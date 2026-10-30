@@ -395,6 +395,8 @@ impl Interp {
         let root = Scope::root();
         self.current = root.clone();
         self.global_scope = root.clone();
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = root.clone();
         self.this_val = NanBox::undefined();
         self.new_target = NanBox::undefined();
@@ -423,6 +425,8 @@ impl Interp {
         // original realm keep the original realm's prototypes.
         self.current = saved_current;
         self.global_scope = saved_global_scope;
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = saved_var_scope;
         self.global_this = saved_global_this;
         self.this_val = saved_this;
@@ -717,6 +721,8 @@ impl Interp {
             scope.clone()
         };
         self.global_scope = scope;
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = self.current.clone();
         self.global_this = global_this;
         self.this_val = global_this;
@@ -735,6 +741,8 @@ impl Interp {
         self.created_realms[idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
         self.current = saved_current;
         self.global_scope = saved_global_scope;
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = saved_var_scope;
         self.global_this = saved_global_this;
         self.this_val = saved_this;
@@ -1545,6 +1553,8 @@ impl Interp {
             scope.clone()
         };
         self.global_scope = scope;
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = self.current.clone();
         self.global_this = global_this;
         self.this_val = global_this;
@@ -1564,6 +1574,8 @@ impl Interp {
         self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
         self.current = saved_current;
         self.global_scope = saved_global_scope;
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = saved_var_scope;
         self.global_this = saved_global_this;
         self.this_val = saved_this;

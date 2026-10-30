@@ -395,6 +395,8 @@ pub(super) struct NumEnv {
     pub(super) backedge: u64,
     pub(super) global_ref: u64,
     pub(super) math1: u64,
+    /// The body's persistent global binding cache (`super::global_persist`).
+    pub(super) persist: u64,
     /// `Ctx`-relative offset of the realm pointer (the inline heap reads').
     pub(super) realm: i32,
 }
@@ -776,6 +778,13 @@ impl NumGen {
         a.g_store(super::call_seq::r::RBP, noted, RAX);
         self.zero_globals(a, Some(ri));
         if validate {
+            // The addresses another activation validated under this very
+            // epoch, when the region's global ops are all reads
+            // (`super::global_persist`).
+            let persisted = self.persisted_gslots(ri);
+            if let Some((pn, entries)) = &persisted {
+                a.gp_restore(self.env.persist, *pn, entries, keep);
+            }
             let r = &self.regions[ri];
             for pc in r.head..=r.end {
                 let k = self.gslot.get(pc).copied().unwrap_or(u32::MAX);
@@ -794,11 +803,48 @@ impl NumGen {
             a.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
             a.raw(&[0x49, 0x8b, 0x03]); // mov rax, [r11]
             a.cmp_rax_mem(noted);
-            a.jcc(CC_E, keep);
+            match &persisted {
+                Some((pn, entries)) => {
+                    let failed = a.new_label();
+                    a.jcc(CC_NE, failed);
+                    a.gp_save_all(self.env.persist, *pn, entries, noted);
+                    a.jmp(keep);
+                    a.bind(failed);
+                }
+                None => a.jcc(CC_E, keep),
+            }
             self.zero_globals(a, Some(ri));
             a.store_empty(noted);
         }
         a.bind(keep);
+    }
+
+    /// Region `ri`'s persistent global binding entries, when its global ops
+    /// are all reads and the body's array has room: the word its epoch is
+    /// noted at, and per global op its `(word, frame displacement)`. (The
+    /// array's words past the body's own cache: one epoch per region, then
+    /// one per global slot.)
+    fn persisted_gslots(&self, ri: usize) -> Option<(usize, Vec<(usize, i32)>)> {
+        use super::global_persist::{BODY_WORDS, LEN};
+        if self.env.persist == 0 || BODY_WORDS + self.regions.len() + self.n_gslots > LEN {
+            return None;
+        }
+        let r = &self.regions[ri];
+        let mut entries = Vec::new();
+        for pc in r.head..=r.end {
+            let k = self.gslot.get(pc).copied().unwrap_or(u32::MAX);
+            if k == u32::MAX {
+                continue;
+            }
+            if !matches!(self.bc(pc), Some(Op::LoadGlobal { .. })) {
+                return None;
+            }
+            entries.push((
+                BODY_WORDS + self.regions.len() + k as usize,
+                self.gslot_disp(k),
+            ));
+        }
+        Some((BODY_WORDS + ri, entries))
     }
 
     /// A global op `pc` of speculative region `ri`'s fast version, its

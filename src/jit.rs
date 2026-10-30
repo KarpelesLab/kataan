@@ -24,6 +24,8 @@ use alloc::vec::Vec;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod global_persist;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod props;
@@ -2944,6 +2946,10 @@ struct GenericSites {
     baked: Vec<alloc::rc::Rc<crate::shape::Shape>>,
     /// What the back-edge poll's recompilation test reads (see [`tierup`]).
     tier_up: tierup::TierUp,
+    /// The persistent global binding cache the code reads and writes
+    /// (`global_persist`).
+    #[allow(dead_code)]
+    persist: global_persist::Persist,
 }
 
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
@@ -3821,7 +3827,9 @@ impl JitProto {
             .collect();
         osr_entries.sort_unstable();
         osr_entries.dedup();
+        let persist = global_persist::Persist::new();
         let (func, native_entry) = JitFunction::compile_generic(
+            persist.addr(),
             proto.n_regs,
             &ops,
             &bytecode,
@@ -3847,6 +3855,7 @@ impl JitProto {
                 methods,
                 baked,
                 tier_up,
+                persist,
             }),
             n_regs: proto.n_regs,
             osr_entries,
@@ -6068,6 +6077,7 @@ impl JitFunction {
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn compile_generic(
+        persist: u64,
         n_regs: usize,
         ops: &[GenericOp],
         bytecode: &[crate::nbvm::Op],
@@ -6182,6 +6192,7 @@ impl JitFunction {
                 backedge: backedge_helper,
                 global_ref: helpers.global_ref as usize as u64,
                 math1: helpers.math1 as usize as u64,
+                persist,
                 realm: helpers.call_layout.realm,
             },
             osr_entries,
@@ -6196,6 +6207,15 @@ impl JitFunction {
         // of its heap slot, as a full walk proved it live, at
         // `[rbp + rc_cell(w)]`. The prologue and every call empty the keys.
         let gc_plan = recv_cache::plan_globals(ops, bytecode, |pc| num.in_region(pc));
+        // The global binding cache's read slots persist across activations
+        // (`global_persist`): word `1 + k` of the array holds slot `k`'s
+        // address, word `0` the epoch they were validated under.
+        let gc_reads: Vec<usize> = (0..gc_plan.slots.min(global_persist::BODY_WORDS - 1))
+            .filter(|&k| {
+                let mut sites = (0..ops.len()).filter(|&pc| gc_plan.site.get(pc) == Some(&Some(k)));
+                sites.all(|pc| matches!(bytecode.get(pc), Some(crate::nbvm::Op::LoadGlobal { .. })))
+            })
+            .collect();
         let rc = recv_cache::plan(
             ops,
             bytecode,
@@ -6339,9 +6359,9 @@ impl JitFunction {
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
         // The global binding cache's refills: (entry, resume, done, op, slot).
-        let mut cold_globals: Vec<(Label, Label, Label, usize, i32)> = Vec::new();
+        let mut cold_globals: Vec<(Label, Label, Label, usize, i32, usize)> = Vec::new();
         // The global binding cache's resets on a changed epoch: (entry, refill).
-        let mut cold_epochs: Vec<(Label, Label)> = Vec::new();
+        let mut cold_epochs: Vec<(Label, Label, Label)> = Vec::new();
         // One label per op (any op can be a branch target or an OSR entry) plus
         // one for the end of the stream (a branch to `len` falls off the end).
         let labels: Vec<Label> = (0..=ops.len()).map(|_| a.new_label()).collect();
@@ -6715,13 +6735,15 @@ impl JitFunction {
                 let back = a.new_label();
                 let done = a.new_label();
                 let reset = a.new_label();
+                let recheck = a.new_label();
                 // The epoch the slots were validated under must still be
                 // current (else, out of line, they are all emptied).
                 a.g_movabs(call_seq::r::R11, epoch_addr as u64);
                 a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
                 a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, gc_epoch);
                 a.jne(reset);
-                cold_epochs.push((reset, fetch));
+                cold_epochs.push((reset, fetch, recheck));
+                a.bind(recheck);
                 a.g_load(call_seq::r::RAX, call_seq::r::RBP, slot);
                 a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
                 a.je(fetch);
@@ -6738,7 +6760,7 @@ impl JitFunction {
                     _ => return None,
                 }
                 a.bind(done);
-                cold_globals.push((fetch, back, done, op_idx, slot));
+                cold_globals.push((fetch, back, done, op_idx, slot, k));
                 continue;
             }
             if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
@@ -8843,15 +8865,23 @@ impl JitFunction {
         // The global binding cache's resets: the epoch changed since the
         // slots were validated, so empty them all, note the current epoch
         // (in `rax`) and refill this one.
-        for (reset, fetch) in core::mem::take(&mut cold_epochs) {
+        // (When the persistent cache holds the read slots validated under
+        // the current epoch, the frame takes them and the op looks again.)
+        let gc_persisted: Vec<(usize, i32)> =
+            gc_reads.iter().map(|&k| (1 + k, gc_slot(k))).collect();
+        for (reset, fetch, recheck) in core::mem::take(&mut cold_epochs) {
             a.bind(reset);
             a.clear_entry_slots();
             a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
+            if !gc_persisted.is_empty() {
+                a.gp_restore(persist, 0, &gc_persisted, recheck);
+            }
             a.jmp(fetch);
         }
         // The global binding cache's refills: a validated address is cached
         // and used, else the interpreter runs the op.
-        for (fetch, back, done, pc, slot) in core::mem::take(&mut cold_globals) {
+        let gc_group: Vec<usize> = gc_reads.iter().map(|&k| 1 + k).collect();
+        for (fetch, back, done, pc, slot, k) in core::mem::take(&mut cold_globals) {
             let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
             let slow = a.new_label();
             a.bind(fetch);
@@ -8862,6 +8892,9 @@ impl JitFunction {
             a.test_rax_rax();
             a.je(slow);
             a.g_store(call_seq::r::RBP, slot, call_seq::r::RAX);
+            if gc_reads.contains(&k) {
+                a.gp_save_one(persist, 0, &gc_group, 1 + k, gc_epoch);
+            }
             a.jmp(back);
             a.bind(slow);
             exec_op!(pc);

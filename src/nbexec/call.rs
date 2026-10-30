@@ -273,6 +273,8 @@ impl Interp {
         self.global_this = gt;
         self.current = gs.clone();
         self.global_scope = gs;
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         // The realm-wide intrinsic slots are a *single* set of `Realm` fields, so
         // entering a realm must swap them: they are what a primitive's
         // `[[Prototype]]` (`%Symbol.prototype%`, `%BigInt.prototype%`), an ordinary
@@ -297,6 +299,8 @@ impl Interp {
             self.cur_realm = realm;
             self.global_this = global_this;
             self.global_scope = global_scope;
+            // (Compiled code keeps global read addresses per scope epoch.)
+            crate::env::bump_global_binding_epoch();
             self.current = current;
             self.realm.restore_intrinsics(intrinsics);
         }

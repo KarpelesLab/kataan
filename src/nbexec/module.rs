@@ -2344,6 +2344,8 @@ impl Interp {
         let child_intl = core::mem::take(&mut self.created_realms[realm_idx].intl_protos);
         self.current = scope.clone();
         self.global_scope = scope.clone();
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = scope;
         self.global_this = global_this;
         self.this_val = NanBox::undefined();
@@ -2389,6 +2391,8 @@ impl Interp {
         self.created_realms[realm_idx].intl_protos = self.realm.replace_intl_protos(saved_intl);
         self.current = saved_current;
         self.global_scope = saved_global_scope;
+        // (Compiled code keeps global read addresses per scope epoch.)
+        crate::env::bump_global_binding_epoch();
         self.var_scope = saved_var_scope;
         self.global_this = saved_global_this;
         self.this_val = saved_this;
