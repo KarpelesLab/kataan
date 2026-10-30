@@ -1056,6 +1056,31 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
             Some(Ok(()))
         }
+        // `x instanceof F` decided from the heap alone (the interpreter arm's
+        // own first step); anything else takes the one-op frame.
+        Op::Relational {
+            dst,
+            instanceof: true,
+            a,
+            b,
+        } => super::instance_of_fast(&ctx.realm, regs[*a as usize], regs[*b as usize]).map(|r| {
+            regs[*dst as usize] = NanBox::boolean(r);
+            Ok(())
+        }),
+        // A sloppy function's `this`: the interpreter arm's fast path (one
+        // realm: `undefined`/`null` binds the global `this`; an object is
+        // its own ToObject).
+        Op::BindThis { this } => {
+            let t = regs[*this as usize];
+            match ctx.host.as_deref() {
+                Some(h) if (t.is_undefined() || t.is_null()) && !ctx.realm.multi_realm => {
+                    regs[*this as usize] = h.global_this();
+                    Some(Ok(()))
+                }
+                Some(_) if super::is_object_value(&ctx.realm, t) => Some(Ok(())),
+                _ => None,
+            }
+        }
         Op::StrEqConst {
             dst,
             src,

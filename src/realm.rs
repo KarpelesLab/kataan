@@ -1189,10 +1189,17 @@ impl Realm {
             && self
                 .object_proto(f)
                 .is_some_and(|p| self.is_function_proto_intrinsic(p))
-            && self
-                .has_instance_key
-                .as_deref()
-                .is_some_and(|k| !self.has_own(f, k))
+            && self.has_instance_key.as_deref().is_some_and(|k| {
+                // `has_own` for a VM function and a symbol key: such a key is
+                // only ever an own property of its auxiliary object (the
+                // synthesized ones are `name`/`length`/`prototype`).
+                !self
+                    .aux_props
+                    .get(&f.to_raw())
+                    .and_then(|aux| self.heap.get(*aux))
+                    .and_then(Cell::as_object)
+                    .is_some_and(|o| o.contains(k) || o.accessor(k).is_some())
+            })
     }
 
     /// Every live typed-array view whose backing bytes cell is `bytes_handle`.
