@@ -1005,22 +1005,22 @@ neverSettles }}` parks forever.
 original (clean-room) programs, takes best-of-3 wall clock, and checks each
 program's output against node's. Ratios are kataan/node; lower is better.
 
-| benchmark | start of campaign (42796a5) | 8ca64fb | c616086 | 9dc93cb | 1d39450 | ed4765fe | b3f37ff9 | fd93e0a4 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| fib | 19x | 4.5x | 1.6x | 1.4x | 1.3x | 1.3x | 1.2x | 1.4x |
-| sort | 20x | 5.0x | 1.8x | 1.7x | 1.5x | 1.0x | 1.0x | 0.9x |
-| json | 11x | 3.5x | 2.0x | 1.9x | 1.4x | 1.4x | 1.4x | 1.4x |
-| array_ops | 44x | 7.6x | 2.6x | 2.6x | 2.5x | 1.6x | 1.6x | 1.6x |
-| loop_arith | 372x | 25.6x | 3.2x | 0.9x | 0.9x | 0.9x | 0.8x | 0.9x |
-| richards_like | (quadratic, fixed) | 9.4x | 4.0x | 3.2x | 2.7x | 2.5x | 2.2x | 2.0x |
-| string_build | 14x | 7.4x | 4.1x | 3.1x | 2.7x | 2.0x | 1.1x | 1.1x |
-| map_set | 400x | 6.6x | 4.6x | 3.2x | 1.4x | 1.4x | 1.5x | 1.2x |
-| regex | 18x | 11.5x | 5.1x | 5.1x | 3.4x | 2.6x | 1.4x | 1.4x |
-| prop_access | 101x | 9.4x | 7.0x | 5.3x | 2.3x | 1.7x | 1.0x | 1.1x |
-| method_calls | 80x | 21.6x | 8.9x | 4.7x | 3.6x | 2.7x | 2.0x | 1.6x |
-| closures | 69x | 16.9x | 12.4x | 3.9x | 2.0x | 1.8x | 1.6x | 1.3x |
-| objects_alloc | 265x | 16.2x | 13.8x | 7.9x | 6.0x | 3.6x | 1.9x | 1.5x |
-| nbody_like | 205x | 28.9x | 21.7x | 15.2x | 9.2x | 5.1x | 2.8x | 3.0x |
+| benchmark | start of campaign (42796a5) | 8ca64fb | c616086 | 9dc93cb | 1d39450 | ed4765fe | b3f37ff9 | fd93e0a4 | 34d0fff7 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fib | 19x | 4.5x | 1.6x | 1.4x | 1.3x | 1.3x | 1.2x | 1.4x | 0.8x |
+| sort | 20x | 5.0x | 1.8x | 1.7x | 1.5x | 1.0x | 1.0x | 0.9x | 0.9x |
+| json | 11x | 3.5x | 2.0x | 1.9x | 1.4x | 1.4x | 1.4x | 1.4x | 1.0x |
+| array_ops | 44x | 7.6x | 2.6x | 2.6x | 2.5x | 1.6x | 1.6x | 1.6x | 0.9x |
+| loop_arith | 372x | 25.6x | 3.2x | 0.9x | 0.9x | 0.9x | 0.8x | 0.9x | 0.8x |
+| richards_like | (quadratic, fixed) | 9.4x | 4.0x | 3.2x | 2.7x | 2.5x | 2.2x | 2.0x | 1.5x |
+| string_build | 14x | 7.4x | 4.1x | 3.1x | 2.7x | 2.0x | 1.1x | 1.1x | 1.0x |
+| map_set | 400x | 6.6x | 4.6x | 3.2x | 1.4x | 1.4x | 1.5x | 1.2x | 0.9x |
+| regex | 18x | 11.5x | 5.1x | 5.1x | 3.4x | 2.6x | 1.4x | 1.4x | 1.0x |
+| prop_access | 101x | 9.4x | 7.0x | 5.3x | 2.3x | 1.7x | 1.0x | 1.1x | 1.0x |
+| method_calls | 80x | 21.6x | 8.9x | 4.7x | 3.6x | 2.7x | 2.0x | 1.6x | 1.3x |
+| closures | 69x | 16.9x | 12.4x | 3.9x | 2.0x | 1.8x | 1.6x | 1.3x | 0.8x |
+| objects_alloc | 265x | 16.2x | 13.8x | 7.9x | 6.0x | 3.6x | 1.9x | 1.5x | 1.4x |
+| nbody_like | 205x | 28.9x | 21.7x | 15.2x | 9.2x | 5.1x | 2.8x | 3.0x | 1.9x |
 
 The main contributors, by landing order:
 - number fast paths;
@@ -1045,9 +1045,14 @@ The main contributors, by landing order:
 - loop variables kept out of closure cells;
 - int32 speculation with wrapping expression trees;
 - global bindings in registers in promoted loops;
-- typed-array index fast paths.
+- typed-array index fast paths;
+- since fd93e0a4: method callee read before arguments without a slowdown, compiled-in constructor adds, type facts and receiver caches in numeric loops, cross-activation global addresses, numeric-callback array loops, Int-tier predicates, per-way call memos;
+- JSON shortest-digit formatting and stringify/parse dispatch, Map/Set site memos and a lean compiled Map/Set helper, one-pass global regex replace/match;
+- truthiness-filled receiver caches, inlined base-class constructors and computed-key calls, fewer prologue stores, an inline back-edge poll;
+- heap arena pinned in r12/r13, promoted registers in allocating loops, a 9-instruction rooted handle walk, a one-counter native call sequence;
+- substring/slice sharing the source buffer, O(1) amortized shift, indexed attribute lists, 2x cheaper realm startup.
 
-loop_arith now runs faster than node (0.9x).
+As of 34d0fff7, kataan is at or ahead of node on ten of the fourteen programs; the remaining gaps are objects_alloc, method_calls, richards_like and nbody_like.
 
 Startup is 3 ms against node's ~15 ms.
 
