@@ -4160,6 +4160,19 @@ fn raw_nan_consumer(op: &GenericOp) -> bool {
     raw_nan_producer(op) || matches!(op, GenericOp::Lt { .. } | GenericOp::Compare { .. })
 }
 
+/// Whether region op `op` (`bc`) is an inline one-argument `Math` function
+/// (`sqrt`, `abs`, the roundings) of register `x`: it reads its argument
+/// as an `f64` only (a NaN gives a NaN result, which it makes canonical
+/// itself), so it is a [`raw_nan_consumer`] of `x`.
+fn raw_nan_math_arg(op: &GenericOp, bc: &Op, x: u16) -> bool {
+    matches!((op, bc), (GenericOp::CallMethod { .. }, Op::CallMethod { recv, args, .. })
+        if args.len() == 1
+            && args[0] == x
+            && *recv != x
+            && super::inline_math(bc)
+                .is_some_and(|(_, f)| !matches!(f, super::MathInline::MaxMin(_))))
+}
+
 /// The pcs of region `head..=end`'s arithmetic whose NaN result may stay the
 /// hardware's NaN in its SSE register: the canonical NaN exists so that a
 /// NaN's *bits* are the interpreter's wherever they can be observed (stored
@@ -4207,7 +4220,10 @@ fn raw_nan_results(
                     continue;
                 }
                 def_use(&bytecode[q], &mut d, &mut u);
-                if !u.contains(&x) || raw_nan_consumer(&ops[q]) {
+                if !u.contains(&x)
+                    || raw_nan_consumer(&ops[q])
+                    || raw_nan_math_arg(&ops[q], &bytecode[q], x)
+                {
                     continue;
                 }
                 match bytecode[q] {
