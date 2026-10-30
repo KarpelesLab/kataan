@@ -47,8 +47,7 @@ impl Interp {
         // and `Object.getPrototypeOf(arrayIterator)`'s chain reaches it (reflection
         // tests). Falls back to the default object proto before Iterator is set up.
         if let Some(iter_proto) = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -75,8 +74,7 @@ impl Interp {
         // Chain to `%IteratorPrototype%` (so the helper methods, `@@iterator`,
         // and `@@dispose` are inherited).
         if let Some(iter_proto) = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -310,7 +308,9 @@ impl Interp {
         {
             let h = Handle::from_raw(raw);
             let ctor = self.read_member(h, "constructor")?;
-            let default_c = self.current.get("Promise").unwrap_or(NanBox::undefined());
+            let default_c = self
+                .intrinsic_global("Promise")
+                .unwrap_or(NanBox::undefined());
             if self.realm.same_value(ctor, default_c) {
                 return Ok(h);
             }
@@ -344,7 +344,9 @@ impl Interp {
     /// `%Promise%`; then reads `[Symbol.species]` (using the constructor itself when
     /// that is `undefined`/`null`). A non-constructor result is a `TypeError`.
     pub(crate) fn promise_species_constructor(&mut self, o: Handle) -> Result<NanBox, ExecError> {
-        let default_c = self.current.get("Promise").unwrap_or(NanBox::undefined());
+        let default_c = self
+            .intrinsic_global("Promise")
+            .unwrap_or(NanBox::undefined());
         let ctor = self.read_member(o, "constructor")?;
         if matches!(ctor.unpack(), Unpacked::Undefined) {
             return Ok(default_c);
@@ -435,7 +437,7 @@ impl Interp {
         let c = self.promise_species_constructor(handle)?;
         // Fast path: the species is the intrinsic Promise — use the cheap reaction
         // registration that returns a native promise directly.
-        if self.current.get("Promise").and_then(|v| v.as_handle()) == c.as_handle() {
+        if self.intrinsic_global("Promise").and_then(|v| v.as_handle()) == c.as_handle() {
             let result = self.register_then(handle, on_f, on_r, false);
             return Ok(NanBox::handle(result.to_raw()));
         }
@@ -736,7 +738,7 @@ impl Interp {
         c: NanBox,
     ) -> Result<PromiseCapability, ExecError> {
         // Fast path: `C` is the realm's own `Promise` constructor.
-        if self.current.get("Promise").and_then(|v| v.as_handle()) == c.as_handle() {
+        if self.intrinsic_global("Promise").and_then(|v| v.as_handle()) == c.as_handle() {
             let promise = self.fresh_promise();
             let resolve = self.realm.new_bound_native(N_RESOLVE, promise);
             let reject = self.realm.new_bound_native(N_REJECT, promise);
@@ -1076,7 +1078,7 @@ impl Interp {
         let msg = self.new_str("All promises were rejected");
         // Use the realm's AggregateError constructor when present so the prototype
         // chain and `instanceof AggregateError` are correct.
-        if let Some(ctor) = self.current.get("AggregateError") {
+        if let Some(ctor) = self.intrinsic_global("AggregateError") {
             let empty = self.realm.new_array(Vec::new());
             if let Ok(e) = self.construct(ctor, &[NanBox::handle(empty.to_raw()), msg]) {
                 if let Some(eh) = e.as_handle().map(Handle::from_raw) {
@@ -1498,8 +1500,7 @@ impl Interp {
         // `Promise` must not change the prototype of a promise the engine creates
         // for `import()`, an async function, or a reaction job.
         if let Some(proto) = self.realm.promise_proto_intrinsic().or_else(|| {
-            self.current
-                .get("Promise")
+            self.intrinsic_global("Promise")
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw)
                 .and_then(|c| self.realm.get_property(c, "prototype"))

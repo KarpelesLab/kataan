@@ -863,8 +863,7 @@ impl Interp {
         // The **running realm's** `Iterator` (`enter_realm` swaps `global_scope`):
         // `otherRealm.Iterator.from(x)` must wrap in *that* realm's
         // `%WrapForValidIteratorPrototype%`.
-        self.global_scope
-            .get("Iterator")
+        self.intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, slot))
@@ -987,8 +986,7 @@ impl Interp {
         // `%Iterator%` is the intrinsic of the realm running `Iterator.from`, not
         // the caller's — `otherRealm.Iterator.from(mainRealmIterator)` must wrap.
         let Some(iter_proto) = self
-            .global_scope
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -1029,8 +1027,7 @@ impl Interp {
     /// rather than reporting "reduce is not a function".
     pub(crate) fn inherits_array_proto(&mut self, h: Handle) -> bool {
         let array_proto = self
-            .current
-            .get("Array")
+            .intrinsic_global("Array")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -1049,8 +1046,7 @@ impl Interp {
     /// Whether `h`'s prototype chain includes `%IteratorPrototype%`.
     pub(crate) fn inherits_iterator_proto(&mut self, h: Handle) -> bool {
         let Some(iter_proto) = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -2032,7 +2028,7 @@ impl Interp {
         // A `C.fromAsync(...)` (subclass / constructor `this`) builds via `Construct`;
         // the default `%Array%` builds a plain dense array.
         let is_array_ctor =
-            self.current.get("Array").and_then(|v| v.as_handle()) == this_ctor.as_handle();
+            self.intrinsic_global("Array").and_then(|v| v.as_handle()) == this_ctor.as_handle();
         let use_ctor = self.is_constructor_value(this_ctor) && !is_array_ctor;
 
         // GetMethod(asyncItems, @@asyncIterator) is read **once**; @@iterator only if

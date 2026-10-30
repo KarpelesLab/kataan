@@ -2414,6 +2414,17 @@ const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
 /// `Object.prototype.toString` reports `[object Arguments]`. (A mapped/sloppy
 /// arguments object additionally carries `ARGS_CALLEE` parameter linkage.)
 const ARGS_MARKER: &str = "\u{0}args";
+/// Hidden slot on a realm's `%Array.prototype%` holding its intrinsic
+/// `%Array.prototype.values%`, the `@@iterator` of every `arguments` object of
+/// that realm (read from here, never from the live `Array` global binding or
+/// the current, possibly replaced, `Array.prototype.values`).
+const ARRAY_VALUES_INTRINSIC: &str = "\u{0}arrvalues";
+/// Prefix of the hidden slots on a realm's global object that capture, once
+/// its globals are installed, every global binding holding an object (the
+/// intrinsic constructors and namespaces). The engine resolves its intrinsics
+/// through these ([`Interp::intrinsic_global`]), never through the live global
+/// bindings a script may rebind (`Map = …`, `TypeError = …`).
+const INTRINSIC_GLOBAL_PREFIX: &str = "\u{0}intr:";
 /// `ArrayBuffer` byte store (an array of 0–255 numbers) and `DataView` linkage.
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
 /// Marks an `ArrayBuffer` as detached (after `transfer()`): its `byteLength` reads 0 and its
@@ -4394,6 +4405,8 @@ impl Interp {
                 let iter_sym = self.well_known_symbol("iterator");
                 let iter_key = self.member_key(iter_sym);
                 self.realm.set_hidden_property(arr_proto, &iter_key, values);
+                self.realm
+                    .set_hidden_property(arr_proto, ARRAY_VALUES_INTRINSIC, values);
                 // Recorded for the bytecode VM's by-index array iteration.
                 if let Some(vh) = values.as_handle().map(Handle::from_raw) {
                     let ai = self.realm.vm_array_iter_mut();
@@ -5174,6 +5187,10 @@ impl Interp {
         for (name, value, _is_const) in &bindings {
             self.realm.set_property(global, name, *value);
             self.realm.mark_hidden(global, name);
+            if self.is_object_value(*value) {
+                let key = alloc::format!("{INTRINSIC_GLOBAL_PREFIX}{name}");
+                self.realm.set_hidden_property(global, &key, *value);
+            }
         }
         // `NaN`, `Infinity`, `undefined` are `{ writable: false, enumerable: false,
         // configurable: false }` value properties of the global object.
@@ -5198,6 +5215,27 @@ impl Interp {
         // array (often its longest) otherwise ran the generic protocol, with
         // a result object per step, to the end.
         self.builtin_iterator_proto("Array Iterator");
+    }
+
+    /// The running realm's intrinsic global `name` (`"Map"`, `"TypeError"`,
+    /// …) as captured when the realm's globals were installed — unaffected by
+    /// a script rebinding or deleting that global. Before the capture (while a
+    /// realm is still being installed, when `global_this` may still be the
+    /// creating realm's) it is the realm's own global binding.
+    pub(crate) fn intrinsic_global(&self, name: &str) -> Option<NanBox> {
+        if let Some(gt) = self.global_this.as_handle().map(Handle::from_raw)
+            && self
+                .global_scope
+                .get("globalThis")
+                .and_then(|v| v.as_handle())
+                == Some(gt.to_raw())
+            && let Some(v) = self
+                .realm
+                .get_property(gt, &alloc::format!("{INTRINSIC_GLOBAL_PREFIX}{name}"))
+        {
+            return Some(v);
+        }
+        self.global_scope.get(name)
     }
 
     /// The global object (`globalThis`) handle, if the realm is initialized.
@@ -6656,14 +6694,12 @@ impl Interp {
     /// fallback for early bootstrap, before the constructors are bound.
     fn error_ctor_by_name(&mut self, name: &str) -> Option<NanBox> {
         if let Some(v) = self
-            .global_scope
-            .get(name)
+            .intrinsic_global(name)
             .or_else(|| self.current.get(name))
         {
             return Some(v);
         }
-        self.global_scope
-            .get("WebAssembly")
+        self.intrinsic_global("WebAssembly")
             .or_else(|| self.current.get("WebAssembly"))
             .and_then(|ns| ns.as_handle())
             .map(Handle::from_raw)
@@ -6724,7 +6760,8 @@ impl Interp {
         // The `WebAssembly.*` error subclasses are namespaced, not global, in every
         // realm — hence the second lookup through the namespace object.
         let realm_ctor = realm_global.and_then(|gt| {
-            self.realm.get_property(gt, name).or_else(|| {
+            let captured = alloc::format!("{INTRINSIC_GLOBAL_PREFIX}{name}");
+            self.realm.get_property(gt, &captured).or_else(|| {
                 self.realm
                     .get_property(gt, "WebAssembly")
                     .and_then(|ns| ns.as_handle())

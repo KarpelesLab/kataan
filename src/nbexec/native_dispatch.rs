@@ -521,13 +521,17 @@ impl Interp {
                     && self.try_is_regexp(pattern)?
                     && let Some(ph) = pattern.as_handle().map(Handle::from_raw)
                 {
-                    let ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
+                    let ctor = self
+                        .intrinsic_global("RegExp")
+                        .unwrap_or(NanBox::undefined());
                     let ctor_of = self.read_member(ph, "constructor")?;
                     if self.realm.same_value(ctor, ctor_of) {
                         return Ok(pattern);
                     }
                 }
-                let regexp_ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
+                let regexp_ctor = self
+                    .intrinsic_global("RegExp")
+                    .unwrap_or(NanBox::undefined());
                 return self.construct(regexp_ctor, args);
             }
             N_SYMBOL => {
@@ -985,9 +989,7 @@ impl Interp {
                 // realm's setter to the *main* realm's home, and step 5 then re-entered
                 // realm B's setter on realm B's `Error.prototype` forever.
                 let error_proto = self
-                    .global_scope
-                    .get("Error")
-                    .or_else(|| self.current.get("Error"))
+                    .intrinsic_global("Error")
                     .and_then(|c| c.as_handle())
                     .map(Handle::from_raw)
                     .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -2435,8 +2437,8 @@ impl Interp {
                 // non-constructor `this` builds a plain dense array. Mirrors the
                 // `Array.from` receiver handling.
                 let this_c = self.this_val;
-                let is_array_ctor =
-                    self.current.get("Array").and_then(|v| v.as_handle()) == this_c.as_handle();
+                let is_array_ctor = self.intrinsic_global("Array").and_then(|v| v.as_handle())
+                    == this_c.as_handle();
                 if self.is_constructor_value(this_c) && !is_array_ctor {
                     let len = args.len();
                     let target = self.construct(this_c, &[NanBox::number(len as f64)])?;
@@ -2845,7 +2847,9 @@ impl Interp {
                 NanBox::undefined()
             }
             // `get %IteratorPrototype%.constructor` → `%Iterator%`.
-            N_ITERATOR_CTOR_GET => self.current.get("Iterator").unwrap_or(NanBox::undefined()),
+            N_ITERATOR_CTOR_GET => self
+                .intrinsic_global("Iterator")
+                .unwrap_or(NanBox::undefined()),
             // `set %IteratorPrototype%.constructor`: SetterThatIgnoresPrototype-
             // Properties(%Iterator.prototype%, "constructor", v). A non-object
             // `this`, or `this` being the home prototype itself (detected as owning

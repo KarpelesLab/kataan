@@ -2189,7 +2189,9 @@ impl Interp {
                 _ => None,
             }
         {
-            let regexp_ctor = self.current.get("RegExp").unwrap_or(NanBox::undefined());
+            let regexp_ctor = self
+                .intrinsic_global("RegExp")
+                .unwrap_or(NanBox::undefined());
             // RegExpCreate(regexp, flags) runs `ToString(regexp)` (RegExpInitialize),
             // never IsRegExp: hand the constructor the pattern string, so the
             // argument's `@@match` is not read again.
@@ -5978,7 +5980,7 @@ impl Interp {
         // Default Array constructor (or `constructor`/species undefined) → an
         // ordinary array of `length` holes.
         let is_default = matches!(c.unpack(), Unpacked::Undefined)
-            || self.current.get("Array").and_then(|v| v.as_handle()) == c.as_handle();
+            || self.intrinsic_global("Array").and_then(|v| v.as_handle()) == c.as_handle();
         if is_default {
             return self.array_create_holes(length);
         }

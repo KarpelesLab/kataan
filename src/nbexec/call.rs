@@ -2037,22 +2037,17 @@ impl Interp {
         if idx >= self.created_realms.len() {
             return default;
         }
-        // Enter the target realm's global environment (scope + intrinsics) so the
+        // Enter the target realm (global object, scope and intrinsics) so the
         // family-prototype builder resolves *its* `Iterator`/`Function` and caches
         // onto *its* constructors, then restore the caller's.
-        let scope = self.created_realms[idx].global_scope.clone();
-        let saved_current = core::mem::replace(&mut self.current, scope);
-        let saved_intrinsics = self.realm.intrinsics_snapshot();
-        self.realm
-            .restore_intrinsics(self.created_realms[idx].intrinsics);
+        let guard = self.enter_realm(Some(idx));
         let proto = match keyword {
             "function*" => self.generator_function_prototype(),
             "async function*" => self.async_generator_function_prototype(),
             "async function" => self.async_function_prototype(),
             _ => None,
         };
-        self.realm.restore_intrinsics(saved_intrinsics);
-        self.current = saved_current;
+        self.leave_realm(guard);
         proto.or(default)
     }
 
@@ -2105,8 +2100,7 @@ impl Interp {
         // swaps), not the caller's lexical scope: a built-in constructing a value
         // while a `$262.createRealm()` realm is running must link *that* realm's
         // prototype, and must never see a user's block-scoped `let Map = …`.
-        self.global_scope
-            .get(name)
+        self.intrinsic_global(name)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))

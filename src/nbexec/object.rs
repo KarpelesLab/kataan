@@ -1776,7 +1776,7 @@ impl Interp {
         // named `Number` stand in for the intrinsic. `current` remains the fallback
         // for the setup window, before the bindings are published.
         if let Some(proto) = ctor_name
-            .and_then(|n| self.global_scope.get(n).or_else(|| self.current.get(n)))
+            .and_then(|n| self.intrinsic_global(n).or_else(|| self.current.get(n)))
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -1820,16 +1820,9 @@ impl Interp {
         mapped_params: Option<&[&str]>,
     ) -> NanBox {
         let obj = self.realm.new_object();
-        // [[Prototype]] = Object.prototype.
-        if let Some(proto) = self
-            .current
-            .get("Object")
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|c| self.realm.get_property(c, "prototype"))
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)
-        {
+        // [[Prototype]] = %Object.prototype% of the current realm (the intrinsic,
+        // not whatever the `Object` global is bound to now).
+        if let Some(proto) = self.realm.default_object_proto() {
             self.realm.set_object_proto(obj, Some(proto));
         }
         // Indexed elements: ordinary enumerable own data properties.
@@ -1846,14 +1839,9 @@ impl Interp {
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
         if let Some(values) = self
-            .current
-            .get("Array")
-            .and_then(|v| v.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|c| self.realm.get_property(c, "prototype"))
-            .and_then(|p| p.as_handle())
-            .map(Handle::from_raw)
-            .and_then(|proto| self.realm.get_property(proto, "values"))
+            .realm
+            .array_proto_intrinsic()
+            .and_then(|ap| self.realm.get_property(ap, super::ARRAY_VALUES_INTRINSIC))
         {
             self.realm.set_hidden_property(obj, &iter_key, values);
         }

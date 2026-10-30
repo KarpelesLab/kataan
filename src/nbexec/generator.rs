@@ -15,8 +15,7 @@ impl Interp {
     /// `Iterator` constructor.
     pub(crate) fn generator_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)?;
         const CACHE: &str = "\u{0}genproto";
@@ -60,8 +59,7 @@ impl Interp {
     /// the `Iterator` constructor.
     pub(crate) fn generator_function_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)?;
         const CACHE: &str = "\u{0}genfnproto";
@@ -145,8 +143,7 @@ impl Interp {
     /// on the `Iterator` constructor.
     pub(crate) fn async_function_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)?;
         const CACHE: &str = "\u{0}asyncfnproto";
@@ -208,8 +205,7 @@ impl Interp {
     /// inheriting `%Object.prototype%`. Cached on the `Iterator` constructor.
     fn async_iterator_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)?;
         const CACHE: &str = "\u{0}asynciterproto";
@@ -222,8 +218,7 @@ impl Interp {
             return Some(h);
         }
         let obj_proto = self
-            .current
-            .get("Object")
+            .intrinsic_global("Object")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .and_then(|c| self.realm.get_property(c, "prototype"))
@@ -254,8 +249,7 @@ impl Interp {
     /// `[Symbol.toStringTag]` "AsyncGenerator", inheriting `%AsyncIteratorPrototype%`.
     pub(crate) fn async_generator_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)?;
         const CACHE: &str = "\u{0}asyncgenproto";
@@ -292,8 +286,7 @@ impl Interp {
     /// set to this via `set_native_proto`.
     pub(crate) fn async_generator_function_prototype(&mut self) -> Option<Handle> {
         let iter_ctor = self
-            .current
-            .get("Iterator")
+            .intrinsic_global("Iterator")
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)?;
         const CACHE: &str = "\u{0}asyncgenfnproto";

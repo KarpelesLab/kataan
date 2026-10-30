@@ -2742,3 +2742,65 @@ fn regex_unicode_ignore_case_backref_folds_astral() {
     "#;
     assert_eq!(run(src), "true|true|false|true|true|false|false");
 }
+
+/// An `arguments` object's `[[Prototype]]` is the realm's intrinsic
+/// `%Object.prototype%` and its `@@iterator` the intrinsic
+/// `%Array.prototype.values%`: rebinding the `Object` / `Array` globals (or
+/// replacing `Array.prototype.values`) must not change either.
+#[test]
+fn arguments_object_uses_intrinsics_not_live_globals() {
+    let src = r#"
+        var OP = Object.prototype, AV = Array.prototype.values, r = [];
+        Array.prototype.values = function () { return 'replaced'; };
+        Object = { prototype: { x: 'hijacked' } };
+        Array = { prototype: { values: function () { return 'bad'; } } };
+        (function () {
+            r.push(arguments.x, Reflect.getPrototypeOf(arguments) === OP, arguments[Symbol.iterator] === AV);
+        })(1, 2);
+        (function () {
+            'use strict';
+            r.push(arguments.x, Reflect.getPrototypeOf(arguments) === OP, [...arguments].join(''));
+        })(1, 2);
+        r.join()
+    "#;
+    assert_eq!(run(src), ",true,true,,true,12");
+}
+
+/// Objects the engine creates on its own (thrown errors, collections, dates,
+/// typed arrays, generators, iterator helpers, promise results) link to the
+/// realm's *intrinsic* prototypes, captured when the realm was installed: a
+/// script rebinding a global (`Map = …`, `TypeError = …`, as polyfills and
+/// mocks do) must not divert them.
+#[test]
+fn engine_created_objects_ignore_rebound_globals() {
+    let src = r#"
+        var gpo = Object.getPrototypeOf, r = [];
+        var I = { TEP: TypeError.prototype, REP: RangeError.prototype, SEP: SyntaxError.prototype,
+                  EP: Error.prototype, MP: Map.prototype, DP: Date.prototype, U8P: Uint8Array.prototype,
+                  GP: Object.getPrototypeOf(function* () {}).prototype, PP: Promise.prototype,
+                  NM: Map, ND: Date, NU8: Uint8Array, NE: Error, NP: Promise, NTE: TypeError,
+                  IP: Object.getPrototypeOf(Object.getPrototypeOf([].values())), J: JSON };
+        ['TypeError', 'RangeError', 'SyntaxError', 'Error', 'Map', 'Date', 'Uint8Array', 'Iterator', 'Promise']
+            .forEach(function (n) { globalThis[n] = { prototype: { hijacked: n } }; });
+        try { null.x; } catch (e) { r.push(gpo(e) === I.TEP, e instanceof I.NTE); }
+        try { (1).toFixed(200); } catch (e) { r.push(gpo(e) === I.REP); }
+        try { I.J.parse('{'); } catch (e) { r.push(gpo(e) === I.SEP); }
+        r.push(gpo(new I.NE('m')) === I.EP);
+        var m = new I.NM([[1, 2]]), s = '';
+        for (var [k, v] of m) s += k + v;
+        r.push(s, gpo(m) === I.MP, typeof m.entries().next);
+        r.push(new I.ND(0).toISOString(), I.J.stringify({ d: new I.ND(0) }));
+        var u = new I.NU8([1, 2, 3]);
+        r.push(gpo(u.map(function (x) { return x * 2; })) === I.U8P, gpo(u.subarray(1)) === I.U8P);
+        r.push(gpo(gpo(function* () {}())) === I.GP, [...'a1b2'.matchAll(/\d/g)].length,
+               [1, 2, 3].values().map(function (x) { return x * 2; }).toArray().join(''),
+               I.IP.constructor !== globalThis.Iterator);
+        r.push(gpo((async function () {})()) === I.PP, gpo(I.NP.resolve(1).then()) === I.PP);
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,true,true,true,true,3,true,function,1970-01-01T00:00:00.000Z,\
+         {\"d\":\"1970-01-01T00:00:00.000Z\"},true,true,true,2,246,true,true,true"
+    );
+}
