@@ -1003,7 +1003,9 @@ pub(crate) extern "C" fn jit_helper_exec_op(
         } if !(*strict && resolved.is_some()) => {
             vm_store_global_fast(ctx, name, cache, regs[*src as usize]).then_some(Ok(()))
         }
-        Op::CallValue { dst, callee, args } => {
+        Op::CallValue {
+            dst, callee, args, ..
+        } => {
             let callee = regs[*callee as usize];
             match call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined()) {
                 Some(r) => Some(r.map(|v| regs[*dst as usize] = v)),

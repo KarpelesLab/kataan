@@ -9462,7 +9462,9 @@ impl crate::nbvm::VmHost for Interp {
             Some(h) if !self.realm.is_string_handle(h) && self.realm.symbol_at(h).is_none() => h,
             _ => {
                 if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    let m = self.new_str("Cannot read properties of null or undefined");
+                    let k = self.realm.message_key_text(key);
+                    let m = Realm::nullish_access_message(recv, k.as_deref(), false);
+                    let m = self.new_str(&m);
                     return Err(crate::nbvm::HostError::Thrown(
                         self.make_error(N_TYPE_ERROR, Some(m)),
                     ));
@@ -9697,6 +9699,10 @@ impl crate::nbvm::VmHost for Interp {
 
     fn is_constructor(&mut self, v: NanBox) -> bool {
         self.is_constructor_value(v)
+    }
+
+    fn is_callable_value(&mut self, v: NanBox) -> bool {
+        Interp::is_callable_value(self, v)
     }
 
     fn new_promise(&mut self) -> NanBox {
@@ -10267,7 +10273,9 @@ impl crate::nbvm::VmHost for Interp {
                 .vm_object_key(key)
                 .and_then(|key| self.assign_member_value(h, key, value)),
             _ if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) => {
-                let m = self.new_str("Cannot set properties of null or undefined");
+                let k = self.realm.message_key_text(key);
+                let m = Realm::nullish_access_message(recv, k.as_deref(), true);
+                let m = self.new_str(&m);
                 Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
             }
             _ => self

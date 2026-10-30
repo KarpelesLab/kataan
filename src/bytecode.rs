@@ -484,7 +484,9 @@ fn verify_op_with(
             reg(*dst)?;
             regs(&lit.srcs)
         }
-        Op::CallValue { dst, callee, args } => {
+        Op::CallValue {
+            dst, callee, args, ..
+        } => {
             reg(*dst)?;
             reg(*callee)?;
             regs(args)
@@ -576,7 +578,7 @@ fn verify_op_with(
             reg(*key)
         }
         Op::DeleteGlobal { dst, .. } | Op::NewBox { dst } => reg(*dst),
-        Op::RequireObjectCoercible { src } | Op::CheckTdz { src } => reg(*src),
+        Op::RequireObjectCoercible { src, .. } | Op::CheckTdz { src } => reg(*src),
         Op::SwitchStr { dst, src, .. } => {
             reg(*dst)?;
             reg(*src)
@@ -1312,7 +1314,9 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u32(*func, out);
             w_regs(captures, out);
         }
-        Op::CallValue { dst, callee, args } => {
+        Op::CallValue {
+            dst, callee, args, ..
+        } => {
             w_u8(45, out);
             w_reg(*dst, out);
             w_reg(*callee, out);
@@ -1493,7 +1497,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_str(name, out);
         }
-        Op::RequireObjectCoercible { src } => {
+        Op::RequireObjectCoercible { src, .. } => {
             w_u8(80, out);
             w_reg(*src, out);
         }
@@ -2288,6 +2292,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             callee: r.reg()?,
             args: r.regs()?,
+            name: None,
         },
         46 => Op::CallValueThis {
             dst: r.reg()?,
@@ -2400,7 +2405,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             name: r.string()?,
         },
-        80 => Op::RequireObjectCoercible { src: r.reg()? },
+        80 => Op::RequireObjectCoercible {
+            src: r.reg()?,
+            key: None,
+        },
         195 => {
             let dst = r.reg()?;
             let src = r.reg()?;

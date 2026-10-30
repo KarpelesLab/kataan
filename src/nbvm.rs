@@ -236,7 +236,12 @@ pub enum Op {
     Concat { dst: Reg, parts: Vec<Reg> },
     /// Throws a `TypeError` if `src` is `null` or `undefined` (an object
     /// destructuring pattern's `RequireObjectCoercible`).
-    RequireObjectCoercible { src: Reg },
+    RequireObjectCoercible {
+        src: Reg,
+        /// The static key the guarded access reads (`u.k()`), for the
+        /// error message only.
+        key: Option<Box<str>>,
+    },
     /// Throws a `ReferenceError` if `src` is the TDZ sentinel (a lexical binding
     /// read or written by a hoisted function before its declaration ran).
     CheckTdz { src: Reg },
@@ -684,6 +689,9 @@ pub enum Op {
         dst: Reg,
         callee: Reg,
         args: Vec<Reg>,
+        /// The callee's source text when it is a name or a dotted path
+        /// (`u`, `obj.method`), for the error message only.
+        name: Option<Box<str>>,
     },
     /// `dst = callee(args…)` with `this = recv` — an indirect call through a
     /// function value, binding an explicit receiver (used by `super.method()`).
@@ -1312,6 +1320,9 @@ pub trait VmHost {
     ) -> Result<(), HostError>;
     /// `IsConstructor(v)`.
     fn is_constructor(&mut self, v: NanBox) -> bool;
+    /// `IsCallable(v)` (for an error message: whether a failed call's callee
+    /// was not a function at all).
+    fn is_callable_value(&mut self, v: NanBox) -> bool;
     /// CreateMappedArgumentsObject's parameter map for a VM function: index
     /// `i` of `args_obj` aliases the parameter cell `cell` (a one-element
     /// array) for each `(i, cell)`.
@@ -7632,16 +7643,14 @@ fn run_frame_at_ic(
                 Ok(v) => regs[*dst as usize] = v,
                 Err(e) => handle_throw!(e),
             },
-            Op::RequireObjectCoercible { src } => {
+            Op::RequireObjectCoercible { src, key } => {
                 if matches!(
                     regs[*src as usize].unpack(),
                     crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
                 ) {
-                    let e = vm_error(
-                        ctx,
-                        "TypeError",
-                        "Cannot read properties of null or undefined",
-                    );
+                    let m =
+                        Realm::nullish_access_message(regs[*src as usize], key.as_deref(), false);
+                    let e = vm_error(ctx, "TypeError", &m);
                     handle_throw!(VmError::Thrown(e));
                 }
             }
@@ -9276,11 +9285,15 @@ fn run_frame_at_ic(
                 tag_new_fn_realm(ctx, handle);
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
-            Op::CallValue { dst, callee, args }
-                if ctx.host.is_some()
-                    && !regs[*callee as usize]
-                        .as_handle()
-                        .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))) =>
+            Op::CallValue {
+                dst,
+                callee,
+                args,
+                name,
+            } if ctx.host.is_some()
+                && !regs[*callee as usize]
+                    .as_handle()
+                    .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))) =>
             {
                 let argv = ArgBuf::from_regs(regs, args);
                 match call_closure(
@@ -9291,10 +9304,15 @@ fn run_frame_at_ic(
                     NanBox::undefined(),
                 ) {
                     Ok(ret) => regs[*dst as usize] = ret,
-                    Err(e) => handle_throw!(e),
+                    Err(e) => {
+                        let e = name_not_callable(ctx, regs[*callee as usize], name.as_deref(), e);
+                        handle_throw!(e)
+                    }
                 }
             }
-            Op::CallValue { dst, callee, args } => {
+            Op::CallValue {
+                dst, callee, args, ..
+            } => {
                 let handle = object_handle(regs[*callee as usize])?;
                 let (id, caps) = ctx
                     .realm
@@ -12888,6 +12906,72 @@ fn may_assign(e: &crate::ast::Expr) -> bool {
 }
 
 /// [`may_assign`] over an argument list.
+/// The source text of a call's callee for its "is not a function" message:
+/// a name, `this`, or a dotted path of them (`a.b.c`); `None` for anything
+/// else (or a very long path).
+fn callee_text(e: &Expr) -> Option<Box<str>> {
+    fn walk(e: &Expr, out: &mut String, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match e {
+            Expr::Ident(id) => out.push_str(&id.name),
+            Expr::This(_) => out.push_str("this"),
+            Expr::Member {
+                object,
+                property: PropertyKey::Ident(k),
+                optional: false,
+                ..
+            } => {
+                if !walk(object, out, depth + 1) {
+                    return false;
+                }
+                out.push('.');
+                out.push_str(k);
+            }
+            _ => return false,
+        }
+        true
+    }
+    let mut s = String::new();
+    (walk(e, &mut s, 0) && s.len() <= 200).then(|| s.into_boxed_str())
+}
+
+/// The message the host gives the `TypeError` of calling a value that is
+/// not callable.
+const NOT_CALLABLE_MSG: &str = "is not a function";
+
+/// A failed call's error, named: when the callee was not callable at all
+/// and the host threw its generic `TypeError` for that (before running
+/// anything), and the site knows the callee's text, the error becomes one
+/// that says what was called (`u is not a function`). Any other error is
+/// `e` unchanged.
+fn name_not_callable(ctx: &mut Ctx, callee: NanBox, name: Option<&str>, e: VmError) -> VmError {
+    let (Some(name), VmError::Thrown(v)) = (name, &e) else {
+        return e;
+    };
+    let generic = v
+        .as_handle()
+        .map(Handle::from_raw)
+        .and_then(|h| ctx.realm.get_property(h, "message"))
+        .and_then(|m| m.as_handle())
+        .and_then(|m| ctx.realm.string_value(Handle::from_raw(m)))
+        .is_some_and(|m| m == NOT_CALLABLE_MSG);
+    if !generic {
+        return e;
+    }
+    let callable = callee.as_handle().is_some()
+        && with_host(ctx, |h| h.is_callable_value(callee)).unwrap_or(true);
+    if callable {
+        return e;
+    }
+    VmError::Thrown(vm_error(
+        ctx,
+        "TypeError",
+        &alloc::format!("{name} {NOT_CALLABLE_MSG}"),
+    ))
+}
+
 /// The fewest string-literal case tests a `switch` dispatches by table
 /// ([`Op::SwitchStr`]); a shorter one compares case by case.
 const SWITCH_STR_MIN: usize = 3;
@@ -13709,6 +13793,7 @@ impl Compiler {
                     dst,
                     callee: f,
                     args,
+                    name: None,
                 });
                 return Ok(dst);
             }
@@ -16342,7 +16427,10 @@ impl Compiler {
                 Ok(())
             }
             Expr::Object { members, .. } => {
-                self.ops.push(Op::RequireObjectCoercible { src: value_reg });
+                self.ops.push(Op::RequireObjectCoercible {
+                    src: value_reg,
+                    key: None,
+                });
                 let mut named: Vec<String> = Vec::new();
                 let mut dyn_keys: Vec<Reg> = Vec::new();
                 for m in members {
@@ -16607,7 +16695,10 @@ impl Compiler {
                 Ok(())
             }
             BindingTarget::Object(pat) => {
-                self.ops.push(Op::RequireObjectCoercible { src: value_reg });
+                self.ops.push(Op::RequireObjectCoercible {
+                    src: value_reg,
+                    key: None,
+                });
                 let mut named: Vec<String> = Vec::new();
                 let mut dyn_keys: Vec<Reg> = Vec::new();
                 for prop in &pat.properties {
@@ -19390,7 +19481,10 @@ impl Compiler {
                     // GetValue of the callee (a TypeError on a nullish base)
                     // precedes the arguments.
                     if self.hosted && !*optional {
-                        self.ops.push(Op::RequireObjectCoercible { src: recv });
+                        self.ops.push(Op::RequireObjectCoercible {
+                            src: recv,
+                            key: Some(Box::from(&**key)),
+                        });
                     }
                     // EvaluateCall reads the callee before the arguments: when
                     // they could tell, the read comes first.
@@ -19421,7 +19515,10 @@ impl Compiler {
                     let key = self.expr(k)?;
                     let key = self.pin_operand(key, args_may_assign(arguments));
                     if self.hosted && !matches!(&**callee, Expr::Member { optional: true, .. }) {
-                        self.ops.push(Op::RequireObjectCoercible { src: recv });
+                        self.ops.push(Op::RequireObjectCoercible {
+                            src: recv,
+                            key: None,
+                        });
                     }
                     if self.hosted && !self.args_pure(arguments) {
                         return self.method_call_ordered(recv, "", Some(key), arguments);
@@ -19475,6 +19572,7 @@ impl Compiler {
                     dst,
                     callee: callee_reg,
                     args,
+                    name: callee_text(callee),
                 });
                 Ok(dst)
             }
@@ -19578,7 +19676,10 @@ impl Compiler {
                                     let k = self.expr(e)?;
                                     let k = self.pin_operand(k, may_assign(value));
                                     if self.hosted {
-                                        self.ops.push(Op::RequireObjectCoercible { src: obj });
+                                        self.ops.push(Op::RequireObjectCoercible {
+                                            src: obj,
+                                            key: None,
+                                        });
                                         let kc = self.alloc();
                                         self.ops.push(Op::ToKey { dst: kc, src: k });
                                         Some(kc)
@@ -19723,7 +19824,10 @@ impl Compiler {
                                     let kc = if self.hosted {
                                         // GetValue's ToObject(base) throws before
                                         // the key's ToPropertyKey runs.
-                                        self.ops.push(Op::RequireObjectCoercible { src: obj });
+                                        self.ops.push(Op::RequireObjectCoercible {
+                                            src: obj,
+                                            key: None,
+                                        });
                                         let kc = self.alloc();
                                         self.ops.push(Op::ToKey { dst: kc, src: k });
                                         key = Some(kc);
@@ -19786,7 +19890,10 @@ impl Compiler {
                     let (raw, key) = match property {
                         PropertyKey::Computed(e) => {
                             let k = self.expr(e)?;
-                            self.ops.push(Op::RequireObjectCoercible { src: obj });
+                            self.ops.push(Op::RequireObjectCoercible {
+                                src: obj,
+                                key: None,
+                            });
                             let kc = self.alloc();
                             self.ops.push(Op::ToKey { dst: kc, src: k });
                             let dst = self.alloc();
@@ -20083,7 +20190,12 @@ impl Compiler {
                         key,
                         args,
                     },
-                    TagCall::Value(callee) => Op::CallValue { dst, callee, args },
+                    TagCall::Value(callee) => Op::CallValue {
+                        dst,
+                        callee,
+                        args,
+                        name: None,
+                    },
                 });
                 Ok(dst)
             }
@@ -20121,7 +20233,12 @@ impl Compiler {
                     self.ops.push(Op::Call { dst, func, args });
                 } else {
                     let callee = self.expr(tag)?;
-                    self.ops.push(Op::CallValue { dst, callee, args });
+                    self.ops.push(Op::CallValue {
+                        dst,
+                        callee,
+                        args,
+                        name: callee_text(tag),
+                    });
                 }
                 Ok(dst)
             }

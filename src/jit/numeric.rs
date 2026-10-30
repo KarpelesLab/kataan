@@ -1917,7 +1917,7 @@ impl NumGen {
                         a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
                         a.store_rax(disp(dst));
                     }
-                    Op::RequireObjectCoercible { src } => {
+                    Op::RequireObjectCoercible { src, .. } => {
                         if (src as usize) >= self.env.n_regs {
                             return None;
                         }
@@ -2049,7 +2049,7 @@ impl NumGen {
             GenericOp::Interp { pc: opc }
                 if reg.is_some() && matches!(bc, Op::RequireObjectCoercible { .. }) =>
             {
-                let Op::RequireObjectCoercible { src } = *bc else {
+                let Op::RequireObjectCoercible { src, .. } = *bc else {
                     return None;
                 };
                 if (src as usize) >= self.env.n_regs {
@@ -2165,8 +2165,10 @@ impl NumGen {
     /// runs the check, and throws, exactly as the interpreter would
     /// (nothing has happened since: the check has no other effect).
     pub(super) fn roc_folded(&self, pc: usize) -> bool {
-        let (Some(&Op::RequireObjectCoercible { src }), Some(call @ Op::CallMethod { recv, .. })) =
-            (self.bc(pc), self.bc(pc + 1))
+        let (
+            Some(&Op::RequireObjectCoercible { src, .. }),
+            Some(call @ Op::CallMethod { recv, .. }),
+        ) = (self.bc(pc), self.bc(pc + 1))
         else {
             return false;
         };
@@ -3604,7 +3606,7 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
             uses.push(*src);
         }
         Op::Return { src } | Op::CheckTdz { src } | Op::StoreGlobal { src, .. } => uses.push(*src),
-        Op::RequireObjectCoercible { src } => uses.push(*src),
+        Op::RequireObjectCoercible { src, .. } => uses.push(*src),
         Op::GetProp { dst, obj, .. }
         | Op::GetMethod { dst, obj, .. }
         | Op::ArrayLen { dst, arr: obj } => {

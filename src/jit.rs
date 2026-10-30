@@ -2619,7 +2619,9 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                     pc: pc32,
                 }
             }
-            Op::CallValue { dst, callee, args } if args.len() <= 32 => {
+            Op::CallValue {
+                dst, callee, args, ..
+            } if args.len() <= 32 => {
                 let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
                 for a in args {
                     argregs.push(r(*a)?);

@@ -241,7 +241,7 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
                 *r = reg(*r);
             }
         }
-        Op::RequireObjectCoercible { src }
+        Op::RequireObjectCoercible { src, .. }
         | Op::CheckTdz { src }
         | Op::Throw { src }
         | Op::Return { src }
@@ -298,7 +298,9 @@ fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], Option<Reg>)> {
             key,
             args,
         } if key != "caller" => Some((*dst, *recv, args, Some(*recv))),
-        Op::CallValue { dst, callee, args } => Some((*dst, *callee, args, None)),
+        Op::CallValue {
+            dst, callee, args, ..
+        } => Some((*dst, *callee, args, None)),
         Op::CallWithMethod {
             dst,
             callee,
