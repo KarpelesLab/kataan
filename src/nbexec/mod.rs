@@ -2416,7 +2416,7 @@ const PRIM_WRAP_TYPE: &str = "\u{0}primtype";
 /// Marks an ordinary object as an `arguments` exotic object, so
 /// `Object.prototype.toString` reports `[object Arguments]`. (A mapped/sloppy
 /// arguments object additionally carries `ARGS_CALLEE` parameter linkage.)
-const ARGS_MARKER: &str = "\u{0}args";
+pub(crate) const ARGS_MARKER: &str = "\u{0}args";
 /// Hidden slot on a realm's `%Array.prototype%` holding its intrinsic
 /// `%Array.prototype.values%`, the `@@iterator` of every `arguments` object of
 /// that realm (read from here, never from the live `Array` global binding or

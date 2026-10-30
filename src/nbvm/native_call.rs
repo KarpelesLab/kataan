@@ -889,16 +889,19 @@ fn run_op(
                 let list = arg(1);
                 match list.as_handle().map(Handle::from_raw) {
                     None if list.is_undefined() || list.is_null() => alloc::vec::Vec::new(),
-                    Some(l) => {
-                        let elems = realm.array_elements(l)?;
-                        if realm.array_has_index_overrides(l)
-                            || realm.array_length(l) != Some(elems.len())
-                            || elems.iter().any(|e| e.is_hole())
-                        {
-                            return None;
+                    Some(l) => match realm.array_elements(l) {
+                        Some(elems) => {
+                            if realm.array_has_index_overrides(l)
+                                || realm.array_length(l) != Some(elems.len())
+                                || elems.iter().any(|e| e.is_hole())
+                            {
+                                return None;
+                            }
+                            elems.to_vec()
                         }
-                        elems.to_vec()
-                    }
+                        // An unchanged `arguments` object: its own indices.
+                        None => realm.arguments_values(l)?,
+                    },
                     None => return None,
                 }
             };

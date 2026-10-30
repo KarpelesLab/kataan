@@ -4719,8 +4719,11 @@ fn call_with_inner(
                     }
                 }
             };
-            let v = with_host(ctx, |h| h.make_arguments(&args, c, *mapped))
-                .ok_or(VmError::Unsupported)?;
+            let v = match ctx.realm.new_arguments_object(&args, c, *mapped) {
+                Some(h) => NanBox::handle(h.to_raw()),
+                None => with_host(ctx, |h| h.make_arguments(&args, c, *mapped))
+                    .ok_or(VmError::Unsupported)?,
+            };
             if let Some(slot) = regs.get_mut(*dst as usize) {
                 *slot = v;
             }
@@ -10142,6 +10145,12 @@ fn vm_get_elem(
     {
         return Ok(v);
     }
+    // An argument of an unchanged `arguments` object: an own data property.
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && let Some(v) = ctx.realm.arguments_own_get(Handle::from_raw(h), Some(n))
+    {
+        return Ok(v);
+    }
     // An in-range index of a string primitive: an own, non-configurable
     // property nothing can intercept (one interned cell per Latin-1 unit).
     if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
@@ -10352,6 +10361,12 @@ fn vm_set_elem(
 /// code-unit count, else an explicit `length` data property (e.g. a regex match
 /// result). `Err(NotAnObject)` when `recv` is not a heap object.
 fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox, VmError> {
+    // An unchanged `arguments` object's own `length`.
+    if let Some(h) = recv.as_handle()
+        && let Some(v) = ctx.realm.arguments_own_get(Handle::from_raw(h), None)
+    {
+        return Ok(v);
+    }
     // Hosted: a primitive receiver (`null.length` throws a TypeError,
     // `(5).length` reads Number.prototype) is an ordinary `[[Get]]`.
     if ctx.host.is_some() && recv.as_handle().is_none() {

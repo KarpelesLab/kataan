@@ -718,6 +718,9 @@ impl Interp {
                     {
                         if let Some(elems) = self.realm.array_elements(h).map(<[_]>::to_vec) {
                             elems
+                        } else if let Some(elems) = self.realm.arguments_values(h) {
+                            // An unchanged `arguments` object: its own indices.
+                            elems
                         } else {
                             // An array-like: ToLength(Get(O, "length")) fires a
                             // getter (whose abrupt completion propagates) and is

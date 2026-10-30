@@ -23,6 +23,7 @@
 //! [`NanBox`]: crate::nanbox::NanBox
 //! [`Handle`]: crate::heap::Handle
 
+mod args_fast;
 pub(crate) mod builtins_fast;
 pub(crate) mod coll_fast;
 mod coll_index;
@@ -95,6 +96,9 @@ pub struct Realm {
     /// object starts with (see [`Realm::init_builtin_fn_props`]), made on
     /// first use.
     builtin_fn_shape: Option<Rc<Shape>>,
+    /// The layouts of the `arguments` objects [`Realm::new_arguments_object`]
+    /// makes, by `2 * argc + mapped` (see `args_fast`), made on first use.
+    args_shapes: alloc::vec::Vec<Option<Rc<Shape>>>,
     atoms: AtomTable,
     /// The in-flight incremental collection's marker, present only while an
     /// incremental marking cycle is running. The write barrier shades stored
@@ -766,6 +770,7 @@ impl Realm {
             heap,
             root_shape: Shape::root(),
             builtin_fn_shape: None,
+            args_shapes: alloc::vec::Vec::new(),
             atoms: AtomTable::new(),
             incremental: None,
             jit_marking: false,

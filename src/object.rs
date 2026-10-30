@@ -824,6 +824,25 @@ impl Object {
         })
     }
 
+    /// [`with_data`](Self::with_data) with the first `hidden` slots marked
+    /// non-enumerable — what marking each of those keys hidden right after
+    /// adding it leaves (the hidden prefix; no mark lists).
+    #[must_use]
+    pub fn with_data_hidden_prefix(
+        shape: Rc<Shape>,
+        values: &[NanBox],
+        hidden: u32,
+    ) -> Option<Self> {
+        if hidden as usize > values.len() {
+            return None;
+        }
+        let mut o = Self::with_data(shape, values)?;
+        if hidden != 0 {
+            o.extra_mut().hidden_prefix = hidden;
+        }
+        Some(o)
+    }
+
     /// A built-in function's own-property object: `length` then `name`, both
     /// `{ writable: false, enumerable: false, configurable: true }`, the
     /// attributes held by `shape` (a [`Shape::builtin_fn_layout`]) rather
