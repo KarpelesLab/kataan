@@ -245,6 +245,10 @@ pub struct Interp {
     /// (read its own `length`/indexed properties) rather than unwrapped to its
     /// boxed primitive and dispatched as a String/Number/Boolean method.
     array_proto_generic: bool,
+    /// The arrays whose `join`/`toString`/`toLocaleString` is in progress, so a
+    /// cycle (`a = [b]; b = [a]`) renders the revisited array as `""`, as every
+    /// web engine does, instead of recursing natively until the stack overflows.
+    join_stack: Vec<Handle>,
     /// `JSON.stringify`'s per-shape key plans, kept from one call to the next
     /// (a plan depends on the shape alone), so serializing many objects built
     /// alike, one call each, plans each shape once.
@@ -2862,6 +2866,7 @@ impl Interp {
             new_target: NanBox::undefined(),
             reflect_new_target: None,
             array_proto_generic: false,
+            join_stack: Vec::new(),
             json_shape_memo: Vec::new(),
             array_like_present: None,
             wasm_states: alloc::collections::BTreeMap::new(),

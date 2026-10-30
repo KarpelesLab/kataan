@@ -1675,3 +1675,21 @@ fn join_reads_elements_after_user_code_live() {
     "#;
     assert_eq!(run(src), "x,,|a-b-changed|L,,|1,m,new|s,1,proto");
 }
+
+/// A join cycle through more than one array (`a = [b]; b = [a]`) renders the
+/// revisited array as `""`, as a direct self-reference already did, matching
+/// every web engine. Each level is a native-to-native call with no call-depth
+/// guard, so the engine recursed until the native stack overflowed and the
+/// process aborted.
+#[test]
+fn join_cycle_through_several_arrays_renders_empty() {
+    let src = r#"
+        var r = [];
+        var a = [1]; var b = [a]; a.push(b); r.push(String(a), a.join("-"), a.toLocaleString(), String([a]));
+        var n = [1, [2, [3, [4]]]]; n[1][1][1].push(n); r.push(String(n));
+        var s = [1]; s.push(s); r.push(String(s), [s, s].join());
+        var w = [[1, 2], [3]]; r.push(String(w), String([w, w]));
+        r.join("|")
+    "#;
+    assert_eq!(run(src), "1,|1-|1,|1,|1,2,3,4,|1,|1,,1,|1,2,3|1,2,3,1,2,3");
+}

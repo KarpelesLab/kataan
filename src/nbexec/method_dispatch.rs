@@ -64,6 +64,38 @@ impl Interp {
         method: &str,
         args: &[NanBox],
     ) -> Result<Option<NanBox>, ExecError> {
+        // Joining an array runs each element's ToString, which can join an array
+        // already being joined (`a = [b]; b = [a]; String(a)`): that revisit
+        // renders as the empty string — the cycle handling every web engine
+        // shares, and the one a direct self-reference already gets — rather than
+        // recursing native-to-native with no call-depth guard until the native
+        // stack overflows and the process aborts.
+        if matches!(method, "join" | "toString" | "toLocaleString")
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.is_array(h)
+        {
+            if self.join_stack.contains(&h) {
+                return Ok(Some(self.new_str("")));
+            }
+            // A generic `Array.prototype.toString` delegates to `this.join`,
+            // which enters (and guards) this array itself.
+            if !(method == "toString" && self.array_proto_generic) {
+                self.join_stack.push(h);
+                let r = self.call_method_inner(recv, method, args);
+                self.join_stack.pop();
+                return r;
+            }
+        }
+        self.call_method_inner(recv, method, args)
+    }
+
+    /// The body of [`Self::call_method`].
+    fn call_method_inner(
+        &mut self,
+        recv: NanBox,
+        method: &str,
+        args: &[NanBox],
+    ) -> Result<Option<NanBox>, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
 
         // Temporal statics: `Temporal.<Type>.from(...)` / `.compare(...)` — a
