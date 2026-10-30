@@ -1871,3 +1871,30 @@ fn array_builtins_honor_a_length_past_the_dense_store() {
          true ; 0=1,1=2,2=3|4294967295 ; P ; P"
     );
 }
+
+/// A mutator on an array whose `length` is non-writable still performs every
+/// element read, move and delete its algorithm makes before the final
+/// `Set(O, "length", …)` throws: `shift` moved the elements down, `pop`
+/// deleted the last one, and `splice` throws even when the length would not
+/// change (the dense fast paths threw up front, leaving the array untouched,
+/// and `splice` with an unchanged length did not throw at all).
+#[test]
+fn mutators_move_elements_before_a_readonly_length_throws() {
+    let src = r#"
+        function show(a) { var s = []; for (var i = 0; i < a.length; i++) s.push(i in a ? a[i] : "_"); return a.length + "[" + s.join(",") + "]"; }
+        function ro() { var a = [0, 1, 2, 3]; Object.defineProperty(a, "length", { writable: false }); return a; }
+        var r = [];
+        [function (a) { return a.shift(); }, function (a) { return a.pop(); },
+         function (a) { return a.splice(1, 1); }, function (a) { return a.splice(1, 1, 8); },
+         function (a) { return a.splice(0, 0); }].forEach(function (f) {
+            var a = ro(), e = "ok";
+            try { f(a); } catch (x) { e = x.constructor.name; }
+            r.push(e + show(a));
+        });
+        r.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "TypeError4[1,2,3,_] TypeError4[0,1,2,_] TypeError4[0,2,3,_] TypeError4[0,8,2,3] TypeError4[0,1,2,3]"
+    );
+}

@@ -3636,11 +3636,14 @@ impl Interp {
             }
             // `pop`: an inherited getter fires only if the index it reads is a hole.
             let reads_hole = dense_len > 0 && self.realm.array_hole_at(handle, dense_len - 1);
-            if overridden || reads_hole || self.realm.array_length(handle) != Some(dense_len) {
+            // A non-writable `length`: the spec still reads and deletes the last
+            // element before its final `Set(O, "length", …)` throws.
+            if overridden
+                || reads_hole
+                || self.realm.array_length(handle) != Some(dense_len)
+                || self.realm.array_length_is_readonly(handle)
+            {
                 return Ok(Some(self.array_like_mutate(method, handle, args)?));
-            }
-            if self.realm.array_length_is_readonly(handle) {
-                return Err(length_readonly_throw(self));
             }
             return Ok(Some(self.realm.array_pop(handle)));
         }
@@ -3845,11 +3848,10 @@ impl Interp {
                     // `DeletePropertyOrThrow`, then `Set(O, "length", len-1, true)`
                     // (throws on a frozen / non-writable length — evaluated *after*
                     // the getter, which may itself freeze the array).
-                    if precise_array {
+                    // A non-writable `length` still sees the element deleted before
+                    // the final `Set(O, "length", …)` throws.
+                    if precise_array || self.realm.array_length_is_readonly(handle) {
                         return Ok(Some(self.array_like_mutate(method, handle, args)?));
-                    }
-                    if self.realm.array_length_is_readonly(handle) {
-                        return Err(length_readonly_throw(self));
                     }
                     return Ok(Some(self.realm.array_pop(handle)));
                 }
@@ -3859,11 +3861,11 @@ impl Interp {
                     // Precise: read/move each index via `[[Get]]`/`HasProperty`/
                     // `[[Set]]`/`Delete` (inherited getters/setters fire, holes
                     // resolve through the prototype), then `Set(O, "length", …, true)`.
-                    if precise_array {
+                    // A non-writable `length` still sees every element moved down
+                    // and the last deleted before the final `Set(O, "length", …)`
+                    // throws.
+                    if precise_array || self.realm.array_length_is_readonly(handle) {
                         return Ok(Some(self.array_like_mutate(method, handle, args)?));
-                    }
-                    if self.realm.array_length_is_readonly(handle) {
-                        return Err(length_readonly_throw(self));
                     }
                     if elems.is_empty() {
                         return Ok(Some(NanBox::undefined()));
@@ -3904,8 +3906,10 @@ impl Interp {
                     // `DeletePropertyOrThrow`, so a non-writable or non-configurable
                     // index throws instead of being bulk-overwritten, an inherited
                     // accessor fires, and holes are preserved. The dense rewrite
-                    // below is only valid for an ordinary hole-free array.
-                    if precise_array {
+                    // below is only valid for an ordinary hole-free array. A
+                    // non-writable `length` makes the final `Set(O, "length", …)`
+                    // throw (even for an unchanged length) after every move.
+                    if precise_array || self.realm.array_length_is_readonly(handle) {
                         return Ok(Some(self.array_like_mutate(method, handle, args)?));
                     }
                     let len = elems.len();
