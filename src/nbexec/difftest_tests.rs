@@ -2440,3 +2440,25 @@ fn supported_locales_of_agrees_with_resolution() {
         "de-AT,fr,zh-Hant-HK,en-US-u-nu-thai|de-AT,fr,zh-Hant-HK,en-US-u-nu-thai|en-US"
     );
 }
+
+/// `currencySign: "accounting"` parenthesizes a negative amount exactly in the
+/// locales whose CLDR accounting pattern does (nl and en-US do; es, it, pt, ru
+/// and en-DE keep the minus), wherever the minus sits in the standard pattern
+/// (`US$ -1,00` in nl), and format agrees with formatToParts (sv's U+2212).
+#[cfg(feature = "intl")]
+#[test]
+fn accounting_parentheses_follow_the_locale_pattern() {
+    let src = r#"
+        function f(l) {
+            var nf = new Intl.NumberFormat(l, { style: "currency", currency: "USD", currencySign: "accounting" });
+            var s = nf.format(-1.5);
+            var same = s === nf.formatToParts(-1.5).map(function (p) { return p.value; }).join("");
+            return l + ":" + (s.indexOf("(") >= 0 ? "P" : "M") + (same ? "" : "!");
+        }
+        ["en-US", "nl", "es", "es-AR", "it", "pt", "pt-PT", "ru", "en-DE", "en-150", "ja", "sv", "tr", "tr-TR"].map(f).join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "en-US:P nl:P es:M es-AR:P it:M pt:M pt-PT:P ru:M en-DE:M en-150:M ja:P sv:M tr:P tr-TR:M"
+    );
+}

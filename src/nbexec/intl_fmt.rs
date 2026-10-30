@@ -641,18 +641,98 @@ fn intl_decimal_round(
 }
 
 /// Whether a locale renders a negative `currencySign: "accounting"` amount with
-/// parentheses (the CLDR root default, inherited by en/ja/ko/zh and most others)
-/// rather than a leading minus (e.g. de-DE). Approximates the accounting pattern
-/// the `intl` crate does not expose; the minus-sign locales are left to the crate.
+/// parentheses rather than a leading minus. The `intl` crate does not expose
+/// CLDR's accounting patterns, so this is that data reduced to its sign shape:
+/// the languages whose accounting pattern has a parenthesized negative
+/// subpattern, then the regional locales that differ from their language
+/// (en-DE / en-150 keep a minus, es-AR and pt-PT parenthesize). A language
+/// outside both lists keeps the root pattern's parentheses. The minus-sign
+/// locales are left to the crate.
 #[cfg(feature = "intl")]
 fn accounting_uses_parens(locale: &str) -> bool {
-    let lang = locale
-        .split(['-', '_'])
-        .next()
-        .unwrap_or(locale)
-        .to_ascii_lowercase();
-    // Locales known to keep a minus sign in their accounting pattern.
-    !matches!(lang.as_str(), "de" | "nl" | "fi" | "hu" | "et")
+    let mut subtags = locale.split(['-', '_']);
+    let lang = subtags.next().unwrap_or(locale).to_ascii_lowercase();
+    let region = subtags
+        .take_while(|s| s.len() != 1)
+        .find(|s| s.len() == 2 || (s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())))
+        .map(str::to_ascii_uppercase);
+    if let Some(r) = region.as_deref() {
+        let regional_minus: &[&str] = match lang.as_str() {
+            "ar" => &[
+                "BH", "DJ", "EG", "ER", "IL", "IQ", "JO", "KM", "KW", "LB", "MR", "OM", "PS", "QA",
+                "SA", "SD", "SO", "SS", "SY", "TD", "YE",
+            ],
+            "en" => &[
+                "AT", "BE", "CH", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GE", "HU", "IT", "LT",
+                "LV", "MV", "NL", "NO", "PT", "SE", "SI", "SK", "UA", "150",
+            ],
+            "ms" => &["ID"],
+            "tr" => &["TR"],
+            "uz" => &["AF"],
+            "ku" => &["IQ"],
+            _ => &[],
+        };
+        if regional_minus.contains(&r) {
+            return false;
+        }
+        let regional_parens: &[&str] = match lang.as_str() {
+            "es" => &["AR", "DO", "UY"],
+            "pt" => &["AO", "CH", "GQ", "GW", "LU", "MO", "MZ", "PT", "ST", "TL"],
+            _ => &[],
+        };
+        if regional_parens.contains(&r) {
+            return true;
+        }
+    }
+    // Languages whose own accounting pattern keeps the minus sign.
+    !matches!(
+        lang.as_str(),
+        "az" | "be"
+            | "bs"
+            | "cs"
+            | "da"
+            | "de"
+            | "el"
+            | "es"
+            | "fi"
+            | "he"
+            | "hi"
+            | "hr"
+            | "hu"
+            | "hy"
+            | "id"
+            | "is"
+            | "it"
+            | "ka"
+            | "kk"
+            | "ky"
+            | "lo"
+            | "lt"
+            | "lv"
+            | "mk"
+            | "mn"
+            | "my"
+            | "ne"
+            | "pa"
+            | "pt"
+            | "ru"
+            | "sv"
+            | "sw"
+            | "tk"
+            | "uk"
+            | "vi"
+            | "ha"
+            | "ti"
+            | "om"
+            | "rw"
+            | "ln"
+            | "lb"
+            | "mt"
+            | "sd"
+            | "jv"
+            | "su"
+            | "qu"
+    )
 }
 
 /// `WeekdayToString` for `Intl.Locale`'s `firstDayOfWeek`: a weekday name
@@ -8263,6 +8343,22 @@ impl Interp {
     /// except those in [`number_uses_handrolled`](Self::number_uses_handrolled) go through
     /// `intl::number::format` (CLDR, locale-aware, full ECMA-402 options); the rest, and the
     /// no-`intl` build, use the hand-rolled en-US path below.
+    /// Whether `handle` renders a negative amount in parentheses: a currency
+    /// formatter with `currencySign: "accounting"` in a locale whose accounting
+    /// pattern parenthesizes (see [`accounting_uses_parens`]). Other styles
+    /// ignore `currencySign`.
+    #[cfg(feature = "intl")]
+    fn accounting_parenthesizes(&self, handle: Handle, locale: &str) -> bool {
+        let slot = |k: &str| {
+            self.realm
+                .get_property(handle, k)
+                .map(|v| self.realm.to_display_string(v))
+        };
+        slot(islot!("currencySign")).as_deref() == Some("accounting")
+            && slot(islot!("style")).as_deref() == Some("currency")
+            && accounting_uses_parens(locale)
+    }
+
     pub(crate) fn intl_format_number(&mut self, handle: Handle, n: f64) -> String {
         // `roundingPriority` more/lessPrecision selects between the significant-
         // and fraction-digit results — an interplay the crate can't express.
@@ -8777,17 +8873,16 @@ impl Interp {
         // locales inherit the root's parenthesized form (`($5.00)`), but some
         // (e.g. de-DE: `-987,00 $`) keep the minus. The intl crate has no
         // currencySign field, so approximate the parenthesizing locales here and
-        // leave the minus-locales on the crate's output.
-        if accounting_uses_parens(&locale)
-            && formatted.starts_with('-')
-            && self
-                .realm
-                .get_property(handle, islot!("currencySign"))
-                .map(|v| self.realm.to_display_string(v))
-                .as_deref()
-                == Some("accounting")
-        {
-            return alloc::format!("({})", &formatted[1..]);
+        // leave the minus-locales on the crate's output. The minus may follow the
+        // currency (`US$ -1,00` in nl) or carry bidi marks the crate fuses into
+        // its minusSign part, so this renders exactly what formatToParts does
+        // (where that part becomes the parentheses), and the two agree.
+        if formatted.contains(['-', '\u{2212}']) && self.accounting_parenthesizes(handle, &locale) {
+            return self
+                .number_handle_parts(handle, NanBox::number(n))
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect();
         }
         formatted
     }
@@ -9772,15 +9867,8 @@ impl Interp {
         // `currencySign: "accounting"` parenthesizes a negative amount in the
         // parenthesizing locales (see `accounting_uses_parens`): the minusSign
         // part becomes a leading `literal "("` and a trailing `literal ")"`.
-        let accounting = self
-            .realm
-            .get_property(handle, islot!("currencySign"))
-            .map(|v| self.realm.to_display_string(v))
-            .as_deref()
-            == Some("accounting");
-        if accounting
-            && accounting_uses_parens(&locale)
-            && parts.iter().any(|(t, _)| *t == "minusSign")
+        if parts.iter().any(|(t, _)| *t == "minusSign")
+            && self.accounting_parenthesizes(handle, &locale)
         {
             parts.retain(|(t, _)| *t != "minusSign");
             parts.insert(0, ("literal", String::from("(")));
