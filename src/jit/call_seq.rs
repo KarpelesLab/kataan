@@ -906,10 +906,6 @@ pub(crate) fn emit_handler_entry(a: &mut X64Assembler, helper: u64, inner: Label
 /// `rbp`'s register number.
 const RBP: u8 = 5;
 
-/// `(bits & HANDLE_TAG) == HANDLE_TAG` iff `bits` is a heap handle (the sign
-/// and quiet-NaN bits both set).
-const HANDLE_TAG: u64 = 0xfffc_0000_0000_0000;
-
 /// One call site's emission inputs (see `emit_call`).
 pub(crate) struct CallEmit<'a> {
     /// The register the result goes to.
@@ -1302,8 +1298,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_dec_mem(r::R9, l.total_depth);
     // 8. The outcome: a throw, falling off the end (`undefined`), or a value.
     let store = a.new_label();
-    a.g_movabs(r::R11, NanBox::jit_throw_bits());
-    a.g_cmp(r::RAX, r::R11);
+    a.p_cmp_throw_rax();
     a.g_jcc(cc::E, e.throw_exit);
     if let CalleeSrc::Construct {
         scratch,
@@ -1319,19 +1314,15 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         let this = a.new_label();
         let check = a.new_label();
         let have = a.new_label();
-        a.g_movabs(r::R11, HANDLE_TAG);
-        a.g_mov(r::RCX, r::RAX);
-        a.g_and(r::RCX, r::R11);
-        a.g_cmp(r::RCX, r::R11);
-        a.g_jcc(cc::NE, this);
+        a.p_cmp_handle_floor(r::RAX);
+        a.g_jcc(cc::B, this);
         a.bind(check);
         a.g_mov(r::RDI, r::R15);
         a.g_mov(r::RSI, r::RAX);
         a.g_load(r::RDX, RBP, scratch);
         a.g_movabs(r::RAX, result);
         a.call_rax();
-        a.g_movabs(r::R11, NanBox::jit_throw_bits());
-        a.g_cmp(r::RAX, r::R11);
+        a.p_cmp_throw_rax();
         a.g_jcc(cc::E, e.throw_exit);
         a.jmp(have);
         a.bind(this);
@@ -1431,6 +1422,11 @@ pub(crate) struct InlineEmit<'a> {
     /// the receiver-cache way the fresh object fills.
     pub new_alloc: Option<u64>,
     pub new_way: Option<RecvWay>,
+    /// Where the guard's `JumpIfFalse` would branch, when the emitter fuses
+    /// that test into the guard (it emits nothing for it): a miss then
+    /// jumps there itself, out of line, and a hit falls through into the
+    /// inlined body. `dst` is written either way.
+    pub fused_miss: Option<Label>,
 }
 
 /// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
@@ -1595,9 +1591,16 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.g_movabs(r::RAX, NanBox::boolean(true).to_bits());
     a.g_store(r::RBX, reg(e.dst), r::RAX);
     a.jmp(done);
+    // (Fused: the miss is out of line and takes the test's branch itself;
+    // the jump over it is dropped once it is.)
+    let cold = e.fused_miss.map(|_| a.cold_begin());
     a.bind(miss);
     a.g_movabs(r::RAX, NanBox::boolean(false).to_bits());
     a.g_store(r::RBX, reg(e.dst), r::RAX);
+    if let (Some(to), Some(cold)) = (e.fused_miss, cold) {
+        a.jmp(to);
+        a.cold_end(cold);
+    }
     a.bind(done);
     Some(())
 }

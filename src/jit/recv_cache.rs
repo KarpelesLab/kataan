@@ -140,6 +140,114 @@ pub(super) fn fresh_inits(
     out
 }
 
+/// One `SetProp` of a **fresh-object add chain** ([`fresh_adds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FreshAdd {
+    /// The inlined `new`'s guard that allocated the receiver (whose
+    /// receiver-cache way it filled).
+    pub(super) guard: usize,
+    /// How many adds of the chain come before this one.
+    pub(super) k: u32,
+    /// The chain's previous add, if any.
+    pub(super) prev: Option<usize>,
+}
+
+/// The `SetProp`s that may add to the object an inlined `new`'s guard has
+/// just allocated (`this`, see `call_seq::emit_inline_new_this`) while
+/// nothing but the chain's own earlier `SetProp`s on it can have touched it:
+/// from the guard on, with no branch target in between (so every path to
+/// such a site came through the guard's success), every op naming `this` is
+/// a `SetProp` on it storing another register. The plan is static only;
+/// what holds at run time is the emitter's to check (see
+/// `X64Assembler::p_add_fresh`): that the guard's way still holds the
+/// object (no call — so no Rust code — since the allocation, and every
+/// earlier add of the chain took its fast path, whose other paths empty
+/// the way).
+pub(super) fn fresh_adds(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    osr_entries: &[usize],
+    catch_targets: &[usize],
+) -> Vec<Option<FreshAdd>> {
+    let n = ops.len();
+    let target = branch_targets(ops, osr_entries, catch_targets);
+    let mut out = vec![None; n];
+    // (guard, this register, adds so far, last add)
+    let mut cur: Option<(usize, u16, u32, Option<usize>)> = None;
+    for (i, op) in ops.iter().enumerate() {
+        if target[i] {
+            cur = None;
+        }
+        if let GenericOp::InlineGuard {
+            call, caps, n_caps, ..
+        } = *op
+        {
+            cur = match ops.get(call as usize) {
+                Some(GenericOp::Construct { .. }) => n_caps
+                    .checked_sub(1)
+                    .and_then(|k| caps.checked_add(k))
+                    .map(|t| (i, t, 0, None)),
+                _ => None,
+            };
+            continue;
+        }
+        let Some((g, t, k, prev)) = cur else {
+            continue;
+        };
+        if let GenericOp::SetProp { obj, val, .. } = *op
+            && obj == t
+            && val != t
+        {
+            out[i] = Some(FreshAdd { guard: g, k, prev });
+            cur = Some((g, t, k + 1, Some(i)));
+            continue;
+        }
+        let names_t = core::cell::Cell::new(false);
+        match bytecode.get(i) {
+            Some(b) => crate::bytecode::op_for_each_reg(b, &|r| {
+                if r == t {
+                    names_t.set(true);
+                }
+            }),
+            None => names_t.set(true),
+        }
+        if names_t.get() || matches!(op, GenericOp::Interp { .. } | GenericOp::PushHandler { .. }) {
+            cur = None;
+        }
+    }
+    out
+}
+
+/// Which `JumpIfFalse`s an inlined call's guard just before takes over
+/// (`call_seq::InlineEmit::fused_miss`): the guard's own test of its result,
+/// branching forward, that nothing else reaches (no branch to it, not an
+/// entry) and that is no receiver-cache site (`plain(i)`: its truthiness
+/// test fills no way). Its guard then branches on a miss itself and falls
+/// into the inlined body on a hit, so the test is emitted as nothing.
+pub(super) fn fused_guard_tests(
+    ops: &[GenericOp],
+    osr_entries: &[usize],
+    catch_targets: &[usize],
+    plain: impl Fn(usize) -> bool,
+) -> Vec<bool> {
+    let n = ops.len();
+    let target = branch_targets(ops, osr_entries, catch_targets);
+    let mut out = vec![false; n];
+    for i in 1..n {
+        if let (GenericOp::InlineGuard { dst, .. }, GenericOp::JumpIfFalse { cond, target: t }) =
+            (&ops[i - 1], &ops[i])
+            && cond == dst
+            && *t > i
+            && *t <= n
+            && !target[i]
+            && plain(i)
+        {
+            out[i] = true;
+        }
+    }
+    out
+}
+
 /// Which op indices (up to `ops.len()`) are branch targets or entries.
 fn branch_targets(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[usize]) -> Vec<bool> {
     let n = ops.len();

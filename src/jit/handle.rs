@@ -58,23 +58,61 @@ pub(crate) fn handle_audit() -> bool {
 
 impl X64Assembler {
     /// To `miss` unless `rax` holds a heap handle (all of `HANDLE_TAG`'s
-    /// bits, the top 14), via `scratch` (`rcx` or `r9`), which it clobbers.
+    /// bits, the top 14). `scratch` (`rcx` or `r9`) is kept for the callers'
+    /// sake: the test clobbers no register (see
+    /// [`p_cmp_handle_floor`](Self::p_cmp_handle_floor)).
     pub(crate) fn p_is_handle(&mut self, scratch: u8, miss: Label) {
-        const _: () = assert!(crate::nanbox::NanBox::handle(0).to_bits() == !0u64 << 50);
         debug_assert!(scratch == r::RCX || scratch == r::R9);
-        let b = (scratch >> 3) & 1;
-        let s = scratch & 7;
-        // mov scratch, rax
-        self.code.extend_from_slice(&[0x48 | b, 0x89, 0xc0 | s]);
-        // shr scratch, 50
-        self.code.extend_from_slice(&[0x48 | b, 0xc1, 0xe8 | s, 50]);
-        // cmp scratch32, 0x3fff
-        if b != 0 {
-            self.code.push(0x41);
-        }
+        self.p_cmp_handle_floor(r::RAX);
+        self.g_jcc(super::call_seq::cc::B, miss);
+    }
+
+    /// `cmp reg, [rip + floor]`, `floor` the code's constant
+    /// `NanBox::handle(0)` word (placed by `finish`): a value has all of the
+    /// top 14 bits that make a heap handle exactly when it is, unsigned, at
+    /// least that word — so the flags then say "handle" as `AE` and "not a
+    /// handle" as `B`. Two instructions where the shift-and-compare took four,
+    /// and no scratch register.
+    pub(crate) fn p_cmp_handle_floor(&mut self, reg: u8) {
+        const _: () = assert!(crate::nanbox::NanBox::handle(0).to_bits() == !0u64 << 50);
+        self.p_rip_floor(0x3b, reg);
+    }
+
+    /// `or rax, [rip + floor]`: the index-and-generation bits in `rax` made a
+    /// `NanBox` heap handle (`NanBox::handle`), with no scratch register.
+    pub(crate) fn p_or_handle_tag_rax(&mut self) {
+        self.p_rip_floor(0x0b, r::RAX);
+    }
+
+    /// `cmp rax, [rip + c]`, `c` the throw sentinel's bits
+    /// (`NanBox::jit_throw_bits`): `E` exactly when a helper or callee
+    /// returned it. No scratch register (a `movabs` fewer than comparing
+    /// with a register).
+    pub(crate) fn p_cmp_throw_rax(&mut self) {
+        self.p_rip_const(0x3b, r::RAX, crate::nanbox::NanBox::jit_throw_bits());
+    }
+
+    /// `REX.W op reg, [rip + floor]` (see [`p_cmp_handle_floor`](Self::p_cmp_handle_floor)).
+    fn p_rip_floor(&mut self, op: u8, reg: u8) {
+        self.p_rip_const(op, reg, crate::nanbox::NanBox::handle(0).to_bits());
+    }
+
+    /// `REX.W op reg, [rip + c]` (an `op r64, r/m64` opcode), `c` a constant
+    /// word with the value `value`, which `finish` places after the code.
+    fn p_rip_const(&mut self, op: u8, reg: u8, value: u64) {
+        let c = match self.consts.iter().find(|c| c.0 == value) {
+            Some(&(_, l)) => l,
+            None => {
+                let l = self.new_label();
+                self.consts.push((value, l));
+                l
+            }
+        };
+        // REX.W (+R) op /r, ModRM mod=00 rm=101: [rip + disp32]. The disp32
+        // ends the instruction, so it resolves as a jump's `rel32` does.
         self.code
-            .extend_from_slice(&[0x81, 0xf8 | s, 0xff, 0x3f, 0x00, 0x00]);
-        self.jne(miss);
+            .extend_from_slice(&[0x48 | (((reg >> 3) & 1) << 2), op, 0x05 | ((reg & 7) << 3)]);
+        self.emit_rel32(c);
     }
 
     /// The walk of a **rooted** handle (see the module docs): from the
@@ -185,13 +223,54 @@ mod tests {
         let mut a = X64Assembler::new();
         let miss = a.new_label();
         a.p_is_handle(r::R9, miss);
+        a.bind(miss);
+        a.ret();
+        let code = a.finish();
+        // cmp rax, [rip + floor]; jb miss; ret; (int3 padding;) the floor.
+        assert_eq!(&code[..3], &[0x48, 0x3b, 0x05]);
+        assert_eq!(&code[7..9], &[0x0f, 0x82]);
+        assert_eq!(code[13], 0xc3);
+        let floor = code.len() - 8;
+        assert!(floor.is_multiple_of(8));
+        let rel = i32::from_le_bytes([code[3], code[4], code[5], code[6]]);
+        assert_eq!(7 + rel as usize, floor);
         assert_eq!(
-            &a.code()[..14],
-            &[
-                0x49, 0x89, 0xc1, // mov r9, rax
-                0x49, 0xc1, 0xe9, 50, // shr r9, 50
-                0x41, 0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00, // cmp r9d, 0x3fff
-            ]
+            u64::from_le_bytes(code[floor..].try_into().unwrap()),
+            crate::nanbox::NanBox::handle(0).to_bits()
         );
+    }
+
+    /// The floor compare classifies exactly the heap handles (run natively).
+    #[test]
+    fn floor_compare_classifies_handles() {
+        use crate::nanbox::NanBox;
+        let mut a = X64Assembler::new();
+        let no = a.new_label();
+        // fn(rdi) -> 1 if handle else 0
+        a.code.extend_from_slice(&[0x48, 0x89, 0xf8]); // mov rax, rdi
+        a.p_is_handle(r::RCX, no);
+        a.code.extend_from_slice(&[0xb8, 1, 0, 0, 0]); // mov eax, 1
+        a.ret();
+        a.bind(no);
+        a.code.extend_from_slice(&[0x31, 0xc0]); // xor eax, eax
+        a.ret();
+        let Some(f) = super::super::JitFunction::from_code(&a.finish()) else {
+            return;
+        };
+        let call = |bits: u64| f.call_args(&[bits.cast_signed()]) != 0;
+        for (bits, want) in [
+            (NanBox::handle(0).to_bits(), true),
+            (NanBox::handle(0x1234_0000_0042).to_bits(), true),
+            (u64::MAX, true),
+            (NanBox::undefined().to_bits(), false),
+            (NanBox::null().to_bits(), false),
+            (NanBox::boolean(true).to_bits(), false),
+            (NanBox::number(-1.5).to_bits(), false),
+            (f64::NEG_INFINITY.to_bits(), false),
+            (NanBox::handle(0).to_bits() - 1, false),
+            (0, false),
+        ] {
+            assert_eq!(call(bits), want, "{bits:#x}");
+        }
     }
 }

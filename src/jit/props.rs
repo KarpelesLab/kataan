@@ -1410,6 +1410,60 @@ impl X64Assembler {
         self.p_inc32_mem(r::RCX, p.off_epoch);
     }
 
+    /// [`Self::p_add_baked`] for a **fresh** object (`rcx` its heap slot): one
+    /// an inlined `new`'s guard allocated (`p_alloc_object`: ordinary, flags
+    /// byte zero, no `extra` part, young, with no incremental marking
+    /// running) to which no Rust code has run since and nothing but the
+    /// fast paths of this chain's earlier adds has been done
+    /// (`recv_cache::fresh_adds`, which the caller checks dynamically too).
+    /// So the flags, the `extra` part and the write barrier need no test
+    /// (a young container with no marking running needs nothing from it);
+    /// the shape is compared only for the chain's `first` add (the root
+    /// shape the allocation gave it), each later one taking the shape its
+    /// predecessor left (the caller checks `b.from` is that one's `to`).
+    /// What may have changed since the allocation is checked as there: the
+    /// dictionary threshold, and the prototype chain by the site's add entry
+    /// ([`Self::p_add_chain`]). Then the add is made; otherwise to `miss`,
+    /// having changed nothing. Clobbers `rax`, `rsi`, `r8`, `r9`, `r11`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn p_add_fresh(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        site: *const MethodSite,
+        b: BakedAdd,
+        first: bool,
+        val_disp: i32,
+        miss: Label,
+    ) {
+        const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
+        assert!(b.slot < INLINE, "a fresh add's slot is inline");
+        let p = &l.props;
+        let slot = i32::try_from(b.slot).expect("a small slot");
+        if first {
+            self.g_movabs(r::R11, b.from);
+            self.g_cmp_mem(r::R11, r::RCX, l.off_shape);
+            self.g_jcc(cc::NE, miss);
+        }
+        // Below the dictionary threshold.
+        self.g_load(r::R8, r::R15, realm_off);
+        self.g_load(r::R8, r::R8, p.dict_threshold);
+        self.g_cmp_imm(r::R8, slot);
+        self.g_jcc(cc::BE, miss);
+        self.g_movabs(r::R11, site as u64);
+        self.p_add_chain(l, miss);
+        // Commit: the value, the count, the shape, the key epoch.
+        self.g_load(r::R8, r::RBX, val_disp);
+        self.g_store(r::RCX, l.off_inline + 8 * slot, r::R8);
+        self.p_inc16_mem(r::RCX, l.off_slots_len);
+        self.g_movabs(r::R9, b.to);
+        self.g_inc_mem(r::R9, p.rc_strong);
+        self.g_movabs(r::R8, b.from);
+        self.g_dec_mem(r::R8, p.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::R9);
+        self.p_inc32_mem(r::RCX, p.off_epoch);
+    }
+
     /// The prototype-chain half of [`MethodSite`]'s add-cache hit
     /// ([`Self::p_add_prop_inline`]) for the object whose heap slot is `rcx`,
     /// with `r11` = the site: each of the entry's `depth` prototype levels is
@@ -1993,11 +2047,7 @@ impl X64Assembler {
         self.bind(walk);
         // A heap handle has all of `HANDLE_TAG`'s bits (the top 14).
         const _: () = assert!(HANDLE_TAG == !0u64 << 50);
-        self.g_mov(r::RCX, r::RAX);
-        self.code.extend_from_slice(&[0x48, 0xc1, 0xe9, 50]); // shr rcx, 50
-        self.code
-            .extend_from_slice(&[0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00]); // cmp ecx, 0x3fff
-        self.jne(other);
+        self.p_is_handle(r::RCX, other);
         self.g_mov(r::R9, r::RAX);
         self.p_arena(realm_off, &l.props);
         self.g_mov(r::RAX, r::R9);
@@ -2051,7 +2101,6 @@ impl X64Assembler {
     /// `miss`, having changed nothing. Keeps `rsi`; clobbers `rax`, `rcx`,
     /// `rdx`, `r9`, `r11`.
     pub(crate) fn p_alloc_object(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
-        const INLINE: i32 = crate::object::INLINE_SLOTS as i32;
         let p = &l.props;
         self.g_load(r::R9, r::R15, realm_off);
         self.g_cmp_byte_imm(r::R9, p.marking, 0);
@@ -2081,10 +2130,8 @@ impl X64Assembler {
         self.g_store(r::RCX, l.off_shape, r::R11);
         self.g_store(r::RCX, p.off_proto, r::RSI);
         self.g_store_imm32(r::RCX, p.off_extra, 0);
-        self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
-        for i in 0..INLINE {
-            self.g_store(r::RCX, l.off_inline + 8 * i, r::R11);
-        }
+        // (No inline value: entries past the slot count are never read or
+        // traced, `Object`'s docs.)
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
         self.p_store_rcx_imm(1, p.off_slot_age, 0);
@@ -2092,8 +2139,7 @@ impl X64Assembler {
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
-        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
-        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+        self.p_or_handle_tag_rax();
     }
 
     /// Inline [`Realm::new_object_in_shape`](crate::realm::Realm) for an
@@ -2171,12 +2217,8 @@ impl X64Assembler {
             self.load_rax(d);
             self.g_store(r::RCX, l.off_inline + 8 * i as i32, r::RAX);
         }
-        if vals.len() < INLINE {
-            self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
-            for i in vals.len()..INLINE {
-                self.g_store(r::RCX, l.off_inline + 8 * i as i32, r::R11);
-            }
-        }
+        // (The inline entries past the values are never read or traced,
+        // `Object`'s docs: left as they are.)
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
         self.p_store_rcx_imm(1, p.off_slot_age, 0);
@@ -2184,8 +2226,7 @@ impl X64Assembler {
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
-        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
-        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+        self.p_or_handle_tag_rax();
     }
 
     /// Inline [`Realm::new_array_from_slice`](crate::realm::Realm) of the
@@ -2256,8 +2297,7 @@ impl X64Assembler {
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
-        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
-        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+        self.p_or_handle_tag_rax();
     }
 
     /// Inline [`Realm::new_box`](crate::realm::Realm::new_box) when the heap
@@ -2296,8 +2336,7 @@ impl X64Assembler {
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
-        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
-        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+        self.p_or_handle_tag_rax();
     }
 
     /// Inline [`Realm::new_vm_function_from`](crate::realm::Realm) of VM
@@ -2367,8 +2406,7 @@ impl X64Assembler {
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
-        self.g_movabs(r::R11, crate::nanbox::NanBox::handle(0).to_bits());
-        self.code.extend_from_slice(&[0x4c, 0x09, 0xd8]); // or rax, r11
+        self.p_or_handle_tag_rax();
     }
 
     /// The call sequence's callee identification, inline (what

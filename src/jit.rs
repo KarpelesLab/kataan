@@ -4302,6 +4302,15 @@ pub struct X64Assembler {
     /// Whether a back-edge poll's countdown decrement was emitted
     /// ([`dec_frame8`](Self::dec_frame8)).
     polls: bool,
+    /// The code's constant words (each once) and their labels, which
+    /// [`finish`](Self::finish) places after all the code: what
+    /// `rip`-relative operands read (`handle::p_rip_const`), such as the
+    /// least heap handle's bits for a two-instruction handle test.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    consts: Vec<(u64, Label)>,
 }
 
 /// A run of code [`X64Assembler::cold_end`] cut out of the main stream: its
@@ -4490,6 +4499,17 @@ impl X64Assembler {
             }
             for (at, label) in chunk.fixups {
                 self.fixups.push((base + at, label));
+            }
+        }
+        // The constant words (data, after the last instruction: nothing
+        // falls through into them), 8-byte aligned within the code.
+        if !self.consts.is_empty() {
+            while !self.code.len().is_multiple_of(8) {
+                self.code.push(0xcc); // int3
+            }
+            for (value, label) in core::mem::take(&mut self.consts) {
+                self.labels[label.0] = self.code.len();
+                self.code.extend_from_slice(&value.to_le_bytes());
             }
         }
         for (at, label) in core::mem::take(&mut self.fixups) {
@@ -5362,10 +5382,8 @@ impl X64Assembler {
         let heap = self.new_label();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         {
-            self.mov_rcx_rax();
-            self.raw(&[0x48, 0xc1, 0xe9, 50]); // shr rcx, 50
-            self.raw(&[0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00]); // cmp ecx, 0x3fff
-            self.je(heap);
+            self.p_cmp_handle_floor(call_seq::r::RAX);
+            self.g_jcc(call_seq::cc::AE, heap);
         }
         // is_number(v) == (v & QNAN) != QNAN — test on a copy, keeping v in rax.
         self.movabs_r11(qnan as i64);
@@ -6269,10 +6287,11 @@ impl JitFunction {
         }
         // `is_number(bits) == (bits & QNAN) != QNAN`.
         const QNAN: u64 = 0x7ffc_0000_0000_0000;
-        // A heap handle is `SIGN | QNAN | payload`, so `(bits & HANDLE_TAG) ==
-        // HANDLE_TAG` iff `bits` is a handle (both the sign and the QNAN pattern
-        // set; a number clears QNAN bits, every other tag clears SIGN).
-        const HANDLE_TAG: u64 = 0x8000_0000_0000_0000 | QNAN;
+        // A heap handle is `SIGN | QNAN | payload`: both the sign and the QNAN
+        // pattern set (a number clears QNAN bits, every other tag clears
+        // SIGN), i.e. the value is at least `NanBox::handle(0)`, unsigned
+        // (`handle::p_cmp_handle_floor`).
+        const _: () = assert!(0x8000_0000_0000_0000 | QNAN == !0u64 << 50);
         // The back-edge poll countdown slot (`[rbp-24]`) and how many iterations a
         // poll covers when no agent is scheduling (the helper returns the reload).
         const COUNTDOWN: i8 = -24;
@@ -6373,6 +6392,15 @@ impl JitFunction {
         let shape_ways: Vec<usize> = (0..rc.ways).filter(|&w| way_shape[w].is_some()).collect();
         // The `InitProp`s of a fresh literal (`recv_cache::fresh_inits`).
         let fresh_init = recv_cache::fresh_inits(ops, bytecode, osr_entries, &catch_targets);
+        // The adds to a just-allocated `this` (`recv_cache::fresh_adds`), and
+        // per op the shape a fresh add's fast path left its object in.
+        let fresh_add = recv_cache::fresh_adds(ops, bytecode, osr_entries, &catch_targets);
+        let mut fresh_to: Vec<Option<u64>> = alloc::vec![None; ops.len()];
+        // The inlined calls' `JumpIfFalse`s the guard fuses (see
+        // `call_seq::InlineEmit::fused_miss`): emitted as nothing.
+        let fused_test = recv_cache::fused_guard_tests(ops, osr_entries, &catch_targets, |i| {
+            rc.sites[i].is_none()
+        });
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
         let rc_key = |w: usize| rc_base - 8 * (3 * w as i32 + 1);
         let rc_cell = |w: usize| rc_base - 8 * (3 * w as i32 + 2);
@@ -6552,8 +6580,7 @@ impl JitFunction {
         // exception). Emitted after every throwing helper call.
         macro_rules! throw_check {
             () => {{
-                a.movabs_r11(NanBox::jit_throw_bits() as i64);
-                a.cmp_rax_r11();
+                a.p_cmp_throw_rax();
                 a.je(throw_exit);
             }};
         }
@@ -7105,6 +7132,14 @@ impl JitFunction {
                             new_target,
                             new_alloc,
                             new_way,
+                            fused_miss: match ops.get(op_idx + 1) {
+                                Some(&GenericOp::JumpIfFalse { target, .. })
+                                    if fused_test.get(op_idx + 1) == Some(&true) =>
+                                {
+                                    Some(num.branch_label(&labels, op_idx + 1, target)?)
+                                }
+                                _ => None,
+                            },
                         },
                     )?;
                     inline_stubs.push((stub, argv.clone(), new_target));
@@ -7565,10 +7600,8 @@ impl JitFunction {
                     let slow = a.new_label();
                     let done = a.new_label();
                     a.load_rax(disp(src));
-                    a.movabs_r11(HANDLE_TAG as i64);
-                    a.and_rax_r11();
-                    a.cmp_rax_r11();
-                    a.je(slow); // a handle value needs the write barrier
+                    a.p_cmp_handle_floor(call_seq::r::RAX);
+                    a.g_jcc(call_seq::cc::AE, slow); // a handle value needs the write barrier
                     recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
                     a.p_array_plain(&layout, helpers.call_layout.realm, true, slow);
                     int_index!(index, slow);
@@ -8268,6 +8301,47 @@ impl JitFunction {
                     let s = sites.get(site as usize)?;
                     let helper = a.new_label();
                     let done = a.new_label();
+                    // An add to the object an inlined `new` just allocated
+                    // (`recv_cache::fresh_adds`), while its guard's way still
+                    // holds it: no call since the allocation, and the
+                    // chain's earlier adds all took this fast path (every
+                    // other path below empties the way). Everything else is
+                    // the ordinary store just below.
+                    let fresh = fresh_add[op_idx].and_then(|f| {
+                        let b = s.add?;
+                        let g = rc.sites[f.guard]?;
+                        let ok = !num.in_region(op_idx)
+                            && s.baked.is_none()
+                            && !s.method_ptr.is_null()
+                            && b.slot < crate::object::INLINE_SLOTS as u32
+                            && g.family == recv_cache::Family::Obj
+                            && !shape_ways.contains(&g.way)
+                            && match f.prev {
+                                None => f.k == 0,
+                                Some(q) => fresh_to[q] == Some(b.from),
+                            };
+                        ok.then_some((b, g.way, f.k == 0))
+                    });
+                    let fresh_done = a.new_label();
+                    if let Some((b, w, first)) = fresh {
+                        let regular = a.new_label();
+                        a.load_rax(disp(obj));
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(w));
+                        a.jne(regular);
+                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(w));
+                        a.p_add_fresh(
+                            &layout,
+                            helpers.call_layout.realm,
+                            s.method_ptr,
+                            b,
+                            first,
+                            disp(val),
+                            regular,
+                        );
+                        a.jmp(fresh_done);
+                        a.bind(regular);
+                        fresh_to[op_idx] = Some(b.to);
+                    }
                     // The in-place store's shape miss, its object walked and
                     // its store guards passed: maybe an add.
                     let shape_miss = a.new_label();
@@ -8531,6 +8605,12 @@ impl JitFunction {
                         a.cold_end(mark);
                     }
                     a.bind(stored);
+                    // Off a fresh add's fast path: the chain's later adds
+                    // must not take theirs.
+                    if let Some((_, w, _)) = fresh {
+                        a.store_empty(rc_key(w));
+                    }
+                    a.bind(fresh_done);
                 }
                 GenericOp::GetElem { dst, obj, index } => {
                     if !ok(dst) || !ok(obj) || !ok(index) {
@@ -8908,6 +8988,9 @@ impl JitFunction {
                     }
                     a.jmp(num.branch_label(&labels, op_idx, target)?);
                 }
+                // Fused into the inlined call's guard just before: its miss
+                // took this branch, its hit falls through.
+                GenericOp::JumpIfFalse { .. } if fused_test[op_idx] => {}
                 GenericOp::JumpIfFalse { cond, target } => {
                     if !ok(cond) || target > ops.len() {
                         return None;
@@ -9097,10 +9180,8 @@ impl JitFunction {
                         }
                         // A heap value (a String among them): the interpreter's.
                         a.load_rax(disp(r));
-                        a.movabs_r11(HANDLE_TAG as i64);
-                        a.and_rax_r11();
-                        a.cmp_rax_r11();
-                        a.je(slow);
+                        a.p_cmp_handle_floor(call_seq::r::RAX);
+                        a.g_jcc(call_seq::cc::AE, slow);
                     }
                     a.movabs_rax(tag_true as i64);
                     a.store_rax(disp(dst));
