@@ -70,8 +70,26 @@ use alloc::vec::Vec;
 const MAX_CALLEE_OPS: usize = 40;
 /// The most callee registers inlined.
 const MAX_CALLEE_REGS: usize = 48;
+/// The largest callee body inlined once it has inlined calls of its own
+/// (in ops; the callee itself is at most [`MAX_CALLEE_OPS`]).
+const MAX_SPLICED_OPS: usize = 100;
+/// The most registers of such a body.
+const MAX_SPLICED_REGS: usize = 96;
+
+/// The op and register limits of an inlined body (`spliced`: one that
+/// inlined calls of its own).
+const fn limits(spliced: bool) -> (usize, usize) {
+    if spliced {
+        (MAX_SPLICED_OPS, MAX_SPLICED_REGS)
+    } else {
+        (MAX_CALLEE_OPS, MAX_CALLEE_REGS)
+    }
+}
+
 /// The most ops inlining may add to one caller.
 const MAX_ADDED_OPS: usize = 600;
+/// The most callees one polymorphic site inlines (`Op::InlineGuard::poly`).
+const MAX_WAYS: usize = 3;
 
 /// A callee to inline at a call site, as the caller's compiler is told it.
 pub struct Candidate<'a> {
@@ -106,13 +124,16 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
     let inner = (!nested.is_empty())
         .then(|| {
             expand(proto, &warm, &|pc, _| {
-                let (_, n) = nested.iter().find(|(p, _)| *p == pc)?;
-                Some(Candidate {
-                    key: n.key,
-                    proto: n.proto,
-                    warm: n.warm.clone(),
-                    nested: Vec::new(),
-                })
+                nested
+                    .iter()
+                    .filter(|(p, _)| *p == pc)
+                    .map(|(_, n)| Candidate {
+                        key: n.key,
+                        proto: n.proto,
+                        warm: n.warm.clone(),
+                        nested: Vec::new(),
+                    })
+                    .collect()
             })
         })
         .flatten();
@@ -155,13 +176,21 @@ pub struct Expanded {
 /// than by its return or a throw.
 #[must_use]
 pub fn callee_ok(proto: &FnProto) -> bool {
+    callee_ok_sized(proto, false)
+}
+
+/// [`callee_ok`], for a callee body that inlined calls of its own when
+/// `spliced` (see [`Candidate::nested`]; the function itself was small
+/// enough, and its inlined calls may add up to [`MAX_SPLICED_OPS`]).
+fn callee_ok_sized(proto: &FnProto, spliced: bool) -> bool {
+    let (max_ops, max_regs) = limits(spliced);
     if proto.class_ctor
         || proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
         || proto.ops.is_empty()
-        || proto.ops.len() > MAX_CALLEE_OPS
-        || proto.n_regs > MAX_CALLEE_REGS
+        || proto.ops.len() > max_ops
+        || proto.n_regs > max_regs
         || proto.n_params + proto.n_captures >= proto.n_regs
     {
         return false;
@@ -185,13 +214,19 @@ pub fn callee_ok(proto: &FnProto) -> bool {
 /// is otherwise what [`callee_ok`] accepts.
 #[must_use]
 pub fn construct_ok(proto: &FnProto) -> bool {
+    construct_ok_sized(proto, false)
+}
+
+/// [`construct_ok`] as [`callee_ok_sized`] is [`callee_ok`].
+fn construct_ok_sized(proto: &FnProto, spliced: bool) -> bool {
+    let (max_ops, max_regs) = limits(spliced);
     if proto.derived
         || proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
         || proto.ops.is_empty()
-        || proto.ops.len() > MAX_CALLEE_OPS
-        || proto.n_regs > MAX_CALLEE_REGS
+        || proto.ops.len() > max_ops
+        || proto.n_regs > max_regs
         || proto.n_params + proto.n_captures >= proto.n_regs
     {
         return false;
@@ -205,6 +240,30 @@ pub fn construct_ok(proto: &FnProto) -> bool {
             let mut o = op.clone();
             remap(&mut o, &|r| r, &|t| t)
         }
+    })
+}
+
+/// Whether every call op in `p` (a callee body, maybe with calls of its own
+/// spliced in) is the fallback of one of its inlined calls' guards: run as
+/// guarded, it makes no call.
+fn calls_only_inlined(p: &FnProto) -> bool {
+    let fallbacks: Vec<usize> = p
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::InlineGuard { call, .. } => Some(*call),
+            _ => None,
+        })
+        .collect();
+    p.ops.iter().enumerate().all(|(pc, o)| {
+        !matches!(
+            o,
+            Op::CallMethod { .. }
+                | Op::CallValue { .. }
+                | Op::CallWithMethod { .. }
+                | Op::CallKey { .. }
+                | Op::Construct { .. }
+        ) || fallbacks.contains(&pc)
     })
 }
 
@@ -470,10 +529,10 @@ fn split_call_key(op: &Op, m: Reg) -> Option<(Op, Op)> {
 pub fn expand<'a>(
     proto: &FnProto,
     warm: &[Option<WarmEntry>],
-    pick: &dyn Fn(usize, &Op) -> Option<Candidate<'a>>,
+    pick: &dyn Fn(usize, &Op) -> Vec<Candidate<'a>>,
 ) -> Option<Expanded> {
     let base = proto.n_regs;
-    let mut sites: Vec<(usize, Site<'a>)> = Vec::new();
+    let mut sites: Vec<(usize, Vec<Site<'a>>)> = Vec::new();
     let mut added = 0usize;
     let mut window = 0usize;
     for (pc, op) in proto.ops.iter().enumerate() {
@@ -498,23 +557,53 @@ pub fn expand<'a>(
         {
             continue;
         }
-        let Some(c) = pick(pc, op) else { continue };
-        let c = site_body(c);
-        let ok = if matches!(op, Op::Construct { .. }) {
-            construct_ok(&c.proto)
-        } else {
-            callee_ok(&c.proto)
-        };
-        if !ok || (c.key >> 32) as usize != c.proto.n_captures {
+        let cands = pick(pc, op);
+        // A polymorphic site's ways: a call of a method or of a value
+        // (whose later guards reuse the callee the first found, or read
+        // its register again).
+        let poly_ok = matches!(
+            op,
+            Op::CallMethod { .. }
+                | Op::CallValue { .. }
+                | Op::CallWithMethod { .. }
+                | Op::CallKey { .. }
+        );
+        if cands.len() > 1 && !poly_ok {
             continue;
         }
-        let cost = c.proto.ops.len() + c.proto.n_regs + 6;
-        if added + cost > MAX_ADDED_OPS {
-            continue;
+        let mut ways: Vec<Site<'a>> = Vec::new();
+        let poly = cands.len() > 1;
+        for c in cands.into_iter().take(MAX_WAYS) {
+            let c = site_body(c);
+            // A polymorphic site's way inlines only a body that calls
+            // nothing but through its own inlined calls' guards (an inner
+            // call's activation pushes cost about what the call saved).
+            if poly && !calls_only_inlined(&c.proto) {
+                continue;
+            }
+            let spliced = matches!(c.proto, alloc::borrow::Cow::Owned(_));
+            let ok = if matches!(op, Op::Construct { .. }) {
+                construct_ok_sized(&c.proto, spliced)
+            } else {
+                callee_ok_sized(&c.proto, spliced)
+            };
+            if !ok
+                || (c.key >> 32) as usize != c.proto.n_captures
+                || ways.iter().any(|w| w.key == c.key)
+            {
+                continue;
+            }
+            let cost = c.proto.ops.len() + c.proto.n_regs + 6;
+            if added + cost > MAX_ADDED_OPS {
+                continue;
+            }
+            added += cost;
+            window = window.max(c.proto.n_regs + 1 + usize::from(split.is_some()));
+            ways.push(c);
         }
-        added += cost;
-        window = window.max(c.proto.n_regs + 1 + usize::from(split.is_some()));
-        sites.push((pc, c));
+        if !ways.is_empty() {
+            sites.push((pc, ways));
+        }
     }
     if sites.is_empty() || base + window > 0xffff {
         return None;
@@ -532,10 +621,12 @@ pub fn expand<'a>(
     for pc in 0..proto.ops.len() {
         new_of.push(u32::try_from(next).ok()?);
         if si < sites.len() && sites[si].0 == pc {
-            next += block_len(
-                &sites[si].1.proto,
-                matches!(proto.ops[pc], Op::Construct { .. }),
-            ) + 1;
+            next += sites[si]
+                .1
+                .iter()
+                .map(|c| block_len(&c.proto, matches!(proto.ops[pc], Op::Construct { .. })))
+                .sum::<usize>()
+                + 1;
             if matches!(proto.ops[pc], Op::CallKey { .. }) {
                 next += 1;
             }
@@ -550,14 +641,16 @@ pub fn expand<'a>(
     for (pc, op) in proto.ops.iter().enumerate() {
         let w = warm.get(pc).cloned().flatten();
         if si < sites.len() && sites[si].0 == pc {
-            let c = &sites[si].1;
+            let site_ways = &sites[si].1;
             si += 1;
             // A `new`: the guard also allocates `this`, into the register
             // after the captures (the callee's `this` slot).
             let construct = matches!(op, Op::Construct { .. });
-            let p: &FnProto = &c.proto;
             let rb = |r: Reg| -> Reg { (base + r as usize) as Reg };
-            let split = split_call_key(op, rb((p.n_regs + 1) as Reg));
+            // (A computed-key call's method register is above every way's
+            // window.)
+            let top = site_ways.iter().map(|c| c.proto.n_regs).max().unwrap_or(0);
+            let split = split_call_key(op, rb((top + 1) as Reg));
             let mut w = w;
             let op = match split {
                 Some((read, call)) => {
@@ -573,129 +666,148 @@ pub fn expand<'a>(
             };
             let op = &*op;
             let (dst, callee, args, this) = call_parts(op)?;
-            let g = ops.len();
-            let tmp = rb(p.n_regs as Reg);
-            let fallback = g + block_len(p, construct);
+            // The ways' blocks in a row, then the call op itself.
+            let fallback = ops.len()
+                + site_ways
+                    .iter()
+                    .map(|c| block_len(&c.proto, construct))
+                    .sum::<usize>();
             let end = fallback + 1;
-            let leave = fallback - 2;
-            macro_rules! emit {
-                ($o:expr, $w:expr, $ops:expr $(,)?) => {{
-                    $ops.push($o);
-                    nwarm.push($w);
-                    orig_of.push(u32::MAX);
-                }};
-            }
-            emit!(
-                Op::InlineGuard {
-                    dst: tmp,
-                    call: fallback,
-                    key: c.key,
-                    callee,
-                    args: args.to_vec(),
-                    caps: rb(p.n_params as Reg),
-                    n_caps: (p.n_captures + usize::from(construct)) as u16,
-                },
-                None,
-                ops
-            );
-            // The guard's own pc is the call's (an entry, a branch to it).
-            *orig_of.last_mut()? = u32::try_from(pc).ok()?;
-            emit!(
-                Op::JumpIfFalse {
-                    cond: tmp,
-                    target: fallback,
-                },
-                None,
-                ops
-            );
-            // The register window, as `call_with_inner` lays it out — the
-            // registers the body may read before writing them (the others'
-            // values are never seen).
-            let this_slot = p.n_params + p.n_captures;
-            for r in window_regs(p, construct) {
-                if construct && r == this_slot {
-                    continue;
+            let n_ways = site_ways.len();
+            for (way, c) in site_ways.iter().enumerate() {
+                let p: &FnProto = &c.proto;
+                let g = ops.len();
+                let tmp = rb(p.n_regs as Reg);
+                let next_way = g + block_len(p, construct);
+                let leave = next_way - 2;
+                macro_rules! emit {
+                    ($o:expr, $w:expr, $ops:expr $(,)?) => {{
+                        $ops.push($o);
+                        nwarm.push($w);
+                        orig_of.push(u32::MAX);
+                    }};
                 }
-                let o = if r < p.n_params {
-                    match args.get(r) {
-                        Some(&a) => Op::Move {
-                            dst: rb(r as Reg),
-                            src: a,
+                emit!(
+                    Op::InlineGuard {
+                        dst: tmp,
+                        call: fallback,
+                        key: c.key,
+                        callee,
+                        args: args.to_vec(),
+                        caps: rb(p.n_params as Reg),
+                        n_caps: (p.n_captures + usize::from(construct)) as u16,
+                        poly: if n_ways > 1 {
+                            (way | n_ways << 8) as u16
+                        } else {
+                            0
                         },
-                        None => Op::LoadConst {
+                    },
+                    None,
+                    ops
+                );
+                // The first guard's own pc is the call's (an entry, a branch to
+                // it).
+                if way == 0 {
+                    *orig_of.last_mut()? = u32::try_from(pc).ok()?;
+                }
+                emit!(
+                    Op::JumpIfFalse {
+                        cond: tmp,
+                        target: next_way,
+                    },
+                    None,
+                    ops
+                );
+                // The register window, as `call_with_inner` lays it out — the
+                // registers the body may read before writing them (the others'
+                // values are never seen).
+                let this_slot = p.n_params + p.n_captures;
+                for r in window_regs(p, construct) {
+                    if construct && r == this_slot {
+                        continue;
+                    }
+                    let o = if r < p.n_params {
+                        match args.get(r) {
+                            Some(&a) => Op::Move {
+                                dst: rb(r as Reg),
+                                src: a,
+                            },
+                            None => Op::LoadConst {
+                                dst: rb(r as Reg),
+                                value: undefined,
+                            },
+                        }
+                    } else if let Some(t) = this.filter(|_| r == this_slot) {
+                        Op::Move {
+                            dst: rb(r as Reg),
+                            src: t,
+                        }
+                    } else {
+                        Op::LoadConst {
                             dst: rb(r as Reg),
                             value: undefined,
-                        },
-                    }
-                } else if let Some(t) = this.filter(|_| r == this_slot) {
-                    Op::Move {
-                        dst: rb(r as Reg),
-                        src: t,
-                    }
-                } else {
-                    Op::LoadConst {
-                        dst: rb(r as Reg),
-                        value: undefined,
-                    }
-                };
-                emit!(o, None, ops);
-            }
-            // The body: callee pc `j` at `body + body_pc(p, j)`.
-            let body = ops.len();
-            let tgt = |t: usize| body + body_pc(p, t, construct);
-            for (j, bop) in p.ops.iter().enumerate() {
-                let bw = c.warm.get(j).cloned().flatten();
-                match width(p, j, construct) {
-                    0 => continue,
-                    w if matches!(bop, Op::Return { .. }) => {
-                        let Op::Return { src } = bop else {
-                            return None;
-                        };
-                        // `return r`: the call's result, then (but from the
-                        // last op) to the end.
-                        emit!(Op::Move { dst, src: rb(*src) }, None, ops,);
-                        if w == 2 {
-                            emit!(Op::Jump { target: leave }, None, ops);
                         }
-                    }
-                    // `new.target`: the constructor (see `construct_ok`).
-                    _ if construct && let Op::LoadNewTarget { dst: d } = bop => {
-                        emit!(
-                            Op::Move {
-                                dst: rb(*d),
-                                src: callee,
-                            },
-                            None,
-                            ops
-                        );
-                    }
-                    _ => {
-                        let mut o = bop.clone();
-                        if !remap(&mut o, &rb, &tgt) {
-                            return None;
+                    };
+                    emit!(o, None, ops);
+                }
+                // The body: callee pc `j` at `body + body_pc(p, j)`.
+                let body = ops.len();
+                let tgt = |t: usize| body + body_pc(p, t, construct);
+                for (j, bop) in p.ops.iter().enumerate() {
+                    let bw = c.warm.get(j).cloned().flatten();
+                    match width(p, j, construct) {
+                        0 => continue,
+                        w if matches!(bop, Op::Return { .. }) => {
+                            let Op::Return { src } = bop else {
+                                return None;
+                            };
+                            // `return r`: the call's result, then (but from the
+                            // last op) to the end.
+                            emit!(Op::Move { dst, src: rb(*src) }, None, ops,);
+                            if w == 2 {
+                                emit!(Op::Jump { target: leave }, None, ops);
+                            }
                         }
-                        emit!(o, bw, ops);
+                        // `new.target`: the constructor (see `construct_ok`).
+                        _ if construct && let Op::LoadNewTarget { dst: d } = bop => {
+                            emit!(
+                                Op::Move {
+                                    dst: rb(*d),
+                                    src: callee,
+                                },
+                                None,
+                                ops
+                            );
+                        }
+                        _ => {
+                            let mut o = bop.clone();
+                            if !remap(&mut o, &rb, &tgt) {
+                                return None;
+                            }
+                            emit!(o, bw, ops);
+                        }
                     }
                 }
+                if falls_off(p) {
+                    // A constructor's end yields `this`, a function's `undefined`.
+                    let o = if construct {
+                        Op::Move {
+                            dst,
+                            src: rb(this_slot as Reg),
+                        }
+                    } else {
+                        Op::LoadConst {
+                            dst,
+                            value: undefined,
+                        }
+                    };
+                    emit!(o, None, ops);
+                }
+                debug_assert_eq!(ops.len(), leave);
+                emit!(Op::InlineLeave, None, ops);
+                emit!(Op::Jump { target: end }, None, ops);
+                debug_assert_eq!(ops.len(), next_way);
             }
-            if falls_off(p) {
-                // A constructor's end yields `this`, a function's `undefined`.
-                let o = if construct {
-                    Op::Move {
-                        dst,
-                        src: rb(this_slot as Reg),
-                    }
-                } else {
-                    Op::LoadConst {
-                        dst,
-                        value: undefined,
-                    }
-                };
-                emit!(o, None, ops);
-            }
-            debug_assert_eq!(ops.len(), leave);
-            emit!(Op::InlineLeave, None, ops);
-            emit!(Op::Jump { target: end }, None, ops);
             debug_assert_eq!(ops.len(), fallback);
             // The call itself, with its warm cache.
             ops.push(op.clone());

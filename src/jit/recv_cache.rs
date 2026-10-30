@@ -539,9 +539,15 @@ pub(super) fn plan(
         // speculative loop, where a later site may take the way as filled
         // without comparing (`known`) while a guard's miss goes on in the
         // loop without filling it.
+        // (A polymorphic site's later way takes the first way's callee
+        // value and looks nothing up.)
         GenericOp::InlineGuard {
-            call, caps, n_caps, ..
-        } if !in_spec(i) => match ops.get(call as usize)? {
+            call,
+            caps,
+            n_caps,
+            poly,
+            ..
+        } if !in_spec(i) && poly & 0xff == 0 => match ops.get(call as usize)? {
             GenericOp::CallMethod { recv: r, .. } | GenericOp::GetProp { obj: r, .. } => {
                 Some((*r, Family::Obj))
             }

@@ -3249,19 +3249,43 @@ pub(super) fn cold_call_pcs(
         .collect()
 }
 
-/// The callee function `caller`'s call site at pc `pc` inlines, if any: the
-/// one VM function its feedback `hints` names, with that function's warm
-/// inline caches (its compiled body's, else its interpreter's) and the
-/// callees of its own call sites (by its own feedback: its compiled
-/// body's, else its interpreter's), which its spliced body inlines in turn.
-/// Whether it can be inlined at all is `crate::jit::inline`'s to decide.
+/// The callee functions `caller`'s call site at pc `pc` inlines: the VM
+/// functions its feedback `hints` names (one, or each of a polymorphic
+/// site's), each with its warm inline caches (its compiled body's, else its
+/// interpreter's) and the callees of its own call sites (by its own
+/// feedback: its compiled body's, else its interpreter's), which its spliced
+/// body inlines in turn. Whether they can be inlined at all is
+/// `crate::jit::inline`'s to decide.
 pub(super) fn inline_candidate<'a>(
     funcs: &'a [FnProto],
     caller: usize,
     hints: &[crate::ic::CalleeHint],
     pc: usize,
-) -> Option<crate::jit::inline::Candidate<'a>> {
-    let mut c = inline_candidate_leaf(funcs, caller, hints, pc)?;
+) -> alloc::vec::Vec<crate::jit::inline::Candidate<'a>> {
+    let keys: alloc::vec::Vec<u64> = match hints.get(pc) {
+        Some(&crate::ic::CalleeHint::One(key)) => alloc::vec![key],
+        Some(h) => h
+            .poly_fns()
+            .into_iter()
+            .filter_map(|f| {
+                let p = funcs.get(f as usize)?;
+                Some(u64::from(f) | ((p.n_captures as u64) << 32))
+            })
+            .collect(),
+        None => alloc::vec::Vec::new(),
+    };
+    keys.into_iter()
+        .filter_map(|k| inline_candidate_one(funcs, caller, k))
+        .collect()
+}
+
+/// [`inline_candidate`] for the callee key `key`.
+fn inline_candidate_one(
+    funcs: &[FnProto],
+    caller: usize,
+    key: u64,
+) -> Option<crate::jit::inline::Candidate<'_>> {
+    let mut c = inline_candidate_key(funcs, caller, key)?;
     let fid = (c.key & 0xffff_ffff) as usize;
     let proto = c.proto;
     let mut own = match proto.tier.jit() {
@@ -3279,7 +3303,10 @@ pub(super) fn inline_candidate<'a>(
     }
     c.nested = (0..proto.ops.len())
         .filter_map(|p| {
-            let n = inline_candidate_leaf(funcs, fid, &own, p)?;
+            let crate::ic::CalleeHint::One(k) = *own.get(p)? else {
+                return None;
+            };
+            let n = inline_candidate_key(funcs, fid, k)?;
             // (Not the outer caller again: its body is being compiled.)
             ((n.key & 0xffff_ffff) as usize != caller).then_some((p, n))
         })
@@ -3287,16 +3314,12 @@ pub(super) fn inline_candidate<'a>(
     Some(c)
 }
 
-/// [`inline_candidate`] without the callee's own inlined calls.
-fn inline_candidate_leaf<'a>(
-    funcs: &'a [FnProto],
+/// [`inline_candidate_one`] without the callee's own inlined calls.
+fn inline_candidate_key(
+    funcs: &[FnProto],
     caller: usize,
-    hints: &[crate::ic::CalleeHint],
-    pc: usize,
-) -> Option<crate::jit::inline::Candidate<'a>> {
-    let crate::ic::CalleeHint::One(key) = *hints.get(pc)? else {
-        return None;
-    };
+    key: u64,
+) -> Option<crate::jit::inline::Candidate<'_>> {
     let fid = (key & 0xffff_ffff) as usize;
     if fid == caller || !inline_enabled() {
         return None;

@@ -403,6 +403,24 @@ struct MethodEntry {
     levels: [ChainLevel; CHAIN_MAX],
 }
 
+/// [`MethodEntry`]'s field offsets, for an inlined call's guard memo
+/// (`call_seq::GuardMemo`), which revalidates the entry a lookup last hit.
+pub(crate) mod entry_off {
+    use super::{ChainLevel, MethodEntry};
+    use core::mem::offset_of;
+    /// `recv_shape` (the shape word; `0` while empty).
+    pub(crate) const SHAPE: i32 = offset_of!(MethodEntry, recv_shape) as i32;
+    /// `acc` (a `u32`).
+    pub(crate) const ACC: i32 = offset_of!(MethodEntry, acc) as i32;
+    /// `stamp`.
+    pub(crate) const STAMP: i32 = offset_of!(MethodEntry, stamp) as i32;
+    /// `value` (the holder's value address, or `0`).
+    pub(crate) const VALUE: i32 = offset_of!(MethodEntry, value) as i32;
+    /// `levels[0].handle` (the receiver's recorded `[[Prototype]]`).
+    pub(crate) const PROTO: i32 =
+        (offset_of!(MethodEntry, levels) + offset_of!(ChainLevel, handle)) as i32;
+}
+
 /// A property site's prototype-chain caches. For a method call, read by
 /// compiled code (see `X64Assembler::p_method_lookup`): up to
 /// `METHOD_WAYS` entries (`MethodEntry`), replaced round-robin. For a
@@ -724,7 +742,7 @@ impl X64Assembler {
     }
 
     /// `cmp dword [base+disp32], imm8` (sign-extended).
-    fn p_cmp32_imm8(&mut self, base: u8, disp: i32, imm: i8) {
+    pub(crate) fn p_cmp32_imm8(&mut self, base: u8, disp: i32, imm: i8) {
         debug_assert!(base & 7 != 4, "no SIB form");
         if base >= 8 {
             self.code.push(0x41);
@@ -871,7 +889,10 @@ impl X64Assembler {
     }
 
     /// The rest of a method lookup, from the walked receiver's slot in `rcx`
-    /// and the arena in `r10` / `rdx`.
+    /// and the arena in `r10` / `rdx`. On a hit, `r11` is the entry that hit
+    /// and `rsi` is nonzero exactly when the value came through the entry's
+    /// recorded holder address (`MethodEntry::value`, at a prototype level:
+    /// what `call_seq::GuardMemo` can revalidate).
     fn p_method_lookup_from(
         &mut self,
         l: &JitLayout,
@@ -944,6 +965,7 @@ impl X64Assembler {
         self.p_load32(r::RAX, r::R11, i(offset_of!(MethodEntry, slot)));
         self.p_obj_slot_addr(l, r::R9, next);
         self.g_load(r::RAX, r::R9, 0);
+        self.g_movabs(r::RSI, 0);
         self.jmp(done);
         // The getter: entry `acc - 1` of the holder's accessor list.
         self.bind(accessor);
@@ -959,6 +981,7 @@ impl X64Assembler {
             self.g_load(r::R9, r::R9, l.props.extra_acc_ptr);
             self.p_add_rax_r9();
             self.g_load(r::RAX, r::RAX, l.props.acc_getter);
+            self.g_movabs(r::RSI, 0);
             self.jmp(getter);
         } else {
             self.jmp(next);

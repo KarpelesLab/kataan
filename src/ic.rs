@@ -52,8 +52,9 @@ pub struct PropertyCache {
 }
 
 /// What a call site has called: nothing yet, always the one VM function
-/// whose id and capture count are the key (`id | n_captures << 32`), or more
-/// than one.
+/// whose id and capture count are the key (`id | n_captures << 32`), a few
+/// VM functions (a polymorphic site, `task.run()` over several classes), or
+/// more than that.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CalleeHint {
     /// No VM closure called yet.
@@ -61,8 +62,60 @@ pub enum CalleeHint {
     None,
     /// Always this key.
     One(u64),
-    /// Several.
+    /// Two or three VM functions, by function id in the order first seen
+    /// (unused entries [`CalleeHint::NO_FN`]); their keys' capture counts
+    /// are the functions' own (a guard compares the whole key anyway).
+    Poly([u32; 3]),
+    /// More than [`CalleeHint::Poly`] keeps, or not only VM functions.
     Mixed,
+}
+
+impl CalleeHint {
+    /// An unused [`CalleeHint::Poly`] entry.
+    pub const NO_FN: u32 = u32::MAX;
+
+    /// The hint after the site also called the VM closure with key `key`.
+    #[must_use]
+    pub fn with(self, key: u64) -> Self {
+        let fid = key as u32;
+        match self {
+            Self::None => Self::One(key),
+            Self::One(k) if k == key => self,
+            Self::One(k) if k as u32 == fid || fid == Self::NO_FN || k as u32 == Self::NO_FN => {
+                Self::Mixed
+            }
+            Self::One(k) => Self::Poly([k as u32, fid, Self::NO_FN]),
+            Self::Poly(mut f) => {
+                if f.contains(&fid) {
+                    return self;
+                }
+                match f.iter_mut().find(|x| **x == Self::NO_FN) {
+                    Some(x) => {
+                        *x = fid;
+                        Self::Poly(f)
+                    }
+                    None => Self::Mixed,
+                }
+            }
+            Self::Mixed => Self::Mixed,
+        }
+    }
+
+    /// The hint of a site that called exactly the closures `keys` (in that
+    /// order, without repeats).
+    #[must_use]
+    pub fn of_keys(keys: &[u64]) -> Self {
+        keys.iter().fold(Self::None, |h, &k| h.with(k))
+    }
+
+    /// The function ids of a [`CalleeHint::Poly`] (empty for any other).
+    #[must_use]
+    pub fn poly_fns(&self) -> alloc::vec::Vec<u32> {
+        match self {
+            Self::Poly(f) => f.iter().copied().filter(|&x| x != Self::NO_FN).collect(),
+            _ => alloc::vec::Vec::new(),
+        }
+    }
 }
 
 /// How many times a site's [`ChainCache`] may be (re)armed.
@@ -194,11 +247,7 @@ impl PropertyCache {
     /// Records that the call site called the VM closure with key `key`
     /// (see [`CalleeHint`]).
     pub fn note_callee(&mut self, key: u64) {
-        self.callee = match self.callee {
-            CalleeHint::None => CalleeHint::One(key),
-            CalleeHint::One(k) if k == key => CalleeHint::One(k),
-            _ => CalleeHint::Mixed,
-        };
+        self.callee = self.callee.with(key);
     }
 
     /// The call site's callee feedback (see [`CalleeHint`]).

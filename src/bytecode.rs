@@ -1421,6 +1421,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             args,
             caps,
             n_caps,
+            poly,
         } => {
             w_u8(163, out);
             w_reg(*dst, out);
@@ -1431,6 +1432,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_regs(args, out);
             w_reg(*caps, out);
             w_u16(*n_caps, out);
+            w_u16(*poly, out);
         }
         Op::InlineLeave => w_u8(164, out),
         Op::LoadGlobal { dst, name, .. } => {
@@ -2729,6 +2731,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             args: r.regs()?,
             caps: r.reg()?,
             n_caps: r.u16()?,
+            poly: r.u16()?,
         },
         164 => Op::InlineLeave,
         161 => Op::Concat {

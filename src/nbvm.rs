@@ -798,6 +798,11 @@ pub enum Op {
     /// the call's would be — then its captured values are in `caps..caps +
     /// n_caps`. The interpreter never inlines: it writes `false`, and the
     /// `JumpIfFalse` after the guard takes the call itself.
+    ///
+    /// A polymorphic site inlines up to three callees, one guard each, in a
+    /// row before the call op: `poly` is the way's index (low byte) and the
+    /// site's number of ways (high byte; `0` for a monomorphic site). A
+    /// later way's guard reuses the callee value the first way's found.
     InlineGuard {
         dst: Reg,
         call: usize,
@@ -806,6 +811,7 @@ pub enum Op {
         args: Vec<Reg>,
         caps: Reg,
         n_caps: u16,
+        poly: u16,
     },
     /// The end of an inlined activation (see [`Op::InlineGuard`]): what the
     /// call's return does to the call bookkeeping. Nothing in the interpreter,

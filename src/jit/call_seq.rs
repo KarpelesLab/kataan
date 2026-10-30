@@ -182,6 +182,53 @@ pub struct CallSite {
     /// A `f.call(…)` method site's proof that the method is
     /// `%Function.prototype.call%` (see [`FnCallMemo`]).
     pub fncall: FnCallMemo,
+    /// The identity memos of a polymorphic inlined site's later ways (its
+    /// first way's is `ident`), as `ident` is for a monomorphic one (see
+    /// `InlineEmit::memo`).
+    pub poly: [IdentMemo; 2],
+    /// An inlined method call's guard memos, one per way (see
+    /// `GuardMemo`).
+    pub guard: [GuardMemo; 3],
+}
+
+/// An inlined method call's guard memo: the method lookup that last
+/// identified way `w`'s callee — the site's `props::MethodSite` entry
+/// `entry` that hit, at a prototype level through its recorded holder
+/// address — and the callee value it found (`bits`, its captures at `caps`),
+/// at prototype epoch `stamp`.
+///
+/// While the epoch is still `stamp` and the entry's own stamp (the entry
+/// was not revalidated since, nor replaced by one of another stamp), a
+/// receiver with the entry's shape and `[[Prototype]]` and no accessors
+/// finds the method at the entry's holder address (exactly the entry's
+/// compiled check: `X64Assembler::p_method_lookup`); a value there equal to
+/// `bits` is the callee the memo identified, its captures at `caps` (as
+/// [`IdentMemo`]). So the guard skips both the lookup and the identification.
+/// The entry is read live, so a replaced entry is compared as it now is.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GuardMemo {
+    /// The `MethodEntry`'s address, or null.
+    pub entry: u64,
+    /// The callee's `NanBox` bits.
+    pub bits: u64,
+    /// Its captured values.
+    pub caps: u64,
+    /// The prototype epoch at which it was identified.
+    pub stamp: u64,
+}
+
+impl GuardMemo {
+    /// An empty memo.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            entry: 0,
+            bits: 0,
+            caps: 0,
+            stamp: 0,
+        }
+    }
 }
 
 /// A method-call site `f.call(thisArg, …args)`'s proof, filled by the call
@@ -358,6 +405,9 @@ impl CallSite {
     pub const EMPTY: u64 = u64::MAX - 1;
     /// Callees a site remembers.
     pub const WAYS: usize = 4;
+    /// The later ways' identity memos of a polymorphic inlined site
+    /// ([`CallSite::poly`]).
+    pub const POLY_MEMOS: usize = 2;
 
     /// An empty cache.
     #[must_use]
@@ -374,6 +424,8 @@ impl CallSite {
             ident: IdentMemo::empty(),
             construct: super::props::ConstructCache::new(),
             fncall: FnCallMemo::empty(),
+            poly: [IdentMemo::empty(); 2],
+            guard: [GuardMemo::empty(); 3],
         }
     }
 
@@ -1161,6 +1213,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.bind(decode);
         cold
     };
+    a.dbg_mark("c-callee");
     // 1. Which function is the callee? (rax = key, rdx = captures)
     // `load_callee(reg)` reloads its value into `reg` afterwards.
     let (callee_base, callee_disp, cold) = match e.callee {
@@ -1349,6 +1402,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // (In an inlined body: its activation, if still pending, is pushed
     // first — the callee's header goes above it. Preserves every register.)
     a.inline_frame_hook();
+    a.dbg_mark("c-limits");
     // 2. The activation may make native calls (`ACT_OK`), one realm, and
     //    room under the depth limit.
     emit_limit_checks(a, l, e.slow);
@@ -1360,6 +1414,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_add_mem(r::RAX, r::R11, SITE_FRAME);
     a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
     a.g_jcc(cc::A, e.slow);
+    a.dbg_mark("c-header");
     // 4. The header and the arguments.
     a.g_load(r::RDX, r::R10, STACK_FRAMES);
     a.g_store(r::RCX, 0, r::RDX);
@@ -1382,6 +1437,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     a.g_store(r::R10, STACK_FRAMES, r::RCX);
     a.g_store(r::R10, STACK_TOP, r::RAX);
     a.g_inc_mem(r::R9, l.total_depth);
+    a.dbg_mark("c-entry");
     // 6. entry(ctx, window, argc, argv, caps, this), `ctx` in `r15`.
     a.g_movabs(r::RDX, argc as u64);
     a.g_lea(r::RCX, r::RCX, hdr(FRAME_HEADER)?);
@@ -1393,6 +1449,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // (No inline frame hook: it ran at `identified`, and nothing since
     // called.)
     a.g_call_mem_unhooked(r::R11, SITE_CODE);
+    a.dbg_mark("c-pop");
     // 7. Pop the activation (the callee restored everything it changed).
     a.g_load(r::R10, r::R15, l.stack);
     a.g_load(r::RCX, r::R10, STACK_FRAMES);
@@ -1578,6 +1635,15 @@ pub(crate) struct InlineEmit<'a> {
     /// jumps there itself, out of line, and a hit falls through into the
     /// inlined body. `dst` is written either way.
     pub fused_miss: Option<Label>,
+    /// A polymorphic site's way (`Op::InlineGuard::poly`: the index in the
+    /// low byte, the number of ways in the high one, `0` when monomorphic).
+    /// Each way memoizes its own callee value (way 0 in `ident`, the others
+    /// in [`CallSite::poly`]), and a value one of the later ways' memos
+    /// holds is a miss for the earlier ones without identifying it. The
+    /// first way leaves the callee value it found in `slots.callee` (on a
+    /// lookup miss, `undefined`, which no way identifies); the later ways
+    /// take it from there ([`CalleeSrc::Frame`]).
+    pub poly: u16,
 }
 
 /// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
@@ -1622,19 +1688,36 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     let hdr = |i: usize| i32::try_from(i * 8).ok();
     let argc = e.args.len();
     let jl = super::compute_jit_layout();
-    let ident = offset_of!(CallSite, ident);
+    let (way, ways) = (usize::from(e.poly & 0xff), usize::from(e.poly >> 8));
+    let memo_of = |w: usize| {
+        if w == 0 {
+            offset_of!(CallSite, ident)
+        } else {
+            offset_of!(CallSite, poly) + (w - 1) * core::mem::size_of::<IdentMemo>()
+        }
+    };
+    if ways > 1 + CallSite::POLY_MEMOS || way >= ways.max(1) {
+        return None;
+    }
+    let ident = memo_of(way);
     let memo_key = site_off(ident + offset_of!(IdentMemo, key));
     let memo_stamp = site_off(ident + offset_of!(IdentMemo, stamp));
     let memo_caps = site_off(ident + offset_of!(IdentMemo, value));
     let miss = a.new_label();
+    // (A polymorphic site's first way leaves `undefined` for the later
+    // ways when its lookup misses.)
+    let chain_first = ways > 1 && way == 0 && matches!(e.callee, CalleeSrc::Method { .. });
+    let lookup_miss = if chain_first { a.new_label() } else { miss };
     let done = a.new_label();
     let identified = a.new_label();
     // 1. The callee value, into the `callee` slot (and rax).
     match e.callee {
         CalleeSrc::Reg(c) => a.g_load(r::RAX, r::RBX, reg(c)),
+        // A later way's: the value the first way's guard found.
+        CalleeSrc::Frame { scratch } if way > 0 => a.g_load(r::RAX, RBP, scratch),
         CalleeSrc::Method { recv, site, .. } => {
             a.g_cmp_byte_imm(r::R15, l.hosted, 0);
-            a.g_jcc(cc::E, miss);
+            a.g_jcc(cc::E, lookup_miss);
             let got = a.new_label();
             let getter = e.getter.then_some(got);
             match e.way {
@@ -1654,7 +1737,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
                             a.jmp(walked);
                         }
                         a.bind(walk);
-                        a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), miss);
+                        a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), lookup_miss);
                         if w.fill {
                             let skip = a.new_label();
                             if let Some(shape) = w.shape {
@@ -1673,18 +1756,27 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
                         }
                     }
                     a.bind(walked);
-                    a.p_method_lookup_walked(jl, l.realm, site, miss, getter);
                 }
-                None => a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, miss, getter),
+                None => a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), lookup_miss),
             }
+            // The guard memos first (the receiver's slot in rcx), then the
+            // lookup, which leaves its entry in rdi (and rsi nonzero when
+            // a memo may record it, see `p_method_lookup_from`).
+            let slow = a.new_label();
+            emit_guard_fast(a, e, (way, ways.max(1)), slow, identified, miss)?;
+            a.bind(slow);
+            a.dbg_mark("g-lookup");
+            a.p_method_lookup_walked(jl, l.realm, site, lookup_miss, getter);
             if e.getter {
-                a.jmp(miss); // a data property
+                a.jmp(lookup_miss); // a data property
                 a.bind(got);
             }
+            a.g_mov(r::RDI, r::R11);
         }
         _ => return None,
     }
     a.g_store(RBP, e.slots.callee, r::RAX);
+    a.dbg_mark("g-ident");
     // 2. Its function: the memo (the same value at the same prototype
     //    epoch, see `CallMemo`), else the cell, memoized when it is `key`'s.
     let decode = a.new_label();
@@ -1695,8 +1787,32 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.g_cmp_mem(r::R9, r::R11, memo_stamp);
     a.g_jcc(cc::NE, decode);
     a.g_load(r::R8, r::R11, memo_caps);
+    let looked_up = matches!(e.callee, CalleeSrc::Method { .. });
+    if looked_up {
+        emit_guard_fill(a, e, way);
+    }
     a.jmp(identified);
     a.bind(decode);
+    a.dbg_mark("g-decode");
+    // (A value a later way memoizes is that way's.)
+    for w in way + 1..ways {
+        let other = a.new_label();
+        let m = memo_of(w);
+        a.g_cmp_mem(r::RAX, r::R11, site_off(m + offset_of!(IdentMemo, key)));
+        a.g_jcc(cc::NE, other);
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, site_off(m + offset_of!(IdentMemo, stamp)));
+        if looked_up {
+            // (Way `w`'s memo, for the next time.)
+            a.g_jcc(cc::NE, other);
+            a.g_load(r::R8, r::R11, site_off(m + offset_of!(IdentMemo, value)));
+            emit_guard_fill(a, e, w);
+            a.jmp(miss);
+        } else {
+            a.g_jcc(cc::E, miss);
+        }
+        a.bind(other);
+    }
     a.p_callee_info(jl, l.realm);
     a.g_movabs(r::R11, e.key);
     a.g_cmp(r::RAX, r::R11);
@@ -1708,7 +1824,11 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     load_proto_epoch(a, r::R9);
     a.g_store(r::R11, memo_stamp, r::R9);
     a.g_store(r::R11, memo_caps, r::R8);
+    if looked_up {
+        emit_guard_fill(a, e, way);
+    }
     a.bind(identified);
+    a.dbg_mark("g-limits");
     // 3. The caller's window on the register stack, one realm, room under
     //    both depth limits and for the header and the arguments (as
     //    `emit_call`) — unless no call since a guard checked them.
@@ -1735,6 +1855,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     if let Some(ctor) = e.new_target {
         emit_inline_new_this(a, e, ctor, e.caps.checked_add(n_caps)?, miss)?;
     }
+    a.dbg_mark("g-pend");
     // 4. Pending, its captures in the inlined body's registers. (An inner
     //    level's activation keeps what `pend` held: the outer one's stub,
     //    or `0` when that one is materialized.)
@@ -1759,7 +1880,13 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     // (Fused: the miss is out of line and takes the test's branch itself;
     // the jump over it is dropped once it is.)
     let cold = e.fused_miss.map(|_| a.cold_begin());
+    if chain_first {
+        a.bind(lookup_miss);
+        a.g_movabs(r::RAX, NanBox::undefined().to_bits());
+        a.g_store(RBP, e.slots.callee, r::RAX);
+    }
     a.bind(miss);
+    a.dbg_mark("g-miss");
     a.g_movabs(r::RAX, NanBox::boolean(false).to_bits());
     a.g_store(r::RBX, reg(e.dst), r::RAX);
     if let (Some(to), Some(cold)) = (e.fused_miss, cold) {
@@ -1768,6 +1895,105 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     }
     a.bind(done);
     Some(())
+}
+
+/// The guard memos' check of an inlined method call's guard
+/// ([`GuardMemo`]), with the receiver's walked heap slot in `rcx` (kept):
+/// for each of the site's `ways` ways' memos that records the receiver's
+/// layout and still holds, the method value at the memo's holder address is
+/// the way's callee when it equals the memo's — then, into `e.slots.callee`
+/// (and `rax`), to `identified` with its captures in `r8` for this guard's
+/// own way `own`, else to `miss` (a later way's guard identifies it).
+/// Otherwise to `slow`. Clobbers `rax`, `rdx`, `rdi`, `r8`, `r9`, `r11`.
+fn emit_guard_fast(
+    a: &mut X64Assembler,
+    e: &InlineEmit<'_>,
+    (own, ways): (usize, usize),
+    slow: Label,
+    identified: Label,
+    miss: Label,
+) -> Option<()> {
+    use super::props::entry_off;
+    use core::mem::offset_of;
+    let jl = super::compute_jit_layout();
+    let g = |w: usize, f: usize| {
+        site_off(offset_of!(CallSite, guard) + w * core::mem::size_of::<GuardMemo>() + f)
+    };
+    let found: alloc::vec::Vec<Label> = (0..ways).map(|_| a.new_label()).collect();
+    a.dbg_mark("g-fast");
+    a.g_load(r::RAX, r::RCX, jl.off_shape);
+    a.g_load(r::RDX, r::RCX, jl.props.off_proto);
+    a.g_movabs(r::R11, e.memo as u64);
+    for (w, &f) in found.iter().enumerate() {
+        let next = a.new_label();
+        a.g_load(r::RDI, r::R11, g(w, offset_of!(GuardMemo, entry)));
+        a.g_test(r::RDI);
+        a.g_jcc(cc::E, next);
+        a.g_cmp_mem(r::RAX, r::RDI, entry_off::SHAPE);
+        a.g_jcc(cc::NE, next);
+        a.g_cmp_mem(r::RDX, r::RDI, entry_off::PROTO);
+        a.g_jcc(cc::E, f);
+        a.bind(next);
+    }
+    a.jmp(slow);
+    for (w, &f) in found.iter().enumerate() {
+        a.bind(f);
+        a.dbg_mark("g-found");
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, g(w, offset_of!(GuardMemo, stamp)));
+        a.g_jcc(cc::NE, slow);
+        a.g_cmp_mem(r::R9, r::RDI, entry_off::STAMP);
+        a.g_jcc(cc::NE, slow);
+        // No accessors on the receiver (as the lookup requires).
+        let no_acc = a.new_label();
+        a.g_load(r::R9, r::RCX, jl.props.off_extra);
+        a.g_test(r::R9);
+        a.g_jcc(cc::E, no_acc);
+        a.g_load(r::R9, r::R9, jl.props.extra_acc_len);
+        a.g_test(r::R9);
+        a.g_jcc(cc::NE, slow);
+        a.bind(no_acc);
+        // A data property for a call, a getter for a read.
+        a.p_cmp32_imm8(r::RDI, entry_off::ACC, 0);
+        a.g_jcc(if e.getter { cc::E } else { cc::NE }, slow);
+        a.g_load(r::R9, r::RDI, entry_off::VALUE);
+        a.g_test(r::R9);
+        a.g_jcc(cc::E, slow);
+        a.g_load(r::RAX, r::R9, 0);
+        a.g_cmp_mem(r::RAX, r::R11, g(w, offset_of!(GuardMemo, bits)));
+        a.g_jcc(cc::NE, slow);
+        a.g_store(RBP, e.slots.callee, r::RAX);
+        if w == own {
+            a.g_load(r::R8, r::R11, g(w, offset_of!(GuardMemo, caps)));
+            a.jmp(identified);
+        } else {
+            a.jmp(miss);
+        }
+    }
+    Some(())
+}
+
+/// Records way `w`'s guard memo ([`GuardMemo`]) after a method lookup that
+/// hit (its entry in `rdi`, `rsi` nonzero when the memo may record it)
+/// identified the callee value in `e.slots.callee` as that way's, with its
+/// captures in `r8`; nothing when `rsi` is zero. Keeps `r8`; clobbers
+/// `rax`, `r9`, `r11`.
+fn emit_guard_fill(a: &mut X64Assembler, e: &InlineEmit<'_>, w: usize) {
+    use core::mem::offset_of;
+    let g = |f: usize| {
+        site_off(offset_of!(CallSite, guard) + w * core::mem::size_of::<GuardMemo>() + f)
+    };
+    let skip = a.new_label();
+    a.g_test(r::RSI);
+    a.g_jcc(cc::E, skip);
+    a.g_movabs(r::R11, e.memo as u64);
+    a.g_store(r::R11, g(offset_of!(GuardMemo, entry)), r::RDI);
+    a.g_load(r::RAX, RBP, e.slots.callee);
+    a.g_store(r::R11, g(offset_of!(GuardMemo, bits)), r::RAX);
+    a.g_store(r::R11, g(offset_of!(GuardMemo, caps)), r::R8);
+    load_proto_epoch(a, r::R9);
+    a.g_store(r::R11, g(offset_of!(GuardMemo, stamp)), r::R9);
+    a.bind(skip);
 }
 
 /// An inlined `new`'s `this` (`emit_inline_guard`, `e.new_target` the
@@ -1875,6 +2101,7 @@ pub(crate) fn emit_inline_stub(
 ) -> Option<()> {
     let reg = |x: u16| i32::from(x) * 8;
     let hdr = |i: usize| i32::try_from(i * 8).ok();
+    a.dbg_mark("stub");
     // push rax, rcx, rdx, r9, r10.
     a.raw(&[0x50, 0x51, 0x52, 0x41, 0x51, 0x41, 0x52]);
     if let Some(save) = s.save {
@@ -1921,6 +2148,7 @@ pub(crate) fn emit_inline_stub(
 /// depth counts restored, as the call sequence does after its callee
 /// returns. Preserves `rax`.
 pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &InlineSlots) {
+    a.dbg_mark("leave");
     let materialized = a.new_label();
     let done = a.new_label();
     if let Some(save) = s.save {

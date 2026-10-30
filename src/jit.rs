@@ -2174,6 +2174,8 @@ pub enum GenericOp {
         caps: u16,
         /// How many captures.
         n_caps: u16,
+        /// A polymorphic site's way (`Op::InlineGuard::poly`).
+        poly: u16,
     },
     /// `Op::InlineLeave`: pop the inlined activation's header.
     InlineLeave,
@@ -2653,7 +2655,18 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                 args,
                 caps,
                 n_caps,
+                poly,
             } => {
+                // A later way of a polymorphic site: only the miss branch
+                // of the previous way's guard (of the same call) reaches it,
+                // so the callee value that guard found is the call's.
+                let (way, ways) = (*poly & 0xff, *poly >> 8);
+                if way >= ways.max(1) || ways > 3 {
+                    return None;
+                }
+                if way > 0 && !chained_guard_ok(&proto.ops, pc) {
+                    return None;
+                }
                 // The guarded call must be a call op with a native sequence
                 // (its argument table entry), reading the same registers.
                 let same = match proto.ops.get(*call) {
@@ -2686,6 +2699,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                     key: *key,
                     caps: *caps,
                     n_caps: *n_caps,
+                    poly: *poly,
                 }
             }
             Op::InlineLeave => GenericOp::InlineLeave,
@@ -3684,7 +3698,7 @@ impl JitProto {
         warm: &[Option<crate::ic::WarmEntry>],
         plain: &dyn Fn(u32) -> bool,
     ) -> Option<Self> {
-        Self::compile_generic_inlining(proto, helpers, warm, plain, &|_, _| None)
+        Self::compile_generic_inlining(proto, helpers, warm, plain, &|_, _| Vec::new())
     }
 
     /// [`compile_generic_closures`](Self::compile_generic_closures), inlining
@@ -3696,7 +3710,7 @@ impl JitProto {
         helpers: &GenericHelpers,
         warm: &[Option<crate::ic::WarmEntry>],
         plain: &dyn Fn(u32) -> bool,
-        pick: &dyn Fn(usize, &crate::nbvm::Op) -> Option<inline::Candidate<'a>>,
+        pick: &dyn Fn(usize, &crate::nbvm::Op) -> Vec<inline::Candidate<'a>>,
     ) -> Option<Self> {
         // The register `call_with_inner` puts `new.target` in, if any (a
         // native-call entry fills it from the call header; one at or below the
@@ -3958,8 +3972,10 @@ impl JitProto {
 
     /// What this body's call sites learned of their callees, by the
     /// function's own pc (the callee feedback of its recompilation): a site
-    /// whose cache holds one callee names it, one with several is mixed; an
-    /// inlined site names its inlined callee unless its call took another.
+    /// whose cache holds one callee names it, one with a few is polymorphic
+    /// (`CalleeHint::Poly`), one with more is mixed; an inlined site names
+    /// its inlined callees (every way of a polymorphic one) and whatever
+    /// else its call took.
     #[must_use]
     pub fn call_hints(&self) -> Vec<crate::ic::CalleeHint> {
         use crate::ic::CalleeHint;
@@ -3990,13 +4006,24 @@ impl JitProto {
                 continue;
             };
             match op {
-                crate::nbvm::Op::InlineGuard { call, key, .. } => {
-                    let others = site_of(*call).map(keys).unwrap_or_default();
-                    *slot = if others.iter().all(|k| k == key) {
-                        CalleeHint::One(*key)
-                    } else {
-                        CalleeHint::Mixed
-                    };
+                // (The first guard of a site is at its own pc; the others
+                // of a polymorphic one guard the same call op.)
+                crate::nbvm::Op::InlineGuard { call, .. } => {
+                    let mut ks: Vec<u64> = bc
+                        .iter()
+                        .filter_map(|o| match o {
+                            crate::nbvm::Op::InlineGuard { call: c, key, .. } if c == call => {
+                                Some(*key)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for k in site_of(*call).map(keys).unwrap_or_default() {
+                        if !ks.contains(&k) {
+                            ks.push(k);
+                        }
+                    }
+                    *slot = CalleeHint::of_keys(&ks);
                 }
                 crate::nbvm::Op::CallMethod { .. }
                 | crate::nbvm::Op::CallValue { .. }
@@ -4005,11 +4032,7 @@ impl JitProto {
                 | crate::nbvm::Op::CallKey { .. }
                 | crate::nbvm::Op::GetProp { .. } => {
                     if let Some(k) = site_of(pc).map(keys) {
-                        *slot = match k[..] {
-                            [] => CalleeHint::None,
-                            [one] => CalleeHint::One(one),
-                            _ => CalleeHint::Mixed,
-                        };
+                        *slot = CalleeHint::of_keys(&k);
                     }
                 }
                 _ => {}
@@ -4028,11 +4051,21 @@ impl JitProto {
     #[must_use]
     pub fn inlined_sites(&self) -> Vec<(usize, u32)> {
         self.bytecode.as_ref().map_or_else(Vec::new, |b| {
+            // (Each way of a polymorphic site at the site's own pc, its
+            // first guard's: the others guard the same call op.)
+            let mut first: Vec<(usize, usize)> = Vec::new();
             b.iter()
                 .enumerate()
                 .filter_map(|(pc, o)| match o {
-                    crate::nbvm::Op::InlineGuard { key, .. } => {
-                        Some((self.orig_pc(pc), (*key & 0xffff_ffff) as u32))
+                    crate::nbvm::Op::InlineGuard { key, call, .. } => {
+                        let at = match first.iter().find(|(c, _)| c == call) {
+                            Some(&(_, at)) => at,
+                            None => {
+                                first.push((*call, self.orig_pc(pc)));
+                                self.orig_pc(pc)
+                            }
+                        };
+                        Some((at, (*key & 0xffff_ffff) as u32))
                     }
                     _ => None,
                 })
@@ -4248,6 +4281,13 @@ pub fn eval_sum_1_to_n(n: i64) -> i64 {
 #[derive(Default)]
 pub struct X64Assembler {
     code: Vec<u8>,
+    /// Profiling marks (`KATAAN_JIT_OPMAP`): labels bound inside an op's
+    /// code, reported with the op offsets.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) dbg_marks: Vec<(Label, &'static str)>,
     /// Per-label byte offset (`usize::MAX` until [`bind`](Self::bind)).
     labels: Vec<usize>,
     /// Pending `rel32` jump fixups: `(operand offset in `code`, target label)`.
@@ -4357,6 +4397,41 @@ const LABEL_COLD: usize = usize::MAX - 1;
 /// so no register ever holds them.
 const RECV_CACHE_EMPTY: i32 = -1;
 
+/// Whether the later-way guard of a polymorphic inlined site at `pc`
+/// (`Op::InlineGuard::poly`) is reached only by the miss branch of the
+/// previous way's guard of the same call (the `JumpIfFalse` right after it),
+/// so that the callee value that guard left in the inline slots is the
+/// call's: the op before it is the previous way's closing jump and nothing
+/// else branches to it.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn chained_guard_ok(ops: &[crate::nbvm::Op], pc: usize) -> bool {
+    use crate::nbvm::Op;
+    let Some(Op::InlineGuard { call, poly, .. }) = ops.get(pc) else {
+        return false;
+    };
+    let Some(prev) = (0..pc).rev().find(|&g| {
+        matches!(ops[g], Op::InlineGuard { call: c, poly: p, .. } if c == *call && p + 1 == *poly)
+    }) else {
+        return false;
+    };
+    let Op::InlineGuard { dst, .. } = ops[prev] else {
+        return false;
+    };
+    matches!(ops.get(prev + 1), Some(Op::JumpIfFalse { target, cond }) if *target == pc && *cond == dst)
+        && matches!(
+            pc.checked_sub(1).and_then(|p| ops.get(p)),
+            Some(Op::Jump { .. })
+        )
+        && !ops.iter().enumerate().any(|(j, o)| {
+            j != prev + 1
+                && matches!(o, Op::Jump { target } | Op::JumpIfFalse { target, .. }
+                    | Op::PushHandler { target, .. } if *target == pc)
+        })
+}
+
 /// Per op, the inlining level of an `InlineGuard` or `InlineLeave` (`1`, or
 /// `2` inside another inlined body: see `inline::Candidate::nested`); `0`
 /// for any other op. Every inlined body is its guard, then its ops, then its
@@ -4389,6 +4464,20 @@ impl X64Assembler {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A profiling mark here (only under `KATAAN_JIT_OPMAP`).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn dbg_mark(&mut self, name: &'static str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_OPMAP").is_some()) {
+            let l = self.new_label();
+            self.bind(l);
+            self.dbg_marks.push((l, name));
+        }
     }
 
     /// The emitted machine code (call [`finish`](Self::finish) first to resolve
@@ -7085,6 +7174,7 @@ impl JitFunction {
                     key,
                     caps,
                     n_caps,
+                    poly,
                 } => {
                     let no_args: Vec<u16> = Vec::new();
                     let mut getter = false;
@@ -7165,6 +7255,30 @@ impl JitFunction {
                     } else {
                         (way, None)
                     };
+                    // A polymorphic method site's later way takes the
+                    // callee value its first way found (`chained_guard_ok`
+                    // proved only that guard's miss reaches it) and walks
+                    // no receiver (`recv_cache` plans no site for it).
+                    let chained = poly & 0xff != 0;
+                    let (callee, way) = match callee {
+                        call_seq::CalleeSrc::Method { .. } if chained => {
+                            if way.is_some() {
+                                return None;
+                            }
+                            let level = if inl_level[op_idx] == 2 {
+                                inl_slots.inner()?
+                            } else {
+                                inl_slots
+                            };
+                            (
+                                call_seq::CalleeSrc::Frame {
+                                    scratch: level.callee,
+                                },
+                                None,
+                            )
+                        }
+                        c => (c, way),
+                    };
                     if way.is_some() && matches!(callee, call_seq::CalleeSrc::Reg(_)) {
                         return None;
                     }
@@ -7204,6 +7318,7 @@ impl JitFunction {
                             new_target,
                             new_alloc,
                             new_way,
+                            poly,
                             fused_miss: match ops.get(op_idx + 1) {
                                 Some(&GenericOp::JumpIfFalse { target, .. })
                                     if fused_test.get(op_idx + 1) == Some(&true) =>
@@ -9729,8 +9844,44 @@ impl JitFunction {
             (native, native_rust)
         };
         // (Their offsets are known once `finish` has placed the cold regions.)
-        let (code, at) = a.finish_at(&[entries.0, entries.1]);
-        Self::from_code(&code).map(|f| (f, (at[0], at[1])))
+        let opmap = std::env::var_os("KATAAN_JIT_OPMAP");
+        let mut want = alloc::vec![entries.0, entries.1];
+        if opmap.is_some() {
+            want.extend(labels.iter().take(ops.len()).copied());
+            want.extend((0..ops.len()).filter_map(|i| num.copy_label(i)));
+            want.extend(a.dbg_marks.iter().map(|m| m.0));
+        }
+        let marks: Vec<&'static str> = a.dbg_marks.iter().map(|m| m.1).collect();
+        let (code, at) = a.finish_at(&want);
+        let f = Self::from_code(&code);
+        if let (Some(path), Some(f)) = (opmap, f.as_ref()) {
+            use std::io::Write as _;
+            if let Ok(mut out) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let mut s = alloc::format!("B {:x} {} {}\n", f.code_ptr(), code.len(), ops.len());
+                for i in 0..ops.len() {
+                    let name = alloc::format!("{:?}", ops[i]);
+                    let name = name.split([' ', '{', '(']).next().unwrap_or("");
+                    s.push_str(&alloc::format!("O {} {} {}\n", i, at[2 + i], name));
+                }
+                let mut k = 2 + ops.len();
+                for i in 0..ops.len() {
+                    if num.copy_label(i).is_some() {
+                        s.push_str(&alloc::format!("C {} {}\n", i, at[k]));
+                        k += 1;
+                    }
+                }
+                for m in &marks {
+                    s.push_str(&alloc::format!("M {} {}\n", at[k], m));
+                    k += 1;
+                }
+                let _ = out.write_all(s.as_bytes());
+            }
+        }
+        f.map(|f| (f, (at[0], at[1])))
     }
 
     /// Wraps already-emitted machine `code` into a callable region (the entry
