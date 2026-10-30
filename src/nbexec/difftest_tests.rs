@@ -2031,3 +2031,34 @@ fn join_honors_a_length_past_the_dense_store() {
     "#;
     assert_eq!(run(src), "RangeError RangeError RangeError 123 123mz 123");
 }
+
+/// `map`/`filter`/`flat`/`flatMap`/`concat` on an array whose `length` lies
+/// past its dense store visit the elements stored past the dense cap and
+/// take the real `length` (they saw the dense elements alone: `map` gave a
+/// length-3 result, `concat` dropped the tail), stepping over the absent
+/// region (each case is a few ms over up to 2**32 - 1 indices). A callback
+/// that adds or deletes a later index is honored; `concat`'s result past
+/// 2**32 - 1 is the final `Set(A, "length")` RangeError.
+#[test]
+fn map_filter_flat_concat_honor_a_length_past_the_dense_store() {
+    let src = r#"
+        function t(f) { try { return String(f()); } catch (e) { return e.constructor.name; } }
+        var a = [1, 2, 3]; a.length = 2 ** 32 - 1; a[4000000000] = 9;
+        var b = [1, , 3]; b[500000000] = 7; b.length = 600000000;
+        var c = [1, 2]; c.length = 1000000000;
+        [t(() => a.map(x => x * 2).length), t(() => Object.keys(a.map(x => x * 2))),
+         t(() => a.filter(x => x > 1)), t(() => a.flat()), t(() => a.flatMap(x => [x, x])),
+         t(() => b.concat([8]).length), t(() => Object.keys(b.concat([8], b))),
+         t(() => [0].concat(a)), t(() => [[1, a], b].flat(2).length),
+         t(() => Object.keys(c.map((x, i) => { if (i == 0) c[900000000] = 5; return x; }))),
+         t(() => { var d = [1, 2]; d[500000000] = 3; d.length = 600000000;
+                   return d.filter((x, i) => { if (i == 0) delete d[500000000]; return true; }); }),
+        ].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "4294967295 0,1,2,4000000000 2,3,9 1,2,3,9 1,1,2,2,3,3,9,9 600000001 \
+         0,2,500000000,600000000,600000001,600000003,1100000001 RangeError 8 \
+         0,1,900000000 1,2"
+    );
+}

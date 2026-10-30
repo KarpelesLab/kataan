@@ -2912,24 +2912,7 @@ impl Interp {
             && (array_proto_generic || self.inherits_array_proto(handle))
             && !self.inherits_iterator_proto(handle)
         {
-            let source_len = self.array_like_length(handle)?;
-            let (depth, mapper, this_arg) = if method == "flat" {
-                let depth = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                    1
-                } else {
-                    self.coerce_to_integer_or_infinity(arg(0))? as i32
-                };
-                (depth, None, NanBox::undefined())
-            } else {
-                self.require_callable(arg(0), "flatMap callback")?;
-                (1, Some(arg(0)), arg(1))
-            };
-            let a_v = self.array_species_create(handle, 0)?;
-            let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
-                return Err(self.type_error("Array species did not return an object"));
-            };
-            self.flatten_into_array(a_h, handle, source_len, 0, depth, mapper, this_arg)?;
-            return Ok(Some(a_v));
+            return Ok(Some(self.array_flat_generic(method, handle, args)?));
         }
         // `map`/`filter` on a generic array-like (including a proxy whose target is
         // an array) read each element live per iteration (`HasProperty` then `Get`) so a callback that
@@ -3662,6 +3645,12 @@ impl Interp {
                     return Ok(Some(self.array_at_with_generic(method, handle, args)?));
                 }
                 "slice" => return Ok(Some(self.array_slice_generic(handle, args)?)),
+                "map" | "filter" => {
+                    return Ok(Some(self.array_map_filter_generic(method, handle, args)?));
+                }
+                "flat" | "flatMap" => {
+                    return Ok(Some(self.array_flat_generic(method, handle, args)?));
+                }
                 "join" | "toLocaleString" => {
                     let locale = method == "toLocaleString";
                     return Ok(Some(self.array_join_generic(handle, args, locale)?));
@@ -6090,9 +6079,15 @@ impl Interp {
         // the literal does not fit (and the limit is unreachable anyway).
         const MAX_SAFE: u64 = 9_007_199_254_740_991;
         let mut target_index = start;
-        for source_index in 0..source_len {
+        let mut next = 0;
+        while next < source_len {
+            let source_index = self.sparse_next_index(source, next, source_len);
+            if source_index >= source_len {
+                break;
+            }
+            next = source_index + 1;
             let key = alloc::format!("{source_index}");
-            if !self.has_property(source, &key) {
+            if !self.has_property_proxied(source, &key)? {
                 continue;
             }
             let mut element = self.read_member(source, &key)?;
@@ -6132,6 +6127,36 @@ impl Interp {
         Ok(target_index)
     }
 
+    /// `Array.prototype.flat`/`flatMap` by the spec algorithm: `LengthOfArrayLike`,
+    /// the depth coercion (or IsCallable(mapper)), `ArraySpeciesCreate(O, 0)`, then
+    /// `FlattenIntoArray` reading the receiver live.
+    fn array_flat_generic(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        let source_len = self.array_like_length(handle)?;
+        let (depth, mapper, this_arg) = if method == "flat" {
+            let depth = if matches!(arg(0).unpack(), Unpacked::Undefined) {
+                1
+            } else {
+                self.coerce_to_integer_or_infinity(arg(0))? as i32
+            };
+            (depth, None, NanBox::undefined())
+        } else {
+            self.require_callable(arg(0), "flatMap callback")?;
+            (1, Some(arg(0)), arg(1))
+        };
+        let a_v = self.array_species_create(handle, 0)?;
+        let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
+            return Err(self.type_error("Array species did not return an object"));
+        };
+        self.flatten_into_array(a_h, handle, source_len, 0, depth, mapper, this_arg)?;
+        Ok(a_v)
+    }
+
     /// `Array.prototype.map`/`filter` over a *plain* (non-array, non-proxy-of-array)
     /// generic array-like: `LengthOfArrayLike`, then `IsCallable(callbackfn)`, then
     /// `ArraySpeciesCreate` (an out-of-range length throws before any callback), then
@@ -6154,9 +6179,17 @@ impl Interp {
         };
         let o = NanBox::handle(handle.to_raw());
         let mut to = 0usize;
-        for i in 0..len {
+        let mut next = 0;
+        while next < len {
+            // Step over the provably absent region past a real array's dense
+            // store (re-derived after every callback, see `array_sparse`).
+            let i = self.sparse_next_index(handle, next, len);
+            if i >= len {
+                break;
+            }
+            next = i + 1;
             let key = alloc::format!("{i}");
-            if !self.has_property(handle, &key) {
+            if !self.has_property_proxied(handle, &key)? {
                 continue;
             }
             let kv = self.read_member(handle, &key)?;
@@ -6258,17 +6291,27 @@ impl Interp {
                     n += len as f64;
                     continue;
                 }
-                for k in 0..len {
+                // `n` advances past every index of `E`; only the present ones
+                // are defined, and the provably absent region past a real
+                // array's dense store is stepped over (see `array_sparse`).
+                let base = n;
+                let mut k = 0;
+                while k < len {
+                    k = self.sparse_next_index(h, k, len);
+                    if k >= len {
+                        break;
+                    }
                     let key = alloc::format!("{k}");
                     // Only define a result element when the source HasProperty(k);
                     // an absent index leaves a hole in `A` (but `n` still advances).
                     // `Get`/`HasProperty` walk the prototype chain and fire getters.
-                    if self.has_property(h, &key) {
+                    if self.has_property_proxied(h, &key)? {
                         let v = self.read_member(h, &key)?;
-                        self.create_data_property_or_throw(a_h, n as usize, v)?;
+                        self.create_data_property_or_throw(a_h, base as usize + k, v)?;
                     }
-                    n += 1.0;
+                    k += 1;
                 }
+                n = base + len as f64;
             } else {
                 // Non-spreadable: added as a single element (a `2^53-1` overflow is
                 // a TypeError).
