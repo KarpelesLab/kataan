@@ -805,10 +805,20 @@ impl Object {
     /// values past the inline room go to a spill sized for exactly them.
     /// `None` unless `shape` holds exactly `values.len()` keys.
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub fn with_data(shape: Rc<Shape>, values: &[NanBox]) -> Option<Self> {
         if values.len() > MAX_SHAPED_LEN || shape.len() as usize != values.len() {
             return None;
+        }
+        // The layout's record of which slots may hold a non-Number: only
+        // the slots it still has as Number-only need a look.
+        let mut pending = shape.number_only_slots();
+        while pending != 0 {
+            let i = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            if values.get(i).is_some_and(|v| !v.is_number()) {
+                shape.note_non_number(i as u32);
+            }
         }
         Some(Self {
             mode: Mode::Shaped,
@@ -899,6 +909,32 @@ impl Object {
         x.hidden_prefix = 2;
         self.layout_changed();
         self.shape = self.shape.unmarked_twin();
+        // Another layout than one this object grew into: it learns the
+        // object's values.
+        self.note_all_slots();
+    }
+
+    /// Records on the object's layout which of its slots hold a value that
+    /// is not a Number (`Shape::note_non_number`) — for a layout the object
+    /// takes other than by adding a key.
+    fn note_all_slots(&self) {
+        if self.is_dict() {
+            return;
+        }
+        let mut non_numbers = 0u64;
+        for (i, v) in self.slots_iter().take(64).enumerate() {
+            non_numbers |= u64::from(!v.is_number()) << i;
+        }
+        self.shape.note_non_numbers(non_numbers);
+    }
+
+    /// Records a write of `v` into slot `slot` on the object's layout
+    /// (`Shape::note_non_number`): every slot write goes through here.
+    #[inline]
+    fn note_slot(&self, slot: u32, v: NanBox) {
+        if !v.is_number() {
+            self.shape.note_non_number(slot);
+        }
     }
 
     /// The out-of-line part holding just `rest` as the spilled slot values
@@ -1042,16 +1078,23 @@ impl Object {
     }
 
     /// Appends `v` as the next slot (shaped mode; `len < MAX_SHAPED_LEN`).
-    #[inline]
+    #[inline(always)]
     fn slot_push(&mut self, v: NanBox) {
         let i = self.len as usize;
         debug_assert!(i < MAX_SHAPED_LEN);
         if i < INLINE_SLOTS {
             self.inline[i] = v;
         } else {
-            self.extra_mut().spill.push(v);
+            self.spill_push(v);
         }
         self.len += 1;
+        self.note_slot(i as u32, v);
+    }
+
+    /// [`slot_push`](Self::slot_push) past the inline room.
+    #[inline(never)]
+    fn spill_push(&mut self, v: NanBox) {
+        self.extra_mut().spill.push(v);
     }
 
     /// The slot values, in slot order.
@@ -1112,6 +1155,7 @@ impl Object {
     }
 
     /// The out-of-line part, allocated on first use.
+    #[inline]
     fn extra_mut(&mut self) -> &mut ObjectExtra {
         self.extra.get_or_insert_with(Default::default)
     }
@@ -1458,6 +1502,7 @@ impl Object {
         match self.slot_get_mut(slot) {
             Some(cell) => {
                 *cell = value;
+                self.note_slot(slot, value);
                 true
             }
             None => false,
@@ -1568,6 +1613,7 @@ impl Object {
             match self.shape.lookup(key) {
                 Some(slot) => {
                     *self.slot_get_mut(slot).expect("slot index in range") = value;
+                    self.note_slot(slot, value);
                     true
                 }
                 None => false,
@@ -2416,6 +2462,35 @@ mod tests {
 
     fn n(x: f64) -> NanBox {
         NanBox::number(x)
+    }
+
+    #[test]
+    fn every_slot_write_keeps_the_layout_number_record() {
+        let root = Shape::root();
+        // Adds, in-place writes, slot writes and `with_data`.
+        let mut a = Object::new(Rc::clone(&root));
+        a.set("x", n(1.0));
+        a.set("y", n(f64::NAN));
+        a.set("z", n(-0.0));
+        let s = Rc::clone(a.shape());
+        assert!((0..3).all(|i| !s.may_be_non_number(i)));
+        a.set("y", NanBox::undefined());
+        assert!(s.may_be_non_number(1) && !s.may_be_non_number(0));
+        assert!(a.set_slot(2, NanBox::boolean(true)));
+        assert!(s.may_be_non_number(2));
+        let t = root.transition("p").transition("q");
+        assert!(Object::with_data(Rc::clone(&t), &[n(1.0), n(2.0)]).is_some());
+        assert!(!t.may_be_non_number(0) && !t.may_be_non_number(1));
+        assert!(Object::with_data(Rc::clone(&t), &[n(1.0), NanBox::null()]).is_some());
+        assert!(!t.may_be_non_number(0) && t.may_be_non_number(1));
+        // A delete rebuilds the layout from the root: the new one learns
+        // the values it takes over.
+        let mut b = Object::new(Rc::clone(&root));
+        b.set("u", n(1.0));
+        b.set("v", NanBox::null());
+        b.set("w", n(3.0));
+        b.delete(Rc::clone(&root), "u");
+        assert!(b.shape().may_be_non_number(0) && !b.shape().may_be_non_number(1));
     }
 
     #[test]

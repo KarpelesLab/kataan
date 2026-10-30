@@ -53,6 +53,9 @@ pub(crate) struct PropsLayout {
     pub acc_getter: i32,
     /// Shape-word-relative offset of the shape's brand byte.
     pub shape_brands: i32,
+    /// Shape-word-relative offset of the shape's may-be-non-Number slot
+    /// mask (`Shape::may_be_non_number`, a `u64`).
+    pub shape_any: i32,
     /// `Realm`-relative offset of the heap slot array's data pointer.
     pub heap_ptr: i32,
     /// `Realm`-relative offset of the heap slot array's length.
@@ -178,6 +181,12 @@ impl PropsLayout {
             acc_getter: i(obj.acc_getter_off),
             shape_brands: i32::try_from(obj.shape_brands_off)
                 .expect("jit layout offset fits in i32"),
+            // (Both relative to the same `Shape`.)
+            shape_any: i32::try_from(
+                obj.shape_brands_off - Shape::brands_offset().cast_signed()
+                    + Shape::any_offset().cast_signed(),
+            )
+            .expect("jit layout offset fits in i32"),
             heap_ptr: i(heap_ptr),
             heap_len: i(heap_len),
         }
@@ -281,6 +290,9 @@ pub(crate) struct BakedAdd {
     pub to: u64,
     /// The new value's slot (`from`'s length).
     pub slot: u32,
+    /// Whether `to` had the slot as Number-only when the add was compiled
+    /// in (see `fieldrep`): else no value written there needs a check.
+    pub num: bool,
 }
 
 impl BakedAdd {
@@ -298,6 +310,7 @@ impl BakedAdd {
             from: shape_word(from),
             to: shape_word(to),
             slot,
+            num: !to.may_be_non_number(slot),
         })
     }
 }
@@ -1064,6 +1077,8 @@ impl X64Assembler {
         self.g_cmp_mem(r::R8, r::RCX, l.off_shape);
         self.g_jcc(cc::NE, miss);
         self.g_load(r::RAX, r::RBX, val_disp);
+        // (`r9`: the cached shape, the add's result.)
+        self.p_field_rep_add(l, (r::RAX, r::R9, r::R8, r::R11), miss);
         self.p_barrier_check(l, realm_off, miss);
         // Commit, and count the hit.
         self.g_movabs(r::R11, cache);
@@ -1304,6 +1319,8 @@ impl X64Assembler {
         // (`to` is set whenever `from` is: `fill_add` stores both.)
         self.p_add_chain(l, miss);
         self.g_load(r::RAX, r::RBX, val_disp);
+        self.g_load(r::R9, r::R11, to);
+        self.p_field_rep_add(l, (r::RAX, r::R9, r::R8, r::R11), miss);
         self.p_barrier_check(l, realm_off, miss);
         self.g_movabs(r::R11, site as u64);
         self.p_add_commit(l, realm_off, to, val_disp);
@@ -1377,6 +1394,9 @@ impl X64Assembler {
         self.g_movabs(r::R11, site as u64);
         self.p_add_chain(l, miss);
         self.g_load(r::RAX, r::RBX, val_disp);
+        if b.num {
+            self.p_field_rep_const(l, (r::RAX, r::R8), b.to, b.slot, barrier_miss);
+        }
         self.p_barrier_check(l, realm_off, barrier_miss);
         // Commit: the value, the count, the shape, the key epoch.
         self.g_load(r::R8, r::RBX, val_disp);
@@ -1452,6 +1472,10 @@ impl X64Assembler {
         self.g_jcc(cc::BE, miss);
         self.g_movabs(r::R11, site as u64);
         self.p_add_chain(l, miss);
+        if b.num {
+            self.g_load(r::RAX, r::RBX, val_disp);
+            self.p_field_rep_const(l, (r::RAX, r::R8), b.to, b.slot, miss);
+        }
         // Commit: the value, the count, the shape, the key epoch.
         self.g_load(r::R8, r::RBX, val_disp);
         self.g_store(r::RCX, l.off_inline + 8 * slot, r::R8);
@@ -2163,7 +2187,7 @@ impl X64Assembler {
         l: &JitLayout,
         realm_off: i32,
         cache: u64,
-        vals: &[i32],
+        (vals, proven): (&[i32], &[bool]),
         miss: Label,
     ) {
         use crate::nbvm::objlit::LitShapeCache;
@@ -2180,6 +2204,10 @@ impl X64Assembler {
         self.g_load(r::RAX, r::R11, LitShapeCache::ROOT_OFF);
         self.g_cmp_mem(r::RAX, r::R9, p.root_shape);
         self.g_jcc(cc::NE, miss);
+        // Promoted registers' current values reach the frame first.
+        self.spill_before_call();
+        // The layout's record of its Number-only slots (`fieldrep`).
+        self.p_field_rep_lit(l, (cache, LitShapeCache::SHAPE_OFF), vals, proven, miss);
         self.g_load(r::RAX, r::R9, p.dict_threshold);
         self.g_cmp_imm(r::RAX, n as i32);
         self.g_jcc(cc::BE, miss);
@@ -2211,8 +2239,6 @@ impl X64Assembler {
         self.g_load(r::RSI, r::R9, p.default_proto);
         self.g_store(r::RCX, p.off_proto, r::RSI);
         self.g_store_imm32(r::RCX, p.off_extra, 0);
-        // Promoted registers' current values reach the frame first.
-        self.spill_before_call();
         for (i, &d) in vals.iter().enumerate() {
             self.load_rax(d);
             self.g_store(r::RCX, l.off_inline + 8 * i as i32, r::RAX);

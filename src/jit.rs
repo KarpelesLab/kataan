@@ -24,6 +24,8 @@ use alloc::vec::Vec;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod fieldrep;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_persist;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod handle;
@@ -3437,6 +3439,11 @@ pub struct SiteInfo {
 struct Baked {
     shape: u64,
     slot: u32,
+    /// Whether the layout had the slot as Number-only when the site was
+    /// compiled (`Shape::may_be_non_number`; a heuristic only: a slot once
+    /// marked stays marked, so `false` is for good, while `true` is
+    /// checked again at run time wherever it matters).
+    num: bool,
 }
 
 /// The calling-convention / signature a compiled [`JitProto`] exposes to a
@@ -3812,6 +3819,7 @@ impl JitProto {
                 baked_at[site] = Some(Baked {
                     shape: props::shape_word(&w.shape),
                     slot: w.slot,
+                    num: !w.shape.may_be_non_number(w.slot),
                 });
                 baked.push(alloc::rc::Rc::clone(&w.shape));
                 tier_baked[site] = Some((alloc::rc::Rc::clone(&w.shape), w.slot));
@@ -3868,7 +3876,8 @@ impl JitProto {
                 add: None,
             })
             .collect();
-        let tier_up = tierup::TierUp::plan(&ops, tier_baked, tier_added);
+        let mut tier_up = tierup::TierUp::plan(&ops, tier_baked, tier_added);
+        tier_up.num_slots = baked_at.iter().map(|b| b.is_some_and(|b| b.num)).collect();
         let call_pcs: Vec<(u32, u16)> = ops
             .iter()
             .enumerate()
@@ -6360,6 +6369,25 @@ impl JitFunction {
                 persist,
                 realm: helpers.call_layout.realm,
                 layout: helpers.call_layout,
+                // A compiled-in read of a slot its layout had as Number-only
+                // (`numeric::Spec::fields`).
+                fields: ops
+                    .iter()
+                    .map(|op| match *op {
+                        GenericOp::GetProp { site, .. } => sites
+                            .get(site as usize)?
+                            .baked
+                            .filter(|b| b.num && b.slot < 64)
+                            .map(|b| {
+                                (
+                                    b.shape
+                                        .wrapping_add_signed(i64::from(layout.props.shape_any)),
+                                    b.slot,
+                                )
+                            }),
+                        _ => None,
+                    })
+                    .collect(),
             },
             osr_entries,
             &catch_targets,
@@ -8086,11 +8114,16 @@ impl JitFunction {
                             let slow = a.new_label();
                             let done = a.new_label();
                             let vals: Vec<i32> = lit.srcs.iter().map(|r| disp(*r)).collect();
+                            let proven: Vec<bool> = lit
+                                .srcs
+                                .iter()
+                                .map(|r| num.is_number_at(op_idx, *r))
+                                .collect();
                             a.p_alloc_object_lit(
                                 &layout,
                                 helpers.call_layout.realm,
                                 core::ptr::from_ref(&lit.cache) as u64,
-                                &vals,
+                                (&vals, &proven),
                                 slow,
                             );
                             a.store_rax(disp(*dst));
@@ -8563,6 +8596,17 @@ impl JitFunction {
                         }
                         if !num.is_number_at(op_idx, val) {
                             a.load_rax(disp(val));
+                            if b.num {
+                                // (The slot's record of Number-only values,
+                                // `fieldrep`.)
+                                a.p_field_rep_const(
+                                    &layout,
+                                    (call_seq::r::RAX, call_seq::r::R8),
+                                    b.shape,
+                                    b.slot,
+                                    helper,
+                                );
+                            }
                             a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                         }
                         let ex = rc.sites[op_idx].filter(|_| in_spec_region);
@@ -8634,6 +8678,20 @@ impl JitFunction {
                         a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                         a.movabs_r11(s.cache_ptr as i64);
                         a.mov_eax_at_r11(layout.cache_slot_off);
+                        // The slot's record of Number-only values
+                        // (`fieldrep`), of the cached layout (the object's).
+                        a.g_load(call_seq::r::R8, call_seq::r::RBX, disp(val));
+                        a.g_load(call_seq::r::R9, call_seq::r::R11, layout.cache_shape_off);
+                        a.p_field_rep_dyn(
+                            &layout,
+                            (
+                                call_seq::r::R8,
+                                call_seq::r::R9,
+                                call_seq::r::RAX,
+                                call_seq::r::R10,
+                            ),
+                            helper,
+                        );
                         a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
                         a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
                         a.load_rdx(disp(val));

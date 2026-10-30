@@ -41,6 +41,12 @@ pub(super) struct TierUp {
     pub(super) added: Vec<Option<(Rc<Shape>, u32)>>,
     /// Every loop's `(header, last back-edge)`, ascending.
     pub(super) extents: Vec<(usize, usize)>,
+    /// Per site: whether its compiled-in layout had its slot as Number-only
+    /// (`Shape::may_be_non_number`), which a speculative loop's fast
+    /// version may rely on (`numeric::Spec::fields`): once the slot may hold
+    /// anything, that version is never entered again, and a recompilation
+    /// gives the loop one that does not rely on it.
+    pub(super) num_slots: Vec<bool>,
     /// `(pc, call cache)` of the call sites that had no callee to inline
     /// when the body was compiled ([`JitProto::note_cold_calls`]): one whose
     /// cache has since settled on a single callee is worth a recompilation
@@ -111,6 +117,7 @@ impl TierUp {
             baked,
             added,
             extents,
+            num_slots: Vec::new(),
             cold_calls: Vec::new(),
             generation: 0,
             countdown: core::cell::Cell::new(1),
@@ -211,6 +218,14 @@ impl JitProto {
         };
         t.loops[i].1.iter().any(|&(site, write)| {
             let site = site as usize;
+            // A Number-only slot the loop's code may rely on no longer is.
+            if !write
+                && t.num_slots.get(site).copied().unwrap_or(false)
+                && let Some(Some((shape, slot))) = t.baked.get(site)
+                && shape.may_be_non_number(*slot)
+            {
+                return true;
+            }
             let (Some(cache), Some(key)) = (s.caches.get(site), s.keys.get(site)) else {
                 return false;
             };

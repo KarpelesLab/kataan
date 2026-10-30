@@ -147,6 +147,13 @@ pub struct Shape {
     /// Which internal brand keys ([`BRAND_KEYS`]) the layout holds, one bit
     /// each, so "is this a wrapper / `[[IsHTMLDDA]]` object" needs no lookup.
     brands: u8,
+    /// The slots (bit `i` for slot `i < 64`) that some object with this
+    /// layout may hold a value other than a Number in: see
+    /// [`Shape::note_non_number`]. A clear bit is a promise that every
+    /// object whose shape is this one holds a Number in that slot; compiled
+    /// code reads such a slot without a type check. Bits are only ever set.
+    /// Slots from 64 on are not tracked (always "may be anything").
+    any: Cell<u64>,
 }
 
 /// The most cached children a [`Transitions`] list holds before it becomes a
@@ -200,6 +207,20 @@ impl Transitions {
                 .find(|(k, _)| k.as_ref() == key)
                 .and_then(|(_, child)| child.upgrade()),
             Transitions::Map { map, .. } => map.get(key).and_then(Weak::upgrade),
+        }
+    }
+
+    /// Calls `f` on every live cached child shape.
+    fn for_each_live(&self, mut f: impl FnMut(Rc<Shape>)) {
+        match self {
+            Transitions::None => {}
+            Transitions::One(_, child) => {
+                if let Some(c) = child.upgrade() {
+                    f(c);
+                }
+            }
+            Transitions::List(list) => list.iter().filter_map(|(_, c)| c.upgrade()).for_each(f),
+            Transitions::Map { map, .. } => map.values().filter_map(Weak::upgrade).for_each(f),
         }
     }
 
@@ -312,6 +333,7 @@ impl Shape {
             index: OnceCell::new(),
             probes: Cell::new(0),
             brands: 0,
+            any: Cell::new(0),
         })
     }
 
@@ -334,6 +356,82 @@ impl Shape {
     #[must_use]
     pub(crate) fn brands_offset() -> usize {
         core::mem::offset_of!(Shape, brands)
+    }
+
+    /// The byte offset of the [`any`](Self::may_be_non_number) slot mask (a
+    /// `u64`) within a `Shape`, read by compiled code.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn any_offset() -> usize {
+        core::mem::offset_of!(Shape, any)
+    }
+
+    /// Whether some object with this layout may hold something other than a
+    /// Number in slot `slot` (always `true` from slot 64 on, which is not
+    /// tracked). `false` is a promise for as long as it stays `false`: every
+    /// object with this layout holds a Number there.
+    #[inline]
+    #[must_use]
+    pub fn may_be_non_number(&self, slot: u32) -> bool {
+        slot >= 64 || self.any.get() & (1u64 << slot) != 0
+    }
+
+    /// The slots `i < min(len, 64)` this layout still has as Number-only
+    /// (see [`may_be_non_number`](Self::may_be_non_number)), as a bit mask.
+    #[inline]
+    #[must_use]
+    pub fn number_only_slots(&self) -> u64 {
+        let all = if self.len >= 64 {
+            !0
+        } else {
+            (1u64 << self.len) - 1
+        };
+        all & !self.any.get()
+    }
+
+    /// Records that an object with this layout now holds a value that is not
+    /// a Number in slot `slot` (or is about to). Must be called by every
+    /// write of such a value into a slot, and for every slot of an object
+    /// that takes this layout other than by adding a key to its parent's
+    /// (whose mask a child always covers).
+    ///
+    /// The mark is one-way, and it is made on every live layout descending
+    /// from this one too: an object of this layout keeps the value when it
+    /// adds a key, and a layout created later starts from its parent's
+    /// mask. (A child whose own bit is already set has, by the same rule,
+    /// marked all of its own descendants.)
+    #[inline]
+    pub fn note_non_number(&self, slot: u32) {
+        if slot < 64 {
+            self.note_non_numbers(1u64 << slot);
+        }
+    }
+
+    /// [`note_non_number`](Self::note_non_number) for every slot `i < 64`
+    /// whose bit is set in `mask`.
+    #[inline]
+    pub fn note_non_numbers(&self, mask: u64) {
+        if mask & !self.any.get() != 0 {
+            self.downgrade(mask);
+        }
+    }
+
+    /// The slow half of [`note_non_numbers`](Self::note_non_numbers): marks
+    /// `mask` here and on every live descendant that lacks it.
+    #[cold]
+    #[inline(never)]
+    fn downgrade(&self, mask: u64) {
+        self.any.set(self.any.get() | mask);
+        let mut stack: Vec<Rc<Shape>> = Vec::new();
+        self.transitions.borrow().for_each_live(|c| stack.push(c));
+        while let Some(s) = stack.pop() {
+            let missing = mask & !s.any.get();
+            if missing == 0 {
+                continue;
+            }
+            s.any.set(s.any.get() | missing);
+            s.transitions.borrow().for_each_live(|c| stack.push(c));
+        }
     }
 
     /// The byte offset of the `parent` link (an `Option<Rc<Shape>>`, one
@@ -434,6 +532,9 @@ impl Shape {
             index: OnceCell::new(),
             probes: Cell::new(0),
             brands: (self.brands & !IMPLIED_FN_ATTRS_BIT) | key_bits(&key),
+            // What may be anything in the parent's slots may be here too:
+            // an object that adds a key keeps its other values.
+            any: Cell::new(self.any.get()),
         });
         self.transitions.borrow_mut().insert(&key, &child);
         child
@@ -458,6 +559,7 @@ impl Shape {
             index: OnceCell::new(),
             probes: Cell::new(0),
             brands: (length.brands & !IMPLIED_FN_ATTRS_BIT) | IMPLIED_FN_ATTRS_BIT,
+            any: Cell::new(length.any.get()),
         })
     }
 
@@ -732,5 +834,30 @@ mod tests {
         assert_eq!(yx.lookup("x"), Some(1));
         assert_eq!(xy.keys(), ["x", "y"]);
         assert_eq!(yx.keys(), ["y", "x"]);
+    }
+
+    #[test]
+    fn non_number_marks_reach_every_live_descendant() {
+        let root = Shape::root();
+        let x = root.transition("x");
+        let xy = x.transition("y");
+        let xyz = xy.transition("z");
+        let xw = x.transition("w");
+        assert!(!xyz.may_be_non_number(0) && !xw.may_be_non_number(0));
+        // Marking `x`'s slot 0 marks every layout grown from it.
+        x.note_non_number(0);
+        for s in [&x, &xy, &xyz, &xw] {
+            assert!(s.may_be_non_number(0));
+        }
+        assert!(!xyz.may_be_non_number(1) && !xyz.may_be_non_number(2));
+        // A child made later starts from its parent's marks.
+        let xv = x.transition("v");
+        assert!(xv.may_be_non_number(0) && !xv.may_be_non_number(1));
+        // A deeper mark leaves the ancestors alone.
+        xy.note_non_numbers(0b10);
+        assert!(xyz.may_be_non_number(1) && !x.may_be_non_number(1) && !xw.may_be_non_number(1));
+        // Untracked slots always may be anything.
+        assert!(root.may_be_non_number(64) && !root.may_be_non_number(63));
+        root.note_non_number(200);
     }
 }

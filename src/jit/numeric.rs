@@ -666,6 +666,16 @@ struct Spec {
     types: Vec<u8>,
     /// The registers checked to be Numbers at the region's entry.
     checks: Vec<u16>,
+    /// The **field facts** the fast version relies on, as `(mask address,
+    /// slots)`: a property read whose layout is compiled in (which the fast
+    /// version proves, or leaves) from a slot that layout records as
+    /// Number-only (`Shape::may_be_non_number`) yields a Number, with no
+    /// type check. A record changes only in Rust code (`jit::fieldrep`),
+    /// which the fast version never runs: every entry into it (the
+    /// region's, a back-edge poll's after its call, an inner header's)
+    /// checks that the slots are still Number-only, else the plain copy
+    /// runs (`spec_globals_ready`).
+    fields: Vec<(u64, u64)>,
 }
 
 /// The helper entry points and frame facts the emitter calls into.
@@ -689,6 +699,10 @@ pub(super) struct NumEnv {
     pub(super) realm: i32,
     /// The call sequence's layout (the back-edge poll's inline test).
     pub(super) layout: super::CallLayout,
+    /// Per pc: for a `GetProp` whose layout is compiled in, and which that
+    /// layout had as a Number-only slot when compiled, the address of the
+    /// layout's may-be-non-Number mask and the slot (see [`Spec::fields`]).
+    pub(super) fields: Vec<Option<(u64, u32)>>,
 }
 
 /// A region truthiness test's receiver-cache way: its key and slot-address
@@ -979,7 +993,7 @@ impl NumGen {
         }
         let mut regions = plan_regions(ops, bytecode, catches, env.n_regs);
         for r in &mut regions {
-            r.spec = plan_spec(r, ops, bytecode, &types, env.n_regs);
+            r.spec = plan_spec(r, ops, bytecode, &types, env.n_regs, &env.fields);
         }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
@@ -1434,13 +1448,20 @@ impl NumGen {
 
     /// The entry check of speculative region `ri`'s fast version: every one
     /// of its global ops has a validated binding address (else, with
-    /// nothing promoted yet, the plain copy runs the iteration). Clobbers
-    /// nothing.
+    /// nothing promoted yet, the plain copy runs the iteration) and its
+    /// field facts ([`Spec::fields`]) still hold. Clobbers `r11` when it has
+    /// any, else nothing.
     fn spec_globals_ready(&self, a: &mut X64Assembler, ri: usize, pc: usize) -> Option<()> {
         let copy = self.copy_label(pc)?;
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
             a.jcc(CC_E, copy);
+        }
+        // The field facts ([`Spec::fields`]): still Number-only slots.
+        if let Some(sp) = &self.regions[ri].spec {
+            for &(addr, mask) in &sp.fields {
+                a.p_fields_still_numbers(addr, mask, copy);
+            }
         }
         Some(())
     }
@@ -4924,13 +4945,27 @@ fn spec_transfer(op: &Op, s: &mut [u8]) {
 ///   type guard.
 /// - A property read the fast version replaces by a copy ([`plan_reuse`])
 ///   yields the copied register's value, so it has that register's type.
-fn spec_step(op: &Op, pc: usize, reuse: &[(usize, u16)], s: &mut [u8]) {
+fn spec_step(
+    op: &Op,
+    pc: usize,
+    reuse: &[(usize, u16)],
+    fields: &[Option<(u64, u32)>],
+    s: &mut [u8],
+) {
     if let Op::GetProp { dst, .. } = op
         && let Some(&(_, src)) = reuse.iter().find(|x| x.0 == pc)
         && let Some(&t) = s.get(src as usize)
         && let Some(x) = s.get_mut(*dst as usize)
     {
         *x = t;
+        return;
+    }
+    // A Number-only slot of a compiled-in layout ([`Spec::fields`]).
+    if let Op::GetProp { dst, .. } = op
+        && fields.get(pc).is_some_and(Option::is_some)
+        && let Some(x) = s.get_mut(*dst as usize)
+    {
+        *x = T_NUM;
         return;
     }
     spec_transfer(op, s);
@@ -4970,6 +5005,7 @@ fn plan_spec(
     bytecode: &[Op],
     types: &Types,
     n_regs: usize,
+    fields: &[Option<(u64, u32)>],
 ) -> Option<Spec> {
     let (head, end) = (r.head, r.end);
     if !r.generic || r.int.is_some() || end >= ops.len() || end >= bytecode.len() {
@@ -5027,19 +5063,35 @@ fn plan_spec(
         if r.loops.is_empty() {
             for (i, op) in bytecode[head..=end].iter().enumerate() {
                 rows.extend_from_slice(&cur);
-                spec_step(op, head + i, &r.reuse, &mut cur);
+                spec_step(op, head + i, &r.reuse, fields, &mut cur);
             }
         } else {
-            cur = spec_nest_rows(r, ops, bytecode, n_regs, cur, &mut rows);
+            cur = spec_nest_rows(r, ops, bytecode, n_regs, fields, cur, &mut rows);
         }
         // `cur` is the back-edge's state: an assumed register the loop writes
         // must come back a Number.
         let before = assumed.len();
         assumed.retain(|&x| !written[x as usize] || cur[x as usize] == T_NUM);
         if assumed.len() == before {
+            let mut facts: Vec<(u64, u64)> = Vec::new();
+            for (pc, op) in bytecode.iter().enumerate().take(end + 1).skip(head) {
+                // (A read the fast version replaces by a copy reads no slot.)
+                if r.reuse.iter().any(|x| x.0 == pc) {
+                    continue;
+                }
+                if let Some(&Some((addr, slot))) = fields.get(pc)
+                    && matches!(op, Op::GetProp { .. })
+                {
+                    match facts.iter_mut().find(|f| f.0 == addr) {
+                        Some(f) => f.1 |= 1 << slot,
+                        None => facts.push((addr, 1 << slot)),
+                    }
+                }
+            }
             return Some(Spec {
                 types: rows,
                 checks: assumed,
+                fields: facts,
             });
         }
     }
@@ -5054,6 +5106,7 @@ fn spec_nest_rows(
     ops: &[GenericOp],
     bytecode: &[Op],
     n_regs: usize,
+    fields: &[Option<(u64, u32)>],
     entry: Vec<u8>,
     rows: &mut Vec<u8>,
 ) -> Vec<u8> {
@@ -5073,7 +5126,7 @@ fn spec_nest_rows(
             if cur.iter().all(|&t| t == T_BOT) && n_regs > 0 {
                 continue;
             }
-            spec_step(&bytecode[pc], pc, &r.reuse, &mut cur);
+            spec_step(&bytecode[pc], pc, &r.reuse, fields, &mut cur);
             let (falls, target) = match ops[pc] {
                 GenericOp::Jump { target } => (false, Some(target)),
                 GenericOp::JumpIfFalse { target, .. } => (true, Some(target)),
@@ -5430,7 +5483,7 @@ mod tests {
         );
         // Its speculative version assumes the sum is a Number at entry.
         let t = infer(&q.ops, q.n_regs);
-        let sp = plan_spec(r, &qops, &q.ops, &t, q.n_regs).expect("speculative");
+        let sp = plan_spec(r, &qops, &q.ops, &t, q.n_regs, &[]).expect("speculative");
         let add = pc_of(&q, |o| matches!(o, Op::AddValue { .. }));
         let Op::AddValue { a: sum, .. } = q.ops[add] else {
             unreachable!()
@@ -5445,7 +5498,7 @@ mod tests {
         let regions = plan_regions(&bops, &b.ops, &[], b.n_regs);
         assert_eq!(regions.len(), 1);
         let t = infer(&b.ops, b.n_regs);
-        assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs).is_none());
+        assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs, &[]).is_none());
     }
 
     #[test]
@@ -5550,7 +5603,7 @@ mod tests {
         let mut regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
         let types = infer(&p.ops, p.n_regs);
         let r = &mut regions[0];
-        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs);
+        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs, &[]);
         assert!(r.spec.is_some());
         let mut is_target = vec![false; p.ops.len() + 1];
         for op in &p.ops {
@@ -5613,7 +5666,7 @@ mod tests {
                 );
             }
         }
-        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs);
+        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs, &[]);
         assert!(r.spec.is_some(), "the nest has a speculative version");
         // Its inner header's live registers (its entry from the plain
         // copy): the outer object and index among them.
@@ -5651,7 +5704,7 @@ mod tests {
         assert_eq!(regions.len(), 1);
         let r = &regions[0];
         let t = infer(&p.ops, p.n_regs);
-        let sp = plan_spec(r, &ops, &p.ops, &t, p.n_regs).expect("speculative");
+        let sp = plan_spec(r, &ops, &p.ops, &t, p.n_regs, &[]).expect("speculative");
         let ty = |pc: usize, reg: u16| sp.types[(pc - r.head) * p.n_regs + reg as usize];
         let sub = pc_of(&p, |o| matches!(o, Op::Sub { .. }));
         let Op::Sub { a: x, b: y, .. } = p.ops[sub] else {
