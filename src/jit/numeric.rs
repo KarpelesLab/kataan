@@ -3627,27 +3627,32 @@ fn plan_regions(
         let mut carried: Vec<&(u16, usize, usize, u32, bool)> =
             info.iter().filter(|x| carried_r(x.0)).collect();
         carried.sort_by(|p, q| q.3.cmp(&p.3).then(p.0.cmp(&q.0)));
-        let mut slots: Vec<Slot> = Vec::new();
-        let mut free: Vec<u8> = (FIRST_XMM..FIRST_XMM + MAX_PROMOTED as u8).rev().collect();
-        for x in carried {
-            let Some(xmm) = free.pop() else { break };
-            slots.push(Slot {
-                reg: x.0,
-                xmm,
-                start: head,
-                end,
-                carried: true,
-                dirty: x.4,
-            });
-        }
-        // Body temporaries: a linear scan over their live intervals.
+        // Body temporaries, by the start of their live intervals.
         let mut temps: Vec<&(u16, usize, usize, u32, bool)> =
             info.iter().filter(|x| !carried_r(x.0)).collect();
         temps.sort_by(|p, q| p.1.cmp(&q.1).then(p.0.cmp(&q.0)));
-        let mut active: Vec<(usize, u8, u16)> = Vec::new();
-        for x in temps {
-            active.retain(|&(e, xmm, _)| {
-                if e < x.1 {
+        // One linear scan: the loop-carried registers first (their interval
+        // the whole region), then the temporaries. When the registers run
+        // out in a generic region, the interval that loses one is the one
+        // whose register buys the least (`spill_weight`): an operand that
+        // is only read, once an iteration of a long interval (an outer
+        // value an inner loop reads), costs one load from the register file
+        // where it stays, while a temporary of the inner loop's arithmetic
+        // left in memory puts a store and a reload on its dependency chain.
+        let weights = spill_weights(bytecode, head, end, &loops, &reuse);
+        let weight = |r: u16| weights.iter().find(|x| x.0 == r).map_or(0, |x| x.1);
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut free: Vec<u8> = (FIRST_XMM..FIRST_XMM + MAX_PROMOTED as u8).rev().collect();
+        // (interval end, xmm, register, interval start, carried)
+        let mut active: Vec<(usize, u8, u16, usize, bool)> = Vec::new();
+        let ordered = carried
+            .iter()
+            .map(|x| (*x, true))
+            .chain(temps.iter().map(|x| (*x, false)));
+        for (x, is_carried) in ordered {
+            let (start, stop) = if is_carried { (head, end) } else { (x.1, x.2) };
+            active.retain(|&(e, xmm, ..)| {
+                if e < start {
                     free.push(xmm);
                     false
                 } else {
@@ -3659,9 +3664,12 @@ fn plan_regions(
             // Generic regions only (no integer version shadows the slots).
             let mut reuse = None;
             if generic
+                && !is_carried
                 && let Op::Move { dst, src } = bytecode[x.1]
                 && dst == x.0
-                && let Some(i) = active.iter().position(|&(e, _, r)| r == src && e == x.1)
+                && let Some(i) = active
+                    .iter()
+                    .position(|&(e, _, r, ..)| r == src && e == x.1)
             {
                 reuse = Some(active.remove(i).1);
             }
@@ -3672,32 +3680,59 @@ fn plan_regions(
             // last, `NumGen::reload`), so the operand's value is intact
             // wherever one stores it.
             if generic
+                && !is_carried
                 && reuse.is_none()
                 && let Some((p, q, commutes)) = float_bin_operands(&ops[x.1], x.0)
             {
                 let ends = |r: u16| {
                     active
                         .iter()
-                        .position(|&(e, _, ar)| ar == r && e == x.1 && r != x.0)
+                        .position(|&(e, _, ar, ..)| ar == r && e == x.1 && r != x.0)
                 };
                 if let Some(i) = ends(p).or_else(|| if commutes { ends(q) } else { None }) {
                     reuse = Some(active.remove(i).1);
                 }
             }
-            let xmm = match reuse {
-                Some(m) => m,
-                None => {
-                    let Some(m) = free.pop() else { continue };
+            let xmm = match (reuse, free.pop()) {
+                (Some(m), f) => {
+                    free.extend(f);
                     m
                 }
+                (None, Some(m)) => m,
+                // Out of registers: in a generic region the active interval
+                // whose register buys the least gives it up, unless that is
+                // this one (an interval only ever holds one register, from
+                // its start to its end, so the loser stays in memory).
+                (None, None) if generic => {
+                    let w = |r: u16, a: usize, b: usize| {
+                        weight(r).saturating_mul(1024) / (b.saturating_sub(a) as u64 + 1)
+                    };
+                    let mine = w(x.0, start, stop);
+                    let victim = active
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(e, _, r, s0, _))| (w(r, s0, e), core::cmp::Reverse(e), i))
+                        .min();
+                    match victim {
+                        Some((vw, core::cmp::Reverse(ve), i))
+                            if vw < mine || (vw == mine && ve > stop) =>
+                        {
+                            let (_, m, vr, vs, _) = active.remove(i);
+                            slots.retain(|s| !(s.reg == vr && s.start == vs));
+                            m
+                        }
+                        _ => continue,
+                    }
+                }
+                (None, None) => continue,
             };
-            active.push((x.2, xmm, x.0));
+            active.push((stop, xmm, x.0, start, is_carried));
             slots.push(Slot {
                 reg: x.0,
                 xmm,
-                start: x.1,
-                end: x.2,
-                carried: false,
+                start,
+                end: stop,
+                carried: is_carried,
                 dirty: x.4,
             });
         }
@@ -3728,6 +3763,37 @@ fn plan_regions(
         });
     }
     out
+}
+
+/// What keeping each register of region `head..=end` in an SSE register is
+/// worth ([`plan_regions`]' spill choice): its mentions in the region (and
+/// the reads [`plan_reuse`] turns into copies of it), each weighted by how
+/// often it runs: 8x per inner loop of a nest (`loops`) around it.
+fn spill_weights(
+    bytecode: &[Op],
+    head: usize,
+    end: usize,
+    loops: &[(usize, usize)],
+    reuse: &[(usize, u16)],
+) -> Vec<(u16, u64)> {
+    let mut w: Vec<(u16, u64)> = Vec::new();
+    let add = |w: &mut Vec<(u16, u64)>, r: u16, pc: usize| {
+        let depth = loops.iter().filter(|&&(h, e)| h <= pc && pc <= e).count();
+        let k = 8u64.saturating_pow(depth.min(6) as u32);
+        match w.iter_mut().find(|x| x.0 == r) {
+            Some(x) => x.1 = x.1.saturating_add(k),
+            None => w.push((r, k)),
+        }
+    };
+    for (pc, op) in bytecode.iter().enumerate().take(end + 1).skip(head) {
+        for r in op_regs(op) {
+            add(&mut w, r, pc);
+        }
+    }
+    for &(pc, src) in reuse {
+        add(&mut w, src, pc);
+    }
+    w
 }
 
 /// Grows the innermost candidate loops `cands` into **loop nests**: an outer
@@ -4634,6 +4700,55 @@ mod tests {
         assert_eq!(regions.len(), 1);
         let t = infer(&b.ops, b.n_regs);
         assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs).is_none());
+    }
+
+    #[test]
+    fn spills_favour_the_inner_loops_arithmetic() {
+        // More values live across the inner loop than there are SSE
+        // registers: the outer loop's read-only values (and its
+        // accumulators) give theirs up, the inner loop's arithmetic keeps
+        // them (each temporary of `dx*dx + dy*dy + ...` in a register).
+        let p = proto_of(
+            "function f(bs, dt){ for (let i = 0; i < bs.length; i = i + 1) { const a = bs[i]; \
+             const ax = a.x, ay = a.y, az = a.z, am = a.m, aw = a.w, au = a.u; \
+             let avx = a.vx, avy = a.vy, avz = a.vz; \
+             for (let j = i + 1; j < bs.length; j = j + 1) { const b = bs[j]; \
+             const dx = ax - b.x, dy = ay - b.y, dz = az - b.z; \
+             const d2 = dx * dx + dy * dy + dz * dz + aw * au; \
+             const mag = dt / (d2 * d2); \
+             avx = avx - dx * b.m * mag; avy = avy - dy * b.m * mag; avz = avz - dz * b.m * mag; \
+             b.vx = b.vx + dx * am * mag; } a.vx = avx; a.vy = avy; a.vz = avz; } }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        let r = regions
+            .iter()
+            .find(|r| !r.loops.is_empty())
+            .expect("one nest");
+        let (h, e) = r.loops[0];
+        let promoted = |reg: u16| r.slots.iter().any(|s| s.reg == reg);
+        // Every product of the inner body is promoted.
+        let products: Vec<u16> = (h..=e)
+            .filter_map(|pc| match p.ops[pc] {
+                Op::Mul { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect();
+        assert!(products.len() >= 8);
+        for d in &products {
+            assert!(promoted(*d), "inner product r{d} promoted");
+        }
+        // The registers still fit: no two live slots share an SSE register.
+        for x in &r.slots {
+            for y in &r.slots {
+                if x.reg != y.reg && x.xmm == y.xmm {
+                    assert!(
+                        x.end < y.start || y.end < x.start || x.end == y.start || y.end == x.start
+                    );
+                }
+            }
+        }
     }
 
     #[test]
