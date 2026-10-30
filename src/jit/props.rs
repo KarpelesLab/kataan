@@ -1659,6 +1659,62 @@ impl X64Assembler {
         }
     }
 
+    /// `movq [base + disp32], xmm(x)` (`base` neither `rsp` nor `r12`).
+    fn p_movq_mem_x(&mut self, base: u8, disp: i32, x: u8) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        self.raw(&[
+            0x66,
+            0x48 | (((x >> 3) & 1) << 2) | ((base >> 3) & 1),
+            0x0f,
+            0x7e,
+        ]);
+        self.raw(&[0x80 | ((x & 7) << 3) | (base & 7)]);
+        self.raw(&disp.to_le_bytes());
+    }
+
+    /// The store twin of
+    /// [`p_obj_fixed_slot_ex_xmm`](Self::p_obj_fixed_slot_ex_xmm): slot
+    /// `slot` = the bits of `xmm(x)` (a promoted Number), with the same
+    /// addressing (`ex`: the frame slot caching the object's `extra`
+    /// pointer, `have`: it holds this object's). Returns whether the frame
+    /// slot then holds the object's `extra` pointer. Clobbers `r11`.
+    pub(crate) fn p_obj_fixed_slot_store_xmm(
+        &mut self,
+        l: &JitLayout,
+        slot: u32,
+        ex: Option<i32>,
+        have: bool,
+        x: u8,
+    ) -> bool {
+        match (Self::fixed_slot(l, slot), ex) {
+            (FixedSlot::Inline(disp), _) => {
+                self.p_movq_mem_x(r::RCX, disp, x);
+                have
+            }
+            (FixedSlot::Near(disp), Some(ex)) => {
+                if have {
+                    self.g_load(r::R11, r::RBP, ex);
+                } else {
+                    self.g_load(r::R11, r::RCX, l.props.off_extra);
+                    self.g_store(r::RBP, ex, r::R11);
+                }
+                self.p_movq_mem_x(r::R11, disp, x);
+                true
+            }
+            (FixedSlot::Near(disp), None) => {
+                self.g_load(r::R11, r::RCX, l.props.off_extra);
+                self.p_movq_mem_x(r::R11, disp, x);
+                false
+            }
+            (FixedSlot::Far(disp), _) => {
+                self.g_load(r::R11, r::RCX, l.props.off_extra);
+                self.g_load(r::R11, r::R11, l.extra_far_ptr);
+                self.p_movq_mem_x(r::R11, disp, x);
+                have
+            }
+        }
+    }
+
     /// Where slot `slot` lives (see [`FixedSlot`]).
     fn fixed_slot(l: &JitLayout, slot: u32) -> FixedSlot {
         const INLINE: u32 = crate::object::INLINE_SLOTS as u32;

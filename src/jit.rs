@@ -7125,6 +7125,18 @@ impl JitFunction {
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
                     let si = sites.get(site as usize)?;
                     let done = a.new_label();
+                    // A one-argument inline `Math.f(x)`'s promoted argument
+                    // (`NumGen::operand_xmm`; else in the register file).
+                    let arg_x = match bytecode.get(op_idx)? {
+                        crate::nbvm::Op::CallMethod { args: margs, .. }
+                            if margs.len() == 1 && (margs[0] as usize) < n_regs =>
+                        {
+                            let inline = inline_math(bytecode.get(op_idx)?).is_some()
+                                && !si.method_ptr.is_null();
+                            num.operand_xmm(&mut a, op_idx, margs[0], inline)
+                        }
+                        _ => None,
+                    };
                     // `Math.f(x)` with the built-in `f`, inline: the site's
                     // chain cache finds the method, which must be that very
                     // built-in, and a Number argument is computed in place.
@@ -7249,13 +7261,34 @@ impl JitFunction {
                         } else if let MathInline::Abs = f {
                             // The sign bit cleared (a NaN argument is already
                             // the canonical one, whose sign is clear).
-                            a.load_rax(disp(x));
+                            match arg_x {
+                                Some(ax) => numeric::NumGen::gpr_from_xmm(&mut a, 0, ax),
+                                None => a.load_rax(disp(x)),
+                            }
                             a.g_movabs(call_seq::r::R11, i64::MAX as u64);
                             a.g_and(call_seq::r::RAX, call_seq::r::R11);
                             a.store_rax(disp(dst));
                             a.jmp(done);
+                        } else if let (MathInline::Sqrt, Some(ax), Some(xr)) =
+                            (f, arg_x, num.result_xmm(op_idx, dst))
+                        {
+                            // A promoted argument and result: straight from
+                            // one SSE register into the other (the NaN path
+                            // stores the canonical NaN, which the slow paths'
+                            // reload then brings into it).
+                            let past = a.new_label();
+                            numeric::NumGen::sqrt_xmm(&mut a, xr, ax, nan);
+                            a.jmp(past);
+                            past_reload = Some(past);
+                            a.bind(nan);
+                            a.movabs_rax(canonical_nan as i64);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
                         } else {
-                            a.movsd_xmm0_mem(disp(x));
+                            match arg_x {
+                                Some(ax) => numeric::NumGen::xmm0_from_xmm(&mut a, ax),
+                                None => a.movsd_xmm0_mem(disp(x)),
+                            }
                             match f {
                                 MathInline::Round(mode) => a.roundsd_xmm0(mode),
                                 MathInline::MaxMin(_) => return None,
@@ -7768,7 +7801,12 @@ impl JitFunction {
                             a.cmp_rax_r11();
                             a.je(slow);
                             recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
-                            int_index!(iter, slow, true);
+                            // The cursor's truncation, as `iter_fast::step`
+                            // takes it (it is always an exact index there; a
+                            // NaN's "indefinite" is negative: the end path's
+                            // sign test sends it to the interpreter).
+                            a.movsd_xmm0_mem(disp(iter));
+                            a.cvttsd2si_rax_xmm0();
                             a.p_arr_len_ptr(&layout);
                             a.cmp_rax_r8();
                             let end = a.new_label();
@@ -7783,7 +7821,9 @@ impl JitFunction {
                             // array's length).
                             numeric::NumGen::inc_r8_to_xmm0(&mut a);
                             a.movsd_mem_xmm0(disp(iter));
-                            a.jmp(fin);
+                            // Straight into the loop body when the `!done`
+                            // test after the step is known to pass.
+                            a.jmp(num.iter_step_body(&labels, op_idx).unwrap_or(fin));
                             // The end (`index >= length`, the length the
                             // plain array's element count): latch `done`, and
                             // the step's value is `undefined`, as
@@ -8246,6 +8286,11 @@ impl JitFunction {
                     // path, an add, another layout than the compiled-in one
                     // (a known site's way must keep proving it).
                     let bail = num.spec_bail(&mut a, op_idx);
+                    // A promoted value: the in-place stores below take it
+                    // from its SSE register (every other path of the fast
+                    // version leaves for the plain copy), or it is stored to
+                    // the register file first (`NumGen::operand_xmm`).
+                    let val_x = num.operand_xmm(&mut a, op_idx, val, true);
                     // A known site of the fast version whose flags test is
                     // proven, storing a Number through the frame's `extra`
                     // pointer, never reads the heap slot (`rcx`).
@@ -8345,9 +8390,25 @@ impl JitFunction {
                             a.load_rax(disp(val));
                             a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
                         }
-                        a.load_rdx(disp(val));
-                        match rc.sites[op_idx].filter(|_| in_spec_region) {
-                            Some(p) => {
+                        let ex = rc.sites[op_idx].filter(|_| in_spec_region);
+                        if val_x.is_none() {
+                            a.load_rdx(disp(val));
+                        }
+                        match (ex, val_x) {
+                            (Some(p), Some(x)) => {
+                                let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
+                                extra_in_frame[op_idx] = a.p_obj_fixed_slot_store_xmm(
+                                    &layout,
+                                    b.slot,
+                                    Some(rc_extra(p.way)),
+                                    have,
+                                    x,
+                                );
+                            }
+                            (None, Some(x)) => {
+                                a.p_obj_fixed_slot_store_xmm(&layout, b.slot, None, false, x);
+                            }
+                            (Some(p), None) => {
                                 let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
                                 extra_in_frame[op_idx] = a.p_obj_fixed_slot_ex(
                                     &layout,
@@ -8357,7 +8418,7 @@ impl JitFunction {
                                     have,
                                 );
                             }
-                            None => a.p_obj_fixed_slot_store(&layout, b.slot),
+                            (None, None) => a.p_obj_fixed_slot_store(&layout, b.slot),
                         }
                         a.jmp(stored);
                         cold = Some(a.cold_begin());
@@ -8385,7 +8446,10 @@ impl JitFunction {
                         let spill = a.new_label();
                         a.mov_eax_at_r11(layout.cache_slot_off);
                         a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
-                        a.load_rdx(disp(val));
+                        match val_x {
+                            Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x),
+                            None => a.load_rdx(disp(val)),
+                        }
                         a.p_obj_slot_store_inline(&layout, helper, spill);
                         a.jmp(done);
                         a.bind(spill);
@@ -8471,7 +8535,10 @@ impl JitFunction {
                     if !ok(dst) || !ok(obj) || !ok(index) {
                         return None;
                     }
-                    let helper = a.new_label();
+                    // (In a speculative loop's fast version every miss
+                    // leaves for the plain copy, which runs the op.)
+                    let bail = num.spec_bail(&mut a, op_idx);
+                    let helper = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
                     // ===== inline dense-array element GET fast path =====
                     // Receiver cell tag == Array, index an exact non-negative
@@ -8480,14 +8547,23 @@ impl JitFunction {
                     // prototype chain). Everything else → `jit_helper_get_elem`.
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Arr);
                     // (A promoted loop's index may be in its SSE register.)
+                    // An index proven integral needs no exactness test: its
+                    // truncation is its value, or (NaN, ±∞, past `i64`) the
+                    // "indefinite" integer, which the bounds check rejects.
+                    let integral = num.is_integral_at(op_idx, index);
                     let index_x = num.result_xmm(op_idx, index);
                     match index_x {
+                        Some(x) if integral => numeric::NumGen::trunc_from_xmm(&mut a, x),
                         Some(x) => numeric::NumGen::index_from_xmm(
                             &mut a,
                             x,
                             !num.is_number_at(op_idx, index),
                             helper,
                         ),
+                        None if integral => {
+                            a.movsd_xmm0_mem(disp(index));
+                            a.cvttsd2si_rax_xmm0();
+                        }
                         None => int_index!(index, helper, num.is_number_at(op_idx, index)),
                     }
                     a.p_arr_len_ptr(&layout);
@@ -8500,29 +8576,33 @@ impl JitFunction {
                     if let Some(x) = num.result_xmm(op_idx, dst) {
                         let past = a.new_label();
                         numeric::NumGen::set_xmm_from_rax(&mut a, x);
-                        a.jmp(past);
-                        past_reload = Some(past);
+                        if bail.is_some() {
+                            // No slow path rejoins: nothing to reload.
+                            ool_past = Some(past);
+                        } else {
+                            a.jmp(past);
+                            past_reload = Some(past);
+                        }
                     } else {
                         a.store_rax(disp(dst));
-                        a.jmp(done);
+                        if bail.is_none() {
+                            a.jmp(done);
+                        }
                     }
-                    // jit_helper_get_elem(ctx, recv, key) (or, in a
-                    // speculative loop's fast version, its plain copy).
-                    let bail = num.spec_bail(&mut a, op_idx);
-                    a.bind(helper);
-                    if let Some(b) = bail {
-                        a.jmp(b);
+                    // jit_helper_get_elem(ctx, recv, key).
+                    if bail.is_none() {
+                        a.bind(helper);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(obj));
+                        match index_x {
+                            Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
+                            None => a.load_argreg(2, disp(index)),
+                        }
+                        a.movabs_rax(get_elem_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                        a.store_rax(disp(dst));
                     }
-                    a.mov_rdi_r15();
-                    a.load_argreg(1, disp(obj));
-                    match index_x {
-                        Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
-                        None => a.load_argreg(2, disp(index)),
-                    }
-                    a.movabs_rax(get_elem_helper as i64);
-                    a.call_rax();
-                    throw_check!();
-                    a.store_rax(disp(dst));
                     a.bind(done);
                 }
                 GenericOp::SetElem {

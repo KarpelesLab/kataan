@@ -258,8 +258,222 @@ fn successors(op: &Op, pc: usize, out: &mut Vec<usize>) {
     }
 }
 
+/// The integrality facts ([`infer_integral`]): a register is [`I_INT`] at a
+/// pc when it surely holds a Number whose value has no fractional part (an
+/// integer, `-0`, NaN or ±∞), [`T_ANY`] otherwise.
+pub(super) const I_INT: u8 = 1;
+
+/// Calls `f` with every register `op` may write (as [`transfer`] models
+/// them: an op it does not list may write any register it names).
+fn for_each_write(op: &Op, f: &mut dyn FnMut(u16)) {
+    match op {
+        Op::LoadConst { dst, .. }
+        | Op::Move { dst, .. }
+        | Op::Sub { dst, .. }
+        | Op::Mul { dst, .. }
+        | Op::Div { dst, .. }
+        | Op::Mod { dst, .. }
+        | Op::ValueBin { dst, .. }
+        | Op::Add { dst, .. }
+        | Op::AddValue { dst, .. }
+        | Op::Lt { dst, .. }
+        | Op::StrictEq { dst, .. }
+        | Op::Not { dst, .. }
+        | Op::PlainPrims { dst, .. }
+        | Op::Compare { dst, .. }
+        | Op::ToNumeric { dst, .. }
+        | Op::Step { dst, .. }
+        | Op::Neg { dst, .. }
+        | Op::BitNot { dst, .. }
+        | Op::GetProp { dst, .. }
+        | Op::GetMethod { dst, .. }
+        | Op::GetKey { dst, .. }
+        | Op::GetElem { dst, .. }
+        | Op::ArrayLen { dst, .. }
+        | Op::CallNative { dst, .. }
+        | Op::Call { dst, .. }
+        | Op::CallMethod { dst, .. }
+        | Op::CallWithMethod { dst, .. }
+        | Op::LoadGlobal { dst, .. }
+        | Op::TypeOf { dst, .. } => f(*dst),
+        Op::IterNext {
+            dst, done, iter, ..
+        } => {
+            f(*dst);
+            f(*done);
+            f(*iter);
+        }
+        Op::InlineGuard {
+            dst, caps, n_caps, ..
+        } => {
+            f(*dst);
+            for i in 0..*n_caps {
+                f(caps.wrapping_add(i));
+            }
+        }
+        Op::SetProp { .. }
+        | Op::SetPropStrict { .. }
+        | Op::SetKey { .. }
+        | Op::SetKeyStrict { .. }
+        | Op::SetElem { .. }
+        | Op::StoreGlobal { .. }
+        | Op::InitProp { .. }
+        | Op::InitGlobal { .. }
+        | Op::CheckTdz { .. }
+        | Op::RequireObjectCoercible { .. }
+        | Op::PushHandler { .. }
+        | Op::PopHandler
+        | Op::InlineLeave
+        | Op::Jump { .. }
+        | Op::JumpIfFalse { .. }
+        | Op::Return { .. }
+        | Op::Throw { .. } => {}
+        _ => {
+            for r in op_regs(op) {
+                f(r);
+            }
+        }
+    }
+}
+
 /// Infers the register types of `ops` (see the module docs).
 pub(super) fn infer(ops: &[Op], n_regs: usize) -> Types {
+    infer_with(ops, n_regs, &transfer)
+}
+
+/// The integrality facts of `ops` ([`I_INT`]), for the registers that may
+/// reach an element read's index (the only consumer): those indices, and
+/// the operands of the ops below that write a tracked register.
+pub(super) struct Ints {
+    /// Per register: its column, or `u32::MAX` (untracked: [`T_ANY`]).
+    col: Vec<u32>,
+    facts: Types,
+}
+
+impl Ints {
+    /// The fact of register `r` on entry to op `pc`.
+    pub(super) fn get(&self, pc: usize, r: u16) -> u8 {
+        match self.col.get(r as usize) {
+            Some(&c) if c != u32::MAX => self.facts.get(pc, c as u16),
+            _ => T_ANY,
+        }
+    }
+}
+
+/// Infers [`Ints`]: an integral constant, a copy, `+` / `-` / `*` / `%` /
+/// unary `-` / `++` / `--` over integral Numbers (whose result is an
+/// integer, or NaN / ±∞ past the exact range), and a bitwise op with an
+/// integral operand (a Number, so no BigInt result: mixing one in throws)
+/// are integral; anything else written is not.
+pub(super) fn infer_integral(ops: &[Op], n_regs: usize) -> Ints {
+    use crate::nbvm::{VB_BIT_AND, VB_USHR};
+    // The int-producing ops' operands: (dst, operands).
+    let feeds = |op: &Op| -> Option<(u16, [Option<u16>; 2])> {
+        match *op {
+            Op::Move { dst, src }
+            | Op::ToNumeric { dst, src }
+            | Op::Step { dst, src, .. }
+            | Op::Neg { dst, a: src } => Some((dst, [Some(src), None])),
+            Op::Add { dst, a, b }
+            | Op::AddValue { dst, a, b }
+            | Op::Sub { dst, a, b }
+            | Op::Mul { dst, a, b }
+            | Op::Mod { dst, a, b } => Some((dst, [Some(a), Some(b)])),
+            Op::ValueBin { dst, op, a, b } if (VB_BIT_AND..=VB_USHR).contains(&op) => {
+                Some((dst, [Some(a), Some(b)]))
+            }
+            _ => None,
+        }
+    };
+    let mut col = vec![u32::MAX; n_regs];
+    let mut k = 0u32;
+    let track = |r: u16, col: &mut Vec<u32>, k: &mut u32| -> bool {
+        match col.get_mut(r as usize) {
+            Some(c) if *c == u32::MAX => {
+                *c = *k;
+                *k += 1;
+                true
+            }
+            _ => false,
+        }
+    };
+    for op in ops {
+        if let Op::GetKey { key, .. } = op {
+            track(*key, &mut col, &mut k);
+        }
+    }
+    let mut changed = k > 0;
+    while changed {
+        changed = false;
+        for op in ops {
+            if let Some((d, srcs)) = feeds(op)
+                && col.get(d as usize).is_some_and(|&c| c != u32::MAX)
+            {
+                for r in srcs.into_iter().flatten() {
+                    changed |= track(r, &mut col, &mut k);
+                }
+            }
+        }
+    }
+    if k == 0 {
+        return Ints {
+            col,
+            facts: Types {
+                n_regs: 0,
+                st: Vec::new(),
+            },
+        };
+    }
+    let c = |r: u16| {
+        col.get(r as usize)
+            .copied()
+            .filter(|&c| c != u32::MAX)
+            .map(|c| c as usize)
+    };
+    let step = |op: &Op, s: &mut [u8]| {
+        let t = |s: &[u8], r: u16| c(r).map_or(T_ANY, |i| s[i]);
+        let int_if = |b: bool| if b { I_INT } else { T_ANY };
+        let v = match op {
+            Op::LoadConst { value, .. } => Some(int_if(
+                value
+                    .as_number()
+                    .is_some_and(|n| n.is_nan() || n == n.trunc()),
+            )),
+            Op::Move { src, .. } => Some(t(s, *src)),
+            Op::ValueBin { op: vop, a, b, .. } if (VB_BIT_AND..=VB_USHR).contains(vop) => Some(
+                int_if(*vop == VB_USHR || t(s, *a) == I_INT || t(s, *b) == I_INT),
+            ),
+            _ => match feeds(op) {
+                Some((_, [Some(a), Some(b)])) => Some(int_if(t(s, a) == I_INT && t(s, b) == I_INT)),
+                Some((_, [Some(a), None])) => Some(int_if(t(s, a) == I_INT)),
+                _ => None,
+            },
+        };
+        let dst = match op {
+            Op::LoadConst { dst, .. } => Some(*dst),
+            _ => feeds(op).map(|f| f.0),
+        };
+        match (dst, v) {
+            (Some(d), Some(v)) => {
+                if let Some(i) = c(d) {
+                    s[i] = v;
+                }
+            }
+            _ => for_each_write(op, &mut |r| {
+                if let Some(i) = c(r) {
+                    s[i] = T_ANY;
+                }
+            }),
+        }
+    };
+    let facts = infer_with(ops, k as usize, &step);
+    Ints { col, facts }
+}
+
+/// The forward analysis [`infer`] and [`infer_integral`] run, over the
+/// `transfer` function of their lattice ([`T_BOT`] below every fact,
+/// [`T_ANY`] above).
+fn infer_with(ops: &[Op], n_regs: usize, transfer: &dyn Fn(&Op, &mut [u8])) -> Types {
     let n = ops.len();
     if n == 0 || n_regs == 0 || (n + 1).saturating_mul(n_regs) > MAX_STATE {
         return Types {
@@ -441,6 +655,17 @@ enum StubKind {
     /// `xmm x` is NaN-patterned: to `slow` unless it is a Number (a NaN),
     /// else resume (no call).
     NanCheck { x: u8, slow: Label },
+    /// An arithmetic result in `xmm x` is a NaN (see `float_bin`): to
+    /// `slow` if one of `regs` is not a Number, else resume — with the NaN
+    /// made canonical when `canon` (no call).
+    DeferNan {
+        x: u8,
+        regs: [Option<u16>; 2],
+        slow: Label,
+        canon: bool,
+        /// First `xmm x = xmm0` (the value the op's result replaced).
+        restore: bool,
+    },
     /// Leave the region: flush, then jump to bytecode pc `target`.
     Exit { target: usize },
     /// A global op at `pc` found no validated binding address: validate it
@@ -473,6 +698,8 @@ struct Stub {
 /// The per-compilation state of the numeric emitter.
 pub(super) struct NumGen {
     types: Types,
+    /// The integrality facts ([`infer_integral`]).
+    ints: Ints,
     regions: Vec<Region>,
     /// Per pc: the region it belongs to (`u32::MAX` for none).
     region_of: Vec<u32>,
@@ -636,6 +863,7 @@ impl NumGen {
     ) -> Self {
         let n = ops.len();
         let types = infer(bytecode, env.n_regs);
+        let ints = infer_integral(bytecode, env.n_regs);
         let mut is_target = vec![false; n + 1];
         let mut mentions = vec![0u32; env.n_regs];
         for op in bytecode {
@@ -689,6 +917,7 @@ impl NumGen {
         }
         Self {
             types,
+            ints,
             regions,
             region_of,
             is_target,
@@ -1715,6 +1944,29 @@ impl NumGen {
             .map(|s| s.xmm)
     }
 
+    /// For a generic region op `pc` that may read operand `r` from an SSE
+    /// register (a `SetProp`'s value, an inline `Math.f(x)`'s argument: see
+    /// `plan_regions`): the register, when `r` is promoted there and the op
+    /// is in a speculative fast version with `r` a Number — every path of
+    /// the op but its inline one then leaves for the plain copy, through a
+    /// flush that stores `r`. Otherwise `r` (if promoted) is first stored
+    /// to the register file, which every path of the op then reads.
+    /// (`inline`: whether the op's code has its inline path at all.)
+    pub(super) fn operand_xmm(
+        &self,
+        a: &mut X64Assembler,
+        pc: usize,
+        r: u16,
+        inline: bool,
+    ) -> Option<u8> {
+        let x = self.result_xmm(pc, r)?;
+        if inline && self.in_spec(pc) && self.copy_label(pc).is_some() && self.is_number_at(pc, r) {
+            return Some(x);
+        }
+        a.movsd_mem_x(disp(r), x);
+        None
+    }
+
     /// Whether register `r` provably holds a Number on entry to op `pc` (in
     /// a speculative region, under its speculation).
     pub(super) fn is_number_at(&self, pc: usize, r: u16) -> bool {
@@ -1755,6 +2007,50 @@ impl NumGen {
         r.reuse.iter().find(|x| x.0 == pc).map(|x| x.1)
     }
 
+    /// For an array iteration's step `pc` (`IterNext`) followed by the
+    /// loop test `t = !done; if (!t) goto exit`: where the step's
+    /// present-element path continues, the test skipped — that path leaves
+    /// `done` as it found it, `false` (the step tests it is not `true`, and
+    /// it is provably a boolean), so `t` is `true` and the branch falls
+    /// through. Only when nothing else names `t` (dead past the branch),
+    /// nothing branches to the test, and the loop body (`pc + 3`) lies in
+    /// the same region (or both in none): the label in the version being
+    /// emitted.
+    pub(super) fn iter_step_body(&self, labels: &[Label], pc: usize) -> Option<Label> {
+        let (
+            Some(&Op::IterNext { done, .. }),
+            Some(&Op::Not { dst: t, a }),
+            Some(&Op::JumpIfFalse { cond, .. }),
+        ) = (self.bc(pc), self.bc(pc + 1), self.bc(pc + 2))
+        else {
+            return None;
+        };
+        if a != done
+            || cond != t
+            || t == done
+            || self.mentions.get(t as usize).copied() != Some(2)
+            || self.is_target.get(pc + 1).copied().unwrap_or(true)
+            || self.is_target.get(pc + 2).copied().unwrap_or(true)
+            || !self.is_bool_at(pc, done)
+            || pc + 3 >= self.region_of.len()
+            || self.region_of[pc] != self.region_of[pc + 3]
+        {
+            return None;
+        }
+        // (No promoted register the step writes, which `after_generic`
+        // would reload after it.)
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        def_use(self.bc(pc)?, &mut d, &mut u);
+        if d.iter().any(|&r| self.result_xmm(pc, r).is_some()) {
+            return None;
+        }
+        if self.copy {
+            self.copy_label(pc + 3)
+        } else {
+            labels.get(pc + 3).copied()
+        }
+    }
+
     /// Whether register `r` provably holds a boolean on entry to op `pc` (in
     /// a speculative region, under its speculation).
     pub(super) fn is_bool_at(&self, pc: usize, r: u16) -> bool {
@@ -1791,6 +2087,18 @@ impl NumGen {
         a.jcc(CC_P, miss);
     }
 
+    /// `rax` = the truncation of the Number in `xmm x` (an element read's
+    /// promoted index proven integral, `is_integral_at`).
+    pub(super) fn trunc_from_xmm(a: &mut X64Assembler, x: u8) {
+        a.cvttsd2si_gpr_x(RAX, x);
+    }
+
+    /// Whether register `r` surely holds an integral Number on entry to op
+    /// `pc` ([`I_INT`]).
+    pub(super) fn is_integral_at(&self, pc: usize, r: u16) -> bool {
+        self.ints.get(pc, r) == I_INT
+    }
+
     /// `gpr = xmm x` (the bits; `gpr` one of `rax`/`rcx`/`rdx`).
     pub(super) fn gpr_from_xmm(a: &mut X64Assembler, gpr: u8, x: u8) {
         a.movq_gpr_x(gpr, x);
@@ -1799,6 +2107,18 @@ impl NumGen {
     /// `xmm = (f64) rax`.
     pub(super) fn set_xmm_from_int_rax(a: &mut X64Assembler, x: u8) {
         a.cvtsi2sd_x_gpr(x, RAX);
+    }
+
+    /// `xmm0 = xmm x`.
+    pub(super) fn xmm0_from_xmm(a: &mut X64Assembler, x: u8) {
+        a.movapd_xx(0, x);
+    }
+
+    /// `xmm d = sqrt(xmm s)`, then to `nan` if that is a NaN.
+    pub(super) fn sqrt_xmm(a: &mut X64Assembler, d: u8, s: u8, nan: Label) {
+        a.sse_rr(0xf2, 0x51, d, s); // sqrtsd d, s
+        a.sse_rr(0x66, 0x2e, d, d); // ucomisd d, d
+        a.jcc(CC_P, nan);
     }
 
     /// `xmm = xmm0`.
@@ -1967,9 +2287,13 @@ impl NumGen {
             return;
         }
         let pc = self.cur_pc;
-        for s in &self.regions[ri].slots {
-            if s.start <= pc && pc <= s.end {
-                a.movsd_x_mem(s.xmm, disp(s.reg));
+        // A temporary op `pc` defines last: it may share its SSE register
+        // with an operand that ends at `pc` (`plan_regions`).
+        for first in [true, false] {
+            for s in &self.regions[ri].slots {
+                if s.start <= pc && pc <= s.end && (s.start != pc || s.carried) == first {
+                    a.movsd_x_mem(s.xmm, disp(s.reg));
+                }
             }
         }
     }
@@ -2122,10 +2446,78 @@ impl NumGen {
         let resume = a.new_label();
         let guarded = self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM;
         let stub = a.new_label();
-        if guarded {
+        // An operand not proven a Number is checked *after* the arithmetic,
+        // through the result: a NaN-boxed value (anything but a Number) is
+        // a NaN to the hardware, so the result of any operation on it is a
+        // NaN, and only then (out of line, `StubKind::DeferNan`) are the
+        // operands looked at — one that is not a Number takes the slow
+        // path, which runs the op from scratch (the operands are intact:
+        // the result is computed where no operand lives); else the NaN is a
+        // Number's, made canonical. The test doubles as the result's NaN
+        // canonicalization.
+        let defer = guarded && self.imode.is_none();
+        if guarded && !defer {
             self.guard_numbers(a, pc, reg, x, y, stub);
         }
+        let unproven = |s: &Self, r: u16| (s.ty(pc, r) != T_NUM).then_some(r);
+        let (ux, uy) = (unproven(self, x), unproven(self, y).filter(|&r| r != x));
         match self.xmm_of(reg, dst) {
+            Some(xd) if defer => {
+                let (xx, xy) = (self.xmm_of(reg, x), self.xmm_of(reg, y));
+                // Computed in its own register. When that holds a value a
+                // slow path still needs (an operand's, or the register's
+                // own before this op), the value is first saved in `xmm0`,
+                // which the check's stub puts back (the result is then a
+                // NaN anyway); a non-commuting op into its second operand's
+                // register goes through `xmm0` instead.
+                let fresh = reg.is_some_and(|ri| {
+                    self.regions[ri]
+                        .slots
+                        .iter()
+                        .any(|s| s.reg == dst && s.start == pc && !s.carried && s.xmm == xd)
+                }) && xx != Some(xd)
+                    && xy != Some(xd);
+                let commutes = opc == 0x58 || opc == 0x59;
+                let shared_y = xy == Some(xd) && xx != Some(xd);
+                let st = if shared_y && !commutes { 0 } else { xd };
+                let restore = !fresh && st == xd;
+                if restore {
+                    a.movapd_xx(0, xd);
+                }
+                if shared_y && commutes {
+                    let xs = self.xmm_src(a, reg, x, 1);
+                    a.sse_rr(0xf2, opc, xd, xs);
+                } else {
+                    match xx {
+                        Some(s) if s == st => {}
+                        Some(s) => a.movapd_xx(st, s),
+                        None => a.movsd_x_mem(st, disp(x)),
+                    }
+                    let ys = self.xmm_src(a, reg, y, 1);
+                    a.sse_rr(0xf2, opc, st, ys);
+                }
+                let check = a.new_label();
+                let back = a.new_label();
+                a.sse_rr(0x66, 0x2e, st, st); // ucomisd st, st
+                a.jcc(CC_P, check);
+                a.bind(back);
+                let canon = !reg.is_some_and(|ri| self.regions[ri].raw_nan.contains(&pc));
+                self.stub(
+                    check,
+                    back,
+                    reg,
+                    StubKind::DeferNan {
+                        x: st,
+                        regs: [ux, uy],
+                        slow: stub,
+                        canon: canon || restore,
+                        restore,
+                    },
+                );
+                if st != xd {
+                    a.movapd_xx(xd, st);
+                }
+            }
             // A promoted result in a region: computed in its own register
             // (`x` copied in first, or `y` when `+` / `*` can commute).
             Some(xd) if self.imode.is_none() => {
@@ -2163,7 +2555,27 @@ impl NumGen {
                 self.load_xmm0(a, reg, x);
                 let xy = self.xmm_src(a, reg, y, 1);
                 a.sse_rr(0xf2, opc, 0, xy);
-                self.canon_xmm0(a, reg);
+                if defer {
+                    let check = a.new_label();
+                    let back = a.new_label();
+                    a.sse_rr(0x66, 0x2e, 0, 0); // ucomisd xmm0, xmm0
+                    a.jcc(CC_P, check);
+                    a.bind(back);
+                    self.stub(
+                        check,
+                        back,
+                        reg,
+                        StubKind::DeferNan {
+                            x: 0,
+                            regs: [ux, uy],
+                            slow: stub,
+                            canon: true,
+                            restore: false,
+                        },
+                    );
+                } else {
+                    self.canon_xmm0(a, reg);
+                }
                 self.store_xmm0(a, reg, dst);
             }
         }
@@ -2311,9 +2723,9 @@ impl NumGen {
             CmpKind::Rel(_) => (x, y, CC_AE),
             CmpKind::Eq(_) => (x, y, CC_E),
         };
-        self.load_xmm0(a, reg, p);
+        let xp = self.xmm_src(a, reg, p, 0);
         let xq = self.xmm_src(a, reg, q, 1);
-        a.sse_rr(0x66, 0x2e, 0, xq); // ucomisd xmm0, q
+        a.sse_rr(0x66, 0x2e, xp, xq); // ucomisd p, q
         let store = fused.is_none_or(|(_, s)| s);
         if store {
             // rax = the 0/1 result (ordered equality needs ZF && !PF).
@@ -2564,6 +2976,29 @@ impl NumGen {
                     a.and_rcx_r11();
                     a.cmp_rcx_r11();
                     a.jcc(CC_E, slow);
+                    a.jmp(s.resume);
+                }
+                StubKind::DeferNan {
+                    x,
+                    regs,
+                    slow,
+                    canon,
+                    restore,
+                } => {
+                    if restore {
+                        a.movapd_xx(x, 0);
+                    }
+                    for r in regs.into_iter().flatten() {
+                        self.load_gpr(a, s.region, RCX, r);
+                        a.movabs_r11(QNAN as i64);
+                        a.and_rcx_r11();
+                        a.cmp_rcx_r11();
+                        a.jcc(CC_E, slow);
+                    }
+                    if canon {
+                        a.movabs_rax(self.canonical_nan as i64);
+                        a.movq_x_gpr(x, RAX);
+                    }
                     a.jmp(s.resume);
                 }
                 StubKind::Exit { target } => {
@@ -3045,8 +3480,23 @@ fn plan_regions(
                     // An element read's index may stay promoted: the
                     // emitter reads it from its SSE register
                     // (`NumGen::index_from_xmm`).
-                    let free = match bytecode[pc] {
-                        Op::GetKey { obj, key, .. } if key != obj => Some(key),
+                    // So may a property store's value and an inline
+                    // `Math.f(x)`'s argument (`NumGen::operand_xmm`).
+                    let free = match (&ops[pc], &bytecode[pc]) {
+                        (_, Op::GetKey { obj, key, .. }) if key != obj => Some(*key),
+                        (
+                            GenericOp::SetProp { .. },
+                            Op::SetProp { obj, src, .. } | Op::SetPropStrict { obj, src, .. },
+                        ) if src != obj => Some(*src),
+                        (GenericOp::CallMethod { .. }, Op::CallMethod { recv, args, .. })
+                            if args.len() == 1
+                                && args[0] != *recv
+                                && super::inline_math(&bytecode[pc]).is_some_and(|(_, f)| {
+                                    !matches!(f, super::MathInline::MaxMin(_))
+                                }) =>
+                        {
+                            Some(args[0])
+                        }
                         _ => None,
                     };
                     pinned.extend(u.iter().copied().filter(|&r| Some(r) != free));
@@ -3101,6 +3551,25 @@ fn plan_regions(
             {
                 reuse = Some(active.remove(i).1);
             }
+            // Likewise an arithmetic op (`float_bin`'s) whose first operand
+            // (or, commuting, second) ends there: the result is computed in
+            // place, with no copy. Every slow path of the op leaves before
+            // the result is written (a stub that resumes reloads the result
+            // last, `NumGen::reload`), so the operand's value is intact
+            // wherever one stores it.
+            if generic
+                && reuse.is_none()
+                && let Some((p, q, commutes)) = float_bin_operands(&ops[x.1], x.0)
+            {
+                let ends = |r: u16| {
+                    active
+                        .iter()
+                        .position(|&(e, _, ar)| ar == r && e == x.1 && r != x.0)
+                };
+                if let Some(i) = ends(p).or_else(|| if commutes { ends(q) } else { None }) {
+                    reuse = Some(active.remove(i).1);
+                }
+            }
             let xmm = match reuse {
                 Some(m) => m,
                 None => {
@@ -3144,6 +3613,22 @@ fn plan_regions(
         });
     }
     out
+}
+
+/// The operands of a region op the numeric emitter computes with
+/// `float_bin` into `dst`: `(a, b, commutes)`.
+fn float_bin_operands(op: &GenericOp, dst: u16) -> Option<(u16, u16, bool)> {
+    match *op {
+        GenericOp::Add { dst: d, a, b } | GenericOp::NumAdd { dst: d, a, b, .. } if d == dst => {
+            Some((a, b, true))
+        }
+        GenericOp::Arith { dst: d, a, b, op } if d == dst => match op {
+            crate::nbvm::GA_MUL => Some((a, b, true)),
+            crate::nbvm::GA_SUB | crate::nbvm::GA_DIV => Some((a, b, false)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The property reads of loop body `head..=end` whose value a register
