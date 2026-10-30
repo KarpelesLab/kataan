@@ -1148,7 +1148,15 @@ fn shorthand_matches(s: Shorthand, c: u32, flags: Flags) -> bool {
 /// predicate — the spec's `Canonicalize`-based CharacterClass matching. Applying
 /// `neg` *before* the variant search is what makes `\P{Lu}` match `A` under `i`
 /// (the lowercase variant `a` is not `Lu`, so it is in the negated set).
+///
+/// The `v` flag changes the order: there the escape's set is first case-folded
+/// (`MaybeSimpleCaseFolding`) and `\P{…}` is its `CharacterComplement` within
+/// the fold-stable code points, so under `vi` `c` matches `\P{…}` exactly when
+/// it does *not* match `\p{…}` case-insensitively (`/\P{Ll}/vi` rejects `A`).
 fn prop_matches_ci(prop: &super::props::PropEscape, neg: bool, c: u32, flags: Flags) -> bool {
+    if neg && flags.ignore_case && flags.unicode_sets {
+        return !prop_matches_ci(prop, false, c, flags);
+    }
     let base = |x: u32| prop.matches(x) ^ neg;
     if base(c) {
         return true;

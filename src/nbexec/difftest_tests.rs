@@ -2564,3 +2564,23 @@ fn intl_percent_scales_exactly() {
          100,000,000,000,000,000,000,000%|7%|101%|true|true|true|true|true"
     );
 }
+
+/// Under the `v` flag a `\P{…}` escape is the complement of the case-folded
+/// property set within the fold-stable code points, so with `i` a character
+/// matches `\P{X}` exactly when no case variant of it is in `X` (`/\P{Ll}/vi`
+/// rejects both `a` and `A`). The `u`-mode order (complement first, then the
+/// case-variant search) had been applied, making `\P{…}` under `vi` match
+/// everything and `[^\P{…}]` match nothing.
+#[test]
+fn regex_v_flag_negated_property_ignore_case() {
+    let src = r#"
+        function bits(re) { return ["a", "A", "K", "1", "ſ"].map(function (c) { return re.test(c) ? 1 : 0; }).join(""); }
+        [bits(/\P{Ll}/vi), bits(/[\P{Ll}]/vi), bits(/[^\P{Ll}]/vi), bits(/\P{Lu}/vi),
+         bits(/[\P{Ll}--x]/vi), bits(/[^\P{Lowercase}]/vi), bits(/\P{Ll}/ui), bits(/[^\P{Ll}]/ui),
+         bits(/\P{Ll}/v), bits(/[^\p{Ll}]/vi)].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "00010|00010|11101|00010|00010|11101|11111|00000|01110|00010"
+    );
+}
