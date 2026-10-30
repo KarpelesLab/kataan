@@ -57,8 +57,46 @@ pub struct Arrow {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(missing_docs)]
 pub enum ArrowBody {
-    /// A concise body: `x => x + 1`.
-    Expr(Box<Expr>),
+    /// A concise body: `x => x + 1`, held as the statement list it means,
+    /// the single `return x + 1;` (built by [`ArrowBody::concise`], read by
+    /// [`ArrowBody::concise_expr`]), so that a compiler can take any arrow's
+    /// body as statements without building (cloning) one.
+    Expr(Vec<Stmt>),
     /// A block body: `x => { return x; }`.
     Block(Vec<Stmt>),
+}
+
+impl ArrowBody {
+    /// The concise body `=> e`.
+    #[must_use]
+    pub fn concise(e: Expr) -> Self {
+        ArrowBody::Expr(alloc::vec![Stmt::Return {
+            argument: Some(Box::new(e)),
+            span: Span::point(0),
+        }])
+    }
+
+    /// The expression of a concise body (`None` for a block body).
+    #[must_use]
+    pub fn concise_expr(&self) -> Option<&Expr> {
+        match self {
+            ArrowBody::Expr(body) => match body.as_slice() {
+                [
+                    Stmt::Return {
+                        argument: Some(e), ..
+                    },
+                ] => Some(e),
+                _ => None,
+            },
+            ArrowBody::Block(_) => None,
+        }
+    }
+
+    /// The body as statements: a block's own, or a concise body's `return`.
+    #[must_use]
+    pub fn stmts(&self) -> &[Stmt] {
+        match self {
+            ArrowBody::Expr(body) | ArrowBody::Block(body) => body,
+        }
+    }
 }

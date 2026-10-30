@@ -62,6 +62,7 @@ pub(crate) fn compile_eval_code(
     privates: &[&str],
 ) -> Result<FnProto, CompileError> {
     let base = table.len();
+    let _free_memo = super::free_memo_session(&program.body);
     let protos = alloc::rc::Rc::new(core::cell::RefCell::new(core::mem::take(table)));
     let r = compile_eval_body(program, &protos, strict, flags, privates);
     *table = alloc::rc::Rc::try_unwrap(protos)

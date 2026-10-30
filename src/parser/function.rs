@@ -6,7 +6,6 @@ use crate::ast::{Arrow, ArrowBody, Expr, Function, Ident, Param, Stmt};
 use crate::common::Span;
 use crate::error::Result;
 use crate::lexer::{Keyword as Kw, TokenKind};
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 
@@ -156,10 +155,15 @@ impl<'src> Parser<'src> {
     /// followed by `=>`. Scans on paren depth alone, which is sufficient for a
     /// well-formed token stream (brackets and braces are independently
     /// balanced, so no stray `)` appears inside them).
+    ///
+    /// A short scan runs directly; past [`PAREN_SCAN`] tokens the matching
+    /// `)` comes from a table built once per token stream, so nested
+    /// parentheses do not each rescan to their end.
     fn paren_arrow_at(&self, offset: usize) -> bool {
-        let mut i = self.pos + offset;
+        let start = self.pos + offset;
+        let mut i = start;
         let mut depth = 0usize;
-        loop {
+        while i < start + PAREN_SCAN {
             match self.tokens.get(i).map(|t| t.kind) {
                 Some(TokenKind::LParen) => depth += 1,
                 Some(TokenKind::RParen) => {
@@ -172,6 +176,28 @@ impl<'src> Parser<'src> {
                 _ => {}
             }
             i += 1;
+        }
+        let close = self.paren_close.get_or_init(|| {
+            let mut close = alloc::vec![u32::MAX; self.tokens.len()];
+            let mut open: Vec<usize> = Vec::new();
+            for (j, t) in self.tokens.iter().enumerate() {
+                match t.kind {
+                    TokenKind::LParen => open.push(j),
+                    TokenKind::RParen => {
+                        if let Some(o) = open.pop() {
+                            close[o] = j as u32;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            close
+        });
+        match close.get(start) {
+            Some(&c) if c != u32::MAX => {
+                self.tokens.get(c as usize + 1).map(|t| t.kind) == Some(TokenKind::Arrow)
+            }
+            _ => false,
         }
     }
 
@@ -232,7 +258,7 @@ impl<'src> Parser<'src> {
             if p.at(TokenKind::LBrace) {
                 Ok(ArrowBody::Block(p.parse_block_body()?))
             } else {
-                Ok(ArrowBody::Expr(Box::new(p.parse_assignment()?)))
+                Ok(ArrowBody::concise(p.parse_assignment()?))
             }
         })?;
         let span = start.to(self.prev_span());
@@ -296,3 +322,7 @@ impl<'src> Parser<'src> {
         }
     }
 }
+
+/// How many tokens an arrow-head lookahead scans for the matching `)` before
+/// it takes the token stream's parenthesis table instead.
+const PAREN_SCAN: usize = 64;

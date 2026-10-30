@@ -172,6 +172,18 @@ pub fn compile_module_into(
         .borrow_mut()
         .extend((base..=init_id).map(|_| placeholder()));
     let no_flags = BTreeMap::new();
+    // The module's statements and its top-level functions (both live to the
+    // end of this function) are the free-variable memo's root.
+    let _free_memo = super::free_memo::session(&body, |body| {
+        let mut direct = alloc::collections::BTreeSet::new();
+        let mut nested = alloc::collections::BTreeSet::new();
+        for s in body {
+            super::refs_stmt(s, &mut direct, &mut nested);
+        }
+        for t in &fns {
+            super::free_of_function(&t.func.params, &t.func.body);
+        }
+    });
     let compiled = (|| {
         let main = Compiler::compile_fn_inner(
             &fn_ids,

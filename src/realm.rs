@@ -341,7 +341,7 @@ pub struct Realm {
     vm_fn_meta: Vec<(Handle, u32)>,
     /// The source text of each VM function id (`Function.prototype.toString`),
     /// parallel to `vm_fn_meta`.
-    vm_fn_source: Vec<Option<alloc::rc::Rc<str>>>,
+    vm_fn_source: Vec<Option<crate::nbvm::FnSource>>,
     /// Live bytecode-VM activations across *all* nested VM contexts. A hosted
     /// VM run nests a fresh `Ctx` (call depth 0) for every host→VM call, so
     /// recursion bouncing between the tiers is bounded here, not per context.

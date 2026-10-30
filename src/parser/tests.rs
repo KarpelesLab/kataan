@@ -197,7 +197,7 @@ fn sexpr(e: &Expr) -> String {
         Expr::Function(f) => sexpr_function(f),
         Expr::Arrow(a) => {
             let body = match &a.body {
-                ArrowBody::Expr(e) => sexpr(e),
+                ArrowBody::Expr(_) => sexpr(a.body.concise_expr().expect("concise")),
                 ArrowBody::Block(b) => format!("(block {})", stmts(b)),
             };
             let kw = if a.is_async { "async-arrow" } else { "arrow" };

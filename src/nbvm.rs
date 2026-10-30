@@ -47,6 +47,7 @@ mod array_hof;
 pub(crate) fn array_species_is_default(realm: &Realm, h: Handle) -> bool {
     array_hof::default_species(realm, h)
 }
+mod free_memo;
 mod iter_fast;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 mod jit_tier;
@@ -931,6 +932,25 @@ const KNOWN_GLOBALS: &[&str] = &[
     "eval",
 ];
 
+/// A function's source text (`Function.prototype.toString`): a slice of its
+/// program's source, which every function of that program shares, so that
+/// nested functions do not each copy the text of all they enclose (which was
+/// quadratic in the nesting depth).
+#[derive(Clone, Debug)]
+pub struct FnSource {
+    text: alloc::rc::Rc<str>,
+    start: u32,
+    end: u32,
+}
+
+impl core::ops::Deref for FnSource {
+    type Target = str;
+    fn deref(&self) -> &str {
+        // In range and on char boundaries: checked when it was made.
+        &self.text[self.start as usize..self.end as usize]
+    }
+}
+
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
 #[derive(Clone, Debug)]
@@ -976,7 +996,7 @@ pub struct FnProto {
     pub source_span: Option<(u32, u32)>,
     /// The function's source text, for `Function.prototype.toString`
     /// (ECMA-262 20.2.3.5). Not part of the portable artifact.
-    pub source: Option<alloc::rc::Rc<str>>,
+    pub source: Option<FnSource>,
     /// The VM's run-time tier state for this function (activation count,
     /// optimized body, inline caches, native code). Not part of the portable
     /// artifact; build it with `Default::default()`.
@@ -12501,6 +12521,7 @@ pub fn compile_program_into(
     table: &mut Vec<FnProto>,
 ) -> Result<u32, CompileError> {
     let base = table.len() as u32;
+    let _free_memo = free_memo_session(&program.body);
     // Dynamic code (`eval` / `Function`) needs a host (it accesses the live
     // lexical scope and parses source at runtime): the bare tier refuses it
     // before any codegen. A hosted run reaches `Function`/indirect `eval` through the host (they
@@ -12684,11 +12705,17 @@ pub fn compile_program_into(
 /// Resolves each newly compiled function's definition span into its source
 /// text (`Function.prototype.toString`).
 pub(crate) fn resolve_source_text(protos: &mut [FnProto], source: &str) {
+    let mut text: Option<alloc::rc::Rc<str>> = None;
     for p in protos {
-        if let Some((start, end)) = p.source_span.take() {
-            p.source = source
-                .get(start as usize..end as usize)
-                .map(alloc::rc::Rc::from);
+        if let Some((start, end)) = p.source_span.take()
+            && source.get(start as usize..end as usize).is_some()
+        {
+            let text = text.get_or_insert_with(|| alloc::rc::Rc::from(source));
+            p.source = Some(FnSource {
+                text: alloc::rc::Rc::clone(text),
+                start,
+                end,
+            });
         }
     }
 }
@@ -12840,19 +12867,22 @@ fn args_may_assign(arguments: &[crate::ast::Argument]) -> bool {
 /// The free variables of a function: names it references that are bound neither
 /// by its parameters nor its local declarations (so they come from an enclosing
 /// scope — i.e. its captures).
+///
+/// Computed once per function of a compile session's root (see `free_memo`).
+/// (An arrow's concise body is a statement list too, `ArrowBody::stmts`.)
 fn free_of_function(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
-    free_of_function_parts(params, body, None)
+    let key = free_memo::key(params, body);
+    if let Some(free) = free_memo::lookup(&key) {
+        return free;
+    }
+    let free = free_of_function_scan(params, body);
+    free_memo::record(key, &free);
+    free
 }
 
-/// [`free_of_function`] of a body that is `body` followed by `return tail` —
-/// an expression-bodied arrow (`tail` with an empty `body`), scanned in place
-/// rather than by cloning the expression into a synthetic `return` statement
-/// (which, for nested arrows, cloned each body once per enclosing scan).
-fn free_of_function_parts(
-    params: &[crate::ast::Param],
-    body: &[Stmt],
-    tail: Option<&Expr>,
-) -> BTreeSet<String> {
+/// [`free_of_function`] computed (the nested functions' sets come from the
+/// session memo when it has them).
+fn free_of_function_scan(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
     let bound = bound_names(params, body);
     let mut direct = BTreeSet::new();
     let mut nested = BTreeSet::new();
@@ -12867,14 +12897,24 @@ fn free_of_function_parts(
     for s in body {
         refs_stmt(s, &mut direct, &mut nested);
     }
-    if let Some(e) = tail {
-        refs_expr(e, &mut direct, &mut nested);
-    }
     direct
         .into_iter()
         .chain(nested)
         .filter(|n| !bound.contains(n))
         .collect()
+}
+
+/// Opens a free-variable memo session over the statement list `body`, the
+/// root of a compilation (see `free_memo`): one scan records the free
+/// variables of every function in it.
+fn free_memo_session(body: &[Stmt]) -> free_memo::Session<'_> {
+    free_memo::session(body, |b| {
+        let mut direct = BTreeSet::new();
+        let mut nested = BTreeSet::new();
+        for s in b {
+            refs_stmt(s, &mut direct, &mut nested);
+        }
+    })
 }
 
 /// Marker "names" the free-variable scans record (they propagate outward like
@@ -13352,10 +13392,7 @@ fn refs_expr(mut e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<
                 direct.insert(String::from(&*id.name));
             }
             Expr::Function(f) => nested.extend(free_of_nonarrow(&f.params, &f.body)),
-            Expr::Arrow(a) => nested.extend(match &a.body {
-                crate::ast::ArrowBody::Block(b) => free_of_function(&a.params, b),
-                crate::ast::ArrowBody::Expr(e) => free_of_function_parts(&a.params, &[], Some(e)),
-            }),
+            Expr::Arrow(a) => nested.extend(free_of_function(&a.params, a.body.stmts())),
             Expr::Class(c) => refs_class(c, direct, nested),
             Expr::Unary { argument, .. }
             | Expr::Update { argument, .. }
@@ -13658,18 +13695,6 @@ const NT_NAME: &str = "\0newtarget";
 
 /// [`free_of_function`] for a function with its *own* `this` (anything but an
 /// arrow): `this` inside it is not a reference to the enclosing one.
-/// An arrow's body as a statement list: a block body borrowed as is, an
-/// expression body as a synthetic `return` of (a clone of) the expression.
-fn arrow_body_stmts(body: &crate::ast::ArrowBody) -> alloc::borrow::Cow<'_, [Stmt]> {
-    match body {
-        crate::ast::ArrowBody::Block(b) => alloc::borrow::Cow::Borrowed(b),
-        crate::ast::ArrowBody::Expr(e) => alloc::borrow::Cow::Owned(alloc::vec![Stmt::Return {
-            argument: Some(Box::new((**e).clone())),
-            span: crate::common::Span::point(0),
-        }]),
-    }
-}
-
 fn free_of_nonarrow(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
     let mut free = free_of_function(params, body);
     free.remove(THIS_NAME);
@@ -20307,9 +20332,9 @@ impl Compiler {
             }
             Expr::Arrow(a) => {
                 self.next_closure_span = Some(a.span);
-                let body = arrow_body_stmts(&a.body);
+                let body = a.body.stmts();
                 self.next_closure_span = Some(a.span);
-                self.make_closure(&a.params, &body, a.is_async, "", true)
+                self.make_closure(&a.params, body, a.is_async, "", true)
             }
             // The optional-chain boundary. Allocate the result (defaulting to
             // `undefined`), then compile the inner chain: each `?.` link with a
@@ -20384,9 +20409,9 @@ impl Compiler {
                 }
                 Expr::Arrow(a) => {
                     self.next_closure_span = Some(a.span);
-                    let body = arrow_body_stmts(&a.body);
+                    let body = a.body.stmts();
                     self.next_closure_span = Some(a.span);
-                    return self.make_closure(&a.params, &body, a.is_async, id.name.as_ref(), true);
+                    return self.make_closure(&a.params, body, a.is_async, id.name.as_ref(), true);
                 }
                 _ => {}
             }

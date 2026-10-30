@@ -2097,3 +2097,60 @@ fn json_depth_is_bounded_by_the_stack_not_a_count() {
         .expect("join");
     assert_eq!(out, "20002,60002,20002,60002,true,20000,10000,TypeError");
 }
+
+/// Deeply nested functions, arrows and classes compile in linear time (each
+/// nested function rescanned its whole body for captures, every function
+/// copied the source text it encloses, and an arrow-head lookahead rescanned
+/// every nested parenthesis: ~10 s at 10,000 levels), with the same
+/// captures: through every level, past shadowing, into direct eval, `with`,
+/// a nested arrow's `arguments` and `this`.
+#[test]
+fn deeply_nested_functions_compile_linearly_with_the_same_captures() {
+    let src = r#"
+        function gen(n, leaf) {
+            var s = "";
+            for (var i = 0; i < n; i++) s += "function f" + i + "(a" + i + ") { var v" + i + " = a" + i + " * 2; return ";
+            s += leaf;
+            for (var i = 0; i < n; i++) s += "; }";
+            return s;
+        }
+        function wrap(n, open, leaf, close) { return open.repeat(n) + leaf + close.repeat(n); }
+        var n = 1000, out = [];
+        var g = new Function(gen(n, "function () { return v0 + v500 + a999; }") + "; return f0;")()(1);
+        for (var i = 1; i < n; i++) g = g(i + 1);
+        out.push(g());
+        var arrows = "";
+        for (var i = 0; i < n; i++) arrows += "(x" + i + ") => ";
+        var h = eval(arrows + "[x0, x499, x999].join('-')");
+        for (var i = 0; i < n; i++) h = h(i);
+        out.push(h);
+        var e = "";
+        for (var i = 0; i < 100; i++) e += "(function (b" + i + ") { return ";
+        var fe = eval(e + "eval('b0 + b50 + b99')" + "; })".repeat(100));
+        for (var i = 0; i < 99; i++) fe = fe(i + 1);
+        out.push(fe(100));
+        out.push(eval("(function () { var o = {p: 7}, q = 3; return " +
+            wrap(200, "(function () { return ", "(function () { with (o) { return p + q; } })()", "; })()") + "; })()"));
+        out.push(eval("(function () { return " + wrap(200, "(() => ", "arguments[1]", ")()") + "; })(5, 6)"));
+        out.push(eval("({ v: 42, m() { return " + wrap(200, "(() => ", "this.v", ")()") + "; } }).m()"));
+        out.push(eval("(() => { let z = 'z'; return " +
+            wrap(200, "new (class { m() { return ", "z + 1", "; } })().m()") + "; })()"));
+        out.push(eval("(function (x) { return ((x) => () => x)(9)(); })(1)"));
+        var k = (u) => (v) => u + v;
+        out.push(String(k(1)), k(1)(2));
+        out.join(" | ")
+    "#;
+    let out = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            crate::stack::set_thread_stack_size(256 * 1024 * 1024);
+            run(src)
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+    assert_eq!(
+        out,
+        "2004 | 0-499-999 | 152 | 10 | 6 | 42 | z1 | 9 | (v) => u + v | 3"
+    );
+}

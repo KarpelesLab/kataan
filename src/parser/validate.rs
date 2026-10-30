@@ -905,7 +905,11 @@ impl Validator {
                     self.stmt(s, &c)?;
                 }
             }
-            ArrowBody::Expr(e) => self.expr(e, &c)?,
+            ArrowBody::Expr(_) => {
+                if let Some(e) = a.body.concise_expr() {
+                    self.expr(e, &c)?;
+                }
+            }
         }
         self.labels = saved_labels;
         Ok(())

@@ -46,9 +46,7 @@ use alloc::vec::Vec;
 ///
 /// This level cap is a backstop on top of that, far above realistic code
 /// (node accepts ~1,500-3,000 nested parens): a paren costs three levels, so
-/// it allows ~33,000, which keeps the passes that are quadratic in nesting
-/// depth (each nested function scans its whole body for captures) in seconds
-/// on a huge stack.
+/// it allows ~33,000, which bounds the passes over the tree on a huge stack.
 const MAX_PARSE_DEPTH: u32 = crate::limits::DEFAULT_MAX_PARSE_DEPTH;
 
 /// The message of the parser's nesting-limit syntax error.
@@ -94,6 +92,11 @@ pub struct Parser<'src> {
     /// round-trip them instead of being folded to U+FFFD at the boundary.
     source: &'src [u8],
     tokens: Vec<Token>,
+    /// For each `(` token, the index of its matching `)` (`u32::MAX` if
+    /// none), built the first time an arrow-head lookahead scans far (see
+    /// `paren_arrow_at`): rescanning every nested parenthesis to its end was
+    /// quadratic in the nesting depth.
+    paren_close: core::cell::OnceCell<Vec<u32>>,
     /// Index of the current token in `tokens`. Never advances past the final
     /// [`TokenKind::Eof`].
     pos: usize,
@@ -188,6 +191,7 @@ impl<'src> Parser<'src> {
         Ok(Self {
             source,
             tokens,
+            paren_close: core::cell::OnceCell::new(),
             pos: 0,
             no_in: false,
             in_generator: false,
