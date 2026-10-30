@@ -45,6 +45,15 @@
 //! leave for the copy inside an inner loop costs the rest of that inner
 //! iteration, not of the whole outer one.
 //!
+//! In a speculative region's fast version, the NaN check a guarded op makes
+//! (an operand not proven a Number shows as a NaN result) is **merged** into
+//! a later op's check when what it computes only flows on by arithmetic to
+//! it ([`plan_defer`]). A NaN there is told apart out of line: when every
+//! operand the merged ops did not prove is a Number, it is a Number's NaN
+//! and the fast version goes on (the NaNs made canonical); else it leaves
+//! for the plain copy at the start of that side-effect-free stretch, which
+//! runs it again exactly.
+//!
 //! Every arithmetic result is NaN-canonicalized before it is stored, so a value
 //! the native code produces is bit-identical to the interpreter's `NanBox`.
 
@@ -90,6 +99,7 @@ const CC_NE: u8 = 0x5;
 const CC_BE: u8 = 0x6;
 const CC_A: u8 = 0x7;
 const CC_P: u8 = 0xa;
+const CC_NP: u8 = 0xb;
 
 /// GPR numbers used by the encoders.
 const RAX: u8 = 0;
@@ -582,7 +592,56 @@ struct Region {
     /// Per inner header of a generic nest: the registers live on entry to
     /// it (its entry from the plain copy, [`NumGen::emit_inner_entries`]).
     live_inner: Vec<(usize, Vec<u16>)>,
+    /// The speculative version's merged NaN checks ([`plan_defer`]).
+    defer: DeferPlan,
 }
+
+/// A speculative version's **merged NaN checks** ([`plan_defer`]): a guarded
+/// arithmetic op whose result (and whose unproven operands) only flow, by
+/// arithmetic, into another op's NaN check before anything observes them
+/// leaves its own check out — a NaN-boxed operand makes a NaN, which every
+/// SSE operation carries on, so the later check sees it. That check then
+/// stands for both ([`Cover`]): a NaN there is a NaN of Numbers when every
+/// operand it and the merged ops did not prove is a Number (the fast
+/// version then goes on, the NaNs made canonical, as their own checks
+/// would have); else something upstream was not a Number, and it leaves
+/// for the plain copy at the start of the side-effect-free stretch it lies
+/// in, which runs it all again exactly, as does every other leave from
+/// inside the stretch.
+#[derive(Default)]
+struct DeferPlan {
+    /// The region pcs whose NaN check is left out ([`DEFER_SKIP`]) or
+    /// stands for others ([`DEFER_COVER`]), ascending.
+    kind: Vec<(usize, u8)>,
+    /// `(first, last, start)`: a leave of op `first..=last` goes to op
+    /// `start` of the plain copy.
+    spans: Vec<(usize, usize, usize)>,
+    /// `(pc, register, xmm)`: before arithmetic op `pc`, store the register
+    /// (live on entry to a stretch, its SSE register handed on there).
+    saves: Vec<(usize, u16, u8)>,
+    /// The checks that stand for others ([`DEFER_COVER`]), ascending.
+    covers: Vec<Cover>,
+}
+
+/// A check that stands for merged ones ([`DeferPlan`]): what its stub
+/// ([`StubKind::DeferNan`]) looks at when the op's result is a NaN.
+struct Cover {
+    pc: usize,
+    /// The merged ops' operands not proven Numbers, each still where it was
+    /// when its op read it: when they all are Numbers (as are the op's
+    /// own), the NaN is a Number's.
+    roots: Vec<u16>,
+    /// The registers read after `pc` (in their SSE register there, or in
+    /// the register file) that may hold a merged op's NaN result, or one
+    /// computed from it: made canonical when the NaN is a Number's, as each
+    /// op's own check would have.
+    canon: Vec<u16>,
+}
+
+/// [`DeferPlan`]: the op's NaN check is left out.
+const DEFER_SKIP: u8 = 1;
+/// [`DeferPlan`]: the op's check stands for others ([`Cover`]).
+const DEFER_COVER: u8 = 2;
 
 /// A region's **speculative** double version: arithmetic whose operands are
 /// not Numbers does not run its slow path in the region but leaves it — all
@@ -680,6 +739,10 @@ enum StubKind {
         canon: bool,
         /// First `xmm x = xmm0` (the value the op's result replaced).
         restore: bool,
+        /// The check stands for others ([`Cover`]): its merged ops'
+        /// operands are checked too (`slow` leaves for the stretch's
+        /// start), and their NaNs made canonical.
+        cover: bool,
     },
     /// Leave the region: flush, then jump to bytecode pc `target`.
     Exit { target: usize },
@@ -917,6 +980,19 @@ impl NumGen {
         let mut regions = plan_regions(ops, bytecode, catches, env.n_regs);
         for r in &mut regions {
             r.spec = plan_spec(r, ops, bytecode, &types, env.n_regs);
+        }
+        if regions.iter().any(|r| r.spec.is_some())
+            && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
+        {
+            let live_at = |pc: usize, r: u16| {
+                (r as usize) < env.n_regs
+                    && live
+                        .get(pc * words + r as usize / 64)
+                        .is_some_and(|w| w & (1u64 << (r % 64)) != 0)
+            };
+            for r in &mut regions {
+                r.defer = plan_defer(r, ops, bytecode, env.n_regs, &is_target, &live_at);
+            }
         }
         let mut region_of = vec![u32::MAX; n];
         let mut gslot = vec![u32::MAX; n];
@@ -1393,12 +1469,47 @@ impl NumGen {
             resume: entry,
             region: self.region_at(pc),
             pc,
-            kind: StubKind::SpecBail { pc: pc as u32 },
+            kind: StubKind::SpecBail {
+                pc: self.bail_pc(pc) as u32,
+            },
             branch: None,
             int: false,
             copy: self.copy,
         });
         Some(entry)
+    }
+
+    /// Region `ri`'s [`Cover`] at `pc`: the operands its stub checks
+    /// besides the op's own, and the registers it makes canonical.
+    fn cover(&self, ri: Option<usize>, pc: usize) -> Option<(Vec<u16>, Vec<u16>)> {
+        let c = &self.regions[ri?].defer.covers;
+        let i = c.binary_search_by_key(&pc, |c| c.pc).ok()?;
+        Some((c[i].roots.clone(), c[i].canon.clone()))
+    }
+
+    /// Region op `pc`'s [`DeferPlan`] kind (`0`: its own check), in the
+    /// fast version.
+    fn defer_kind(&self, pc: usize) -> u8 {
+        let Some(ri) = self.region_at(pc) else {
+            return 0;
+        };
+        let k = &self.regions[ri].defer.kind;
+        k.binary_search_by_key(&pc, |e| e.0).map_or(0, |i| k[i].1)
+    }
+
+    /// Where a leave of the fast version at op `pc` goes in the plain copy:
+    /// the start of a merged-check stretch it lies in ([`DeferPlan`]), else
+    /// the op itself.
+    fn bail_pc(&self, pc: usize) -> usize {
+        let Some(ri) = self.region_at(pc) else {
+            return pc;
+        };
+        self.regions[ri]
+            .defer
+            .spans
+            .iter()
+            .find(|&&(f, l, _)| f <= pc && pc <= l)
+            .map_or(pc, |x| x.2)
     }
 
     fn region_at(&self, pc: usize) -> Option<usize> {
@@ -2316,7 +2427,7 @@ impl NumGen {
                 if region.is_some_and(|ri| self.regions[ri].spec.is_some()) =>
             {
                 StubKind::SpecBail {
-                    pc: self.cur_pc as u32,
+                    pc: self.bail_pc(self.cur_pc) as u32,
                 }
             }
             k => k,
@@ -2517,6 +2628,13 @@ impl NumGen {
         slow: impl FnOnce(&Self) -> StubKind,
     ) {
         let resume = a.new_label();
+        if let Some(ri) = reg {
+            for &(at, r, xmm) in &self.regions[ri].defer.saves {
+                if at == pc {
+                    a.movsd_mem_x(disp(r), xmm);
+                }
+            }
+        }
         let guarded = self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM;
         let stub = a.new_label();
         // An operand not proven a Number is checked *after* the arithmetic,
@@ -2529,6 +2647,9 @@ impl NumGen {
         // Number's, made canonical. The test doubles as the result's NaN
         // canonicalization.
         let defer = guarded && self.imode.is_none();
+        // A check merged into a later one ([`DeferPlan`]): none here.
+        let dk = if defer { self.defer_kind(pc) } else { 0 };
+        let cover = dk == DEFER_COVER;
         if guarded && !defer {
             self.guard_numbers(a, pc, reg, x, y, stub);
         }
@@ -2553,7 +2674,7 @@ impl NumGen {
                 let commutes = opc == 0x58 || opc == 0x59;
                 let shared_y = xy == Some(xd) && xx != Some(xd);
                 let st = if shared_y && !commutes { 0 } else { xd };
-                let restore = !fresh && st == xd;
+                let restore = !fresh && st == xd && dk != DEFER_SKIP;
                 if restore {
                     a.movapd_xx(0, xd);
                 }
@@ -2569,24 +2690,27 @@ impl NumGen {
                     let ys = self.xmm_src(a, reg, y, 1);
                     a.sse_rr(0xf2, opc, st, ys);
                 }
-                let check = a.new_label();
-                let back = a.new_label();
-                a.sse_rr(0x66, 0x2e, st, st); // ucomisd st, st
-                a.jcc(CC_P, check);
-                a.bind(back);
-                let canon = !reg.is_some_and(|ri| self.regions[ri].raw_nan.contains(&pc));
-                self.stub(
-                    check,
-                    back,
-                    reg,
-                    StubKind::DeferNan {
-                        x: st,
-                        regs: [ux, uy],
-                        slow: stub,
-                        canon: canon || restore,
-                        restore,
-                    },
-                );
+                if dk != DEFER_SKIP {
+                    let check = a.new_label();
+                    let back = a.new_label();
+                    a.sse_rr(0x66, 0x2e, st, st); // ucomisd st, st
+                    a.jcc(CC_P, check);
+                    a.bind(back);
+                    let canon = !reg.is_some_and(|ri| self.regions[ri].raw_nan.contains(&pc));
+                    self.stub(
+                        check,
+                        back,
+                        reg,
+                        StubKind::DeferNan {
+                            x: st,
+                            regs: [ux, uy],
+                            slow: stub,
+                            canon: canon || restore,
+                            restore,
+                            cover,
+                        },
+                    );
+                }
                 if st != xd {
                     a.movapd_xx(xd, st);
                 }
@@ -2628,7 +2752,9 @@ impl NumGen {
                 self.load_xmm0(a, reg, x);
                 let xy = self.xmm_src(a, reg, y, 1);
                 a.sse_rr(0xf2, opc, 0, xy);
-                if defer {
+                if dk == DEFER_SKIP {
+                    // (Checked later, [`DeferPlan`].)
+                } else if defer {
                     let check = a.new_label();
                     let back = a.new_label();
                     a.sse_rr(0x66, 0x2e, 0, 0); // ucomisd xmm0, xmm0
@@ -2644,6 +2770,7 @@ impl NumGen {
                             slow: stub,
                             canon: true,
                             restore: false,
+                            cover,
                         },
                     );
                 } else {
@@ -2653,7 +2780,7 @@ impl NumGen {
             }
         }
         a.bind(resume);
-        if guarded {
+        if guarded && dk != DEFER_SKIP {
             let k = slow(self);
             self.stub(stub, resume, reg, k);
         }
@@ -3089,19 +3216,65 @@ impl NumGen {
                     slow,
                     canon,
                     restore,
+                    cover,
                 } => {
                     if restore {
                         a.movapd_xx(x, 0);
                     }
-                    for r in regs.into_iter().flatten() {
+                    let merged = if cover {
+                        self.cover(s.region, s.pc)
+                    } else {
+                        None
+                    };
+                    if cover && merged.is_none() {
+                        a.jmp(slow);
+                        continue;
+                    }
+                    let (roots, fix) = merged.unwrap_or_default();
+                    let mut first = true;
+                    for r in regs.into_iter().flatten().chain(roots) {
                         self.load_gpr(a, s.region, RCX, r);
-                        a.movabs_r11(QNAN as i64);
+                        if core::mem::take(&mut first) {
+                            a.movabs_r11(QNAN as i64);
+                        }
                         a.and_rcx_r11();
                         a.cmp_rcx_r11();
                         a.jcc(CC_E, slow);
                     }
-                    if canon {
+                    // A Number's NaN: every merged op's NaN made canonical
+                    // (those in the register file first: `rax` then holds
+                    // the canonical NaN for the others).
+                    let (fix_x, fix_m): (Vec<_>, Vec<_>) = fix
+                        .into_iter()
+                        .map(|r| (r, self.xmm_of(s.region, r)))
+                        .partition(|e| e.1.is_some());
+                    for (i, &(r, _)) in fix_m.iter().enumerate() {
+                        // (A NaN's bits, the sign shifted out, are above
+                        // the infinities'.)
+                        let ok = a.new_label();
+                        a.mov_gpr_mem(RAX, disp(r));
+                        a.shl_rax_imm(1);
+                        if i == 0 {
+                            a.movabs_r11(0xffe0_0000_0000_0000_u64 as i64);
+                        }
+                        a.cmp_rax_r11();
+                        a.jcc(CC_BE, ok);
                         a.movabs_rax(self.canonical_nan as i64);
+                        a.mov_mem_gpr(disp(r), RAX);
+                        a.bind(ok);
+                    }
+                    if canon || !fix_x.is_empty() {
+                        a.movabs_rax(self.canonical_nan as i64);
+                    }
+                    for (_, y) in fix_x {
+                        let Some(y) = y else { continue };
+                        let ok = a.new_label();
+                        a.sse_rr(0x66, 0x2e, y, y); // ucomisd y, y
+                        a.jcc(CC_NP, ok);
+                        a.movq_x_gpr(y, RAX);
+                        a.bind(ok);
+                    }
+                    if canon {
                         a.movq_x_gpr(x, RAX);
                     }
                     a.jmp(s.resume);
@@ -3156,7 +3329,7 @@ impl NumGen {
                     if !s.int
                         && let Some(ri) = s.region
                         && self.regions[ri].spec.is_some()
-                        && let Some(l) = self.copy_label(pc)
+                        && let Some(l) = self.copy_label(self.bail_pc(pc))
                     {
                         a.jmp(l);
                         continue;
@@ -3867,6 +4040,7 @@ fn plan_regions(
             reuse,
             loops,
             live_inner,
+            defer: DeferPlan::default(),
         });
     }
     out
@@ -3901,6 +4075,453 @@ fn spill_weights(
         add(&mut w, src, pc);
     }
     w
+}
+
+/// Plans speculative region `r`'s merged NaN checks ([`DeferPlan`]).
+///
+/// The fast version's body is cut into **stretches**: runs of ops with no
+/// effect a second run could see (none stores anything but registers, and
+/// none writes a register live on entry to the stretch), no branch, no
+/// join inside. A guarded arithmetic op ([`NumGen::float_bin`]'s check:
+/// one operand not proven a Number) is
+/// *deferred*, its check left out, when what it makes is then only carried
+/// by arithmetic to the check of a later op of the stretch — as an operand
+/// it did not prove, which the speculation then counts as a Number, or as
+/// its result. A value carrying such a pending NaN is *tainted* by the
+/// deferred ops it came through (a move or a property read the fast
+/// version replaces by a copy passes the taint on; `+ - * /` and an inline
+/// one-argument `Math` function combine it; a check of a guarded op clears
+/// it, from every register, once that check passes). Anything else reading
+/// a tainted value (a store, a branch, a comparison, an element index...)
+/// makes the deferral it came from keep its check, as does reaching the
+/// end of the stretch unchecked. A check that clears a taint *covers*
+/// those deferrals ([`Cover`]). A NaN there is a Number's when every
+/// operand the covered ops did not prove is a Number, so those must still
+/// hold the values the ops read at the check: one written in between
+/// makes its deferral keep its check, and one whose promoted interval
+/// ends before the check is stored to the register file by the deferred
+/// op (where the check's stub reads it). A NaN with some operand not a
+/// Number leaves for the stretch's start in the plain copy, as does every
+/// leave of the fast version from the first deferred op to the last
+/// covering check — so every register live on entry to the stretch must
+/// still hold its value there (its SSE register not handed on while the
+/// stretch may still leave, unless the register file has it).
+fn plan_defer(
+    r: &Region,
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    n_regs: usize,
+    is_target: &[bool],
+    live: &dyn Fn(usize, u16) -> bool,
+) -> DeferPlan {
+    let Some(sp) = r.spec.as_ref() else {
+        return DeferPlan::default();
+    };
+    let (head, end) = (r.head, r.end);
+    if end >= ops.len() || end >= bytecode.len() {
+        return DeferPlan::default();
+    }
+    let ty = |pc: usize, x: u16| {
+        sp.types
+            .get((pc - head) * n_regs + x as usize)
+            .copied()
+            .unwrap_or(T_ANY)
+    };
+    let slot_at = |pc: usize, x: u16| {
+        r.slots
+            .iter()
+            .position(|s| s.reg == x && s.start <= pc && pc <= s.end)
+    };
+    let is_float = |pc: usize| {
+        written_reg(&bytecode[pc]).is_some_and(|dst| float_bin_operands(&ops[pc], dst).is_some())
+    };
+    let mut kept = vec![false; end - head + 1];
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    for _ in 0..32 {
+        let mut st = DeferState::new(n_regs);
+        let mut plan = DeferPlan::default();
+        let mut changed = false;
+        st.start = head;
+        for pc in head..=end {
+            let (op, bc) = (&ops[pc], &bytecode[pc]);
+            def_use(bc, &mut d, &mut u);
+            // A join, or a write of a register live on entry to the stretch,
+            // starts a new one.
+            if pc > st.start
+                && (is_target.get(pc).copied().unwrap_or(true)
+                    || d.iter().any(|&x| live(st.start, x)))
+            {
+                changed |= st.close(r, &mut kept, &mut plan, head, live, &is_float);
+                st.start = pc;
+            }
+            let float =
+                written_reg(bc).and_then(|dst| float_bin_operands(op, dst).map(|o| (dst, o)));
+            let math = match (op, bc) {
+                (
+                    GenericOp::CallMethod { .. },
+                    Op::CallMethod {
+                        dst, recv, args, ..
+                    },
+                ) if args.len() == 1
+                    && super::inline_math(bc)
+                        .is_some_and(|(_, f)| !matches!(f, super::MathInline::MaxMin(_))) =>
+                {
+                    Some((*dst, *recv, args[0]))
+                }
+                _ => None,
+            };
+            let mut boundary = false;
+            if let Some((dst, (x, y, _))) = float {
+                let guarded = ty(pc, x) != T_NUM || ty(pc, y) != T_NUM;
+                let t = st.taint[x as usize] | st.taint[y as usize];
+                if guarded && !kept[pc - head] && st.cands.len() < 64 {
+                    let bit = 1u64 << st.cands.len();
+                    st.cands.push(pc);
+                    st.first.get_or_insert(pc);
+                    let mut roots = [None; 2];
+                    for (i, o) in [x, y].into_iter().enumerate() {
+                        if ty(pc, o) != T_NUM {
+                            st.taint[o as usize] |= bit;
+                            if i == 0 || o != x {
+                                roots[i] = Some(o);
+                            }
+                        }
+                    }
+                    st.roots.push(roots);
+                    st.set(dst, t | bit, pc);
+                } else if guarded {
+                    if t != 0 {
+                        changed |= st.cover(pc, t, &slot_at, live, &mut kept, head);
+                        st.last = Some(pc);
+                    }
+                    st.set(dst, 0, pc);
+                } else {
+                    st.set(dst, t, pc);
+                }
+            } else if let Some((dst, recv, arg)) = math {
+                changed |= st.observe(recv, &mut kept, head);
+                if ty(pc, arg) != T_NUM {
+                    changed |= st.observe(arg, &mut kept, head);
+                }
+                let t = st.taint[arg as usize];
+                st.set(dst, t, pc);
+            } else {
+                match (op, bc) {
+                    (GenericOp::Move { .. }, &Op::Move { dst, src }) => st.copy(dst, src, pc),
+                    (GenericOp::Const { .. } | GenericOp::Nop, _) => {
+                        for &x in &d {
+                            st.set(x, 0, pc);
+                        }
+                    }
+                    (GenericOp::GetProp { .. }, &Op::GetProp { dst, obj, .. }) => {
+                        match r.reuse.iter().find(|x| x.0 == pc) {
+                            Some(&(_, src)) => st.copy(dst, src, pc),
+                            None => {
+                                changed |= st.observe(obj, &mut kept, head);
+                                st.set(dst, 0, pc);
+                            }
+                        }
+                    }
+                    (GenericOp::GetElem { .. } | GenericOp::ArrayLen { .. }, _)
+                    | (
+                        GenericOp::Interp { .. },
+                        Op::LoadGlobal { .. } | Op::RequireObjectCoercible { .. },
+                    ) => {
+                        for &x in &u {
+                            changed |= st.observe(x, &mut kept, head);
+                        }
+                        for &x in &d {
+                            st.set(x, 0, pc);
+                        }
+                    }
+                    _ => boundary = true,
+                }
+            }
+            if boundary {
+                for &x in &u {
+                    changed |= st.observe(x, &mut kept, head);
+                }
+            }
+            changed |= st.overwrite(&d, &mut kept, head);
+            st.wrote.extend(d.iter().map(|&x| (pc, x)));
+            // An op that ends the stretch (or writes what it reads, live on
+            // entry to the stretch it starts) closes it.
+            if boundary || d.iter().any(|&x| live(st.start, x)) || pc == end {
+                changed |= st.close(r, &mut kept, &mut plan, head, live, &is_float);
+                st.start = pc + 1;
+            }
+        }
+        if !changed {
+            plan.kind.sort_unstable();
+            plan.covers.sort_unstable_by_key(|c| c.pc);
+            return plan;
+        }
+    }
+    DeferPlan::default()
+}
+
+/// [`plan_defer`]'s walk through one stretch.
+struct DeferState {
+    /// Per register: the deferred ops (bits of `cands`) whose pending NaN
+    /// its value may carry.
+    taint: Vec<u64>,
+    /// Per register: the op of the stretch that last wrote it.
+    def: Vec<usize>,
+    /// Per register: the op that made its value (through copies).
+    maker: Vec<usize>,
+    /// The stretch's deferred ops.
+    cands: Vec<usize>,
+    /// Per deferred op: its operands not proven Numbers.
+    roots: Vec<[Option<u16>; 2]>,
+    /// The checks that clear a taint ([`DeferPlan::covers`]).
+    covers: Vec<Cover>,
+    /// `(pc, register)`: the stretch's register writes.
+    wrote: Vec<(usize, u16)>,
+    /// `(pc, register, slot)`: a [`Cover`]'s operand whose promoted
+    /// interval ends before the check, stored by deferred op `pc`.
+    root_saves: Vec<(usize, u16, usize)>,
+    /// The cleared deferrals (bits of `cands`).
+    verified: u64,
+    start: usize,
+    first: Option<usize>,
+    last: Option<usize>,
+    /// A read this walk already made keep a check (the stretch's other
+    /// deferrals are judged on the next walk).
+    revised: bool,
+}
+
+impl DeferState {
+    fn new(n_regs: usize) -> Self {
+        Self {
+            taint: vec![0; n_regs],
+            def: vec![usize::MAX; n_regs],
+            maker: vec![usize::MAX; n_regs],
+            cands: Vec::new(),
+            roots: Vec::new(),
+            covers: Vec::new(),
+            root_saves: Vec::new(),
+            wrote: Vec::new(),
+            verified: 0,
+            start: 0,
+            first: None,
+            last: None,
+            revised: false,
+        }
+    }
+
+    fn set(&mut self, x: u16, t: u64, pc: usize) {
+        if let Some(v) = self.taint.get_mut(x as usize) {
+            *v = t;
+            self.def[x as usize] = pc;
+            self.maker[x as usize] = pc;
+        }
+    }
+
+    /// Op `pc` copies register `src` into `dst`.
+    fn copy(&mut self, dst: u16, src: u16, pc: usize) {
+        let (t, m) = match self.taint.get(src as usize) {
+            Some(&t) => (t, self.maker[src as usize]),
+            None => (0, pc),
+        };
+        self.set(dst, t, pc);
+        if let Some(v) = self.maker.get_mut(dst as usize) {
+            *v = m;
+        }
+    }
+
+    /// Guarded op `pc`, whose operands carry the deferrals `t`, checks for
+    /// them ([`Cover`]): each one's unproven operands must still be where
+    /// they were (unwritten, `overwrite`, and in the same promoted interval
+    /// or none, `slot_at`) for its stub to tell a Number's NaN from a type
+    /// miss; a deferral whose are not keeps its own check. `true` if that
+    /// changed the plan.
+    fn cover(
+        &mut self,
+        pc: usize,
+        t: u64,
+        slot_at: &dyn Fn(usize, u16) -> Option<usize>,
+        live: &dyn Fn(usize, u16) -> bool,
+        kept: &mut [bool],
+        head: usize,
+    ) -> bool {
+        let mut changed = false;
+        let mut roots = Vec::new();
+        for (i, (&c, rs)) in self.cands.iter().zip(&self.roots).enumerate() {
+            if t & (1u64 << i) == 0 {
+                continue;
+            }
+            for r in rs.iter().flatten().copied() {
+                let (then, now) = (slot_at(c, r), slot_at(pc, r));
+                if then != now {
+                    // Its interval ended (the register file then holds an
+                    // older value): stored there by the merged op.
+                    match then {
+                        Some(k) if now.is_none() => {
+                            if !self.root_saves.iter().any(|s| s.1 == r) {
+                                self.root_saves.push((c, r, k));
+                            }
+                        }
+                        _ => {
+                            kept[c - head] = true;
+                            changed = true;
+                        }
+                    }
+                }
+                if !roots.contains(&r) {
+                    roots.push(r);
+                }
+            }
+        }
+        if changed {
+            self.revised = true;
+            return true;
+        }
+        // (Only what is read after the check: a register whose interval
+        // ended since is dead.)
+        let canon = (0..self.taint.len())
+            .filter(|&x| {
+                let r = x as u16;
+                self.taint[x] & t != 0
+                    && live(pc + 1, r)
+                    && (slot_at(pc, r).is_some() || slot_at(self.def[x], r).is_none())
+            })
+            .map(|x| x as u16)
+            .collect();
+        self.covers.push(Cover { pc, roots, canon });
+        self.verify(t);
+        false
+    }
+
+    /// Op writes registers `d`: a deferral still pending that one of them
+    /// was an unproven operand of can no longer be told apart at a later
+    /// check ([`cover`](Self::cover)), so it keeps its own. `true` if that
+    /// changed the plan.
+    fn overwrite(&mut self, d: &[u16], kept: &mut [bool], head: usize) -> bool {
+        let mut changed = false;
+        for (i, (&c, rs)) in self.cands.iter().zip(&self.roots).enumerate() {
+            if self.verified & (1u64 << i) == 0
+                && rs.iter().flatten().any(|r| d.contains(r))
+                && !kept[c - head]
+            {
+                kept[c - head] = true;
+                changed = true;
+            }
+        }
+        self.revised |= changed;
+        changed
+    }
+
+    /// A check passed: what it carried is cleared everywhere.
+    fn verify(&mut self, t: u64) {
+        self.verified |= t;
+        for v in &mut self.taint {
+            *v &= !t;
+        }
+    }
+
+    /// Register `x` read by an op that is not arithmetic: what taints it
+    /// keeps its own check — its maker if that is a deferral (which then
+    /// clears the rest), else each deferral it came from. `true` if that
+    /// changed the plan.
+    fn observe(&mut self, x: u16, kept: &mut [bool], head: usize) -> bool {
+        let t = self.taint.get(x as usize).copied().unwrap_or(0);
+        if t == 0 {
+            return false;
+        }
+        let maker = self.maker[x as usize];
+        if self.cands.contains(&maker) {
+            kept[maker - head] = true;
+        } else {
+            for (i, &c) in self.cands.iter().enumerate() {
+                if t & (1u64 << i) != 0 {
+                    kept[c - head] = true;
+                }
+            }
+        }
+        self.revised = true;
+        true
+    }
+
+    /// The stretch ends: every deferral must have been cleared, and every
+    /// register live on entry to it must still hold its value up to its
+    /// last covering check; then its plan is recorded. `true` if that
+    /// changed the plan (a deferral keeps its check).
+    fn close(
+        &mut self,
+        r: &Region,
+        kept: &mut [bool],
+        plan: &mut DeferPlan,
+        head: usize,
+        live: &dyn Fn(usize, u16) -> bool,
+        is_float: &dyn Fn(usize) -> bool,
+    ) -> bool {
+        let n = self.cands.len();
+        let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let mut changed = self.revised;
+        if self.revised {
+            // (Judged again on the next walk.)
+        } else if all & !self.verified != 0 {
+            for (i, &c) in self.cands.iter().enumerate() {
+                if self.verified & (1u64 << i) == 0 {
+                    kept[c - head] = true;
+                }
+            }
+            changed = true;
+        } else if let (Some(first), Some(last)) = (self.first, self.last) {
+            // Where a leave from `first..=last` restarts: the first deferred
+            // op itself when nothing from there on writes a register live
+            // there (the ops before it ran checked), else the stretch's
+            // start (whose own such writes split stretches). A register
+            // live at the restart whose SSE register is handed on while
+            // the stretch may still leave: stored to the register file by
+            // the arithmetic op that ends its interval, just before that
+            // op (only there: other ops are not this module's to emit).
+            let restart = |at: usize| {
+                if at != self.start
+                    && self
+                        .wrote
+                        .iter()
+                        .any(|&(pc, x)| at <= pc && pc <= last && live(at, x))
+                {
+                    return None;
+                }
+                let lost: Vec<&Slot> = r
+                    .slots
+                    .iter()
+                    .filter(|s| {
+                        s.start <= at && at <= s.end && s.end < last && s.dirty && live(at, s.reg)
+                    })
+                    .collect();
+                (!lost.iter().any(|s| !is_float(s.end))).then_some((at, lost))
+            };
+            let Some((start, lost)) = restart(first).or_else(|| restart(self.start)) else {
+                for &c in &self.cands {
+                    kept[c - head] = true;
+                }
+                let n_regs = self.taint.len();
+                *self = Self::new(n_regs);
+                return true;
+            };
+            {
+                plan.kind
+                    .extend(self.cands.iter().map(|&c| (c, DEFER_SKIP)));
+                plan.kind
+                    .extend(self.covers.iter().map(|c| (c.pc, DEFER_COVER)));
+                plan.covers.append(&mut self.covers);
+                plan.spans.push((first, last, start));
+                plan.saves
+                    .extend(lost.iter().map(|s| (s.end, s.reg, s.xmm)));
+                plan.saves.extend(
+                    self.root_saves
+                        .iter()
+                        .map(|&(pc, x, k)| (pc, x, r.slots[k].xmm)),
+                );
+            }
+        }
+        let n_regs = self.taint.len();
+        *self = Self::new(n_regs);
+        changed
+    }
 }
 
 /// Grows the innermost candidate loops `cands` into **loop nests**: an outer
@@ -4872,6 +5493,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn nan_checks_merge_into_a_later_one() {
+        // `d` and `e` (each from a property read) flow only into `f`, whose
+        // operand check before the store stands for theirs; the unused
+        // quotient keeps its own check, as does the op whose result the
+        // store reads.
+        let p = proto_of(
+            "function f(xs, k){ let s = 0; for (let i = 0; i < xs.length; i = i + 1) { const o = xs[i]; \
+             const d = o.a - 1; const e = o.b * 2; const u = o.c / 3; \
+             const g = d * d + e * k; o.out = g + o.out; s = s + d; } return s; }",
+            "f",
+        );
+        let plan = defer_plan(&p);
+        let kind = |pc: usize| plan.kind.iter().find(|x| x.0 == pc).map_or(0, |x| x.1);
+        let pc_mul2 = pc_of(&p, |o| matches!(o, Op::Mul { .. }));
+        let pc_sub1 = pc_of(&p, |o| matches!(o, Op::Sub { .. }));
+        let pc_div = pc_of(&p, |o| matches!(o, Op::Div { .. }));
+        assert_eq!(kind(pc_sub1), DEFER_SKIP, "{:?}", plan.kind);
+        assert_eq!(kind(pc_mul2), DEFER_SKIP, "{:?}", plan.kind);
+        assert_eq!(kind(pc_div), 0, "the unused quotient keeps its check");
+        // The store's operand: a covering check.
+        let store = pc_of(&p, |o| matches!(o, Op::SetProp { .. }));
+        assert!(
+            plan.kind
+                .iter()
+                .any(|&(pc, k)| k == DEFER_COVER && pc < store)
+        );
+        // Every leave from the merged stretch restarts it.
+        assert_eq!(plan.spans.len(), 1);
+        let (first, last, start) = plan.spans[0];
+        assert!(start <= pc_sub1 && first == pc_sub1 && last < store);
+        // Its stub tells a Number's NaN by the merged ops' own unproven
+        // operands: the reads of `o.a` and `o.b`.
+        let read = |key: &str| {
+            p.ops.iter().find_map(|o| match o {
+                Op::GetProp { dst, key: k, .. } if &**k == key => Some(*dst),
+                _ => None,
+            })
+        };
+        assert_eq!(plan.covers.len(), 1);
+        let roots = &plan.covers[0].roots;
+        for key in ["a", "b"] {
+            let r = read(key).expect("read");
+            assert!(roots.contains(&r), "{key}: {roots:?}");
+        }
+    }
+
+    /// The first speculative region of `p`, its merged NaN checks planned.
+    fn defer_plan(p: &crate::nbvm::FnProto) -> DeferPlan {
+        let (ops, ..) = crate::jit::lower_nbvm_generic(p).expect("generic");
+        let mut regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        let types = infer(&p.ops, p.n_regs);
+        let r = &mut regions[0];
+        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs);
+        assert!(r.spec.is_some());
+        let mut is_target = vec![false; p.ops.len() + 1];
+        for op in &p.ops {
+            if let Op::Jump { target } | Op::JumpIfFalse { target, .. } = op {
+                is_target[*target] = true;
+            }
+        }
+        let (words, live) = liveness(&p.ops, p.n_regs, &[]).expect("liveness");
+        let live_at =
+            |pc: usize, x: u16| live[pc * words + x as usize / 64] & (1u64 << (x % 64)) != 0;
+        plan_defer(r, &ops, &p.ops, p.n_regs, &is_target, &live_at)
+    }
+
+    #[test]
+    fn a_merged_check_needs_its_operands_intact() {
+        // `x` held the read the product did not prove, and is written
+        // before the sum's check: that check could not tell a Number's NaN
+        // from a non-Number there, so the product keeps its own.
+        let p = proto_of(
+            "function f(xs){ let t = 0; for (let i = 0; i < xs.length; i = i + 1) { const o = xs[i]; \
+             let x = o.a; const y = x * 3; x = o.b; const z = y + x; o.out = z; t = t + z; } return t; }",
+            "f",
+        );
+        let plan = defer_plan(&p);
+        let mul = pc_of(&p, |o| matches!(o, Op::Mul { .. }));
+        assert!(
+            plan.kind.iter().all(|&(pc, _)| pc != mul),
+            "{:?}",
+            plan.kind
+        );
     }
 
     #[test]
