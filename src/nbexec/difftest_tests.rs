@@ -2699,3 +2699,18 @@ fn temporal_non_iso_plaindatetime_day_time_rounding() {
          -P2Y3M5D|-P117W6DT6H|P1M11D|-P1M10DT16H"
     );
 }
+
+/// Under `u`/`v` with `i`, the fold classes of `s` and `k` also hold the long
+/// s U+017F and the Kelvin sign U+212A, so a class range containing either
+/// matches `s`/`S` (or `k`/`K`). The ASCII fast path of the range test only
+/// tried the two ASCII case variants; the legacy (non-`u`) mode, whose
+/// Canonicalize never maps non-ASCII onto ASCII, must still reject them.
+#[test]
+fn regex_unicode_ignore_case_range_reaches_long_s_and_kelvin() {
+    let src = r#"
+        function bits(re) { return ["s", "S", "k", "K", "ſ", "K"].map(function (c) { return re.test(c) ? 1 : 0; }).join(""); }
+        [bits(/^[Ā-ſ]$/iu), bits(/^[℀-ℰ]$/iv), bits(/^[Ā-ſ]$/i),
+         bits(/^[^℀-ℰ]$/iu), bits(/^[Ā-ž]$/iu)].join("|")
+    "#;
+    assert_eq!(run(src), "110010|001101|000010|110010|000000");
+}

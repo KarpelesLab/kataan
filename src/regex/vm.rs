@@ -1108,9 +1108,10 @@ fn class_matches(class: &Class, c: u32, flags: Flags) -> bool {
 /// canonical form under the active flags — so `/[a-z]/iu` matches the Kelvin
 /// sign while the legacy (non-`u`) `/[a-z]/i` does not.
 ///
-/// ASCII takes a branch-free fast path: for an ASCII `c` the two ASCII case
-/// variants are exactly its canonical partners in both modes, and this predicate
-/// runs per character on the matching hot path.
+/// ASCII takes a fast path: an ASCII `c`'s canonical partners are its two ASCII
+/// case variants, plus — under `u`/`v` only — the long s U+017F for `s`/`S` and
+/// the Kelvin sign U+212A for `k`/`K` (`/[\u0100-\u017F]/iu` matches `s`). This
+/// predicate runs per character on the matching hot path.
 fn range_fold_hit(c: u32, lo: u32, hi: u32, flags: Flags) -> bool {
     let Some(ch) = char::from_u32(c) else {
         return false;
@@ -1118,7 +1119,15 @@ fn range_fold_hit(c: u32, lo: u32, hi: u32, flags: Flags) -> bool {
     if ch.is_ascii() {
         let cl = ch.to_ascii_lowercase() as u32;
         let cu = ch.to_ascii_uppercase() as u32;
-        return (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi);
+        if (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi) {
+            return true;
+        }
+        let extra = match cl {
+            0x6B => 0x212A,
+            0x73 => 0x017F,
+            _ => return false,
+        };
+        return (flags.unicode || flags.unicode_sets) && extra >= lo && extra <= hi;
     }
     case_variants(ch, flags).any(|v| {
         v >= lo && v <= hi && char::from_u32(v).is_some_and(|cv| char_fold_eq(cv, ch, flags))
