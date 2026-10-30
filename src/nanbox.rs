@@ -91,9 +91,18 @@ const TAG_JIT_FALLOFF: u64 = QNAN | 0x09;
 /// date). Never a legal JS value, like `TAG_JIT_THROW`.
 const TAG_JIT_EXIT: u64 = QNAN | 0x0a;
 
-/// The canonical quiet-NaN payload a `f64` NaN is normalized to, chosen so that
-/// `(bits & QNAN) != QNAN` (i.e. it still reads back as a number).
-const CANONICAL_NAN: u64 = 0x7ff8_0000_0000_0000;
+/// The canonical quiet-NaN payload a `f64` NaN is normalized to: the one bit
+/// pattern of the Number NaN. It is free in the tag space (`(bits & QNAN) !=
+/// QNAN`, so it reads back as a number), and it is x86-64 SSE's *default NaN*
+/// (sign and quiet bit set, zero payload): what `addsd`/`subsd`/`mulsd`/
+/// `divsd`/`sqrtsd` make of an invalid operation (`0/0`, `∞-∞`, `√-1`), while an
+/// operand NaN propagates as itself, quieted, which leaves this one unchanged.
+/// So that arithmetic over Numbers (all of whose NaNs are this one) yields only
+/// this NaN, and the JIT stores such results without a NaN fix-up. A sign-bit
+/// operation (negation, `Math.abs`) can still flip it to `0x7ff8…`, which must
+/// be made canonical again; [`NanBox::number`] does it for every `f64` (on any
+/// target: aarch64's default NaN is the positive one).
+const CANONICAL_NAN: u64 = 0xfff8_0000_0000_0000;
 
 /// A handle's payload occupies the low 48 bits.
 const HANDLE_MASK: u64 = 0x0000_ffff_ffff_ffff;
@@ -460,6 +469,46 @@ mod tests {
         let arith_nan = NanBox::number(f64::INFINITY - f64::INFINITY);
         assert!(arith_nan.is_number());
         assert!(arith_nan.as_number().unwrap().is_nan());
+    }
+
+    #[test]
+    fn every_nan_boxes_to_the_one_canonical_pattern() {
+        let canon = NanBox::number(f64::NAN).to_bits();
+        assert_eq!(canon, CANONICAL_NAN);
+        assert_ne!(canon & QNAN, QNAN, "the canonical NaN must not alias a tag");
+        // The positive / negative default NaNs, signalling NaNs, and payloads in
+        // the tag space all box to the same word.
+        for bits in [
+            0x7ff8_0000_0000_0000_u64,
+            0xfff8_0000_0000_0000,
+            0x7ff0_0000_0000_0001,
+            0xfff0_0000_0000_1234,
+            0x7ffc_0000_0000_0001,
+            0xfffc_0000_0000_0005,
+            u64::MAX,
+        ] {
+            assert_eq!(NanBox::number(f64::from_bits(bits)).to_bits(), canon);
+            assert_eq!(NanBox::number(-f64::from_bits(bits)).to_bits(), canon);
+        }
+        // Arithmetic on the canonical NaN, and an invalid operation, keep it
+        // (x86-64's default NaN; `black_box` keeps the ops at run time).
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::hint::black_box;
+            let n = f64::from_bits(canon);
+            let one = black_box(1.0_f64);
+            for r in [
+                black_box(n) + one,
+                one - black_box(n),
+                black_box(n) * black_box(n),
+                one / black_box(n),
+                black_box(f64::INFINITY) - black_box(f64::INFINITY),
+                black_box(0.0_f64) / black_box(0.0_f64),
+                black_box(f64::INFINITY) * black_box(0.0_f64),
+            ] {
+                assert_eq!(r.to_bits(), canon);
+            }
+        }
     }
 
     #[test]

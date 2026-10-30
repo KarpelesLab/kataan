@@ -6794,19 +6794,14 @@ impl JitFunction {
                 a.je($slow);
             }};
         }
-        // xmm0 = [ra] <fb> [rb], reboxed (NaN canonicalized) into dst.
+        // xmm0 = [ra] <fb> [rb] (two Numbers), stored into dst. A NaN result
+        // is already the canonical NaN: the hardware's default NaN, or an
+        // operand's (`NanBox`'s `CANONICAL_NAN`).
         macro_rules! fbin_store {
             ($fb:expr, $ra:expr, $rb:expr, $dst:expr, $done:expr) => {{
-                let nan_fix = a.new_label();
                 a.movsd_xmm0_mem(disp($ra));
                 a.fbin_xmm0_mem($fb, disp($rb));
-                a.ucomisd_xmm0_xmm0();
-                a.jp(nan_fix);
                 a.movsd_mem_xmm0(disp($dst));
-                a.jmp($done);
-                a.bind(nan_fix);
-                a.movabs_rax(canonical_nan as i64);
-                a.store_rax(disp($dst));
                 a.jmp($done);
             }};
         }
@@ -7487,31 +7482,37 @@ impl JitFunction {
                             a.store_rax(disp(dst));
                             a.jmp(done);
                         } else if let MathInline::Abs = f {
-                            // The sign bit cleared (a NaN argument is already
-                            // the canonical one, whose sign is clear).
+                            // The sign bit cleared. That turns the canonical
+                            // NaN (sign set) into `0x7ff8…`, so a NaN (whose
+                            // bits, sign clear, are then above the
+                            // infinity's) stores the canonical one instead.
                             match arg_x {
                                 Some(ax) => numeric::NumGen::gpr_from_xmm(&mut a, 0, ax),
                                 None => a.load_rax(disp(x)),
                             }
                             a.g_movabs(call_seq::r::R11, i64::MAX as u64);
                             a.g_and(call_seq::r::RAX, call_seq::r::R11);
+                            a.movabs_r11(f64::INFINITY.to_bits() as i64);
+                            a.cmp_rax_r11();
+                            a.jg(nan);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                            a.bind(nan);
+                            a.movabs_rax(canonical_nan as i64);
                             a.store_rax(disp(dst));
                             a.jmp(done);
                         } else if let (MathInline::Sqrt, Some(ax), Some(xr)) =
                             (f, arg_x, num.result_xmm(op_idx, dst))
                         {
                             // A promoted argument and result: straight from
-                            // one SSE register into the other (the NaN path
-                            // stores the canonical NaN, which the slow paths'
-                            // reload then brings into it).
+                            // one SSE register into the other (a NaN result
+                            // is the canonical NaN: the hardware's default
+                            // NaN for a negative argument, else the
+                            // argument's own).
                             let past = a.new_label();
-                            numeric::NumGen::sqrt_xmm(&mut a, xr, ax, nan);
+                            numeric::NumGen::sqrt_xmm(&mut a, xr, ax);
                             a.jmp(past);
                             past_reload = Some(past);
-                            a.bind(nan);
-                            a.movabs_rax(canonical_nan as i64);
-                            a.store_rax(disp(dst));
-                            a.jmp(done);
                         } else {
                             match arg_x {
                                 Some(ax) => numeric::NumGen::xmm0_from_xmm(&mut a, ax),
@@ -7522,8 +7523,9 @@ impl JitFunction {
                                 MathInline::MaxMin(_) => return None,
                                 _ => a.sqrtsd_xmm0(),
                             }
-                            a.ucomisd_xmm0_xmm0();
-                            a.jp(nan);
+                            // (A NaN is the canonical one: `roundsd` keeps an
+                            // argument NaN, `sqrtsd` too or makes the
+                            // hardware's default NaN.)
                             if let Some(x) = num.result_xmm(op_idx, dst) {
                                 let past = a.new_label();
                                 numeric::NumGen::set_xmm_from_xmm0(&mut a, x);
@@ -7533,10 +7535,6 @@ impl JitFunction {
                                 a.movsd_mem_xmm0(disp(dst));
                                 a.jmp(done);
                             }
-                            a.bind(nan);
-                            a.movabs_rax(canonical_nan as i64);
-                            a.store_rax(disp(dst));
-                            a.jmp(done);
                         }
                         // The receiver walk, recorded in the site's cache.
                         a.bind(walk);
@@ -7764,7 +7762,6 @@ impl JitFunction {
                     }
                     let slow = a.new_label();
                     let done = a.new_label();
-                    let nan_fix = a.new_label();
                     a.movabs_r11(QNAN as i64);
                     a.load_rax(disp(src));
                     a.and_rax_r11();
@@ -7778,13 +7775,8 @@ impl JitFunction {
                     } else {
                         a.addsd_xmm0_xmm1();
                     }
-                    a.ucomisd_xmm0_xmm0();
-                    a.jp(nan_fix);
+                    // (`NaN ± 1` is that NaN, the canonical one.)
                     a.movsd_mem_xmm0(disp(dst));
-                    a.jmp(done);
-                    a.bind(nan_fix);
-                    a.movabs_rax(canonical_nan as i64);
-                    a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(slow);
                     exec_op!(pc);

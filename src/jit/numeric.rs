@@ -50,12 +50,15 @@
 //! a later op's check when what it computes only flows on by arithmetic to
 //! it ([`plan_defer`]). A NaN there is told apart out of line: when every
 //! operand the merged ops did not prove is a Number, it is a Number's NaN
-//! and the fast version goes on (the NaNs made canonical); else it leaves
-//! for the plain copy at the start of that side-effect-free stretch, which
-//! runs it again exactly.
+//! and the fast version goes on; else it leaves for the plain copy at the
+//! start of that side-effect-free stretch, which runs it again exactly.
 //!
-//! Every arithmetic result is NaN-canonicalized before it is stored, so a value
-//! the native code produces is bit-identical to the interpreter's `NanBox`.
+//! A value the native code produces is bit-identical to the interpreter's
+//! `NanBox`. For `+ - * /` and `sqrt` over Numbers that takes no NaN fix-up:
+//! the canonical NaN is the hardware's default NaN, which an invalid
+//! operation makes and an operand NaN (only ever the canonical one) carries
+//! through unchanged. A sign-bit operation (negation, `Math.abs`) does
+//! rewrite a NaN result to the canonical one.
 
 use super::{GenericOp, Label, X64Assembler};
 use crate::nanbox::NanBox;
@@ -99,7 +102,6 @@ const CC_NE: u8 = 0x5;
 const CC_BE: u8 = 0x6;
 const CC_A: u8 = 0x7;
 const CC_P: u8 = 0xa;
-const CC_NP: u8 = 0xb;
 
 /// GPR numbers used by the encoders.
 const RAX: u8 = 0;
@@ -581,9 +583,6 @@ struct Region {
     live_head: Vec<u16>,
     /// Its speculative double version, if planned ([`plan_spec`]).
     spec: Option<Spec>,
-    /// The pcs of arithmetic ops whose result needs no NaN canonicalization
-    /// in its SSE register ([`raw_nan_results`]).
-    raw_nan: Vec<usize>,
     /// The property reads the speculative version replaces by a copy of the
     /// register already holding the value ([`plan_reuse`]): `(pc, src)`.
     reuse: Vec<(usize, u16)>,
@@ -603,8 +602,8 @@ struct Region {
 /// SSE operation carries on, so the later check sees it. That check then
 /// stands for both ([`Cover`]): a NaN there is a NaN of Numbers when every
 /// operand it and the merged ops did not prove is a Number (the fast
-/// version then goes on, the NaNs made canonical, as their own checks
-/// would have); else something upstream was not a Number, and it leaves
+/// version then goes on, as their own checks would have: a NaN of Numbers
+/// is the canonical NaN); else something upstream was not a Number, and it leaves
 /// for the plain copy at the start of the side-effect-free stretch it lies
 /// in, which runs it all again exactly, as does every other leave from
 /// inside the stretch.
@@ -631,11 +630,6 @@ struct Cover {
     /// when its op read it: when they all are Numbers (as are the op's
     /// own), the NaN is a Number's.
     roots: Vec<u16>,
-    /// The registers read after `pc` (in their SSE register there, or in
-    /// the register file) that may hold a merged op's NaN result, or one
-    /// computed from it: made canonical when the NaN is a Number's, as each
-    /// op's own check would have.
-    canon: Vec<u16>,
 }
 
 /// [`DeferPlan`]: the op's NaN check is left out.
@@ -738,24 +732,21 @@ enum StubKind {
     Truthy { cond: u16, target: usize },
     /// `xmm0 = canonical NaN` (no call).
     CanonNan,
-    /// `xmm x = canonical NaN` (no call).
-    CanonNanX { x: u8 },
     /// `xmm x` is NaN-patterned: to `slow` unless it is a Number (a NaN),
     /// else resume (no call).
     NanCheck { x: u8, slow: Label },
     /// An arithmetic result in `xmm x` is a NaN (see `float_bin`): to
-    /// `slow` if one of `regs` is not a Number, else resume — with the NaN
-    /// made canonical when `canon` (no call).
+    /// `slow` if one of `regs` is not a Number, else resume (no call).
     DeferNan {
         x: u8,
         regs: [Option<u16>; 2],
         slow: Label,
-        canon: bool,
-        /// First `xmm x = xmm0` (the value the op's result replaced).
+        /// First `xmm x = xmm0` (the value the op's result replaced), and
+        /// on resuming `xmm x = canonical NaN` (the op's result).
         restore: bool,
         /// The check stands for others ([`Cover`]): its merged ops'
         /// operands are checked too (`slow` leaves for the stretch's
-        /// start), and their NaNs made canonical.
+        /// start).
         cover: bool,
     },
     /// Leave the region: flush, then jump to bytecode pc `target`.
@@ -1501,11 +1492,11 @@ impl NumGen {
     }
 
     /// Region `ri`'s [`Cover`] at `pc`: the operands its stub checks
-    /// besides the op's own, and the registers it makes canonical.
-    fn cover(&self, ri: Option<usize>, pc: usize) -> Option<(Vec<u16>, Vec<u16>)> {
+    /// besides the op's own.
+    fn cover(&self, ri: Option<usize>, pc: usize) -> Option<Vec<u16>> {
         let c = &self.regions[ri?].defer.covers;
         let i = c.binary_search_by_key(&pc, |c| c.pc).ok()?;
-        Some((c[i].roots.clone(), c[i].canon.clone()))
+        Some(c[i].roots.clone())
     }
 
     /// Region op `pc`'s [`DeferPlan`] kind (`0`: its own check), in the
@@ -2320,11 +2311,9 @@ impl NumGen {
         a.movapd_xx(0, x);
     }
 
-    /// `xmm d = sqrt(xmm s)`, then to `nan` if that is a NaN.
-    pub(super) fn sqrt_xmm(a: &mut X64Assembler, d: u8, s: u8, nan: Label) {
+    /// `xmm d = sqrt(xmm s)` (of a Number: a NaN result is the canonical NaN).
+    pub(super) fn sqrt_xmm(a: &mut X64Assembler, d: u8, s: u8) {
         a.sse_rr(0xf2, 0x51, d, s); // sqrtsd d, s
-        a.sse_rr(0x66, 0x2e, d, d); // ucomisd d, d
-        a.jcc(CC_P, nan);
     }
 
     /// `xmm = xmm0`.
@@ -2667,8 +2656,7 @@ impl NumGen {
         // operands looked at — one that is not a Number takes the slow
         // path, which runs the op from scratch (the operands are intact:
         // the result is computed where no operand lives); else the NaN is a
-        // Number's, made canonical. The test doubles as the result's NaN
-        // canonicalization.
+        // Number's, the canonical one.
         let defer = guarded && self.imode.is_none();
         // A check merged into a later one ([`DeferPlan`]): none here.
         let dk = if defer { self.defer_kind(pc) } else { 0 };
@@ -2719,7 +2707,6 @@ impl NumGen {
                     a.sse_rr(0x66, 0x2e, st, st); // ucomisd st, st
                     a.jcc(CC_P, check);
                     a.bind(back);
-                    let canon = !reg.is_some_and(|ri| self.regions[ri].raw_nan.contains(&pc));
                     self.stub(
                         check,
                         back,
@@ -2728,7 +2715,6 @@ impl NumGen {
                             x: st,
                             regs: [ux, uy],
                             slow: stub,
-                            canon: canon || restore,
                             restore,
                             cover,
                         },
@@ -2760,16 +2746,7 @@ impl NumGen {
                     let ys = self.xmm_src(a, reg, y, 1);
                     a.sse_rr(0xf2, opc, xd, ys);
                 }
-                // A NaN made canonical (out of line), unless nothing can
-                // observe its bits (`raw_nan_results`).
-                if !reg.is_some_and(|ri| self.regions[ri].raw_nan.contains(&pc)) {
-                    let fix = a.new_label();
-                    let back = a.new_label();
-                    a.sse_rr(0x66, 0x2e, xd, xd); // ucomisd xd, xd
-                    a.jcc(CC_P, fix);
-                    a.bind(back);
-                    self.stub(fix, back, reg, StubKind::CanonNanX { x: xd });
-                }
+                // (A NaN of Numbers is the canonical NaN.)
             }
             _ => {
                 self.load_xmm0(a, reg, x);
@@ -2791,14 +2768,12 @@ impl NumGen {
                             x: 0,
                             regs: [ux, uy],
                             slow: stub,
-                            canon: true,
                             restore: false,
                             cover,
                         },
                     );
-                } else {
-                    self.canon_xmm0(a, reg);
                 }
+                // (A NaN of Numbers is the canonical NaN.)
                 self.store_xmm0(a, reg, dst);
             }
         }
@@ -3220,11 +3195,6 @@ impl NumGen {
                     a.movq_x_gpr(0, RAX);
                     a.jmp(s.resume);
                 }
-                StubKind::CanonNanX { x } => {
-                    a.movabs_rax(self.canonical_nan as i64);
-                    a.movq_x_gpr(x, RAX);
-                    a.jmp(s.resume);
-                }
                 StubKind::NanCheck { x, slow } => {
                     a.movq_gpr_x(RCX, x);
                     a.movabs_r11(QNAN as i64);
@@ -3237,23 +3207,21 @@ impl NumGen {
                     x,
                     regs,
                     slow,
-                    canon,
                     restore,
                     cover,
                 } => {
                     if restore {
                         a.movapd_xx(x, 0);
                     }
-                    let merged = if cover {
-                        self.cover(s.region, s.pc)
+                    let roots = if cover {
+                        let Some(roots) = self.cover(s.region, s.pc) else {
+                            a.jmp(slow);
+                            continue;
+                        };
+                        roots
                     } else {
-                        None
+                        Vec::new()
                     };
-                    if cover && merged.is_none() {
-                        a.jmp(slow);
-                        continue;
-                    }
-                    let (roots, fix) = merged.unwrap_or_default();
                     let mut first = true;
                     for r in regs.into_iter().flatten().chain(roots) {
                         self.load_gpr(a, s.region, RCX, r);
@@ -3264,40 +3232,10 @@ impl NumGen {
                         a.cmp_rcx_r11();
                         a.jcc(CC_E, slow);
                     }
-                    // A Number's NaN: every merged op's NaN made canonical
-                    // (those in the register file first: `rax` then holds
-                    // the canonical NaN for the others).
-                    let (fix_x, fix_m): (Vec<_>, Vec<_>) = fix
-                        .into_iter()
-                        .map(|r| (r, self.xmm_of(s.region, r)))
-                        .partition(|e| e.1.is_some());
-                    for (i, &(r, _)) in fix_m.iter().enumerate() {
-                        // (A NaN's bits, the sign shifted out, are above
-                        // the infinities'.)
-                        let ok = a.new_label();
-                        a.mov_gpr_mem(RAX, disp(r));
-                        a.shl_rax_imm(1);
-                        if i == 0 {
-                            a.movabs_r11(0xffe0_0000_0000_0000_u64 as i64);
-                        }
-                        a.cmp_rax_r11();
-                        a.jcc(CC_BE, ok);
+                    // A Number's NaN: the canonical one (every merged op's
+                    // too), which the op's restored register is then given.
+                    if restore {
                         a.movabs_rax(self.canonical_nan as i64);
-                        a.mov_mem_gpr(disp(r), RAX);
-                        a.bind(ok);
-                    }
-                    if canon || !fix_x.is_empty() {
-                        a.movabs_rax(self.canonical_nan as i64);
-                    }
-                    for (_, y) in fix_x {
-                        let Some(y) = y else { continue };
-                        let ok = a.new_label();
-                        a.sse_rr(0x66, 0x2e, y, y); // ucomisd y, y
-                        a.jcc(CC_NP, ok);
-                        a.movq_x_gpr(y, RAX);
-                        a.bind(ok);
-                    }
-                    if canon {
                         a.movq_x_gpr(x, RAX);
                     }
                     a.jmp(s.resume);
@@ -4059,7 +3997,6 @@ fn plan_regions(
             generic,
             live_head,
             spec: None,
-            raw_nan: raw_nan_results(ops, bytecode, head, end, &carried_r),
             reuse,
             loops,
             live_inner,
@@ -4214,7 +4151,7 @@ fn plan_defer(
                     st.set(dst, t | bit, pc);
                 } else if guarded {
                     if t != 0 {
-                        changed |= st.cover(pc, t, &slot_at, live, &mut kept, head);
+                        changed |= st.cover(pc, t, &slot_at, &mut kept, head);
                         st.last = Some(pc);
                     }
                     st.set(dst, 0, pc);
@@ -4288,8 +4225,6 @@ struct DeferState {
     /// Per register: the deferred ops (bits of `cands`) whose pending NaN
     /// its value may carry.
     taint: Vec<u64>,
-    /// Per register: the op of the stretch that last wrote it.
-    def: Vec<usize>,
     /// Per register: the op that made its value (through copies).
     maker: Vec<usize>,
     /// The stretch's deferred ops.
@@ -4317,7 +4252,6 @@ impl DeferState {
     fn new(n_regs: usize) -> Self {
         Self {
             taint: vec![0; n_regs],
-            def: vec![usize::MAX; n_regs],
             maker: vec![usize::MAX; n_regs],
             cands: Vec::new(),
             roots: Vec::new(),
@@ -4335,7 +4269,6 @@ impl DeferState {
     fn set(&mut self, x: u16, t: u64, pc: usize) {
         if let Some(v) = self.taint.get_mut(x as usize) {
             *v = t;
-            self.def[x as usize] = pc;
             self.maker[x as usize] = pc;
         }
     }
@@ -4363,7 +4296,6 @@ impl DeferState {
         pc: usize,
         t: u64,
         slot_at: &dyn Fn(usize, u16) -> Option<usize>,
-        live: &dyn Fn(usize, u16) -> bool,
         kept: &mut [bool],
         head: usize,
     ) -> bool {
@@ -4399,18 +4331,7 @@ impl DeferState {
             self.revised = true;
             return true;
         }
-        // (Only what is read after the check: a register whose interval
-        // ended since is dead.)
-        let canon = (0..self.taint.len())
-            .filter(|&x| {
-                let r = x as u16;
-                self.taint[x] & t != 0
-                    && live(pc + 1, r)
-                    && (slot_at(pc, r).is_some() || slot_at(self.def[x], r).is_none())
-            })
-            .map(|x| x as u16)
-            .collect();
-        self.covers.push(Cover { pc, roots, canon });
+        self.covers.push(Cover { pc, roots });
         self.verify(t);
         false
     }
@@ -4776,117 +4697,6 @@ fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Ve
                 avail.retain(|e| !d.contains(&e.0) && !d.contains(&e.2));
             }
             _ => avail.clear(),
-        }
-    }
-    out
-}
-
-/// Whether `op` is an SSE arithmetic op whose inline result is computed from
-/// two Numbers (`+`, `-`, `*`, `/`): a NaN result is whatever NaN the
-/// hardware made, canonicalized before it is stored.
-fn raw_nan_producer(op: &GenericOp) -> bool {
-    match *op {
-        GenericOp::Add { .. } | GenericOp::NumAdd { .. } => true,
-        GenericOp::Arith { op, .. } => matches!(
-            op,
-            crate::nbvm::GA_SUB | crate::nbvm::GA_MUL | crate::nbvm::GA_DIV
-        ),
-        _ => false,
-    }
-}
-
-/// Whether `op` only ever looks at a Number operand's value as an `f64`: it
-/// treats every NaN alike and never stores the operand's bits anywhere (its
-/// own result, or its slow path's, is a fresh value): the arithmetic of
-/// [`raw_nan_producer`] (whose own result is canonicalized or raw by the same
-/// rule) and the relational comparisons.
-fn raw_nan_consumer(op: &GenericOp) -> bool {
-    raw_nan_producer(op) || matches!(op, GenericOp::Lt { .. } | GenericOp::Compare { .. })
-}
-
-/// Whether region op `op` (`bc`) is an inline one-argument `Math` function
-/// (`sqrt`, `abs`, the roundings) of register `x`: it reads its argument
-/// as an `f64` only (a NaN gives a NaN result, which it makes canonical
-/// itself), so it is a [`raw_nan_consumer`] of `x`.
-fn raw_nan_math_arg(op: &GenericOp, bc: &Op, x: u16) -> bool {
-    matches!((op, bc), (GenericOp::CallMethod { .. }, Op::CallMethod { recv, args, .. })
-        if args.len() == 1
-            && args[0] == x
-            && *recv != x
-            && super::inline_math(bc)
-                .is_some_and(|(_, f)| !matches!(f, super::MathInline::MaxMin(_))))
-}
-
-/// The pcs of region `head..=end`'s arithmetic whose NaN result may stay the
-/// hardware's NaN in its SSE register: the canonical NaN exists so that a
-/// NaN's *bits* are the interpreter's wherever they can be observed (stored
-/// into an object, a typed array, compared by identity...), but such a
-/// result never reaches anything that looks at its bits. Its register is
-/// not loop-carried (dead at the header, the exits and the catch entries,
-/// `carried`), and every op of the region that reads it is a
-/// [`raw_nan_consumer`] or a `Move` into a register that satisfies the same
-/// (a `const` binding's copy) — so a value of it reaches nothing else,
-/// whichever way control goes: an op before the header's next execution
-/// that reads such a register reads this value or a later write, and after
-/// an exit (or a leave at the header) the register is dead. Wherever such a
-/// value is written to the register file (a flush before a call) it still
-/// reads as a Number: the hardware's NaNs (the default `0xfff8…` or a
-/// quieted operand NaN, itself a Number) never have the boxed pattern.
-fn raw_nan_results(
-    ops: &[GenericOp],
-    bytecode: &[Op],
-    head: usize,
-    end: usize,
-    carried: &impl Fn(u16) -> bool,
-) -> Vec<usize> {
-    let (mut d, mut u) = (Vec::new(), Vec::new());
-    let mut out = Vec::new();
-    for pc in head..=end {
-        if !raw_nan_producer(&ops[pc]) {
-            continue;
-        }
-        let Some(r) = written_reg(&bytecode[pc]) else {
-            continue;
-        };
-        // The registers the value may reach (through moves), each checked.
-        let mut reach = alloc::vec![r];
-        let mut i = 0;
-        let mut ok = true;
-        while ok && i < reach.len() && reach.len() <= 8 {
-            let x = reach[i];
-            i += 1;
-            if carried(x) {
-                ok = false;
-                break;
-            }
-            for q in head..=end {
-                if q == pc && x == r {
-                    continue;
-                }
-                def_use(&bytecode[q], &mut d, &mut u);
-                if !u.contains(&x)
-                    || raw_nan_consumer(&ops[q])
-                    || raw_nan_math_arg(&ops[q], &bytecode[q], x)
-                {
-                    continue;
-                }
-                match bytecode[q] {
-                    Op::Move { dst, src }
-                        if src == x && matches!(ops[q], GenericOp::Move { .. }) =>
-                    {
-                        if !reach.contains(&dst) {
-                            reach.push(dst);
-                        }
-                    }
-                    _ => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if ok && i == reach.len() {
-            out.push(pc);
         }
     }
     out
@@ -5731,38 +5541,6 @@ mod tests {
             })
             .expect("o.z");
         assert_eq!(ty(z.0 + 1, z.1), T_ANY, "o.z is unchecked");
-    }
-
-    #[test]
-    fn raw_nan_results_feed_only_arithmetic() {
-        // `t = a * b` and `u = t - b` only feed arithmetic: raw. `w` is
-        // stored into an object, `q` is loop-carried, `m` moves: canonical.
-        let p = proto_of(
-            "function f(o, a, b){ let q = 0; for (let i = 0; i < 100; i = i + 1) { const t = a * b; const u = t - b; const w = u / a; o.w = w; q = q + u; const m = t * 2; const n = m; o.n = n; } return q; }",
-            "f",
-        );
-        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
-        let regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
-        assert_eq!(regions.len(), 1);
-        let r = &regions[0];
-        let muls: Vec<usize> = (r.head..=r.end)
-            .filter(|&pc| matches!(p.ops[pc], Op::Mul { .. }))
-            .collect();
-        let sub = pc_of(&p, |o| matches!(o, Op::Sub { .. }));
-        let div = pc_of(&p, |o| matches!(o, Op::Div { .. }));
-        assert_eq!(muls.len(), 2);
-        assert!(
-            r.raw_nan.contains(&muls[0]),
-            "t feeds - and *: {:?}",
-            r.raw_nan
-        );
-        assert!(r.raw_nan.contains(&sub), "u feeds / and +");
-        assert!(!r.raw_nan.contains(&div), "w is stored");
-        assert!(!r.raw_nan.contains(&muls[1]), "m is moved");
-        let add = (r.head..=r.end)
-            .find(|&pc| matches!(p.ops[pc], Op::AddValue { .. } | Op::Add { .. }) && pc > sub)
-            .expect("q + u");
-        assert!(!r.raw_nan.contains(&add), "q is loop-carried");
     }
 
     #[test]
