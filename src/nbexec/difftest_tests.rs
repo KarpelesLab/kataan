@@ -1951,3 +1951,22 @@ fn length_shrink_drops_the_attributes_of_deleted_elements() {
         r#"9 {"value":9,"writable":true,"enumerable":true,"configurable":true} 0,1,2,5 0,7,8,9"#
     );
 }
+
+/// A hot `new` of a class whose constructor reads a captured binding (its
+/// own class name) at script top level: the compiled construct sequence's
+/// allocation helper can grow the heap, moving every cell — the
+/// constructor's, whose inline captures the site had cached a pointer
+/// into — so the callee then read its capture through a dangling pointer
+/// (a segfault under the JIT). The cached pointer is now used only while the
+/// prototype epoch (bumped by every move) is unchanged after the allocation.
+#[test]
+fn hot_construct_reads_captures_after_the_heap_grows() {
+    let src = r#"
+        class A { constructor() { this.t = A; } }
+        class B extends A { constructor() { super(); this.u = B; } }
+        var ok = 0;
+        for (var i = 0; i < 20000; i++) { var a = new A(), b = new B(); if (a.t === A && b.u === B && b.t === A) ok++; }
+        ok
+    "#;
+    assert_eq!(run(src), "20000");
+}

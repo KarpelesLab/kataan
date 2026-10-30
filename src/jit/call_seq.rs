@@ -1032,6 +1032,19 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_mov(r::RDI, r::R15);
             a.g_movabs(r::RAX, alloc);
             a.call_rax();
+            // That allocation may have grown the heap (or collected), moving
+            // every cell — the constructor's own, whose inline captures
+            // `caps` points into, among them — and bumping the epoch: then
+            // the record's `caps` is stale, so the helper identifies the
+            // callee afresh (making its own `this`; this one is garbage).
+            a.g_movabs(r::R11, e.site as u64);
+            load_proto_epoch(a, r::R9);
+            a.g_cmp_mem(
+                r::R9,
+                r::R11,
+                site_off(fast + offset_of!(ConstructFast, stamp)),
+            );
+            a.g_jcc(cc::NE, prep);
             a.bind(made);
             a.g_store(RBP, scratch, r::RAX);
             a.g_movabs(r::R11, e.site as u64);
@@ -1559,6 +1572,13 @@ fn emit_inline_new_this(
         a.g_mov(r::RDI, r::R15);
         a.g_movabs(r::RAX, alloc);
         a.call_rax();
+        // Growing the heap (or collecting) moves every cell and bumps the
+        // epoch, leaving the memo's captures' pointer stale: then miss (the
+        // object just made is garbage, unobservable).
+        a.g_movabs(r::R11, e.memo as u64);
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, f(offset_of!(ConstructFast, stamp)));
+        a.g_jcc(cc::NE, miss);
         a.bind(made);
         a.g_movabs(r::R11, e.memo as u64);
         a.g_load(
