@@ -310,6 +310,38 @@ fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], Option<Reg>)> {
     }
 }
 
+/// A computed-key call `recv[key](args)` (`Op::CallKey`) is inlined as its
+/// two halves: the element read into the scratch register `m` (above the
+/// callee's window), then the call of `m` with `this` the receiver —
+/// `Op::CallWithMethod` with no key, the plain call, exactly `Op::CallKey`'s
+/// call half (the arguments are registers the read cannot change). `None`
+/// for any other op.
+fn split_call_key(op: &Op, m: Reg) -> Option<(Op, Op)> {
+    let Op::CallKey {
+        dst,
+        recv,
+        key,
+        args,
+    } = op
+    else {
+        return None;
+    };
+    Some((
+        Op::GetKey {
+            dst: m,
+            obj: *recv,
+            key: *key,
+        },
+        Op::CallWithMethod {
+            dst: *dst,
+            callee: m,
+            recv: *recv,
+            key: alloc::string::String::new(),
+            args: args.clone(),
+        },
+    ))
+}
+
 /// Splices the callees `pick` names into `proto`'s bytecode (see the module
 /// docs); `warm` is the caller's warm inline caches by its own pc. `None` when
 /// no call was inlined.
@@ -324,7 +356,17 @@ pub fn expand<'a>(
     let mut added = 0usize;
     let mut window = 0usize;
     for (pc, op) in proto.ops.iter().enumerate() {
-        let Some((dst, callee, args, this)) = call_parts(op) else {
+        // (A computed-key call's callee is its read's scratch register, above
+        // the caller's: its receiver and key must be the caller's.)
+        let split = split_call_key(op, Reg::MAX);
+        let parts = match (&split, op) {
+            (Some((_, call)), Op::CallKey { key, .. }) if (*key as usize) < base => {
+                call_parts(call).map(|(d, _, a, t)| (d, 0, a, t))
+            }
+            (Some(_), _) => None,
+            (None, _) => call_parts(op),
+        };
+        let Some((dst, callee, args, this)) = parts else {
             continue;
         };
         if args.len() > 32
@@ -349,7 +391,7 @@ pub fn expand<'a>(
             continue;
         }
         added += cost;
-        window = window.max(c.proto.n_regs + 1);
+        window = window.max(c.proto.n_regs + 1 + usize::from(split.is_some()));
         sites.push((pc, c));
     }
     if sites.is_empty() || base + window > 0xffff {
@@ -369,6 +411,9 @@ pub fn expand<'a>(
         new_of.push(u32::try_from(next).ok()?);
         if si < sites.len() && sites[si].0 == pc {
             next += block_len(&sites[si].1, matches!(proto.ops[pc], Op::Construct { .. })) + 1;
+            if matches!(proto.ops[pc], Op::CallKey { .. }) {
+                next += 1;
+            }
             si += 1;
         } else {
             next += 1;
@@ -382,13 +427,28 @@ pub fn expand<'a>(
         if si < sites.len() && sites[si].0 == pc {
             let c = &sites[si].1;
             si += 1;
-            let (dst, callee, args, this) = call_parts(op)?;
             // A `new`: the guard also allocates `this`, into the register
             // after the captures (the callee's `this` slot).
             let construct = matches!(op, Op::Construct { .. });
-            let g = ops.len();
             let p = c.proto;
             let rb = |r: Reg| -> Reg { (base + r as usize) as Reg };
+            let split = split_call_key(op, rb((p.n_regs + 1) as Reg));
+            let mut w = w;
+            let op = match split {
+                Some((read, call)) => {
+                    // The read first (a branch to the call enters it); a
+                    // throw from it is the call's, as `Op::CallKey`'s is.
+                    ops.push(read);
+                    nwarm.push(None);
+                    orig_of.push(u32::MAX);
+                    w = None;
+                    alloc::borrow::Cow::Owned(call)
+                }
+                None => alloc::borrow::Cow::Borrowed(op),
+            };
+            let op = &*op;
+            let (dst, callee, args, this) = call_parts(op)?;
+            let g = ops.len();
             let tmp = rb(p.n_regs as Reg);
             let fallback = g + block_len(c, construct);
             let end = fallback + 1;

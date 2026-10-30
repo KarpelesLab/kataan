@@ -5018,6 +5018,10 @@ fn ensure_jit(
                 },
                 &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
             )
+            .map(|mut j| {
+                j.note_cold_calls(&jit_tier::cold_call_pcs(&funcs[id], &hints));
+                j
+            })
         })
         .map(alloc::rc::Rc::new);
     if jit_tier::jit_log_enabled() {
@@ -8487,6 +8491,13 @@ fn run_frame_at_ic(
                         continue;
                     }
                 };
+                // The callee feedback the machine-code tier inlines from.
+                if let Some((f, c)) = method
+                    .as_handle()
+                    .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+                {
+                    site_cache!(site).note_callee(u64::from(f) | ((c.len() as u64) << 32));
+                }
                 let pub_mark = ctx.frame_shadow.len();
                 ctx.frame_shadow.extend_from_slice(regs);
                 ctx.frames_published += 1;
@@ -24706,6 +24717,65 @@ mod tests {
         // Functions report `function`; arrays/objects unchanged; the internal tag
         // is non-enumerable (absent from Object.keys).
         assert_eq!(out, "function\nfunction\nfunction\nobject\nobject\n-1\n");
+    }
+
+    /// A call site the machine-code tier inlined with its callee read before
+    /// the arguments (`Op::CallWithMethod`) must leave the inlined body once
+    /// the method becomes a built-in the site serves directly: the built-in
+    /// shortcut shares the guard's identity memo, and must not pass for the
+    /// inlined function.
+    #[cfg(feature = "std")]
+    #[test]
+    fn jit_inlined_method_call_leaves_for_a_builtin() {
+        let (out, _) = execute(
+            "var o = { m: function (x) { return x * 2; } };
+             var a = 0, c = 0, arr = [0];
+             for (let i = 0; i < 30000; i++) {
+               if (i === 25000) o.m = Math.abs;
+               arr[0] = i;
+               var v = o.m(arr[0]++);
+               if (i < 25000) a += v; else c += v;
+             }
+             console.log(a, c);",
+        )
+        .expect("ok");
+        assert_eq!(out, "624975000 137497500\n");
+    }
+
+    /// Computed-key calls (`recv[key](args)`) are inlined by their callee's
+    /// function, whichever closure of it the element holds, and follow the
+    /// site's callee to another function, a built-in and a non-callable; the
+    /// key is read (and converted) once per call; `this` is the receiver.
+    #[cfg(feature = "std")]
+    #[test]
+    fn jit_inlined_computed_key_calls() {
+        let (out, _) = execute(
+            "var fs = [];
+             for (let i = 0; i < 50; i++) fs.push((x) => x + i);
+             var t = 0;
+             for (let r = 0; r < 2000; r++) for (let i = 0; i < fs.length; i++) t = (t + fs[i](r)) | 0;
+             console.log(t);
+             var tbl = [function (x) { return x * 2; }];
+             var a = 0, b = 0, c = 0, e = 0;
+             for (let i = 0; i < 30000; i++) {
+               if (i === 20000) tbl[0] = function (x) { return x - 1; };
+               if (i === 25000) tbl[0] = Math.abs;
+               var v = tbl[0](i);
+               if (i < 20000) a += v; else if (i < 25000) b += v; else c += v;
+             }
+             tbl[0] = 42;
+             try { tbl[0](1); } catch (err) { e = err instanceof TypeError; }
+             console.log(a, b, c, e);
+             var kc = 0, kobj = { toString() { kc++; return 'f'; } };
+             var h = { k: 1, f(x) { return x + this.k; } }, hs = 0;
+             for (let i = 0; i < 20000; i++) hs += h[kobj](i);
+             console.log(hs, kc);",
+        )
+        .expect("ok");
+        assert_eq!(
+            out,
+            "102400000\n399980000 112492500 137497500 true\n200010000 20000\n"
+        );
     }
 
     #[test]

@@ -559,6 +559,7 @@ fn recompile(
         },
         &|pc, _| inline_candidate(funcs, id, &hints, pc),
     )?;
+    new.note_cold_calls(&cold_call_pcs(proto, &hints));
     new.set_generation(old.generation() + 1);
     let new = Rc::new(new);
     if jit_log_enabled() {
@@ -1791,6 +1792,11 @@ pub(crate) extern "C" fn jit_helper_call_with_method(
             } else {
                 CallSite::EMPTY
             };
+            // The same memo is an inlined guard's of this call
+            // (`call_seq::emit_inline_guard`), which takes a key at the
+            // current epoch as its VM function: no epoch is `u64::MAX`, so
+            // the guard never takes a built-in for its inlined callee.
+            site.ident.stamp = u64::MAX;
         }
         match served {
             Some(r) => r,
@@ -2942,6 +2948,35 @@ fn wants_to_leave(ctx: &mut Ctx, header: usize) -> bool {
 fn inline_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INLINE").is_none_or(|v| v != "0"))
+}
+
+/// The pcs of `proto`'s call sites with no callee feedback in `hints` (none
+/// to inline when it is compiled): a body recompiles when one of them settles
+/// on a single callee (`JitProto::note_cold_calls`).
+pub(super) fn cold_call_pcs(
+    proto: &FnProto,
+    hints: &[crate::ic::CalleeHint],
+) -> alloc::vec::Vec<usize> {
+    if !inline_enabled() {
+        return alloc::vec::Vec::new();
+    }
+    proto
+        .ops
+        .iter()
+        .enumerate()
+        .filter(|&(pc, op)| {
+            matches!(
+                op,
+                Op::CallMethod { .. }
+                    | Op::CallValue { .. }
+                    | Op::CallWithMethod { .. }
+                    | Op::CallKey { .. }
+            ) && hints
+                .get(pc)
+                .is_none_or(|h| *h == crate::ic::CalleeHint::None)
+        })
+        .map(|(pc, _)| pc)
+        .collect()
 }
 
 /// The callee function `caller`'s call site at pc `pc` inlines, if any: the

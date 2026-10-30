@@ -3849,6 +3849,7 @@ impl JitProto {
                 GenericOp::CallMethod { pc, cache, .. }
                 | GenericOp::CallValue { pc, cache, .. }
                 | GenericOp::CallWithMethod { pc, cache, .. }
+                | GenericOp::CallKey { pc, cache, .. }
                     if cache != u16::MAX =>
                 {
                     Some((pc, cache))
@@ -3965,6 +3966,7 @@ impl JitProto {
                 | crate::nbvm::Op::CallValue { .. }
                 | crate::nbvm::Op::CallWithMethod { .. }
                 | crate::nbvm::Op::Construct { .. }
+                | crate::nbvm::Op::CallKey { .. }
                 | crate::nbvm::Op::GetProp { .. } => {
                     if let Some(k) = site_of(pc).map(keys) {
                         *slot = match k[..] {

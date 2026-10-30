@@ -39,6 +39,13 @@ pub(super) struct TierUp {
     /// Per add site: the transition compiled into its code
     /// (`props::BakedAdd`), as the add's result shape and the new slot.
     pub(super) added: Vec<Option<(Rc<Shape>, u32)>>,
+    /// Every loop's `(header, last back-edge)`, ascending.
+    pub(super) extents: Vec<(usize, usize)>,
+    /// `(pc, call cache)` of the call sites that had no callee to inline
+    /// when the body was compiled ([`JitProto::note_cold_calls`]): one whose
+    /// cache has since settled on a single callee is worth a recompilation
+    /// that may inline it.
+    pub(super) cold_calls: Vec<(usize, u16)>,
     /// How many recompilations produced this body (`0`: the first compile).
     pub(super) generation: u8,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
@@ -82,6 +89,7 @@ impl TierUp {
             }
         }
         ends.sort_unstable();
+        let extents = ends.clone();
         let loops = ends
             .into_iter()
             .map(|(head, end)| {
@@ -102,6 +110,8 @@ impl TierUp {
             loops,
             baked,
             added,
+            extents,
+            cold_calls: Vec::new(),
             generation: 0,
             countdown: core::cell::Cell::new(1),
         }
@@ -114,6 +124,27 @@ impl JitProto {
     #[must_use]
     pub fn generation(&self) -> u8 {
         self.sites.as_ref().map_or(0, |s| s.tier_up.generation)
+    }
+
+    /// Records the call sites, by the function's own pc, that had no callee
+    /// feedback when this body was compiled (so none to inline): the back-edge
+    /// poll recompiles the body once one of them settles on a single callee
+    /// (see [`JitProto::wants_recompile`]).
+    pub fn note_cold_calls(&mut self, own_pcs: &[usize]) {
+        let body: Vec<usize> = own_pcs.iter().map(|&pc| self.body_pc(pc)).collect();
+        let Some(s) = self.sites.as_mut() else {
+            return;
+        };
+        s.tier_up.cold_calls = body
+            .into_iter()
+            .filter_map(|pc| {
+                let i = s
+                    .call_pcs
+                    .binary_search_by_key(&pc, |&(p, _)| p as usize)
+                    .ok()?;
+                Some((pc, s.call_pcs[i].1))
+            })
+            .collect();
     }
 
     /// Marks this body as the `generation`th recompilation of its function.
@@ -137,15 +168,47 @@ impl JitProto {
         if t.generation >= MAX_GENERATION {
             return false;
         }
-        let Ok(i) = t.loops.binary_search_by_key(&header, |l| l.0) else {
+        let props = t.loops.binary_search_by_key(&header, |l| l.0).ok();
+        let calls = t
+            .extents
+            .binary_search_by_key(&header, |l| l.0)
+            .ok()
+            .map(|i| t.extents[i])
+            .filter(|&(head, end)| {
+                t.cold_calls
+                    .iter()
+                    .any(|&(pc, _)| (head..=end).contains(&pc))
+            });
+        if props.is_none() && calls.is_none() {
             return false;
-        };
+        }
         let left = t.countdown.get() - 1;
         if left > 0 {
             t.countdown.set(left);
             return false;
         }
         t.countdown.set(CHECK_EVERY);
+        if let Some((head, end)) = calls
+            && t.cold_calls.iter().any(|&(pc, cache)| {
+                (head..=end).contains(&pc)
+                    && s.calls.get(cache as usize).is_some_and(|c| {
+                        // SAFETY: as for the property caches below.
+                        #[allow(unsafe_code)]
+                        let c = unsafe { &*c.get() };
+                        let mut keys = c
+                            .targets
+                            .iter()
+                            .map(|t| t.key)
+                            .filter(|&k| k != super::call_seq::CallSite::EMPTY);
+                        keys.next().is_some() && keys.next().is_none()
+                    })
+            })
+        {
+            return true;
+        }
+        let Some(i) = props else {
+            return false;
+        };
         t.loops[i].1.iter().any(|&(site, write)| {
             let site = site as usize;
             let (Some(cache), Some(key)) = (s.caches.get(site), s.keys.get(site)) else {
