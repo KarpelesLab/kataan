@@ -40,7 +40,10 @@
 //! across the inner loops (a register live into an inner header holds its
 //! register over that whole loop), the inner loops' entries and exits are
 //! plain branches, and their back-edges poll like the outer one. An entry at
-//! an inner header (on-stack replacement) loads the registers live there.
+//! an inner header (on-stack replacement) loads the registers live there;
+//! in a speculative nest so does the plain copy's inner back-edge, so a
+//! leave for the copy inside an inner loop costs the rest of that inner
+//! iteration, not of the whole outer one.
 //!
 //! Every arithmetic result is NaN-canonicalized before it is stored, so a value
 //! the native code produces is bit-identical to the interpreter's `NanBox`.
@@ -576,6 +579,9 @@ struct Region {
     reuse: Vec<(usize, u16)>,
     /// A loop nest's inner back-edges, as `(header, back-edge)` ([`plan_nests`]).
     loops: Vec<(usize, usize)>,
+    /// Per inner header of a generic nest: the registers live on entry to
+    /// it (its entry from the plain copy, [`NumGen::emit_inner_entries`]).
+    live_inner: Vec<(usize, Vec<u16>)>,
 }
 
 /// A region's **speculative** double version: arithmetic whose operands are
@@ -754,6 +760,11 @@ pub(super) struct NumGen {
     /// The entries at a loop nest's inner headers (on-stack replacement
     /// there), as `(label, pc)` ([`Self::entry_label`]).
     nest_entries: Vec<(Label, usize)>,
+    /// Per inner header of a speculative nest: the entry into its fast
+    /// version there ([`Self::emit_inner_entries`]), which the plain copy's
+    /// inner back-edge (and an on-stack replacement there) takes, as
+    /// `(header, label)`.
+    inner_entries: Vec<(usize, Label)>,
 }
 
 /// The ops a region may contain: each is emitted here, with calls only on slow
@@ -954,6 +965,7 @@ impl NumGen {
             truthy_ways: Vec::new(),
             leave_exit: None,
             nest_entries: Vec::new(),
+            inner_entries: Vec::new(),
         }
     }
 
@@ -964,8 +976,19 @@ impl NumGen {
                 for pc in r.head..=r.end {
                     self.copy_labels[pc] = Some(a.new_label());
                 }
+                for &(h, _) in &r.loops {
+                    if !self.inner_entries.iter().any(|e| e.0 == h) {
+                        self.inner_entries.push((h, a.new_label()));
+                    }
+                }
             }
         }
+    }
+
+    /// The entry into speculative nest `ri`'s fast version at its inner
+    /// header `h`, if it has one.
+    fn inner_entry(&self, h: usize) -> Option<Label> {
+        self.inner_entries.iter().find(|e| e.0 == h).map(|e| e.1)
     }
 
     /// The order the generic emitter emits the body in, as `(pc, copy)`: every
@@ -2973,6 +2996,15 @@ impl NumGen {
             && self.region_of.get(target) == Some(&ri)
             && self.regions[ri as usize].head != target
         {
+            // A speculative nest's inner back-edge goes back into the fast
+            // version at that header (`emit_inner_entries`): after a leave
+            // for the copy, the copy runs the rest of that inner iteration
+            // only, not of the whole outer one.
+            if self.regions[ri as usize].loops.contains(&(target, from))
+                && let Some(l) = self.inner_entry(target)
+            {
+                return Some(l);
+            }
             return self.copy_label(target);
         }
         labels.get(target).copied()
@@ -3200,7 +3232,7 @@ impl NumGen {
             };
             self.cur_pc = pc;
             if self.regions[ri].spec.is_some() {
-                if let Some(c) = self.copy_label(pc) {
+                if let Some(c) = self.inner_entry(pc).or_else(|| self.copy_label(pc)) {
                     a.jmp(c);
                 }
                 continue;
@@ -3214,6 +3246,72 @@ impl NumGen {
             if let Some(&t) = labels.get(pc) {
                 a.jmp(t);
             }
+        }
+        self.emit_inner_entries(a, labels);
+    }
+
+    /// The entries into the speculative nests' fast versions at their inner
+    /// headers, taken from the plain copy (its inner back-edges) and by an
+    /// on-stack replacement there, with the register file up to date: like
+    /// the nest's own entry, the global bindings validated (else the copy
+    /// runs on), then the promoted registers live at the header loaded and
+    /// each one the fast version assumes there to be a Number checked (a
+    /// failed check runs the inner iteration in the copy, whose back-edge
+    /// tries again). A register live at the header whose speculative type
+    /// there is neither its plain one nor a Number makes the header have no
+    /// entry (the copy runs on to the outer back-edge, as without one).
+    fn emit_inner_entries(&mut self, a: &mut X64Assembler, labels: &[Label]) {
+        for (h, l) in core::mem::take(&mut self.inner_entries) {
+            a.bind(l);
+            let (Some(ri), Some(copy), Some(&fast)) =
+                (self.region_at(h), self.copy_label(h), labels.get(h))
+            else {
+                continue;
+            };
+            self.cur_pc = h;
+            let Some(sp) = self.regions[ri].spec.as_ref() else {
+                a.jmp(copy);
+                continue;
+            };
+            let n = self.env.n_regs;
+            let row = (h - self.regions[ri].head) * n;
+            let mut checks = Vec::new();
+            let mut ok = true;
+            let live: &[u16] = self.regions[ri]
+                .live_inner
+                .iter()
+                .find(|x| x.0 == h)
+                .map_or(&[], |x| x.1.as_slice());
+            for &r in live {
+                let spec = sp.types.get(row + r as usize).copied().unwrap_or(T_ANY);
+                let plain = self.types.get(h, r);
+                if spec == plain || spec == T_ANY {
+                    continue;
+                }
+                if spec == T_NUM {
+                    checks.push(r);
+                } else {
+                    ok = false;
+                }
+            }
+            if !ok {
+                a.jmp(copy);
+                continue;
+            }
+            self.refresh_globals(a, ri, true);
+            if self.spec_globals_ready(a, ri, h).is_none() {
+                a.jmp(copy);
+                continue;
+            }
+            for s in &self.regions[ri].slots {
+                if s.start <= h && h <= s.end {
+                    a.movsd_x_mem(s.xmm, disp(s.reg));
+                }
+            }
+            for r in checks {
+                self.num_guard(a, Some(ri), r, copy);
+            }
+            a.jmp(fast);
         }
     }
 }
@@ -3748,6 +3846,14 @@ fn plan_regions(
         } else {
             Vec::new()
         };
+        let live_inner = if generic {
+            loops
+                .iter()
+                .map(|&(h, _)| (h, (0..n_regs as u16).filter(|&r| is_live(h, r)).collect()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         out.push(Region {
             head,
             end,
@@ -3760,6 +3866,7 @@ fn plan_regions(
             raw_nan: raw_nan_results(ops, bytecode, head, end, &carried_r),
             reuse,
             loops,
+            live_inner,
         });
     }
     out
@@ -4783,6 +4890,18 @@ mod tests {
         }
         r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs);
         assert!(r.spec.is_some(), "the nest has a speculative version");
+        // Its inner header's live registers (its entry from the plain
+        // copy): the outer object and index among them.
+        let at_h = &r
+            .live_inner
+            .iter()
+            .find(|x| x.0 == h)
+            .expect("inner header")
+            .1;
+        for x in at_h {
+            assert!(live[h * words + *x as usize / 64] & (1u64 << (x % 64)) != 0);
+        }
+        assert!(at_h.len() >= 3, "{at_h:?}");
         // An inner loop with a call keeps its own region (no nest).
         let q = proto_of(
             "function g(bs, f){ let s = 0; for (let i = 0; i < bs.length; i = i + 1) { const a = bs[i]; for (let j = 0; j < bs.length; j = j + 1) { s = s + f(a.x); } } return s; }",
