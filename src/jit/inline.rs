@@ -4,8 +4,10 @@
 //! behind a guard, so the call costs no call sequence and the callee's code is
 //! optimized together with its caller's (the receiver cache, the numeric
 //! types, the promoted loop registers all see through it). The sites are
-//! method calls, calls of a value, and property reads that call an inherited
-//! getter.
+//! method calls, calls of a value, property reads that call an inherited
+//! getter, and `new` of a small base class constructor (whose guard also
+//! allocates `this`, as the site's `call_seq::ConstructFast` record says,
+//! into the callee's `this` register; see [`construct_ok`]).
 //!
 //! The splice happens on the tier's **own copy** of the caller's bytecode,
 //! before lowering, and uses only ordinary ops besides two of its own
@@ -106,6 +108,39 @@ pub fn callee_ok(proto: &FnProto) -> bool {
     let n = proto.ops.len();
     proto.ops.iter().enumerate().all(|(pc, op)| match op {
         Op::Jump { target } | Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
+        _ => {
+            let mut o = op.clone();
+            remap(&mut o, &|r| r, &|t| t)
+        }
+    })
+}
+
+/// Whether `proto` can be inlined at a `new` site (`Op::Construct`): a
+/// small base class constructor — the only kind a site's
+/// `call_seq::ConstructFast` record, which the guard requires, serves with an
+/// allocated `this` — whose body never returns explicitly (falling off its
+/// end yields `this`), reads `new.target` only through `Op::LoadNewTarget`
+/// (the constructor itself, which such a `new` passes as `new.target`), and
+/// is otherwise what [`callee_ok`] accepts.
+#[must_use]
+pub fn construct_ok(proto: &FnProto) -> bool {
+    if !proto.class_ctor
+        || proto.derived
+        || proto.is_async
+        || proto.is_generator
+        || proto.rest_from.is_some()
+        || proto.ops.is_empty()
+        || proto.ops.len() > MAX_CALLEE_OPS
+        || proto.n_regs > MAX_CALLEE_REGS
+        || proto.n_params + proto.n_captures >= proto.n_regs
+    {
+        return false;
+    }
+    let n = proto.ops.len();
+    proto.ops.iter().enumerate().all(|(pc, op)| match op {
+        Op::Jump { target } | Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
+        Op::LoadNewTarget { .. } => true,
+        Op::Return { .. } => false,
         _ => {
             let mut o = op.clone();
             remap(&mut o, &|r| r, &|t| t)
@@ -255,6 +290,8 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
 fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], Option<Reg>)> {
     match op {
         Op::GetProp { dst, obj, .. } => Some((*dst, *obj, &[], Some(*obj))),
+        // (`this` is the object the guard allocates.)
+        Op::Construct { dst, ctor, args } => Some((*dst, *ctor, args, None)),
         Op::CallMethod {
             dst,
             recv,
@@ -299,7 +336,12 @@ pub fn expand<'a>(
             continue;
         }
         let Some(c) = pick(pc, op) else { continue };
-        if !callee_ok(c.proto) || (c.key >> 32) as usize != c.proto.n_captures {
+        let ok = if matches!(op, Op::Construct { .. }) {
+            construct_ok(c.proto)
+        } else {
+            callee_ok(c.proto)
+        };
+        if !ok || (c.key >> 32) as usize != c.proto.n_captures {
             continue;
         }
         let cost = c.proto.ops.len() + c.proto.n_regs + 6;
@@ -326,7 +368,7 @@ pub fn expand<'a>(
     for pc in 0..proto.ops.len() {
         new_of.push(u32::try_from(next).ok()?);
         if si < sites.len() && sites[si].0 == pc {
-            next += block_len(&sites[si].1) + 1;
+            next += block_len(&sites[si].1, matches!(proto.ops[pc], Op::Construct { .. })) + 1;
             si += 1;
         } else {
             next += 1;
@@ -341,11 +383,14 @@ pub fn expand<'a>(
             let c = &sites[si].1;
             si += 1;
             let (dst, callee, args, this) = call_parts(op)?;
+            // A `new`: the guard also allocates `this`, into the register
+            // after the captures (the callee's `this` slot).
+            let construct = matches!(op, Op::Construct { .. });
             let g = ops.len();
             let p = c.proto;
             let rb = |r: Reg| -> Reg { (base + r as usize) as Reg };
             let tmp = rb(p.n_regs as Reg);
-            let fallback = g + block_len(c);
+            let fallback = g + block_len(c, construct);
             let end = fallback + 1;
             let leave = fallback - 2;
             macro_rules! emit {
@@ -363,7 +408,7 @@ pub fn expand<'a>(
                     callee,
                     args: args.to_vec(),
                     caps: rb(p.n_params as Reg),
-                    n_caps: p.n_captures as u16,
+                    n_caps: (p.n_captures + usize::from(construct)) as u16,
                 },
                 None,
                 ops
@@ -383,6 +428,9 @@ pub fn expand<'a>(
             // values are never seen).
             let this_slot = p.n_params + p.n_captures;
             for r in window_regs(p) {
+                if construct && r == this_slot {
+                    continue;
+                }
                 let o = if r < p.n_params {
                     match args.get(r) {
                         Some(&a) => Op::Move {
@@ -425,6 +473,17 @@ pub fn expand<'a>(
                             emit!(Op::Jump { target: leave }, None, ops);
                         }
                     }
+                    // `new.target`: the constructor (see `construct_ok`).
+                    _ if construct && let Op::LoadNewTarget { dst: d } = bop => {
+                        emit!(
+                            Op::Move {
+                                dst: rb(*d),
+                                src: callee,
+                            },
+                            None,
+                            ops
+                        );
+                    }
                     _ => {
                         let mut o = bop.clone();
                         if !remap(&mut o, &rb, &tgt) {
@@ -435,14 +494,19 @@ pub fn expand<'a>(
                 }
             }
             if falls_off(p) {
-                emit!(
+                // A constructor's end yields `this`, a function's `undefined`.
+                let o = if construct {
+                    Op::Move {
+                        dst,
+                        src: rb(this_slot as Reg),
+                    }
+                } else {
                     Op::LoadConst {
                         dst,
                         value: undefined,
-                    },
-                    None,
-                    ops
-                );
+                    }
+                };
+                emit!(o, None, ops);
             }
             debug_assert_eq!(ops.len(), leave);
             emit!(Op::InlineLeave, None, ops);
@@ -525,9 +589,15 @@ fn body_pc(p: &FnProto, t: usize) -> usize {
 
 /// The ops one inlined site takes before its call op: guard, branch, window,
 /// body, fall-off, leave, jump.
-fn block_len(c: &Candidate<'_>) -> usize {
+/// (`construct`: a `new` site, whose `this` the guard writes.)
+fn block_len(c: &Candidate<'_>, construct: bool) -> usize {
     let p = c.proto;
-    2 + window_regs(p).len() + body_pc(p, p.ops.len()) + usize::from(falls_off(p)) + 2
+    let this_slot = p.n_params + p.n_captures;
+    let window = window_regs(p)
+        .into_iter()
+        .filter(|&r| !(construct && r == this_slot))
+        .count();
+    2 + window + body_pc(p, p.ops.len()) + usize::from(falls_off(p)) + 2
 }
 
 /// The callee registers an inlined site initializes as a call's register

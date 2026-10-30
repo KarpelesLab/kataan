@@ -2660,6 +2660,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                         callee: c, args: a, ..
                     }) => c == callee && a == args,
                     Some(Op::GetProp { obj, .. }) => obj == callee && args.is_empty(),
+                    Some(Op::Construct { ctor, args: a, .. }) => ctor == callee && a == args,
                     _ => false,
                 };
                 if !same || args.len() > 32 || *call <= pc {
@@ -3761,6 +3762,8 @@ impl JitProto {
         let mut baked: Vec<alloc::rc::Rc<crate::shape::Shape>> = Vec::new();
         let mut tier_baked: Vec<Option<(alloc::rc::Rc<crate::shape::Shape>, u32)>> =
             alloc::vec![None; keys.len()];
+        let mut tier_added: Vec<Option<(alloc::rc::Rc<crate::shape::Shape>, u32)>> =
+            alloc::vec![None; keys.len()];
         for (pc, op) in ops.iter().enumerate() {
             let (site, write) = match *op {
                 GenericOp::GetProp { site, .. } => (site as usize, false),
@@ -3795,6 +3798,7 @@ impl JitProto {
                 // (`w.shape` holds its parent, the add's `from`.)
                 add_at[site] = Some(b);
                 baked.push(alloc::rc::Rc::clone(&w.shape));
+                tier_added[site] = Some((alloc::rc::Rc::clone(&w.shape), w.slot));
             }
         }
         // A chain cache for each method-call and property-write site.
@@ -3837,7 +3841,7 @@ impl JitProto {
                 add: None,
             })
             .collect();
-        let tier_up = tierup::TierUp::plan(&ops, tier_baked);
+        let tier_up = tierup::TierUp::plan(&ops, tier_baked, tier_added);
         let call_pcs: Vec<(u32, u16)> = ops
             .iter()
             .enumerate()
@@ -3960,6 +3964,7 @@ impl JitProto {
                 crate::nbvm::Op::CallMethod { .. }
                 | crate::nbvm::Op::CallValue { .. }
                 | crate::nbvm::Op::CallWithMethod { .. }
+                | crate::nbvm::Op::Construct { .. }
                 | crate::nbvm::Op::GetProp { .. } => {
                     if let Some(k) = site_of(pc).map(keys) {
                         *slot = match k[..] {
@@ -6439,7 +6444,7 @@ impl JitFunction {
         }
         // The inlined calls' frame materialization stubs: (entry, the call's
         // argument registers).
-        let mut inline_stubs: Vec<(Label, Vec<u16>)> = Vec::new();
+        let mut inline_stubs: Vec<(Label, Vec<u16>, Option<u16>)> = Vec::new();
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
         // The global binding cache's refills: (entry, resume, done, op, slot).
@@ -6944,11 +6949,21 @@ impl JitFunction {
                             )
                         }
                         GenericOp::CallValue { callee, site, .. }
-                        | GenericOp::CallWithMethod { callee, site, .. } => (
+                        | GenericOp::CallWithMethod { callee, site, .. }
+                        | GenericOp::Construct {
+                            ctor: callee, site, ..
+                        } => (
                             call_seq::CalleeSrc::Reg(*callee),
                             call_args.get(*site as usize)?,
                         ),
                         _ => return None,
+                    };
+                    // A `new`: the guard allocates `this` (`inline`'s
+                    // construct sites), passing the constructor as
+                    // `new.target`.
+                    let new_target = match ops.get(call as usize)? {
+                        GenericOp::Construct { ctor, .. } => Some(*ctor),
+                        _ => None,
                     };
                     if !ok(dst)
                         || argv.iter().any(|&r| !ok(r))
@@ -6969,15 +6984,25 @@ impl JitFunction {
                         Some(_) => return None,
                         None => None,
                     };
+                    // A `new`'s way is its fresh `this`'s.
+                    let (way, new_way) = if new_target.is_some() {
+                        (None, way)
+                    } else {
+                        (way, None)
+                    };
                     if way.is_some() && matches!(callee, call_seq::CalleeSrc::Reg(_)) {
                         return None;
                     }
+                    // (A promoted loop's guard makes no call.)
+                    let new_alloc = (new_target.is_some() && !num.in_region(op_idx))
+                        .then_some(construct_alloc_helper);
                     let stub = a.new_label();
                     let memo = call_sites
                         .get(match ops.get(call as usize)? {
                             GenericOp::CallMethod { cache, .. }
                             | GenericOp::CallValue { cache, .. }
-                            | GenericOp::CallWithMethod { cache, .. } => *cache as usize,
+                            | GenericOp::CallWithMethod { cache, .. }
+                            | GenericOp::Construct { cache, .. } => *cache as usize,
                             GenericOp::GetProp { call, .. } => *call as usize,
                             _ => return None,
                         })
@@ -6997,9 +7022,12 @@ impl JitFunction {
                             memo,
                             getter,
                             way,
+                            new_target,
+                            new_alloc,
+                            new_way,
                         },
                     )?;
-                    inline_stubs.push((stub, argv.clone()));
+                    inline_stubs.push((stub, argv.clone(), new_target));
                 }
                 GenericOp::InlineLeave => {
                     call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inl_slots);
@@ -9220,9 +9248,9 @@ impl JitFunction {
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
         // (Out of line, called: see `call_seq::emit_inline_stub`.)
-        for (stub, argv) in core::mem::take(&mut inline_stubs) {
+        for (stub, argv, nt) in core::mem::take(&mut inline_stubs) {
             a.bind(stub);
-            call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &inl_slots, &argv)?;
+            call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &inl_slots, &argv, nt)?;
         }
         // The native-call entry (`call_seq::emit_native_entry`), behind one
         // that gives it a handler-stack segment of its own when the body has

@@ -8557,6 +8557,14 @@ fn run_frame_at_ic(
             Op::Construct { dst, ctor, args } => {
                 let c = regs[*ctor as usize];
                 let argv = ArgBuf::from_regs(regs, args);
+                // The callee feedback the machine-code tier inlines from.
+                if let Some(key) = c
+                    .as_handle()
+                    .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+                    .map(|(f, cs)| u64::from(f) | ((cs.len() as u64) << 32))
+                {
+                    site_cache!(site).note_callee(key);
+                }
                 if c.as_handle()
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                 {

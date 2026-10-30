@@ -426,10 +426,15 @@ pub(super) fn plan(
         // speculative loop, where a later site may take the way as filled
         // without comparing (`known`) while a guard's miss goes on in the
         // loop without filling it.
-        GenericOp::InlineGuard { call, .. } if !in_spec(i) => match ops.get(call as usize)? {
+        GenericOp::InlineGuard {
+            call, caps, n_caps, ..
+        } if !in_spec(i) => match ops.get(call as usize)? {
             GenericOp::CallMethod { recv: r, .. } | GenericOp::GetProp { obj: r, .. } => {
                 Some((*r, Family::Obj))
             }
+            // An inlined `new`'s guard allocates `this` (the register after
+            // the captures) and fills its way with the fresh object.
+            GenericOp::Construct { .. } => Some((caps + n_caps.checked_sub(1)?, Family::Obj)),
             _ => None,
         },
         _ => site_recv(op, bytecode.get(i)),
@@ -503,7 +508,20 @@ pub(super) fn plan(
         }
         (l, f)
     };
+    // The `this` an inlined `new`'s guard writes (a new value, which its
+    // own site walks first).
+    let new_this = |op: &GenericOp| match *op {
+        GenericOp::InlineGuard {
+            call, caps, n_caps, ..
+        } if matches!(ops.get(call as usize), Some(GenericOp::Construct { .. })) => {
+            n_caps.checked_sub(1).map(|k| caps + k)
+        }
+        _ => None,
+    };
     for (i, op) in ops.iter().enumerate() {
+        if let Some(t) = new_this(op) {
+            ids.retain(|&(x, _)| x != t);
+        }
         if target[i] {
             let falls_in = i > 0
                 && !matches!(
@@ -571,7 +589,9 @@ pub(super) fn plan(
                 dst, caps, n_caps, ..
             } => {
                 let written = |x: u16| x == dst || (x >= caps && x - caps < n_caps);
-                ids.retain(|&(x, _)| !written(x));
+                // (A `new`'s `this` keeps the id its site gave it.)
+                let this = new_this(op);
+                ids.retain(|&(x, _)| !written(x) || Some(x) == this);
                 fresh.retain(|&x| !written(x));
             }
             GenericOp::Move { dst, src } => {

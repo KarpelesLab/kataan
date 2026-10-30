@@ -1218,6 +1218,16 @@ pub(crate) struct InlineEmit<'a> {
     /// The receiver cache's way for a method's receiver
     /// (`super::recv_cache`), if the guard is one of its sites.
     pub way: Option<RecvWay>,
+    /// A `new` site's constructor register (also its `new.target`): the
+    /// guard then requires the call's [`ConstructFast`] record for a base
+    /// constructor and allocates `this` as it says, into the register after
+    /// the captures (`n_caps` counts it).
+    pub new_target: Option<u16>,
+    /// For a `new`: the helper that allocates `this` when the heap's free
+    /// list is empty ([`ConstructAllocHelper`]; `None`: that is a miss), and
+    /// the receiver-cache way the fresh object fills.
+    pub new_alloc: Option<u64>,
+    pub new_way: Option<RecvWay>,
 }
 
 /// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
@@ -1367,10 +1377,15 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.g_jcc(cc::A, miss);
     a.g_store_imm32(RBP, e.slots.ok, 0);
     a.bind(checked);
+    // 3b. A `new`: `this`, as the call's `[[Construct]]` would make it.
+    let n_caps = e.n_caps - u16::from(e.new_target.is_some());
+    if let Some(ctor) = e.new_target {
+        emit_inline_new_this(a, e, ctor, e.caps.checked_add(n_caps)?, miss)?;
+    }
     // 4. Pending, its captures in the inlined body's registers.
     a.g_lea_label(r::RAX, e.stub);
     a.g_store(RBP, e.slots.pend, r::RAX);
-    for i in 0..e.n_caps {
+    for i in 0..n_caps {
         a.g_load(r::RAX, r::R8, hdr(usize::from(i))?);
         a.g_store(r::RBX, reg(e.caps.checked_add(i)?), r::RAX);
     }
@@ -1384,16 +1399,100 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     Some(())
 }
 
+/// An inlined `new`'s `this` (`emit_inline_guard`, `e.new_target` the
+/// constructor register `ctor`): the call's [`ConstructFast`] record must
+/// hold for this constructor as its own `new.target`, at the current
+/// prototype epoch, for a base constructor whose way is `e.key`'s — so the
+/// construct is exactly "allocate an ordinary object whose `[[Prototype]]`
+/// is `proto` (`new.target.prototype`, which the record proves fixed), then
+/// run the body" (`OrdinaryCreateFromConstructor` observes nothing else) —
+/// and the object is allocated (`p_alloc_object`, else `e.new_alloc`'s
+/// helper, else a miss), into register `this` (and `e.new_way`). Otherwise
+/// to `miss`, having changed nothing observable (the call op makes the
+/// construct). Keeps `r8` (the captures' pointer).
+fn emit_inline_new_this(
+    a: &mut X64Assembler,
+    e: &InlineEmit<'_>,
+    ctor: u16,
+    this: u16,
+    miss: Label,
+) -> Option<()> {
+    use core::mem::offset_of;
+    let reg = |x: u16| i32::from(x) * 8;
+    let fast = offset_of!(CallSite, fast);
+    let f = |o: usize| site_off(fast + o);
+    a.g_movabs(r::R11, e.memo as u64);
+    a.g_load(r::RAX, r::RBX, reg(ctor));
+    a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ctor)));
+    a.g_jcc(cc::NE, miss);
+    a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, nt)));
+    a.g_jcc(cc::NE, miss);
+    load_proto_epoch(a, r::R9);
+    a.g_cmp_mem(r::R9, r::R11, f(offset_of!(ConstructFast, stamp)));
+    a.g_jcc(cc::NE, miss);
+    a.g_load(r::RAX, r::R11, f(offset_of!(ConstructFast, derived)));
+    a.g_test(r::RAX);
+    a.g_jcc(cc::NE, miss);
+    a.g_load(r::R9, r::R11, f(offset_of!(ConstructFast, target)));
+    a.g_test(r::R9);
+    a.g_jcc(cc::E, miss);
+    a.g_movabs(r::RAX, e.key);
+    a.g_cmp_mem(
+        r::RAX,
+        r::R9,
+        i32::try_from(offset_of!(CallTarget, key)).ok()?,
+    );
+    a.g_jcc(cc::NE, miss);
+    a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
+    let made = a.new_label();
+    let by_helper = a.new_label();
+    a.p_alloc_object(
+        super::compute_jit_layout(),
+        e.layout.realm,
+        if e.new_alloc.is_some() {
+            by_helper
+        } else {
+            miss
+        },
+    );
+    // (`rcx`: the fresh object's heap slot.)
+    if let Some(w) = e.new_way {
+        a.g_store(RBP, w.key, r::RAX);
+        a.g_store(RBP, w.cell, r::RCX);
+    }
+    if let Some(alloc) = e.new_alloc {
+        a.jmp(made);
+        // The free list is empty: the allocation the call's sequence would
+        // make (`rsi` kept), which may collect — before the activation,
+        // as there. The captures' pointer is reloaded from the memo.
+        a.bind(by_helper);
+        a.g_mov(r::RDI, r::R15);
+        a.g_movabs(r::RAX, alloc);
+        a.call_rax();
+        a.bind(made);
+        a.g_movabs(r::R11, e.memo as u64);
+        a.g_load(
+            r::R8,
+            r::R11,
+            site_off(offset_of!(CallSite, ident) + offset_of!(IdentMemo, value)),
+        );
+    }
+    a.g_store(r::RBX, reg(this), r::RAX);
+    Some(())
+}
+
 /// Emits an inlined call's materialization stub: called (by
 /// [`X64Assembler::inline_frame_hook`]) with the call's activation pending,
 /// it pushes the native-call header and the arguments (the caller's
-/// registers `args`) and bumps the depth counts exactly as [`emit_call`]
-/// does, records the header and clears `pend`. Preserves every register.
+/// registers `args`; `new_target` the register a `new`'s header records)
+/// and bumps the depth counts exactly as [`emit_call`] does, records the
+/// header and clears `pend`. Preserves every register.
 pub(crate) fn emit_inline_stub(
     a: &mut X64Assembler,
     l: &CallLayout,
     s: &InlineSlots,
     args: &[u16],
+    new_target: Option<u16>,
 ) -> Option<()> {
     use crate::nanbox::NanBox;
     let reg = |x: u16| i32::from(x) * 8;
@@ -1411,7 +1510,10 @@ pub(crate) fn emit_inline_stub(
     a.g_load(r::RDX, r::R9, l.callee_len);
     a.g_store(r::RCX, 16, r::RDX);
     a.g_store_imm32(r::RCX, 24, i32::try_from(args.len()).ok()?);
-    a.g_movabs(r::RDX, NanBox::undefined().to_bits());
+    match new_target {
+        Some(nt) => a.g_load(r::RDX, r::RBX, reg(nt)),
+        None => a.g_movabs(r::RDX, NanBox::undefined().to_bits()),
+    }
     a.g_store(r::RCX, 32, r::RDX);
     for (i, &ar) in args.iter().enumerate() {
         a.g_load(r::RDX, r::RBX, reg(ar));

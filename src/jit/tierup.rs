@@ -36,6 +36,9 @@ pub(super) struct TierUp {
     pub(super) loops: Vec<(usize, Vec<(u16, bool)>)>,
     /// Per site: the layout compiled into its code, if any, and the slot.
     pub(super) baked: Vec<Option<(Rc<Shape>, u32)>>,
+    /// Per add site: the transition compiled into its code
+    /// (`props::BakedAdd`), as the add's result shape and the new slot.
+    pub(super) added: Vec<Option<(Rc<Shape>, u32)>>,
     /// How many recompilations produced this body (`0`: the first compile).
     pub(super) generation: u8,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
@@ -55,7 +58,11 @@ const CHECK_EVERY: u8 = 8;
 impl TierUp {
     /// The checks' data for lowered `ops`, whose sites `baked` has compiled
     /// in.
-    pub(super) fn plan(ops: &[GenericOp], baked: Vec<Option<(Rc<Shape>, u32)>>) -> Self {
+    pub(super) fn plan(
+        ops: &[GenericOp],
+        baked: Vec<Option<(Rc<Shape>, u32)>>,
+        added: Vec<Option<(Rc<Shape>, u32)>>,
+    ) -> Self {
         let mut site_pcs = Vec::new();
         for (pc, op) in ops.iter().enumerate() {
             if let GenericOp::GetProp { site, .. } | GenericOp::SetProp { site, .. } = *op {
@@ -94,6 +101,7 @@ impl TierUp {
             site_pcs,
             loops,
             baked,
+            added,
             generation: 0,
             countdown: core::cell::Cell::new(1),
         }
@@ -162,7 +170,8 @@ impl JitProto {
     /// function's own bytecode pc (the warm start of its recompilation; an
     /// inlined body's sites are left out). A site with a layout compiled
     /// in reports that layout as settled unless its cache settled on
-    /// another: the compiled-in compare, not the cache, counts its hits.
+    /// another: the compiled-in compare, not the cache, counts its hits
+    /// (likewise a compiled-in add, as an add memo).
     #[must_use]
     pub fn runtime_warm(&self) -> Vec<Option<crate::ic::WarmEntry>> {
         let Some(s) = self.sites.as_ref() else {
@@ -186,16 +195,27 @@ impl JitProto {
             #[allow(unsafe_code)]
             let w = unsafe { (*c.get()).warm_entry() };
             let baked = s.tier_up.baked.get(site as usize).cloned().flatten();
-            out[pc] = match (w, baked) {
-                (Some(w), _) if w.is_stable() => Some(w),
-                (_, Some((shape, slot))) => Some(crate::ic::WarmEntry {
+            let added = s.tier_up.added.get(site as usize).cloned().flatten();
+            out[pc] = match (w, baked, added) {
+                (Some(w), _, _) if w.is_stable() => Some(w),
+                (_, Some((shape, slot)), _) => Some(crate::ic::WarmEntry {
                     shape,
                     slot,
                     hits: BAKED_HITS,
                     misses: 0,
                     by_add: false,
                 }),
-                (w, None) => w,
+                // A compiled-in add counts no hits in the cache either (an
+                // inlined copy of the body, or its recompilation, then
+                // compiles it in again).
+                (_, None, Some((shape, slot))) => Some(crate::ic::WarmEntry {
+                    shape,
+                    slot,
+                    hits: BAKED_HITS,
+                    misses: 0,
+                    by_add: true,
+                }),
+                (w, None, None) => w,
             };
         }
         out

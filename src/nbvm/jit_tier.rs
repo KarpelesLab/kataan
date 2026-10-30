@@ -2962,7 +2962,7 @@ pub(super) fn inline_candidate<'a>(
         return None;
     }
     let proto = funcs.get(fid)?;
-    if !crate::jit::inline::callee_ok(proto) {
+    if !crate::jit::inline::callee_ok(proto) && !crate::jit::inline::construct_ok(proto) {
         return None;
     }
     let mut warm = match proto.tier.jit() {
