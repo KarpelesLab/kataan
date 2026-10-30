@@ -2676,3 +2676,26 @@ fn temporal_zoned_calendar_rounding_day_correction() {
     "#;
     assert_eq!(run(src), "P4W|-P7Y6M4W|P4W5D|P28D");
 }
+
+/// A non-ISO PlainDateTime difference with a calendar largestUnit and a
+/// day/time smallestUnit must round (NudgeToDayOrTimeUnit +
+/// BubbleRelativeDuration) like the ISO one; it had returned the unrounded
+/// difference, keeping the hours under `smallestUnit: "days"`. The Gregorian
+/// results must equal the ISO ones.
+#[test]
+fn temporal_non_iso_plaindatetime_day_time_rounding() {
+    let src = r#"
+        var P = Temporal.PlainDateTime;
+        function run(cal) {
+            var a = P.from("2015-08-22T04:15").withCalendar(cal), b = P.from("2013-05-18T19:15").withCalendar(cal), c = P.from("2015-09-21T20:15").withCalendar(cal);
+            return [String(a.until(b, { largestUnit: "years", smallestUnit: "days" })), String(a.until(b, { largestUnit: "weeks", smallestUnit: "hours", roundingIncrement: 6, roundingMode: "ceil" })),
+                String(a.until(c, { largestUnit: "months", smallestUnit: "days", roundingMode: "halfExpand" })), String(a.since(c, { largestUnit: "years", smallestUnit: "minutes", roundingIncrement: 30 }))].join("|");
+        }
+        [run("iso8601"), run("gregory"), run("coptic")].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "-P2Y3M3D|-P117W6DT6H|P1M|-P30DT16H -P2Y3M3D|-P117W6DT6H|P1M|-P30DT16H \
+         -P2Y3M5D|-P117W6DT6H|P1M11D|-P1M10DT16H"
+    );
+}

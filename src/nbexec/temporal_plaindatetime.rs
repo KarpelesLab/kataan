@@ -1355,18 +1355,19 @@ impl Interp {
                 pdt_round_calendar_cal(&data.calendar, from, to, largest, smallest, increment, mode)
             };
             rounded.map_err(|()| self.pdt_range("rounded date is outside the valid ISO range"))?
-        } else if is_iso {
-            // A calendar `largestUnit` with a day/time `smallestUnit`: round the
-            // day+time span (NudgeToDayOrTimeUnit + BubbleRelativeDuration). When no
-            // rounding is required (nanoseconds, increment 1) the raw difference is
-            // already exact.
-            if smallest == Unit::Nanosecond && increment == 1 {
+        } else if smallest == Unit::Nanosecond && increment == 1 {
+            // A calendar `largestUnit` with no rounding required: the raw
+            // difference is already exact.
+            if is_iso {
                 pdt_difference(from, to, largest)
             } else {
-                pdt_round_day_time(from, to, largest, smallest, increment, mode)
+                pdt_difference_cal(&data.calendar, from, to, largest)
             }
         } else {
-            pdt_difference_cal(&data.calendar, from, to, largest)
+            // A calendar `largestUnit` with a day/time `smallestUnit`: round the
+            // day+time span (NudgeToDayOrTimeUnit + BubbleRelativeDuration), in the
+            // receiver's calendar.
+            pdt_round_day_time(&data.calendar, from, to, largest, smallest, increment, mode)
         };
         if negate {
             dur = negate_duration(dur);
@@ -2099,6 +2100,7 @@ fn pdt_round_calendar(
 /// outside the representable range are never materialised — only the actual end
 /// date is, so a result that stays within a few days of the limit does not throw.
 fn pdt_round_day_time(
+    cal: &str,
     from: (IsoDate, IsoTime),
     to: (IsoDate, IsoTime),
     largest: Unit,
@@ -2106,7 +2108,12 @@ fn pdt_round_day_time(
     increment: i64,
     mode: RoundMode,
 ) -> DurationFields {
-    let base = pdt_difference(from, to, largest);
+    let is_iso = tcal::is_iso(cal);
+    let base = if is_iso {
+        pdt_difference(from, to, largest)
+    } else {
+        pdt_difference_cal(cal, from, to, largest)
+    };
     // NudgeToDayOrTimeUnit: round (whole days + time-of-day), in nanoseconds, to
     // the smallest unit; `days * nsPerDay` is already a multiple of any sub-day
     // unit, so this rounds only the time part and carries into the day count.
@@ -2116,16 +2123,17 @@ fn pdt_round_day_time(
     let new_days = (rounded / iso::NS_PER_DAY) as i64;
     let rem = rounded % iso::NS_PER_DAY;
     // BubbleRelativeDuration: the whole-day date part, re-expressed in largestUnit.
-    let end_date = iso::add_iso_date(
-        from.0,
-        base.years as i64,
-        base.months as i64,
-        base.weeks as i64,
-        new_days,
-        Overflow::Constrain,
-    )
-    .unwrap_or(from.0);
-    let (by, bm, bw, bd) = iso::difference_iso_date(from.0, end_date, largest);
+    let (y, m, w) = (base.years as i64, base.months as i64, base.weeks as i64);
+    let (by, bm, bw, bd) = if is_iso {
+        let end_date =
+            iso::add_iso_date(from.0, y, m, w, new_days, Overflow::Constrain).unwrap_or(from.0);
+        iso::difference_iso_date(from.0, end_date, largest)
+    } else {
+        let end_date = tcal::calendar_date_add(cal, from.0, y, m, w, new_days, Overflow::Constrain)
+            .unwrap_or(from.0);
+        let p = tcal::calendar_date_until(cal, from.0, end_date, largest);
+        (p.years, p.months, p.weeks, p.days)
+    };
     let mut out = iso::balance_time_duration(rem, Unit::Hour);
     out.years = i128::from(by);
     out.months = i128::from(bm);
