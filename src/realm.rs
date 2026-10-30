@@ -24,7 +24,9 @@
 //! [`Handle`]: crate::heap::Handle
 
 pub(crate) mod builtins_fast;
+pub(crate) mod coll_fast;
 mod coll_index;
+mod concat_fast;
 pub(crate) mod hidden_layout;
 mod shortest;
 pub use coll_index::CollIndex;
@@ -3127,9 +3129,23 @@ impl Realm {
             _ => return None,
         };
         // Entries are deleted in place (tombstones), so the cursor only needs
-        // rebasing after a compaction renumbered them.
-        let (idx, now) = self.collection_iter_rebase(coll, idx, epoch, last);
-        let next = self.collection_next_live(coll, idx);
+        // rebasing after a compaction renumbered them: with none since it was
+        // saved (the common case), the next live entry is read in one look.
+        let (next, now) = match self.heap.get(coll) {
+            Some(Cell::Collection {
+                epoch: e, entries, ..
+            }) if *e == epoch => (
+                entries
+                    .get(idx..)
+                    .and_then(|rest| rest.iter().position(|e| !e.0.is_hole()))
+                    .map(|i| (idx + i, entries[idx + i].0, entries[idx + i].1)),
+                epoch,
+            ),
+            _ => {
+                let (idx, now) = self.collection_iter_rebase(coll, idx, epoch, last);
+                (self.collection_next_live(coll, idx), now)
+            }
+        };
         let a = self.heap.get_mut(state)?.as_array_mut()?;
         let Some((pos, k, v)) = next else {
             a[4] = NanBox::number(2.0);
@@ -7557,6 +7573,9 @@ impl Realm {
     pub fn add_checked(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
         if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
             return Some(NanBox::number(x + y));
+        }
+        if let Some(v) = self.add_str_int(a, b) {
+            return Some(v);
         }
         // A string operand keeps the O(1) rope concatenation path.
         if self.is_string(a) || self.is_string(b) {

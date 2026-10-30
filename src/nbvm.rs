@@ -5372,6 +5372,10 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         return Ok(NanBox::number(x + y));
     }
+    // `'k' + i`: built in one small string (`Realm::add_str_int`).
+    if let Some(v) = ctx.realm.add_str_int(a, b) {
+        return Ok(v);
+    }
     // A string with a string or a number: no host operand, ToPrimitive is the
     // identity and no Symbol is involved.
     let prim_str = |v: NanBox| {
@@ -6352,6 +6356,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         pop_handler: jit_tier::jit_helper_pop_handler,
         handler_frame: jit_tier::jit_helper_handler_frame,
         call_method: jit_tier::jit_helper_call_method,
+        coll_call: jit_tier::jit_helper_coll_call,
         call_value: jit_tier::jit_helper_call_value,
         call_with_method: jit_tier::jit_helper_call_with_method,
         call_native_got: jit_tier::jit_helper_call_native_got,

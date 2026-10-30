@@ -174,6 +174,24 @@ impl Rope {
         )))
     }
 
+    /// A flat rope of `len` bytes, at most [`SMALL_CAP`], that `fill` writes
+    /// straight into its inline buffer (`fill` must leave canonical WTF-8);
+    /// `None` when `len` is too long to be held inline.
+    #[must_use]
+    #[inline]
+    pub fn small_with(len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Self> {
+        if len > SMALL_CAP {
+            return None;
+        }
+        let mut buf = [0u8; SMALL_CAP];
+        fill(&mut buf[..len]);
+        Some(Rope(Rc::new(Node::Small {
+            len: len as u8,
+            u16: core::cell::Cell::new(SMALL_U16_UNKNOWN),
+            buf,
+        })))
+    }
+
     /// A leaf rope copying raw WTF-8 `bytes`.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {

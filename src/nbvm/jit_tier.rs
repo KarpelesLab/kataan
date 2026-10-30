@@ -1054,6 +1054,11 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
             Some(Ok(()))
         }
+        // A string literal (`'k' + i` evaluates its `'k'` every iteration).
+        Op::NewString { dst, value } => {
+            regs[*dst as usize] = NanBox::handle(ctx.realm.new_literal_string(value).to_raw());
+            Some(Ok(()))
+        }
         Op::CellGet { dst, cell } => regs[*cell as usize].as_handle().map(|h| {
             regs[*dst as usize] = super::vm_cell_get(ctx, Handle::from_raw(h));
             Ok(())
@@ -1777,6 +1782,50 @@ pub(crate) extern "C" fn jit_helper_call_method(
         }
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// `Op::CallMethod` of a `get`/`set`/`has`/`add`/`delete` key in compiled
+/// code, tried before the call sequence: when the site last called that
+/// `Map.prototype`/`Set.prototype` method on this very receiver and still
+/// proves it ([`super::native_call::try_coll`]), the result is stored to the
+/// destination register and `0` returned; anything else returns `1`, having
+/// done nothing, and the compiled code takes its ordinary call. Never throws.
+///
+/// # Safety
+/// As [`jit_helper_call_method`] (`call_site` is unused).
+pub(crate) extern "C" fn jit_helper_coll_call(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cache: *mut core::ffi::c_void,
+    _call_site: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    let Op::CallMethod {
+        dst, recv, args, ..
+    } = op
+    else {
+        return 1;
+    };
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    // SAFETY: the activation's register file, live and unaliased here.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+    // SAFETY: the site's own cache (see the function contract).
+    #[allow(unsafe_code)]
+    let cache = unsafe { &*cache.cast::<crate::ic::PropertyCache>() };
+    match super::native_call::try_coll(ctx, regs[*recv as usize], regs, args, cache) {
+        Some(v) => {
+            regs[*dst as usize] = v;
+            0
+        }
+        None => 1,
+    }
 }
 
 /// `Op::CallWithMethod` in compiled code (the native call sequence's

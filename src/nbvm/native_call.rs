@@ -46,6 +46,7 @@ use crate::nbexec::{
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
+use crate::realm::coll_fast::CollOp;
 use alloc::boxed::Box;
 
 /// How many times a site may (re)resolve its method before it stops trying.
@@ -146,6 +147,23 @@ enum FastOp {
     /// otherwise): the resolved function is called through the host
     /// directly, with no by-name re-resolution.
     HostDirect,
+}
+
+impl FastOp {
+    /// The `Map`/`Set` method this is, for `Realm::coll_fast`.
+    #[inline]
+    fn coll_op(self) -> Option<CollOp> {
+        Some(match self {
+            FastOp::MapGet => CollOp::MapGet,
+            FastOp::MapSet => CollOp::MapSet,
+            FastOp::MapHas => CollOp::MapHas,
+            FastOp::MapDelete => CollOp::MapDelete,
+            FastOp::SetAdd => CollOp::SetAdd,
+            FastOp::SetHas => CollOp::SetHas,
+            FastOp::SetDelete => CollOp::SetDelete,
+            _ => return None,
+        })
+    }
 }
 
 /// A method-call site's memo of the intrinsic it calls (see the module docs).
@@ -410,6 +428,14 @@ pub(super) fn try_call(
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }
+    if cache
+        .native
+        .as_deref()
+        .is_some_and(|s| s.op.coll_op().is_some())
+        && let Some(v) = try_coll(ctx, recv, regs, args, cache)
+    {
+        return Some(Ok(v));
+    }
     // A Number receiver owns no property: its lookup starts at
     // `%Number.prototype%`, which then stands in for it in the site's chain.
     let (h, prim) = match recv.as_handle() {
@@ -441,6 +467,35 @@ pub(super) fn try_call(
     }
     let (op, method) = (site.op, site.method);
     run_op(ctx, funcs, op, method, recv, h, prim, regs, args)
+}
+
+/// `recv.key(args…)` when the site last called a `Map.prototype` /
+/// `Set.prototype` method on this very Map/Set and still proves it is that
+/// intrinsic (`Realm::method_site_memo_hit`): the method's lean form
+/// (`Realm::coll_fast`). `None`, having done nothing, otherwise. Never runs
+/// code and never throws (a receiver of the wrong kind is a miss).
+#[inline(never)]
+pub(super) fn try_coll(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    regs: &[NanBox],
+    args: &[Reg],
+    cache: &PropertyCache,
+) -> Option<NanBox> {
+    let site = cache.native.as_deref()?;
+    let op = site.op.coll_op()?;
+    let h = Handle::from_raw(recv.as_handle()?);
+    if ctx.host.is_none()
+        || ctx.realm.multi_realm
+        || !ctx.realm.method_site_memo_hit(h, &site.chain, site.method)
+    {
+        return None;
+    }
+    let arg = |i: usize| {
+        args.get(i)
+            .map_or(NanBox::undefined(), |r| regs[*r as usize])
+    };
+    ctx.realm.coll_fast(h, op, arg(0), arg(1))
 }
 
 /// `Call(method, recv, args…)` for a method value already read (EvaluateCall

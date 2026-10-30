@@ -3077,6 +3077,10 @@ pub struct GenericHelpers {
     /// `Op::CallMethod` (`jit_helper_call_method(ctx, regs, n_regs, op, cache,
     /// call_site)`, `call_site` the native sequence's `CallSite` or null).
     pub call_method: JitCallMethodHelper,
+    /// A `Map`/`Set` method call's lean form, tried first
+    /// (`jit_helper_coll_call(ctx, regs, n_regs, op, cache, _)`: `0` with the
+    /// result stored, `1` to make the ordinary call).
+    pub coll_call: JitCallMethodHelper,
     /// A method call's callee lookup (`jit_method_info`).
     pub method_info: MethodHelper,
     /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
@@ -6230,6 +6234,7 @@ impl JitFunction {
         let pop_handler_helper = helpers.pop_handler as usize as u64;
         let unwind_helper = helpers.unwind as usize as u64;
         let call_method_helper = helpers.call_method as usize as u64;
+        let coll_call_helper = helpers.coll_call as usize as u64;
         let call_value_helper = helpers.call_value as usize as u64;
         let method_helper = helpers.method_info as usize as u64;
         let construct_helper = helpers.construct_info as usize as u64;
@@ -7305,6 +7310,26 @@ impl JitFunction {
                     }
                     // `Math.f(x)` with the built-in `f` is computed directly.
                     num.math_call(&mut a, op_idx, done);
+                    // `m.get(k)`, `s.add(v)`, …: a site that last called the
+                    // `Map`/`Set` method on this receiver serves it in one
+                    // helper call (`jit_helper_coll_call`), else on to the call.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && matches!(key.as_str(), "get" | "set" | "has" | "add" | "delete")
+                        && (1..=2).contains(&margs.len())
+                    {
+                        a.mov_rdi_r15(); // rdi = ctx
+                        a.mov_rsi_rbx(); // rsi = regs
+                        a.movabs_argreg(2, n_regs as i64); // rdx = n_regs
+                        a.movabs_argreg(3, op_ptr as i64); // rcx = &op
+                        a.movabs_argreg(4, si.cache_ptr as i64); // r8 = the site cache
+                        a.movabs_argreg(5, 0); // r9 = unused
+                        a.movabs_rax(coll_call_helper as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.je(done);
+                    }
                     // The native call sequence, when the site has one.
                     let native = call_args
                         .get(args as usize)

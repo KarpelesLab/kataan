@@ -546,6 +546,43 @@ impl Realm {
         self.site_links_get_stamping(cur, key, cache)
     }
 
+    /// The one-receiver fast form of [`method_site_get`](Self::method_site_get):
+    /// whether `cache` proves that `recv[key]` is the function cell `method`
+    /// because `recv` is the Map/Set it noted at the current prototype epoch
+    /// ([`method_site_note_recv`](Self::method_site_note_recv)), with every
+    /// link unchanged since and the holder's slot still `method`. `false`
+    /// sends the caller to the general check.
+    #[inline]
+    pub(crate) fn method_site_memo_hit(
+        &self,
+        recv: Handle,
+        cache: &MethodSiteCache,
+        method: u64,
+    ) -> bool {
+        let epoch = crate::object::proto_epoch();
+        if !cache.armed
+            || cache.prim
+            || cache.own
+            || cache.recv_memo != recv.to_raw()
+            || cache.recv_stamp != epoch
+            || cache.stamp != epoch
+            || cache.swaps != self.cell_swaps
+        {
+            return false;
+        }
+        // The holder's own value (a store to an existing data property does
+        // not move the epoch): read under its recorded shape.
+        if let Some(Cell::Object(o)) = self.heap.get(Handle::from_raw(cache.holder_props))
+            && let (Some(s), Some(m)) = (o.shaped_shape(), cache.holder_shape.as_ref())
+            && Rc::ptr_eq(s, m)
+        {
+            return o
+                .slot(cache.holder_slot)
+                .is_some_and(|v| v.to_bits() == method);
+        }
+        false
+    }
+
     /// After a [`method_site_get`](Self::method_site_get) hit on the Map/Set
     /// `recv` with every link watched at the current prototype epoch: watches
     /// `recv` (its cell and auxiliary object, so a new own property or a
