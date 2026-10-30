@@ -1167,10 +1167,12 @@ impl Realm {
         let i = progs
             .iter()
             .rposition(|p| &*p.source == source && &*p.flags == flags)?;
-        let p = progs.remove(i);
-        let program = Rc::clone(&p.program);
-        progs.push(p);
-        Some(program)
+        // Already the most recent (a literal evaluated in a loop): no move.
+        if i + 1 != progs.len() {
+            let p = progs.remove(i);
+            progs.push(p);
+        }
+        progs.last().map(|p| Rc::clone(&p.program))
     }
 
     /// Remembers `program` as the compilation of `(source, flags)`, dropping

@@ -434,9 +434,16 @@ impl Linear {
         steps_used: &Cell<u64>,
         budget: u64,
     ) -> Option<()> {
-        let mut small = [Choice::default(); STACK_CHOICES];
+        // Sized to the pattern: a typical one has a choice point or two, and
+        // clearing the full stack array cost more than the attempt.
+        let mut tiny;
+        let mut small;
         let mut big: Vec<Choice>;
-        let stack: &mut [Choice] = if self.reps <= STACK_CHOICES {
+        let stack: &mut [Choice] = if self.reps <= 4 {
+            tiny = [Choice::default(); 4];
+            &mut tiny
+        } else if self.reps <= STACK_CHOICES {
+            small = [Choice::default(); STACK_CHOICES];
             &mut small
         } else {
             big = alloc::vec![Choice::default(); self.reps];

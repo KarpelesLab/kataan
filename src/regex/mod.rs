@@ -571,9 +571,14 @@ impl Regex {
             && core::ptr::eq(prog, self.prog.as_slice())
         {
             let slots = lin.slots();
-            let mut buf = [usize::MAX; 32];
+            let mut tiny;
+            let mut buf;
             let mut heap: Vec<usize>;
-            let saves: &mut [usize] = if slots <= buf.len() {
+            let saves: &mut [usize] = if slots <= 8 {
+                tiny = [usize::MAX; 8];
+                &mut tiny[..slots]
+            } else if slots <= 32 {
+                buf = [usize::MAX; 32];
                 &mut buf[..slots]
             } else {
                 heap = alloc::vec![usize::MAX; slots];

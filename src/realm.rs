@@ -1582,14 +1582,19 @@ impl Realm {
         if let [u] = *units {
             return self.unit_string(u);
         }
-        if units.len() <= crate::rope::SMALL_CAP && units.iter().all(|&u| u < 0x80) {
+        if units.len() <= crate::rope::SMALL_CAP {
+            // Narrow and test for ASCII in one (vectorizable) pass.
             let mut buf = [0u8; crate::rope::SMALL_CAP];
+            let mut any = 0u16;
             for (b, &u) in buf.iter_mut().zip(units) {
                 *b = u as u8;
+                any |= u;
             }
-            return self
-                .heap
-                .alloc(Cell::Str(Rope::from_bytes(&buf[..units.len()])));
+            if any < 0x80 {
+                return self
+                    .heap
+                    .alloc(Cell::Str(Rope::from_bytes(&buf[..units.len()])));
+            }
         }
         self.new_string_wtf8(crate::wtf8::from_utf16(units))
     }
@@ -3863,6 +3868,12 @@ impl Realm {
         if self.has_explicit_null_proto(handle) {
             return None;
         }
+        // A RegExp with no explicit link (see `regexp_default_proto`).
+        if let Some(p) = self.regexp_default_proto
+            && matches!(cell, Some(Cell::RegExp { .. }))
+        {
+            return Some(p);
+        }
         // The commonest remaining case first (the last test below, which no
         // other test in between accepts): a dense array.
         if matches!(cell, Some(Cell::Array(_))) {
@@ -3885,12 +3896,6 @@ impl Realm {
         // "BigInt", and `(1n).toString`/`valueOf` resolve).
         if matches!(cell, Some(Cell::BigInt(_))) {
             return self.bigint_proto_intrinsic;
-        }
-        // A RegExp with no explicit link (see `regexp_default_proto`).
-        if let Some(p) = self.regexp_default_proto
-            && matches!(cell, Some(Cell::RegExp { .. }))
-        {
-            return Some(p);
         }
         // A VM closure with no explicit link (see `vm_fn_default_proto`).
         if let Some(p) = self.vm_fn_default_proto
