@@ -1991,3 +1991,24 @@ fn to_primitive_runs_the_methods_of_keyless_objects() {
         "/a\\/b/ [object WeakMap] [object Set] [object Promise] RT 43 RT"
     );
 }
+
+/// `parseInt` rounds a long decimal (or power-of-two radix) digit string to
+/// the nearest Number once, as `Number(…)` does: the digit-by-digit
+/// accumulation rounded at every step past 2^53, so
+/// `parseInt("68826266662840068")` was 68826266662840070, not
+/// 68826266662840060.
+#[test]
+fn parse_int_rounds_long_digit_strings_once() {
+    let src = r#"
+        var ss = ["68826266662840068", "123456789012345678", "-9007199254740993", "4246262060842220800460422"];
+        var r = ss.map(function (s) { return parseInt(s) === Number(s); });
+        r.push(parseInt("20000000000001", 16) === 0x20000000000001, parseInt("1" + "0".repeat(60) + "1", 2) === 2 ** 61,
+               parseInt("100000000000000000000000000000000000000000000000000000001", 2) === 2 ** 56,
+               parseInt("f".repeat(300), 16), parseInt("12ab", 10), parseInt("  -0x1F"), parseInt("z", 36));
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,true,true,true,true,true,true,Infinity,12,-31,35"
+    );
+}

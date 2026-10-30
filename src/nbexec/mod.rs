@@ -10474,22 +10474,46 @@ pub(crate) fn parse_int(s: &str, radix: u32) -> f64 {
     if !(2..=36).contains(&radix) {
         return f64::NAN;
     }
-    // Consume the leading digits valid in this radix.
-    let mut value: f64 = 0.0;
-    let mut any = false;
-    for c in t.chars() {
-        match c.to_digit(radix) {
-            Some(d) => {
-                value = value * f64::from(radix) + f64::from(d);
-                any = true;
-            }
-            None => break,
-        }
-    }
-    if !any {
+    // The leading digits valid in this radix.
+    let end = t
+        .char_indices()
+        .find(|&(_, c)| c.to_digit(radix).is_none())
+        .map_or(t.len(), |(i, _)| i);
+    if end == 0 {
         return f64::NAN;
     }
+    let value = int_digits_value(&t[..end], radix);
     if neg { -value } else { value }
+}
+
+/// The Number nearest the integer the digits `digits` (all valid in `radix`,
+/// at least one) name, as `parseInt` returns it (19.2.5): correctly rounded
+/// for radix 10 and the powers of two, which the spec requires exactly (a
+/// digit-by-digit `value * radix + d` rounds at every step once past 2^53,
+/// so `parseInt("68826266662840068")` came out one unit off). Other radixes
+/// keep that accumulation, the approximation the spec permits for them.
+pub(crate) fn int_digits_value(digits: &str, radix: u32) -> f64 {
+    let mut value: f64 = 0.0;
+    for c in digits.chars() {
+        value = value * f64::from(radix) + f64::from(c.to_digit(radix).unwrap_or(0));
+    }
+    // Exact while below 2^53 (every step was then exact).
+    if value < 9_007_199_254_740_992.0 {
+        return value;
+    }
+    if radix == 10 {
+        return digits.parse::<f64>().unwrap_or(value);
+    }
+    if !matches!(radix, 2 | 4 | 8 | 16 | 32) {
+        return value;
+    }
+    // A power of two: past 1100 significant bits the value is `Infinity`;
+    // below, the exact integer rounds once.
+    let sig = digits.trim_start_matches('0');
+    if sig.len() as u64 * u64::from(radix.trailing_zeros()) > 1100 {
+        return f64::INFINITY;
+    }
+    crate::bignum::BigInt::from_str_radix(sig, radix).map_or(value, |b| b.to_f64())
 }
 
 /// Renders a `BigInt` in the given radix (2..=36), base 10 by default.

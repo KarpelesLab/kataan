@@ -11993,20 +11993,14 @@ fn parse_int(s: &str, radix: u32) -> f64 {
     if !(2..=36).contains(&radix) {
         return f64::NAN;
     }
-    let mut value = 0.0;
-    let mut any = false;
-    for c in t.chars() {
-        match c.to_digit(radix) {
-            Some(d) => {
-                value = value * f64::from(radix) + f64::from(d);
-                any = true;
-            }
-            None => break,
-        }
-    }
-    if !any {
+    let end = t
+        .char_indices()
+        .find(|&(_, c)| c.to_digit(radix).is_none())
+        .map_or(t.len(), |(i, _)| i);
+    if end == 0 {
         return f64::NAN;
     }
+    let value = crate::nbexec::int_digits_value(&t[..end], radix);
     if neg { -value } else { value }
 }
 
