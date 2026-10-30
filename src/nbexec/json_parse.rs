@@ -16,6 +16,9 @@ use alloc::boxed::Box;
 const CACHED_DEPTHS: usize = 16;
 const CACHED_POSITIONS: usize = 32;
 
+/// The JSON string escape byte.
+const BACKSLASH: u8 = 0x5C;
+
 /// Per-parse state: the transition caches, each remembering the key it was
 /// armed for (a cache is only ever offered the key it learned).
 struct JsonParser<'a> {
@@ -36,6 +39,30 @@ impl JsonParser<'_> {
 
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
+    }
+
+    /// When the input at `pos` is the quoted key that the transition cache
+    /// of (`depth`, `ordinal`) was armed for, written without escapes (the
+    /// key holds no quote, backslash or control character, so the token can
+    /// only be that key): consumes it and returns the cache's index.
+    fn cached_key_at(&mut self, depth: usize, ordinal: usize) -> Option<usize> {
+        if depth >= CACHED_DEPTHS || ordinal >= CACHED_POSITIONS {
+            return None;
+        }
+        let idx = depth * CACHED_POSITIONS + ordinal;
+        let (k, _) = self.caches.get(idx)?.as_ref()?;
+        let k = k.as_bytes();
+        let rest = self.src.get(self.pos..)?;
+        if rest.len() < k.len() + 2
+            || rest[0] != b'"'
+            || rest[k.len() + 1] != b'"'
+            || &rest[1..=k.len()] != k
+            || k.iter().any(|&b| b == b'"' || b == BACKSLASH || b < 0x20)
+        {
+            return None;
+        }
+        self.pos += k.len() + 2;
+        Some(idx)
     }
 
     /// Four hex digits at `at` as a code unit.
@@ -94,6 +121,11 @@ impl Interp {
             b'"' => {
                 let s = self.json_fast_string(p)?;
                 Ok(match s {
+                    // A one-byte (ASCII) string is the realm's shared unit
+                    // string (strings are values: sharing is invisible).
+                    JsonStr::Borrowed(a, b) if b == a + 1 => {
+                        NanBox::handle(self.realm.unit_string(u16::from(p.src[a])).to_raw())
+                    }
                     JsonStr::Borrowed(a, b) => {
                         // The input is a `&str`, and an unescaped run between
                         // quotes starts and ends on character boundaries.
@@ -140,6 +172,37 @@ impl Interp {
                 let mut ordinal = 0usize;
                 loop {
                     p.skip_ws();
+                    // The key this position's transition cache was armed for,
+                    // when the input spells it out verbatim (no escapes):
+                    // then the property name needs no scan and no compare.
+                    if let Some(idx) = p.cached_key_at(depth, ordinal) {
+                        p.skip_ws();
+                        if p.peek() != Some(b':') {
+                            return Err(self.json_error("Expected ':'"));
+                        }
+                        p.pos += 1;
+                        let v = self.json_fast_value(p, depth + 1)?;
+                        let added = match &mut p.caches[idx] {
+                            Some((k, cache)) => {
+                                self.realm.init_data_property_cached(obj, k, v, cache)
+                            }
+                            None => false,
+                        };
+                        if !added && let Some((k, _)) = &p.caches[idx] {
+                            self.realm.set_property(obj, k, v);
+                        }
+                        ordinal += 1;
+                        p.skip_ws();
+                        match p.peek() {
+                            Some(b',') => p.pos += 1,
+                            Some(b'}') => {
+                                p.pos += 1;
+                                break;
+                            }
+                            _ => return Err(self.json_error("Expected ',' or '}'")),
+                        }
+                        continue;
+                    }
                     if p.peek() != Some(b'"') {
                         return Err(self.json_error("Expected property name"));
                     }

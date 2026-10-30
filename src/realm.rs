@@ -26,6 +26,7 @@
 pub(crate) mod builtins_fast;
 mod coll_index;
 pub(crate) mod hidden_layout;
+mod shortest;
 pub use coll_index::CollIndex;
 mod handle_map;
 
@@ -7993,6 +7994,15 @@ fn sci_render(abs: f64, prec: Option<usize>) -> Option<(Digits, i32)> {
 /// exponent `n` with `abs = 0.digits × 10^n`.
 #[must_use]
 pub(crate) fn shortest_digits(abs: f64) -> (Digits, i32) {
+    if let Some(r) = shortest::shortest_digits_exact(abs) {
+        return r;
+    }
+    shortest_digits_fmt(abs)
+}
+
+/// [`shortest_digits`] through Rust's float formatter (the general path, for
+/// the magnitudes [`shortest::shortest_digits_exact`] does not cover).
+fn shortest_digits_fmt(abs: f64) -> (Digits, i32) {
     let Some((mut digits, mut exp)) = sci_render(abs, None) else {
         let (d, e) = sci_digits(alloc::format!("{abs:e}").as_bytes());
         return (d, e + 1);

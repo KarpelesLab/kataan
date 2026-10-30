@@ -257,6 +257,31 @@ impl Interp {
         mut value: NanBox,
         indent: &str,
     ) -> Result<bool, ExecError> {
+        // With no replacer function, the two commonest heap values skip the
+        // general dispatch: a String primitive (no `toJSON` lookup, no wrapper
+        // or RawJSON probes) is quoted, and an ordinary dense array with no
+        // named own properties (so no own `toJSON`) whose prototype chain is
+        // known to lack `toJSON` is serialized as an array — exactly what
+        // the steps below conclude for them.
+        if cx.replacer_fn.as_handle().is_none()
+            && let Some(h) = value.as_handle().map(Handle::from_raw)
+        {
+            if self.realm.typeof_is_string(h) {
+                self.json_quote_string(cx, h);
+                return Ok(true);
+            }
+            if self.realm.is_plain_array_cell(h)
+                && !self.realm.is_host_exotic(h)
+                && !self.realm.may_own_named(h)
+                && self
+                    .realm
+                    .object_proto(h)
+                    .is_some_and(|proto| self.realm.chain_absent_cached(proto, &cx.tojson_arr))
+            {
+                self.json_ser_array(cx, h, indent)?;
+                return Ok(true);
+            }
+        }
         // If value is an Object (or BigInt) with a callable `toJSON`, call it.
         if let Some(h) = value.as_handle().map(Handle::from_raw) {
             let tj = self.json_to_json_of(cx, h)?;
@@ -275,6 +300,17 @@ impl Interp {
             )?;
         }
         self.json_ser_value(cx, value, indent)
+    }
+
+    /// `QuoteJSONString` of the string cell `h`, appended to `cx.out`.
+    fn json_quote_string(&mut self, cx: &mut JsonOut<'_>, h: Handle) {
+        // Collapse a rope once so the quoting borrows one leaf.
+        self.realm.flatten_string(h);
+        if let Some(bytes) = self.realm.string_leaf_bytes(h) {
+            json_quote_wtf8_into(&mut cx.out, bytes);
+        } else if let Some(bytes) = self.realm.string_bytes(h) {
+            json_quote_wtf8_into(&mut cx.out, &bytes);
+        }
     }
 
     /// The type-dispatch tail of SerializeJSONProperty: appends an already-
@@ -342,13 +378,7 @@ impl Interp {
             Unpacked::Handle(raw) => {
                 let h = Handle::from_raw(raw);
                 if self.realm.is_string_handle(h) {
-                    // Collapse a rope once so the quoting borrows one leaf.
-                    self.realm.flatten_string(h);
-                    if let Some(bytes) = self.realm.string_leaf_bytes(h) {
-                        json_quote_wtf8_into(&mut cx.out, bytes);
-                    } else if let Some(bytes) = self.realm.string_bytes(h) {
-                        json_quote_wtf8_into(&mut cx.out, &bytes);
-                    }
+                    self.json_quote_string(cx, h);
                     return Ok(true);
                 }
                 if self.realm.bigint_at(h).is_some() {
