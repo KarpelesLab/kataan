@@ -181,12 +181,23 @@ impl Interp {
             Some(t) => self.read_member(t, "name")?,
             None => NanBox::undefined(),
         };
-        let name_str = target_name
-            .as_handle()
-            .map(Handle::from_raw)
-            .and_then(|nh| self.realm.string_value(nh))
-            .unwrap_or_default();
-        let bound_name = self.new_str(&alloc::format!("bound {name_str}"));
+        // The concatenation is a rope join, not a copy: re-binding a bound
+        // function `n` times would otherwise copy `"bound bound …"` names of
+        // every length up to `6n` (quadratic), and it keeps a lone surrogate
+        // in the target's name intact.
+        let prefix = NanBox::handle(self.realm.new_string("bound ").to_raw());
+        let bound_name = match target_name.as_handle().map(Handle::from_raw) {
+            Some(nh) if self.realm.typeof_is_string(nh) => {
+                match self.realm.add_checked(prefix, target_name) {
+                    Some(joined) => joined,
+                    None => {
+                        let m = self.new_str("Invalid string length");
+                        return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                    }
+                }
+            }
+            _ => prefix,
+        };
         self.realm.set_property(obj, "name", bound_name);
         self.realm.mark_hidden(obj, "name");
         self.realm.set_readonly_property(obj, "name");

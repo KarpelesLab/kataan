@@ -1693,3 +1693,20 @@ fn join_cycle_through_several_arrays_renders_empty() {
     "#;
     assert_eq!(run(src), "1,|1-|1,|1,|1,2,3,4,|1,|1,,1,|1,2,3|1,2,3,1,2,3");
 }
+
+/// `bind` builds the bound name `"bound " + targetName` as a rope join: a
+/// chain of re-binds stays linear (it copied every name, quadratic in the
+/// chain length) and a lone surrogate in the target's name survives (it was
+/// replaced by U+FFFD).
+#[test]
+fn bound_function_name_is_a_rope_join() {
+    let src = r#"
+        var f = function () { return 7; };
+        for (var i = 0; i < 20000; i++) f = f.bind(null);
+        var k = function () {}; Object.defineProperty(k, "name", { value: "a\uD800b" });
+        var n = k.bind().name;
+        var g = function () {}; Object.defineProperty(g, "name", { value: 42 });
+        [f.name.length, f.name.slice(0, 12), n.length, n.charCodeAt(7), JSON.stringify(g.bind().name)].join()
+    "#;
+    assert_eq!(run(src), r#"120001,bound bound ,9,55296,"bound ""#);
+}
