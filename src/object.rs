@@ -353,6 +353,13 @@ struct ObjectExtra {
     non_configurable: Vec<alloc::boxed::Box<str>>,
     /// The class this object was instantiated from (for `instanceof`), if any.
     class_tag: Option<u32>,
+    /// How many of the first slots (shaped mode) hold **non-enumerable**
+    /// keys not listed in `hidden`: a built-in prototype or namespace marks
+    /// each method hidden right after adding it, which only moves this count
+    /// along (no list entry, no scan). Written out to `hidden` (and reset)
+    /// before anything renumbers the slots (a delete, dictionary mode) or
+    /// clears one of these marks.
+    hidden_prefix: u32,
     /// Unified own-key insertion order across **both** data and accessor
     /// properties. `None` on the fast path (a pure data object, or one that has
     /// never held an accessor): enumeration then derives its order from the shape
@@ -450,6 +457,7 @@ impl ObjectExtra {
             && self.hidden.is_empty()
             && self.non_configurable.is_empty()
             && self.class_tag.is_none()
+            && self.hidden_prefix == 0
             && self.key_order.is_none()
             && self.index.is_none()
     }
@@ -655,6 +663,7 @@ static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
     hidden: Vec::new(),
     non_configurable: Vec::new(),
     class_tag: None,
+    hidden_prefix: 0,
     key_order: None,
     index: None,
 };
@@ -735,6 +744,7 @@ impl ExtraPool {
         if self.boxes.len() < Self::CAP && x.recyclable() {
             x.spill.n = 0;
             x.class_tag = None;
+            x.hidden_prefix = 0;
             self.boxes.push(x);
         } else {
             drop_extra(x);
@@ -812,6 +822,64 @@ impl Object {
             // temporary would cost a store-forwarding stall per word.
             inline: core::array::from_fn(|i| values.get(i).copied().unwrap_or(NanBox::undefined())),
         })
+    }
+
+    /// A built-in function's own-property object: `length` then `name`, both
+    /// `{ writable: false, enumerable: false, configurable: true }`, the
+    /// attributes held by `shape` (a [`Shape::builtin_fn_layout`]) rather
+    /// than by attribute-mark lists, so making one allocates nothing past the
+    /// cell. The first change that the layout alone cannot describe (a new
+    /// key, a delete, a cleared mark, an accessor, dictionary mode) first
+    /// writes the marks out and moves to the ordinary layout (see
+    /// `materialize_implied_attrs`); until then every attribute query answers
+    /// as though the marks were listed.
+    #[must_use]
+    pub fn builtin_fn_props(shape: Rc<Shape>, length: NanBox, name: NanBox) -> Self {
+        debug_assert!(shape.has_implied_fn_attrs());
+        let mut o = Self::with_data(shape, &[length, name]).expect("a {length, name} layout");
+        // What `set_readonly` leaves: compiled code's in-place store goes to
+        // the helper, which checks the key.
+        o.flags |= JIT_FLAG_READONLY;
+        o
+    }
+
+    /// Whether the object's layout implies its `length`/`name` marks (see
+    /// [`builtin_fn_props`](Self::builtin_fn_props)).
+    #[inline]
+    fn implied_attrs(&self) -> bool {
+        !self.is_dict() && self.shape.has_implied_fn_attrs()
+    }
+
+    /// Whether `key` is non-writable and non-enumerable by layout alone.
+    #[inline]
+    fn implied_mark(&self, key: &str) -> bool {
+        self.implied_attrs() && (key == "length" || key == "name")
+    }
+
+    /// Writes the marks a [`builtin_fn_props`](Self::builtin_fn_props)
+    /// layout implies into the attribute lists and moves the object to the
+    /// ordinary layout with the same slots, before a change the layout cannot
+    /// describe. A no-op for any other object.
+    #[inline]
+    fn materialize_implied_attrs(&mut self) {
+        if self.implied_attrs() {
+            self.write_out_implied_attrs();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write_out_implied_attrs(&mut self) {
+        let x = self.extra_mut();
+        for k in ["length", "name"] {
+            x.add_mark(Mark::Readonly, k);
+        }
+        // Slots 0 and 1: the two keys are the start of a hidden prefix,
+        // which a constructor's `prototype` and static methods extend.
+        debug_assert_eq!(x.hidden_prefix, 0);
+        x.hidden_prefix = 2;
+        self.layout_changed();
+        self.shape = self.shape.unmarked_twin();
     }
 
     /// The out-of-line part holding just `rest` as the spilled slot values
@@ -999,6 +1067,7 @@ impl Object {
     /// a dictionary entry. A shaped object already at [`MAX_SHAPED_LEN`]
     /// becomes a dictionary first.
     fn add_new(&mut self, key: &str, value: NanBox) {
+        self.materialize_implied_attrs();
         if !self.is_dict() && self.len as usize >= MAX_SHAPED_LEN {
             self.convert_to_dict();
         }
@@ -1181,6 +1250,7 @@ impl Object {
     /// Defines an accessor property `name` with `getter`/`setter` (either may be
     /// `undefined`). Replaces an existing accessor of the same name.
     pub fn define_accessor(&mut self, name: &str, getter: NanBox, setter: NanBox) {
+        self.materialize_implied_attrs();
         // Start tracking unified key order the moment an accessor is involved: seed
         // the log with the current data keys (their chronological order) so this and
         // every later new key slot into the correct interleaved position.
@@ -1272,8 +1342,12 @@ impl Object {
     pub fn keys_follow_shape(&self) -> bool {
         !self.is_dict()
             && self.extra.as_deref().is_none_or(|e| {
-                e.accessors.is_empty() && e.hidden.is_empty() && e.key_order.is_none()
+                e.accessors.is_empty()
+                    && e.hidden.is_empty()
+                    && e.hidden_prefix == 0
+                    && e.key_order.is_none()
             })
+            && !self.shape.has_implied_fn_attrs()
     }
 
     /// The object's current shape (its hidden class). In dictionary mode this is
@@ -1554,6 +1628,8 @@ impl Object {
         if self.is_dict() {
             return;
         }
+        self.materialize_implied_attrs();
+        self.write_out_hidden_prefix();
         let keys = self.shape.keys();
         let mut order: Vec<Option<Box<str>>> = Vec::with_capacity(keys.len());
         let mut map: BTreeMap<Box<str>, DictSlot> = BTreeMap::new();
@@ -1710,6 +1786,21 @@ impl Object {
 
     /// Marks own property `key` non-enumerable (idempotent).
     pub fn set_hidden(&mut self, key: &str) {
+        // The newest key, right past the hidden prefix (a property marked
+        // right after it was added, all earlier ones hidden too), extends the
+        // prefix. Found without a lookup: building a big prototype key by key
+        // must not make every intermediate layout build its hashed index.
+        let prefix = self.ex().hidden_prefix;
+        if !self.is_dict()
+            && self.shape.last_key() == Some(key)
+            && self.shape.len() == prefix + 1
+            && !self.implied_mark(key)
+        {
+            if !self.ex().has_mark(Mark::Hidden, key) {
+                self.extra_mut().hidden_prefix = prefix + 1;
+            }
+            return;
+        }
         if !self.is_hidden(key) {
             self.extra_mut().add_mark(Mark::Hidden, key);
         }
@@ -1720,12 +1811,55 @@ impl Object {
     #[inline]
     pub fn is_hidden(&self, key: &str) -> bool {
         let x = self.ex();
-        !x.hidden.is_empty() && x.has_mark(Mark::Hidden, key)
+        self.implied_mark(key)
+            || self.prefix_hidden(key)
+            || (!x.hidden.is_empty() && x.has_mark(Mark::Hidden, key))
+    }
+
+    /// Whether `key` is a data property in the hidden prefix (see
+    /// `ObjectExtra::hidden_prefix`).
+    #[inline]
+    fn prefix_hidden(&self, key: &str) -> bool {
+        let prefix = self.ex().hidden_prefix;
+        prefix != 0 && !self.is_dict() && self.shape.lookup(key).is_some_and(|s| s < prefix)
+    }
+
+    /// Lists the hidden prefix's keys in `hidden` and empties the prefix,
+    /// before a change that renumbers the slots or clears one of its marks.
+    #[inline]
+    fn write_out_hidden_prefix(&mut self) {
+        if self.ex().hidden_prefix != 0 {
+            self.write_out_hidden_prefix_slow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write_out_hidden_prefix_slow(&mut self) {
+        let prefix = self.ex().hidden_prefix as usize;
+        let keys: Vec<Box<str>> = self
+            .shape
+            .keys()
+            .into_iter()
+            .take(prefix)
+            .map(Box::from)
+            .collect();
+        let x = self.extra_mut();
+        x.hidden_prefix = 0;
+        for k in keys {
+            if !x.has_mark(Mark::Hidden, &k) {
+                x.add_mark(Mark::Hidden, &k);
+            }
+        }
     }
 
     /// Clears the non-enumerable mark for `key` (a `defineProperty` redefining a
     /// configurable property to `enumerable: true`).
     pub fn clear_hidden(&mut self, key: &str) {
+        self.materialize_implied_attrs();
+        if self.prefix_hidden(key) {
+            self.write_out_hidden_prefix();
+        }
         if let Some(x) = self.extra.as_deref_mut() {
             x.remove_mark(Mark::Hidden, key);
         }
@@ -1747,12 +1881,13 @@ impl Object {
     #[inline]
     pub fn is_readonly(&self, key: &str) -> bool {
         let x = self.ex();
-        !x.readonly.is_empty() && x.has_mark(Mark::Readonly, key)
+        self.implied_mark(key) || (!x.readonly.is_empty() && x.has_mark(Mark::Readonly, key))
     }
 
     /// Clears the non-writable mark for `key` (a `defineProperty` redefines
     /// attributes from scratch, so the prior `writable: false` is dropped first).
     pub fn clear_readonly(&mut self, key: &str) {
+        self.materialize_implied_attrs();
         if let Some(x) = self.extra.as_deref_mut() {
             x.remove_mark(Mark::Readonly, key);
         }
@@ -1796,10 +1931,11 @@ impl Object {
     pub fn is_plain_data_slot_or_absent(&self, key: &str) -> bool {
         self.flags & (OBJ_FLAG_FROZEN | OBJ_FLAG_SEALED | OBJ_FLAG_NON_EXTENSIBLE) == 0
             && !key.starts_with('\0')
+            && !self.implied_mark(key)
             && self.extra.as_deref().is_none_or(|x| {
                 (x.readonly.is_empty() || !self.is_readonly(key))
                     && (x.accessors.is_empty() || self.accessor(key).is_none())
-                    && (x.hidden.is_empty() || !self.is_hidden(key))
+                    && (x.hidden.is_empty() && x.hidden_prefix == 0 || !self.is_hidden(key))
                     && (x.non_configurable.is_empty() || !self.is_non_configurable(key))
             })
     }
@@ -1895,6 +2031,8 @@ impl Object {
     /// `root` without it, and leaving any same-named accessor untouched. Used when
     /// `defineProperty` converts a data property into an accessor.
     pub fn delete_data(&mut self, root: Rc<Shape>, key: &str) {
+        self.materialize_implied_attrs();
+        self.write_out_hidden_prefix();
         self.bump_key_epoch();
         if self.is_dict() {
             let d = self.dict_mut();
@@ -1934,6 +2072,8 @@ impl Object {
     /// it (also drops a same-named accessor). Returns whether anything was
     /// removed.
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
+        self.materialize_implied_attrs();
+        self.write_out_hidden_prefix();
         self.bump_key_epoch();
         let had_accessor = self.extra.as_deref_mut().is_some_and(|x| x.remove_acc(key));
         // Clear the property's attribute flags so a later re-add of the same key
@@ -2298,6 +2438,73 @@ mod tests {
         assert_eq!(all.last(), Some(&"k9"));
         assert!(!o.enumerable_keys().contains(&"k2"));
         assert!(o.enumerable_keys().contains(&"k4"));
+    }
+
+    #[test]
+    fn builtin_fn_props_imply_their_marks_until_changed() {
+        let root = Shape::root();
+        let layout = Shape::builtin_fn_layout(&root);
+        let mut o = Object::builtin_fn_props(Rc::clone(&layout), n(2.0), n(7.0));
+        assert_eq!(o.keys(), ["length", "name"]);
+        assert!(o.is_hidden("length") && o.is_readonly("name"));
+        assert!(!o.is_non_configurable("name"));
+        assert!(o.enumerable_keys().is_empty());
+        assert!(!o.keys_follow_shape());
+        // A write to a non-writable property is ignored.
+        o.set("name", n(1.0));
+        assert!(matches!(o.get("name").unwrap().unpack(), Unpacked::Number(x) if x == 7.0));
+        // A new key moves the object to the ordinary layout, marks kept.
+        o.set("prototype", n(3.0));
+        assert!(!o.shape().has_implied_fn_attrs());
+        assert_eq!(o.keys(), ["length", "name", "prototype"]);
+        assert!(o.is_hidden("length") && o.is_hidden("name") && !o.is_hidden("prototype"));
+        assert!(o.is_readonly("length") && o.is_readonly("name") && !o.is_readonly("prototype"));
+        // The ordinary twin is the plain `+length +name` layout.
+        let plain = root.add("length").add("name");
+        assert!(Rc::ptr_eq(o.shape().parent().unwrap(), &plain));
+        // Clearing a mark on a fresh one keeps the other.
+        let mut p = Object::builtin_fn_props(layout, n(0.0), n(5.0));
+        p.clear_readonly("name");
+        assert!(!p.is_readonly("name") && p.is_readonly("length"));
+        assert!(p.is_hidden("name"));
+        p.set("name", n(6.0));
+        assert!(matches!(p.get("name").unwrap().unpack(), Unpacked::Number(x) if x == 6.0));
+    }
+
+    #[test]
+    fn hidden_prefix_marks_keys_added_then_hidden() {
+        let root = Shape::root();
+        let mut o = Object::new(Rc::clone(&root));
+        for k in ["a", "b", "c"] {
+            o.set(k, n(1.0));
+            o.set_hidden(k);
+        }
+        o.set("d", n(1.0));
+        assert_eq!(o.ex().hidden_prefix, 3);
+        assert!(o.ex().hidden.is_empty());
+        assert_eq!(o.enumerable_keys(), ["d"]);
+        assert!(o.is_hidden("b") && !o.is_hidden("d") && !o.is_hidden("zz"));
+        // Out of order: listed.
+        o.set("e", n(1.0));
+        o.set_hidden("d");
+        assert_eq!(o.ex().hidden_prefix, 3);
+        assert_eq!(o.enumerable_keys(), ["e"]);
+        // Clearing one prefix mark writes the prefix out.
+        o.clear_hidden("b");
+        assert_eq!(o.ex().hidden_prefix, 0);
+        assert_eq!(o.enumerable_keys(), ["b", "e"]);
+        // A delete renumbers slots, so the prefix is written out first.
+        let mut q = Object::new(Rc::clone(&root));
+        for k in ["x", "y", "z"] {
+            q.set(k, n(1.0));
+            q.set_hidden(k);
+        }
+        q.set("w", n(1.0));
+        assert!(q.delete(Rc::clone(&root), "x"));
+        assert_eq!(q.enumerable_keys(), ["w"]);
+        assert!(q.is_hidden("y") && q.is_hidden("z"));
+        q.set("x", n(2.0));
+        assert_eq!(q.enumerable_keys(), ["w", "x"]);
     }
 
     #[test]

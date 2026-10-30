@@ -12099,7 +12099,20 @@ pub fn execute_capturing(
     source: &str,
     limits: crate::limits::Limits,
 ) -> (String, Result<String, String>) {
-    crate::nbexec::eval_source_capturing_on(source, limits)
+    crate::nbexec::eval_source_capturing_on(source, limits, false)
+}
+
+/// [`execute_capturing`] for a process that exits right after it returns
+/// (the `kataan run` command line): the engine's heap is left for the exit
+/// to reclaim rather than freed object by object. Its memory is never
+/// returned before the process ends, so a long-lived host should call
+/// [`execute_capturing`] instead.
+#[cfg(feature = "std")]
+pub fn execute_capturing_then_exit(
+    source: &str,
+    limits: crate::limits::Limits,
+) -> (String, Result<String, String>) {
+    crate::nbexec::eval_source_capturing_on(source, limits, true)
 }
 
 /// Like [`execute_with_limits`], but on failure returns a structured

@@ -223,6 +223,23 @@ impl Cache {
         }
     }
 
+    /// What [`refill`](Self::refill) does when no other thread stashed
+    /// blocks of class `c` and the bump arena has room (a fresh thread's
+    /// every allocation): the next block of the arena, else null. Inline, so
+    /// that common case does not pay for `refill`'s frame.
+    #[inline(always)]
+    fn try_bump(&mut self, c: usize) -> *mut u8 {
+        let size = class_size(c);
+        if STASH_HAS[c].load(Ordering::Relaxed) || (self.end as usize) - (self.bump as usize) < size
+        {
+            return ptr::null_mut();
+        }
+        let p = self.bump;
+        // SAFETY: `p + size <= end`, both inside the current arena.
+        self.bump = unsafe { p.add(size) };
+        p
+    }
+
     /// The slow path of an allocation of class `c` whose free list is empty.
     #[cold]
     fn refill(&mut self, c: usize) -> *mut u8 {
@@ -406,6 +423,11 @@ fn alloc_slow(cache: *mut Cache, c: usize) -> *mut u8 {
         _ => return alloc_uncached(c),
     }
     // SAFETY: as above (a live cache; `refill` does not re-enter).
+    let p = unsafe { (*cache).try_bump(c) };
+    if !p.is_null() {
+        return p;
+    }
+    // SAFETY: as above.
     unsafe { (*cache).refill(c) }
 }
 

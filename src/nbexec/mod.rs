@@ -2965,16 +2965,26 @@ impl Interp {
     /// `defineProperty` redefinitions behave per spec — exactly what Test262's
     /// `verifyProperty` exercises.
     pub(crate) fn install_fn_name_length(&mut self, f: Handle, name: &str, length: u32) {
+        let name_v = self.new_str(name);
+        self.install_fn_name_length_value(f, name_v, length);
+    }
+
+    /// [`Self::install_fn_name_length`] with the `name` value already made.
+    pub(crate) fn install_fn_name_length_value(&mut self, f: Handle, name_v: NanBox, length: u32) {
+        let length_v = NanBox::number(f64::from(length));
+        // A function that owns no property yet (every built-in as it is
+        // made) gets both in one step.
+        if self.realm.init_builtin_fn_props(f, length_v, name_v) {
+            return;
+        }
         // Spec own-key order for a function is `length` before `name`. Clear any
         // prior readonly flag first so a re-install (e.g. a NamedEvaluation name
         // overwriting the "" placeholder set at creation) actually takes effect —
         // `set_property` is a no-op on a readonly property.
         self.realm.clear_readonly_property(f, "length");
-        self.realm
-            .set_property(f, "length", NanBox::number(f64::from(length)));
+        self.realm.set_property(f, "length", length_v);
         self.realm.mark_hidden(f, "length");
         self.realm.set_readonly_property(f, "length");
-        let name_v = self.new_str(name);
         self.realm.clear_readonly_property(f, "name");
         self.realm.set_property(f, "name", name_v);
         self.realm.mark_hidden(f, "name");
@@ -3170,7 +3180,12 @@ impl Interp {
         for &name in methods {
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(native_id, name_h);
-            self.install_fn_name_length(f, name, builtin_method_arity(name));
+            // The method's name string doubles as its `name` value.
+            self.install_fn_name_length_value(
+                f,
+                NanBox::handle(name_h.to_raw()),
+                builtin_method_arity(name),
+            );
             self.realm
                 .set_property(proto, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(proto, name);
@@ -3323,7 +3338,7 @@ impl Interp {
             }
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(N_TYPED_ARRAY_PROTO_FN, name_h);
-            self.install_fn_name_length(f, name, arity);
+            self.install_fn_name_length_value(f, NanBox::handle(name_h.to_raw()), arity);
             self.realm
                 .set_property(ta_proto, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(ta_proto, name);
@@ -3549,7 +3564,11 @@ impl Interp {
     fn readable_buffer_method(&mut self, name: &str, id: u16) -> NanBox {
         let name_h = self.realm.new_string(name);
         let f = self.realm.new_bound_native(id, name_h);
-        self.install_fn_name_length(f, name, builtin_method_arity(name));
+        self.install_fn_name_length_value(
+            f,
+            NanBox::handle(name_h.to_raw()),
+            builtin_method_arity(name),
+        );
         NanBox::handle(f.to_raw())
     }
 
@@ -3621,6 +3640,11 @@ impl Interp {
     /// coercion/parse functions. (A token stdlib to prove the native-call path;
     /// the full port is the remaining migration work.)
     fn install_globals(&mut self) {
+        // About what the intrinsics take (3,399 cells, 896 of them functions
+        // with own properties, as of this writing): a hint, so the heap and
+        // the property side table do not regrow and copy themselves while
+        // they are built.
+        self.realm.reserve_for_intrinsics(3600, 960);
         // An object whose properties are native methods, bound to `global_name`.
         let install_namespace = |this: &mut Self, global_name: &str, methods: &[(&str, u16)]| {
             let obj = this.realm.new_object();
@@ -4096,7 +4120,11 @@ impl Interp {
         for &name in ITERATOR_PROTO_METHODS {
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(N_ITERATOR_PROTO_FN, name_h);
-            self.install_fn_name_length(f, name, builtin_method_arity(name));
+            self.install_fn_name_length_value(
+                f,
+                NanBox::handle(name_h.to_raw()),
+                builtin_method_arity(name),
+            );
             self.realm
                 .set_property(iter_proto, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(iter_proto, name);
@@ -8970,6 +8998,7 @@ pub(crate) fn eval_source_on(
 pub(crate) fn eval_source_capturing_on(
     source: &str,
     limits: crate::limits::Limits,
+    at_exit: bool,
 ) -> (String, Result<String, String>) {
     let program = match crate::parser::Parser::parse_program(source) {
         Ok(program) => program,
@@ -8981,7 +9010,15 @@ pub(crate) fn eval_source_capturing_on(
         Err(ExecError::Throw(thrown)) => Err(format_thrown(&interp, thrown)),
         Err(other) => Err(alloc::format!("{other:?}")),
     };
-    (String::from(interp.output()), outcome)
+    let output = String::from(interp.output());
+    if at_exit {
+        // The process is about to exit, which frees everything at once: skip
+        // freeing the heap and shape tree cell by cell. Agent workers are
+        // still stopped and joined, as dropping the interpreter does.
+        drop(core::mem::take(&mut interp.agent));
+        core::mem::forget(interp);
+    }
+    (output, outcome)
 }
 
 /// Formats an uncaught thrown value for an error message: `name: message` for an

@@ -159,7 +159,7 @@ impl Interp {
         }
         for (kind, ctor_id) in TEMPORAL_CTOR_IDS {
             let name = kind.type_name();
-            let ctor = self.new_named_native(name, ctor_id);
+            let ctor = self.realm.new_native(ctor_id);
             self.install_fn_name_length(ctor, name, ctor_len(kind));
             let (methods, getters) = tables_for(kind);
             let op = self.object_prototype();
@@ -182,7 +182,11 @@ impl Interp {
             for &m in methods {
                 let name_h = self.realm.new_string(m);
                 let f = self.realm.new_bound_native(N_TEMPORAL_PROTO_FN, name_h);
-                self.install_fn_name_length(f, m, method_len(kind, m));
+                self.install_fn_name_length_value(
+                    f,
+                    NanBox::handle(name_h.to_raw()),
+                    method_len(kind, m),
+                );
                 self.realm
                     .set_property(proto, m, NanBox::handle(f.to_raw()));
                 self.realm.mark_hidden(proto, m);
@@ -227,7 +231,7 @@ impl Interp {
         for (nm, len) in NOW_METHODS {
             let name_h = self.realm.new_string(nm);
             let f = self.realm.new_bound_native(N_TEMPORAL_NOW_FN, name_h);
-            self.install_fn_name_length(f, nm, len);
+            self.install_fn_name_length_value(f, NanBox::handle(name_h.to_raw()), len);
             self.realm
                 .set_property(now_ns, nm, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(now_ns, nm);

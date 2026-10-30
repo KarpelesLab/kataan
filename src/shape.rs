@@ -156,7 +156,9 @@ const TRANSITION_LIST_MAX: usize = 16;
 /// A shape's cached child shapes, one per property added from it (each a
 /// [`Weak`] link; see [`Shape::transitions`]).
 ///
-/// Most shapes have a few children, kept in a short list. A shape that many
+/// Most shapes have one child (an object built key by key walks a chain),
+/// held without a list allocation, or a few, kept in a short list. Each
+/// entry shares its child's key string. A shape that many
 /// different first keys hang off (the root, when objects each start with a
 /// distinct key: `{["id" + i]: …}`, a JSON array of single-key objects, or a
 /// rebuild-from-root after `delete`) switches to an ordered map, so finding a
@@ -164,27 +166,35 @@ const TRANSITION_LIST_MAX: usize = 16;
 /// which made building `n` such objects quadratic. Entries whose child shape
 /// has been freed are swept out whenever the map has doubled since the last
 /// sweep, so the cache cannot grow without bound either.
+#[derive(Default)]
 enum Transitions {
-    /// Few children: scanned linearly.
-    List(Vec<(Box<str>, Weak<Shape>)>),
+    /// No child yet.
+    #[default]
+    None,
+    /// One child.
+    One(Rc<str>, Weak<Shape>),
+    /// A few children: scanned linearly.
+    List(Vec<(Rc<str>, Weak<Shape>)>),
     /// Many children: looked up by key. `sweep_at` is the size at which dead
     /// entries are next swept.
     Map {
-        map: BTreeMap<Box<str>, Weak<Shape>>,
+        map: BTreeMap<Rc<str>, Weak<Shape>>,
         sweep_at: usize,
     },
-}
-
-impl Default for Transitions {
-    fn default() -> Self {
-        Transitions::List(Vec::new())
-    }
 }
 
 impl Transitions {
     /// The live child shape cached for `key`, if any.
     fn get(&self, key: &str) -> Option<Rc<Shape>> {
         match self {
+            Transitions::None => None,
+            Transitions::One(k, child) => {
+                if k.as_ref() == key {
+                    child.upgrade()
+                } else {
+                    None
+                }
+            }
             Transitions::List(list) => list
                 .iter()
                 .find(|(k, _)| k.as_ref() == key)
@@ -193,13 +203,24 @@ impl Transitions {
         }
     }
 
-    /// Caches `child` as the shape reached by adding `key`, replacing a dead
-    /// entry for the same key rather than adding a second one.
-    fn insert(&mut self, key: &str, child: &Rc<Shape>) {
+    /// Caches `child` as the shape reached by adding `key` (the child's own
+    /// key string), replacing a dead entry for the same key rather than
+    /// adding a second one.
+    fn insert(&mut self, key: &Rc<str>, child: &Rc<Shape>) {
         let weak = Rc::downgrade(child);
         match self {
+            Transitions::None => *self = Transitions::One(Rc::clone(key), weak),
+            Transitions::One(k, c) => {
+                if k == key || c.strong_count() == 0 {
+                    *k = Rc::clone(key);
+                    *c = weak;
+                } else {
+                    let first = (Rc::clone(k), core::mem::take(c));
+                    *self = Transitions::List(alloc::vec![first, (Rc::clone(key), weak)]);
+                }
+            }
             Transitions::List(list) => {
-                if let Some(entry) = list.iter_mut().find(|(k, _)| k.as_ref() == key) {
+                if let Some(entry) = list.iter_mut().find(|(k, _)| k == key) {
                     entry.1 = weak;
                     return;
                 }
@@ -207,16 +228,16 @@ impl Transitions {
                     list.retain(|(_, c)| c.strong_count() > 0);
                 }
                 if list.len() < TRANSITION_LIST_MAX {
-                    list.push((Box::from(key), weak));
+                    list.push((Rc::clone(key), weak));
                     return;
                 }
-                let mut map: BTreeMap<Box<str>, Weak<Shape>> = list.drain(..).collect();
-                map.insert(Box::from(key), weak);
+                let mut map: BTreeMap<Rc<str>, Weak<Shape>> = list.drain(..).collect();
+                map.insert(Rc::clone(key), weak);
                 let sweep_at = 2 * map.len();
                 *self = Transitions::Map { map, sweep_at };
             }
             Transitions::Map { map, sweep_at } => {
-                map.insert(Box::from(key), weak);
+                map.insert(Rc::clone(key), weak);
                 if map.len() >= *sweep_at {
                     map.retain(|_, c| c.strong_count() > 0);
                     *sweep_at = (2 * map.len()).max(2 * TRANSITION_LIST_MAX);
@@ -242,6 +263,13 @@ pub const SYMBOL_KEY_PREFIX: &str = "\u{0}sym:";
 /// every object whose layout has none without walking its keys. Kept clear of
 /// the [`BRAND_KEYS`] bits.
 const SYMBOL_KEYS_BIT: u8 = 0x80;
+
+/// The `brands` bit of the one layout made by
+/// [`Shape::builtin_fn_layout`]: an object with exactly this layout holds
+/// `length` and `name` as non-writable, non-enumerable data properties
+/// without listing them in its attribute marks (see
+/// `Object::builtin_fn_props`). Never inherited by a child layout.
+const IMPLIED_FN_ATTRS_BIT: u8 = 0x40;
 
 /// The [`BRAND_KEYS`] bit of `key` (0 for any other key).
 #[inline]
@@ -356,6 +384,14 @@ impl Shape {
         }
     }
 
+    /// The key this layout adds over its parent (the newest one, in the last
+    /// slot), or `None` for the root.
+    #[inline]
+    #[must_use]
+    pub fn last_key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
     /// Whether this is the empty (root) layout.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -388,18 +424,58 @@ impl Shape {
         if let Some(child) = cached {
             return child;
         }
+        let key: Rc<str> = Rc::from(key);
         let child = Rc::new(Shape {
             parent: Some(Rc::clone(self)),
-            key: Some(Rc::from(key)),
+            key: Some(Rc::clone(&key)),
             slot: self.len,
             len: self.len + 1,
             transitions: RefCell::new(Transitions::default()),
             index: OnceCell::new(),
             probes: Cell::new(0),
-            brands: self.brands | key_bits(key),
+            brands: (self.brands & !IMPLIED_FN_ATTRS_BIT) | key_bits(&key),
         });
-        self.transitions.borrow_mut().insert(key, &child);
+        self.transitions.borrow_mut().insert(&key, &child);
         child
+    }
+
+    /// The `{length, name}` layout of a built-in function's own properties,
+    /// grown from `root`, marked so that an object with it has both keys
+    /// non-writable and non-enumerable by layout alone (see
+    /// [`has_implied_fn_attrs`](Self::has_implied_fn_attrs)). Its `name` node
+    /// is not cached as `root + length`'s `name` child: that child stays the
+    /// ordinary layout, which [`unmarked_twin`](Self::unmarked_twin) finds.
+    #[must_use]
+    pub fn builtin_fn_layout(root: &Rc<Self>) -> Rc<Shape> {
+        debug_assert!(root.is_empty());
+        let length = root.transition("length");
+        Rc::new(Shape {
+            parent: Some(Rc::clone(&length)),
+            key: Some(Rc::from("name")),
+            slot: length.len,
+            len: length.len + 1,
+            transitions: RefCell::new(Transitions::default()),
+            index: OnceCell::new(),
+            probes: Cell::new(0),
+            brands: (length.brands & !IMPLIED_FN_ATTRS_BIT) | IMPLIED_FN_ATTRS_BIT,
+        })
+    }
+
+    /// Whether this is a [`builtin_fn_layout`](Self::builtin_fn_layout).
+    #[inline]
+    #[must_use]
+    pub fn has_implied_fn_attrs(&self) -> bool {
+        self.brands & IMPLIED_FN_ATTRS_BIT != 0
+    }
+
+    /// The ordinary layout with the same keys in the same slots as this
+    /// [`builtin_fn_layout`](Self::builtin_fn_layout) (`self` for any other).
+    #[must_use]
+    pub fn unmarked_twin(self: &Rc<Self>) -> Rc<Shape> {
+        match (&self.parent, &self.key) {
+            (Some(parent), Some(key)) if self.has_implied_fn_attrs() => parent.transition(key),
+            _ => Rc::clone(self),
+        }
     }
 
     /// The slot index of `key` in this layout, or `None` if absent. A small
@@ -475,6 +551,40 @@ impl Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_then_many_children_are_each_reused() {
+        let root = Shape::root();
+        let a = root.add("a");
+        assert!(Rc::ptr_eq(&a, &root.add("a")));
+        let b = root.add("b");
+        assert!(Rc::ptr_eq(&a, &root.add("a")) && Rc::ptr_eq(&b, &root.add("b")));
+        // A dead only child is replaced, not kept beside a new one.
+        let x = a.add("x");
+        drop(x);
+        let y = a.add("y");
+        assert!(matches!(&*a.transitions.borrow(), Transitions::One(k, _) if &**k == "y"));
+        assert!(Rc::ptr_eq(&y, &a.add("y")));
+        let x2 = a.add("x");
+        assert_eq!(x2.lookup("x"), Some(1));
+        // Past the list size, children still resolve.
+        let kids: Vec<Rc<Shape>> = (0..40).map(|i| b.add(&alloc::format!("k{i}"))).collect();
+        for (i, k) in kids.iter().enumerate() {
+            assert!(Rc::ptr_eq(k, &b.add(&alloc::format!("k{i}"))));
+        }
+    }
+
+    #[test]
+    fn builtin_fn_layout_is_marked_but_its_children_are_not() {
+        let root = Shape::root();
+        let l = Shape::builtin_fn_layout(&root);
+        assert!(l.has_implied_fn_attrs());
+        assert_eq!(l.keys(), ["length", "name"]);
+        let plain = l.unmarked_twin();
+        assert!(!plain.has_implied_fn_attrs());
+        assert!(Rc::ptr_eq(&plain, &root.add("length").add("name")));
+        assert!(!l.add("prototype").has_implied_fn_attrs());
+    }
 
     #[test]
     fn root_is_empty() {

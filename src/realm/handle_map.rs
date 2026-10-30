@@ -178,6 +178,14 @@ impl<V: Copy> HandleKeyedMap<V> {
         }
     }
 
+    /// Makes room for `additional` more entries without the table growing.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        let want = (self.len + additional) * 2;
+        if want > self.index.len() {
+            self.rebuild_index(want);
+        }
+    }
+
     #[inline]
     fn may_contain(&self, raw: u64) -> bool {
         let i = slot_of(raw);

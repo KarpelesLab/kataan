@@ -491,6 +491,16 @@ impl<T> Heap<T> {
 
     /// Allocates `value`, reusing a freed slot when one is available, and
     /// returns a handle to it.
+    /// Makes room for at least `additional` more freshly allocated cells
+    /// without the slot array growing (and moving every cell) on the way.
+    pub fn reserve(&mut self, additional: usize) {
+        if self.slots.capacity() - self.slots.len() < additional {
+            // The reserve moves every cell, as a growing push would.
+            crate::object::bump_proto_epoch();
+            self.slots.reserve(additional);
+        }
+    }
+
     pub fn alloc(&mut self, value: T) -> Handle {
         self.live += 1;
         self.allocs_since_gc += 1;

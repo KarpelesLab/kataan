@@ -89,6 +89,10 @@ type ShapeKeyRopes = (Rc<crate::shape::Shape>, Rc<[Rope]>);
 pub struct Realm {
     heap: Heap<Cell>,
     root_shape: Rc<Shape>,
+    /// The `{length, name}` layout every built-in function's own-property
+    /// object starts with (see [`Realm::init_builtin_fn_props`]), made on
+    /// first use.
+    builtin_fn_shape: Option<Rc<Shape>>,
     atoms: AtomTable,
     /// The in-flight incremental collection's marker, present only while an
     /// incremental marking cycle is running. The write barrier shades stored
@@ -727,6 +731,7 @@ impl Realm {
             vm_reg_pool: Vec::new(),
             heap,
             root_shape: Shape::root(),
+            builtin_fn_shape: None,
             atoms: AtomTable::new(),
             incremental: None,
             jit_marking: false,
@@ -1506,6 +1511,54 @@ impl Realm {
     /// Reassigns a constructor function's `.prototype` (`Fn.prototype = obj`).
     pub fn set_function_prototype(&mut self, func_id: u32, proto: Handle) {
         self.fn_protos.insert(func_id, proto);
+    }
+
+    /// Gives the function `f`, which owns no named property yet, its own
+    /// `length` and `name` data properties, in that order, each `{ writable:
+    /// false, enumerable: false, configurable: true }`: the same properties
+    /// (and auxiliary object) that setting each, then marking it hidden and
+    /// read-only, leaves, built in one step on a shared layout that carries
+    /// the attributes (see [`Object::builtin_fn_props`]). `false`, having
+    /// changed nothing, when `f` already has named properties or keeps none
+    /// in an auxiliary object; the caller then takes the general path.
+    pub fn init_builtin_fn_props(&mut self, f: Handle, length: NanBox, name: NanBox) -> bool {
+        if self.aux_props.get(&f.to_raw()).is_some()
+            || self.heap.get(f).is_none_or(|c| c.as_object().is_some())
+            || !self.aux_eligible(f)
+        {
+            return false;
+        }
+        let shape = match &self.builtin_fn_shape {
+            Some(s) => Rc::clone(s),
+            None => {
+                let s = Shape::builtin_fn_layout(&self.root_shape);
+                self.builtin_fn_shape = Some(Rc::clone(&s));
+                s
+            }
+        };
+        // As `aux_object` makes it (through `new_object`), then the two adds.
+        let mut obj = Object::builtin_fn_props(shape, length, name);
+        let proto = self.default_object_proto;
+        obj.set_proto(proto);
+        let aux = self.heap.alloc(Cell::Object(obj));
+        if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
+            marker.mark_grey(p);
+        }
+        self.cell_link_changed(f);
+        self.aux_props.insert(f.to_raw(), aux);
+        self.mark_array_side_state(f);
+        self.write_barrier(aux, length);
+        self.write_barrier(aux, name);
+        true
+    }
+
+    /// Makes room for `cells` more heap cells, `fn_props` of them functions
+    /// with own properties, so building a realm's intrinsics does not regrow
+    /// (and copy) the heap's slot array and the property side table on the
+    /// way.
+    pub fn reserve_for_intrinsics(&mut self, cells: usize, fn_props: usize) {
+        self.heap.reserve(cells);
+        self.aux_props.reserve(fn_props);
     }
 
     /// Allocates a fresh empty object in the heap and returns its handle.

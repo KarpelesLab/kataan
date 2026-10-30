@@ -158,7 +158,7 @@ fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
     // The script's `console` output is printed on the error path too: an
     // uncaught throw does not un-print what ran before it.
     let (output, outcome) =
-        kataan::nbvm::execute_capturing(source, kataan::limits::Limits::default());
+        kataan::nbvm::execute_capturing_then_exit(source, kataan::limits::Limits::default());
     print!("{output}");
     match outcome {
         Ok(completion) => {

@@ -226,7 +226,7 @@ impl Interp {
         for &(m, arity) in &[("evaluate", 1u32), ("importValue", 2)] {
             let name_h = self.realm.new_string(m);
             let f = self.realm.new_bound_native(N_SHADOW_REALM_PROTO, name_h);
-            self.install_fn_name_length(f, m, arity);
+            self.install_fn_name_length_value(f, NanBox::handle(name_h.to_raw()), arity);
             self.realm
                 .set_property(proto, m, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(proto, m);
