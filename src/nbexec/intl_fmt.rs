@@ -8376,9 +8376,11 @@ impl Interp {
 
         // Build the selected result's digit vectors with its own minimum padding.
         let (int_d, frac_d) = if use_s {
-            // ToRawPrecision: pad with trailing zeros up to minimumSignificantDigits.
+            // ToRawPrecision: cut trailing fraction zeros down to
+            // minimumSignificantDigits (`1.005` at two digits is `1`, not `1.0`),
+            // then pad with trailing zeros up to it.
             let (mut i, mut f) = (s_int, s_frac);
-            let sig_now = {
+            let sig_of = |i: &[u8], f: &[u8]| {
                 let first = i
                     .iter()
                     .chain(f.iter())
@@ -8386,6 +8388,10 @@ impl Interp {
                     .unwrap_or(i.len());
                 (i.len() + f.len()).saturating_sub(first)
             };
+            while f.last() == Some(&0) && sig_of(&i, &f) > min_sig {
+                f.pop();
+            }
+            let sig_now = sig_of(&i, &f);
             if sig_now < min_sig {
                 f.resize(f.len() + (min_sig - sig_now), 0);
             }
@@ -8536,7 +8542,11 @@ impl Interp {
         // instead of `988M`). NaN/∞ carry no mantissa and fall through.
         if n.is_finite() && compact_wants_reround(&opts) {
             let mut o = opts;
-            o.maximum_fraction_digits = Some(6);
+            // Six fraction digits past the ones the re-round keeps: a mantissa
+            // below 1 keeps `1 - e` of them (`1e-7` → `0.0000001`), so a fixed
+            // six would render it as `0` before the re-round could see a digit.
+            let keep = (1 - decimal_magnitude(n.abs())).max(0);
+            o.maximum_fraction_digits = Some((keep + 6).min(20) as u8);
             let render = |v: f64| -> Vec<(&'static str, String)> {
                 intl::number::format_to_parts(&locale, v, &o)
                     .into_iter()

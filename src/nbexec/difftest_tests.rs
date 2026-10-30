@@ -2332,3 +2332,24 @@ fn collator_case_first_upper_orders_uppercase_first() {
     "#;
     assert_eq!(run(src), "1,1,-1,-1,1,-1,1,AaBb,false,false");
 }
+
+/// Two NumberFormat rounding paths dropped or kept the wrong digits:
+/// `roundingPriority` picking the significant-digit result kept its trailing
+/// zeros (ToRawPrecision cuts them down to minimumSignificantDigits), and the
+/// default compact notation rendered a value below 1e-6 as `0` (its mantissa was
+/// rendered at six fraction digits before the two-significant-digit re-round).
+#[cfg(feature = "intl")]
+#[test]
+fn number_format_significant_results_keep_the_right_digits() {
+    let src = r#"
+        var lp = new Intl.NumberFormat("en", { roundingPriority: "lessPrecision", maximumSignificantDigits: 2, maximumFractionDigits: 3 });
+        var lp2 = new Intl.NumberFormat("en", { roundingPriority: "lessPrecision", minimumSignificantDigits: 2, maximumSignificantDigits: 2, maximumFractionDigits: 3 });
+        var c = new Intl.NumberFormat("en", { notation: "compact" });
+        [lp.format(1.005), lp.format(1.04), lp.format(1.5), lp2.format(1),
+         c.format(1e-7), c.format(1.23e-7), c.format(-5e-8), c.format(0.000123), c.format(1234)].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "1 1 1.5 1.0 0.0000001 0.00000012 -0.00000005 0.00012 1.2K"
+    );
+}
