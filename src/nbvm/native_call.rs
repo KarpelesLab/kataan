@@ -176,6 +176,20 @@ pub(crate) struct NativeSite {
     fills: u8,
 }
 
+/// The bits of `%Function.prototype.call%` when the site `cache` resolved
+/// its method to it (as [`try_call`] serves it).
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(super) fn fn_call_method(cache: &PropertyCache) -> Option<u64> {
+    cache
+        .native
+        .as_deref()
+        .filter(|s| s.op == FastOp::FnCall)
+        .map(|s| s.method)
+}
+
 /// The function cell `v` as one of the built-ins served here.
 fn classify(realm: &Realm, v: NanBox) -> FastOp {
     let Some(f) = v.as_handle().map(Handle::from_raw) else {

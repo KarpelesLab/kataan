@@ -179,6 +179,45 @@ pub struct CallSite {
     pub ident: IdentMemo,
     /// A `new` site's constructor cache (unused by other sites).
     pub construct: super::props::ConstructCache,
+    /// A `f.call(…)` method site's proof that the method is
+    /// `%Function.prototype.call%` (see [`FnCallMemo`]).
+    pub fncall: FnCallMemo,
+}
+
+/// A method-call site `f.call(thisArg, …args)`'s proof, filled by the call
+/// helper when the call reached the intrinsic `%Function.prototype.call%`
+/// on the VM function `f`, that the `[[Get]]` of `call` on the value `recv`
+/// still yields it: while the prototype epoch is `stamp`, `recv` names the
+/// same function cell, which (with its auxiliary property object, watched)
+/// still owns no `call` and still has the watched `[[Prototype]]` `holder`,
+/// whose `call` data property's value sits at `slot` (a value write there
+/// changes no layout, so the compiled test also compares `*slot` with
+/// `method`). The call is then exactly `Call(recv, thisArg, args)`, which
+/// the call sequence makes with `recv` as the callee.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FnCallMemo {
+    /// The function's `NanBox` bits, or [`CallSite::EMPTY`].
+    pub recv: u64,
+    /// The prototype epoch at which it was proved.
+    pub stamp: u64,
+    /// The address of the holder's `call` value.
+    pub slot: *const u64,
+    /// The intrinsic's `NanBox` bits.
+    pub method: u64,
+}
+
+impl FnCallMemo {
+    /// An empty memo.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            recv: CallSite::EMPTY,
+            stamp: 0,
+            slot: core::ptr::null(),
+            method: 0,
+        }
+    }
 }
 
 /// A call site's identity memo: the callee **value** (its handle bits) the
@@ -334,6 +373,7 @@ impl CallSite {
             fast: ConstructFast::empty(),
             ident: IdentMemo::empty(),
             construct: super::props::ConstructCache::new(),
+            fncall: FnCallMemo::empty(),
         }
     }
 
@@ -503,6 +543,24 @@ fn check_construct_proto(a: &mut X64Assembler, site: u8, fast: usize, miss: Labe
     );
     a.g_jcc(cc::NE, miss);
     a.bind(fixed);
+}
+
+/// Whether `[r11]`'s (a [`CallSite`]'s) [`FnCallMemo`] proves the method
+/// call `f.call(…)` on the receiver in `rax` reaches
+/// `%Function.prototype.call%` (see its docs); else to `miss`. Clobbers
+/// `rax` and `r9`.
+pub(crate) fn emit_fncall_check(a: &mut X64Assembler, miss: Label) {
+    use core::mem::offset_of;
+    let m = offset_of!(CallSite, fncall);
+    a.g_cmp_mem(r::RAX, r::R11, site_off(m + offset_of!(FnCallMemo, recv)));
+    a.g_jcc(cc::NE, miss);
+    load_proto_epoch(a, r::R9);
+    a.g_cmp_mem(r::R9, r::R11, site_off(m + offset_of!(FnCallMemo, stamp)));
+    a.g_jcc(cc::NE, miss);
+    a.g_load(r::RAX, r::R11, site_off(m + offset_of!(FnCallMemo, slot)));
+    a.g_load(r::RAX, r::RAX, 0);
+    a.g_cmp_mem(r::RAX, r::R11, site_off(m + offset_of!(FnCallMemo, method)));
+    a.g_jcc(cc::NE, miss);
 }
 
 /// Where a call sequence's callee comes from.

@@ -42,8 +42,8 @@ mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
-    ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, HDR_CONSTRUCT, IdentMemo,
-    JitStack, MethodHelper, PollLayout, SuperTwiceHelper, header_argc,
+    ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, FnCallMemo, HDR_CONSTRUCT,
+    IdentMemo, JitStack, MethodHelper, PollLayout, SuperTwiceHelper, header_argc,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
@@ -7400,6 +7400,42 @@ impl JitFunction {
                         a.call_rax();
                         a.test_rax_rax();
                         a.je(done);
+                    }
+                    // `f.call(thisArg, …args)` that the site's memo proves
+                    // reaches `%Function.prototype.call%`: the call sequence
+                    // calls `f` itself (no receiver-cache way involved).
+                    // Anything else — or a callee the site does not know —
+                    // takes the general path below, nothing done yet.
+                    if let crate::nbvm::Op::CallMethod { key, .. } = bytecode.get(op_idx)?
+                        && key == "call"
+                        && rc.sites[op_idx].is_none()
+                        && let Some((argv, &site_ptr)) = call_args
+                            .get(args as usize)
+                            .zip(call_sites.get(cache as usize))
+                        && let Some((&this, rest)) = argv.split_first()
+                    {
+                        if !ok(dst) || !ok(recv) || argv.iter().any(|&r| !ok(r)) {
+                            return None;
+                        }
+                        let general = a.new_label();
+                        a.load_rax(disp(recv));
+                        a.movabs_r11(site_ptr as i64);
+                        call_seq::emit_fncall_check(&mut a, general);
+                        call_seq::emit_call(
+                            &mut a,
+                            &call_seq::CallEmit {
+                                dst,
+                                callee: call_seq::CalleeSrc::Reg(recv),
+                                this: Some(this),
+                                args: rest,
+                                site: site_ptr,
+                                layout: &helpers.call_layout,
+                                throw_exit,
+                                slow: general,
+                                done,
+                            },
+                        )?;
+                        a.bind(general);
                     }
                     // The native call sequence, when the site has one.
                     let native = call_args

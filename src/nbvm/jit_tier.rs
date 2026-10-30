@@ -1745,6 +1745,16 @@ pub(crate) extern "C" fn jit_helper_call_method(
             if let Some(r) =
                 super::native_call::try_call(ctx, funcs, recv_val, key, regs, args, cache)
             {
+                if key == "call"
+                    && r.is_ok()
+                    && !call_site.is_null()
+                    && let Some(method) = super::native_call::fn_call_method(cache)
+                {
+                    // SAFETY: the op's own `CallSite` (see the function contract).
+                    #[allow(unsafe_code)]
+                    let site = unsafe { &mut *call_site.cast::<CallSite>() };
+                    fill_fncall_memo(ctx, site, recv_val, method);
+                }
                 return match r {
                     Ok(v) => {
                         regs[*dst as usize] = v;
@@ -2571,6 +2581,56 @@ pub(crate) extern "C" fn jit_construct_info(
     let obj = ctx.realm.jit_new_object_with_proto(Handle::from_raw(p));
     store(out, NanBox::handle(obj.to_raw()));
     jit_callee_info(ctx_raw, body_val)
+}
+
+/// Fills `site`'s [`crate::jit::FnCallMemo`] for the method call
+/// `recv.call(…)` that just reached `%Function.prototype.call%` (the value
+/// `method`), when its terms hold now: `recv` a VM function whose auxiliary
+/// object owns no `call`, whose `[[Prototype]]` is an ordinary shaped
+/// object holding `method` as its `call` data property; all three objects
+/// watched. Also points the site at `recv` itself, the callee the compiled
+/// sequence then calls.
+fn fill_fncall_memo(ctx: &mut Ctx, site: &mut CallSite, recv: NanBox, method: u64) {
+    let epoch = crate::object::proto_epoch();
+    if site.fncall.recv == recv.to_bits() && site.fncall.stamp == epoch {
+        return;
+    }
+    let Some(fh) = recv.as_handle().map(Handle::from_raw) else {
+        return;
+    };
+    if !ctx.realm.is_vm_function(fh) {
+        return;
+    }
+    let Some(aux) = ctx.realm.jit_aux_of(fh) else {
+        return;
+    };
+    if ctx
+        .realm
+        .jit_object(aux)
+        .is_none_or(|o| o.has_own_key("call"))
+    {
+        return;
+    }
+    let Some(holder) = ctx.realm.object_proto(fh) else {
+        return;
+    };
+    let Some(slot) = ctx.realm.jit_object(holder).and_then(|o| {
+        let k = o.shaped_shape()?.lookup("call")?;
+        (o.slot(k).map(NanBox::to_bits) == Some(method))
+            .then(|| o.jit_slot_ptr(k))
+            .flatten()
+    }) else {
+        return;
+    };
+    ctx.realm.watch_link(fh.to_raw(), Some(aux.to_raw()));
+    ctx.realm.watch_link(holder.to_raw(), None);
+    fill_call_site(ctx, recv, site);
+    site.fncall = crate::jit::FnCallMemo {
+        recv: recv.to_bits(),
+        stamp: crate::object::proto_epoch(),
+        slot: slot.cast::<u64>(),
+        method,
+    };
 }
 
 /// Records a construct of the value `ctor` with `new.target` `nt`, which
