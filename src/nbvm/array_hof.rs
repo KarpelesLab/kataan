@@ -240,6 +240,9 @@ pub(super) struct Callee<'f> {
     /// tier-up threshold is a handful of calls — will not).
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     misses: u32,
+    /// `proto`'s parameter count: the arguments an unboxed tier is called with.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    n_params: usize,
 }
 
 /// See [`Callee::misses`].
@@ -263,6 +266,8 @@ impl<'f> Callee<'f> {
             unboxed: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             misses: 0,
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            n_params: proto.map_or(0, |p| p.n_params),
         }
     }
 
@@ -279,24 +284,69 @@ impl<'f> Callee<'f> {
         this: NanBox,
     ) -> Result<NanBox, VmError> {
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        if let Some(proto) = self.proto {
+        {
             if let Some(c) = &mut self.compiled {
                 return c.call(ctx, self.funcs, this, args);
             }
+            if let Some(v) = self.unboxed_call(ctx, args) {
+                return Ok(v);
+            }
+        }
+        self.invoke_slow(ctx, args, this)
+    }
+
+    /// The resolved Int/Float-tier call of [`Self::invoke`]: `None` when there
+    /// is none (yet), the depth limit is reached, or its guard declines these
+    /// arguments.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[inline(always)]
+    fn unboxed_call(&self, ctx: &Ctx, args: &[NanBox]) -> Option<NanBox> {
+        let j = self.unboxed.as_ref()?;
+        if ctx.call_depth >= ctx.realm.limits.max_call_depth
+            || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        {
+            return None;
+        }
+        j.call_guarded(args.get(..self.n_params)?)
+    }
+
+    /// The callee's Int/Float-tier code when it is resolved and may be called
+    /// right now (the depth limits, which no such call changes, not reached),
+    /// with its parameter count: what a loop needs to call it directly.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[inline]
+    fn unboxed_ready(&self, ctx: &Ctx) -> Option<(alloc::rc::Rc<crate::jit::JitProto>, usize)> {
+        let j = self.unboxed.as_ref()?;
+        (ctx.call_depth < ctx.realm.limits.max_call_depth
+            && ctx.realm.vm_total_depth < ctx.realm.limits.max_call_depth)
+            .then(|| (alloc::rc::Rc::clone(j), self.n_params))
+    }
+
+    /// [`Self::invoke`] while no direct call is resolved: look for one (until
+    /// [`COMPILED_MISS_LIMIT`]), else the ordinary VM call.
+    #[inline(never)]
+    fn invoke_slow(
+        &mut self,
+        ctx: &mut Ctx,
+        args: &[NanBox],
+        this: NanBox,
+    ) -> Result<NanBox, VmError> {
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if let Some(proto) = self.proto
+            && self.compiled.is_none()
+            && self.unboxed.is_none()
+            && self.misses < COMPILED_MISS_LIMIT
+        {
             if ctx.call_depth < ctx.realm.limits.max_call_depth
                 && ctx.realm.vm_total_depth < ctx.realm.limits.max_call_depth
             {
                 // `unboxed_fast_call`, with its (permanent) lookup done once.
-                if self.unboxed.is_none() && self.misses < COMPILED_MISS_LIMIT {
-                    self.unboxed = super::jit_tier::unboxed_target(proto);
-                }
-                if let Some(j) = &self.unboxed
-                    && let Some(v) = args.get(..proto.n_params).and_then(|a| j.call_guarded(a))
-                {
+                self.unboxed = super::jit_tier::unboxed_target(proto);
+                if let Some(v) = self.unboxed_call(ctx, args) {
                     return Ok(v);
                 }
             }
-            if self.misses < COMPILED_MISS_LIMIT && self.unboxed.is_none() {
+            if self.unboxed.is_none() {
                 if let Some(mut c) =
                     super::jit_tier::CompiledCallback::new(ctx, self.funcs, self.cb)
                 {
@@ -369,14 +419,16 @@ impl Loop<'_> {
     /// `forEach`, `map`, `filter`, `some`, `every` and the `find` family.
     fn iterate(&mut self, ctx: &mut Ctx, len: usize, op: Hof) -> Result<NanBox, VmError> {
         // `ArraySpeciesCreate` (default, checked by the caller): `map` gets
-        // `ArrayCreate(len)` (all holes), `filter` `ArrayCreate(0)`.
-        let out = match op {
-            Hof::Map => Some(ctx.realm.new_array(alloc::vec![NanBox::hole(); len])),
-            Hof::Filter => Some(ctx.realm.new_array(Vec::new())),
-            _ => None,
-        };
-        if let Some(o) = out {
-            ctx.frame_shadow[self.slot] = NanBox::handle(o.to_raw());
+        // `ArrayCreate(len)` (all holes), `filter` `ArrayCreate(0)`. That new
+        // array `A` is unreachable from user code until it is returned, and
+        // its creation has no observable effect, so its elements are
+        // collected (rooted) on the frame shadow past `out` and the array is
+        // made from them at the end: `map`'s `CreateDataPropertyOrThrow(A, k,
+        // mappedValue)` is the `k`-th entry (a hole for an index skipped),
+        // `filter`'s `(A, to, kValue)` the `to`-th.
+        let out = ctx.frame_shadow.len();
+        if op == Hof::Map {
+            ctx.frame_shadow.reserve(len);
         }
         // The `find` family reads every index with a plain `Get` (no
         // `HasProperty`), the rest skip absent indices.
@@ -385,28 +437,41 @@ impl Loop<'_> {
             Hof::Find | Hof::FindIndex | Hof::FindLast | Hof::FindLastIndex
         );
         let backwards = matches!(op, Hof::FindLast | Hof::FindLastIndex);
-        for n in 0..len {
+        let mut n = 0;
+        while n < len {
+            // A callee on an unboxed tier runs as many elements as it can
+            // straight off the dense storage, then (if any are left) the
+            // element it stopped at takes the ordinary step below.
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            if !backwards && let Some((j, np)) = self.callee.unboxed_ready(ctx) {
+                let (next, done) = self.unboxed_run(ctx, &j, np, n, len, op);
+                if let Some(r) = done {
+                    return Ok(r);
+                }
+                n = next;
+                if n >= len {
+                    break;
+                }
+            }
             let k = if backwards { len - 1 - n } else { n };
+            n += 1;
             let v = match self.element(ctx, k, probe)? {
                 Some(v) => v,
-                None if probe => continue,
+                None if probe => {
+                    if op == Hof::Map {
+                        ctx.frame_shadow.push(NanBox::hole());
+                    }
+                    continue;
+                }
                 None => NanBox::undefined(),
             };
             let r = self.call(ctx, v, k)?;
             match op {
                 Hof::ForEach => {}
-                Hof::Map => {
-                    // CreateDataPropertyOrThrow(A, k, mappedValue): `A` is fresh
-                    // and unreachable from user code, so a plain store.
-                    ctx.realm.set_element(out.expect("map result"), k, r);
-                }
+                Hof::Map => ctx.frame_shadow.push(r),
                 Hof::Filter => {
                     if ctx.realm.truthy(r) {
-                        // CreateDataPropertyOrThrow(A, to, kValue), through the
-                        // write barrier (`A` may have aged during the callbacks).
-                        let a = out.expect("filter result");
-                        let to = ctx.realm.array_dense_len(a).unwrap_or(0);
-                        ctx.realm.set_element(a, to, v);
+                        ctx.frame_shadow.push(v);
                     }
                 }
                 Hof::Some => {
@@ -433,12 +498,88 @@ impl Loop<'_> {
             }
         }
         Ok(match op {
-            Hof::Map | Hof::Filter => ctx.frame_shadow[self.slot],
+            Hof::Map | Hof::Filter => {
+                let elems = ctx.frame_shadow.split_off(out);
+                debug_assert!(op != Hof::Map || elems.len() == len);
+                NanBox::handle(ctx.realm.new_array(elems).to_raw())
+            }
             Hof::Some => NanBox::boolean(false),
             Hof::Every => NanBox::boolean(true),
             Hof::FindIndex | Hof::FindLastIndex => NanBox::number(-1.0),
             _ => NanBox::undefined(),
         })
+    }
+
+    /// [`Self::iterate`]'s steps `from..` (forwards) with a callee on an
+    /// unboxed (Int/Float) tier, `j` over `np` parameters, for as long as each
+    /// index is a present dense slot and `j`'s guard takes the arguments.
+    /// Such a callee is a pure function of its numeric arguments: it reads
+    /// and writes nothing in the realm, cannot throw, allocate or collect, so
+    /// nothing can change the array between steps and its storage is read in
+    /// place. Returns the first index not done, and the built-in's result if
+    /// it is decided.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn unboxed_run(
+        &mut self,
+        ctx: &mut Ctx,
+        j: &crate::jit::JitProto,
+        np: usize,
+        from: usize,
+        len: usize,
+        op: Hof,
+    ) -> (usize, Option<NanBox>) {
+        let recv = self.recv;
+        let Some(elems) = ctx.realm.array_elements(self.h) else {
+            return (from, None);
+        };
+        if np > 3 {
+            return (from, None);
+        }
+        let end = len.min(elems.len());
+        let shadow = &mut ctx.frame_shadow;
+        let mut k = from;
+        while k < end {
+            let v = elems[k];
+            if v.is_hole() {
+                break;
+            }
+            let a = [v, NanBox::number(k as f64), recv];
+            let Some(r) = j.call_guarded(&a[..np]) else {
+                break;
+            };
+            match op {
+                Hof::ForEach => {}
+                Hof::Map => shadow.push(r),
+                Hof::Filter => {
+                    if r.to_boolean() {
+                        shadow.push(v);
+                    }
+                }
+                Hof::Some => {
+                    if r.to_boolean() {
+                        return (k, Some(NanBox::boolean(true)));
+                    }
+                }
+                Hof::Every => {
+                    if !r.to_boolean() {
+                        return (k, Some(NanBox::boolean(false)));
+                    }
+                }
+                Hof::Find => {
+                    if r.to_boolean() {
+                        return (k, Some(v));
+                    }
+                }
+                Hof::FindIndex => {
+                    if r.to_boolean() {
+                        return (k, Some(NanBox::number(k as f64)));
+                    }
+                }
+                _ => return (k, None),
+            }
+            k += 1;
+        }
+        (k, None)
     }
 
     /// `reduce` / `reduceRight` (23.1.3.24 / .25).
@@ -472,6 +613,33 @@ impl Loop<'_> {
             }
         };
         while n < len {
+            // An unboxed-tier callee (see `unboxed_run`) folds straight over
+            // the dense storage while the accumulator and elements stay
+            // within its guard.
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            if !right
+                && let Some((j, np)) = self.callee.unboxed_ready(ctx)
+                && np <= 4
+                && let Some(elems) = ctx.realm.array_elements(self.h)
+            {
+                let end = len.min(elems.len());
+                let recv = self.recv;
+                while n < end {
+                    let v = elems[n];
+                    if v.is_hole() {
+                        break;
+                    }
+                    let a = [acc, v, NanBox::number(n as f64), recv];
+                    let Some(r) = j.call_guarded(&a[..np]) else {
+                        break;
+                    };
+                    acc = r;
+                    n += 1;
+                }
+                if n >= len {
+                    break;
+                }
+            }
             let k = at(n);
             n += 1;
             let Some(v) = self.element(ctx, k, true)? else {

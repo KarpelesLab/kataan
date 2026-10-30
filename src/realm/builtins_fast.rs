@@ -474,6 +474,13 @@ impl Realm {
             // `caller`/`arguments` are the VM's); its other own properties live
             // in its auxiliary object, as a native function's do.
             Cell::VmFunction { .. } if matches!(key, "name" | "caller" | "arguments") => None,
+            // An array that never had side-table state owns no named property
+            // (so no auxiliary object), and one whose `[[Prototype]]` was never
+            // set has the realm's first `%Array.prototype%`: what the side-table
+            // lookups below would find (see `plain_array_root_proto`).
+            Cell::Array(a) if !a.has_side_state() && !a.has_proto_set() => {
+                Some(self.root_array_proto)
+            }
             Cell::Array(_)
             | Cell::RegExp { .. }
             | Cell::Collection { .. }
