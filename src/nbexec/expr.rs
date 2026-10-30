@@ -2221,7 +2221,7 @@ impl Interp {
         {
             return None;
         }
-        if !self.arg_maps.is_empty() && self.arg_maps.contains_key(&handle.to_raw()) {
+        if self.is_mapped_arguments(handle) {
             return None;
         }
         let (hit, own) = self.realm.ordinary_chain_get(handle, name)?;

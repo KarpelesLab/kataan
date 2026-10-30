@@ -24,6 +24,7 @@
 //! [`Handle`]: crate::heap::Handle
 
 mod args_fast;
+pub use args_fast::ARGS_CELLS;
 pub(crate) mod builtins_fast;
 pub(crate) mod coll_fast;
 mod coll_index;
@@ -100,8 +101,13 @@ pub struct Realm {
     /// first use.
     builtin_fn_shape: Option<Rc<Shape>>,
     /// The layouts of the `arguments` objects [`Realm::new_arguments_object`]
-    /// makes, by `2 * argc + mapped` (see `args_fast`), made on first use.
+    /// makes, by `3 * argc + kind` (unmapped, mapped, mapped with its
+    /// parameter cells; see `args_fast`), made on first use.
     args_shapes: alloc::vec::Vec<Option<Rc<Shape>>>,
+    /// Whether any `arguments` object ever had VM parameter cells attached
+    /// (`Realm::attach_argument_cells`), so the hosts' "is it mapped"
+    /// checks cost nothing until one has.
+    args_cells_attached: bool,
     atoms: AtomTable,
     /// The in-flight incremental collection's marker, present only while an
     /// incremental marking cycle is running. The write barrier shades stored
@@ -779,6 +785,7 @@ impl Realm {
             root_shape: Shape::root(),
             builtin_fn_shape: None,
             args_shapes: alloc::vec::Vec::new(),
+            args_cells_attached: false,
             atoms: AtomTable::new(),
             incremental: None,
             jit_marking: false,

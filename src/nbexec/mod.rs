@@ -548,11 +548,10 @@ struct ArgMap {
     /// The function-call scope holding the aliased parameter bindings.
     scope: Scope,
     /// Currently-mapped `index → parameter name`. An index is removed when its
-    /// mapping breaks (delete / accessor or non-writable redefine).
+    /// mapping breaks (delete / accessor or non-writable redefine). (A
+    /// bytecode-VM function's map is on its arguments object instead: see
+    /// `Realm::attach_argument_cells`.)
     slots: alloc::collections::BTreeMap<usize, String>,
-    /// For a bytecode-VM function's arguments object: `index → parameter cell`
-    /// (a one-element array the VM reads and writes the parameter through).
-    cells: alloc::collections::BTreeMap<usize, Handle>,
 }
 
 /// What a mapped `arguments` index aliases: an interpreter binding or a VM
@@ -10033,34 +10032,6 @@ impl crate::nbvm::VmHost for Interp {
             Some(e) => Err(exec_to_host(ExecError::Throw(e))),
             None => Ok(None),
         }
-    }
-
-    fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]) {
-        let Some(obj) = args_obj.as_handle().map(Handle::from_raw) else {
-            return;
-        };
-        // Only indices bound by an actual argument are mapped.
-        let argc = self
-            .realm
-            .get_property(obj, "length")
-            .and_then(|l| l.as_number())
-            .unwrap_or(0.0) as usize;
-        let map: alloc::collections::BTreeMap<usize, Handle> = cells
-            .iter()
-            .filter(|(i, _)| *i < argc)
-            .filter_map(|(i, c)| c.as_handle().map(|h| (*i, Handle::from_raw(h))))
-            .collect();
-        if map.is_empty() {
-            return;
-        }
-        self.arg_maps.insert(
-            obj.to_raw(),
-            ArgMap {
-                scope: self.current.clone(),
-                slots: alloc::collections::BTreeMap::new(),
-                cells: map,
-            },
-        );
     }
 
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)> {

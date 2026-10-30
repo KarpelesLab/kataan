@@ -1099,7 +1099,7 @@ impl Interp {
                 // severs the alias to the parameter.
                 if let Some(raw) = arg(0).as_handle()
                     && (self.realm.proxy_at(Handle::from_raw(raw)).is_some()
-                        || self.arg_maps.contains_key(&raw))
+                        || self.is_mapped_arguments(Handle::from_raw(raw)))
                 {
                     self.proxy_set_integrity_level(Handle::from_raw(raw), true)?;
                     return Ok(arg(0));

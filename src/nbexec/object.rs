@@ -9,7 +9,7 @@ impl Interp {
         if self.realm.proxy_at(h).is_some()
             || self.realm.typed_kind(h).is_some()
             || self.realm.is_host_exotic(h)
-            || self.arg_maps.contains_key(&h.to_raw())
+            || self.is_mapped_arguments(h)
         {
             return None;
         }
@@ -1893,7 +1893,6 @@ impl Interp {
                     super::ArgMap {
                         scope: self.current.clone(),
                         slots,
-                        cells: alloc::collections::BTreeMap::new(),
                     },
                 );
             }
@@ -1905,14 +1904,21 @@ impl Interp {
     /// or `None` if `handle` is not a mapped arguments object or `key` is not (or
     /// no longer) a mapped index. `key` must be a canonical integer string.
     pub(crate) fn arg_map_binding(&self, handle: Handle, key: &str) -> Option<super::ArgRef> {
-        let map = self.arg_maps.get(&handle.to_raw())?;
+        let map = self.arg_maps.get(&handle.to_raw());
+        if map.is_none() && !self.is_mapped_arguments(handle) {
+            return None;
+        }
         let i = key.parse::<usize>().ok()?;
         if !crate::realm::is_canonical_decimal(key) {
             return None;
         }
-        if let Some(c) = map.cells.get(&i) {
-            return Some(super::ArgRef::Cell(*c));
-        }
+        // A bytecode-VM function's map is on the object itself.
+        let Some(map) = map else {
+            return self
+                .realm
+                .arguments_cell(handle, i)
+                .map(super::ArgRef::Cell);
+        };
         let name = map.slots.get(&i)?;
         Some(super::ArgRef::Scope(map.scope.clone(), name.clone()))
     }
@@ -1950,8 +1956,20 @@ impl Interp {
             && crate::realm::is_canonical_decimal(key)
         {
             map.slots.remove(&i);
-            map.cells.remove(&i);
         }
+        if let Ok(i) = key.parse::<usize>()
+            && crate::realm::is_canonical_decimal(key)
+        {
+            self.realm.arguments_unmap(handle, i);
+        }
+    }
+
+    /// Whether the object at `handle` is a mapped `arguments` object: one
+    /// with a `[[ParameterMap]]` (this interpreter's, or the VM's parameter
+    /// cells on the object; see `Realm::attach_argument_cells`).
+    pub(crate) fn is_mapped_arguments(&self, handle: Handle) -> bool {
+        (!self.arg_maps.is_empty() && self.arg_maps.contains_key(&handle.to_raw()))
+            || self.realm.has_argument_map_marker(handle)
     }
 
     /// `ToObject(v)` for `Object(v)`: `null`/`undefined` yield a fresh object; an

@@ -376,14 +376,8 @@ impl Interp {
                     }
                 }
                 if !slots.is_empty() {
-                    self.arg_maps.insert(
-                        obj.to_raw(),
-                        ArgMap {
-                            scope: s,
-                            slots,
-                            cells: alloc::collections::BTreeMap::new(),
-                        },
-                    );
+                    self.arg_maps
+                        .insert(obj.to_raw(), ArgMap { scope: s, slots });
                 }
                 Ok((undef, undef))
             }

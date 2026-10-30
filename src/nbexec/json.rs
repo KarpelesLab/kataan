@@ -464,7 +464,7 @@ impl Interp {
             self.realm.chain_key_fill(proto, KEY, cache);
             return self.read_member(h, KEY);
         }
-        if self.realm.plain_keyed_shape(h).is_none() || self.arg_maps.contains_key(&h.to_raw()) {
+        if self.realm.plain_keyed_shape(h).is_none() || self.is_mapped_arguments(h) {
             return self.read_member(h, KEY);
         }
         let cache = &mut cx.tojson_obj;
@@ -491,7 +491,7 @@ impl Interp {
     /// built on the first object of each shape; `None` when `h` is not a plain
     /// keyed object or its shape holds an engine-internal key.
     fn json_shape_keys(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Option<Rc<JsonShapeKeys>> {
-        if self.arg_maps.contains_key(&h.to_raw()) || self.realm.is_function_proto_intrinsic(h) {
+        if self.is_mapped_arguments(h) || self.realm.is_function_proto_intrinsic(h) {
             return None;
         }
         let shape = self.realm.plain_keyed_shape(h)?;

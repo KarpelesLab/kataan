@@ -446,7 +446,8 @@ pub enum Op {
     /// `dst` = the value to await before the next step.
     AsyncDisposeStep { state: Reg, dst: Reg, done: Reg },
     /// Maps the arguments object `args`: index `i` aliases the parameter cell
-    /// in register `reg` for each `(i, reg)` (see [`VmHost::map_arguments`]).
+    /// in register `reg` for each `(i, reg)` (see
+    /// [`Realm::attach_argument_cells`]).
     MapArguments { args: Reg, cells: Vec<(u32, Reg)> },
     /// `dst = eval(...args)` at a hosted script's top level (see
     /// [`VmHost::direct_eval`]).
@@ -1323,10 +1324,6 @@ pub trait VmHost {
     /// `IsCallable(v)` (for an error message: whether a failed call's callee
     /// was not a function at all).
     fn is_callable_value(&mut self, v: NanBox) -> bool;
-    /// CreateMappedArgumentsObject's parameter map for a VM function: index
-    /// `i` of `args_obj` aliases the parameter cell `cell` (a one-element
-    /// array) for each `(i, cell)`.
-    fn map_arguments(&mut self, args_obj: NanBox, cells: &[(usize, NanBox)]);
     /// A `using` declaration's checks: the dispose method of `value`
     /// (`undefined` for `null`/`undefined`).
     ///
@@ -2002,6 +1999,13 @@ fn vm_set_elem_mode(
     if ctx.host.is_none() {
         return vm_set_elem(ctx, funcs, recv, key, value);
     }
+    // An argument of a mapped `arguments` object, and the parameter it
+    // aliases.
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && ctx.realm.arguments_own_set(Handle::from_raw(h), n, value)
+    {
+        return Ok(());
+    }
     // An indexed write on a VM function (an ordinary object's index keys) is
     // the host's; the VM's element store is for arrays.
     // An index write past an array's end (other than an append) makes holes
@@ -2630,10 +2634,6 @@ fn yield_delegate_step(
     })
 }
 
-/// Marks an arguments object whose indices alias VM parameter cells: its
-/// computed reads and writes are the host's (the parameter map).
-const ARGS_MAPPED: &str = "\0argsmapped";
-
 /// Whether `v` is a String wrapper object (its `length` and indices are
 /// String exotic own properties — the host's).
 fn is_string_wrapper(realm: &Realm, v: NanBox) -> bool {
@@ -2643,13 +2643,12 @@ fn is_string_wrapper(realm: &Realm, v: NanBox) -> bool {
     })
 }
 
-/// Whether `v` is a mapped arguments object (see [`ARGS_MAPPED`]).
+/// Whether `v` is an arguments object whose indices alias parameters: its
+/// computed reads and writes are the host's (the parameter map), but for the
+/// ones `Realm::arguments_own_get` / `arguments_own_set` serve.
 fn is_mapped_arguments(realm: &Realm, v: NanBox) -> bool {
-    v.as_handle().is_some_and(|h| {
-        realm
-            .get_property(Handle::from_raw(h), ARGS_MAPPED)
-            .is_some()
-    })
+    v.as_handle()
+        .is_some_and(|h| realm.has_argument_map_marker(Handle::from_raw(h)))
 }
 
 /// The hidden slot of a VM async function's controller object: the array
@@ -8166,11 +8165,7 @@ fn run_frame_at_ic(
                         if *kind == EK_MAP_ARGS
                             && let Some(h) = regs[rs[0] as usize].as_handle()
                         {
-                            ctx.realm.set_hidden_property(
-                                Handle::from_raw(h),
-                                ARGS_MAPPED,
-                                NanBox::boolean(true),
-                            );
+                            ctx.realm.mark_host_argument_map(Handle::from_raw(h));
                         }
                     }
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -8252,19 +8247,14 @@ fn run_frame_at_ic(
             }
             Op::MapArguments { args, cells } => {
                 let a = regs[*args as usize];
-                let cs: Vec<(usize, NanBox)> = cells
-                    .iter()
-                    .map(|(i, r)| (*i as usize, regs[*r as usize]))
-                    .collect();
-                if with_host(ctx, |h| h.map_arguments(a, &cs)).is_none() {
-                    return Err(VmError::Unsupported);
-                }
+                // The map lives on the object (its computed reads and writes
+                // then take the paths that consult it).
                 if let Some(h) = a.as_handle() {
-                    ctx.realm.set_hidden_property(
-                        Handle::from_raw(h),
-                        ARGS_MAPPED,
-                        NanBox::boolean(true),
-                    );
+                    let cs: Vec<(usize, NanBox)> = cells
+                        .iter()
+                        .map(|(i, r)| (*i as usize, regs[*r as usize]))
+                        .collect();
+                    ctx.realm.attach_argument_cells(Handle::from_raw(h), &cs);
                 }
             }
             Op::ObjectRestDyn {
@@ -14750,11 +14740,25 @@ impl Compiler {
                 cell_names.insert(String::from(NT_NAME));
             }
         }
-        // Real parameter mapping (see `MapArguments`): every parameter is a cell
-        // the arguments object aliases.
+        // Real parameter mapping (see `MapArguments`): every parameter the
+        // body can name is a cell the arguments object aliases. One it never
+        // names (no reference, declaration, closure or dynamic scope reaches
+        // it) can be left unmapped: only its own reads and writes could tell.
         if real_mapping {
+            let mut direct = BTreeSet::new();
+            let mut nested = BTreeSet::new();
+            for s in body {
+                refs_stmt(s, &mut direct, &mut nested);
+                declared_in_stmt(s, &mut direct);
+            }
+            let mut names = BTreeSet::new();
             for p in params {
-                pattern_names(&p.target, &mut cell_names);
+                pattern_names(&p.target, &mut names);
+            }
+            for n in names {
+                if dyn_fn || direct.contains(&n) || nested.contains(&n) {
+                    cell_names.insert(n);
+                }
             }
         }
         let mut uses_new_target = false;
@@ -15002,7 +15006,9 @@ impl Compiler {
                     cells.push((i as u32, b.reg));
                 }
             }
-            if let Some(ab) = c.scopes[0].get("arguments").copied() {
+            if !cells.is_empty()
+                && let Some(ab) = c.scopes[0].get("arguments").copied()
+            {
                 let args = c.read_var(ab);
                 c.ops.push(Op::MapArguments { args, cells });
             }
