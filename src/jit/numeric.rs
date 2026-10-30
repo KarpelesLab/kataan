@@ -1577,6 +1577,10 @@ impl NumGen {
                 if (src as usize) >= self.env.n_regs {
                     return None;
                 }
+                if self.roc_folded(pc) {
+                    // The `Math.f(x)` call after it checks instead.
+                    return Some(true);
+                }
                 // Only `undefined` / `null` throw (the interpreter's op).
                 let stub = a.new_label();
                 let resume = a.new_label();
@@ -1649,6 +1653,29 @@ impl NumGen {
     /// a speculative region, under its speculation).
     pub(super) fn is_number_at(&self, pc: usize, r: u16) -> bool {
         self.ty(pc, r) == T_NUM
+    }
+
+    /// Whether the `RequireObjectCoercible` at `pc` of a speculative region's
+    /// fast version emits nothing, its check folded into the inline
+    /// `Math.f(x)` call on the same register right after it (no entry in
+    /// between): that call's fast path proves its receiver an object (a
+    /// heap handle walked to a plain object holding the built-in), and its
+    /// every other path leaves for the plain copy *at this op* — which then
+    /// runs the check, and throws, exactly as the interpreter would
+    /// (nothing has happened since: the check has no other effect).
+    pub(super) fn roc_folded(&self, pc: usize) -> bool {
+        let (Some(&Op::RequireObjectCoercible { src }), Some(call @ Op::CallMethod { recv, .. })) =
+            (self.bc(pc), self.bc(pc + 1))
+        else {
+            return false;
+        };
+        src == *recv
+            && super::inline_math(call).is_some()
+            && self.in_spec(pc)
+            && self.in_spec(pc + 1)
+            && self.region_at(pc) == self.region_at(pc + 1)
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && self.copy_label(pc).is_some()
     }
 
     /// The register whose value the speculative version of region op `pc`

@@ -7096,8 +7096,14 @@ impl JitFunction {
                         a.jmp(have);
                         // A chain-cache miss: refill it from the receiver
                         // (in a speculative loop's fast version, the copy
-                        // does, as it makes every call).
-                        let bail = num.spec_bail(&mut a, op_idx);
+                        // does, as it makes every call — from the
+                        // receiver's `RequireObjectCoercible` when this
+                        // call checks for it, `NumGen::roc_folded`).
+                        let bail = if op_idx > 0 && num.roc_folded(op_idx - 1) {
+                            num.spec_bail(&mut a, op_idx - 1)
+                        } else {
+                            num.spec_bail(&mut a, op_idx)
+                        };
                         a.bind(fill);
                         if let Some(b) = bail {
                             a.jmp(b);
