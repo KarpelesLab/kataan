@@ -119,6 +119,10 @@ pub(crate) struct Linear {
     /// `(A, B, x)` when the one branch opens with `A B* x` (captures aside)
     /// and the literal `x` is outside `B`; see [`Linear::find`].
     lead_run: Option<(usize, usize, u16)>,
+    /// The literal every match opens with (captures aside), when the one
+    /// branch begins with at least two exact units: a candidate start whose
+    /// text differs is skipped without an attempt.
+    lead_lit: Vec<u16>,
 }
 
 /// The unit every match begins with.
@@ -383,6 +387,17 @@ impl Linear {
             }
             _ => None,
         };
+        let lead_lit: Vec<u16> = match branches.as_slice() {
+            [only] => only
+                .iter()
+                .filter(|s| !matches!(s, Step::Save(_)))
+                .map_while(|s| match s {
+                    Step::Unit(u) => Some(*u),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         Some(Linear {
             branches,
             sets,
@@ -390,6 +405,11 @@ impl Linear {
             slots,
             first,
             lead_run,
+            lead_lit: if lead_lit.len() >= 2 {
+                lead_lit
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -473,6 +493,12 @@ impl Linear {
             }
             // In `u` mode a match can only begin on a character boundary.
             if U && !is_char_boundary(units, s) {
+                s += 1;
+                continue;
+            }
+            // An attempt here would fail within the opening literal (whose
+            // units are never surrogates, so `s` is a character boundary).
+            if !self.lead_lit.is_empty() && !units[s..].starts_with(&self.lead_lit) {
                 s += 1;
                 continue;
             }

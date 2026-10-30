@@ -494,6 +494,42 @@ impl Regex {
         flags: Flags,
         steps: &core::cell::Cell<u64>,
     ) -> Option<Captures> {
+        let mut groups = Vec::new();
+        self.scan_into(prog, units, start, flags, steps, &mut groups)
+            .then_some(Captures { groups })
+    }
+
+    /// As [`captures_in_u16`](Self::captures_in_u16), but appends the match's
+    /// `group_count() + 1` spans to `out` (leaving it untouched on no match)
+    /// instead of allocating a [`Captures`]: for a caller that collects every
+    /// match of a global scan into one buffer.
+    pub fn captures_into_u16(
+        &self,
+        units: &[u16],
+        start: usize,
+        out: &mut Vec<Option<(usize, usize)>>,
+    ) -> bool {
+        self.scan_into(
+            &self.prog,
+            units,
+            start,
+            self.flags,
+            &core::cell::Cell::new(0),
+            out,
+        )
+    }
+
+    /// The scan behind [`scan_counted`](Self::scan_counted): on a match, appends
+    /// its spans to `out` and returns `true`.
+    fn scan_into(
+        &self,
+        prog: &[vm::Inst],
+        units: &[u16],
+        start: usize,
+        flags: Flags,
+        steps: &core::cell::Cell<u64>,
+        out: &mut Vec<Option<(usize, usize)>>,
+    ) -> bool {
         // A sticky match must begin exactly at `start`. So must an anchored one
         // (`^…`) when `m` is off: `^` holds only at position 0, so if `start` is 0
         // there is exactly one candidate, and if it is not, no position from
@@ -543,14 +579,20 @@ impl Regex {
                 heap = alloc::vec![usize::MAX; slots];
                 &mut heap
             };
-            lin.find(prog, units, start, last, flags, saves, steps, budget)?;
-            let groups = saves
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&[a, b]| (a != usize::MAX && b != usize::MAX).then_some((a, b)))
-                .collect();
-            return Some(Captures { groups });
+            if lin
+                .find(prog, units, start, last, flags, saves, steps, budget)
+                .is_none()
+            {
+                return false;
+            }
+            out.extend(
+                saves
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&[a, b]| (a != usize::MAX && b != usize::MAX).then_some((a, b))),
+            );
+            return true;
         }
         // Only offsets in `s..=last` are candidate starts, so both filters below
         // search *that* range, not the rest of the subject. An anchored or sticky
@@ -564,9 +606,12 @@ impl Regex {
             if let Some(want) = filter {
                 let end = candidate_end(units);
                 if s >= end {
-                    return None;
+                    return false;
                 }
-                s += linear::find_unit(&units[s..end], want)?;
+                let Some(k) = linear::find_unit(&units[s..end], want) else {
+                    return false;
+                };
+                s += k;
                 // In `u` mode a match can only begin on a character boundary, so a
                 // hit in the middle of a surrogate pair is not a candidate — step
                 // over it and look for the next occurrence.
@@ -579,9 +624,12 @@ impl Regex {
                 // class-led pattern): skip offsets the set rules out.
                 let end = candidate_end(units);
                 if s >= end {
-                    return None;
+                    return false;
                 }
-                s += units[s..end].iter().position(|&u| set.allows(u))?;
+                let Some(k) = units[s..end].iter().position(|&u| set.allows(u)) else {
+                    return false;
+                };
+                s += k;
                 if flags.unicode && !is_char_boundary(units, s) {
                     s += 1;
                     continue;
@@ -597,7 +645,8 @@ impl Regex {
                 steps,
                 budget,
             ) {
-                return Some(Captures { groups });
+                out.extend(groups);
+                return true;
             }
             // A failed attempt at the head of a `C+x` run (`x` outside `C`)
             // fails at every later start inside the same run too: from any of
@@ -622,7 +671,7 @@ impl Regex {
             }
             s = advance_string_index(units, s, flags.unicode);
         }
-        None
+        false
     }
 
     /// Replaces matches in `text` with `replacement`, honoring the `g` flag

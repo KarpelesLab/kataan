@@ -1107,8 +1107,8 @@ pub(super) fn try_call_value(realm: &mut Realm, f: NanBox, args: &[NanBox]) -> O
             if a0.as_handle().is_some() {
                 a0
             } else {
-                let s = realm.to_display_string(a0);
-                NanBox::handle(realm.new_string(&s).to_raw())
+                // A number shares its rope (or a digit's interned cell).
+                NanBox::handle(realm.new_primitive_string(a0).to_raw())
             }
         }
         N_NUMBER if args.is_empty() => NanBox::number(0.0),

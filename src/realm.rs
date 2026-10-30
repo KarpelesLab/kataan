@@ -299,6 +299,11 @@ pub struct Realm {
     /// single-realm run so that creating a closure does not insert a side-table
     /// entry. Closures made once other realms exist are always stamped.
     vm_fn_default_proto: Option<Handle>,
+    /// The `[[Prototype]]` of a RegExp cell that carries no `native_protos`
+    /// entry: the main realm's `%RegExp.prototype%`, recorded by the first
+    /// [`link_regexp_proto`](Realm::link_regexp_proto) of a single-realm run,
+    /// so that evaluating a regex literal inserts no side-table entry.
+    regexp_default_proto: Option<Handle>,
     /// Class tags for *non-object* cells — a derived instance of a native base
     /// (`class S extends Map {}` → a real `Map` cell) records its class here, since
     /// the inline class tag lives only on plain-object cells. Read by
@@ -751,6 +756,7 @@ impl Realm {
             native_protos: handle_map::HandleKeyedMap::new(),
             callable_null_protos: alloc::collections::BTreeSet::new(),
             vm_fn_default_proto: None,
+            regexp_default_proto: None,
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
@@ -830,6 +836,26 @@ impl Realm {
         }
         self.jit_vmfn_plain = false;
         self.set_native_proto(f, proto);
+    }
+
+    /// Links the new RegExp cell `h` to `proto`, the running realm's
+    /// `%RegExp.prototype%`: in a single-realm run the first such prototype
+    /// becomes the default every unlinked RegExp reports, so no entry is made
+    /// for it (as [`link_vm_fn_proto`](Self::link_vm_fn_proto) does for
+    /// closures); any other link is recorded explicitly.
+    pub fn link_regexp_proto(&mut self, h: Handle, proto: Handle) {
+        if !self.multi_realm && matches!(self.heap.get(h), Some(Cell::RegExp { .. })) {
+            match self.regexp_default_proto {
+                None => {
+                    crate::object::bump_proto_epoch();
+                    self.regexp_default_proto = Some(proto);
+                    return;
+                }
+                Some(p) if p == proto => return,
+                Some(_) => {}
+            }
+        }
+        self.set_native_proto(h, proto);
     }
 
     /// Records an explicit `[[Prototype]]` for a callable cell (native / bound
@@ -3860,6 +3886,12 @@ impl Realm {
         if matches!(cell, Some(Cell::BigInt(_))) {
             return self.bigint_proto_intrinsic;
         }
+        // A RegExp with no explicit link (see `regexp_default_proto`).
+        if let Some(p) = self.regexp_default_proto
+            && matches!(cell, Some(Cell::RegExp { .. }))
+        {
+            return Some(p);
+        }
         // A VM closure with no explicit link (see `vm_fn_default_proto`).
         if let Some(p) = self.vm_fn_default_proto
             && matches!(cell, Some(Cell::VmFunction { .. }))
@@ -5117,9 +5149,20 @@ impl Realm {
             return None;
         }
         let v = *a.get(i)?;
-        if v.is_hole()
-            || self.aux_props.contains_key(&handle.to_raw())
-            || self.is_host_exotic(handle)
+        if v.is_hole() || self.is_host_exotic(handle) {
+            return None;
+        }
+        // Named own properties (a match result's `index`/`input`/`groups`)
+        // live in an aux object and cannot shadow a present dense element (an
+        // index accessor sits over a hole). Only the two internal markers that
+        // make a cell's indices the host's (a boxed String primitive, a mapped
+        // arguments object) send the read to the slow path.
+        if let Some(aux) = self.aux_props.get(&handle.to_raw())
+            && self
+                .heap
+                .get(*aux)
+                .and_then(Cell::as_object)
+                .is_none_or(|o| o.get("\u{0}prim").is_some() || o.get("\u{0}argsmapped").is_some())
         {
             return None;
         }
@@ -6182,6 +6225,7 @@ impl Realm {
         // reach, so their values are strong roots.
         out.extend(self.native_protos.values().copied());
         out.extend(self.vm_fn_default_proto);
+        out.extend(self.regexp_default_proto);
         out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
         out.extend(self.intl_protos.values().copied());
         // Host-pinned values and the JIT's spilled temporaries.

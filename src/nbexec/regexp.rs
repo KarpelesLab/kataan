@@ -360,7 +360,7 @@ impl Interp {
         // `self.regexp_proto` remains the fallback for the bootstrap window before
         // `main_regexp_proto` is recorded.
         if let Some(proto) = self.current_regexp_proto().or(self.regexp_proto) {
-            self.realm.set_native_proto(h, proto);
+            self.realm.link_regexp_proto(h, proto);
         }
         h
     }
@@ -457,13 +457,25 @@ impl Interp {
             }
             let h = Handle::from_raw(raw);
             self.realm.flatten_string(h);
-            let units = match self.realm.string_leaf_bytes(h) {
-                Some(bytes) => utf16_units_of(bytes),
+            // The previous subject's buffer, when nothing else holds it, is
+            // refilled in place rather than freed and reallocated: a `test` or
+            // `exec` over many short strings would otherwise pay both per call.
+            let mut units = match self.subject_units_cache.take() {
+                Some((_, rc)) => alloc::rc::Rc::try_unwrap(rc).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            units.clear();
+            // Don't keep a long subject's allocation alive for short ones.
+            if units.capacity() > 4096 {
+                units = Vec::new();
+            }
+            match self.realm.string_leaf_bytes(h) {
+                Some(bytes) => utf16_units_into(bytes, &mut units),
                 None => {
                     let bytes = self.coerce_to_string_bytes(value)?;
-                    utf16_units_of(&bytes)
+                    utf16_units_into(&bytes, &mut units);
                 }
-            };
+            }
             let units = alloc::rc::Rc::new(units);
             self.subject_units_cache = Some((raw, units.clone()));
             return Ok((value, units));
@@ -1082,6 +1094,53 @@ impl Interp {
             .flatten()
     }
 
+    /// Every match a global `@@replace` (or `@@match`) collection loop would
+    /// find on `rx`, when that loop provably runs no user code: `Get(rx,
+    /// "exec")` reads the intrinsic `exec` from a data property (found without
+    /// performing the `Get`), `lastIndex` is the plain cell slot, and the
+    /// RegExp itself is global. Each `RegExpBuiltinExec` then starts at the
+    /// previous match's end (advanced past an empty match by
+    /// `AdvanceStringIndex` with `unicode`), and the loop ends on the first
+    /// failure, which leaves `lastIndex` at 0 — so the whole loop is one pass
+    /// with one capture buffer. The legacy match record is left to the caller.
+    ///
+    /// Returns the program, the spans (`group_count() + 1` per match) and
+    /// whether the RegExp has the `d` flag; `None` (with nothing done) when
+    /// the loop must run step by step.
+    #[cfg(feature = "regex")]
+    pub(crate) fn builtin_global_matches(
+        &mut self,
+        rx: NanBox,
+        h: Handle,
+        units: &[u16],
+        unicode: bool,
+    ) -> Option<GlobalMatches> {
+        let exec = self.regexp_exec_peek(h)?;
+        let rh = self.builtin_exec_target(rx, exec)?;
+        if self.realm.regex_aux_last_index_defined(rh) {
+            return None;
+        }
+        let flags = self.realm.regexp_flags(rh)?;
+        if !flags.contains('g') {
+            return None;
+        }
+        let has_indices = flags.contains('d');
+        let re = self.realm.regex_compiled(rh)?;
+        let stride = re.group_count() + 1;
+        let mut spans = Vec::new();
+        let mut li = self.realm.regex_last_index(rh);
+        while li <= units.len() && re.captures_into_u16(units, li, &mut spans) {
+            let (a, b) = spans[spans.len() - stride].unwrap_or_default();
+            li = if a == b {
+                self.advance_string_index(units, b, unicode)
+            } else {
+                b
+            };
+        }
+        self.realm.set_regex_last_index(rh, 0);
+        Some((re, spans, has_indices))
+    }
+
     /// The value `Get(R, "exec")` would produce, when the method-site cache can
     /// prove it reads a data property — found without performing the (then
     /// unobservable) `Get`. `None` when it cannot tell.
@@ -1224,6 +1283,26 @@ impl Interp {
         // the loop makes the whole match quadratic in the subject.
         let units: &[u16] = &units_rc;
         let mut results: Vec<NanBox> = Vec::new();
+        #[cfg(feature = "regex")]
+        if let Some((re, spans, _)) = self.builtin_global_matches(rx, h, units, unicode) {
+            let stride = re.group_count() + 1;
+            for g in spans.chunks(stride) {
+                let (a, b) = g[0].unwrap_or_default();
+                let s = self.realm.new_string_units(&units[a..b]);
+                results.push(NanBox::handle(s.to_raw()));
+            }
+            if let Some(last) = spans.rchunks(stride).next() {
+                let caps = crate::regex::Captures {
+                    groups: last.to_vec(),
+                };
+                self.update_legacy_regexp(&units_rc, &caps);
+            }
+            return Ok(if results.is_empty() {
+                NanBox::null()
+            } else {
+                NanBox::handle(self.realm.new_array(results).to_raw())
+            });
+        }
         // As in `@@replace`: once `exec` is proven to be the intrinsic, read
         // from a data property, and `lastIndex` is plain, nothing in this loop
         // runs user code, so each `RegExpExec` is `RegExpBuiltinExec` and only
@@ -1720,7 +1799,6 @@ impl Interp {
         // is transcoded once rather than once here and again by the first exec.
         let (str_v, units_rc) = self.subject_units_cached(string)?;
         let units: &[u16] = &units_rc;
-        let length = units.len();
         let func_replace = replace
             .as_handle()
             .map(Handle::from_raw)
@@ -1739,6 +1817,51 @@ impl Interp {
         }
         // Collect all matches first (so user `exec` runs in the spec order).
         let mut results: Vec<ExecOutcome> = Vec::new();
+        // A global regexp whose `exec` is provably the intrinsic one, with a
+        // plain `lastIndex`: the whole collection loop below runs no user code,
+        // so it is done in one pass over the subject (see
+        // `builtin_global_matches`).
+        #[cfg(feature = "regex")]
+        if global
+            && let Some((re, spans, has_indices)) =
+                self.builtin_global_matches(rx, h, units, unicode)
+        {
+            let stride = re.group_count() + 1;
+            if let Some(last) = spans.rchunks(stride).next() {
+                let caps = crate::regex::Captures {
+                    groups: last.to_vec(),
+                };
+                self.update_legacy_regexp(&units_rc, &caps);
+            }
+            if plan && func_replace && re.group_names().is_empty() {
+                return Ok(crate::nbvm::ReplaceStep::Plan(crate::nbvm::ReplacePlan {
+                    subject: str_v,
+                    units: units_rc.clone(),
+                    stride,
+                    spans,
+                }));
+            }
+            results = spans
+                .chunks(stride)
+                .map(|g| {
+                    ExecOutcome::Match(RegexMatch {
+                        units: units_rc.clone(),
+                        input: str_v,
+                        caps: crate::regex::Captures { groups: g.to_vec() },
+                        re: re.clone(),
+                        has_indices,
+                    })
+                })
+                .collect();
+            return self.regexp_replace_build(
+                results,
+                func_replace,
+                replace,
+                &repl_str,
+                str_v,
+                units,
+            );
+        }
         // Once `Get(rx, "exec")` is proven to read the intrinsic `exec` from a
         // data property, with a plain `lastIndex`, nothing left in this loop
         // can run user code (each result is a built-in match, and `lastIndex`
@@ -1848,7 +1971,21 @@ impl Interp {
                 spans,
             }));
         }
-        // Build the output.
+        self.regexp_replace_build(results, func_replace, replace, &repl_str, str_v, units)
+    }
+
+    /// `RegExp.prototype[@@replace]` steps 14–15: the output string built from
+    /// the collected `results` over the subject `str_v` (code units `units`).
+    fn regexp_replace_build(
+        &mut self,
+        results: Vec<ExecOutcome>,
+        func_replace: bool,
+        replace: NanBox,
+        repl_str: &[u8],
+        str_v: NanBox,
+        units: &[u16],
+    ) -> Result<crate::nbvm::ReplaceStep, ExecError> {
+        let length = units.len();
         let mut accumulated: Vec<u8> = Vec::new();
         let mut next_source_position = 0usize;
         for result in results {
@@ -1909,7 +2046,7 @@ impl Interp {
                     let replacement = self.regexp_replacement(
                         func_replace,
                         replace,
-                        &repl_str,
+                        repl_str,
                         matched_units,
                         units,
                         pos.min(length),
@@ -1961,7 +2098,7 @@ impl Interp {
             let replacement = self.regexp_replacement(
                 func_replace,
                 replace,
-                &repl_str,
+                repl_str,
                 &matched_units,
                 units,
                 pos,
@@ -2229,13 +2366,22 @@ fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 /// The UTF-16 code units of WTF-8 `bytes` (an ASCII string widens byte by byte).
-fn utf16_units_of(bytes: &[u8]) -> Vec<u16> {
+fn utf16_units_into(bytes: &[u8], out: &mut Vec<u16>) {
     if bytes.is_ascii() {
-        bytes.iter().map(|&b| u16::from(b)).collect()
+        out.extend(bytes.iter().map(|&b| u16::from(b)));
     } else {
-        crate::wtf8::utf16_units(bytes).collect()
+        out.extend(crate::wtf8::utf16_units(bytes));
     }
 }
+
+/// What [`Interp::builtin_global_matches`] collects: the program, every
+/// match's spans (`group_count() + 1` each) and whether the RegExp has `d`.
+#[cfg(feature = "regex")]
+pub(crate) type GlobalMatches = (
+    alloc::rc::Rc<crate::regex::Regex>,
+    Vec<Option<(usize, usize)>>,
+    bool,
+);
 
 /// A `RegExpBuiltinExec` match before its result array is built (see
 /// [`Interp::regexp_builtin_match`]).
