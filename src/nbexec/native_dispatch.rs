@@ -1044,7 +1044,10 @@ impl Interp {
                 if let Some(raw) = arg(0).as_handle()
                     && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
                 {
-                    let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
+                    let boxed: Vec<NanBox> = keys
+                        .iter()
+                        .map(|k| self.new_str(crate::realm::key_text(k)))
+                        .collect();
                     return Ok(NanBox::handle(self.realm.new_array(boxed).to_raw()));
                 }
                 let target = arg(0)
@@ -1086,7 +1089,10 @@ impl Interp {
                         keys.extend(self.realm.aux_named_keys(h));
                     }
                 }
-                let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_str(k)).collect();
+                let boxed: Vec<NanBox> = keys
+                    .iter()
+                    .map(|k| self.new_str(crate::realm::key_text(k)))
+                    .collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             N_OBJECT_FREEZE => {
@@ -1922,7 +1928,10 @@ impl Interp {
                 let names = src
                     .and_then(|h| self.realm.own_property_names(h))
                     .unwrap_or_default();
-                let boxed: Vec<NanBox> = names.iter().map(|k| self.new_str(k)).collect();
+                let boxed: Vec<NanBox> = names
+                    .iter()
+                    .map(|k| self.new_str(crate::realm::key_text(k)))
+                    .collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             // `Object.getOwnPropertySymbols(obj)` — the own symbol-keyed
@@ -2112,7 +2121,7 @@ impl Interp {
                 {
                     let mut pairs = Vec::with_capacity(entries.len());
                     for (k, v) in entries {
-                        let key = self.new_str(&k);
+                        let key = self.new_str(crate::realm::key_text(&k));
                         pairs.push(NanBox::handle(
                             self.realm.new_array(alloc::vec![key, v]).to_raw(),
                         ));
@@ -2161,7 +2170,7 @@ impl Interp {
                 let pairs: Vec<NanBox> = entries
                     .into_iter()
                     .map(|(k, v)| {
-                        let key = self.new_str(&k);
+                        let key = self.new_str(crate::realm::key_text(&k));
                         NanBox::handle(self.realm.new_array(alloc::vec![key, v]).to_raw())
                     })
                     .collect();

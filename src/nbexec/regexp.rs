@@ -1212,7 +1212,7 @@ impl Interp {
     fn set_prop_throwing(&mut self, h: Handle, key: &str, v: NanBox) -> Result<(), ExecError> {
         let saved = self.strict;
         self.strict = true;
-        let key_v = self.new_str(key);
+        let key_v = self.key_to_value(key);
         let res = self.assign_member_value(h, key_v, v);
         self.strict = saved;
         res

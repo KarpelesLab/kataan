@@ -2028,6 +2028,7 @@ impl Interp {
                 .as_handle()
                 .map(Handle::from_raw)
                 .and_then(|h| self.realm.string_value(h))
+                .map(crate::realm::user_key_owned)
             else {
                 continue;
             };
@@ -2078,6 +2079,7 @@ impl Interp {
                 .as_handle()
                 .map(Handle::from_raw)
                 .and_then(|h| self.realm.string_value(h))
+                .map(crate::realm::user_key_owned)
             else {
                 continue;
             };
@@ -2497,7 +2499,7 @@ impl Interp {
     fn key_descriptor_string(&self, key: NanBox) -> String {
         if let Some(h) = key.as_handle().map(Handle::from_raw) {
             if let Some(s) = self.realm.string_value(h) {
-                return s;
+                return crate::realm::user_key_owned(s);
             }
             if let Some((_, id)) = self.realm.symbol_at(h) {
                 return alloc::format!("\u{0}sym:{id}");
@@ -2960,7 +2962,7 @@ impl Interp {
         }
         let mut out = Vec::new();
         for k in self.realm.own_property_names(handle).unwrap_or_default() {
-            out.push(self.new_str(&k));
+            out.push(self.key_to_value(&k));
         }
         // Symbol keys live directly on a genuine object cell (`object_all_keys`),
         // but a non-object exotic (typed array, array, function) stores its symbol

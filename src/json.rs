@@ -82,7 +82,11 @@ fn stringify_seen(
                 for k in keys {
                     let val = realm.get_property(h, &k).unwrap_or(NanBox::undefined());
                     if let Some(s) = stringify_seen(realm, val, seen)? {
-                        parts.push(alloc::format!("{}:{}", quote(&k), s));
+                        parts.push(alloc::format!(
+                            "{}:{}",
+                            quote(crate::realm::key_text(&k)),
+                            s
+                        ));
                     }
                 }
                 Some(alloc::format!("{{{}}}", parts.join(",")))
@@ -158,7 +162,11 @@ fn stringify_at(
                 for k in keys {
                     let val = realm.get_property(h, &k).unwrap_or(NanBox::undefined());
                     if let Some(s) = stringify_at(realm, val, indent, &inner, seen)? {
-                        parts.push(alloc::format!("{inner}{}: {}", quote(&k), s));
+                        parts.push(alloc::format!(
+                            "{inner}{}: {}",
+                            quote(crate::realm::key_text(&k)),
+                            s
+                        ));
                     }
                 }
                 if parts.is_empty() {
@@ -298,7 +306,9 @@ fn parse_value(
                 }
                 // Property keys live in the `&str`-keyed object layer; a lone
                 // surrogate in a *key* (an exotic edge) is decoded lossily.
-                let key = crate::wtf8::to_string_lossy(&parse_string(c, pos)?);
+                let key = crate::realm::user_key_owned(crate::wtf8::to_string_lossy(
+                    &parse_string(c, pos)?,
+                ));
                 skip_ws(c, pos);
                 if c.get(*pos) != Some(&':') {
                     return Err(String::from("Expected ':' in JSON"));

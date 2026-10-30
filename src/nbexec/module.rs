@@ -1585,7 +1585,10 @@ impl Interp {
         let mut slots: Vec<(String, Scope, String)> = Vec::new();
         for n in &names {
             if let Ok((s, l)) = self.resolve_export(key, n, &mut BTreeSet::new()) {
-                slots.push((n.clone(), s, l));
+                // The namespace's property (and binding map) key is the export
+                // name's storage key (`export { x as "\0a" }`, see
+                // `realm::is_internal_key`).
+                slots.push((crate::realm::user_key(n).into_owned(), s, l));
             }
         }
         // Snapshot the current values; namespace properties read the *current*

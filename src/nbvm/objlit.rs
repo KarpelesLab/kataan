@@ -155,7 +155,7 @@ pub(super) fn vm_new_object_lit(
         // `vm_init_prop`'s own fallback: the host's [[DefineOwnProperty]]
         // (on a fresh ordinary object it runs no JavaScript and so no
         // collection, which could not see the object yet).
-        let kv = NanBox::handle(ctx.realm.new_string(k).to_raw());
+        let kv = ctx.realm.key_value(k);
         match super::with_host(ctx, |x| x.define_data(o, kv, v, 7)) {
             Some(Ok(())) => {}
             Some(Err(e)) => return Err(VmError::from(e)),

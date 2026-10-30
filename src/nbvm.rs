@@ -1661,7 +1661,7 @@ fn host_get(ctx: &mut Ctx, recv: NanBox, key: NanBox) -> Result<NanBox, VmError>
 
 /// [`host_get`] for a static string key.
 fn host_get_str(ctx: &mut Ctx, recv: NanBox, key: &str) -> Result<NanBox, VmError> {
-    let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
+    let k = ctx.realm.key_value(key);
     host_get(ctx, recv, k)
 }
 
@@ -1826,7 +1826,7 @@ fn vm_init_prop(
             .init_data_property_cached(Handle::from_raw(h), key, v, cache)
     });
     if !fast {
-        let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
+        let k = ctx.realm.key_value(key);
         match with_host(ctx, |h| h.define_data(o, k, v, 7)) {
             Some(Ok(())) => {}
             Some(Err(e)) => return Err(VmError::from(e)),
@@ -1941,7 +1941,7 @@ fn vm_set_prop_mode(
             r => return r,
         }
     }
-    let k = NanBox::handle(ctx.realm.new_string(key).to_raw());
+    let k = ctx.realm.key_value(key);
     host_set(ctx, recv, k, value, strict)
 }
 
@@ -7296,7 +7296,7 @@ fn run_frame_at_ic(
                             Some(kh) => match ctx.realm.symbol_at(kh) {
                                 Some((_, id)) => alloc::format!("\u{0}sym:{id}"),
                                 None if ctx.realm.string_value(kh).is_some() => {
-                                    ctx.realm.to_display_string(kv)
+                                    crate::realm::user_key_owned(ctx.realm.to_display_string(kv))
                                 }
                                 None => return Err(VmError::Unsupported),
                             },
@@ -7343,7 +7343,9 @@ fn run_frame_at_ic(
             Op::DeleteProp { dst, obj, key } => {
                 let removed = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     Some(h) => {
-                        let k = ctx.realm.to_display_string(regs[*key as usize]);
+                        let k = crate::realm::user_key_owned(
+                            ctx.realm.to_display_string(regs[*key as usize]),
+                        );
                         ctx.realm.delete_property(h, &k)
                     }
                     None => true,
@@ -8958,7 +8960,7 @@ fn run_frame_at_ic(
                         .unwrap_or_else(|| ctx.realm.aux_named_keys(c));
                     for k in named {
                         if seen.insert(k.clone()) {
-                            out.push(NanBox::handle(ctx.realm.new_string(&k).to_raw()));
+                            out.push(ctx.realm.key_value(&k));
                         }
                     }
                     cur = ctx.realm.object_proto(c);
@@ -9673,7 +9675,7 @@ fn json_stringify(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<N
                     .map(<[_]>::to_vec)
                     .unwrap_or_default()
                     .iter()
-                    .map(|e| ctx.realm.to_display_string(*e))
+                    .map(|e| crate::realm::user_key_owned(ctx.realm.to_display_string(*e)))
                     .collect();
                 (None, Some(a))
             }
@@ -9774,7 +9776,7 @@ fn json_revive(
             }
         }
     }
-    let kb = NanBox::handle(ctx.realm.new_string(key).to_raw());
+    let kb = ctx.realm.key_value(key);
     call_closure(
         ctx,
         funcs,
@@ -9845,13 +9847,13 @@ fn json_normalize(
             .map(Handle::from_raw)
             .is_some_and(|r| ctx.realm.is_vm_function(r))
         {
-            let kb = NanBox::handle(ctx.realm.new_string(key).to_raw());
+            let kb = ctx.realm.key_value(key);
             v = call_closure(ctx, funcs, tj, &[kb], v)?;
         }
     }
     // The replacer function transforms the value.
     if let Some(rf) = replacer {
-        let kb = NanBox::handle(ctx.realm.new_string(key).to_raw());
+        let kb = ctx.realm.key_value(key);
         v = call_closure(ctx, funcs, rf, &[kb, v], holder)?;
     }
     // Recurse into plain arrays/objects, rebuilding a normalized copy. Closures,
@@ -10018,10 +10020,15 @@ fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
             return k
                 .as_handle()
                 .and_then(|r| ctx.realm.string_value(Handle::from_raw(r)))
+                .map(crate::realm::user_key_owned)
                 .ok_or(VmError::Unsupported);
         }
     }
-    Ok(ctx.realm.to_display_string(key))
+    // A String key is escaped into the user namespace (see
+    // `realm::is_internal_key`): no string can name an internal slot.
+    Ok(crate::realm::user_key_owned(
+        ctx.realm.to_display_string(key),
+    ))
 }
 
 /// The integer index `key` names on typed array `recv`, when the element access
@@ -10178,7 +10185,7 @@ fn vm_get_elem(
                 // an inherited method reached by a computed key. An object key
                 // was already converted (its ToPropertyKey runs once).
                 let key = if is_object_value(&ctx.realm, key) {
-                    NanBox::handle(ctx.realm.new_string(&ks).to_raw())
+                    ctx.realm.key_value(&ks)
                 } else {
                     key
                 };
@@ -11527,7 +11534,7 @@ fn vm_object_kv(
                     continue;
                 }
                 let item = match native {
-                    NB_OBJECT_KEYS => NanBox::handle(ctx.realm.new_string(&k).to_raw()),
+                    NB_OBJECT_KEYS => ctx.realm.key_value(&k),
                     _ => {
                         // A fresh cache per key: the inline cache keys only on the
                         // receiver's shape pointer (one property per call site), so
@@ -11537,7 +11544,7 @@ fn vm_object_kv(
                         if native == NB_OBJECT_VALUES {
                             v
                         } else {
-                            let key = NanBox::handle(ctx.realm.new_string(&k).to_raw());
+                            let key = ctx.realm.key_value(&k);
                             NanBox::handle(ctx.realm.new_array(alloc::vec![key, v]).to_raw())
                         }
                     }
@@ -11683,10 +11690,10 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
             let mut out = Vec::with_capacity(pairs.len());
             for (k, v) in pairs {
                 let item = match native {
-                    NB_OBJECT_KEYS => NanBox::handle(ctx.realm.new_string(&k).to_raw()),
+                    NB_OBJECT_KEYS => ctx.realm.key_value(&k),
                     NB_OBJECT_VALUES => v,
                     _ => {
-                        let key = NanBox::handle(ctx.realm.new_string(&k).to_raw());
+                        let key = ctx.realm.key_value(&k);
                         NanBox::handle(ctx.realm.new_array(alloc::vec![key, v]).to_raw())
                     }
                 };
@@ -11866,7 +11873,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 {
                     if let Some(ph) = pair.as_handle().map(Handle::from_raw) {
                         let key_el = ctx.realm.get_element(ph, 0);
-                        let k = ctx.realm.to_display_string(key_el);
+                        let k = crate::realm::user_key_owned(ctx.realm.to_display_string(key_el));
                         let v = ctx.realm.get_element(ph, 1);
                         ctx.realm.set_property(obj, &k, v);
                     }
@@ -15484,7 +15491,7 @@ impl Compiler {
             };
             let this = self.this_reg;
             let key = match &fd.key {
-                FieldKey::Static(k) => self.constant_str(k),
+                FieldKey::Static(k) => self.key_constant(k),
                 FieldKey::Hidden(n) => read(self, n)?,
                 FieldKey::Private(n) => {
                     let key = read(self, n)?;
@@ -18235,7 +18242,7 @@ impl Compiler {
                             );
                             let key = match property {
                                 PropertyKey::Computed(e) => self.expr(e)?,
-                                _ => self.constant_str(&static_key(property)?),
+                                _ => self.key_constant(&static_key(property)?),
                             };
                             let dst = self.alloc();
                             self.ops.push(Op::HostDelete {
@@ -18290,7 +18297,7 @@ impl Compiler {
                                         }
                                         let key = match property {
                                             PropertyKey::Computed(e) => self.expr(e)?,
-                                            _ => self.constant_str(&static_key(property)?),
+                                            _ => self.key_constant(&static_key(property)?),
                                         };
                                         let dst = self.alloc();
                                         self.ops.push(Op::HostDelete {
@@ -18343,7 +18350,7 @@ impl Compiler {
                         );
                         let key = match property {
                             PropertyKey::Computed(e) => self.expr(e)?,
-                            _ => self.constant_str(&static_key(property)?),
+                            _ => self.key_constant(&static_key(property)?),
                         };
                         let dst = self.alloc();
                         self.ops.push(Op::DeleteProp { dst, obj, key });
@@ -20657,6 +20664,13 @@ impl Compiler {
     }
 
     /// A fresh register holding a new heap string.
+    /// A String register holding the JavaScript text of static storage key `k`
+    /// (a string-literal key arrives escaped, see `realm::is_internal_key`; the
+    /// runtime ToPropertyKey of the value escapes it again).
+    fn key_constant(&mut self, k: &str) -> Reg {
+        self.constant_str(crate::realm::key_text(k))
+    }
+
     fn constant_str(&mut self, s: &str) -> Reg {
         let r = self.alloc();
         self.ops.push(Op::NewString {
@@ -22243,7 +22257,7 @@ impl Compiler {
             PropertyKey::Private(_) => return Err(CompileError::Unsupported("private name")),
             other => {
                 let k = static_key(other)?;
-                self.constant_str(&k)
+                self.key_constant(&k)
             }
         })
     }
@@ -22541,7 +22555,8 @@ impl Compiler {
     fn named_field_value(&mut self, e: &Expr, name: &str) -> Result<Reg, CompileError> {
         if is_anonymous_fn_def(e) {
             let bt = BindingTarget::Ident(Ident {
-                name: name.into(),
+                // A static storage key names the function by its text.
+                name: crate::realm::key_text(name).into(),
                 span: crate::common::Span::point(0),
             });
             self.expr_named(e, &bt)
@@ -22792,7 +22807,7 @@ impl Compiler {
             PropertyKey::Private(_) => return Err(CompileError::Unsupported("private name")),
             other => {
                 let k = static_key(other)?;
-                self.constant_str(&k)
+                self.key_constant(&k)
             }
         };
         let home = self.read_var(hb);
@@ -22830,7 +22845,7 @@ impl Compiler {
             }
             None => {
                 let k = static_key(property)?;
-                self.constant_str(&k)
+                self.key_constant(&k)
             }
         };
         Ok((snap, this, key))

@@ -690,9 +690,9 @@ impl<'src> Parser<'src> {
         ) {
             self.bump();
             let key = match tok.kind {
-                TokenKind::String => {
-                    PropertyKey::Str(cook::string_key(tok.text(self.source), tok.span)?.into())
-                }
+                TokenKind::String => PropertyKey::Str(
+                    cook::string_property_key(tok.text(self.source), tok.span)?.into(),
+                ),
                 TokenKind::BigInt => {
                     PropertyKey::Str(cook::bigint_property_key(tok.ascii_text(self.source)).into())
                 }

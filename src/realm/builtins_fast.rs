@@ -64,11 +64,14 @@ impl Realm {
             return Some(keys.clone());
         }
         let shape = shape.clone();
-        let keys: Rc<[crate::rope::Rope]> = self
-            .object_keys(handle)?
-            .iter()
-            .map(|k| crate::rope::Rope::leaf(k))
-            .collect();
+        let names = self.object_keys(handle)?;
+        // An escaped user key (`"\0\0…"`, see `realm::is_internal_key`) is not
+        // its own text: leave such an object to the general path.
+        if names.iter().any(|k| k.starts_with('\0')) {
+            return None;
+        }
+        let keys: Rc<[crate::rope::Rope]> =
+            names.iter().map(|k| crate::rope::Rope::leaf(k)).collect();
         *self.key_ropes.borrow_mut() = Some((shape, keys.clone()));
         Some(keys)
     }

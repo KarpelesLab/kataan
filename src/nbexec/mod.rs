@@ -10119,7 +10119,7 @@ impl crate::nbvm::VmHost for Interp {
 
     fn to_property_key(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
         let k = self.coerce_property_key(v).map_err(exec_to_host)?;
-        Ok(self.new_str(&k))
+        Ok(self.key_to_value(&k))
     }
 
     fn to_object(&mut self, v: NanBox) -> NanBox {
@@ -10602,7 +10602,7 @@ impl Interp {
             return Ok(key);
         }
         let k = self.coerce_property_key(key)?;
-        Ok(self.new_str(&k))
+        Ok(self.key_to_value(&k))
     }
 }
 

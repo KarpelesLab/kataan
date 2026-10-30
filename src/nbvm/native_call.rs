@@ -726,16 +726,18 @@ fn run_op(
             let leaf;
             let owned;
             let key: &str = match k.as_handle().map(Handle::from_raw) {
-                // A flat, well-formed string is its own key, borrowed.
+                // A flat, well-formed string is its own key, borrowed (one that
+                // starts with NUL is escaped, see `realm::is_internal_key`).
                 Some(kh)
                     if let Some(b) = realm.string_leaf_bytes(kh)
+                        && b.first() != Some(&0)
                         && let Ok(t) = core::str::from_utf8(b) =>
                 {
                     leaf = t;
                     leaf
                 }
                 Some(kh) if realm.is_string_handle(kh) => {
-                    owned = realm.to_display_string(k);
+                    owned = crate::realm::user_key_owned(realm.to_display_string(k));
                     &owned
                 }
                 Some(_) => return None,

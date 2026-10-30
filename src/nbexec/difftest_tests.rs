@@ -1731,3 +1731,94 @@ fn at_and_with_honor_a_length_past_the_dense_store() {
     "#;
     assert_eq!(run(src), "u,1,3,last,RangeError,x,u,3");
 }
+
+/// A user String key that starts with NUL is an ordinary key: it enumerates,
+/// serializes and round-trips through every key path, distinct from the
+/// engine's internal `"\0…"` slots (which used to swallow `"\0a"`-style names
+/// from `Object.keys`, `for-in`, `JSON.stringify` and `Reflect.ownKeys`).
+#[test]
+fn nul_prefixed_string_keys_are_ordinary_keys() {
+    let src = r#"
+        var esc = function (a) { return JSON.stringify(a); };
+        var ks = ["\0a", "\0", "\0\0", "\0#x", "\0sym:1", "\0prim", "\0\v", "a\0b"];
+        var o = {};
+        for (var i = 0; i < ks.length; i++) o[ks[i]] = i;
+        var fi = []; for (var k in o) fi.push(k);
+        var lit = { "\0lit": 1, ["\0comp"]: 2 };
+        var parsed = JSON.parse('{"\\u0000p":1,"\\u0000sym:2":2}');
+        var d = {}; Object.defineProperty(d, "\0d", { value: 1, enumerable: true });
+        var trap = [];
+        var px = new Proxy({ "\0t": 1 }, { get: function (t, k) { trap.push(k); return t[k]; } });
+        px["\0t"];
+        var hits = ks.filter(function (k) { return k in o && o.hasOwnProperty(k) && o[k] === ks.indexOf(k); }).length;
+        [esc(Object.keys(o)), esc(fi), esc(Reflect.ownKeys(o)), esc(o), esc(Object.keys(lit)),
+         esc(Object.keys(parsed)), esc(Object.keys(d)), esc(trap), hits,
+         esc(Object.keys(JSON.parse(JSON.stringify(o))))].join("|")
+    "#;
+    let keys = r#"["\u0000a","\u0000","\u0000\u0000","\u0000#x","\u0000sym:1","\u0000prim","\u0000\u000b","a\u0000b"]"#;
+    let obj = r#"{"\u0000a":0,"\u0000":1,"\u0000\u0000":2,"\u0000#x":3,"\u0000sym:1":4,"\u0000prim":5,"\u0000\u000b":6,"a\u0000b":7}"#;
+    let want = [
+        keys,
+        keys,
+        keys,
+        obj,
+        r#"["\u0000lit","\u0000comp"]"#,
+        r#"["\u0000p","\u0000sym:2"]"#,
+        r#"["\u0000d"]"#,
+        r#"["\u0000t"]"#,
+        "8",
+        keys,
+    ]
+    .join("|");
+    assert_eq!(run(src), want);
+}
+
+/// No String key can name an internal slot: a guessed private-name storage key
+/// neither reads nor overwrites `#x` nor passes its brand check, a
+/// `"\0sym:<id>"` string does not alias the Symbol with that id, and a
+/// `"\0prim"` / `"\0PromiseState"` own property does not make an object a
+/// primitive wrapper or a promise.
+#[test]
+fn string_keys_cannot_forge_internal_slots() {
+    let src = r#"
+        class A { #x = 1; static get(o) { return o.#x; } static has(o) { return #x in o; } }
+        var a = new A(), b = {};
+        for (var i = 0; i < 4000; i++) {
+            var k = "\0#x@v" + i.toString(16);
+            a[k] = 42; a[k + "f"] = 42; b[k] = 1; b[k + "f"] = 1;
+        }
+        var forged;
+        try { A.get(b); forged = "read"; } catch (e) { forged = e instanceof TypeError; }
+        var c = {};
+        for (var j = 0; j < 100; j++) c["\0sym:" + j] = function () { return { next: function () { return { done: true }; } }; };
+        var iter;
+        try { for (var _ of c); iter = "iterated"; } catch (e) { iter = e instanceof TypeError; }
+        var w = { "\0prim": 5 };
+        var n = new Number(3); n["\0prim"] = 9;
+        var pr;
+        try { Promise.prototype.then.call({ "\0PromiseState": 1 }); pr = "then"; } catch (e) { pr = e instanceof TypeError; }
+        [A.get(a), A.has(b), forged, iter, Object.getOwnPropertySymbols(c).length,
+         Object.prototype.toString.call(w), n.valueOf(), pr].join()
+    "#;
+    assert_eq!(run(src), "1,false,true,true,0,[object Object],3,true");
+}
+
+/// A Symbol produced by an object key's `@@toPrimitive` is still that Symbol
+/// (the host's ToPropertyKey hands the VM the key *value*, not its storage
+/// string), and functions named after NUL string keys keep the key's text.
+#[test]
+fn key_values_round_trip_symbols_and_names() {
+    let src = r#"
+        var s = Symbol("k");
+        var o = {}; o[{ [Symbol.toPrimitive]: function () { return s; } }] = 1;
+        var m = { "\0m": function () {}, get "\0g"() { return 1; }, ["\0c"]: () => 0 };
+        class K { static "\0sm"() {} "\0f" = function () {}; }
+        [o[s], Object.getOwnPropertySymbols(o).length, Object.keys(o).length,
+         JSON.stringify([m["\0m"].name, Object.getOwnPropertyDescriptor(m, "\0g").get.name,
+                         m["\0c"].name, K["\0sm"].name, new K()["\0f"].name])].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        r#"1|1|0|["\u0000m","get \u0000g","\u0000c","\u0000sm","\u0000f"]"#
+    );
+}

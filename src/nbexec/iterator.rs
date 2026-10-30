@@ -2705,6 +2705,7 @@ impl Interp {
                     .as_handle()
                     .map(Handle::from_raw)
                     .and_then(|kh| self.realm.string_value(kh))
+                    .map(crate::realm::user_key_owned)
                 else {
                     continue;
                 };
@@ -2718,7 +2719,7 @@ impl Interp {
                         .get_property(dh, "enumerable")
                         .is_some_and(|v| self.realm.truthy(v));
                     if enumerable {
-                        out.push(self.new_str(&name));
+                        out.push(k);
                     }
                 }
             }
@@ -2767,7 +2768,7 @@ impl Interp {
             .unwrap_or_else(|| self.realm.aux_named_keys(c));
         for k in enumerable {
             if seen.insert(k.clone()) {
-                out.push(self.new_str(&k));
+                out.push(self.new_str(crate::realm::key_text(&k)));
             }
         }
         // *Every* own key (including the non-enumerable ones) shadows a

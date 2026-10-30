@@ -165,7 +165,9 @@ impl Interp {
         {
             return alloc::format!("\u{0}sym:{id}");
         }
-        self.realm.to_display_string(k)
+        // A String key is escaped into the user namespace (see
+        // `realm::is_internal_key`): no string can name an internal slot.
+        crate::realm::user_key_owned(self.realm.to_display_string(k))
     }
 
     /// Inverse of [`member_key`] for handing a property key to a Proxy trap: a
@@ -173,13 +175,7 @@ impl Interp {
     /// `Symbol(Symbol.iterator)`, not the internal sentinel string); any other key
     /// becomes a String.
     pub(crate) fn key_to_value(&mut self, name: &str) -> NanBox {
-        if let Some(idstr) = name.strip_prefix("\u{0}sym:")
-            && let Ok(id) = idstr.parse::<u64>()
-            && let Some(sh) = self.realm.symbol_for_id(id)
-        {
-            return NanBox::handle(sh.to_raw());
-        }
-        self.new_str(name)
+        self.realm.key_value(name)
     }
 
     /// `ToPropertyKey(k)`: like `member_key`, but a non-string, non-symbol object
@@ -209,7 +205,9 @@ impl Interp {
             {
                 return Ok(self.member_key(p));
             }
-            return Ok(self.realm.to_display_string(p));
+            return Ok(crate::realm::user_key_owned(
+                self.realm.to_display_string(p),
+            ));
         }
         Ok(self.member_key(k))
     }
@@ -663,7 +661,7 @@ impl Interp {
             if let Some((target, p_handler)) = self.realm.proxy_at(c) {
                 self.guard_revoked(c)?;
                 if let Some(trap) = self.proxy_trap(p_handler, "set")? {
-                    let key_box = self.new_str(key);
+                    let key_box = self.key_to_value(key);
                     let handler_box = NanBox::handle(p_handler.to_raw());
                     let r = self.call_with_this(
                         trap,
@@ -865,7 +863,7 @@ impl Interp {
                 if !self.can_write_property(recv_h, key) {
                     return Ok(false);
                 }
-                let key_box = self.new_str(key);
+                let key_box = self.key_to_value(key);
                 self.assign_member_value(recv_h, key_box, value)?;
                 return Ok(true);
             }

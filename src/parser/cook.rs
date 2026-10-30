@@ -232,6 +232,13 @@ pub(super) fn string_key(raw: &[u8], span: Span) -> Result<String> {
     Ok(wtf8::to_string_lossy(&string(raw, span)?))
 }
 
+/// [`string_key`] in **storage-key** form, for an object-literal, class or
+/// pattern property key: a key that starts with NUL is escaped
+/// ([`crate::realm::user_key`]) so it can never name an engine-internal slot.
+pub(super) fn string_property_key(raw: &[u8], span: Span) -> Result<String> {
+    Ok(crate::realm::user_key_owned(string_key(raw, span)?))
+}
+
 /// Decodes the escape sequences in a string or template-cooked segment.
 ///
 /// `body` is the text *between* the delimiters. Returns the cooked value as

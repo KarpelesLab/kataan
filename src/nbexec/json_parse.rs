@@ -212,8 +212,12 @@ impl Interp {
                     let owned;
                     let key: &str = match self.json_fast_string(p)? {
                         JsonStr::Borrowed(a, b) => text.get(a..b).unwrap_or_default(),
+                        // (An unescaped run cannot hold a raw NUL; an escaped
+                        // `\u0000…` key is escaped into the user namespace, see
+                        // `realm::is_internal_key`.)
                         JsonStr::Scratch => {
-                            owned = crate::wtf8::to_string_lossy(&p.buf);
+                            owned =
+                                crate::realm::user_key_owned(crate::wtf8::to_string_lossy(&p.buf));
                             &owned
                         }
                     };

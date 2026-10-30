@@ -2398,6 +2398,26 @@ impl Realm {
         self.symbols_by_id.get(&id).copied()
     }
 
+    /// The JavaScript property-key **value** that storage key `key` stores
+    /// (the inverse of ToPropertyKey, see [`is_internal_key`]): a Symbol key
+    /// (`"\0sym:<id>"`) is its Symbol, any other key a String of its
+    /// [`key_text`]. For handing a stored key to code that takes a key value
+    /// (the host's member operations, a Proxy trap, a callback).
+    pub fn key_value(&mut self, key: &str) -> NanBox {
+        if let Some(idstr) = key.strip_prefix(crate::shape::SYMBOL_KEY_PREFIX)
+            && let Ok(id) = idstr.parse::<u64>()
+            && let Some(sh) = self.symbol_for_id(id)
+        {
+            return NanBox::handle(sh.to_raw());
+        }
+        debug_assert!(
+            !is_internal_key(key),
+            "internal key {} has no JavaScript key value",
+            key.escape_debug()
+        );
+        NanBox::handle(self.new_string(key_text(key)).to_raw())
+    }
+
     /// The `(description, id)` of the symbol at `handle`, if it is one.
     #[must_use]
     pub fn symbol_at(&self, handle: Handle) -> Option<(alloc::string::String, u64)> {
@@ -8655,17 +8675,69 @@ pub fn is_private_key(key: &str) -> bool {
     key.as_bytes().starts_with(b"\0#")
 }
 
-/// Whether `key` is an engine-internal storage slot rather than a JavaScript
-/// property name. Internal slots are namespaced by a leading NUL followed by an
-/// ASCII alphanumeric or `#` (`"\0sym:<id>"` for a Symbol key, `"\0#<name>@<scope>"`
-/// for a private element, `"\0prim"`, `"\0gbuf"`, …), so they never collide with
-/// a *user* key such as `obj["\0\v"]`, which must still enumerate and serialize
-/// like any other string key.
+/// Whether storage key `key` is an engine-internal slot rather than a JavaScript
+/// property name.
+///
+/// # The storage-key namespace
+///
+/// Property keys are `&str` storage keys shared by two kinds of names:
+///
+/// - **internal** keys, minted only by the engine: a leading NUL followed by
+///   anything but a second NUL (`"\0sym:<id>"` for a Symbol key,
+///   `"\0#<name>@<scope>"` for a private element, `"\0prim"`, `"\0gbuf"`, …);
+/// - **user** keys, the storage form of a JavaScript String key: the string
+///   itself, except that one starting with NUL is *escaped* with one more
+///   leading NUL ([`user_key`]), so it starts with `"\0\0"`.
+///
+/// Every place a JavaScript String becomes a property key goes through
+/// [`user_key`] (ToPropertyKey in the VM and the host, string-literal keys in
+/// the parser, JSON.parse, Proxy trap results), and every place a stored key
+/// flows back to JavaScript as a String goes through [`key_text`]. So no user
+/// string, whatever its bytes, can name an internal slot, and a user key that
+/// starts with NUL enumerates and serializes like any other string key.
 #[must_use]
+#[inline]
 pub fn is_internal_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    chars.next() == Some('\u{0}')
-        && matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '#')
+    let b = key.as_bytes();
+    b.first() == Some(&0) && b.get(1) != Some(&0)
+}
+
+/// The storage key of JavaScript String key `s` (see [`is_internal_key`]): `s`
+/// itself, or `s` with one more leading NUL when it starts with NUL.
+#[must_use]
+#[inline]
+pub fn user_key(s: &str) -> alloc::borrow::Cow<'_, str> {
+    if s.as_bytes().first() == Some(&0) {
+        let mut k = alloc::string::String::with_capacity(s.len() + 1);
+        k.push('\0');
+        k.push_str(s);
+        alloc::borrow::Cow::Owned(k)
+    } else {
+        alloc::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// [`user_key`] for an owned string (no copy unless it starts with NUL).
+#[must_use]
+#[inline]
+pub fn user_key_owned(mut s: alloc::string::String) -> alloc::string::String {
+    if s.as_bytes().first() == Some(&0) {
+        s.insert(0, '\0');
+    }
+    s
+}
+
+/// The JavaScript String text of a non-internal storage key: the inverse of
+/// [`user_key`] (an escaped `"\0\0…"` key loses its escape NUL; any other key
+/// is its own text).
+#[must_use]
+#[inline]
+pub fn key_text(key: &str) -> &str {
+    if key.as_bytes().starts_with(b"\0\0") {
+        &key[1..]
+    } else {
+        key
+    }
 }
 
 #[cfg(test)]
