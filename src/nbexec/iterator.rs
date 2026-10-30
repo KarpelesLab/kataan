@@ -2473,6 +2473,57 @@ impl Interp {
         Ok(out)
     }
 
+    /// `GroupBy(items, callbackfn, keyCoercion)`'s iteration (ECMA-262 7.3.35):
+    /// each value `items` yields with its group key — `Ok` the property key
+    /// (`property_keys`: `ToPropertyKey` of the callback's result) or `Err`
+    /// the value itself (a `Map` key, `-0` made `+0`) — in order. The items
+    /// are stepped one at a time, so a callback (or key coercion) that throws
+    /// stops the iteration and closes the iterator (`IteratorClose`) instead
+    /// of the remaining values being drawn first.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn group_by_pairs(
+        &mut self,
+        items: NanBox,
+        cb: NanBox,
+        property_keys: bool,
+    ) -> Result<Vec<(Result<String, NanBox>, NanBox)>, ExecError> {
+        let mut pairs = Vec::new();
+        let key_of = |this: &mut Self, item: NanBox, k: usize| {
+            let key = this.call(cb, &[item, NanBox::number(k as f64)])?;
+            if property_keys {
+                return this.coerce_property_key(key).map(Ok);
+            }
+            let key = if key.as_number() == Some(0.0) {
+                NanBox::number(0.0)
+            } else {
+                key
+            };
+            Ok(Err(key))
+        };
+        let Some(it) = self.for_of_get_iterator_ext(items, true)? else {
+            // A built-in iterable without a stepping iterator here (a string, a
+            // generator): its values, then the callback over each.
+            for (k, item) in self.iterate_values(items)?.into_iter().enumerate() {
+                let key = key_of(self, item, k)?;
+                pairs.push((key, item));
+            }
+            return Ok(pairs);
+        };
+        let next = self.read_member(it, "next")?;
+        let mut k = 0usize;
+        while let Some(item) = self.iter_step(it, next)? {
+            match key_of(self, item, k) {
+                Ok(key) => pairs.push((key, item)),
+                Err(e) => {
+                    let _ = self.iterator_close(it);
+                    return Err(e);
+                }
+            }
+            k += 1;
+        }
+        Ok(pairs)
+    }
+
     pub(crate) fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             let m = self.new_str("is not iterable");

@@ -1982,10 +1982,10 @@ impl Interp {
             // items (so `Map.groupBy([], null)` throws even for an empty list).
             let cb = arg(1);
             self.require_callable(cb, "Map.groupBy callback")?;
-            let items = self.iterate_values(arg(0))?;
+            let pairs = self.group_by_pairs(arg(0), cb, false)?;
             let map = self.new_collection_object(false);
-            for (i, item) in items.iter().enumerate() {
-                let key = self.call(cb, &[*item, NanBox::number(i as f64)])?;
+            for (key, item) in &pairs {
+                let key = key.as_ref().err().copied().unwrap_or(NanBox::undefined());
                 let bucket = match self
                     .realm
                     .collection_get(map, key)

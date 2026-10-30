@@ -1360,17 +1360,16 @@ impl Interp {
                 // IsCallable(callbackfn) is checked *before* iterating.
                 let cb = arg(1);
                 self.require_callable(cb, "Object.groupBy callback")?;
-                let items = self.iterate_values(arg(0))?;
+                let pairs = self.group_by_pairs(arg(0), cb, true)?;
                 // The result is a null-prototype object; group keys are property keys
                 // (ToPropertyKey — a Symbol key stays a Symbol).
                 let out = self.realm.new_object();
                 self.realm.set_object_proto(out, None);
-                for (i, item) in items.iter().enumerate() {
-                    let key = self.call(cb, &[*item, NanBox::number(i as f64)])?;
-                    let k = self.coerce_property_key(key)?;
+                for (key, item) in &pairs {
+                    let k = key.as_deref().unwrap_or_default();
                     let bucket = match self
                         .realm
-                        .get_property(out, &k)
+                        .get_property(out, k)
                         .and_then(NanBox::as_handle)
                         .map(Handle::from_raw)
                     {
@@ -1378,7 +1377,7 @@ impl Interp {
                         None => {
                             let arr = self.realm.new_array(Vec::new());
                             self.realm
-                                .set_property(out, &k, NanBox::handle(arr.to_raw()));
+                                .set_property(out, k, NanBox::handle(arr.to_raw()));
                             arr
                         }
                     };

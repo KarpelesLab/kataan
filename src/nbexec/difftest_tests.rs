@@ -1898,3 +1898,30 @@ fn mutators_move_elements_before_a_readonly_length_throws() {
         "TypeError4[1,2,3,_] TypeError4[0,1,2,_] TypeError4[0,2,3,_] TypeError4[0,8,2,3] TypeError4[0,1,2,3]"
     );
 }
+
+/// `Object.groupBy`/`Map.groupBy` step the iterable one value at a time: a
+/// callback that throws stops the iteration and closes the iterator, rather
+/// than every value having been drawn first (and the iterator left open).
+#[test]
+fn group_by_closes_the_iterator_when_the_callback_throws() {
+    let src = r#"
+        var log = [];
+        function it() {
+            var i = 0;
+            return { [Symbol.iterator]() { return this; },
+                     next() { log.push("n" + i); return i < 5 ? { value: i++, done: false } : { done: true }; },
+                     return() { log.push("R"); return {}; } };
+        }
+        var r = [];
+        [Object.groupBy, Map.groupBy].forEach(function (g) {
+            log = [];
+            try { g(it(), function (v) { if (v === 2) throw 0; return v; }); } catch (e) { log.push("E"); }
+            r.push(log.join(""));
+        });
+        var a = [1, 2, 3];
+        var keys = Object.keys(Object.groupBy(a, function (v) { if (a.length < 5) a.push(v * 10); return v; }));
+        r.push(keys.join(), String([...Map.groupBy([-0, 0], function (v) { return v; }).keys()].map(function (k) { return 1 / k; })));
+        r.join(" ")
+    "#;
+    assert_eq!(run(src), "n0n1n2RE n0n1n2RE 1,2,3,10,20 Infinity");
+}
