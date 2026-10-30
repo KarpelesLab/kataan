@@ -756,7 +756,7 @@ fn run_op(
         }
         FastOp::StrSlice | FastOp::StrSubstring => {
             let rope = str_parts(realm, h)?;
-            let (bytes, units) = (rope.as_leaf_bytes()?, rope.utf16_len());
+            let units = rope.utf16_len();
             let start = int_arg(arg(0))?.unwrap_or(0.0);
             let end = int_arg(arg(1))?;
             let (a, b) = if op == FastOp::StrSlice {
@@ -776,8 +776,7 @@ fn run_op(
                 let b = end.map_or(units, clamp);
                 if a > b { (b, a) } else { (a, b) }
             };
-            let out = crate::wtf8::slice_utf16_ascii(bytes, a, b, rope.is_ascii());
-            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+            NanBox::handle(realm.new_string_slice(&rope, a, b)?.to_raw())
         }
         FastOp::StrStartsWith | FastOp::StrEndsWith | FastOp::StrIncludes => {
             // A string search argument is not a RegExp, and converts as itself.

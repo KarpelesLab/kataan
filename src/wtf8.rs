@@ -493,6 +493,89 @@ pub fn slice_utf16(bytes: &[u8], start_unit: usize, end_unit: usize) -> Vec<u8> 
 /// Whether UTF-16 `unit` falls on a whole-character boundary of `bytes` (i.e. it
 /// does **not** land on the low half of an astral surrogate pair). The endpoints
 /// `0` and `utf16_len` are boundaries.
+/// Where the UTF-16 unit range `[start, end)` of a WTF-8 string lies in its
+/// bytes (see [`utf16_range`]): the whole characters `bytes[start..end]`,
+/// plus a lone low surrogate before them (`lead`) and a lone high surrogate
+/// after them (`trail`) for a boundary that falls inside an astral
+/// character, between its surrogate halves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitRange {
+    /// The first whole character's byte offset.
+    pub start: usize,
+    /// The byte offset just past the last whole character.
+    pub end: usize,
+    /// The low surrogate unit that begins the range, when it starts inside
+    /// an astral character.
+    pub lead: Option<u16>,
+    /// The high surrogate unit that ends the range, when it ends inside an
+    /// astral character.
+    pub trail: Option<u16>,
+}
+
+/// Locates the UTF-16 unit range `[start_unit, end_unit)` of `bytes`
+/// (`start_unit < end_unit <= total_units`, the string's UTF-16 length) in
+/// one forward pass that starts at `hint`: a `(byte, unit)` position known
+/// to be a character boundary (`(0, 0)` when none is known; ignored when
+/// past `start_unit`). An `end_unit` equal to `total_units` is the end of
+/// the bytes without a scan, so the cost is the distance from the hint to
+/// `start_unit`, plus the range's length unless it runs to the end.
+#[must_use]
+pub fn utf16_range(
+    bytes: &[u8],
+    hint: (usize, usize),
+    start_unit: usize,
+    end_unit: usize,
+    total_units: usize,
+) -> UnitRange {
+    let (mut i, mut u) = if hint.1 <= start_unit && hint.0 <= bytes.len() {
+        hint
+    } else {
+        (0, 0)
+    };
+    let mut lead = None;
+    while u < start_unit && i < bytes.len() {
+        let (cp, n) = decode_code_point(bytes, i);
+        i += n;
+        if cp >= FOUR_BYTE_MIN {
+            if u + 1 == start_unit {
+                lead = Some((LOW_SURROGATE_MIN + ((cp - 0x1_0000) & 0x3FF)) as u16);
+            }
+            u += 2;
+        } else {
+            u += 1;
+        }
+    }
+    let start = i;
+    if end_unit >= total_units {
+        return UnitRange {
+            start,
+            end: bytes.len(),
+            lead,
+            trail: None,
+        };
+    }
+    let mut trail = None;
+    while u < end_unit && i < bytes.len() {
+        let (cp, n) = decode_code_point(bytes, i);
+        if cp >= FOUR_BYTE_MIN {
+            if u + 1 == end_unit {
+                trail = Some((0xD800 + ((cp - 0x1_0000) >> 10)) as u16);
+                break;
+            }
+            u += 2;
+        } else {
+            u += 1;
+        }
+        i += n;
+    }
+    UnitRange {
+        start,
+        end: i,
+        lead,
+        trail,
+    }
+}
+
 fn unit_at_char_boundary(bytes: &[u8], unit: usize) -> bool {
     if unit == 0 {
         return true;

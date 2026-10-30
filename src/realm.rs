@@ -239,6 +239,14 @@ pub struct Realm {
     /// resumes the scan here instead of from the start each time (linear, not
     /// quadratic). One slot, like `regex_subject_units`, for the same reasons.
     unit_cursor: Option<(Rope, usize, usize)>,
+    /// Where the last [`new_string_slice`](Realm::new_string_slice) of a
+    /// non-ASCII flat string started: the string and that (byte, UTF-16 unit)
+    /// boundary, so `s.substring(i)` over increasing `i` resumes the scan
+    /// instead of starting over (linear, not quadratic). Separate from
+    /// `unit_cursor` because a loop typically reads the slice it just made.
+    /// Boxed: the realm is moved by value on every host call, so a rarely
+    /// used field costs a word, not three.
+    slice_cursor: Option<alloc::boxed::Box<(Rope, usize, usize)>>,
     /// How many times [`swap_cell_state`](Realm::swap_cell_state) has moved one
     /// cell's contents into another handle: a cache that identifies objects by
     /// handle and key epoch (`builtins_fast::ChainKeyCache`) is only valid
@@ -741,6 +749,7 @@ impl Realm {
             regex_subject_units: None,
             unit_strings: alloc::vec::Vec::new(),
             unit_cursor: None,
+            slice_cursor: None,
             cell_swaps: 0,
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -1597,6 +1606,26 @@ impl Realm {
             }
         }
         self.new_string_wtf8(crate::wtf8::from_utf16(units))
+    }
+
+    /// The UTF-16 units `[start, end)` of the flat string `rope` (see
+    /// [`Rope::slice_units`]), as a new string value. A non-ASCII string's
+    /// scan resumes from the previous slice's start when that was of the
+    /// same string at or before `start` (see `slice_cursor`), so `s.substring(i)` over increasing `i` stays linear.
+    /// `None` when `rope` is not flat.
+    pub fn new_string_slice(&mut self, rope: &Rope, start: usize, end: usize) -> Option<Handle> {
+        let hint = match self.slice_cursor.as_deref() {
+            Some((r, b, u)) if !rope.is_ascii() && r.ptr_eq(rope) => (*b, *u),
+            _ => (0, 0),
+        };
+        let (out, (b, u)) = rope.slice_units_from(hint, start, end)?;
+        if !rope.is_ascii() {
+            match self.slice_cursor.as_deref_mut() {
+                Some(c) => *c = (rope.clone(), b, u),
+                None => self.slice_cursor = Some(alloc::boxed::Box::new((rope.clone(), b, u))),
+            }
+        }
+        Some(self.heap.alloc(Cell::Str(out)))
     }
 
     /// Allocates a string value sharing `rope` (an `Rc` bump, no copy).

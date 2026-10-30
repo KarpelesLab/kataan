@@ -6737,6 +6737,23 @@ impl Interp {
         NanBox::handle(self.realm.new_string_wtf8(bytes).to_raw())
     }
 
+    /// The UTF-16 units `[a, b)` of the string `rope` (whose bytes, flat or
+    /// materialized, are `bytes`) as a new string value, sharing a flat
+    /// rope's buffer when the result is long (see [`Rope::slice_units`](crate::rope::Rope::slice_units)).
+    fn new_str_slice(
+        &mut self,
+        rope: &crate::rope::Rope,
+        bytes: &[u8],
+        a: usize,
+        b: usize,
+    ) -> NanBox {
+        if let Some(h) = self.realm.new_string_slice(rope, a, b) {
+            return NanBox::handle(h.to_raw());
+        }
+        let out = crate::wtf8::slice_utf16_ascii(bytes, a, b, rope.is_ascii());
+        self.new_str_bytes(out)
+    }
+
     /// `ToString(v)` as WTF-8 bytes, fallibly: an object runs ToPrimitive(string)
     /// (its `@@toPrimitive`/`toString`/`valueOf`, which may throw); a Symbol is a
     /// TypeError. A surrogate-bearing string value is preserved losslessly.

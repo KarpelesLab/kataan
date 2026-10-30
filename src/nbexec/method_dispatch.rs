@@ -2451,7 +2451,7 @@ impl Interp {
                     let a = idx(start);
                     let b = idx(end);
                     let (a, b) = if a < b { (a, b) } else { (a, a) };
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16_ascii(bytes, a, b, ascii)))
+                    Some(self.new_str_slice(&rope, bytes, a, b))
                 }
                 "split" => {
                     // `limit` is ToUint32 (undefined → 2^32-1). A limit of 0 yields
@@ -2528,7 +2528,7 @@ impl Interp {
                     if a > b {
                         core::mem::swap(&mut a, &mut b);
                     }
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16_ascii(bytes, a, b, ascii)))
+                    Some(self.new_str_slice(&rope, bytes, a, b))
                 }
                 "substr" => {
                     let len = units_len;
@@ -2545,12 +2545,7 @@ impl Interp {
                         (self.coerce_to_integer_or_infinity(arg(1))?.max(0.0) as usize)
                             .min(len - start)
                     };
-                    Some(self.new_str_bytes(crate::wtf8::slice_utf16_ascii(
-                        bytes,
-                        start,
-                        start + count,
-                        ascii,
-                    )))
+                    Some(self.new_str_slice(&rope, bytes, start, start + count))
                 }
                 // Annex B.2.3: `trimLeft`/`trimRight` are legacy aliases of
                 // `trimStart`/`trimEnd`.

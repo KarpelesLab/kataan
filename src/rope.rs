@@ -64,6 +64,17 @@ enum Node {
     /// A contiguous run of WTF-8 bytes, with its UTF-16 length memoized on
     /// first use (see [`Rope::utf16_len`]).
     Leaf(Box<[u8]>, core::cell::Cell<usize>),
+    /// A contiguous run of another string's bytes: `base`'s bytes
+    /// `[start, start + len)`, shared rather than copied (see
+    /// [`Rope::slice_units`]). `base` is always a `Leaf`, so a slice of a
+    /// slice points at the original buffer and reads stay one hop. The
+    /// UTF-16 length is memoized like a leaf's.
+    Slice {
+        base: Rope,
+        start: usize,
+        len: usize,
+        u16_len: core::cell::Cell<usize>,
+    },
     /// The concatenation of two ropes, with the total byte length cached and the
     /// UTF-16 length memoized on first use.
     Concat {
@@ -106,10 +117,26 @@ impl Node {
         match self {
             Node::Small { len, buf, .. } => Some(&buf[..usize::from(*len)]),
             Node::Leaf(s, _) => Some(s),
+            Node::Slice {
+                base, start, len, ..
+            } => match &*base.0 {
+                Node::Leaf(s, _) => s.get(*start..*start + *len),
+                _ => None,
+            },
             Node::Concat { .. } => None,
         }
     }
 }
+
+/// The shortest result of [`Rope::slice_units`] that shares its receiver's
+/// buffer: anything that fits a `Small` node is copied into one.
+const SLICE_SHARE_MIN: usize = SMALL_CAP + 1;
+
+/// [`Rope::slice_units`] shares the receiver's buffer only when the result is
+/// at least `1 / SLICE_SHARE_RATIO` of that buffer, which bounds how much a
+/// kept slice can pin: a short piece of a huge string is copied (its cost is
+/// proportional to the piece anyway), so the huge one can still be freed.
+const SLICE_SHARE_RATIO: usize = 16;
 
 /// Sentinel for "the UTF-16 length has not been computed yet". A real length is
 /// bounded by [`MAX_STRING_LEN`], so it can never collide.
@@ -159,7 +186,7 @@ impl Rope {
         match &*self.0 {
             Node::Small { len, .. } => usize::from(*len),
             Node::Leaf(s, _) => s.len(),
-            Node::Concat { len, .. } => *len,
+            Node::Slice { len, .. } | Node::Concat { len, .. } => *len,
         }
     }
 
@@ -207,6 +234,15 @@ impl Rope {
                 cell.set(n);
                 return n;
             }
+            Node::Slice { u16_len, .. } => {
+                let cached = u16_len.get();
+                if cached != U16_LEN_UNKNOWN {
+                    return cached;
+                }
+                let n = wtf8::utf16_len(self.0.flat_bytes().unwrap_or_default());
+                u16_len.set(n);
+                return n;
+            }
             Node::Concat { u16_len, .. } => u16_len,
         };
         let cached = root_cell.get();
@@ -232,6 +268,7 @@ impl Rope {
                     cell.set(n);
                     total += n;
                 }
+                Node::Slice { .. } => total += node.utf16_len(),
                 Node::Concat { left, right, .. } => {
                     stack.push(right);
                     stack.push(left);
@@ -260,7 +297,9 @@ impl Rope {
     fn u16_len_cell(&self) -> Option<&core::cell::Cell<usize>> {
         match &*self.0 {
             Node::Small { .. } => None,
-            Node::Leaf(_, u16_len) | Node::Concat { u16_len, .. } => Some(u16_len),
+            Node::Leaf(_, u16_len) | Node::Slice { u16_len, .. } | Node::Concat { u16_len, .. } => {
+                Some(u16_len)
+            }
         }
     }
 
@@ -362,6 +401,88 @@ impl Rope {
     #[must_use]
     pub fn as_leaf_str(&self) -> Option<&str> {
         self.0.flat_bytes().and_then(wtf8::as_str)
+    }
+
+    /// The UTF-16 code units `[start, end)` of a flat rope (see
+    /// [`Rope::as_leaf_bytes`]) as a new string — `String.prototype.slice`'s
+    /// and `substring`'s result. Indices are clamped to the length, and
+    /// `start >= end` is empty. A boundary inside an astral character splits
+    /// it into lone surrogates, as JavaScript does.
+    ///
+    /// A long result **shares** the receiver's buffer (a `Slice` node) rather
+    /// than copying it, so `s = s.slice(1)` or `s.substring(i)` in a loop is
+    /// linear, not quadratic in the string's length; see [`SLICE_SHARE_MIN`]
+    /// and [`SLICE_SHARE_RATIO`] for when it copies instead. `None` when the
+    /// rope is a `Concat` (flatten it first).
+    #[must_use]
+    pub fn slice_units(&self, start: usize, end: usize) -> Option<Rope> {
+        self.slice_units_from((0, 0), start, end).map(|(r, _)| r)
+    }
+
+    /// [`Rope::slice_units`] scanning a non-ASCII string from `hint`, a
+    /// `(byte, unit)` character boundary of it (see [`wtf8::utf16_range`]),
+    /// rather than from its start; also returns the first whole character's
+    /// `(byte, unit)` position, the next call's hint.
+    #[must_use]
+    pub fn slice_units_from(
+        &self,
+        hint: (usize, usize),
+        start: usize,
+        end: usize,
+    ) -> Option<(Rope, (usize, usize))> {
+        let bytes = self.0.flat_bytes()?;
+        let units = self.utf16_len();
+        let end = end.min(units);
+        let start = start.min(end);
+        if start == end {
+            return Some((Rope::new(), hint));
+        }
+        if self.is_ascii() {
+            return Some((self.share_bytes(start, end, end - start), (start, start)));
+        }
+        let r = wtf8::utf16_range(bytes, hint, start, end, units);
+        let (lead, trail) = (
+            usize::from(r.lead.is_some()),
+            usize::from(r.trail.is_some()),
+        );
+        let mid = self.share_bytes(r.start, r.end, end - start - lead - trail);
+        let at = (r.start, start + lead);
+        if lead + trail == 0 {
+            return Some((mid, at));
+        }
+        // A boundary splits an astral character: its half is a lone
+        // surrogate beside the whole characters (the concatenation keeps the
+        // canonical form; nothing here can pair).
+        let lone = |u: Option<u16>| u.map(|u| Rope::from_wtf8(wtf8::from_utf16(&[u])));
+        let mut out = lone(r.lead).unwrap_or_default().concat(&mid);
+        if let Some(t) = lone(r.trail) {
+            out = out.concat(&t);
+        }
+        Some((out, at))
+    }
+
+    /// The bytes `[b0, b1)` of this flat rope, holding `units` UTF-16 units,
+    /// as a rope: shared or copied (see [`Rope::slice_units`]).
+    fn share_bytes(&self, b0: usize, b1: usize, units: usize) -> Rope {
+        let bytes = self.0.flat_bytes().unwrap_or_default();
+        let len = b1 - b0;
+        if len == bytes.len() {
+            return self.clone();
+        }
+        let (base, base_start) = match &*self.0 {
+            Node::Slice { base, start, .. } => (base, *start),
+            Node::Leaf(..) => (self, 0),
+            _ => return Rope::from_bytes(&bytes[b0..b1]),
+        };
+        if len < SLICE_SHARE_MIN || len.saturating_mul(SLICE_SHARE_RATIO) < base.len() {
+            return Rope::from_bytes(&bytes[b0..b1]);
+        }
+        Rope(Rc::new(Node::Slice {
+            base: base.clone(),
+            start: base_start + b0,
+            len,
+            u16_len: core::cell::Cell::new(units),
+        }))
     }
 
     /// The rightmost leaf's bytes (O(depth)) — used to peek the trailing code unit
@@ -551,6 +672,52 @@ impl core::fmt::Display for Rope {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+
+    #[test]
+    fn slices_share_long_results_and_stay_exact() {
+        let base = Rope::leaf(&"0123456789".repeat(20));
+        let tail = base.slice_units(5, 200).unwrap();
+        assert!(matches!(*tail.0, Node::Slice { .. }));
+        assert_eq!(tail.materialize(), base.materialize()[5..]);
+        assert_eq!(tail.utf16_len(), 195);
+        // A slice of a slice points at the original leaf.
+        let inner = tail.slice_units(10, 150).unwrap();
+        match &*inner.0 {
+            Node::Slice { base: b, start, .. } => {
+                assert!(b.ptr_eq(&base));
+                assert_eq!(*start, 15);
+            }
+            _ => panic!("expected a shared slice"),
+        }
+        assert_eq!(inner.materialize(), base.materialize()[15..155]);
+        // Short results are copied inline; so is a small piece of a big base.
+        assert!(matches!(
+            *base.slice_units(3, 9).unwrap().0,
+            Node::Small { .. }
+        ));
+        let big = Rope::leaf(&"x".repeat(10_000));
+        assert!(matches!(
+            *big.slice_units(0, 100).unwrap().0,
+            Node::Leaf(..)
+        ));
+        // A whole-range slice is the receiver itself; a Concat has no slice.
+        assert!(base.slice_units(0, 999).unwrap().ptr_eq(&base));
+        assert!(base.concat(&base).slice_units(0, 1).is_none());
+        // Non-ASCII and split astral pairs.
+        let s = Rope::from_wtf8(crate::wtf8::from_utf16(
+            &"a\u{e9}\u{1F600}b"
+                .repeat(20)
+                .encode_utf16()
+                .collect::<Vec<_>>(),
+        ));
+        let units: Vec<u16> = "a\u{e9}\u{1F600}b".repeat(20).encode_utf16().collect();
+        for (a, b) in [(0, 100), (2, 100), (3, 50), (1, 3), (4, 99), (7, 7)] {
+            let got = s.slice_units(a, b).unwrap();
+            let want = crate::wtf8::from_utf16(&units[a..b.min(units.len())]);
+            assert_eq!(got.materialize_bytes(), want, "{a}..{b}");
+            assert_eq!(got.utf16_len(), b.min(units.len()) - a);
+        }
+    }
 
     #[test]
     fn leaf_basics() {

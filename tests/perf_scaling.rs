@@ -221,3 +221,30 @@ fn distinct_first_keys_are_linear() {
         )
     });
 }
+
+/// Taking the tail of a string is O(1) in its length: `substring`, `slice`
+/// and `substr` copied the result, so `s.substring(i)` over every `i` (and
+/// `s = s.slice(1)` as a consuming parser does) was quadratic. A long result
+/// now shares the receiver's buffer; a non-ASCII receiver also resumes its
+/// unit-to-byte scan from the previous slice's start.
+#[test]
+fn string_tail_slicing_is_linear() {
+    assert_scaling("substring tails", 20_000, 8.0, |n| {
+        timed(
+            &format!("const s='abc'.repeat({n});"),
+            "let c=0; for(let i=0;i<s.length;i++) c+=s.substring(i).length;",
+        )
+    });
+    assert_scaling("slice(1) consumer", 20_000, 8.0, |n| {
+        timed(
+            &format!("let s='abc'.repeat({n});"),
+            "let c=0; while(s.length){ c+=s.charCodeAt(0); s=s.slice(1); }",
+        )
+    });
+    assert_scaling("non-ASCII substr tails", 10_000, 8.0, |n| {
+        timed(
+            &format!("const s='ab\\u00e9\\u{{1F600}}'.repeat({n});"),
+            "let c=0; for(let i=0;i<s.length;i+=2) c+=s.substr(i).length;",
+        )
+    });
+}
