@@ -205,6 +205,10 @@ pub struct Realm {
     /// costs a prototype walk that was already spec-required in the rare programs
     /// that pollute those prototypes.
     proto_index_accessor_dirty: bool,
+    /// The last chain [`array_chain_index_free`](Realm::array_chain_index_free)
+    /// found free of index keys: `%Array.prototype%`'s auxiliary (named
+    /// property) object and its prototype, with their key epochs then.
+    chain_index_free_memo: Option<(u64, u32, u64, u32)>,
     /// One-slot memo of the most recent regex subject widened to UTF-16, kept
     /// because the matcher takes `&[u16]` and every `test`/`exec`/`split`/…
     /// otherwise re-transcodes the whole subject — making a match cost O(subject)
@@ -746,6 +750,7 @@ impl Realm {
             non_extensible_arrays: alloc::collections::BTreeSet::new(),
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
             proto_index_accessor_dirty: false,
+            chain_index_free_memo: None,
             regex_subject_units: None,
             unit_strings: alloc::vec::Vec::new(),
             unit_cursor: None,
@@ -4595,7 +4600,7 @@ impl Realm {
         if a.len() >= max {
             return None;
         }
-        a.vec_mut().push(value);
+        a.push_back(value);
         Some(a.len())
     }
 
@@ -4616,6 +4621,7 @@ impl Realm {
         if a.len().saturating_add(values.len()) > max {
             return None;
         }
+        // (A plain array is never a queue: queue mode marks side state.)
         a.vec_mut().extend_from_slice(values);
         Some(a.len())
     }
@@ -4635,6 +4641,84 @@ impl Realm {
             Some(v) if v.is_hole() => None,
             Some(_) => a.vec_mut().pop(),
         }
+    }
+
+    /// `arr.shift()` without element moves, when that is exactly the spec's
+    /// algorithm: the array's indices are plain writable data properties
+    /// (no index attribute or accessor override), it is extensible with a
+    /// writable `length` equal to its element count, and nothing on its
+    /// prototype chain has an integer-indexed property — so a hole reads
+    /// `undefined` and shifting it down just moves the hole, and no step
+    /// runs user code. The removed value; `None`, with nothing done,
+    /// otherwise (the general algorithm then runs). O(1) amortized for a
+    /// long array (see [`crate::cell::ArrayElems::shift_front`]).
+    pub fn array_shift_fast(&mut self, handle: Handle) -> Option<NanBox> {
+        let dense = self.heap.get(handle)?.as_array()?.len();
+        if self.proto_index_accessor_dirty
+            || self.array_has_index_overrides(handle)
+            || self.array_is_non_extensible(handle)
+            || self.array_length_is_readonly(handle)
+            || self.array_length(handle) != Some(dense)
+            || !self.array_chain_index_free(handle)
+        {
+            return None;
+        }
+        let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
+        let v = a.shift_front().unwrap_or(NanBox::undefined());
+        Some(if v.is_hole() { NanBox::undefined() } else { v })
+    }
+
+    /// Whether no object on the array at `handle`'s prototype chain has an
+    /// integer-indexed own property: its prototype is the default
+    /// `%Array.prototype%`, whose own prototype is an ordinary object with
+    /// none above it, and neither has an index key (data or accessor).
+    /// Memoized on the two objects' key epochs, so a hit is two compares.
+    fn array_chain_index_free(&mut self, handle: Handle) -> bool {
+        let Some(Cell::Array(a)) = self.heap.get(handle) else {
+            return false;
+        };
+        if a.has_proto_set() || self.native_protos.contains_key(&handle.to_raw()) {
+            return false;
+        }
+        // `%Array.prototype%` is an Array exotic object: index properties are
+        // its elements, or (with attributes or accessors) keys of its
+        // auxiliary object, which also holds its named properties.
+        let Some(ap) = self.root_array_proto else {
+            return false;
+        };
+        let Some(Cell::Array(ap_elems)) = self.heap.get(ap) else {
+            return false;
+        };
+        if !ap_elems.is_empty() || self.sparse_array_lengths.contains_key(&ap.to_raw()) {
+            return false;
+        }
+        let Some(&aux) = self.aux_props.get(&ap.to_raw()) else {
+            return false;
+        };
+        let Some(apo) = self.heap.get(aux).and_then(Cell::as_object) else {
+            return false;
+        };
+        let Some(op) = self.object_proto(ap) else {
+            return false;
+        };
+        let Some(opo) = self.heap.get(op).and_then(Cell::as_object) else {
+            return false;
+        };
+        if opo.proto().is_some()
+            || self.host_exotic.contains(&ap.to_raw())
+            || self.host_exotic.contains(&op.to_raw())
+        {
+            return false;
+        }
+        let stamp = (aux.to_raw(), apo.key_epoch(), op.to_raw(), opo.key_epoch());
+        if self.chain_index_free_memo == Some(stamp) {
+            return true;
+        }
+        if apo.has_index_key() || opo.has_index_key() {
+            return false;
+        }
+        self.chain_index_free_memo = Some(stamp);
+        true
     }
 
     /// Replaces the whole contents of the array at `handle` (for in-place
@@ -4894,7 +4978,7 @@ impl Realm {
             .heap
             .get_mut(handle)
             .and_then(Cell::as_array_mut)
-            .and_then(|a| a.vec_mut().pop())
+            .and_then(crate::cell::ArrayElems::pop_back)
             .unwrap_or(NanBox::undefined());
         // A popped hole reads as `undefined` (the sentinel never escapes).
         if v.is_hole() { NanBox::undefined() } else { v }

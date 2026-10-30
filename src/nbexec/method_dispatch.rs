@@ -3848,6 +3848,9 @@ impl Interp {
                     if elems.is_empty() {
                         return Ok(Some(NanBox::undefined()));
                     }
+                    if let Some(v) = self.realm.array_shift_fast(handle) {
+                        return Ok(Some(v));
+                    }
                     // The removed first element: a hole is read as `undefined`
                     // (the sentinel never escapes). The remaining elements keep
                     // their holes (shifting preserves absent indices).

@@ -445,6 +445,18 @@ pub const ARRAY_ON_HEAP: u8 = u8::MAX;
 /// [`vec_mut`](ArrayElems::vec_mut), which first moves inline elements to
 /// the `Vec` for good. Compiled code tests `inline_len` to find the elements
 /// (all offsets probed, see `jit_cell_layout`).
+///
+/// **Queue mode.** A `shift` of a long array does not move its elements:
+/// the array switches to queue mode, where the elements are
+/// `elems[head..]` and the slots before `head` are dead (`undefined`), so
+/// a run of `shift`s costs O(1) each, amortized (see
+/// [`shift_front`](ArrayElems::shift_front)). Queue mode is
+/// `inline_len == 0` with a `Vec` that owns a buffer, which no other state
+/// has (an empty inline array's `Vec` is unallocated). Compiled code that
+/// reads such an array by the inline rule sees it empty; the mode also
+/// sets the side-state flag, which sends compiled code's element paths to
+/// the helpers. [`vec_mut`](ArrayElems::vec_mut) leaves queue mode (moving
+/// the elements down once).
 #[repr(C)] // compiled code reads every field at probed offsets
 #[derive(Clone)]
 pub struct ArrayElems {
@@ -452,6 +464,9 @@ pub struct ArrayElems {
     side: bool,
     proto_set: bool,
     inline_len: u8,
+    /// Queue mode's dead prefix length (meaningless otherwise; compiled
+    /// code's inline allocation leaves it unset).
+    head: u32,
     /// The inline elements; past `inline_len` (and entirely, on the heap)
     /// always `undefined`, so no stale handle lingers there.
     inline: [NanBox; ARRAY_INLINE_CAP],
@@ -587,6 +602,7 @@ impl ArrayElems {
                 side: false,
                 proto_set: false,
                 inline_len: elems.len() as u8,
+                head: 0,
                 inline,
             }
         } else {
@@ -601,6 +617,7 @@ impl ArrayElems {
             side: false,
             proto_set: false,
             inline_len: ARRAY_ON_HEAP,
+            head: 0,
             inline: INLINE_FILL,
         }
     }
@@ -631,44 +648,143 @@ impl ArrayElems {
     #[must_use]
     #[inline]
     pub fn is_inline(&self) -> bool {
-        self.inline_len != ARRAY_ON_HEAP
+        self.inline_len != ARRAY_ON_HEAP && !self.is_queue()
+    }
+
+    /// Whether the array is in queue mode (see [`ArrayElems`]).
+    #[must_use]
+    #[inline]
+    fn is_queue(&self) -> bool {
+        self.inline_len == 0 && self.elems.capacity() != 0
     }
 
     /// The elements.
     #[must_use]
     #[inline]
     pub fn as_slice(&self) -> &[NanBox] {
-        if self.is_inline() {
+        if self.inline_len == ARRAY_ON_HEAP {
+            &self.elems
+        } else if self.inline_len != 0 || self.elems.capacity() == 0 {
             &self.inline[..usize::from(self.inline_len)]
         } else {
-            &self.elems
+            self.queue_slice()
         }
+    }
+
+    /// A queue's live elements (see [`ArrayElems`]).
+    #[cold]
+    #[inline(never)]
+    fn queue_slice(&self) -> &[NanBox] {
+        &self.elems[self.head as usize..]
     }
 
     /// The elements, mutably (in place: the count cannot change).
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [NanBox] {
-        if self.is_inline() {
+        if self.inline_len == ARRAY_ON_HEAP {
+            &mut self.elems
+        } else if self.inline_len != 0 || self.elems.capacity() == 0 {
             &mut self.inline[..usize::from(self.inline_len)]
         } else {
-            &mut self.elems
+            self.queue_slice_mut()
         }
     }
 
+    /// A queue's live elements, mutably.
+    #[cold]
+    #[inline(never)]
+    fn queue_slice_mut(&mut self) -> &mut [NanBox] {
+        &mut self.elems[self.head as usize..]
+    }
+
     /// The element `Vec`, for an operation that may change the element
-    /// count. Inline elements move to the `Vec` first, and stay there.
+    /// count. Inline elements move to the `Vec` first, and stay there; a
+    /// queue's move down to its start.
     #[inline]
     pub fn vec_mut(&mut self) -> &mut Vec<NanBox> {
-        if self.is_inline() {
+        if self.inline_len != ARRAY_ON_HEAP {
             self.spill();
         }
         &mut self.elems
     }
 
-    /// Moves the inline elements to the `Vec` (with room to grow).
+    /// The shortest array whose `shift` enters queue mode rather than moving
+    /// its elements (a short move is as cheap as the bookkeeping).
+    const QUEUE_MIN: usize = 16;
+
+    /// Removes and returns the first element (`None` when empty) — the
+    /// element move of `Array.prototype.shift` on an array whose indices are
+    /// all plain data properties. A long array enters queue mode (see
+    /// [`ArrayElems`]) instead of moving every element down, so repeated
+    /// shifts are O(1) amortized: the dead prefix is reclaimed once it is as
+    /// long as the live part. Marks the side-state flag (compiled code's
+    /// element paths must not read a queue).
+    pub fn shift_front(&mut self) -> Option<NanBox> {
+        if self.is_empty() {
+            return None;
+        }
+        if !self.is_queue() {
+            if self.inline_len != ARRAY_ON_HEAP
+                || self.elems.len() < Self::QUEUE_MIN
+                || u32::try_from(self.elems.len()).is_err()
+            {
+                return Some(self.vec_mut().remove(0));
+            }
+            self.inline_len = 0;
+            self.head = 0;
+            self.side = true;
+        }
+        let h = self.head as usize;
+        let v = core::mem::replace(&mut self.elems[h], NanBox::undefined());
+        self.head += 1;
+        if 2 * self.head as usize >= self.elems.len() {
+            self.elems.drain(..self.head as usize);
+            self.head = 0;
+        }
+        Some(v)
+    }
+
+    /// Appends `v`, keeping a queue in queue mode.
+    pub fn push_back(&mut self, v: NanBox) {
+        if self.is_queue() {
+            self.elems.push(v);
+        } else {
+            self.vec_mut().push(v);
+        }
+    }
+
+    /// Appends `vs`, keeping a queue in queue mode.
+    pub fn extend_back(&mut self, vs: &[NanBox]) {
+        if self.is_queue() {
+            self.elems.extend_from_slice(vs);
+        } else {
+            self.vec_mut().extend_from_slice(vs);
+        }
+    }
+
+    /// Removes and returns the last element, keeping a queue in queue mode.
+    pub fn pop_back(&mut self) -> Option<NanBox> {
+        if self.is_queue() {
+            if self.is_empty() {
+                return None;
+            }
+            self.elems.pop()
+        } else {
+            self.vec_mut().pop()
+        }
+    }
+
+    /// Moves the inline elements to the `Vec` (with room to grow), or a
+    /// queue's elements down to its start.
     #[cold]
     #[inline(never)]
     fn spill(&mut self) {
+        if self.is_queue() {
+            self.elems.drain(..self.head as usize);
+            self.head = 0;
+            self.inline_len = ARRAY_ON_HEAP;
+            return;
+        }
         let n = usize::from(self.inline_len);
         let mut v = Vec::with_capacity(2 * ARRAY_INLINE_CAP + 2);
         v.extend_from_slice(&self.inline[..n]);
@@ -679,11 +795,11 @@ impl ArrayElems {
 
     /// The elements, by value.
     #[must_use]
-    pub fn into_vec(self) -> Vec<NanBox> {
+    pub fn into_vec(mut self) -> Vec<NanBox> {
         if self.is_inline() {
             self.as_slice().to_vec()
         } else {
-            self.elems
+            core::mem::take(self.vec_mut())
         }
     }
 }
@@ -947,6 +1063,7 @@ impl Cell {
 
     /// The array elements, if this cell is one.
     #[must_use]
+    #[inline]
     pub fn as_array(&self) -> Option<&[NanBox]> {
         match self {
             Cell::Array(a) => Some(a),
@@ -1406,6 +1523,47 @@ mod tests {
     use crate::heap::Heap;
     use crate::shape::Shape;
     use alloc::rc::Rc;
+
+    #[test]
+    fn queue_mode_shifts_without_moving() {
+        let n = |x: usize| NanBox::number(x as f64);
+        let mut a = ArrayElems::from((0..40).map(n).collect::<Vec<_>>());
+        assert!(!a.is_queue());
+        let mut want: alloc::collections::VecDeque<NanBox> = (0..40).map(n).collect();
+        for i in 0..200 {
+            assert_eq!(
+                a.shift_front().map(NanBox::to_bits),
+                want.pop_front().map(NanBox::to_bits)
+            );
+            if i % 3 == 0 {
+                a.push_back(n(100 + i));
+                want.push_back(n(100 + i));
+            }
+            if i == 5 {
+                assert!(a.is_queue() && a.has_side_state() && !a.is_inline());
+            }
+            assert_eq!(a.len(), want.len());
+            let got: Vec<u64> = a.iter().map(|v| v.to_bits()).collect();
+            let exp: Vec<u64> = want.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got, exp);
+        }
+        assert!(a.shift_front().is_none());
+        // Leaving queue mode keeps the elements.
+        let mut b = ArrayElems::from((0..20).map(n).collect::<Vec<_>>());
+        b.shift_front();
+        b.shift_front();
+        assert!(b.is_queue());
+        b.as_mut_slice()[0] = n(99);
+        assert_eq!(b.pop_back().map(NanBox::to_bits), Some(n(19).to_bits()));
+        b.vec_mut().insert(1, n(7));
+        assert!(!b.is_queue());
+        let got: Vec<u64> = b.iter().map(|v| v.to_bits()).collect();
+        let mut exp: Vec<u64> = (2..19).map(|i| n(i).to_bits()).collect();
+        exp[0] = n(99).to_bits();
+        exp.insert(1, n(7).to_bits());
+        assert_eq!(got, exp);
+        assert_eq!(b.clone().into_vec().len(), 18);
+    }
 
     #[test]
     fn accessors_select_the_right_kind() {

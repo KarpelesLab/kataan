@@ -365,6 +365,75 @@ struct ObjectExtra {
     /// `None` is a null word (compiled code's inline adds test it).
     #[allow(clippy::box_collection)] // for the null word
     key_order: Option<Box<Vec<Box<str>>>>,
+    /// A by-name index over the lists above (see [`AttrIndex`]), built once
+    /// one holds more than [`ATTR_INDEX_MIN`] entries and kept in step
+    /// with them from then on; `None` while they are short enough to search.
+    index: Option<Box<AttrIndex>>,
+}
+
+/// Which attribute-mark list of an [`ObjectExtra`] (an index into
+/// [`AttrEntry::marks`]).
+#[derive(Clone, Copy)]
+enum Mark {
+    Readonly = 0,
+    Hidden = 1,
+    NonConfigurable = 2,
+}
+
+/// The length of one of an object's attribute-mark or accessor lists past
+/// which the object gets an [`AttrIndex`]: below it a linear search is about
+/// as fast, and costs no memory (built-in prototypes, with a few dozen
+/// hidden methods each, stay unindexed).
+const ATTR_INDEX_MIN: usize = 128;
+
+/// The key-order log length past which the object gets an [`AttrIndex`]
+/// (the log is only scanned when a key is added).
+const ORDER_INDEX_MIN: usize = 256;
+
+/// A single attribute list this short is scanned even when indexed: a few
+/// string compares beat a tree walk (a built-in prototype with many hidden
+/// methods but one accessor is indexed, and its accessor probed per miss).
+const ATTR_SCAN_MAX: usize = 8;
+
+/// Where each key stands in an [`ObjectExtra`]'s attribute lists, so that
+/// "is `k` non-writable / non-enumerable / non-configurable", "`k`'s
+/// accessor" and "is `k` in the key-order log" are a map lookup rather than
+/// a scan: an object with thousands of `defineProperty`'d or accessor
+/// properties (a bundled module's export object) made every one of those
+/// O(n), and defining, reading or enumerating them O(n^2).
+///
+/// The lists stay the source of truth (compiled code reads their lengths,
+/// and the accessor list by position); this mirrors them.
+#[derive(Default)]
+struct AttrIndex {
+    map: BTreeMap<Box<str>, AttrEntry>,
+}
+
+/// A key's positions in its object's attribute lists (see [`AttrIndex`]).
+#[derive(Clone, Copy, Default)]
+struct AttrEntry {
+    /// One more than the key's position in the readonly / hidden /
+    /// non-configurable list ([`Mark`] order); `0` when not marked.
+    marks: [u32; 3],
+    /// One more than the key's position in the accessor list; `0` for none.
+    acc: u32,
+    /// Whether the key-order log records the key.
+    ordered: bool,
+}
+
+impl AttrIndex {
+    /// The entry for `key`, created empty if absent.
+    fn entry(&mut self, key: &str) -> &mut AttrEntry {
+        if !self.map.contains_key(key) {
+            self.map.insert(Box::from(key), AttrEntry::default());
+        }
+        self.map.get_mut(key).expect("just inserted")
+    }
+
+    /// The entry for `key`, if any.
+    fn get(&self, key: &str) -> Option<&AttrEntry> {
+        self.map.get(key)
+    }
 }
 
 impl ObjectExtra {
@@ -382,6 +451,198 @@ impl ObjectExtra {
             && self.non_configurable.is_empty()
             && self.class_tag.is_none()
             && self.key_order.is_none()
+            && self.index.is_none()
+    }
+
+    /// The mark list `m`.
+    fn marks(&self, m: Mark) -> &Vec<Box<str>> {
+        match m {
+            Mark::Readonly => &self.readonly,
+            Mark::Hidden => &self.hidden,
+            Mark::NonConfigurable => &self.non_configurable,
+        }
+    }
+
+    /// The mark list `m`, mutably.
+    fn marks_mut(&mut self, m: Mark) -> &mut Vec<Box<str>> {
+        match m {
+            Mark::Readonly => &mut self.readonly,
+            Mark::Hidden => &mut self.hidden,
+            Mark::NonConfigurable => &mut self.non_configurable,
+        }
+    }
+
+    /// Whether `key` carries mark `m`.
+    #[inline]
+    fn has_mark(&self, m: Mark, key: &str) -> bool {
+        let list = self.marks(m);
+        match &self.index {
+            Some(ix) if list.len() > ATTR_SCAN_MAX => {
+                ix.get(key).is_some_and(|e| e.marks[m as usize] != 0)
+            }
+            _ => list.iter().any(|k| k.as_ref() == key),
+        }
+    }
+
+    /// Gives `key` (unmarked) mark `m`.
+    #[inline]
+    fn add_mark(&mut self, m: Mark, key: &str) {
+        let list = self.marks_mut(m);
+        list.push(Box::from(key));
+        let n = list.len() as u32;
+        match self.index.as_deref_mut() {
+            Some(ix) => ix.entry(key).marks[m as usize] = n,
+            None if n as usize > ATTR_INDEX_MIN => self.build_index(),
+            None => {}
+        }
+    }
+
+    /// Removes mark `m` from `key`, if it has it.
+    fn remove_mark(&mut self, m: Mark, key: &str) {
+        let Some(ix) = self.index.as_deref_mut() else {
+            self.marks_mut(m).retain(|k| k.as_ref() != key);
+            return;
+        };
+        let Some(e) = ix.map.get_mut(key) else {
+            return;
+        };
+        let pos = core::mem::take(&mut e.marks[m as usize]);
+        if pos == 0 {
+            return;
+        }
+        // Unordered: the last entry fills the gap.
+        let list = match m {
+            Mark::Readonly => &mut self.readonly,
+            Mark::Hidden => &mut self.hidden,
+            Mark::NonConfigurable => &mut self.non_configurable,
+        };
+        let i = pos as usize - 1;
+        list.swap_remove(i);
+        if let Some(moved) = list.get(i)
+            && let Some(e) = ix.map.get_mut(moved.as_ref())
+        {
+            e.marks[m as usize] = pos;
+        }
+    }
+
+    /// The position of `key`'s accessor in the accessor list.
+    #[inline]
+    fn acc_pos(&self, key: &str) -> Option<usize> {
+        match &self.index {
+            _ if self.accessors.len() <= ATTR_SCAN_MAX => self
+                .accessors
+                .iter()
+                .position(|(k, _, _)| k.as_ref() == key),
+            Some(ix) => ix
+                .get(key)
+                .and_then(|e| (e.acc != 0).then(|| e.acc as usize - 1)),
+            None => self
+                .accessors
+                .iter()
+                .position(|(k, _, _)| k.as_ref() == key),
+        }
+    }
+
+    /// Appends an accessor for `key` (which has none).
+    fn add_acc(&mut self, key: &str, getter: NanBox, setter: NanBox) {
+        self.accessors.push((Box::from(key), getter, setter));
+        let n = self.accessors.len() as u32;
+        match self.index.as_deref_mut() {
+            Some(ix) => ix.entry(key).acc = n,
+            None if n as usize > ATTR_INDEX_MIN => self.build_index(),
+            None => {}
+        }
+    }
+
+    /// Removes `key`'s accessor, keeping the others in order; whether it had
+    /// one.
+    fn remove_acc(&mut self, key: &str) -> bool {
+        let Some(i) = self.acc_pos(key) else {
+            return false;
+        };
+        self.accessors.remove(i);
+        if let Some(ix) = self.index.as_deref_mut() {
+            // Every later accessor moves down one place (O(n), like the
+            // removal itself).
+            for e in ix.map.values_mut() {
+                if e.acc as usize > i + 1 {
+                    e.acc -= 1;
+                } else if e.acc as usize == i + 1 {
+                    e.acc = 0;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the key-order log records `key` (`false` without a log).
+    fn order_has(&self, key: &str) -> bool {
+        match (&self.index, &self.key_order) {
+            (_, None) => false,
+            (Some(ix), Some(_)) => ix.get(key).is_some_and(|e| e.ordered),
+            (None, Some(order)) => order.iter().any(|k| k.as_ref() == key),
+        }
+    }
+
+    /// Appends `key` (unrecorded) to the key-order log, which must exist.
+    fn order_push(&mut self, key: &str) {
+        let Some(order) = self.key_order.as_mut() else {
+            return;
+        };
+        order.push(Box::from(key));
+        let n = order.len();
+        match self.index.as_deref_mut() {
+            Some(ix) => ix.entry(key).ordered = true,
+            None if n > ORDER_INDEX_MIN => self.build_index(),
+            None => {}
+        }
+    }
+
+    /// Drops `key` from the key-order log, if there is one.
+    fn order_remove(&mut self, key: &str) {
+        let Some(order) = self.key_order.as_mut() else {
+            return;
+        };
+        if let Some(ix) = self.index.as_deref_mut() {
+            match ix.map.get_mut(key) {
+                Some(e) if e.ordered => e.ordered = false,
+                _ => return,
+            }
+        }
+        order.retain(|k| k.as_ref() != key);
+    }
+
+    /// Starts the key-order log as `order` (there is none yet).
+    fn set_order(&mut self, order: Vec<Box<str>>) {
+        if let Some(ix) = self.index.as_deref_mut() {
+            for k in &order {
+                ix.entry(k).ordered = true;
+            }
+        }
+        let n = order.len();
+        self.key_order = Some(Box::new(order));
+        if self.index.is_none() && n > ORDER_INDEX_MIN {
+            self.build_index();
+        }
+    }
+
+    /// Builds the [`AttrIndex`] from the lists.
+    #[cold]
+    #[inline(never)]
+    fn build_index(&mut self) {
+        let mut ix = AttrIndex::default();
+        for m in [Mark::Readonly, Mark::Hidden, Mark::NonConfigurable] {
+            for (i, k) in self.marks(m).iter().enumerate() {
+                ix.entry(k).marks[m as usize] = i as u32 + 1;
+            }
+        }
+        for (i, (k, _, _)) in self.accessors.iter().enumerate() {
+            ix.entry(k).acc = i as u32 + 1;
+        }
+        for k in self.key_order.iter().flat_map(|o| o.iter()) {
+            ix.entry(k).ordered = true;
+        }
+        self.index = Some(Box::new(ix));
     }
 }
 
@@ -395,6 +656,7 @@ static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
     non_configurable: Vec::new(),
     class_tag: None,
     key_order: None,
+    index: None,
 };
 
 /// An empty dictionary, for reads of a dictionary-mode object's map.
@@ -417,6 +679,7 @@ impl ObjectExtra {
     fn recyclable(&self) -> bool {
         self.dict.is_none()
             && self.key_order.is_none()
+            && self.index.is_none()
             && self.spill.far.capacity() == 0
             && self.readonly.capacity() == 0
             && self.accessors.capacity() == 0
@@ -771,10 +1034,11 @@ impl Object {
     /// or accessor — is materialized.
     fn track_key(&mut self, key: &str) {
         self.bump_key_epoch();
-        if let Some(order) = self.extra.as_deref_mut().and_then(|x| x.key_order.as_mut())
-            && !order.iter().any(|k| k.as_ref() == key)
+        if let Some(x) = self.extra.as_deref_mut()
+            && x.key_order.is_some()
+            && !x.order_has(key)
         {
-            order.push(Box::from(key));
+            x.order_push(key);
         }
     }
 
@@ -789,7 +1053,7 @@ impl Object {
     pub fn ensure_key_order(&mut self) {
         if self.ex().key_order.is_none() {
             let order = self.keys().into_iter().map(Box::from).collect();
-            self.extra_mut().key_order = Some(Box::new(order));
+            self.extra_mut().set_order(order);
         }
     }
 
@@ -798,31 +1062,26 @@ impl Object {
     /// any present key the log missed (data keys before accessor keys). Only called
     /// when `key_order` is `Some`.
     fn merged_key_order(&self) -> Vec<&str> {
-        let data = self.keys();
-        let acc: Vec<&str> = self
-            .ex()
-            .accessors
-            .iter()
-            .map(|(k, _, _)| k.as_ref())
-            .collect();
-        let present = |k: &str| data.contains(&k) || acc.contains(&k);
-        let order = self
-            .ex()
+        let x = self.ex();
+        let order = x
             .key_order
             .as_deref()
             .expect("merged_key_order needs a log");
-        let mut result: Vec<&str> = Vec::with_capacity(data.len() + acc.len());
-        for k in order {
-            let k = k.as_ref();
-            if present(k) && !result.contains(&k) {
-                result.push(k);
-            }
-        }
+        let present = |k: &str| self.contains(k) || x.acc_pos(k).is_some();
+        let data = self.keys();
+        let mut result: Vec<&str> = Vec::with_capacity(data.len() + x.accessors.len());
+        // The log holds each key once (`track_key` checks).
+        result.extend(order.iter().map(AsRef::as_ref).filter(|k| present(k)));
         // Self-heal: any live key the log never recorded (a data key added through a
         // path that predates tracking) still enumerates — appended in the legacy
         // data-then-accessor order.
-        for k in data.iter().chain(acc.iter()) {
-            if !result.contains(k) {
+        let accessors = x.accessors.iter().map(|(k, _, _)| k.as_ref());
+        for k in data
+            .iter()
+            .copied()
+            .chain(accessors.filter(|k| !self.contains(k)))
+        {
+            if !x.order_has(k) && !result.contains(&k) {
                 result.push(k);
             }
         }
@@ -896,10 +1155,7 @@ impl Object {
     /// the list bumps it).
     #[must_use]
     pub fn accessor_index(&self, name: &str) -> Option<usize> {
-        self.ex()
-            .accessors
-            .iter()
-            .position(|(k, _, _)| k.as_ref() == name)
+        self.ex().acc_pos(name)
     }
 
     /// Sets generic-JIT flag bits (they are never cleared).
@@ -928,12 +1184,10 @@ impl Object {
         // Start tracking unified key order the moment an accessor is involved: seed
         // the log with the current data keys (their chronological order) so this and
         // every later new key slot into the correct interleaved position.
-        if self.ex().key_order.is_none() {
-            let order = self.keys().into_iter().map(Box::from).collect();
-            self.extra_mut().key_order = Some(Box::new(order));
-        }
-        let accessors = &mut self.extra_mut().accessors;
-        if let Some(a) = accessors.iter_mut().find(|(k, _, _)| k.as_ref() == name) {
+        self.ensure_key_order();
+        let x = self.extra_mut();
+        if let Some(i) = x.acc_pos(name) {
+            let a = &mut x.accessors[i];
             if !matches!(getter.unpack(), crate::nanbox::Unpacked::Undefined) {
                 a.1 = getter;
             }
@@ -941,7 +1195,7 @@ impl Object {
                 a.2 = setter;
             }
         } else {
-            accessors.push((alloc::boxed::Box::from(name), getter, setter));
+            x.add_acc(name, getter, setter);
         }
         self.track_key(name);
     }
@@ -959,11 +1213,14 @@ impl Object {
     /// The `(getter, setter)` of accessor `name`, if defined.
     #[must_use]
     pub fn accessor(&self, name: &str) -> Option<(NanBox, NanBox)> {
-        self.ex()
-            .accessors
-            .iter()
-            .find(|(k, _, _)| k.as_ref() == name)
-            .map(|(_, g, s)| (*g, *s))
+        let x = self.ex();
+        if x.accessors.is_empty() {
+            return None;
+        }
+        x.acc_pos(name).map(|i| {
+            let (_, g, s) = &x.accessors[i];
+            (*g, *s)
+        })
     }
 
     /// The object's shape when it is in shaped (non-dictionary) mode.
@@ -1429,24 +1686,48 @@ impl Object {
         ints.into_iter().chain(rest).collect()
     }
 
+    /// Whether some own key (data or accessor) is an array index.
+    #[must_use]
+    pub fn has_index_key(&self) -> bool {
+        let x = self.ex();
+        let digit = |k: &str| k.as_bytes().first().is_some_and(u8::is_ascii_digit);
+        let data = if self.is_dict() {
+            self.dict()
+                .map
+                .keys()
+                .any(|k| digit(k) && array_index(k).is_some())
+        } else {
+            self.shape
+                .keys()
+                .iter()
+                .any(|k| digit(k) && array_index(k).is_some())
+        };
+        data || x
+            .accessors
+            .iter()
+            .any(|(k, _, _)| digit(k) && array_index(k).is_some())
+    }
+
     /// Marks own property `key` non-enumerable (idempotent).
     pub fn set_hidden(&mut self, key: &str) {
         if !self.is_hidden(key) {
-            self.extra_mut().hidden.push(alloc::boxed::Box::from(key));
+            self.extra_mut().add_mark(Mark::Hidden, key);
         }
     }
 
     /// Whether own property `key` is non-enumerable.
     #[must_use]
+    #[inline]
     pub fn is_hidden(&self, key: &str) -> bool {
-        self.ex().hidden.iter().any(|k| k.as_ref() == key)
+        let x = self.ex();
+        !x.hidden.is_empty() && x.has_mark(Mark::Hidden, key)
     }
 
     /// Clears the non-enumerable mark for `key` (a `defineProperty` redefining a
     /// configurable property to `enumerable: true`).
     pub fn clear_hidden(&mut self, key: &str) {
         if let Some(x) = self.extra.as_deref_mut() {
-            x.hidden.retain(|k| k.as_ref() != key);
+            x.remove_mark(Mark::Hidden, key);
         }
     }
 
@@ -1457,44 +1738,46 @@ impl Object {
                 self.layout_changed();
             }
             self.flags |= JIT_FLAG_READONLY;
-            self.extra_mut().readonly.push(alloc::boxed::Box::from(key));
+            self.extra_mut().add_mark(Mark::Readonly, key);
         }
     }
 
     /// Whether own property `key` is non-writable.
     #[must_use]
+    #[inline]
     pub fn is_readonly(&self, key: &str) -> bool {
-        self.ex().readonly.iter().any(|k| k.as_ref() == key)
+        let x = self.ex();
+        !x.readonly.is_empty() && x.has_mark(Mark::Readonly, key)
     }
 
     /// Clears the non-writable mark for `key` (a `defineProperty` redefines
     /// attributes from scratch, so the prior `writable: false` is dropped first).
     pub fn clear_readonly(&mut self, key: &str) {
         if let Some(x) = self.extra.as_deref_mut() {
-            x.readonly.retain(|k| k.as_ref() != key);
+            x.remove_mark(Mark::Readonly, key);
         }
     }
 
     /// Marks own property `key` non-configurable (idempotent).
     pub fn set_non_configurable(&mut self, key: &str) {
         if !self.is_non_configurable(key) {
-            self.extra_mut()
-                .non_configurable
-                .push(alloc::boxed::Box::from(key));
+            self.extra_mut().add_mark(Mark::NonConfigurable, key);
         }
     }
 
     /// Whether own property `key` is non-configurable (cannot be deleted).
     #[must_use]
+    #[inline]
     pub fn is_non_configurable(&self, key: &str) -> bool {
-        self.ex().non_configurable.iter().any(|k| k.as_ref() == key)
+        let x = self.ex();
+        !x.non_configurable.is_empty() && x.has_mark(Mark::NonConfigurable, key)
     }
 
     /// Clears the non-configurable mark for `key` (a `defineProperty` redefining a
     /// configurable property whose new descriptor keeps it configurable).
     pub fn clear_non_configurable(&mut self, key: &str) {
         if let Some(x) = self.extra.as_deref_mut() {
-            x.non_configurable.retain(|k| k.as_ref() != key);
+            x.remove_mark(Mark::NonConfigurable, key);
         }
     }
 
@@ -1563,12 +1846,7 @@ impl Object {
     /// Whether `key` is an own property (data slot or accessor).
     #[must_use]
     pub fn has_own_key(&self, key: &str) -> bool {
-        self.contains(key)
-            || self
-                .ex()
-                .accessors
-                .iter()
-                .any(|(k, _, _)| k.as_ref() == key)
+        self.contains(key) || self.accessor(key).is_some()
     }
 
     /// Marks the object frozen (`Object.freeze`) — implies sealed + non-extensible.
@@ -1609,7 +1887,7 @@ impl Object {
     pub fn clear_accessor(&mut self, key: &str) {
         self.bump_key_epoch();
         if let Some(x) = self.extra.as_deref_mut() {
-            x.accessors.retain(|(k, _, _)| k.as_ref() != key);
+            x.remove_acc(key);
         }
     }
 
@@ -1657,31 +1935,22 @@ impl Object {
     /// removed.
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
         self.bump_key_epoch();
-        let had_accessor = self
-            .ex()
-            .accessors
-            .iter()
-            .any(|(k, _, _)| k.as_ref() == key);
-        if let Some(x) = self.extra.as_deref_mut() {
-            x.accessors.retain(|(k, _, _)| k.as_ref() != key);
-        }
+        let had_accessor = self.extra.as_deref_mut().is_some_and(|x| x.remove_acc(key));
         // Clear the property's attribute flags so a later re-add of the same key
         // starts from defaults — otherwise a stale `readonly` flag makes `set` a
         // silent no-op, and a stale `hidden`/`non_configurable` flag wrongly
         // carries over to the new property (e.g. re-defining a deleted, formerly
         // non-writable `name`/`length`, or NamedEvaluation re-installing `name`).
         if let Some(x) = self.extra.as_deref_mut() {
-            x.hidden.retain(|k| k.as_ref() != key);
-        }
-        if let Some(x) = self.extra.as_deref_mut() {
-            x.readonly.retain(|k| k.as_ref() != key);
-            x.non_configurable.retain(|k| k.as_ref() != key);
+            x.remove_mark(Mark::Hidden, key);
+            x.remove_mark(Mark::Readonly, key);
+            x.remove_mark(Mark::NonConfigurable, key);
         }
         // Drop from the unified insertion log so a later re-add of the same key
         // appends at the end (a deleted-then-recreated property is chronologically
         // new), rather than reclaiming its former slot.
-        if let Some(order) = self.extra.as_deref_mut().and_then(|x| x.key_order.as_mut()) {
-            order.retain(|k| k.as_ref() != key);
+        if let Some(x) = self.extra.as_deref_mut() {
+            x.order_remove(key);
         }
         if self.is_dict() {
             let d = self.dict_mut();
@@ -1973,6 +2242,62 @@ mod tests {
 
     fn n(x: f64) -> NanBox {
         NanBox::number(x)
+    }
+
+    #[test]
+    fn attribute_index_mirrors_the_lists() {
+        let mut o = Object::new(Shape::root());
+        let mut keys = Vec::new();
+        for i in 0..300 {
+            let k = alloc::format!("k{i}");
+            o.set(&k, n(i as f64));
+            keys.push(k);
+        }
+        for (i, k) in keys.iter().enumerate() {
+            if i % 2 == 0 {
+                o.set_hidden(k);
+            }
+            if i % 3 == 0 {
+                o.set_readonly(k);
+            }
+            if i % 5 == 0 {
+                o.set_non_configurable(k);
+            }
+        }
+        for i in 0..30 {
+            o.define_accessor(&alloc::format!("a{i}"), n(i as f64), NanBox::undefined());
+        }
+        assert!(o.ex().index.is_some());
+        // Remove a scattering, then check every query against the lists.
+        for (i, k) in keys.iter().enumerate() {
+            if i % 4 == 0 {
+                o.clear_hidden(k);
+                o.clear_readonly(k);
+            }
+        }
+        for i in (0..30).step_by(7) {
+            o.clear_accessor(&alloc::format!("a{i}"));
+        }
+        o.delete(Shape::root(), "k9");
+        o.define_accessor("k9", n(9.0), NanBox::undefined());
+        let x = o.ex();
+        for k in keys
+            .iter()
+            .cloned()
+            .chain((0..30).map(|i| alloc::format!("a{i}")))
+        {
+            let scan = |l: &Vec<Box<str>>| l.iter().any(|e| e.as_ref() == k);
+            assert_eq!(o.is_hidden(&k), scan(&x.hidden), "{k}");
+            assert_eq!(o.is_readonly(&k), scan(&x.readonly), "{k}");
+            assert_eq!(o.is_non_configurable(&k), scan(&x.non_configurable), "{k}");
+            let pos = x.accessors.iter().position(|(a, _, _)| a.as_ref() == k);
+            assert_eq!(o.accessor_index(&k), pos, "{k}");
+        }
+        let all = o.all_keys();
+        assert_eq!(all.len(), 300 + 30 - 5);
+        assert_eq!(all.last(), Some(&"k9"));
+        assert!(!o.enumerable_keys().contains(&"k2"));
+        assert!(o.enumerable_keys().contains(&"k4"));
     }
 
     #[test]

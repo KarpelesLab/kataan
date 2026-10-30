@@ -60,6 +60,7 @@ enum FastOp {
     ArrayPush,
     /// `Array.prototype.pop`.
     ArrayPop,
+    ArrayShift,
     /// `String.prototype.indexOf`.
     StrIndexOf,
     /// `String.prototype.charCodeAt`.
@@ -194,6 +195,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
     match (id, name) {
         (N_ARRAY_PROTO_FN, b"push") => FastOp::ArrayPush,
         (N_ARRAY_PROTO_FN, b"pop") => FastOp::ArrayPop,
+        (N_ARRAY_PROTO_FN, b"shift") => FastOp::ArrayShift,
         (N_STRING_PROTO_FN, b"indexOf") => FastOp::StrIndexOf,
         (N_STRING_PROTO_FN, b"charCodeAt") => FastOp::StrCharCodeAt,
         (N_STRING_PROTO_FN, b"charAt") => FastOp::StrCharAt,
@@ -636,6 +638,7 @@ fn run_op(
             }
             realm.array_pop(h)
         }
+        FastOp::ArrayShift => realm.array_shift_fast(h)?,
         FastOp::StrIndexOf => {
             // A string needle (ToString is the identity) and a Number or absent
             // position (ToIntegerOrInfinity runs no code).

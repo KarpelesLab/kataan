@@ -248,3 +248,51 @@ fn string_tail_slicing_is_linear() {
         )
     });
 }
+
+/// A `shift`-based queue is linear: `shift` moved every element down, so a
+/// BFS-style `push`/`shift` loop was quadratic. A long array now shifts by
+/// advancing a start offset.
+#[test]
+fn array_shift_queue_is_linear() {
+    assert_scaling("shift queue", 20_000, 8.0, |n| {
+        timed(
+            &format!("const q=[]; for(let i=0;i<{n};i++) q.push(i);"),
+            "let c=0; while(q.length){ const x=q.shift(); c+=x; if(x%3===0 && x<1e9) q.push(x+1e9); }",
+        )
+    });
+}
+
+/// Attribute and accessor bookkeeping is O(log n) per property: the
+/// non-writable / non-enumerable / non-configurable marks and the accessor
+/// list were searched linearly, so `defineProperty` on a big object,
+/// `Object.keys` past many hidden keys and getter reads on an object with
+/// many accessors (a bundled module's exports) were quadratic.
+#[test]
+fn property_attributes_scale_linearly() {
+    assert_scaling("defineProperty on a large object", 4_000, 8.0, |n| {
+        timed(
+            "const o={};",
+            &format!(
+                "for(let i=0;i<{n};i++) Object.defineProperty(o,'k'+i,{{value:i,writable:false,enumerable:false,configurable:true}}); \
+                 let c=0; for(let i=0;i<{n};i++) c+=o['k'+i];"
+            ),
+        )
+    });
+    assert_scaling("Object.keys past hidden keys", 4_000, 8.0, |n| {
+        timed(
+            &format!(
+                "const o={{}}; for(let i=0;i<{n};i++){{ o['e'+i]=i; \
+                 Object.defineProperty(o,'h'+i,{{value:i,enumerable:false,writable:true,configurable:true}}); }}"
+            ),
+            "let c=0; for(let r=0;r<5;r++) c+=Object.keys(o).length;",
+        )
+    });
+    assert_scaling("getters on many accessors", 2_000, 8.0, |n| {
+        timed(
+            &format!(
+                "const o={{}}; for(let i=0;i<{n};i++) Object.defineProperty(o,'k'+i,{{get(){{return i;}},enumerable:true}});"
+            ),
+            &format!("let c=0; for(let r=0;r<4*{n};r++) c+=o['k'+(r%{n})];"),
+        )
+    });
+}
