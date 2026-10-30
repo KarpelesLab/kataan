@@ -202,3 +202,22 @@ fn string_building_is_linear() {
         )
     })
 }
+
+/// Building objects that each start with a distinct key is linear. A shape
+/// cached its children in a list scanned on every add, and the root shape
+/// collects one child per distinct first key, so `o['u' + i] = i` on fresh
+/// objects, a JSON array of single-key objects, and add-after-`delete` (which
+/// rebuilds the layout from the root) each cost O(n): 80 000 such objects
+/// took 8.4 s, a JSON.parse of 80 000 of them 13 s.
+#[test]
+fn distinct_first_keys_are_linear() {
+    assert_scaling("distinct first keys", 10_000, 8.0, |n| {
+        timed(
+            "const keep=[];",
+            &format!(
+                "for(let i=0;i<{n};i++){{const o={{}}; o['u'+i]=i; keep.push(o);}} \
+                 const d={{}}; for(let i=0;i<{n};i++){{d['k'+i]=i; if(i>5) delete d['k'+(i-5)];}}"
+            ),
+        )
+    });
+}

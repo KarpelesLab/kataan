@@ -19,6 +19,7 @@
 //! shape with a value vector, and inline caches over shapes, build on top.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::{Cell, OnceCell, RefCell};
@@ -137,7 +138,7 @@ pub struct Shape {
     /// realm. A cached child that no object still uses is simply dropped and
     /// rebuilt on next use; shape identity is only ever a cache-hit test
     /// ([`crate::ic`]), so a rebuilt shape costs a miss, never correctness.
-    transitions: RefCell<Vec<(Box<str>, Weak<Shape>)>>,
+    transitions: RefCell<Transitions>,
     /// The hashed key table, built after [`INDEX_AFTER_PROBES`] lookups of a
     /// layout with at least [`INDEX_MIN_LEN`] properties (see [`ShapeIndex`]).
     index: OnceCell<Box<ShapeIndex>>,
@@ -146,6 +147,83 @@ pub struct Shape {
     /// Which internal brand keys ([`BRAND_KEYS`]) the layout holds, one bit
     /// each, so "is this a wrapper / `[[IsHTMLDDA]]` object" needs no lookup.
     brands: u8,
+}
+
+/// The most cached children a [`Transitions`] list holds before it becomes a
+/// map: a shape usually has a handful, which a short scan finds fastest.
+const TRANSITION_LIST_MAX: usize = 16;
+
+/// A shape's cached child shapes, one per property added from it (each a
+/// [`Weak`] link; see [`Shape::transitions`]).
+///
+/// Most shapes have a few children, kept in a short list. A shape that many
+/// different first keys hang off (the root, when objects each start with a
+/// distinct key: `{["id" + i]: …}`, a JSON array of single-key objects, or a
+/// rebuild-from-root after `delete`) switches to an ordered map, so finding a
+/// child stays logarithmic rather than a scan of every key ever added there,
+/// which made building `n` such objects quadratic. Entries whose child shape
+/// has been freed are swept out whenever the map has doubled since the last
+/// sweep, so the cache cannot grow without bound either.
+enum Transitions {
+    /// Few children: scanned linearly.
+    List(Vec<(Box<str>, Weak<Shape>)>),
+    /// Many children: looked up by key. `sweep_at` is the size at which dead
+    /// entries are next swept.
+    Map {
+        map: BTreeMap<Box<str>, Weak<Shape>>,
+        sweep_at: usize,
+    },
+}
+
+impl Default for Transitions {
+    fn default() -> Self {
+        Transitions::List(Vec::new())
+    }
+}
+
+impl Transitions {
+    /// The live child shape cached for `key`, if any.
+    fn get(&self, key: &str) -> Option<Rc<Shape>> {
+        match self {
+            Transitions::List(list) => list
+                .iter()
+                .find(|(k, _)| k.as_ref() == key)
+                .and_then(|(_, child)| child.upgrade()),
+            Transitions::Map { map, .. } => map.get(key).and_then(Weak::upgrade),
+        }
+    }
+
+    /// Caches `child` as the shape reached by adding `key`, replacing a dead
+    /// entry for the same key rather than adding a second one.
+    fn insert(&mut self, key: &str, child: &Rc<Shape>) {
+        let weak = Rc::downgrade(child);
+        match self {
+            Transitions::List(list) => {
+                if let Some(entry) = list.iter_mut().find(|(k, _)| k.as_ref() == key) {
+                    entry.1 = weak;
+                    return;
+                }
+                if list.len() >= TRANSITION_LIST_MAX {
+                    list.retain(|(_, c)| c.strong_count() > 0);
+                }
+                if list.len() < TRANSITION_LIST_MAX {
+                    list.push((Box::from(key), weak));
+                    return;
+                }
+                let mut map: BTreeMap<Box<str>, Weak<Shape>> = list.drain(..).collect();
+                map.insert(Box::from(key), weak);
+                let sweep_at = 2 * map.len();
+                *self = Transitions::Map { map, sweep_at };
+            }
+            Transitions::Map { map, sweep_at } => {
+                map.insert(Box::from(key), weak);
+                if map.len() >= *sweep_at {
+                    map.retain(|_, c| c.strong_count() > 0);
+                    *sweep_at = (2 * map.len()).max(2 * TRANSITION_LIST_MAX);
+                }
+            }
+        }
+    }
 }
 
 /// The internal key under which a primitive wrapper object boxes its value.
@@ -202,7 +280,7 @@ impl Shape {
             key: None,
             slot: 0,
             len: 0,
-            transitions: RefCell::new(Vec::new()),
+            transitions: RefCell::new(Transitions::default()),
             index: OnceCell::new(),
             probes: Cell::new(0),
             brands: 0,
@@ -306,12 +384,7 @@ impl Shape {
         // Reuse the cached transition if this `+key` was taken before and the
         // child is still in use. (The `let` ends the borrow before the
         // `borrow_mut` below.)
-        let cached = self
-            .transitions
-            .borrow()
-            .iter()
-            .find(|(k, _)| k.as_ref() == key)
-            .and_then(|(_, child)| child.upgrade());
+        let cached = self.transitions.borrow().get(key);
         if let Some(child) = cached {
             return child;
         }
@@ -320,18 +393,12 @@ impl Shape {
             key: Some(Rc::from(key)),
             slot: self.len,
             len: self.len + 1,
-            transitions: RefCell::new(Vec::new()),
+            transitions: RefCell::new(Transitions::default()),
             index: OnceCell::new(),
             probes: Cell::new(0),
             brands: self.brands | key_bits(key),
         });
-        // Replace a dead entry in place rather than growing the cache with it.
-        let mut transitions = self.transitions.borrow_mut();
-        match transitions.iter_mut().find(|(k, _)| k.as_ref() == key) {
-            Some(entry) => entry.1 = Rc::downgrade(&child),
-            None => transitions.push((Box::from(key), Rc::downgrade(&child))),
-        }
-        drop(transitions);
+        self.transitions.borrow_mut().insert(key, &child);
         child
     }
 
