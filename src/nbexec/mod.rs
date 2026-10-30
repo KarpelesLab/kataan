@@ -2772,6 +2772,7 @@ const PCOMB_CALLED: &str = "\u{0}pc_called";
 mod agent;
 #[cfg(feature = "std")]
 mod agent_pool;
+mod array_sparse;
 mod base64;
 mod call;
 mod convert;

@@ -2116,7 +2116,12 @@ impl Interp {
                 if let Ok(i) = name.parse::<usize>()
                     && crate::realm::is_canonical_decimal(name)
                 {
-                    if i < self.realm.array_length(p).unwrap_or(0) {
+                    // An array's index past its dense store (an element kept
+                    // in the auxiliary object, past the dense cap) is read by
+                    // the own-property lookup below, not from the dense store.
+                    if i < self.realm.array_length(p).unwrap_or(0)
+                        && self.realm.array_dense_len(p).is_none_or(|d| i < d)
+                    {
                         let v = self.realm.get_element(p, i);
                         // A hole on a prototype array is also absent — keep walking.
                         if !v.is_hole() {

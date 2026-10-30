@@ -1825,3 +1825,49 @@ fn key_values_round_trip_symbols_and_names() {
         r#"1|1|0|["\u0000m","get \u0000g","\u0000c","\u0000sm","\u0000f"]"#
     );
 }
+
+/// The `Array.prototype` built-ins on a real array whose `length` lies past
+/// its dense store (`a.length = 2**32 - 1`) run their index-by-index
+/// algorithms against the real `length` (they took the dense store's size,
+/// so `fill(7, -1)` wrote index 2 and `slice(-2)` returned the last two
+/// *stored* elements), stepping over the absent region past the dense store
+/// so each still finishes at once. `delete` of an element stored past the
+/// dense cap removes it (it was a silent no-op), and such an element on an
+/// array *prototype* is inherited (it read as `undefined`).
+#[test]
+fn array_builtins_honor_a_length_past_the_dense_store() {
+    let src = r#"
+        var L = 2 ** 32 - 1;
+        function mk() { var a = [1, 2, 3]; a.length = L; return a; }
+        function K(a) { return Object.keys(a).map(function (k) { return k + "=" + a[k]; }).join(",") + "|" + a.length; }
+        var r = [];
+        r.push(K(mk().slice(-2)), K(mk().slice(0, 5)));
+        r.push(mk().indexOf(3, -1), mk().includes(3, -2), mk().includes(undefined));
+        var a = mk(); a[L - 3] = 3; r.push(a.lastIndexOf(3), a.lastIndexOf(3, -4));
+        a = mk(); a.fill(7, -1); r.push(K(a));
+        a = mk(); a[L - 1] = 9; a.copyWithin(0, L - 2); r.push(K(a));
+        a = mk(); a[L - 1] = 9; var s = a.splice(1, 1); r.push(K(s), K(a));
+        a = mk(); a[L - 2] = 5; s = a.splice(0); r.push(K(s), K(a));
+        a = mk(); a[L - 2] = "r"; a.reverse(); r.push(K(a));
+        a = mk(); a[L - 2] = 0; a.sort(); r.push(K(a));
+        a = mk(); a[L - 1] = 4; r.push(a.shift(), K(a));
+        a = mk(); a.length = L - 1; r.push(a.unshift(0), K(a));
+        a = mk(); a[L - 1] = 5; var seen = []; a.forEach(function (v, i) { seen.push(i); });
+        r.push(seen.join(" "), a.reduce(function (x, y) { return x + y; }));
+        a = mk(); a[L - 2] = 0; r.push(delete a[L - 2], K(a));
+        var p = []; p[L - 2] = "P"; var b = []; Object.setPrototypeOf(b, p);
+        r.push(b[L - 2], Object.create(p)[L - 2]);
+        r.join(" ; ")
+    "#;
+    assert_eq!(
+        run(src),
+        "|2 ; 0=1,1=2,2=3|5 ; -1 ; false ; true ; 4294967292 ; 2 ; \
+         0=1,1=2,2=3,4294967294=7|4294967295 ; 1=9,2=3,4294967294=9|4294967295 ; \
+         0=2|1 ; 0=1,1=3,4294967293=9|4294967294 ; \
+         0=1,1=2,2=3,4294967293=5|4294967295 ; |0 ; \
+         1=r,4294967292=3,4294967293=2,4294967294=1|4294967295 ; \
+         0=0,1=1,2=2,3=3|4294967295 ; 1 ; 0=2,1=3,4294967293=4|4294967294 ; \
+         4294967295 ; 0=0,1=1,2=2,3=3|4294967295 ; 0 1 2 4294967294 ; 11 ; \
+         true ; 0=1,1=2,2=3|4294967295 ; P ; P"
+    );
+}

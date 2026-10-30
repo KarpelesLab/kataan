@@ -4526,6 +4526,63 @@ impl Realm {
         self.aux_props.contains_key(&handle.to_raw())
     }
 
+    /// The array-index keys (`0 ..= 2**32 - 2`, canonical decimal) held in the
+    /// array's auxiliary store, unsorted: the elements stored past the dense cap
+    /// and the indices carrying an accessor or attribute override. Together with
+    /// the dense store's non-hole slots they are the array's own indices.
+    #[must_use]
+    pub fn array_aux_indices(&self, handle: Handle) -> Vec<usize> {
+        let Some(o) = self
+            .aux_props
+            .get(&handle.to_raw())
+            .and_then(|aux| self.heap.get(*aux))
+            .and_then(Cell::as_object)
+        else {
+            return Vec::new();
+        };
+        o.all_keys()
+            .into_iter()
+            .filter_map(canonical_array_index)
+            .collect()
+    }
+
+    /// Whether an absent own index of `handle` is unobservable: every object on
+    /// its prototype chain is an ordinary object cell (no proxy, array, typed
+    /// array, String wrapper or auxiliary store) without an own array-index
+    /// property. Then `HasProperty` of a missing index is `false` and its `Get`
+    /// is `undefined`, both with no side effects, so an algorithm may skip it.
+    #[must_use]
+    pub fn proto_chain_index_free(&self, handle: Handle) -> bool {
+        let mut cur = self.object_proto(handle);
+        let mut depth = 0u32;
+        while let Some(p) = cur {
+            depth += 1;
+            if depth > 1000 || self.string_object_len(p).is_some() {
+                return false;
+            }
+            match self.heap.get(p) {
+                Some(Cell::Object(o)) => {
+                    if self.aux_props.contains_key(&p.to_raw())
+                        || o.all_keys()
+                            .into_iter()
+                            .any(|k| canonical_array_index(k).is_some())
+                    {
+                        return false;
+                    }
+                }
+                // `%Array.prototype%` is itself an (empty) array.
+                Some(Cell::Array(a)) => {
+                    if a.iter().any(|e| !e.is_hole()) || !self.array_aux_indices(p).is_empty() {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            cur = self.object_proto(p);
+        }
+        true
+    }
+
     /// Whether the array index `i` carries a *non-default* own attribute or an
     /// accessor — i.e. a `defineProperty` once demoted its writability/enumerability/
     /// configurability or installed a getter/setter, so an `arr[i] = v` write cannot
@@ -5587,7 +5644,14 @@ impl Realm {
                         .and_then(Cell::as_array)
                         .is_some_and(|a| i < a.len());
                 let has_accessor = self.accessor(handle, key).is_some();
-                if !present && !has_accessor {
+                // An element stored past the dense cap lives in the aux object.
+                let in_aux = self
+                    .aux_props
+                    .get(&handle.to_raw())
+                    .and_then(|aux| self.heap.get(*aux))
+                    .and_then(Cell::as_object)
+                    .is_some_and(|o| o.has_own_key(key));
+                if !present && !has_accessor && !in_aux {
                     return true;
                 }
                 // A non-configurable index (frozen array, or one demoted via
@@ -9974,4 +10038,14 @@ pub enum ChainHit {
 pub(crate) fn is_canonical_decimal(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty() && b[0] != b'+' && (b[0] != b'0' || b.len() == 1)
+}
+
+/// The index named by `k` if it is a canonical array-index key (`"0"` ..=
+/// `"4294967294"`, no sign and no leading zero), else `None`.
+#[must_use]
+pub(crate) fn canonical_array_index(k: &str) -> Option<usize> {
+    k.parse::<u32>()
+        .ok()
+        .filter(|&i| i != u32::MAX && is_canonical_decimal(k))
+        .map(|i| i as usize)
 }

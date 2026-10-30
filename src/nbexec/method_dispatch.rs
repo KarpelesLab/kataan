@@ -3650,15 +3650,35 @@ impl Interp {
         // for the array's `length`, so `at(-1)` read the last *stored* element.
         // `at`/`with` read only the indices they name, so they run their
         // index-by-index algorithm, which honors the real `length`.
-        if self.realm.typed_kind(handle).is_none()
-            && matches!(method, "at" | "with")
-            && let Some(dense_len) = self.realm.array_elements(handle).map(<[_]>::len)
-            && self
-                .realm
-                .array_length(handle)
-                .is_some_and(|l| l != dense_len)
-        {
-            return Ok(Some(self.array_at_with_generic(method, handle, args)?));
+        // The other methods listed here visit every index below `length` in
+        // their spec algorithms; their per-index paths step over the absent
+        // region past the dense store (see `array_sparse`), so they stay fast.
+        if self.array_length_past_dense(handle) {
+            match method {
+                "at" | "with" => {
+                    return Ok(Some(self.array_at_with_generic(method, handle, args)?));
+                }
+                "slice" => return Ok(Some(self.array_slice_generic(handle, args)?)),
+                "fill" | "copyWithin" | "splice" | "shift" | "unshift" | "reverse" | "sort" => {
+                    return Ok(Some(self.array_like_mutate(method, handle, args)?));
+                }
+                "indexOf" | "lastIndexOf" | "includes" => {
+                    return Ok(Some(self.array_iter_sparse(method, handle, args, None)?));
+                }
+                "forEach" | "some" | "every" | "find" | "findIndex" | "findLast"
+                | "findLastIndex" | "reduce" | "reduceRight" => {
+                    // `length` is read before IsCallable(callback) is checked.
+                    let len = self.array_like_length(handle)?;
+                    self.require_callable(arg(0), &alloc::format!("{method} callback"))?;
+                    return Ok(Some(self.array_iter_sparse(
+                        method,
+                        handle,
+                        args,
+                        Some(len),
+                    )?));
+                }
+                _ => {}
+            }
         }
         // Deferred until after the `push`/`pop` fast path above: building the
         // hole mask walks and allocates over the whole array, and those two
@@ -6324,7 +6344,7 @@ impl Interp {
     /// Resolves a spec "relative index" argument against `len`: ToIntegerOrInfinity,
     /// then a negative value counts from the end (clamped to 0) and a positive value
     /// is clamped to `len`. `default` is used when the argument is `undefined`.
-    fn relative_index(
+    pub(crate) fn relative_index(
         &mut self,
         v: NanBox,
         len: usize,
@@ -6418,8 +6438,16 @@ impl Interp {
                     return Ok(NanBox::undefined());
                 }
                 let first = self.array_like_get(handle, 0)?;
-                for to in 1..len {
-                    self.array_like_move(handle, to, to - 1)?;
+                // Move `to + 1` to `to` for every `to` below `len - 1`, skipping
+                // the positions where both indices are provably absent.
+                let mut to = 0;
+                while to + 1 < len {
+                    to = self.sparse_next_pair(handle, to, len - 1, 1, 0);
+                    if to + 1 >= len {
+                        break;
+                    }
+                    self.array_like_move(handle, to + 1, to)?;
+                    to += 1;
                 }
                 self.array_like_delete(handle, len - 1)?;
                 self.array_like_set_length(handle, len - 1)?;
@@ -6433,9 +6461,15 @@ impl Interp {
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
                 if count > 0 {
-                    // Shift existing elements up by `count`, high index first.
-                    for k in (0..len).rev() {
-                        self.array_like_move(handle, k, k + count)?;
+                    // Shift existing elements up by `count`, high index first
+                    // (skipping positions whose source and target are absent).
+                    let mut k = len;
+                    while k > 0 {
+                        let Some(p) = self.sparse_prev_pair(handle, k - 1, 0, 0, count) else {
+                            break;
+                        };
+                        self.array_like_move(handle, p, p + count)?;
+                        k = p;
                     }
                     for (j, a) in args.iter().enumerate() {
                         self.array_like_set(handle, j, *a)?;
@@ -6447,7 +6481,19 @@ impl Interp {
             }
             "reverse" => {
                 let mid = len / 2;
-                for lower in 0..mid {
+                let mut lower = 0;
+                while lower < mid {
+                    // The next pair with a present end: the lower index ascends
+                    // through `[lower, mid)` while its partner descends through
+                    // `[len - mid, len - 1 - lower]`.
+                    let from_lower = self.sparse_next_index(handle, lower, mid);
+                    let from_upper = self
+                        .sparse_prev_index(handle, len - 1 - lower, len - mid)
+                        .map_or(mid, |u| len - 1 - u);
+                    lower = from_lower.min(from_upper);
+                    if lower >= mid {
+                        break;
+                    }
                     let upper = len - lower - 1;
                     // Spec order per pair (23.1.3.26): HasProperty(lower), then
                     // Get(lower) *only if present*, then HasProperty(upper), then
@@ -6480,6 +6526,7 @@ impl Interp {
                         }
                         (None, None) => {}
                     }
+                    lower += 1;
                 }
                 Ok(NanBox::handle(handle.to_raw()))
             }
@@ -6496,34 +6543,41 @@ impl Interp {
                 let to = self.relative_index(arg(0), len, 0)?;
                 let from = self.relative_index(arg(1), len, 0)?;
                 let fin = self.relative_index(arg(2), len, len)?;
-                let mut count = fin.saturating_sub(from).min(len.saturating_sub(to));
+                let count = fin.saturating_sub(from).min(len.saturating_sub(to));
                 // Spec steps 12-15: element by element (HasProperty, Get, Set or
                 // Delete per index, so a Proxy/getter sees interleaved reads and
                 // writes), walking backwards when the ranges overlap with the
-                // source first.
-                let (mut from, mut to, back) = if from < to && to < from + count {
-                    (from + count - 1, to + count - 1, true)
-                } else {
-                    (from, to, false)
-                };
-                while count > 0 {
+                // source first. Offset `j` copies `from + j` to `to + j`; the
+                // offsets where both are provably absent are skipped.
+                let back = from < to && to < from + count;
+                let step = |this: &mut Self, j: usize| -> Result<(), ExecError> {
                     // `fromPresent = HasProperty(O, fromKey)` then ReturnIfAbrupt — a
                     // throwing `has` trap propagates (must not collapse to `false`).
-                    if self.has_property_proxied(handle, &alloc::format!("{from}"))? {
-                        let v = self.array_like_get(handle, from)?;
-                        self.array_like_set(handle, to, v)?;
+                    if this.has_property_proxied(handle, &alloc::format!("{}", from + j))? {
+                        let v = this.array_like_get(handle, from + j)?;
+                        this.array_like_set(handle, to + j, v)
                     } else {
-                        self.array_like_delete(handle, to)?;
+                        this.array_like_delete(handle, to + j)
                     }
-                    count -= 1;
-                    if count > 0 {
-                        if back {
-                            from -= 1;
-                            to -= 1;
-                        } else {
-                            from += 1;
-                            to += 1;
+                };
+                if back {
+                    let mut j = count;
+                    while j > 0 {
+                        let Some(p) = self.sparse_prev_pair(handle, j - 1, 0, from, to) else {
+                            break;
+                        };
+                        step(self, p)?;
+                        j = p;
+                    }
+                } else {
+                    let mut j = 0;
+                    while j < count {
+                        j = self.sparse_next_pair(handle, j, count, from, to);
+                        if j >= count {
+                            break;
                         }
+                        step(self, j)?;
+                        j += 1;
                     }
                 }
                 Ok(NanBox::handle(handle.to_raw()))
@@ -6538,18 +6592,30 @@ impl Interp {
                 // absent indices excluded), sort them, then write the sorted run
                 // back to `0..count` and delete `count..len` (holes float to the end).
                 let mut items: Vec<NanBox> = Vec::new();
-                for i in 0..len {
+                let mut i = 0;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     if self.has_property(handle, &alloc::format!("{i}")) {
                         items.push(self.array_like_get(handle, i)?);
                     }
+                    i += 1;
                 }
                 let count = items.len();
                 let sorted = self.sort_array(items, cmp, false)?;
                 for (i, v) in sorted.into_iter().enumerate() {
                     self.array_like_set(handle, i, v)?;
                 }
-                for i in count..len {
+                let mut i = count;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     self.array_like_delete(handle, i)?;
+                    i += 1;
                 }
                 Ok(NanBox::handle(handle.to_raw()))
             }
@@ -6585,16 +6651,22 @@ impl Interp {
                 let default_removed = self.realm.is_array(removed_arr)
                     && self.realm.array_length(removed_arr) == Some(delete_count)
                     && !self.realm.array_has_index_overrides(removed_arr);
-                for k in 0..delete_count {
-                    let idx = start + k;
+                let mut idx = start;
+                while idx < start + delete_count {
+                    idx = self.sparse_next_index(handle, idx, start + delete_count);
+                    if idx >= start + delete_count {
+                        break;
+                    }
+                    let k = idx - start;
                     if self.has_property(handle, &alloc::format!("{idx}")) {
                         let v = self.array_like_get(handle, idx)?;
-                        if default_removed {
-                            self.realm.set_element(removed_arr, k, v);
-                        } else {
+                        // The dense store refuses an index past its cap; such an
+                        // element goes through the defining path instead.
+                        if !(default_removed && self.realm.set_element(removed_arr, k, v)) {
                             self.create_data_property_or_throw(removed_arr, k, v)?;
                         }
                     }
+                    idx += 1;
                 }
                 let rem_len_key = self.new_str("length");
                 self.assign_member_value(
@@ -6603,16 +6675,43 @@ impl Interp {
                     NanBox::number(delete_count as f64),
                 )?;
                 // Shift the tail to its new position.
+                // (Positions whose source and target are provably absent are
+                // skipped.)
                 if insert_count < delete_count {
-                    for k in start..(len - delete_count) {
+                    let mut k = start;
+                    while k < len - delete_count {
+                        k = self.sparse_next_pair(
+                            handle,
+                            k,
+                            len - delete_count,
+                            delete_count,
+                            insert_count,
+                        );
+                        if k >= len - delete_count {
+                            break;
+                        }
                         self.array_like_move(handle, k + delete_count, k + insert_count)?;
+                        k += 1;
                     }
-                    for k in ((len - delete_count + insert_count)..len).rev() {
-                        self.array_like_delete(handle, k)?;
+                    let lo = len - delete_count + insert_count;
+                    let mut k = len;
+                    while k > lo {
+                        let Some(p) = self.sparse_prev_index(handle, k - 1, lo) else {
+                            break;
+                        };
+                        self.array_like_delete(handle, p)?;
+                        k = p;
                     }
                 } else if insert_count > delete_count {
-                    for k in (start..(len - delete_count)).rev() {
-                        self.array_like_move(handle, k + delete_count, k + insert_count)?;
+                    let mut k = len - delete_count;
+                    while k > start {
+                        let Some(p) =
+                            self.sparse_prev_pair(handle, k - 1, start, delete_count, insert_count)
+                        else {
+                            break;
+                        };
+                        self.array_like_move(handle, p + delete_count, p + insert_count)?;
+                        k = p;
                     }
                 }
                 // Write the inserted items.
@@ -6701,7 +6800,12 @@ impl Interp {
                     return Ok(NanBox::number(-1.0));
                 }
                 let from = self.array_from_index_checked(arg(1), len)?;
-                for i in from..len {
+                let mut i = from;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
@@ -6709,6 +6813,7 @@ impl Interp {
                             return Ok(NanBox::number(i as f64));
                         }
                     }
+                    i += 1;
                 }
                 return Ok(NanBox::number(-1.0));
             }
@@ -6729,6 +6834,10 @@ impl Interp {
                 };
                 let mut i = from;
                 while i >= 0 {
+                    match self.sparse_prev_index(handle, i as usize, 0) {
+                        Some(p) => i = p as i64,
+                        None => break,
+                    }
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
@@ -6750,8 +6859,20 @@ impl Interp {
                 }
                 let from = self.array_from_index_checked(arg(1), len)?;
                 let t_nan = target.as_number().is_some_and(f64::is_nan);
-                for i in from..len {
+                let t_undef = matches!(target.unpack(), Unpacked::Undefined);
+                let mut i = from;
+                while i < len {
+                    // A skipped (absent, unobservable) index reads `undefined`.
+                    let next = self.sparse_next_index(handle, i, len);
+                    if next > i && t_undef {
+                        return Ok(NanBox::boolean(true));
+                    }
+                    i = next;
+                    if i >= len {
+                        break;
+                    }
                     let v = self.read_member(handle, &alloc::format!("{i}"))?;
+                    i += 1;
                     if self.realm.strict_equals(v, target)
                         || (t_nan && v.as_number().is_some_and(f64::is_nan))
                     {
@@ -6765,12 +6886,18 @@ impl Interp {
         self.require_callable(f, &alloc::format!("{method} callback"))?;
         match method {
             "forEach" => {
-                for i in 0..len {
+                let mut i = 0;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
                         self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
                     }
+                    i += 1;
                 }
                 Ok(NanBox::undefined())
             }
@@ -6793,7 +6920,12 @@ impl Interp {
             }
             "filter" => {
                 let mut out = Vec::new();
-                for i in 0..len {
+                let mut i = 0;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
@@ -6803,11 +6935,17 @@ impl Interp {
                             out.push(v);
                         }
                     }
+                    i += 1;
                 }
                 Ok(NanBox::handle(self.realm.new_array(out).to_raw()))
             }
             "some" => {
-                for i in 0..len {
+                let mut i = 0;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
@@ -6817,11 +6955,17 @@ impl Interp {
                             return Ok(NanBox::boolean(true));
                         }
                     }
+                    i += 1;
                 }
                 Ok(NanBox::boolean(false))
             }
             "every" => {
-                for i in 0..len {
+                let mut i = 0;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
@@ -6831,6 +6975,7 @@ impl Interp {
                             return Ok(NanBox::boolean(false));
                         }
                     }
+                    i += 1;
                 }
                 Ok(NanBox::boolean(true))
             }
@@ -6882,6 +7027,10 @@ impl Interp {
                 } else {
                     let mut seed = None;
                     while start < len {
+                        start = self.sparse_next_index(handle, start, len);
+                        if start >= len {
+                            break;
+                        }
                         let key = alloc::format!("{start}");
                         if self.has_property(handle, &key) {
                             seed = Some(self.read_member(handle, &key)?);
@@ -6898,12 +7047,18 @@ impl Interp {
                         }
                     }
                 }
-                for i in start..len {
+                let mut i = start;
+                while i < len {
+                    i = self.sparse_next_index(handle, i, len);
+                    if i >= len {
+                        break;
+                    }
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
                         acc = self.call(f, &[acc, v, NanBox::number(i as f64), o])?;
                     }
+                    i += 1;
                 }
                 Ok(acc)
             }
@@ -6915,6 +7070,13 @@ impl Interp {
                 } else {
                     let mut seed = None;
                     while idx >= 0 {
+                        match self.sparse_prev_index(handle, idx as usize, 0) {
+                            Some(p) => idx = p as i64,
+                            None => {
+                                idx = -1;
+                                break;
+                            }
+                        }
                         let key = alloc::format!("{idx}");
                         if self.has_property(handle, &key) {
                             seed = Some(self.read_member(handle, &key)?);
@@ -6932,6 +7094,10 @@ impl Interp {
                     }
                 }
                 while idx >= 0 {
+                    match self.sparse_prev_index(handle, idx as usize, 0) {
+                        Some(p) => idx = p as i64,
+                        None => break,
+                    }
                     let key = alloc::format!("{idx}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
