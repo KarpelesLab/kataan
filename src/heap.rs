@@ -151,14 +151,20 @@ impl<T> Slot<T> {
         self.value.is_some()
     }
 
-    /// Empties the slot, giving it `generation`, and returns the value it
-    /// held (for the sweep to release).
-    #[inline]
-    fn vacate(&mut self, generation: u16) -> Option<T> {
+    /// Empties the slot for the sweep, giving it `generation`, and
+    /// [`release`]s the value it held where it lies (see
+    /// [`Trace::release_in`](crate::gc::Trace::release_in)).
+    ///
+    /// [`release`]: crate::gc::Trace::release
+    #[inline(always)]
+    fn vacate_release(&mut self, generation: u16, pool: &mut crate::object::ExtraPool)
+    where
+        T: crate::gc::Trace,
+    {
         self.occupied = 0;
         self.dirty = CLEAN;
         self.generation = generation;
-        self.value.take()
+        T::release_in(&mut self.value, pool);
     }
 }
 
@@ -232,7 +238,7 @@ fn vacant_tag_byte<T>(slot: Slot<T>) -> u8 {
         }
     };
     let live = read(&v);
-    drop(v[0].vacate(1));
+    drop(v[0].value.take());
     let vacant = read(&v);
     assert_ne!(
         live, vacant,
@@ -789,9 +795,7 @@ impl<T> Heap<T> {
             // See `free` for why a slot leaving the low generation range is
             // retired rather than reused.
             let next_gen = slot.generation.wrapping_add(1);
-            if let Some(v) = slot.vacate(next_gen) {
-                v.release(extra_pool);
-            }
+            slot.vacate_release(next_gen, extra_pool);
             if next_gen < COMPACT_GEN_BASE {
                 free.push(i as u32);
             }
@@ -884,6 +888,15 @@ impl<T> Heap<T> {
             }
         }
         let floor = *young_floor;
+        if poison.is_none() {
+            let swept = sweep_young_fast(
+                slots, free, *free_top, floor, &sticky, remembered, extra_pool,
+            );
+            *live -= swept;
+            *free_top = free.len();
+            *young_floor = slots.len();
+            return swept;
+        }
         let mut swept = 0;
         // Counted locally (and the tables walked as plain slices), so the
         // loops below keep their state in registers.
@@ -1147,6 +1160,116 @@ impl<T> Heap<T> {
     }
 }
 
+/// What [`settle_young_fast`] did with a young slot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// Still holds its value (a survivor, or a slot already free).
+    Kept,
+    /// Freed, and goes back on the free list.
+    Freed,
+    /// Freed, but retired: its generation left the low range (see
+    /// [`Heap::free`]).
+    Retired,
+}
+
+/// [`Heap::sweep_young`] outside GC-verification mode: frees every young
+/// object left unmarked among the free-list entries consumed since the last
+/// collection (from `free_top`) and the slots pushed since (from `floor`),
+/// and returns how many it freed.
+///
+/// The per-object work is what bounds a minor collection of short-lived
+/// garbage, so the loops carry as little as they can: the count freed is
+/// worked out from the free list's growth afterwards (only a retired slot,
+/// which is rare, is counted as it happens), and an entry freed again is
+/// not written back one by one: it stays where it is, or moves down with
+/// the whole run of such entries it belongs to.
+fn sweep_young_fast<T: crate::gc::Trace>(
+    slots: &mut Vec<Slot<T>>,
+    free: &mut Vec<u32>,
+    free_top: usize,
+    floor: usize,
+    sticky: &impl Fn(&T) -> bool,
+    remembered: &mut Vec<u32>,
+    pool: &mut crate::object::ExtraPool,
+) -> usize {
+    let mut retired = 0;
+    let n = free.len();
+    let gap = {
+        let slots = slots.as_mut_slice();
+        let free = free.as_mut_slice();
+        // The entries not freed again so far (`gap` of them) leave a hole
+        // the list closes: each run of entries freed again moves down by
+        // `gap` as one block once it ends. Survivors are rare in a nursery,
+        // so the runs are long and the per-entry loop writes nothing.
+        let mut gap = 0;
+        let mut r = free_top;
+        loop {
+            // A run of entries freed again: `free[run..r]`.
+            let run = r;
+            let mut fate = Fate::Freed;
+            while r < n {
+                let i = free[r];
+                fate = settle_young_fast(&mut slots[i as usize], i, sticky, remembered, pool);
+                if fate != Fate::Freed {
+                    break;
+                }
+                r += 1;
+            }
+            if gap > 0 {
+                free.copy_within(run..r, run - gap);
+            }
+            if r == n {
+                break;
+            }
+            // `free[r]` leaves the list.
+            if fate == Fate::Retired {
+                retired += 1;
+            }
+            gap += 1;
+            r += 1;
+        }
+        gap
+    };
+    free.truncate(n - gap);
+    for (i, slot) in slots.iter_mut().enumerate().skip(floor) {
+        match settle_young_fast(slot, i as u32, sticky, remembered, pool) {
+            Fate::Kept => {}
+            Fate::Freed => free.push(i as u32),
+            Fate::Retired => retired += 1,
+        }
+    }
+    free.len() - free_top + retired
+}
+
+/// [`settle_young`] outside GC-verification mode.
+#[inline(always)]
+fn settle_young_fast<T: crate::gc::Trace>(
+    slot: &mut Slot<T>,
+    i: u32,
+    sticky: &impl Fn(&T) -> bool,
+    remembered: &mut Vec<u32>,
+    pool: &mut crate::object::ExtraPool,
+) -> Fate {
+    let Some(value) = &slot.value else {
+        return Fate::Kept;
+    };
+    if slot.age >= crate::gc::OLD_AGE {
+        // Marked (promoted), or a slot listed twice.
+        if slot.dirty == CLEAN && sticky(value) {
+            slot.dirty = STICKY;
+            remembered.push(i);
+        }
+        return Fate::Kept;
+    }
+    let next_gen = slot.generation.wrapping_add(1);
+    slot.vacate_release(next_gen, pool);
+    if next_gen < COMPACT_GEN_BASE {
+        Fate::Freed
+    } else {
+        Fate::Retired
+    }
+}
+
 /// One young slot's fate in [`Heap::sweep_young`]: a promoted (marked)
 /// object stays — entering the remembered set if `sticky` — and an unmarked
 /// one is freed (or, in GC-verification mode, recorded and kept). Returns
@@ -1185,9 +1308,7 @@ fn settle_young<T: crate::gc::Trace>(
     }
     *live -= 1;
     let next_gen = slot.generation.wrapping_add(1);
-    if let Some(v) = slot.vacate(next_gen) {
-        v.release(pool);
-    }
+    slot.vacate_release(next_gen, pool);
     next_gen < COMPACT_GEN_BASE
 }
 
@@ -1295,6 +1416,97 @@ mod tests {
         }
         // Retirement means the table grew past the single recycled slot.
         assert!(h.slots.len() > 1, "the exhausted slot should have retired");
+    }
+
+    #[test]
+    fn minor_sweeps_keep_the_free_list_exact() {
+        // Survivors at every position of the consumed free-list entries (the
+        // sweep closes the holes they leave), explicit frees of young and old
+        // objects (a slot listed twice), and enough cycles for the busiest
+        // slots to retire: after every sweep the list holds each vacant,
+        // unretired slot exactly once, and nothing else.
+        struct V;
+        impl crate::gc::Trace for V {
+            fn trace(&self, _: &mut dyn FnMut(Handle)) {}
+        }
+        let mut h: Heap<V> = Heap::new();
+        let mut old: Vec<Handle> = Vec::new();
+        let mut rng = 0x2545_f491_u32;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        // Start every slot near the end of the low generation range, so that
+        // the busiest ones retire within the run.
+        let first: Vec<Handle> = (0..48).map(|_| h.alloc(V)).collect();
+        for x in first {
+            h.free(x);
+        }
+        for s in &mut h.slots {
+            s.generation = COMPACT_GEN_BASE - 300;
+        }
+        for _ in 0..4000 {
+            let n = 1 + (next() % 9) as usize;
+            let young: Vec<Handle> = (0..n).map(|_| h.alloc(V)).collect();
+            let mut kept = Vec::new();
+            let mut dead = 0;
+            for &y in &young {
+                match next() % 11 {
+                    0 | 1 => {
+                        assert!(h.promote_young(y));
+                        kept.push(y);
+                    }
+                    2 => {
+                        h.free(y);
+                        if next() % 2 == 0 {
+                            // Reallocated at once: its index is consumed twice
+                            // (unless freeing it retired the slot).
+                            let again = h.alloc(V);
+                            if y.generation() + 1 < COMPACT_GEN_BASE {
+                                assert_eq!(again.index(), y.index());
+                            }
+                            assert!(h.promote_young(again));
+                            kept.push(again);
+                        }
+                    }
+                    _ => dead += 1,
+                }
+            }
+            let before = h.len();
+            let swept = h.sweep_young(Vec::new(), |_| false);
+            assert_eq!(swept, dead);
+            assert_eq!(h.len(), before - swept);
+            for &k in &kept {
+                assert!(h.is_live(k) && !h.is_young(k));
+            }
+            old.extend(kept);
+            if old.len() > 24 {
+                for x in old.drain(..12) {
+                    h.free(x);
+                }
+            }
+            let mut listed = BTreeSet::new();
+            for &i in &h.free {
+                assert!(listed.insert(i), "slot {i} listed twice");
+                assert!(!h.slots[i as usize].is_live(), "live slot {i} listed");
+            }
+            assert_eq!(h.free_top, h.free.len());
+            assert_eq!(h.young_floor, h.slots.len());
+            for (i, s) in h.slots.iter().enumerate() {
+                let retired = s.generation >= COMPACT_GEN_BASE;
+                assert_eq!(
+                    !s.is_live() && !retired,
+                    listed.contains(&(i as u32)),
+                    "slot {i}"
+                );
+            }
+        }
+        assert!(
+            h.slots.iter().any(|s| s.generation >= COMPACT_GEN_BASE),
+            "some slot should have retired"
+        );
     }
 
     #[test]

@@ -66,6 +66,20 @@ pub trait Trace {
         let _ = pool;
         drop(self);
     }
+
+    /// [`release`](Self::release)s the object held in `place` (a heap slot
+    /// being freed), leaving `None`. The default takes it out first; an
+    /// implementation can test the kind in place, so that only the parts of
+    /// the common kinds that own memory are moved out, not the whole value.
+    #[inline(always)]
+    fn release_in(place: &mut Option<Self>, pool: &mut crate::object::ExtraPool)
+    where
+        Self: Sized,
+    {
+        if let Some(value) = place.take() {
+            value.release(pool);
+        }
+    }
 }
 
 /// What a collection knows to be alive, as handed to the weak-key

@@ -1307,6 +1307,30 @@ fn release_cold(cell: Cell) {
     drop(cell);
 }
 
+/// [`Trace::release`] of a swept cell that is not a plain object. The cells
+/// that own no heap memory are forgotten outright (their drop glue would do
+/// nothing); arrays, closures and strings release their one owned part; the
+/// rest take the full drop glue, further out of line.
+#[inline(never)]
+fn release_rest(cell: Cell) {
+    match cell {
+        // (Reached by `release` alone: the sweep's `release_in` frees an
+        // array inline.)
+        Cell::Array(a) => drop(a),
+        Cell::VmFunction { captures, .. } => drop(captures),
+        Cell::Str(s) => drop(s),
+        // Plain data (numbers, ids and handles): nothing to drop.
+        plain @ (Cell::Box(_)
+        | Cell::Native(_)
+        | Cell::HostFn(_)
+        | Cell::BoundNative { .. }
+        | Cell::Date(_)
+        | Cell::TypedArray { .. }
+        | Cell::Proxy { .. }) => core::mem::forget(plain),
+        other => release_cold(other),
+    }
+}
+
 impl Trace for Cell {
     fn weight(&self) -> usize {
         1 + match self {
@@ -1333,26 +1357,36 @@ impl Trace for Cell {
         }
     }
 
-    /// Inlined into the sweep loop. The cells that own no heap memory are
-    /// forgotten outright (their drop glue would do nothing); objects,
-    /// arrays and closures release their one or two owned parts inline; the
-    /// rest take the full drop glue, out of line.
     #[inline(always)]
     fn release(self, pool: &mut crate::object::ExtraPool) {
         match self {
             Cell::Object(o) => o.release(pool),
-            Cell::Array(a) => drop(a),
-            Cell::VmFunction { captures, .. } => drop(captures),
-            Cell::Str(s) => drop(s),
-            // Plain data (numbers, ids and handles): nothing to drop.
-            plain @ (Cell::Box(_)
-            | Cell::Native(_)
-            | Cell::HostFn(_)
-            | Cell::BoundNative { .. }
-            | Cell::Date(_)
-            | Cell::TypedArray { .. }
-            | Cell::Proxy { .. }) => core::mem::forget(plain),
-            other => release_cold(other),
+            other => release_rest(other),
+        }
+    }
+
+    /// Inlined into the sweep loop: the plain object and the array, by far
+    /// the most common swept kinds, are each recognized by one compare of
+    /// the tag byte and released inline; every other kind goes out of line
+    /// to [`release_rest`]. The array's one owned part, its element vector,
+    /// is moved out where it lies, and what is left of the cell (owning
+    /// nothing) forgotten: moving a cell out on more than one path makes
+    /// the compiler copy all of it, and one three-arm `match` computes the
+    /// full discriminant (the object's tag is a niche) rather than compare
+    /// the tag byte.
+    #[inline(always)]
+    fn release_in(place: &mut Option<Self>, pool: &mut crate::object::ExtraPool) {
+        if let Some(Cell::Array(elems)) = place {
+            // `ArrayElems` owns nothing else (and has no `Drop` of its own).
+            let elems = core::mem::take(&mut elems.elems);
+            core::mem::forget(place.take());
+            drop(elems);
+            return;
+        }
+        match place.take() {
+            Some(Cell::Object(o)) => o.release(pool),
+            Some(other) => release_rest(other),
+            None => {}
         }
     }
 
