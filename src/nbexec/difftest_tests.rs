@@ -2462,3 +2462,24 @@ fn accounting_parentheses_follow_the_locale_pattern() {
         "en-US:P nl:P es:M es-AR:P it:M pt:M pt-PT:P ru:M en-DE:M en-150:M ja:P sv:M tr:P tr-TR:M"
     );
 }
+
+/// `formatToParts` rendered three option sets differently from `format`:
+/// `roundingPriority` (both digit options went to the crate), `trailingZeroDisplay:
+/// "stripIfInteger"` (not applied) and default compact below 1e-6 (rendered `0`).
+#[cfg(feature = "intl")]
+#[test]
+fn format_to_parts_agrees_with_format() {
+    let src = r#"
+        function j(nf, v) { return nf.formatToParts(v).map(function (p) { return p.value; }).join(""); }
+        var a = new Intl.NumberFormat("en", { roundingPriority: "morePrecision", maximumSignificantDigits: 2, maximumFractionDigits: 0 });
+        var b = new Intl.NumberFormat("en", { roundingPriority: "lessPrecision", maximumSignificantDigits: 2, maximumFractionDigits: 3 });
+        var c = new Intl.NumberFormat("en", { trailingZeroDisplay: "stripIfInteger", minimumFractionDigits: 2 });
+        var d = new Intl.NumberFormat("en", { notation: "compact" });
+        [j(a, -1234.5678), j(b, 0.001234), j(b, 1e-7), j(c, 1), j(c, 1.5), j(d, 1e-7),
+         a.format(-1234.5678), b.format(0.001234), b.format(1e-7), c.format(1), d.format(1e-7)].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "-1,235 0.001 0 1 1.50 0.0000001 -1,235 0.001 0 1 0.0000001"
+    );
+}

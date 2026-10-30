@@ -957,6 +957,17 @@ fn exact_significant_digits(
     Some((int_digits, frac_digits))
 }
 
+/// The fraction digits a default compact-notation mantissa is rendered with
+/// before its re-round (see [`compact_reround_parts`]): six past the ones the
+/// re-round keeps. A mantissa below 1 keeps `1 - e` of them (`1e-7` is
+/// `0.0000001`), so a fixed six would render it as `0` before the re-round
+/// could see a digit.
+#[cfg(feature = "intl")]
+fn compact_render_fraction_digits(n: f64) -> u8 {
+    let keep = (1 - decimal_magnitude(n.abs())).max(0);
+    (keep + 6).min(100) as u8
+}
+
 /// Whether a compact-notation formatter carries no explicit digit options, so the
 /// ECMA-402 default rounding (`roundingPriority: "morePrecision"` with
 /// `maximumFractionDigits: 0` / `maximumSignificantDigits: 2`) applies and the
@@ -8692,19 +8703,38 @@ impl Interp {
         if !n.is_finite() || n == 0.0 {
             return n;
         }
-        // `roundingPriority` other than the default `auto` combines the significant-
-        // and fraction-digit results in a way the crate can't express; leave those
-        // to the existing path rather than pre-rounding on the wrong precision.
+        // `roundingPriority` other than the default `auto` takes either the
+        // significant-digit or the fraction-digit result, by their rounding
+        // magnitudes, an interplay the crate can't express: keep only the
+        // winning digit options (the format path's `try_rounding_priority`
+        // makes the same choice), then pre-round on those.
         let priority = self
             .realm
             .get_property(handle, islot!("roundingPriority"))
             .map(|v| self.realm.to_display_string(v))
             .unwrap_or_default();
-        if matches!(priority.as_str(), "morePrecision" | "lessPrecision")
-            && opts.maximum_significant_digits.is_some()
-            && opts.maximum_fraction_digits.is_some()
-        {
-            return n;
+        if matches!(priority.as_str(), "morePrecision" | "lessPrecision") {
+            let min_frac = opts.minimum_fraction_digits.unwrap_or(0);
+            let max_sig = i32::from(opts.maximum_significant_digits.unwrap_or(21));
+            let max_frac = opts.maximum_fraction_digits.unwrap_or(min_frac.max(3));
+            let e = decimal_magnitude(n.abs());
+            let (s_mag, f_mag) = (e - max_sig + 1, -i32::from(max_frac));
+            let use_s = if priority == "morePrecision" {
+                s_mag <= f_mag
+            } else {
+                s_mag > f_mag
+            };
+            if use_s {
+                opts.maximum_significant_digits = Some(max_sig as u8);
+                opts.minimum_significant_digits = opts.minimum_significant_digits.or(Some(1));
+                opts.minimum_fraction_digits = None;
+                opts.maximum_fraction_digits = None;
+            } else {
+                opts.minimum_fraction_digits = Some(min_frac);
+                opts.maximum_fraction_digits = Some(max_frac);
+                opts.minimum_significant_digits = None;
+                opts.maximum_significant_digits = None;
+            }
         }
         let increment = self
             .realm
@@ -8754,23 +8784,18 @@ impl Interp {
         }
     }
 
+    /// `trailingZeroDisplay: "stripIfInteger"`: an integer value (already
+    /// pre-rounded) drops its forced trailing fraction (and significant) zeros.
+    /// The intl crate has no such option, so lower the minimum digit counts for
+    /// this value. (A percentage is an integer when its scaled value is.)
+    /// Shared by `format` and `formatToParts`.
     #[cfg(feature = "intl")]
-    fn intl_format_number_inner(&mut self, handle: Handle, n: f64) -> String {
-        let locale = self
-            .realm
-            .get_property(handle, "\u{0}locale")
-            .map(|v| self.realm.to_display_string(v))
-            .unwrap_or_else(|| String::from("en"));
-        let mut opts = self.number_format_options(handle);
-        // Round the value's shortest round-trip decimal ourselves (ECMA-402 /
-        // ICU rounding) and hand the crate a "clean" value — this fixes the
-        // crate's binary-expansion rounding boundary (`1.15` → `1.2`, not `1.1`)
-        // and applies `roundingIncrement` (which the crate has no option for).
-        let n = self.number_precision_round(handle, &mut opts, n);
-        // `trailingZeroDisplay: "stripIfInteger"`: an integer value drops its
-        // forced trailing fraction (and significant) zeros. The intl crate has
-        // no such option, so lower the minimum digit counts for this value.
-        // (A percentage is an integer when its scaled value is.)
+    fn strip_if_integer(
+        &self,
+        handle: Handle,
+        opts: &mut intl::number::NumberFormatOptions,
+        n: f64,
+    ) {
         let shown = if matches!(opts.style, intl::number::NumberStyle::Percent) {
             decimal_shift(n, 2)
         } else {
@@ -8789,6 +8814,22 @@ impl Interp {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "intl")]
+    fn intl_format_number_inner(&mut self, handle: Handle, n: f64) -> String {
+        let locale = self
+            .realm
+            .get_property(handle, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        let mut opts = self.number_format_options(handle);
+        // Round the value's shortest round-trip decimal ourselves (ECMA-402 /
+        // ICU rounding) and hand the crate a "clean" value — this fixes the
+        // crate's binary-expansion rounding boundary (`1.15` → `1.2`, not `1.1`)
+        // and applies `roundingIncrement` (which the crate has no option for).
+        let n = self.number_precision_round(handle, &mut opts, n);
+        self.strip_if_integer(handle, &mut opts, n);
         // `intl` 0.5 panics formatting a true negative zero. Substitute the
         // smallest negative subnormal (which rounds to a displayed zero) so the
         // crate applies the locale's negative affix (e.g. ar's U+200E mark) and
@@ -8805,11 +8846,7 @@ impl Interp {
         // instead of `988M`). NaN/∞ carry no mantissa and fall through.
         if n.is_finite() && compact_wants_reround(&opts) {
             let mut o = opts;
-            // Six fraction digits past the ones the re-round keeps: a mantissa
-            // below 1 keeps `1 - e` of them (`1e-7` → `0.0000001`), so a fixed
-            // six would render it as `0` before the re-round could see a digit.
-            let keep = (1 - decimal_magnitude(n.abs())).max(0);
-            o.maximum_fraction_digits = Some((keep + 6).min(100) as u8);
+            o.maximum_fraction_digits = Some(compact_render_fraction_digits(n));
             let render = |v: f64| -> Vec<(&'static str, String)> {
                 intl::number::format_to_parts(&locale, v, &o)
                     .into_iter()
@@ -9799,6 +9836,7 @@ impl Interp {
         let mut opts = self.number_format_options(handle);
         // Pre-round to the ECMA-402 / ICU decimal (matches the `format` path).
         let n = self.number_precision_round(handle, &mut opts, n);
+        self.strip_if_integer(handle, &mut opts, n);
         // `intl` 0.5 panics formatting a true negative zero; feed the smallest
         // negative subnormal (rounds to a displayed zero) so the crate emits the
         // proper minusSign / locale marks and applies `signDisplay` itself.
@@ -9812,7 +9850,7 @@ impl Interp {
         // and [`compact_reround_parts`]).
         let reround = feed.is_finite() && compact_wants_reround(&opts);
         if reround {
-            opts.maximum_fraction_digits = Some(6);
+            opts.maximum_fraction_digits = Some(compact_render_fraction_digits(feed));
         }
         let render = |v: f64| -> Vec<(&'static str, String)> {
             intl::number::format_to_parts(&locale, v, &opts)
