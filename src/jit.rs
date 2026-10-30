@@ -1263,8 +1263,46 @@ pub fn lower_nbvm(proto: &crate::nbvm::FnProto) -> Option<Vec<RegOp>> {
 /// hold a number and must only be read by a branch, a `!` or a `Move`;
 /// otherwise the function is left to the generic tier, which boxes real
 /// booleans.
+///
+/// With `bool_return`, a body whose *every* `return` returns such a register
+/// (a predicate, `x => x % 3 === 0`) is sound too: its result is then always
+/// a native `0`/`1` that the caller boxes as `false`/`true`
+/// ([`JitProto::returns_bool`]). `Some(returns_bool)` when sound.
 #[cfg(feature = "alloc")]
-fn numeric_tier_booleans_sound(proto: &crate::nbvm::FnProto) -> bool {
+fn numeric_tier_booleans(proto: &crate::nbvm::FnProto, bool_return: bool) -> Option<bool> {
+    use crate::nbvm::Op;
+    let mut returns = (false, false); // (a boolean, a number)
+    let ok = numeric_tier_booleans_check(proto, &mut |is_bool| {
+        if is_bool {
+            returns.0 = true;
+        } else {
+            returns.1 = true;
+        }
+    });
+    if !ok {
+        return None;
+    }
+    match returns {
+        (false, _) => Some(false),
+        (true, false) if bool_return => {
+            // Every exit must be a `Return` (no fall-off `undefined`).
+            proto
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Return { .. }))
+                .then_some(true)
+        }
+        _ => None,
+    }
+}
+
+/// [`numeric_tier_booleans`] without the return rule: `on_return(is_bool)` is
+/// told of each `return`'s register kind.
+#[cfg(feature = "alloc")]
+fn numeric_tier_booleans_check(
+    proto: &crate::nbvm::FnProto,
+    on_return: &mut dyn FnMut(bool),
+) -> bool {
     use crate::nbvm::Op;
     let n = proto.n_regs;
     let mut boolish = alloc::vec![false; n];
@@ -1305,6 +1343,7 @@ fn numeric_tier_booleans_sound(proto: &crate::nbvm::FnProto) -> bool {
         match op {
             Op::JumpIfFalse { .. } => {}
             Op::Not { .. } => {}
+            Op::Return { src } => on_return(is_b(*src)),
             Op::Move { dst, src } => {
                 if is_b(*dst) != is_b(*src) {
                     return false; // a boolean register also receives a number
@@ -1348,7 +1387,7 @@ pub fn lower_nbvm_with(
     if proto.n_regs > 64
         || proto.n_params > 6
         || proto.n_captures != 0
-        || !numeric_tier_booleans_sound(proto)
+        || numeric_tier_booleans(proto, true).is_none()
     {
         return None;
     }
@@ -1633,7 +1672,7 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
     if proto.n_regs > 64
         || proto.n_params > 4
         || proto.n_captures != 0
-        || !numeric_tier_booleans_sound(proto)
+        || numeric_tier_booleans(proto, false).is_none()
     {
         return None;
     }
@@ -2912,6 +2951,10 @@ pub struct JitProto {
     /// own pc its pc in the body, and per body pc the function's own (or
     /// `u32::MAX` inside an inlined body).
     pc_map: Option<alloc::boxed::Box<(Vec<u32>, Vec<u32>)>>,
+    /// Int tier: the body returns a comparison's native `0`/`1` (a predicate;
+    /// see [`numeric_tier_booleans`]), which [`Self::call_guarded`] boxes as
+    /// a boolean. Such a body is never a native callee of another Int body.
+    returns_bool: bool,
 }
 
 /// Per-site key + inline-cache storage for a generic-tier body, owned by the
@@ -3459,6 +3502,7 @@ impl JitProto {
         registry: &alloc::collections::BTreeMap<u32, u64>,
     ) -> Option<Self> {
         if let Some(ops) = lower_nbvm_with(proto, registry) {
+            let returns_bool = numeric_tier_booleans(proto, true) == Some(true);
             let has_call = ops.iter().any(|o| matches!(o, RegOp::Call { .. }));
             let func = if has_call {
                 // Call programs skip the constant/allocation passes (which assume
@@ -3481,6 +3525,7 @@ impl JitProto {
                 osr_entries: Vec::new(),
                 bytecode: None,
                 pc_map: None,
+                returns_bool,
             });
         }
         let ops = lower_nbvm_float(proto)?;
@@ -3495,6 +3540,7 @@ impl JitProto {
             osr_entries: Vec::new(),
             bytecode: None,
             pc_map: None,
+            returns_bool: false,
         })
     }
 
@@ -3532,7 +3578,11 @@ impl JitProto {
                 let r = self.func.call_int6(a);
                 // A result outside ±2^53 is the overflow/range deopt sentinel.
                 if (-SAFE_INT_MAX..=SAFE_INT_MAX).contains(&r) {
-                    Some(crate::nanbox::NanBox::number(r as f64))
+                    Some(if self.returns_bool {
+                        crate::nanbox::NanBox::boolean(r != 0)
+                    } else {
+                        crate::nanbox::NanBox::number(r as f64)
+                    })
                 } else {
                     None
                 }
@@ -3861,6 +3911,7 @@ impl JitProto {
             osr_entries,
             bytecode: Some(bytecode),
             pc_map,
+            returns_bool: false,
         })
     }
 
@@ -4013,6 +4064,14 @@ impl JitProto {
     #[must_use]
     pub fn is_generic(&self) -> bool {
         self.kind == JitKind::Generic
+    }
+
+    /// Whether this Int-tier body returns a boolean as a native `0`/`1` (see
+    /// [`Self::call_guarded`]): a native caller would read it as a number, so
+    /// it must not be a JIT→JIT direct-call target.
+    #[must_use]
+    pub fn returns_bool(&self) -> bool {
+        self.returns_bool
     }
 
     /// The [`AbiKind`] this body exposes to a caller's native code — the tier it

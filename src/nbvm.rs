@@ -4988,6 +4988,7 @@ fn ensure_jit(
                 && fid < funcs.len()
                 && let Some(j) = ensure_jit(cache, funcs, fid, stack, None)
                 && j.abi_kind() == crate::jit::AbiKind::Int
+                && !j.returns_bool()
             {
                 registry.insert(*func, j.code_ptr() as u64);
             }
@@ -29128,16 +29129,41 @@ mod generic_jit_tests {
     }
 
     /// The unboxed numeric tiers compute comparisons as native `0`/`1`: a body
-    /// whose comparison result is *returned* or used as a number is left to the
-    /// generic tier (which boxes real booleans), while a comparison used only as
-    /// a branch condition keeps the numeric tier.
+    /// whose comparison result is used as a number, or returned on some paths
+    /// only, is left to the generic tier (which boxes real booleans), while a
+    /// comparison used only as a branch condition keeps the numeric tier. A
+    /// predicate (every `return` a comparison) takes the Int tier, boxed as a
+    /// boolean, and is never a native callee.
     #[test]
     fn numeric_tiers_refuse_value_booleans() {
+        for (src, args, want) in [
+            ("function f(n){ return n % 2 === 0; }", 4.0, true),
+            ("function f(n){ return n % 2 === 0; }", 5.0, false),
+            ("function f(n){ return !n; }", 0.0, true),
+            (
+                "function f(n){ if (n < 3) return n === 1; return n === 7; }",
+                7.0,
+                true,
+            ),
+        ] {
+            let (funcs, f) = compile_named(src, "f");
+            assert!(crate::jit::lower_nbvm(&funcs[f]).is_some(), "{src}");
+            assert!(crate::jit::lower_nbvm_float(&funcs[f]).is_none(), "{src}");
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                let jit = crate::jit::JitProto::compile(&funcs[f]).expect("Int tier");
+                assert!(jit.returns_bool(), "{src}");
+                assert_eq!(
+                    jit.call_guarded(&[NanBox::number(args)]),
+                    Some(NanBox::boolean(want)),
+                    "{src}"
+                );
+            }
+        }
         for src in [
-            "function f(n){ return n % 2 === 0; }",
-            "function f(n){ return !n; }",
             "function f(n){ return (n < 2) === 1; }",
             "function f(n){ return (n < 2) + 1; }",
+            "function f(n){ if (n < 0) return n; return n === 7; }",
         ] {
             let (funcs, f) = compile_named(src, "f");
             assert!(crate::jit::lower_nbvm(&funcs[f]).is_none(), "{src}");
