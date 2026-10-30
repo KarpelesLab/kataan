@@ -6541,7 +6541,8 @@ impl JitFunction {
                 continue;
             }
             a.cmp_rdx_imm32(i32::try_from(t).ok()?);
-            a.je(labels[t]);
+            let to = num.entry_label(&mut a, &labels, t)?;
+            a.je(to);
         }
         a.test_rdx_rdx();
         a.jne(refuse_exit); // an unknown entry is a caller bug: refuse, never misrun
@@ -8905,7 +8906,7 @@ impl JitFunction {
                     if target <= op_idx {
                         backedge!(target);
                     }
-                    a.jmp(labels[target]);
+                    a.jmp(num.branch_label(&labels, op_idx, target)?);
                 }
                 GenericOp::JumpIfFalse { cond, target } => {
                     if !ok(cond) || target > ops.len() {
@@ -8913,14 +8914,15 @@ impl JitFunction {
                     }
                     truthy_rax!(op_idx, cond, None);
                     a.test_rax_rax();
+                    let to = num.branch_label(&labels, op_idx, target)?;
                     if target <= op_idx {
                         let stay = a.new_label();
                         a.jne(stay);
                         backedge!(target);
-                        a.jmp(labels[target]);
+                        a.jmp(to);
                         a.bind(stay);
                     } else {
-                        a.je(labels[target]); // falsy (truthy == 0) → branch
+                        a.je(to); // falsy (truthy == 0) → branch
                     }
                 }
                 GenericOp::CallNative { dst, native, site } => {

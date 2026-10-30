@@ -35,6 +35,13 @@
 //! back-edge poll, so a loop that stays on its fast paths runs with no memory
 //! traffic for its promoted registers.
 //!
+//! A call-free **loop nest** of such generic loops is one region too
+//! ([`plan_nests`]): the outer loop's registers stay in their SSE registers
+//! across the inner loops (a register live into an inner header holds its
+//! register over that whole loop), the inner loops' entries and exits are
+//! plain branches, and their back-edges poll like the outer one. An entry at
+//! an inner header (on-stack replacement) loads the registers live there.
+//!
 //! Every arithmetic result is NaN-canonicalized before it is stored, so a value
 //! the native code produces is bit-identical to the interpreter's `NanBox`.
 
@@ -567,6 +574,8 @@ struct Region {
     /// The property reads the speculative version replaces by a copy of the
     /// register already holding the value ([`plan_reuse`]): `(pc, src)`.
     reuse: Vec<(usize, u16)>,
+    /// A loop nest's inner back-edges, as `(header, back-edge)` ([`plan_nests`]).
+    loops: Vec<(usize, usize)>,
 }
 
 /// A region's **speculative** double version: arithmetic whose operands are
@@ -693,6 +702,9 @@ struct Stub {
     /// Emitted by a region's integer version (its flush / reload convert the
     /// int registers).
     int: bool,
+    /// Emitted in a speculative region's plain copy (its branches stay in
+    /// the copy: [`NumGen::branch_label`]).
+    copy: bool,
 }
 
 /// The per-compilation state of the numeric emitter.
@@ -739,6 +751,9 @@ pub(super) struct NumGen {
     /// Where a back-edge poll that asks the body to leave for the
     /// interpreter jumps (with the promoted registers flushed).
     pub(super) leave_exit: Option<Label>,
+    /// The entries at a loop nest's inner headers (on-stack replacement
+    /// there), as `(label, pc)` ([`Self::entry_label`]).
+    nest_entries: Vec<(Label, usize)>,
 }
 
 /// The ops a region may contain: each is emitted here, with calls only on slow
@@ -938,6 +953,7 @@ impl NumGen {
             copy_labels: vec![None; n],
             truthy_ways: Vec::new(),
             leave_exit: None,
+            nest_entries: Vec::new(),
         }
     }
 
@@ -966,6 +982,27 @@ impl NumGen {
             }
         }
         out
+    }
+
+    /// Where the body's entry at loop header `pc` (`0`, or an on-stack
+    /// replacement) goes: an inner header of a loop nest is entered through
+    /// a stub ([`Self::finish`]) that loads the promoted registers live
+    /// there, or — in a speculative nest — runs the plain copy from there
+    /// (which re-enters the fast version at the nest's own header).
+    pub(super) fn entry_label(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        pc: usize,
+    ) -> Option<Label> {
+        match self.region_at(pc) {
+            Some(ri) if self.regions[ri].head != pc => {
+                let l = a.new_label();
+                self.nest_entries.push((l, pc));
+                Some(l)
+            }
+            _ => labels.get(pc).copied(),
+        }
     }
 
     /// Sets where a back-edge poll that asks the body to leave jumps.
@@ -1186,7 +1223,8 @@ impl NumGen {
     /// still holding its binding's value, when an earlier global op of the
     /// iteration on the same name read it into one, or wrote it from one,
     /// that no op since has written. (The fast version runs straight from
-    /// the header: its only branches leave it.)
+    /// the header, or from a loop nest's last join: its other branches
+    /// leave it.)
     fn global_known(&self, ri: usize, pc: usize) -> Option<u16> {
         let Op::LoadGlobal { name, .. } = self.bc(pc)? else {
             return None;
@@ -1194,6 +1232,10 @@ impl NumGen {
         let head = self.regions[ri].head;
         let (mut d, mut u) = (Vec::new(), Vec::new());
         for q in (head..pc).rev() {
+            // (Not across a join: a loop nest's inner header or exit.)
+            if self.is_target.get(q + 1).copied().unwrap_or(true) {
+                return None;
+            }
             let bq = self.bc(q)?;
             let held = match bq {
                 Op::LoadGlobal { name: n, dst, .. } if n == name => Some(*dst),
@@ -1295,8 +1337,8 @@ impl NumGen {
     /// of its global ops has a validated binding address (else, with
     /// nothing promoted yet, the plain copy runs the iteration). Clobbers
     /// nothing.
-    fn spec_globals_ready(&self, a: &mut X64Assembler, ri: usize) -> Option<()> {
-        let copy = self.copy_label(self.regions[ri].head)?;
+    fn spec_globals_ready(&self, a: &mut X64Assembler, ri: usize, pc: usize) -> Option<()> {
+        let copy = self.copy_label(pc)?;
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
             a.jcc(CC_E, copy);
@@ -1331,6 +1373,7 @@ impl NumGen {
             kind: StubKind::SpecBail { pc: pc as u32 },
             branch: None,
             int: false,
+            copy: self.copy,
         });
         Some(entry)
     }
@@ -1413,7 +1456,7 @@ impl NumGen {
             let validate = self.regions[ri].spec.is_some();
             if validate {
                 self.refresh_globals(a, ri, true);
-                self.spec_globals_ready(a, ri)?;
+                self.spec_globals_ready(a, ri, pc)?;
             }
             for s in &self.regions[ri].slots {
                 if s.carried {
@@ -1817,8 +1860,10 @@ impl NumGen {
             GenericOp::Jump { target } if reg.is_some() => {
                 let ri = reg?;
                 if target <= pc {
-                    // The region's back-edge: poll, then the in-region header.
-                    if pc != self.regions[ri].end || target != self.regions[ri].head {
+                    // The region's back-edge (or, in a loop nest, an inner
+                    // loop's): poll, then the in-region header.
+                    let nested = pc != self.regions[ri].end || target != self.regions[ri].head;
+                    if nested && !self.regions[ri].loops.contains(&(target, pc)) {
                         return None;
                     }
                     let skip = a.new_label();
@@ -1851,14 +1896,18 @@ impl NumGen {
                     let validate = self.regions[ri].spec.is_some();
                     if validate {
                         self.refresh_globals(a, ri, true);
-                        self.spec_globals_ready(a, ri)?;
+                        self.spec_globals_ready(a, ri, target)?;
                     }
                     self.reload(a, reg);
                     if !validate {
                         self.refresh_globals(a, ri, false);
                     }
                     a.bind(skip);
-                    a.jmp(self.regions[ri].inner?);
+                    if nested {
+                        a.jmp(*labels.get(target)?);
+                    } else {
+                        a.jmp(self.regions[ri].inner?);
+                    }
                 } else {
                     self.jump(a, labels, reg, target);
                 }
@@ -2257,6 +2306,7 @@ impl NumGen {
             kind,
             branch: None,
             int: self.imode.is_some(),
+            copy: self.copy,
         });
     }
 
@@ -2890,7 +2940,7 @@ impl NumGen {
         target: usize,
     ) -> Option<Label> {
         match reg {
-            None => labels.get(target).copied(),
+            None => self.branch_label(labels, self.cur_pc, target),
             Some(ri) => {
                 let rg = &self.regions[ri];
                 if target == rg.head && self.imode == Some(ri) {
@@ -2904,6 +2954,28 @@ impl NumGen {
                 }
             }
         }
+    }
+
+    /// Where a branch from op `from` to `target` goes: in a speculative
+    /// loop nest's plain copy, a target in the nest past its header is the
+    /// copy's own op (the copy runs on the register file, the fast version
+    /// on its SSE registers; only the outer back-edge goes back through the
+    /// region's entry, which loads and checks them), else `target`'s label.
+    pub(super) fn branch_label(
+        &self,
+        labels: &[Label],
+        from: usize,
+        target: usize,
+    ) -> Option<Label> {
+        if self.copy
+            && let Some(&ri) = self.region_of.get(from)
+            && ri != u32::MAX
+            && self.region_of.get(target) == Some(&ri)
+            && self.regions[ri as usize].head != target
+        {
+            return self.copy_label(target);
+        }
+        labels.get(target).copied()
     }
 
     /// `goto target` (flushing first if that leaves region `reg`).
@@ -2946,6 +3018,7 @@ impl NumGen {
         for s in &stubs {
             a.bind(s.entry);
             self.cur_pc = s.pc;
+            self.copy = s.copy;
             self.imode = if s.int { s.region } else { None };
             match s.kind {
                 StubKind::Bail { pc, store } => {
@@ -3119,6 +3192,29 @@ impl NumGen {
             }
         }
         self.imode = None;
+        self.copy = false;
+        for (l, pc) in core::mem::take(&mut self.nest_entries) {
+            a.bind(l);
+            let Some(ri) = self.region_at(pc) else {
+                continue;
+            };
+            self.cur_pc = pc;
+            if self.regions[ri].spec.is_some() {
+                if let Some(c) = self.copy_label(pc) {
+                    a.jmp(c);
+                }
+                continue;
+            }
+            self.refresh_globals(a, ri, false);
+            for s in &self.regions[ri].slots {
+                if s.start <= pc && pc <= s.end {
+                    a.movsd_x_mem(s.xmm, disp(s.reg));
+                }
+            }
+            if let Some(&t) = labels.get(pc) {
+                a.jmp(t);
+            }
+        }
     }
 }
 
@@ -3408,6 +3504,8 @@ fn plan_regions(
     if cands.is_empty() {
         return Vec::new();
     }
+    // Loop nests around them (each with the inner back-edges it contains).
+    let cands = plan_nests(ops, bytecode, catches, cands);
     let Some((words, live)) = liveness(bytecode, n_regs, catches) else {
         return Vec::new();
     };
@@ -3417,7 +3515,7 @@ fn plan_regions(
             && live[pc * words + r as usize / 64] & (1u64 << (r % 64)) != 0
     };
     let mut out = Vec::new();
-    for (head, end) in cands {
+    for (head, end, loops) in cands {
         // Per register named in the body: first / last mention, uses, written.
         let mut info: Vec<(u16, usize, usize, u32, bool)> = Vec::new();
         let mut exits: Vec<usize> = Vec::new();
@@ -3504,6 +3602,22 @@ fn plan_regions(
             }
         }
         info.retain(|x| !pinned.contains(&x.0));
+        // In a nest, a register live into an inner loop's header holds its
+        // value around that loop's back-edge too: its interval covers the
+        // whole inner loop (to a fixpoint, for loops nested deeper).
+        let mut grown = !loops.is_empty();
+        while grown {
+            grown = false;
+            for x in &mut info {
+                for &(h, e) in &loops {
+                    if is_live(h, x.0) && (x.1 > h || x.2 < e) {
+                        x.1 = x.1.min(h);
+                        x.2 = x.2.max(e);
+                        grown = true;
+                    }
+                }
+            }
+        }
         // Loop-carried: live into the header, at an exit, or at a catch entry.
         let carried_r = |r: u16| {
             is_live(head, r)
@@ -3610,8 +3724,121 @@ fn plan_regions(
             spec: None,
             raw_nan: raw_nan_results(ops, bytecode, head, end, &carried_r),
             reuse,
+            loops,
         });
     }
+    out
+}
+
+/// Grows the innermost candidate loops `cands` into **loop nests**: an outer
+/// loop `head..=end` (its back-edge the unconditional `Jump` at `end`) whose
+/// every op is a region op and whose every other backward branch is the
+/// back-edge of a loop nested in it that is itself a candidate (or a nest),
+/// with no catch entry inside and no branch from outside into its body, is
+/// promoted as one region: the outer loop's registers stay in their SSE
+/// registers across the inner loops, whose entries and exits are then plain
+/// in-region branches. Only nests of generic loops, all of them call-free
+/// (an inner loop of numeric ops alone keeps its own region and its integer
+/// version; a call would store and reload the outer registers around it).
+/// The outermost qualifying loop wins. Returns the regions to plan as
+/// `(head, end, inner back-edges)`.
+#[allow(clippy::type_complexity)]
+fn plan_nests(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    catches: &[usize],
+    cands: Vec<(usize, usize)>,
+) -> Vec<(usize, usize, Vec<(usize, usize)>)> {
+    // The back-edges of the body, innermost first.
+    let mut backs: Vec<(usize, usize)> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(e, op)| match *op {
+            GenericOp::Jump { target: h } if h < e => Some((h, e)),
+            _ => None,
+        })
+        .collect();
+    let simple =
+        |cands: &[(usize, usize)]| cands.iter().map(|&(h, e)| (h, e, Vec::new())).collect();
+    if backs.len() < 2 {
+        return simple(&cands);
+    }
+    backs.sort_by_key(|&(h, e)| e - h);
+    // Every branch of the body, as `(from, to)`.
+    let branches: Vec<(usize, usize)> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| match *op {
+            GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => {
+                Some((pc, target))
+            }
+            GenericOp::PushHandler { target, .. } => Some((pc, target)),
+            _ => None,
+        })
+        .collect();
+    let generic_loop = |h: usize, e: usize| {
+        (h..=e).any(|pc| generic_region_op(&ops[pc], &bytecode[pc]))
+            && !(h..=e).any(|pc| region_call(&ops[pc], &bytecode[pc]))
+    };
+    // Per back-edge (as in `backs`): the inner back-edges of the nest it heads.
+    let mut nest: Vec<Option<Vec<(usize, usize)>>> = vec![None; backs.len()];
+    for i in 0..backs.len() {
+        let (head, end) = backs[i];
+        let body = head..=end;
+        if !body.clone().all(|pc| region_op_ok(&ops[pc], &bytecode[pc]))
+            || catches.iter().any(|c| body.contains(c))
+            || branches
+                .iter()
+                .any(|&(f, t)| !body.contains(&f) && t > head && t <= end)
+            || !generic_loop(head, end)
+        {
+            continue;
+        }
+        // Every other backward branch: a nested loop's (a candidate or a
+        // nest), properly inside.
+        let mut inner: Vec<(usize, usize)> = Vec::new();
+        let mut ok = true;
+        for &(f, t) in &branches {
+            if f == end || !body.contains(&f) || t > f {
+                continue;
+            }
+            let edge = (t, f);
+            let jump = matches!(ops[f], GenericOp::Jump { .. });
+            let nested = cands.contains(&edge) && generic_loop(t, f)
+                || backs[..i]
+                    .iter()
+                    .position(|&b| b == edge)
+                    .and_then(|k| nest[k].as_ref())
+                    .is_some();
+            if !jump || t <= head || !nested {
+                ok = false;
+                break;
+            }
+            inner.push(edge);
+        }
+        if ok && !inner.is_empty() {
+            nest[i] = Some(inner);
+        }
+    }
+    // The outermost nests, then the candidates outside them.
+    let mut out: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
+    for i in (0..backs.len()).rev() {
+        let (h, e) = backs[i];
+        if let Some(inner) = &nest[i]
+            && !out.iter().any(|&(oh, oe, _)| oh <= e && h <= oe)
+        {
+            out.push((h, e, inner.clone()));
+        }
+    }
+    if out.is_empty() {
+        return simple(&cands);
+    }
+    for &(h, e) in &cands {
+        if !out.iter().any(|&(oh, oe, _)| oh <= e && h <= oe) {
+            out.push((h, e, Vec::new()));
+        }
+    }
+    out.sort_by_key(|x| x.0);
     out
 }
 
@@ -3651,10 +3878,24 @@ fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Ve
     let mut avail: Vec<(u16, &str, u16)> = Vec::new();
     let mut out = Vec::new();
     let (mut d, mut u) = (Vec::new(), Vec::new());
+    // A loop nest's in-body branch targets (its inner loops' headers and
+    // exits) are joins: nothing is known there.
+    let mut joins: Vec<usize> = Vec::new();
+    for op in ops.get(head..=end).unwrap_or(&[]) {
+        if let GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } = *op
+            && target > head
+            && target <= end
+        {
+            joins.push(target);
+        }
+    }
     for pc in head..end.min(ops.len()) {
         let (Some(op), Some(bc)) = (ops.get(pc), bytecode.get(pc)) else {
             break;
         };
+        if joins.contains(&pc) {
+            avail.clear();
+        }
         match (op, bc) {
             (GenericOp::GetProp { .. }, Op::GetProp { dst, obj, key }) => {
                 let (dst, obj) = (*dst, *obj);
@@ -3935,7 +4176,9 @@ fn plan_spec(
             GenericOp::PushHandler { .. } => return None,
             _ => continue,
         };
-        if pc != end && (head..=end).contains(&t) {
+        // (A loop nest's in-body branches are its inner loops': the plain
+        // copy keeps them to itself, `NumGen::branch_label`.)
+        if pc != end && (head..=end).contains(&t) && r.loops.is_empty() {
             return None;
         }
     }
@@ -3969,9 +4212,13 @@ fn plan_spec(
             cur[x as usize] = T_NUM;
         }
         let mut rows = Vec::with_capacity(len * n_regs);
-        for (i, op) in bytecode[head..=end].iter().enumerate() {
-            rows.extend_from_slice(&cur);
-            spec_step(op, head + i, &r.reuse, &mut cur);
+        if r.loops.is_empty() {
+            for (i, op) in bytecode[head..=end].iter().enumerate() {
+                rows.extend_from_slice(&cur);
+                spec_step(op, head + i, &r.reuse, &mut cur);
+            }
+        } else {
+            cur = spec_nest_rows(r, ops, bytecode, n_regs, cur, &mut rows);
         }
         // `cur` is the back-edge's state: an assumed register the loop writes
         // must come back a Number.
@@ -3984,6 +4231,67 @@ fn plan_spec(
             });
         }
     }
+}
+
+/// [`plan_spec`]'s in-state rows for loop nest `r` (into `rows`), its entry
+/// state `entry`: a forward dataflow over the nest's body to a fixpoint (its
+/// inner loops' back-edges and exits are joins). Returns the state the
+/// outer back-edge carries to the header.
+fn spec_nest_rows(
+    r: &Region,
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    n_regs: usize,
+    entry: Vec<u8>,
+    rows: &mut Vec<u8>,
+) -> Vec<u8> {
+    let (head, end) = (r.head, r.end);
+    let len = end - head + 1;
+    rows.clear();
+    rows.resize(len * n_regs, T_BOT);
+    rows[..n_regs].copy_from_slice(&entry);
+    let mut back = vec![T_BOT; n_regs];
+    let mut cur = vec![T_BOT; n_regs];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..len {
+            let pc = head + i;
+            cur.copy_from_slice(&rows[i * n_regs..(i + 1) * n_regs]);
+            if cur.iter().all(|&t| t == T_BOT) && n_regs > 0 {
+                continue;
+            }
+            spec_step(&bytecode[pc], pc, &r.reuse, &mut cur);
+            let (falls, target) = match ops[pc] {
+                GenericOp::Jump { target } => (false, Some(target)),
+                GenericOp::JumpIfFalse { target, .. } => (true, Some(target)),
+                _ => (true, None),
+            };
+            let mut flow = |to: usize, rows: &mut Vec<u8>, changed: &mut bool| {
+                if to == head {
+                    for (b, &c) in back.iter_mut().zip(&cur) {
+                        *b = join(*b, c);
+                    }
+                } else if to > head && to <= end {
+                    let row = &mut rows[(to - head) * n_regs..(to - head + 1) * n_regs];
+                    for (x, &c) in row.iter_mut().zip(&cur) {
+                        let j = join(*x, c);
+                        if j != *x {
+                            *x = j;
+                            *changed = true;
+                        }
+                    }
+                }
+            };
+            if falls && pc < end {
+                flow(pc + 1, rows, &mut changed);
+            }
+            if let Some(t) = target {
+                flow(t, rows, &mut changed);
+            }
+        }
+    }
+    back
 }
 
 /// The register a region op writes (region ops write at most one, `dst`).
@@ -4326,6 +4634,48 @@ mod tests {
         assert_eq!(regions.len(), 1);
         let t = infer(&b.ops, b.n_regs);
         assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs).is_none());
+    }
+
+    #[test]
+    fn loop_nests_promote_across_inner_loops() {
+        // A call-free nest of generic loops: one region, its inner
+        // back-edge recorded, the outer object and index live across the
+        // inner loop held for all of it, and a speculative version.
+        let p = proto_of(
+            "function f(bs){ let s = 0; for (let i = 0; i < bs.length; i = i + 1) { const a = bs[i]; for (let j = i + 1; j < bs.length; j = j + 1) { s = s + a.x * bs[j].x; } } return s; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let mut regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1, "one nest");
+        let types = infer(&p.ops, p.n_regs);
+        let r = &mut regions[0];
+        assert_eq!(r.loops.len(), 1, "one inner loop");
+        let (h, e) = r.loops[0];
+        assert!(r.head < h && e < r.end);
+        assert!(matches!(ops[e], GenericOp::Jump { target } if target == h));
+        // A register live into the inner header covers the whole inner loop.
+        let (words, live) = liveness(&p.ops, p.n_regs, &[]).expect("liveness");
+        for s in &r.slots {
+            let at_h = live[h * words + s.reg as usize / 64] & (1u64 << (s.reg % 64)) != 0;
+            if at_h {
+                assert!(
+                    s.start <= h && s.end >= e,
+                    "slot r{} spans the inner loop",
+                    s.reg
+                );
+            }
+        }
+        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs);
+        assert!(r.spec.is_some(), "the nest has a speculative version");
+        // An inner loop with a call keeps its own region (no nest).
+        let q = proto_of(
+            "function g(bs, f){ let s = 0; for (let i = 0; i < bs.length; i = i + 1) { const a = bs[i]; for (let j = 0; j < bs.length; j = j + 1) { s = s + f(a.x); } } return s; }",
+            "g",
+        );
+        let (qops, ..) = crate::jit::lower_nbvm_generic(&q).expect("generic");
+        let qr = plan_regions(&qops, &q.ops, &[], q.n_regs);
+        assert!(qr.iter().all(|r| r.loops.is_empty()));
     }
 
     #[test]
