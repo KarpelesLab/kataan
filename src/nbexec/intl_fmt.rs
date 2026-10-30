@@ -12,6 +12,28 @@ macro_rules! islot {
     };
 }
 
+/// `s` with each letter that has a one-character opposite case swapped to it
+/// (`"aB"` -> `"Ab"`); other characters are kept. Used by `caseFirst: "upper"`.
+#[cfg(feature = "intl")]
+fn swap_letter_case(s: &str) -> String {
+    fn single(mut it: impl Iterator<Item = char>) -> Option<char> {
+        let c = it.next()?;
+        it.next().is_none().then_some(c)
+    }
+    s.chars()
+        .map(|c| {
+            let swapped = if c.is_lowercase() {
+                single(c.to_uppercase())
+            } else if c.is_uppercase() {
+                single(c.to_lowercase())
+            } else {
+                None
+            };
+            swapped.unwrap_or(c)
+        })
+        .collect()
+}
+
 /// [`islot!`] of a computed slot name; a name that already is an internal key
 /// (`"\u{0}locale"`) is its own storage key. The slot names are static keys
 /// (the formatters read a dozen slots per call); any other name is built.
@@ -3993,8 +4015,7 @@ impl Interp {
             let collation = get_str(self, "collation").unwrap_or_else(|| String::from("default"));
             let cv = self.new_str(&collation);
             self.realm.set_property(out, "collation", cv);
-            // `numeric`/`caseFirst` are reported only when the instance resolved
-            // them (they are optional keys of the resolved-options table).
+            // `numeric`/`caseFirst` (always resolved by InitializeCollator here).
             if let Some(n) = fmt.and_then(|h| self.realm.get_property(h, islot!("numeric"))) {
                 let nv = NanBox::boolean(self.realm.truthy(n));
                 self.realm.set_property(out, "numeric", nv);
@@ -5365,7 +5386,9 @@ impl Interp {
             additions.retain(|a| !a.starts_with("-co-"));
         }
 
-        // kn (numeric): default false; reported only when set from ext or option.
+        // kn (numeric): default false. Both "kn" and "kf" are relevant extension
+        // keys of this implementation, so [[Numeric]] and [[CaseFirst]] always
+        // exist and resolvedOptions always reports them.
         let ext_kn = locale_unicode_bool_keyword(&locale, "kn");
         let mut kn_value = ext_kn.unwrap_or(false);
         if let Some(b) = ext_kn {
@@ -5381,9 +5404,8 @@ impl Interp {
             kn_value = opt;
             additions.retain(|a| a != "-kn" && a != "-kn-false");
         }
-        let kn_reported = ext_kn.is_some() || numeric.is_some();
 
-        // kf (caseFirst): reported only when set from ext or option.
+        // kf (caseFirst): default "false".
         let mut kf_value: Option<String> = None;
         if let Some(ext) = locale_unicode_keyword(&locale, "kf")
             && matches!(ext.as_str(), "upper" | "lower" | "false")
@@ -5409,13 +5431,10 @@ impl Interp {
         self.realm
             .set_hidden_property(obj, islot!("ignorePunctuation"), ipv);
         self.store_str(obj, "collation", &Some(co_value));
-        if kn_reported {
-            self.realm
-                .set_hidden_property(obj, islot!("numeric"), NanBox::boolean(kn_value));
-        }
-        if let Some(cf) = kf_value {
-            self.store_str(obj, "caseFirst", &Some(cf));
-        }
+        self.realm
+            .set_hidden_property(obj, islot!("numeric"), NanBox::boolean(kn_value));
+        let cf = kf_value.unwrap_or_else(|| String::from("false"));
+        self.store_str(obj, "caseFirst", &Some(cf));
         self.brand_intl_instance(obj, N_INTL_COLLATOR);
         Ok(())
     }
@@ -5451,6 +5470,26 @@ impl Interp {
                 .map(|v| v.unpack()),
             Some(Unpacked::Bool(true))
         );
+        // `caseFirst: "upper"` orders an uppercase letter before its lowercase
+        // form at the case (tertiary) level; the crate's collator only knows the
+        // UCA default, lowercase first. Swapping the case of every letter in both
+        // operands inverts exactly that one ordering (case variants share their
+        // primary and secondary weights, and the swap keeps width and other
+        // tertiary variants), so the default comparison of the swapped strings
+        // is the upper-first comparison of the originals. "lower" and "false"
+        // are the default order.
+        let upper_first = ch
+            .and_then(|h| self.realm.get_property(h, islot!("caseFirst")))
+            .map(|v| self.realm.to_display_string(v))
+            .is_some_and(|cf| cf == "upper");
+        let (swapped_a, swapped_b);
+        let (a, b) = if upper_first {
+            swapped_a = swap_letter_case(a);
+            swapped_b = swap_letter_case(b);
+            (swapped_a.as_str(), swapped_b.as_str())
+        } else {
+            (a, b)
+        };
         let alternate = if matches!(
             ch.and_then(|h| self.realm.get_property(h, islot!("ignorePunctuation")))
                 .map(|v| v.unpack()),

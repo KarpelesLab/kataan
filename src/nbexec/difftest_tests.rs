@@ -2311,3 +2311,24 @@ fn far_array_writes_stay_sparse() {
         assert_eq!(realm.array_length(h), Some(100_000_000));
     }
 }
+
+/// `caseFirst: "upper"` (or `-u-kf-upper`) orders an uppercase letter before
+/// its lowercase form; the option was accepted and reported but the comparison
+/// kept the default lowercase-first order. `numeric` and `caseFirst` are
+/// relevant extension keys here, so resolvedOptions reports them by default.
+#[cfg(feature = "intl")]
+#[test]
+fn collator_case_first_upper_orders_uppercase_first() {
+    let src = r#"
+        var up = new Intl.Collator("en", { caseFirst: "upper" });
+        var upc = new Intl.Collator("en", { caseFirst: "upper", sensitivity: "case" });
+        var lo = new Intl.Collator("en", { caseFirst: "lower" });
+        var ro = new Intl.Collator("en").resolvedOptions();
+        [up.compare("a", "A"), up.compare("ab", "Ab"), up.compare("aB", "ab"), up.compare("a", "B"),
+         upc.compare("a", "A"), lo.compare("a", "A"),
+         new Intl.Collator("en-u-kf-upper").compare("a", "A"),
+         ["b", "A", "a", "B"].sort(up.compare).join(""),
+         ro.numeric, ro.caseFirst].join()
+    "#;
+    assert_eq!(run(src), "1,1,-1,-1,1,-1,1,AaBb,false,false");
+}
