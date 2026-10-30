@@ -3964,12 +3964,17 @@ impl Interp {
                     // digits and a string's bytes (lone surrogates intact) are
                     // appended in place, with no per-element `String`; a seam
                     // between a lone high and a lone low surrogate is paired.
+                    // Once an element's ToString has run user code (an object
+                    // element's `toString`/`valueOf`), that code may have changed
+                    // the array, so the remaining elements are read live rather
+                    // than from the snapshot (`len` stays the one read up front).
                     let mut out: Vec<u8> = Vec::new();
+                    let mut live = precise_array;
                     for (k, dense) in elems.iter().enumerate() {
                         if k > 0 {
                             crate::wtf8::append(&mut out, &sep);
                         }
-                        let e = if precise_array {
+                        let e = if live {
                             self.read_member(handle, &alloc::format!("{k}"))?
                         } else {
                             *dense
@@ -3992,6 +3997,7 @@ impl Interp {
                             // conversion and throws a TypeError (the raw display
                             // string would render `Symbol(x)` instead).
                             _ => {
+                                live |= self.is_object_value(e);
                                 let b = self.arg_string_bytes_fallible(e)?;
                                 crate::wtf8::append(&mut out, &b);
                             }
@@ -4048,9 +4054,13 @@ impl Interp {
                     // `[[Get]]` (spec `Get(O, k)`): a hole resolves through the
                     // prototype chain, so an inherited element's `toLocaleString` is
                     // invoked too (rather than rendering empty).
+                    // Every invoked `toLocaleString` is user code that may change
+                    // the array, so after the first one the remaining elements are
+                    // read live rather than from the snapshot.
                     let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+                    let mut live = precise_array;
                     for (k, dense) in elems.iter().enumerate() {
-                        let e = if precise_array {
+                        let e = if live {
                             self.read_member(handle, &alloc::format!("{k}"))?
                         } else {
                             *dense
@@ -4080,6 +4090,7 @@ impl Interp {
                                         self.get_with_receiver(bh, "toLocaleString", e)?
                                     }
                                 };
+                                live = true;
                                 let r = self.call_with_this(m, e, &[arg(0), arg(1)])?;
                                 self.coerce_to_string(r)?
                             }

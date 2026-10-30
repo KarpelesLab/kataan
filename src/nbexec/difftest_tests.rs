@@ -1655,3 +1655,23 @@ fn long_quantified_group_iterations_still_match() {
         "true,ab,true,true,true,0,40001,true,true,true,true,x,false"
     );
 }
+
+/// `Array.prototype.join` reads `length` once and then `Get`s each element in
+/// turn, so an element's `toString` that changes the array is seen by the
+/// elements after it (and likewise each element's `toLocaleString`). The
+/// engine joined a snapshot of the elements taken before any user code ran.
+#[test]
+fn join_reads_elements_after_user_code_live() {
+    let src = r#"
+        var r = [];
+        var f = [{ toString() { f.length = 1; return "x"; } }, "y", "z"]; r.push(f.join());
+        var g = [{ toString() { g[2] = "changed"; return "a"; } }, "b", "c"]; r.push(g.join("-"));
+        var t = [{ toLocaleString() { t.length = 1; return "L"; } }, 5, 6]; r.push(t.toLocaleString());
+        var u = [1, { toLocaleString() { u[2] = { toLocaleString() { return "new"; } }; return "m"; } }, 3];
+        r.push(u.toLocaleString());
+        var p = [{ toString() { Array.prototype[2] = "proto"; p.length = 2; p.length = 3; return "s"; } }, 1, 2];
+        r.push(p.join()); delete Array.prototype[2];
+        r.join("|")
+    "#;
+    assert_eq!(run(src), "x,,|a-b-changed|L,,|1,m,new|s,1,proto");
+}
