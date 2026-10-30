@@ -751,12 +751,12 @@ impl X64Assembler {
     /// cycles on the dependency chain of every handle decode, where
     /// `imul` + `add` take four.
     fn p_index_to_slot(&mut self, l: &JitLayout) {
+        // (The base is `r12` instead when the arena is pinned, `super::pin`.)
         if l.slot_stride == 72 {
-            self.code.extend_from_slice(&[0x48, 0x8d, 0x04, 0xc0]); // lea rax, [rax + rax*8]
-            self.code.extend_from_slice(&[0x49, 0x8d, 0x04, 0xc2]); // lea rax, [r10 + rax*8]
+            self.p_slot_lea72(r::RAX);
         } else {
             self.imul_rax_imm(l.slot_stride);
-            self.add_rax_r10();
+            self.p_add_arena_base(r::RAX);
         }
     }
 
@@ -768,7 +768,7 @@ impl X64Assembler {
         self.mov_r8_rax();
         self.shr_r8_imm(32); // r8w = generation
         self.p_zext_eax(); // rax = index
-        self.cmp_rax_rdx();
+        self.p_cmp_arena_len(r::RAX); // (`r13` when pinned)
         self.jae(miss);
         self.p_index_to_slot(l);
         self.mov_rcx_rax();
@@ -817,8 +817,7 @@ impl X64Assembler {
         miss: Label,
         getter: Option<Label>,
     ) {
-        self.p_load_arena(realm_off, &l.props);
-        self.mov_r10_rax();
+        self.p_arena(realm_off, &l.props);
         self.g_load(r::RAX, recv_base, recv_disp);
         self.p_handle_check(miss);
         self.p_slot_of(l, miss);
@@ -837,8 +836,7 @@ impl X64Assembler {
         (recv_base, recv_disp): (u8, i32),
         miss: Label,
     ) {
-        self.p_load_arena(realm_off, &l.props);
-        self.mov_r10_rax();
+        self.p_arena(realm_off, &l.props);
         self.g_load(r::RAX, recv_base, recv_disp);
         self.p_handle_check(miss);
         self.p_slot_of(l, miss);
@@ -857,8 +855,7 @@ impl X64Assembler {
         miss: Label,
         getter: Option<Label>,
     ) {
-        self.p_load_arena(realm_off, &l.props);
-        self.mov_r10_rax();
+        self.p_arena(realm_off, &l.props);
         self.p_method_lookup_from(l, site, miss, getter);
     }
 
@@ -1038,8 +1035,7 @@ impl X64Assembler {
         cache: u64,
         miss: Label,
     ) {
-        self.p_load_arena(realm_off, &l.props);
-        self.mov_r10_rax();
+        self.p_arena(realm_off, &l.props);
         self.g_load(r::RAX, r::RBX, obj_disp);
         self.p_zext_eax(); // rax = handle index
         self.p_index_to_slot(l);
@@ -1751,9 +1747,11 @@ impl X64Assembler {
     /// `r8`, `r10`, `r11`.
     pub(crate) fn p_is_native(&mut self, l: &JitLayout, realm_off: i32, id: u16, miss: Label) {
         self.p_handle_check(miss);
-        self.g_load(r::R11, r::R15, realm_off);
-        self.g_load(r::R10, r::R11, l.props.heap_ptr);
-        self.g_load(r::RDX, r::R11, l.props.heap_len);
+        if !self.pinned() {
+            self.g_load(r::R11, r::R15, realm_off);
+            self.g_load(r::R10, r::R11, l.props.heap_ptr);
+            self.g_load(r::RDX, r::R11, l.props.heap_len);
+        }
         self.p_slot_of(l, miss);
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.native_disc);
         self.jne(miss);
@@ -1791,8 +1789,10 @@ impl X64Assembler {
         self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
         self.g_jcc(cc::B, done);
         // The arena, for the target's slot (`r11` is still the realm).
-        self.g_load(r::R10, r::R11, l.props.heap_ptr);
-        self.g_load(r::RDX, r::R11, l.props.heap_len);
+        if !self.pinned() {
+            self.g_load(r::R10, r::R11, l.props.heap_ptr);
+            self.g_load(r::RDX, r::R11, l.props.heap_len);
+        }
         self.g_mov(r::R9, r::RCX);
         self.p_slot_of(l, miss);
         self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
@@ -1843,9 +1843,12 @@ impl X64Assembler {
                 core::mem::offset_of!(J, next_fn),
             ),
         ] {
-            // r11 = the realm; rax:rdx = the arena.
-            self.p_load_arena(realm_off, &l.props);
-            self.mov_r10_rax();
+            // r11 = the realm (and the arena, unless pinned).
+            if self.pinned() {
+                self.g_load(r::R11, r::R15, realm_off);
+            } else {
+                self.p_arena(realm_off, &l.props);
+            }
             self.g_load(r::RAX, r::R11, off(h));
             self.p_slot_of(l, miss);
             self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
@@ -1887,8 +1890,7 @@ impl X64Assembler {
     pub(crate) fn p_truthy_handle(&mut self, realm_off: i32, truthy: Label, other: Label) {
         let l = super::compute_jit_layout();
         self.g_mov(r::R9, r::RAX);
-        self.p_load_arena(realm_off, &l.props);
-        self.mov_r10_rax();
+        self.p_arena(realm_off, &l.props);
         self.g_mov(r::RAX, r::R9);
         self.p_slot_of(l, other);
         // An ordinary object first (the usual condition), then a function
@@ -1947,8 +1949,7 @@ impl X64Assembler {
             .extend_from_slice(&[0x81, 0xf9, 0xff, 0x3f, 0x00, 0x00]); // cmp ecx, 0x3fff
         self.jne(other);
         self.g_mov(r::R9, r::RAX);
-        self.p_load_arena(realm_off, &l.props);
-        self.mov_r10_rax();
+        self.p_arena(realm_off, &l.props);
         self.g_mov(r::RAX, r::R9);
         self.p_slot_of(l, other);
         self.p_plain_shaped(l, other);
@@ -2328,8 +2329,7 @@ impl X64Assembler {
         let none = self.new_label();
         let done = self.new_label();
         self.g_mov(r::R9, r::RAX);
-        self.p_load_arena(realm_off, &l.props);
-        self.mov_r10_rax();
+        self.p_arena(realm_off, &l.props);
         self.g_mov(r::RAX, r::R9);
         self.p_handle_check(none);
         self.p_slot_of(l, none);

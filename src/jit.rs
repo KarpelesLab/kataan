@@ -28,6 +28,8 @@ mod global_persist;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod pin;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod prologue;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod props;
@@ -4272,6 +4274,9 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     cold_binds: Option<Vec<usize>>,
+    /// A generic body's heap arena, pinned in `r12`/`r13` (`pin`).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pin: Option<pin::PinArena>,
 }
 
 /// A run of code [`X64Assembler::cold_end`] cut out of the main stream: its
@@ -5029,6 +5034,8 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0xff, 0xd0]);
         self.clear_recv_cache();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        self.pin_reload();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.reload_after_call();
     }
 
@@ -5120,6 +5127,8 @@ impl X64Assembler {
     /// `lea rsp, [rbp-16]; pop rbx; pop r15; pop rbp; ret` — the frame-ABI
     /// epilogue (the result is already in `rax`).
     pub fn frame_epilogue(&mut self) {
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        self.pin_leave();
         self.code.extend_from_slice(&[0x48, 0x8d, 0x65, 0xf0]); // lea rsp, [rbp-16]
         self.code.push(0x5b); // pop rbx
         self.code.extend_from_slice(&[0x41, 0x5f]); // pop r15
@@ -6409,7 +6418,9 @@ impl JitFunction {
                 None => t,
             }
         };
+        // (The last 16 bytes: the caller's `r12`/`r13`, see `pin`.)
         let frame = ((16
+            + 16
             + max_argc as u32 * 8
             + (num.frame_slots()
                 + 3 * rc.ways
@@ -6421,6 +6432,16 @@ impl JitFunction {
             & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
+        // The heap arena in `r12`/`r13` for the whole body (`pin`), the
+        // caller's in the frame's deepest two slots.
+        if pin::worth_pinning(ops) {
+            a.set_pin(Some(pin::PinArena {
+                realm: helpers.call_layout.realm,
+                heap_ptr: layout.props.heap_ptr,
+                heap_len: layout.props.heap_len,
+                save: -16 - i32::try_from(frame).ok()?,
+            }));
+        }
         a.set_recv_cache_keys(
             (0..rc.ways)
                 .map(rc_key)
@@ -6467,6 +6488,7 @@ impl JitFunction {
         a.frame_prologue(frame);
         a.mov_r15_rdi(); // pin ctx
         a.mov_rbx_rsi(); // pin the register file
+        a.pin_enter(); // the caller's `r12`/`r13`, and the arena (clobbers `r11` only)
         a.mov_frame8_imm32(COUNTDOWN, 1); // poll at the first back-edge
         // Entry dispatch: `entry` (rdx) is 0 or a known loop header.
         for &t in osr_entries {
@@ -6560,12 +6582,12 @@ impl JitFunction {
         }
         // The receiver walk shared by the inline heap fast paths: from the handle in
         // `rax`, guard handle-ness / arena bounds / slot occupancy / generation and
-        // leave `rcx = &Slot` (`r10` = arena base, `rdx` = arena len, `rax` = the
-        // receiver's bits). Any miss jumps to `$miss`. Needs the arena just
-        // loaded (`p_load_arena`: rax:rdx).
+        // leave `rcx = &Slot` (`rax` = the receiver's bits; the arena pinned
+        // in `r12`/`r13`, see `pin`). Any miss jumps to `$miss`. Clobbers
+        // `rcx`, `r8` (and, unpinned, `rdx`, `r10`, `r11`).
         macro_rules! walk_to_slot {
             ($recv:expr, $miss:expr) => {{
-                a.mov_r10_rax(); // r10 = arena base
+                a.p_arena(helpers.call_layout.realm, &layout.props); // (pinned: nothing)
                 a.load_rax(disp($recv)); // rax = recv bits
                 // A heap handle has all of `HANDLE_TAG`'s bits (the top 14).
                 const _: () = assert!(HANDLE_TAG == !0u64 << 50);
@@ -6576,17 +6598,16 @@ impl JitFunction {
                 a.mov_r8_rax();
                 a.shr_r8_imm(32); // r8 = generation (low 16)
                 a.raw(&[0x89, 0xc1]); // mov ecx, eax: rcx = handle index
-                a.raw(&[0x48, 0x39, 0xd1]); // cmp rcx, rdx
+                a.p_cmp_arena_len(call_seq::r::RCX);
                 a.jae($miss); // index >= arena len
                 if layout.slot_stride == 72 {
-                    // rcx = r10 + rcx*72 in two `lea`s (shorter on the
+                    // rcx = base + rcx*72 in two `lea`s (shorter on the
                     // dependency chain than `imul` + `add`).
-                    a.raw(&[0x48, 0x8d, 0x0c, 0xc9]); // lea rcx, [rcx + rcx*8]
-                    a.raw(&[0x49, 0x8d, 0x0c, 0xca]); // lea rcx, [r10 + rcx*8]
+                    a.p_slot_lea72(call_seq::r::RCX);
                 } else {
                     a.raw(&[0x48, 0x69, 0xc9]); // imul rcx, rcx, stride
                     a.raw(&layout.slot_stride.to_le_bytes());
-                    a.raw(&[0x4c, 0x01, 0xd1]); // add rcx, r10: rcx = &Slot
+                    a.p_add_arena_base(call_seq::r::RCX); // rcx = &Slot
                 }
                 a.cmp_byte_at_rcx_imm(layout.off_slot_occ, layout.slot_occupied_disc);
                 a.jne($miss);
@@ -6676,7 +6697,6 @@ impl JitFunction {
                         cold_walks.push((walk, walked.unwrap_or(back), $recv, $miss, way, $fam));
                     }
                     plan => {
-                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
                         walk_to_slot!($recv, $miss);
                         family_checks!($fam, $miss);
                         if let Some(recv_cache::SitePlan {
@@ -6717,7 +6737,6 @@ impl JitFunction {
                         a.jmp(proven);
                     }
                     a.bind(walk);
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!($r, general);
                     family_checks!(recv_cache::Family::Obj, general);
                     // (`rax`: the receiver's bits, from the walk.)
@@ -7207,7 +7226,6 @@ impl JitFunction {
                         }
                         // The receiver walk, recorded in the site's cache.
                         a.bind(walk);
-                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
                         walk_to_slot!(recv, general);
                         family_checks!(recv_cache::Family::Obj, general);
                         a.g_store(call_seq::r::RBP, m_slot(mi, 0), call_seq::r::RAX);
@@ -7477,7 +7495,6 @@ impl JitFunction {
                             {
                                 return None;
                             }
-                            a.p_load_arena(helpers.call_layout.realm, &layout.props);
                             walk_to_slot!(cell, slow);
                             a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.props.box_disc);
                             a.jne(walked);
@@ -7497,7 +7514,6 @@ impl JitFunction {
                     // A one-element array cell (a parameter's): its present
                     // element 0, as `GetElem` reads it.
                     a.bind(other);
-                    a.p_load_arena(helpers.call_layout.realm, &layout.props);
                     walk_to_slot!(cell, slow);
                     a.bind(walked);
                     family_checks!(recv_cache::Family::Arr, slow);
@@ -7721,7 +7737,6 @@ impl JitFunction {
                             let (iter, next, src) = (*iter, *next, *src);
                             let slow = a.new_label();
                             let fin = a.new_label();
-                            a.p_load_arena(helpers.call_layout.realm, &layout.props);
                             walk_to_slot!(src, slow);
                             family_checks!(recv_cache::Family::Arr, slow);
                             a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
@@ -8332,7 +8347,6 @@ impl JitFunction {
                     }
                     if !s.method_ptr.is_null() {
                         a.p_add_armed(s.method_ptr, call_helper);
-                        a.p_load_arena(helpers.call_layout.realm, &layout.props);
                         walk_to_slot!(obj, call_helper);
                         a.p_add_prop_inline(
                             &layout,
@@ -9155,7 +9169,6 @@ impl JitFunction {
         // The receiver cache's full walks: each refills its way and resumes.
         for (walk, back, recv, miss, w, fam) in core::mem::take(&mut cold_walks) {
             a.bind(walk);
-            a.p_load_arena(helpers.call_layout.realm, &layout.props);
             walk_to_slot!(recv, miss);
             family_checks!(fam, miss);
             a.g_store(call_seq::r::RBP, rc_key(w), call_seq::r::RAX);
@@ -9280,7 +9293,12 @@ impl JitFunction {
         let entry = if uses_handlers {
             let outer = a.new_label();
             a.bind(outer);
+            // (A frame of its own, which neither uses nor pins the arena:
+            // the entry it calls saves and restores `r12`/`r13`.)
+            let pinned = a.pin();
+            a.set_pin(None);
             call_seq::emit_handler_entry(&mut a, helpers.handler_frame as usize as u64, native);
+            a.set_pin(pinned);
             outer
         } else {
             native

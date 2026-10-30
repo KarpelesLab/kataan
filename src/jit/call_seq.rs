@@ -644,6 +644,7 @@ impl X64Assembler {
         self.spill_before_call();
         self.g_mem(false, &[0xff], 2, base, disp);
         self.clear_recv_cache();
+        self.pin_reload();
         self.reload_after_call();
     }
 
@@ -730,6 +731,7 @@ pub(crate) fn emit_native_entry(
     a.frame_prologue(frame);
     a.mov_r15_rdi(); // pin ctx
     a.mov_rbx_rsi(); // pin the window
+    a.pin_enter(); // the caller's `r12`/`r13` (see `pin`)
     let n_params = n_params.min(n_regs);
     if n_params > 0 {
         // rdx = argc, rcx = argv.
