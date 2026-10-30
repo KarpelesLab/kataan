@@ -2499,3 +2499,29 @@ fn plural_rules_compact_selects_on_the_rounded_mantissa() {
     "#;
     assert_eq!(run(src), "one,one,many,many,many,one,other");
 }
+
+/// The Locale Info getters answer with the locale's own Unicode-extension
+/// keyword (or the matching constructor option) when it has one:
+/// `en-u-ca-buddhist` reports `["buddhist"]`, not the default `["gregory"]`.
+/// Without an `-u-hc-` keyword the hour cycle is the locale's own clock
+/// (`h12` for en-US and ko, `h23` for ja and de) rather than always `h23`.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_locale_info_honors_extension_keywords() {
+    let src = r#"
+        function j(l) {
+            return [l.getCalendars(), l.getCollations(), l.getHourCycles(), l.getNumberingSystems()]
+                .map(function (a) { return a.join("+"); }).join(" ");
+        }
+        [j(new Intl.Locale("en-u-ca-buddhist-co-phonebk-hc-h11-nu-thai")),
+         j(new Intl.Locale("en", { calendar: "japanese", collation: "emoji", hourCycle: "h24", numberingSystem: "fullwide" })),
+         new Intl.Locale("en-u-ca-buddhist", { calendar: "gregory" }).getCalendars().join(),
+         new Intl.Locale("en-US").getHourCycles().join(), new Intl.Locale("ja").getHourCycles().join(),
+         new Intl.Locale("de").getHourCycles().join(), new Intl.Locale("ko").getHourCycles().join(),
+         new Intl.Locale("ja-u-hc-h12").getHourCycles().join()].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "buddhist phonebk h11 thai|japanese emoji h24 fullwide|gregory|h12|h23|h23|h12|h12"
+    );
+}

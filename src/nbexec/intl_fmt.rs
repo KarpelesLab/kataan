@@ -9734,12 +9734,36 @@ impl Interp {
             let vals: Vec<NanBox> = items.iter().map(|s| this.new_str(s)).collect();
             NanBox::handle(this.realm.new_array(vals).to_raw())
         };
+        // A Unicode-extension keyword (or the matching option) on the locale
+        // is the whole answer: CalendarsOfLocale / CollationsOfLocale /
+        // HourCyclesOfLocale / NumberingSystemsOfLocale return just
+        // `loc.[[Calendar]]` (etc.) when it is set, so `en-u-ca-buddhist`
+        // reports `["buddhist"]`, not the locale default.
+        let one_or = |this: &mut Self, slot: &str, default: &str| {
+            let v = this
+                .realm
+                .get_property(h, slot)
+                .filter(|v| !matches!(v.unpack(), Unpacked::Undefined))
+                .map(|v| this.realm.to_display_string(v))
+                .unwrap_or_else(|| String::from(default));
+            array_of(this, &[v.as_str()])
+        };
         match name {
             "toString" => Ok(self.new_str(&tag)),
-            "getCalendars" => Ok(array_of(self, &["gregory"])),
-            "getCollations" => Ok(array_of(self, &["default"])),
-            "getHourCycles" => Ok(array_of(self, &["h23"])),
-            "getNumberingSystems" => Ok(array_of(self, &["latn"])),
+            "getCalendars" => Ok(one_or(self, "\u{0}loc_ca", "gregory")),
+            "getCollations" => Ok(one_or(self, "\u{0}loc_co", "default")),
+            "getHourCycles" => {
+                // Without a keyword, the locale's own clock (from the intl
+                // crate's CLDR time patterns): `h12` for en-US, `h23` for ja/de.
+                let base = ParsedLocale::from_canonical(&tag).base_name();
+                let (hc12, is_12h) = self.locale_hour_defaults(&base);
+                Ok(one_or(
+                    self,
+                    "\u{0}loc_hc",
+                    if is_12h { hc12 } else { "h23" },
+                ))
+            }
+            "getNumberingSystems" => Ok(one_or(self, "\u{0}loc_nu", "latn")),
             "getTimeZones" => {
                 // `undefined` for a region-less locale; otherwise a (placeholder)
                 // Array. Real per-region zone lists are §3.9 CLDR data.
