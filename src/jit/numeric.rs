@@ -3192,6 +3192,51 @@ fn spec_transfer(op: &Op, s: &mut [u8]) {
     transfer(op, s);
 }
 
+/// One op of a speculative region's straight-line body, `pc`, under the
+/// speculation: [`spec_transfer`], plus what the fast version's continuing
+/// past the op proves.
+///
+/// - A [`spec_num_op`] takes its inline path only on Number operands: every
+///   other operand takes its slow path, which in the fast version leaves for
+///   the plain copy ([`NumGen::stub`]). So past it each register it read
+///   holds a Number (until written again): a later op reading one needs no
+///   type guard.
+/// - A property read the fast version replaces by a copy ([`plan_reuse`])
+///   yields the copied register's value, so it has that register's type.
+fn spec_step(op: &Op, pc: usize, reuse: &[(usize, u16)], s: &mut [u8]) {
+    if let Op::GetProp { dst, .. } = op
+        && let Some(&(_, src)) = reuse.iter().find(|x| x.0 == pc)
+        && let Some(&t) = s.get(src as usize)
+        && let Some(x) = s.get_mut(*dst as usize)
+    {
+        *x = t;
+        return;
+    }
+    spec_transfer(op, s);
+    // `Math.f(x…)` computed inline: past it (in the fast version every other
+    // case — another method, a non-Number argument — leaves for the copy)
+    // each argument and the result are Numbers.
+    if let Op::CallMethod { dst, args, .. } = op
+        && super::inline_math(op).is_some()
+    {
+        for &r in args.iter().chain(core::iter::once(dst)) {
+            if let Some(x) = s.get_mut(r as usize) {
+                *x = T_NUM;
+            }
+        }
+        return;
+    }
+    if spec_num_op(op) {
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        def_use(op, &mut d, &mut u);
+        for r in u {
+            if let Some(x) = s.get_mut(r as usize) {
+                *x = T_NUM;
+            }
+        }
+    }
+}
+
 /// Plans region `r`'s speculative double version ([`Spec`]): for a region of
 /// generic ops (and no integer version) whose in-body branches all leave it
 /// (the back-edge aside), so the plain copy needs no other in-body entry.
@@ -3256,9 +3301,9 @@ fn plan_spec(
             cur[x as usize] = T_NUM;
         }
         let mut rows = Vec::with_capacity(len * n_regs);
-        for op in &bytecode[head..=end] {
+        for (i, op) in bytecode[head..=end].iter().enumerate() {
             rows.extend_from_slice(&cur);
-            spec_transfer(op, &mut cur);
+            spec_step(op, head + i, &r.reuse, &mut cur);
         }
         // `cur` is the back-edge's state: an assumed register the loop writes
         // must come back a Number.
@@ -3613,6 +3658,49 @@ mod tests {
         assert_eq!(regions.len(), 1);
         let t = infer(&b.ops, b.n_regs);
         assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs).is_none());
+    }
+
+    #[test]
+    fn spec_facts_follow_guarded_operands() {
+        // `o.x - o.y` passes only on Numbers: past it the two field values
+        // are Numbers, and so is the reused read of `o.x` (a copy of the
+        // first). A field read the arithmetic has not seen yet is not.
+        let p = proto_of(
+            "function f(o){ let s = 0; for (let i = 0; i < 100; i = i + 1) { const d = o.x - o.y; s = s + o.x * d + o.z; } return s; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        let t = infer(&p.ops, p.n_regs);
+        let sp = plan_spec(r, &ops, &p.ops, &t, p.n_regs).expect("speculative");
+        let ty = |pc: usize, reg: u16| sp.types[(pc - r.head) * p.n_regs + reg as usize];
+        let sub = pc_of(&p, |o| matches!(o, Op::Sub { .. }));
+        let Op::Sub { a: x, b: y, .. } = p.ops[sub] else {
+            unreachable!()
+        };
+        assert_eq!(ty(sub, x), T_ANY, "o.x before the subtraction");
+        assert_eq!(ty(sub + 1, x), T_NUM, "o.x past it");
+        assert_eq!(ty(sub + 1, y), T_NUM, "o.y past it");
+        let mul = pc_of(&p, |o| matches!(o, Op::Mul { .. }));
+        let Op::Mul { a: x2, .. } = p.ops[mul] else {
+            unreachable!()
+        };
+        assert!(
+            r.reuse.iter().any(|&(_, src)| src == x),
+            "the second o.x reuses the first: {:?}",
+            r.reuse
+        );
+        assert_eq!(ty(mul, x2), T_NUM, "the reused read of o.x");
+        let z = (r.head..=r.end)
+            .rev()
+            .find_map(|pc| match &p.ops[pc] {
+                Op::GetProp { dst, key, .. } if key.as_str() == "z" => Some((pc, *dst)),
+                _ => None,
+            })
+            .expect("o.z");
+        assert_eq!(ty(z.0 + 1, z.1), T_ANY, "o.z is unchecked");
     }
 
     #[test]

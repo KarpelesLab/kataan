@@ -591,6 +591,27 @@ pub(super) fn plan(
             check[i] = !fresh_first[i];
         }
     }
+    // Likewise in any other loop's body (an outer loop, or one that calls):
+    // a loop-invariant receiver read afresh each iteration (a global or
+    // captured binding, an outer loop's array) is usually the one this site
+    // walked last iteration, and when no call ran since its way still holds
+    // it. A miss only costs the compare (the walk then refills the way).
+    let mut in_loop = vec![false; n];
+    for (end, op) in ops.iter().enumerate() {
+        if let GenericOp::Jump { target: head } = *op
+            && head <= end
+        {
+            for x in &mut in_loop[head..=end] {
+                *x = true;
+            }
+        }
+    }
+    for i in 0..n {
+        if in_loop[i] && !in_region(i) && !fresh_first[i] && site_recv(&ops[i], i).is_some() {
+            fill[i] = true;
+            check[i] = true;
+        }
+    }
     // Ways, least recently used first per family, over the sites that use
     // the cache: `Obj` ways are `0..obj`, `Arr` ways follow them.
     // As many ways as the family has distinct values to cache, up to its cap.
