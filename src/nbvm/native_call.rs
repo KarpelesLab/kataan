@@ -795,7 +795,7 @@ fn run_op(
                     leaf
                 }
                 Some(kh) if realm.is_string_handle(kh) => {
-                    owned = crate::realm::user_key_owned(realm.to_display_string(k));
+                    owned = realm.display_key(k);
                     &owned
                 }
                 Some(_) => return None,

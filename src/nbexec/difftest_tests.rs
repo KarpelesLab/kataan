@@ -2190,3 +2190,73 @@ fn intl_internal_slots_are_not_properties() {
          TypeError TypeError 1,234.5 5 a and b 1/1/1970"
     );
 }
+
+/// A String key holding a lone surrogate is its own key: `"\uD800"`,
+/// `"\uDC00"` and `"\uFFFD"` stay three properties, and every key path (literal
+/// and computed keys, JSON.parse/stringify, enumeration, Proxy traps, Symbol
+/// descriptions, the global symbol registry and the function names derived
+/// from keys) keeps the exact code units. Keys used to be lossy UTF-8, folding
+/// every lone surrogate into U+FFFD. The encoded form cannot be forged by a
+/// string that spells it.
+#[test]
+fn lone_surrogate_keys_keep_their_code_units() {
+    let src = r#"
+        var c = function (s) { var r = []; for (var i = 0; i < s.length; i++) r.push(s.charCodeAt(i).toString(16)); return r.join(" "); };
+        var H = "\uD800", L = "\uDC00";
+        var o = {}; o[H] = 1; o[L] = 2; o["\uFFFD"] = 3;
+        var lit = { "\uD800": 4, [L + "x"]: 5 };
+        var p = JSON.parse('{"\\ud800":6,"\\udc00":7}');
+        var pair = {}; pair[H + L] = 8;
+        var fo = { [H]: function () {}, get [L]() { return 0; } };
+        var seen = [];
+        var px = new Proxy({}, { get: function (t, k) { seen.push(c(k)); return 0; } });
+        px[L];
+        var s = Symbol(H);
+        var z = {}; z["\0\x01"] = 1; z["\x01" + H] = 2; z["\0\x01" + H] = 3; z["\0\x01d800"] = 4;
+        [Object.keys(o).map(c).join(), [o[H], o[L], H in o, "\uD801" in o].join(),
+         Object.keys(lit).map(c).join(), [p[H], p[L]].join(), pair["\u{10000}"],
+         JSON.stringify(o).length, c(fo[H].name), c(Object.getOwnPropertyDescriptor(fo, L).get.name),
+         seen.join(), c(s.description), c(s.toString()), Symbol.for(H) === Symbol.for(L),
+         c(Symbol.keyFor(Symbol.for(L))), Symbol("\0nodesc").description === "\0nodesc",
+         Object.keys(z).map(function (k) { return c(k) + "=" + z[k]; }).join()].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "d800,dc00,fffd|1,2,true,false|d800,dc00 78|6,7|8|29|d800|67 65 74 20 dc00|dc00|d800|\
+         53 79 6d 62 6f 6c 28 d800 29|false|dc00|true|0 1=1,1 d800=2,0 1 d800=3,0 1 64 38 30 30=4"
+    );
+}
+
+/// The storage-key codec for lone surrogates round-trips every UTF-16 shape
+/// and stays injective against strings that spell its encoding.
+#[test]
+fn wtf_key_codec_round_trips() {
+    let cases: [&[u16]; 9] = [
+        &[0xD800],
+        &[0xDC00],
+        &[0x41, 0xDBFF, 0x42],
+        &[0xD800, 0xDC00],
+        &[0x01, 0xD800, 0x01],
+        &[0x00, 0xDFFF],
+        &[0x00, 0x01, 0xD800],
+        &[0xDC00, 0xD800],
+        &[0x61],
+    ];
+    let mut keys = alloc::vec::Vec::new();
+    for units in cases {
+        let bytes = crate::wtf8::from_utf16(units);
+        let key = crate::realm::user_key_wtf8(&bytes);
+        assert!(!crate::realm::is_internal_key(&key));
+        let back: alloc::vec::Vec<u16> =
+            crate::wtf8::utf16_units(&crate::realm::key_wtf8(&key)).collect();
+        assert_eq!(back, units);
+        assert!(!keys.contains(&key));
+        keys.push(key);
+    }
+    // A well-formed string never takes the encoded form, even one that spells it.
+    for s in ["\0\u{1}d800", "\u{1}d800", "\0\u{1}\u{1}d800"] {
+        let key = crate::realm::user_key_wtf8(s.as_bytes());
+        assert!(!crate::realm::is_wtf_key(&key));
+        assert!(!keys.contains(&key));
+    }
+}

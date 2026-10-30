@@ -280,9 +280,7 @@ impl Interp {
                 // (An unescaped run cannot hold a raw NUL; an escaped
                 // `\u0000...` key is escaped into the user namespace, see
                 // `realm::is_internal_key`.)
-                JsonStr::Scratch => JsonKey::Owned(crate::realm::user_key_owned(
-                    crate::wtf8::to_string_lossy(&p.buf),
-                )),
+                JsonStr::Scratch => JsonKey::Owned(crate::realm::user_key_wtf8(&p.buf)),
             }
         };
         p.skip_ws();

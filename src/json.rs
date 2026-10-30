@@ -86,7 +86,7 @@ fn stringify_seen(
                     if let Some(s) = stringify_seen(realm, val, seen)? {
                         parts.push(alloc::format!(
                             "{}:{}",
-                            quote(crate::realm::key_text(&k)),
+                            crate::json::quote_wtf8(&crate::realm::key_wtf8(&k)),
                             s
                         ));
                     }
@@ -168,7 +168,7 @@ fn stringify_at(
                     if let Some(s) = stringify_at(realm, val, indent, &inner, seen)? {
                         parts.push(alloc::format!(
                             "{inner}{}: {}",
-                            quote(crate::realm::key_text(&k)),
+                            crate::json::quote_wtf8(&crate::realm::key_wtf8(&k)),
                             s
                         ));
                     }
@@ -310,11 +310,8 @@ fn parse_value(
                 if c.get(*pos) != Some(&'"') {
                     return Err(String::from("Expected property name in JSON"));
                 }
-                // Property keys live in the `&str`-keyed object layer; a lone
-                // surrogate in a *key* (an exotic edge) is decoded lossily.
-                let key = crate::realm::user_key_owned(crate::wtf8::to_string_lossy(
-                    &parse_string(c, pos)?,
-                ));
+                // The storage key, lossless (a lone surrogate keeps its identity).
+                let key = crate::realm::user_key_wtf8(&parse_string(c, pos)?);
                 skip_ws(c, pos);
                 if c.get(*pos) != Some(&':') {
                     return Err(String::from("Expected ':' in JSON"));

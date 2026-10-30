@@ -2755,8 +2755,7 @@ impl Interp {
                 let Some(name) = k
                     .as_handle()
                     .map(Handle::from_raw)
-                    .and_then(|kh| self.realm.string_value(kh))
-                    .map(crate::realm::user_key_owned)
+                    .and_then(|kh| self.realm.string_key(kh))
                 else {
                     continue;
                 };
@@ -2819,7 +2818,7 @@ impl Interp {
             .unwrap_or_else(|| self.realm.aux_named_keys(c));
         for k in enumerable {
             if seen.insert(k.clone()) {
-                out.push(self.new_str(crate::realm::key_text(&k)));
+                out.push(self.new_key_str(&k));
             }
         }
         // *Every* own key (including the non-enumerable ones) shadows a

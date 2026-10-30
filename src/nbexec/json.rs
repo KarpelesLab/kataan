@@ -129,7 +129,7 @@ impl Interp {
             let src_box = self.new_str(source);
             self.realm.set_property(context, "source", src_box);
         }
-        let kb = self.new_str(crate::realm::key_text(key));
+        let kb = self.new_key_str(key);
         self.call_with_this(
             reviver,
             NanBox::handle(holder.to_raw()),
@@ -167,25 +167,29 @@ impl Interp {
                 for i in 0..len {
                     let e = self.read_member(rh, &alloc::format!("{i}"))?;
                     let item = match e.unpack() {
-                        Unpacked::Number(_) => Some(self.realm.to_display_string(e)),
+                        Unpacked::Number(_) => Some(self.realm.display_key(e)),
                         Unpacked::Handle(raw) => {
                             let h = Handle::from_raw(raw);
                             if self.realm.is_string_handle(h) {
-                                Some(self.realm.to_display_string(e))
+                                self.realm.string_key(h)
                             } else if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
                                 // A String/Number wrapper contributes its key via
                                 // ToString/ToNumber (honoring a user valueOf/toString).
                                 // A Number *or* String wrapper's key is `ToString(v)`
                                 // (per PropertyList construction) — not ToNumber.
                                 match prim.unpack() {
-                                    Unpacked::Number(_) => Some(self.coerce_to_string(e)?),
+                                    Unpacked::Number(_) => Some(crate::realm::user_key_wtf8_owned(
+                                        self.coerce_to_string_bytes(e)?,
+                                    )),
                                     Unpacked::Handle(pr)
                                         if self
                                             .realm
                                             .string_value(Handle::from_raw(pr))
                                             .is_some() =>
                                     {
-                                        Some(self.coerce_to_string(e)?)
+                                        Some(crate::realm::user_key_wtf8_owned(
+                                            self.coerce_to_string_bytes(e)?,
+                                        ))
                                     }
                                     _ => None,
                                 }
@@ -196,7 +200,7 @@ impl Interp {
                         _ => None,
                     };
                     // The list holds storage keys (see `realm::is_internal_key`).
-                    if let Some(k) = item.map(crate::realm::user_key_owned)
+                    if let Some(k) = item
                         && !list.contains(&k)
                     {
                         list.push(k);
@@ -514,7 +518,7 @@ impl Interp {
         for k in names {
             let slot = shape.lookup(&k)?;
             let mut quoted = String::with_capacity(k.len() + 2);
-            json_quote_wtf8_into(&mut quoted, crate::realm::key_text(&k).as_bytes());
+            json_quote_wtf8_into(&mut quoted, &crate::realm::key_wtf8(&k));
             keys.push((k, quoted, slot));
         }
         let m = Rc::new(JsonShapeKeys { shape, keys });
@@ -637,7 +641,7 @@ impl Interp {
                 cx.out.push('\n');
                 cx.out.push_str(&new_indent);
             }
-            json_quote_wtf8_into(&mut cx.out, crate::realm::key_text(&k).as_bytes());
+            json_quote_wtf8_into(&mut cx.out, &crate::realm::key_wtf8(&k));
             cx.out.push_str(if pretty { ": " } else { ":" });
             // `Get(h, k)`: an own data property of an ordinary object is its
             // slot; everything else takes the full `[[Get]]`.
@@ -856,11 +860,8 @@ impl Interp {
                     if c.get(*pos) != Some(&'"') {
                         return Err(self.json_error("Expected property name"));
                     }
-                    // Keys live in the `&str`-keyed object layer; a lone surrogate
-                    // in a *key* (an exotic edge) decodes lossily.
-                    let key = crate::realm::user_key_owned(crate::wtf8::to_string_lossy(
-                        &self.json_string(c, pos)?,
-                    ));
+                    // The storage key, lossless (a lone surrogate keeps its identity).
+                    let key = crate::realm::user_key_wtf8(&self.json_string(c, pos)?);
                     skip_ws(c, pos);
                     if c.get(*pos) != Some(&':') {
                         return Err(self.json_error("Expected ':'"));
@@ -1003,9 +1004,7 @@ impl Interp {
                     if c.get(*pos) != Some(&'"') {
                         return Err(self.json_error("Expected property name"));
                     }
-                    let key = crate::realm::user_key_owned(crate::wtf8::to_string_lossy(
-                        &self.json_string(c, pos)?,
-                    ));
+                    let key = crate::realm::user_key_wtf8(&self.json_string(c, pos)?);
                     skip_ws(c, pos);
                     if c.get(*pos) != Some(&':') {
                         return Err(self.json_error("Expected ':'"));
@@ -1186,7 +1185,7 @@ enum JsonKey<'a> {
 impl JsonKey<'_> {
     fn to_value(self, interp: &mut Interp) -> NanBox {
         match self {
-            JsonKey::Str(k) => interp.new_str(crate::realm::key_text(k)),
+            JsonKey::Str(k) => interp.new_key_str(k),
             JsonKey::Index(i) => interp.new_str(&alloc::format!("{i}")),
         }
     }

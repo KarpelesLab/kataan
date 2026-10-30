@@ -2516,7 +2516,103 @@ impl Realm {
             "internal key {} has no JavaScript key value",
             key.escape_debug()
         );
-        NanBox::handle(self.new_string(key_text(key)).to_raw())
+        NanBox::handle(self.key_string(key).to_raw())
+    }
+
+    /// A new String holding the JavaScript text of non-internal storage key
+    /// `key` ([`key_wtf8`]: lossless, a lone surrogate included).
+    pub fn key_string(&mut self, key: &str) -> Handle {
+        if is_wtf_key(key) {
+            let bytes = key_wtf8(key).into_owned();
+            return self.new_string_wtf8(bytes);
+        }
+        self.new_string(key_text(key))
+    }
+
+    /// The storage key ([`user_key_wtf8`], lossless) of the String at `handle`,
+    /// or `None` when it is not a string.
+    #[must_use]
+    pub fn string_key(&self, handle: Handle) -> Option<alloc::string::String> {
+        let rope = self.heap.get(handle)?.as_str()?;
+        Some(match rope.as_leaf_bytes() {
+            Some(b) => user_key_wtf8(b),
+            None => user_key_wtf8_owned(rope.materialize_bytes()),
+        })
+    }
+
+    /// The storage key of String-or-primitive `v`: [`string_key`](Self::string_key)
+    /// for a String, else the storage key of its display string (a Symbol is
+    /// *not* handled here; callers test for it first).
+    #[must_use]
+    pub fn display_key(&self, v: NanBox) -> alloc::string::String {
+        if let Some(raw) = v.as_handle()
+            && let Some(k) = self.string_key(Handle::from_raw(raw))
+        {
+            return k;
+        }
+        user_key_owned(self.to_display_string(v))
+    }
+
+    /// The `[[Description]]` of the symbol at `handle` as WTF-8 bytes (lossless,
+    /// see [`new_symbol_wtf8`](Self::new_symbol_wtf8)): `None` when `handle` is
+    /// not a symbol, `Some(None)` for an `undefined` description.
+    #[must_use]
+    pub fn symbol_description_wtf8(&self, handle: Handle) -> Option<Option<Vec<u8>>> {
+        let (d, _) = self.heap.get(handle)?.as_symbol()?;
+        Some((d != crate::nbexec::SYMBOL_NO_DESC).then(|| key_wtf8(d).into_owned()))
+    }
+
+    /// Allocates a fresh, unique `Symbol` whose description is the String with
+    /// WTF-8 bytes `description` (`None`: an `undefined` description). The
+    /// description is held in storage-key form ([`user_key_wtf8`]), so a lone
+    /// surrogate keeps its identity and no description can spell the reserved
+    /// no-description sentinel.
+    pub fn new_symbol_wtf8(&mut self, description: Option<&[u8]>) -> Handle {
+        match description {
+            Some(b) => {
+                let d = user_key_wtf8(b);
+                self.new_symbol(&d)
+            }
+            None => self.new_symbol(crate::nbexec::SYMBOL_NO_DESC),
+        }
+    }
+
+    /// `SymbolDescriptiveString(sym)` (`"Symbol(" + description + ")"`) of the
+    /// symbol at `handle` as WTF-8 bytes, or `None` when it is not a symbol.
+    #[must_use]
+    pub fn symbol_descriptive_wtf8(&self, handle: Handle) -> Option<Vec<u8>> {
+        let d = self.symbol_description_wtf8(handle)?.unwrap_or_default();
+        let mut out = Vec::with_capacity(d.len() + 8);
+        out.extend_from_slice(b"Symbol(");
+        out.extend_from_slice(&d);
+        out.push(b')');
+        Some(out)
+    }
+
+    /// SetFunctionName's name for property key `key` (a String, Symbol or other
+    /// primitive) with optional `prefix` (`"get"`/`"set"`), as WTF-8 bytes: a
+    /// Symbol names `[description]` (empty for an `undefined` description), a
+    /// String its own text, lone surrogates included.
+    #[must_use]
+    pub fn function_name_for_key(&self, key: NanBox, prefix: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !prefix.is_empty() {
+            out.extend_from_slice(prefix.as_bytes());
+            out.push(b' ');
+        }
+        let h = key.as_handle().map(Handle::from_raw);
+        if let Some(d) = h.and_then(|h| self.symbol_description_wtf8(h)) {
+            if let Some(d) = d {
+                out.push(b'[');
+                out.extend_from_slice(&d);
+                out.push(b']');
+            }
+        } else if let Some(r) = h.and_then(|h| self.heap.get(h)).and_then(Cell::as_str) {
+            r.append_bytes_to(&mut out);
+        } else {
+            out.extend_from_slice(self.to_display_string(key).as_bytes());
+        }
+        out
     }
 
     /// The `(description, id)` of the symbol at `handle`, if it is one.
@@ -7479,7 +7575,7 @@ impl Realm {
                     if &**description == crate::nbexec::SYMBOL_NO_DESC {
                         alloc::string::String::from("Symbol()")
                     } else {
-                        alloc::format!("Symbol({description})")
+                        alloc::format!("Symbol({})", key_display(description))
                     }
                 }
                 Some(Cell::BigInt(n)) => alloc::format!("{n}"),
@@ -8964,16 +9060,143 @@ pub fn is_private_key(key: &str) -> bool {
 ///   leading NUL ([`user_key`]), so it starts with `"\0\0"`.
 ///
 /// Every place a JavaScript String becomes a property key goes through
-/// [`user_key`] (ToPropertyKey in the VM and the host, string-literal keys in
-/// the parser, JSON.parse, Proxy trap results), and every place a stored key
-/// flows back to JavaScript as a String goes through [`key_text`]. So no user
+/// [`user_key_wtf8`] (ToPropertyKey in the VM and the host via
+/// [`Realm::string_key`] / [`Realm::display_key`], string-literal keys in the
+/// parser, JSON.parse, Proxy trap results), and every place a stored key flows
+/// back to JavaScript as a String goes through [`key_wtf8`] (via
+/// [`Realm::key_string`] / [`Realm::key_value`]). So no user
 /// string, whatever its bytes, can name an internal slot, and a user key that
 /// starts with NUL enumerates and serializes like any other string key.
+///
+/// A JavaScript String holding a **lone surrogate** has no `&str` form, so its
+/// key is *encoded* ([`user_key_wtf8`]): [`WTF_KEY_PREFIX`] (`"\0\u{1}"`)
+/// followed by the text with each lone surrogate written as `U+0001` plus four
+/// hex digits and each literal `U+0001` doubled. That is a third, user,
+/// namespace: injective, never produced for a surrogate-free string (so every
+/// string has exactly one key), and decoded back by [`key_wtf8`].
 #[must_use]
 #[inline]
 pub fn is_internal_key(key: &str) -> bool {
     let b = key.as_bytes();
-    b.first() == Some(&0) && b.get(1) != Some(&0)
+    b.first() == Some(&0) && !matches!(b.get(1), Some(&0 | &1))
+}
+
+/// The prefix of the storage key of a String that holds a lone surrogate (see
+/// [`is_internal_key`]).
+pub const WTF_KEY_PREFIX: &str = "\0\u{1}";
+
+/// Whether storage key `key` is the encoded form of a String holding a lone
+/// surrogate (see [`is_internal_key`]).
+#[must_use]
+#[inline]
+pub fn is_wtf_key(key: &str) -> bool {
+    key.as_bytes().starts_with(b"\0\x01")
+}
+
+/// The storage key of the JavaScript String whose WTF-8 bytes are `bytes`
+/// (lossless: a lone surrogate keeps its identity, see [`is_internal_key`]).
+/// Well-formed text, the common case, is [`user_key`] of it.
+#[must_use]
+#[inline]
+pub fn user_key_wtf8(bytes: &[u8]) -> alloc::string::String {
+    match core::str::from_utf8(bytes) {
+        Ok(s) => user_key(s).into_owned(),
+        Err(_) => encode_wtf_key(bytes),
+    }
+}
+
+/// [`user_key_wtf8`] for an owned byte buffer (no copy for well-formed text).
+#[must_use]
+#[inline]
+pub fn user_key_wtf8_owned(bytes: alloc::vec::Vec<u8>) -> alloc::string::String {
+    match alloc::string::String::from_utf8(bytes) {
+        Ok(s) => user_key_owned(s),
+        Err(e) => encode_wtf_key(e.as_bytes()),
+    }
+}
+
+#[cold]
+fn encode_wtf_key(bytes: &[u8]) -> alloc::string::String {
+    // The code points, with a surrogate pair stored as two separate 3-byte
+    // forms joined back into its one astral character.
+    let mut cps: Vec<u32> = Vec::with_capacity(bytes.len());
+    let mut it = crate::wtf8::code_points(bytes).peekable();
+    while let Some(cp) = it.next() {
+        if (0xD800..0xDC00).contains(&cp)
+            && let Some(&lo) = it.peek()
+            && (0xDC00..0xE000).contains(&lo)
+        {
+            it.next();
+            cps.push(0x1_0000 + ((cp - 0xD800) << 10) + (lo - 0xDC00));
+        } else {
+            cps.push(cp);
+        }
+    }
+    if cps.iter().all(|&cp| char::from_u32(cp).is_some()) {
+        let text: alloc::string::String = cps.iter().filter_map(|&cp| char::from_u32(cp)).collect();
+        return user_key_owned(text);
+    }
+    let mut out = alloc::string::String::with_capacity(bytes.len() + 8);
+    out.push_str(WTF_KEY_PREFIX);
+    for cp in cps {
+        match char::from_u32(cp) {
+            Some('\u{1}') => out.push_str("\u{1}\u{1}"),
+            Some(c) => out.push(c),
+            None => {
+                out.push('\u{1}');
+                for shift in [12, 8, 4, 0] {
+                    out.push(char::from_digit((cp >> shift) & 0xF, 16).unwrap_or('0'));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The WTF-8 bytes of the JavaScript String a non-internal storage key names:
+/// the lossless inverse of [`user_key_wtf8`] (for a key of either user form,
+/// see [`is_internal_key`]). An internal key yields its own bytes.
+#[must_use]
+#[inline]
+pub fn key_wtf8(key: &str) -> alloc::borrow::Cow<'_, [u8]> {
+    if is_wtf_key(key) {
+        alloc::borrow::Cow::Owned(decode_wtf_key(&key[WTF_KEY_PREFIX.len()..]))
+    } else {
+        alloc::borrow::Cow::Borrowed(key_text(key).as_bytes())
+    }
+}
+
+#[cold]
+fn decode_wtf_key(payload: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len());
+    let mut chars = payload.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1}' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        } else if chars.clone().next() == Some('\u{1}') {
+            chars.next();
+            out.push(1);
+        } else {
+            let mut cp = 0u32;
+            for _ in 0..4 {
+                cp = cp * 16 + chars.next().and_then(|d| d.to_digit(16)).unwrap_or(0);
+            }
+            crate::wtf8::encode_code_point(cp, &mut out);
+        }
+    }
+    out
+}
+
+/// The JavaScript String text of a non-internal storage key for a *message*
+/// or other display: [`key_text`], with a lone surrogate shown as U+FFFD.
+#[must_use]
+pub fn key_display(key: &str) -> alloc::borrow::Cow<'_, str> {
+    if is_wtf_key(key) {
+        alloc::borrow::Cow::Owned(crate::wtf8::to_string_lossy(&key_wtf8(key)))
+    } else {
+        alloc::borrow::Cow::Borrowed(key_text(key))
+    }
 }
 
 /// The storage key of JavaScript String key `s` (see [`is_internal_key`]): `s`

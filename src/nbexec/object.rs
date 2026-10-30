@@ -2027,8 +2027,7 @@ impl Interp {
             let Some(name) = k
                 .as_handle()
                 .map(Handle::from_raw)
-                .and_then(|h| self.realm.string_value(h))
-                .map(crate::realm::user_key_owned)
+                .and_then(|h| self.realm.string_key(h))
             else {
                 continue;
             };
@@ -2078,8 +2077,7 @@ impl Interp {
             let Some(name) = k
                 .as_handle()
                 .map(Handle::from_raw)
-                .and_then(|h| self.realm.string_value(h))
-                .map(crate::realm::user_key_owned)
+                .and_then(|h| self.realm.string_key(h))
             else {
                 continue;
             };
@@ -2421,7 +2419,7 @@ impl Interp {
             let elh = el.as_handle().map(Handle::from_raw);
             // Each key must be a String or Symbol; duplicates are a TypeError.
             if let Some(eh) = elh
-                && let Some(s) = self.realm.string_value(eh)
+                && let Some(s) = self.realm.string_key(eh)
             {
                 if !seen_strs.insert(s) {
                     return Err(self.type_error("proxy 'ownKeys' trap returned duplicate entries"));
@@ -2498,8 +2496,8 @@ impl Interp {
     /// The canonical descriptor string for a String/Symbol key NanBox.
     fn key_descriptor_string(&self, key: NanBox) -> String {
         if let Some(h) = key.as_handle().map(Handle::from_raw) {
-            if let Some(s) = self.realm.string_value(h) {
-                return crate::realm::user_key_owned(s);
+            if let Some(k) = self.realm.string_key(h) {
+                return k;
             }
             if let Some((_, id)) = self.realm.symbol_at(h) {
                 return alloc::format!("\u{0}sym:{id}");
@@ -3116,7 +3114,8 @@ impl Interp {
                 ))
             } else {
                 self.new_str(&alloc::format!(
-                    "Cannot assign to read only property '{key_name}'"
+                    "Cannot assign to read only property '{}'",
+                    crate::realm::key_display(key_name)
                 ))
             };
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -3204,7 +3203,8 @@ impl Interp {
                     ))
                 } else {
                     self.new_str(&alloc::format!(
-                        "Cannot assign to read only property '{key}'"
+                        "Cannot assign to read only property '{}'",
+                        crate::realm::key_display(key)
                     ))
                 };
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));

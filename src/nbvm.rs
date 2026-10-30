@@ -7334,7 +7334,7 @@ fn run_frame_at_ic(
                             Some(kh) => match ctx.realm.symbol_at(kh) {
                                 Some((_, id)) => alloc::format!("\u{0}sym:{id}"),
                                 None if ctx.realm.string_value(kh).is_some() => {
-                                    crate::realm::user_key_owned(ctx.realm.to_display_string(kv))
+                                    ctx.realm.display_key(kv)
                                 }
                                 None => return Err(VmError::Unsupported),
                             },
@@ -7381,9 +7381,7 @@ fn run_frame_at_ic(
             Op::DeleteProp { dst, obj, key } => {
                 let removed = match regs[*obj as usize].as_handle().map(Handle::from_raw) {
                     Some(h) => {
-                        let k = crate::realm::user_key_owned(
-                            ctx.realm.to_display_string(regs[*key as usize]),
-                        );
+                        let k = ctx.realm.display_key(regs[*key as usize]);
                         ctx.realm.delete_property(h, &k)
                     }
                     None => true,
@@ -9720,7 +9718,7 @@ fn json_stringify(ctx: &mut Ctx, funcs: &[FnProto], args: &[NanBox]) -> Result<N
                     .map(<[_]>::to_vec)
                     .unwrap_or_default()
                     .iter()
-                    .map(|e| crate::realm::user_key_owned(ctx.realm.to_display_string(*e)))
+                    .map(|e| ctx.realm.display_key(*e))
                     .collect();
                 (None, Some(a))
             }
@@ -10056,7 +10054,7 @@ fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
         if let Some((_, id)) = ctx.realm.symbol_at(h) {
             return Ok(alloc::format!("\u{0}sym:{id}"));
         }
-        if ctx.realm.string_value(h).is_none() {
+        if !ctx.realm.is_string_handle(h) {
             // Hosted: the host runs the full ToPrimitive(key, string) once.
             let k = match with_host(ctx, |hst| hst.to_property_key(key)) {
                 Some(r) => r.map_err(VmError::from)?,
@@ -10064,16 +10062,13 @@ fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
             };
             return k
                 .as_handle()
-                .and_then(|r| ctx.realm.string_value(Handle::from_raw(r)))
-                .map(crate::realm::user_key_owned)
+                .and_then(|r| ctx.realm.string_key(Handle::from_raw(r)))
                 .ok_or(VmError::Unsupported);
         }
     }
     // A String key is escaped into the user namespace (see
     // `realm::is_internal_key`): no string can name an internal slot.
-    Ok(crate::realm::user_key_owned(
-        ctx.realm.to_display_string(key),
-    ))
+    Ok(ctx.realm.display_key(key))
 }
 
 /// The integer index `key` names on typed array `recv`, when the element access
@@ -11918,7 +11913,7 @@ fn call_native(ctx: &mut Ctx, native: u16, args: &[NanBox]) -> NanBox {
                 {
                     if let Some(ph) = pair.as_handle().map(Handle::from_raw) {
                         let key_el = ctx.realm.get_element(ph, 0);
-                        let k = crate::realm::user_key_owned(ctx.realm.to_display_string(key_el));
+                        let k = ctx.realm.display_key(key_el);
                         let v = ctx.realm.get_element(ph, 1);
                         ctx.realm.set_property(obj, &k, v);
                     }
@@ -20779,6 +20774,9 @@ impl Compiler {
     /// (a string-literal key arrives escaped, see `realm::is_internal_key`; the
     /// runtime ToPropertyKey of the value escapes it again).
     fn key_constant(&mut self, k: &str) -> Reg {
+        if crate::realm::is_wtf_key(k) {
+            return self.wtf8_string(&crate::realm::key_wtf8(k));
+        }
         self.constant_str(crate::realm::key_text(k))
     }
 

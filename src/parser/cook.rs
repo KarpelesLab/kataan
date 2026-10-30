@@ -223,20 +223,20 @@ pub(super) fn string_has_legacy_octal_escape(b: &[u8]) -> bool {
     false
 }
 
-/// Decodes a string-literal token used as a **property key**, returning a
-/// `String`. Property keys are stored in the `&str`-keyed object/shape layer, so
-/// a lone surrogate in a key is decoded lossily (→ U+FFFD); a non-surrogate key
-/// — the overwhelmingly common case — is unchanged. (Surrogate-correct *string
-/// values* go through [`string`], which keeps the WTF-8 bytes.)
+/// Decodes a string-literal token used as a module import/export **name**,
+/// returning a `String`; a lone surrogate is decoded lossily (→ U+FFFD). (A
+/// property key goes through [`string_property_key`] and a string *value*
+/// through [`string`], both of which keep the WTF-8 bytes.)
 pub(super) fn string_key(raw: &[u8], span: Span) -> Result<String> {
     Ok(wtf8::to_string_lossy(&string(raw, span)?))
 }
 
-/// [`string_key`] in **storage-key** form, for an object-literal, class or
-/// pattern property key: a key that starts with NUL is escaped
-/// ([`crate::realm::user_key`]) so it can never name an engine-internal slot.
+/// A string-literal token in **storage-key** form, for an object-literal, class
+/// or pattern property key ([`crate::realm::user_key_wtf8`]): lossless (a lone
+/// surrogate keeps its identity), and a key that starts with NUL is escaped so
+/// it can never name an engine-internal slot.
 pub(super) fn string_property_key(raw: &[u8], span: Span) -> Result<String> {
-    Ok(crate::realm::user_key_owned(string_key(raw, span)?))
+    Ok(crate::realm::user_key_wtf8_owned(string(raw, span)?))
 }
 
 /// Decodes the escape sequences in a string or template-cooked segment.

@@ -996,7 +996,10 @@ impl Interp {
                     // `Symbol.for(key)` does `ToString(key)` — a user `toString`/
                     // `valueOf` runs (propagating) and a Symbol argument is a
                     // TypeError, unlike the raw `to_display_string`.
-                    let key = self.coerce_to_string(arg(0))?;
+                    // The registry is keyed by the description in storage-key form
+                    // (lossless, see `Realm::new_symbol_wtf8`).
+                    let key =
+                        crate::realm::user_key_wtf8_owned(self.coerce_to_string_bytes(arg(0))?);
                     if let Some(s) = self.symbol_registry.get(&key) {
                         return Ok(Some(*s));
                     }
@@ -1021,7 +1024,7 @@ impl Interp {
                         .find(|(_, v)| self.realm.strict_equals(**v, target))
                         .map(|(k, _)| k.clone());
                     return Ok(Some(match found {
-                        Some(k) => self.new_str(&k),
+                        Some(k) => self.new_key_str(&k),
                         None => NanBox::undefined(),
                     }));
                 }
@@ -1029,18 +1032,10 @@ impl Interp {
             }
         }
         // --- symbol instance: `sym.toString()` ---
-        if let Some((desc, _)) = self.realm.symbol_at(handle)
-            && method == "toString"
+        if method == "toString"
+            && let Some(text) = self.realm.symbol_descriptive_wtf8(handle)
         {
-            // A no-argument `Symbol()` has an empty (undefined) description, marked
-            // by the exact `\0nodesc` sentinel — a description that merely *starts*
-            // with NUL (`Symbol("\0")`) is a real description and must show.
-            let shown = if &*desc == crate::nbexec::SYMBOL_NO_DESC {
-                ""
-            } else {
-                &desc
-            };
-            return Ok(Some(self.new_str(&alloc::format!("Symbol({shown})"))));
+            return Ok(Some(self.new_str_bytes(text)));
         }
         // --- BigInt instance: `toString(radix)` / `valueOf` ---
         if let Some(big) = self.realm.bigint_at(handle) {

@@ -167,7 +167,7 @@ impl Interp {
         }
         // A String key is escaped into the user namespace (see
         // `realm::is_internal_key`): no string can name an internal slot.
-        crate::realm::user_key_owned(self.realm.to_display_string(k))
+        self.realm.display_key(k)
     }
 
     /// Inverse of [`member_key`] for handing a property key to a Proxy trap: a
@@ -205,9 +205,7 @@ impl Interp {
             {
                 return Ok(self.member_key(p));
             }
-            return Ok(crate::realm::user_key_owned(
-                self.realm.to_display_string(p),
-            ));
+            return Ok(self.realm.display_key(p));
         }
         Ok(self.member_key(k))
     }
@@ -718,7 +716,8 @@ impl Interp {
                     // (The dot-key path already did this; the computed-key path
                     // silently dropped it.)
                     let m = self.new_str(&alloc::format!(
-                        "Cannot assign to read only property '{key}' (accessor has no setter)"
+                        "Cannot assign to read only property '{}' (accessor has no setter)",
+                        crate::realm::key_display(key)
                     ));
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
@@ -736,7 +735,8 @@ impl Interp {
                 if !self.can_write_property(c, key) {
                     if self.strict {
                         let m = self.new_str(&alloc::format!(
-                            "Cannot assign to read only property '{key}'"
+                            "Cannot assign to read only property '{}'",
+                            crate::realm::key_display(key)
                         ));
                         return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                     }
@@ -1125,7 +1125,8 @@ impl Interp {
                 // A getter-only accessor cannot be written: the throwing form of
                 // `[[Set]]` raises a TypeError; sloppy assignment drops the write.
                 let m = self.new_str(&alloc::format!(
-                    "Cannot assign to read only property '{name}' (accessor has no setter)"
+                    "Cannot assign to read only property '{}' (accessor has no setter)",
+                    crate::realm::key_display(&name)
                 ));
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
@@ -1271,7 +1272,8 @@ impl Interp {
                     self.call_with_this(setter, this, &[new])?;
                 } else if self.strict {
                     let m = self.new_str(&alloc::format!(
-                        "Cannot assign to read only property '{key}' (accessor has no setter)"
+                        "Cannot assign to read only property '{}' (accessor has no setter)",
+                        crate::realm::key_display(&key)
                     ));
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }
@@ -1657,13 +1659,12 @@ impl Interp {
             return Ok(self.well_known_symbol(key));
         }
         // A symbol's `description` (`undefined` for a no-argument `Symbol()`).
-        if let Some((desc, _)) = self.realm.symbol_at(handle)
-            && name == "description"
+        if name == "description"
+            && let Some(desc) = self.realm.symbol_description_wtf8(handle)
         {
-            return Ok(if &*desc == SYMBOL_NO_DESC {
-                NanBox::undefined()
-            } else {
-                self.new_str(&desc)
+            return Ok(match desc {
+                Some(d) => self.new_str_bytes(d),
+                None => NanBox::undefined(),
             });
         }
         // A bound function's `name` is `"bound " + target.name` (recursing so a

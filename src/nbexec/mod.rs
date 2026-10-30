@@ -6787,6 +6787,12 @@ impl Interp {
         NanBox::handle(self.realm.new_string(s).to_raw())
     }
 
+    /// A String of the JavaScript text of non-internal storage key `key` (see
+    /// [`crate::realm::key_wtf8`]: lossless, a lone surrogate included).
+    fn new_key_str(&mut self, key: &str) -> NanBox {
+        NanBox::handle(self.realm.key_string(key).to_raw())
+    }
+
     /// Allocates a heap string from raw **WTF-8 bytes** (lone surrogates
     /// preserved) and returns its boxed handle.
     fn new_str_bytes(&mut self, bytes: alloc::vec::Vec<u8>) -> NanBox {
@@ -9566,25 +9572,18 @@ impl crate::nbvm::VmHost for Interp {
             return Err(crate::nbvm::HostError::Fault);
         };
         let name = self.member_key(key);
-        // SetFunctionName: a symbol key names the function `[description]`.
-        let base = match key
-            .as_handle()
-            .and_then(|h| self.realm.symbol_at(Handle::from_raw(h)))
-        {
-            Some((d, _)) if d == SYMBOL_NO_DESC => String::new(),
-            Some((d, _)) => alloc::format!("[{d}]"),
-            None => self.realm.to_display_string(key),
-        };
         // Bit 4: an object literal's (enumerable) definition.
         let enumerable = kind & 4 != 0;
         let kind = kind & 3;
-        let fname = match kind {
-            1 => alloc::format!("get {base}"),
-            2 => alloc::format!("set {base}"),
-            _ => base.clone(),
+        // SetFunctionName: a symbol key names the function `[description]`.
+        let prefix = match kind {
+            1 => "get",
+            2 => "set",
+            _ => "",
         };
+        let fname = self.realm.function_name_for_key(key, prefix);
         let nd = self.realm.new_object();
-        let nv = self.new_str(&fname);
+        let nv = self.new_str_bytes(fname);
         self.realm.set_property(nd, "value", nv);
         self.realm
             .set_property(nd, "writable", NanBox::boolean(false));
@@ -9616,6 +9615,7 @@ impl crate::nbvm::VmHost for Interp {
             .apply_descriptor(o, &name, desc, true)
             .map_err(exec_to_host)?
         {
+            let base = crate::wtf8::to_string_lossy(&self.realm.function_name_for_key(key, ""));
             let e = self.type_error(&alloc::format!("Cannot redefine property: {base}"));
             return Err(exec_to_host(e));
         }
@@ -10157,7 +10157,8 @@ impl crate::nbvm::VmHost for Interp {
             && strict
         {
             let e = self.type_error(&alloc::format!(
-                "Cannot assign to read only property '{name}' of super"
+                "Cannot assign to read only property '{}' of super",
+                crate::realm::key_display(&name)
             ));
             return Err(exec_to_host(e));
         }

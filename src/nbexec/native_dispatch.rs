@@ -458,13 +458,11 @@ impl Interp {
                 }
                 // `String(symbol)` is *not* a TypeError (unlike `new String(sym)`
                 // or an implicit ToString): it yields `SymbolDescriptiveString`.
-                if arg(0)
+                if let Some(text) = arg(0)
                     .as_handle()
-                    .map(Handle::from_raw)
-                    .is_some_and(|h| self.realm.symbol_at(h).is_some())
+                    .and_then(|h| self.realm.symbol_descriptive_wtf8(Handle::from_raw(h)))
                 {
-                    let s = self.realm.to_display_string(arg(0));
-                    return Ok(NanBox::handle(self.realm.new_string(&s).to_raw()));
+                    return Ok(self.new_str_bytes(text));
                 }
                 // `ToString` of a Number runs no code: a small integer shares
                 // its rope (a digit is the interned one-unit string).
@@ -536,14 +534,14 @@ impl Interp {
                 // A no-argument `Symbol()` has an `undefined` description, marked
                 // with a reserved sentinel (distinct from `Symbol("")`).
                 let desc = if matches!(arg(0).unpack(), Unpacked::Undefined) {
-                    String::from(SYMBOL_NO_DESC)
+                    None
                 } else {
                     // `Symbol(description)` does `ToString(description)` — a user
                     // `toString` runs (propagating) and a Symbol argument is a
                     // TypeError, unlike the raw `to_display_string`.
-                    self.coerce_to_string(arg(0))?
+                    Some(self.coerce_to_string_bytes(arg(0))?)
                 };
-                NanBox::handle(self.realm.new_symbol(&desc).to_raw())
+                NanBox::handle(self.realm.new_symbol_wtf8(desc.as_deref()).to_raw())
             }
             // `WeakRef.prototype.deref()` — RequireInternalSlot(this, [[Target]]),
             // then return the held target (never collected here).
@@ -663,8 +661,11 @@ impl Interp {
             // `Symbol.prototype.toString()` — `thisSymbolValue` then `SymbolDescriptiveString`.
             N_SYMBOL_PROTO_TOSTRING => {
                 let sym = self.this_symbol_value()?;
-                let s = self.realm.to_display_string(sym);
-                self.new_str(&s)
+                let text = sym
+                    .as_handle()
+                    .and_then(|h| self.realm.symbol_descriptive_wtf8(Handle::from_raw(h)))
+                    .unwrap_or_default();
+                self.new_str_bytes(text)
             }
             // `Symbol.prototype.valueOf()` — return the symbol primitive.
             N_SYMBOL_PROTO_VALUEOF => self.this_symbol_value()?,
@@ -672,10 +673,9 @@ impl Interp {
             N_SYMBOL_PROTO_DESC_GET => {
                 let sym = self.this_symbol_value()?;
                 let h = sym.as_handle().map(Handle::from_raw);
-                match h.and_then(|h| self.realm.symbol_at(h)) {
-                    Some((desc, _)) if &*desc == SYMBOL_NO_DESC => NanBox::undefined(),
-                    Some((desc, _)) => self.new_str(&desc),
-                    None => NanBox::undefined(),
+                match h.and_then(|h| self.realm.symbol_description_wtf8(h)) {
+                    Some(Some(desc)) => self.new_str_bytes(desc),
+                    _ => NanBox::undefined(),
                 }
             }
             // `Symbol.prototype[Symbol.toPrimitive](hint)` — return the symbol.
@@ -1044,10 +1044,7 @@ impl Interp {
                 if let Some(raw) = arg(0).as_handle()
                     && let Some(keys) = self.proxy_own_enumerable_keys(Handle::from_raw(raw))?
                 {
-                    let boxed: Vec<NanBox> = keys
-                        .iter()
-                        .map(|k| self.new_str(crate::realm::key_text(k)))
-                        .collect();
+                    let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_key_str(k)).collect();
                     return Ok(NanBox::handle(self.realm.new_array(boxed).to_raw()));
                 }
                 let target = arg(0)
@@ -1089,10 +1086,7 @@ impl Interp {
                         keys.extend(self.realm.aux_named_keys(h));
                     }
                 }
-                let boxed: Vec<NanBox> = keys
-                    .iter()
-                    .map(|k| self.new_str(crate::realm::key_text(k)))
-                    .collect();
+                let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_key_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             N_OBJECT_FREEZE => {
@@ -1927,10 +1921,7 @@ impl Interp {
                 let names = src
                     .and_then(|h| self.realm.own_property_names(h))
                     .unwrap_or_default();
-                let boxed: Vec<NanBox> = names
-                    .iter()
-                    .map(|k| self.new_str(crate::realm::key_text(k)))
-                    .collect();
+                let boxed: Vec<NanBox> = names.iter().map(|k| self.new_key_str(k)).collect();
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             // `Object.getOwnPropertySymbols(obj)` — the own symbol-keyed
@@ -2120,7 +2111,7 @@ impl Interp {
                 {
                     let mut pairs = Vec::with_capacity(entries.len());
                     for (k, v) in entries {
-                        let key = self.new_str(crate::realm::key_text(&k));
+                        let key = self.new_key_str(&k);
                         pairs.push(NanBox::handle(
                             self.realm.new_array(alloc::vec![key, v]).to_raw(),
                         ));
@@ -2169,7 +2160,7 @@ impl Interp {
                 let pairs: Vec<NanBox> = entries
                     .into_iter()
                     .map(|(k, v)| {
-                        let key = self.new_str(crate::realm::key_text(&k));
+                        let key = self.new_key_str(&k);
                         NanBox::handle(self.realm.new_array(alloc::vec![key, v]).to_raw())
                     })
                     .collect();
