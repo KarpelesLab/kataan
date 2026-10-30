@@ -7029,6 +7029,16 @@ fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>) {
     )
 }
 
+/// Whether a [`vm_safepoint`] here would collect: the collector enabled and
+/// unlocked, every frame published, and a cycle due (the cheap pre-check
+/// that skips building the root vector).
+fn vm_safepoint_due(ctx: &Ctx) -> bool {
+    ctx.gc_enabled
+        && ctx.frames_published + 1 == ctx.call_depth
+        && ctx.gc_lock == 0
+        && ctx.realm.gc_pressure() >= ctx.realm.gc_next_threshold()
+}
+
 /// Collection is only sound where the whole root set is enumerable, and in this
 /// engine that is true at exactly one place: the top of the *outermost*
 /// activation's dispatch loop. Everywhere else a live [`NanBox`] may sit in a
@@ -7059,11 +7069,7 @@ fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>) {
 /// *inside a function* — which is to say nearly every real program — from
 /// growing without bound.
 fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox]) {
-    if !ctx.gc_enabled || ctx.frames_published + 1 != ctx.call_depth || ctx.gc_lock != 0 {
-        return;
-    }
-    // Cheap pre-check: skip building the root vector unless a cycle is due.
-    if ctx.realm.gc_pressure() < ctx.realm.gc_next_threshold() {
+    if !vm_safepoint_due(ctx) {
         return;
     }
     let mut roots: Vec<Handle> = Vec::new();

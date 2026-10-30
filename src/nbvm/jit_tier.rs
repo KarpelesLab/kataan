@@ -2829,6 +2829,20 @@ pub(crate) extern "C" fn jit_helper_backedge(
     // SAFETY: as `jit_helper_exec_op`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // The usual poll has nothing to do: no interrupt, no agents, no
+    // collection due, and not the activation that may leave (the body of a
+    // short loop polls at its first back-edge on every call).
+    if !ctx.realm.agents_active
+        && regs_addr != ctx.jit_rt.exit_regs
+        && !super::vm_safepoint_due(ctx)
+        && !ctx
+            .realm
+            .interrupt
+            .as_ref()
+            .is_some_and(crate::interrupt::Interrupt::is_tripped)
+    {
+        return ctx.jit_rt.poll_interval;
+    }
     #[allow(unsafe_code)]
     let funcs = unsafe {
         &*ctx

@@ -783,10 +783,19 @@ impl X64Assembler {
     fn p_plain_shaped(&mut self, l: &JitLayout, miss: Label) {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
         self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
-        self.jne(miss);
+        self.p_shaped_after_object(l, miss);
         self.p_test_byte_imm(r::RCX, l.props.off_jit_flags, FLAG_EXOTIC);
         self.jne(miss);
+    }
+
+    /// After the slot in `rcx` compared equal to the object cell tag: to
+    /// `miss` unless its object data is shaped — no code when the object-data
+    /// tag is the very byte and value just compared.
+    fn p_shaped_after_object(&mut self, l: &JitLayout, miss: Label) {
+        if (l.off_od_tag, l.obj_shaped_disc) != (l.off_cell_tag, l.cell_object_disc) {
+            self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
+            self.jne(miss);
+        }
     }
 
     /// `rax` = the prototype epoch (a plain load of its counter).
@@ -1138,8 +1147,7 @@ impl X64Assembler {
     fn p_add_guards(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
         self.jne(miss);
-        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
-        self.jne(miss);
+        self.p_shaped_after_object(l, miss);
         self.cmp_byte_at_rcx_imm(l.props.off_jit_flags, 0);
         self.jne(miss);
         self.p_add_room(l, realm_off, miss);
@@ -1842,8 +1850,7 @@ impl X64Assembler {
             self.p_slot_of(l, miss);
             self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
             self.jne(miss);
-            self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
-            self.jne(miss);
+            self.p_shaped_after_object(l, miss);
             self.g_load(r::RAX, r::RCX, l.off_shape);
             self.g_cmp_mem(r::RAX, r::R11, off(sh));
             self.g_jcc(cc::NE, miss);
@@ -1884,21 +1891,24 @@ impl X64Assembler {
         self.mov_r10_rax();
         self.g_mov(r::RAX, r::R9);
         self.p_slot_of(l, other);
-        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.vmfn_disc);
-        self.g_jcc(cc::E, truthy);
-        // (An array is never `[[IsHTMLDDA]]`.)
-        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
-        self.g_jcc(cc::E, truthy);
+        // An ordinary object first (the usual condition), then a function
+        // or an array (never `[[IsHTMLDDA]]`).
+        let not_object = self.new_label();
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
-        self.jne(other);
-        self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
-        self.jne(other);
+        self.jne(not_object);
+        self.p_shaped_after_object(l, other);
         self.g_load(r::R11, r::RCX, l.off_shape);
         self.p_test_byte_imm(
             r::R11,
             l.props.shape_brands,
             crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
         );
+        self.g_jcc(cc::E, truthy);
+        self.jmp(other);
+        self.bind(not_object);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.vmfn_disc);
+        self.g_jcc(cc::E, truthy);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
         self.g_jcc(cc::E, truthy);
         self.jmp(other);
     }

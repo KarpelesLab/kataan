@@ -118,8 +118,9 @@ pub struct CallSite {
     pub targets: [CallTarget; CallSite::WAYS],
     /// The way the next new callee replaces.
     pub next: usize,
-    /// The last callee value the sequence identified (see [`CallMemo`]).
-    pub memo: CallMemo,
+    /// Per way, the last callee value the sequence identified as it (see
+    /// [`CallMemo`]): a polymorphic site's values each keep theirs.
+    pub memo: [CallMemo; CallSite::WAYS],
     /// A `new` site's inline constructor cache (see [`ConstructFast`]).
     pub fast: ConstructFast,
     /// An identity cache for a non-call op that keeps one here (see
@@ -266,7 +267,7 @@ impl CallSite {
                 frame_bytes: 0,
             }; Self::WAYS],
             next: 0,
-            memo: CallMemo::empty(),
+            memo: [CallMemo::empty(); Self::WAYS],
             fast: ConstructFast::empty(),
             ident: IdentMemo::empty(),
             construct: super::props::ConstructCache::new(),
@@ -295,7 +296,7 @@ impl CallSite {
         }
         let way = self.next % Self::WAYS;
         self.targets[way] = target;
-        self.memo = CallMemo::empty();
+        self.memo = [CallMemo::empty(); Self::WAYS];
         self.fast = ConstructFast::empty();
         self.next = (way + 1) % Self::WAYS;
     }
@@ -814,28 +815,44 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     let hdr = |i: usize| i32::try_from(i * 8).ok();
     let jl = super::compute_jit_layout();
     use core::mem::offset_of;
-    let memo = offset_of!(CallSite, memo);
-    let memo_bits = site_off(memo + offset_of!(CallMemo, bits));
-    let memo_stamp = site_off(memo + offset_of!(CallMemo, stamp));
-    let memo_target = site_off(memo + offset_of!(CallMemo, target));
-    let memo_caps = site_off(memo + offset_of!(CallMemo, caps));
+    // Way `w`'s memo fields (see `CallMemo`).
+    let memo = |w: usize| offset_of!(CallSite, memo) + w * core::mem::size_of::<CallMemo>();
+    let memo_bits = |w: usize| site_off(memo(w) + offset_of!(CallMemo, bits));
+    let memo_stamp = |w: usize| site_off(memo(w) + offset_of!(CallMemo, stamp));
+    let memo_target = |w: usize| site_off(memo(w) + offset_of!(CallMemo, target));
+    let memo_caps = |w: usize| site_off(memo(w) + offset_of!(CallMemo, caps));
     // `identified`: the way is in r11 and the captures in r8 already (a memo
     // hit, or a constructor the site's `fast` cache prepared).
     let identified = a.new_label();
-    // The memo check for the callee value in `rax` (see `CallMemo`): on a hit
-    // r11 = the way, r8 = the captures and on to `identified`; else on, `rax`
-    // unchanged.
+    // The memo check for the callee value in `rax` (see `CallMemo`): the
+    // value one of the ways' memos names, at the current prototype epoch —
+    // then r11 = the way, r8 = the captures and on to `identified`; else on,
+    // `rax` unchanged.
     let memo_check = |a: &mut X64Assembler| {
         let decode = a.new_label();
+        let found = a.new_label();
+        let others = a.new_label();
+        // Way 0's memo falls through (the monomorphic site's path).
         a.g_movabs(r::R11, e.site as u64);
-        a.g_cmp_mem(r::RAX, r::R11, memo_bits);
-        a.g_jcc(cc::NE, decode);
+        a.g_cmp_mem(r::RAX, r::R11, memo_bits(0));
+        a.g_jcc(cc::NE, others);
+        a.bind(found);
         load_proto_epoch(a, r::R9);
-        a.g_cmp_mem(r::R9, r::R11, memo_stamp);
+        a.g_cmp_mem(r::R9, r::R11, memo_stamp(0));
         a.g_jcc(cc::NE, decode);
-        a.g_load(r::R8, r::R11, memo_caps);
-        a.g_load(r::R11, r::R11, memo_target);
+        a.g_load(r::R8, r::R11, memo_caps(0));
+        a.g_load(r::R11, r::R11, memo_target(0));
         a.jmp(identified);
+        a.bind(others);
+        for w in 1..CallSite::WAYS {
+            let next = a.new_label();
+            a.g_cmp_mem(r::RAX, r::R11, memo_bits(w));
+            a.g_jcc(cc::NE, next);
+            // r11 = way `w`'s memo, addressed as way 0's.
+            a.g_lea(r::R11, r::R11, memo_bits(w) - memo_bits(0));
+            a.jmp(found);
+            a.bind(next);
+        }
         a.bind(decode);
     };
     // 1. Which function is the callee? (rax = key, rdx = captures)
@@ -965,28 +982,44 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             (r::RBX, reg(ctor))
         }
     };
-    // r11 = the matching way.
+    // r11 = the matching way (and, to memoize the callee in, r10 = its
+    // memo, addressed as way 0's).
     a.g_movabs(r::R11, e.site as u64);
     let hit = a.new_label();
+    let memoize = !matches!(e.callee, CalleeSrc::Construct { .. });
+    let mut way_hits = alloc::vec::Vec::with_capacity(CallSite::WAYS);
     for way in 0..CallSite::WAYS {
         if way > 0 {
             a.g_lea(r::R11, r::R11, TARGET_BYTES);
         }
         a.g_cmp_mem(r::RAX, r::R11, SITE_KEY);
-        a.g_jcc(cc::E, hit);
+        if memoize {
+            let h = a.new_label();
+            a.g_jcc(cc::E, h);
+            way_hits.push(h);
+        } else {
+            a.g_jcc(cc::E, hit);
+        }
     }
     a.jmp(e.slow);
+    for (way, h) in way_hits.into_iter().enumerate() {
+        a.bind(h);
+        a.g_movabs(
+            r::R10,
+            e.site as u64 + (memo_bits(way) - memo_bits(0)) as u64,
+        );
+        a.jmp(hit);
+    }
     a.bind(hit);
     a.g_mov(r::R8, r::RDX); // captures, for the callee's entry
-    if !matches!(e.callee, CalleeSrc::Construct { .. }) {
-        // Memoize the callee (see `CallMemo`).
+    if memoize {
+        // Memoize the callee in its way's memo (see `CallMemo`).
         a.g_load(r::R9, callee_base, callee_disp);
-        a.g_movabs(r::RDX, e.site as u64);
-        a.g_store(r::RDX, memo_bits, r::R9);
+        a.g_store(r::R10, memo_bits(0), r::R9);
         load_proto_epoch(a, r::R9);
-        a.g_store(r::RDX, memo_stamp, r::R9);
-        a.g_store(r::RDX, memo_target, r::R11);
-        a.g_store(r::RDX, memo_caps, r::R8);
+        a.g_store(r::R10, memo_stamp(0), r::R9);
+        a.g_store(r::R10, memo_target(0), r::R11);
+        a.g_store(r::R10, memo_caps(0), r::R8);
     }
     a.bind(identified);
     // (In an inlined body: its activation, if still pending, is pushed

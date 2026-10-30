@@ -439,8 +439,9 @@ pub(super) fn plan(
     let mut next_id = 0u32;
     let mut ids: Vec<(u16, u32)> = Vec::new();
     // The live values since the last call or join: (id, the op that last
-    // walked it).
-    let mut live: Vec<(u32, usize)> = Vec::new();
+    // walked it, whether every path here passed that op — else a join merged
+    // it in from some of its predecessors only).
+    let mut live: Vec<(u32, usize, bool)> = Vec::new();
     let mut fill = vec![false; n];
     let mut check = vec![false; n];
     let mut site_id = vec![0u32; n];
@@ -457,17 +458,51 @@ pub(super) fn plan(
     // into it, no other branch, not an entry) knows what that branch knew:
     // `if (!p) return; p.x`. (`ids` is not restored: a register the skipped
     // code wrote just loses its value's identity, which only costs a hit.)
+    //
+    // A target reached only forward (no back-edge, not an entry) by several
+    // paths may find a value walked on some of them: its sites compare the
+    // way first (a key compare is always sound, and a miss just walks), but
+    // none of them is `known`.
     let mut into = vec![0u32; n + 1];
-    for op in ops {
+    let mut back = vec![false; n + 1];
+    for (i, op) in ops.iter().enumerate() {
         if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
             && t <= n
         {
             into[t] += 1;
+            back[t] |= t <= i;
         }
     }
     let entry: Vec<usize> = osr_entries.iter().chain(catch_targets).copied().collect();
     #[allow(clippy::type_complexity)]
-    let mut snap: Vec<Option<(Vec<(u32, usize)>, Vec<u16>)>> = vec![None; n + 1];
+    let mut snap: Vec<Option<(Vec<(u32, usize, bool)>, Vec<u16>)>> = vec![None; n + 1];
+    // The union of two paths' states (see above).
+    let merge = |fill: &mut Vec<bool>,
+                 (mut l, mut f): (Vec<(u32, usize, bool)>, Vec<u16>),
+                 (l2, f2): (Vec<(u32, usize, bool)>, Vec<u16>)| {
+        for (id, at, _) in l2 {
+            match l.iter_mut().find(|e| e.0 == id) {
+                Some(e) => {
+                    if e.1 != at {
+                        // Both walks fill the way (a later site checks it).
+                        fill[at] = true;
+                        fill[e.1] = true;
+                    }
+                }
+                None => l.push((id, at, false)),
+            }
+        }
+        // (Nothing merged is certain: `known` follows one path's sites.)
+        for e in &mut l {
+            e.2 = false;
+        }
+        for r in f2 {
+            if !f.contains(&r) {
+                f.push(r);
+            }
+        }
+        (l, f)
+    };
     for (i, op) in ops.iter().enumerate() {
         if target[i] {
             let falls_in = i > 0
@@ -477,6 +512,17 @@ pub(super) fn plan(
                 );
             match snap[i].take() {
                 Some((l, f)) if into[i] == 1 && !falls_in && !entry.contains(&i) => {
+                    live = l;
+                    fresh = f;
+                }
+                Some(st) if !back[i] && !entry.contains(&i) => {
+                    let here = (core::mem::take(&mut live), core::mem::take(&mut fresh));
+                    let (l, f) = if falls_in {
+                        merge(&mut fill, st, here)
+                    } else {
+                        // Several branches and no fall-in: `st` merged them.
+                        st
+                    };
                     live = l;
                     fresh = f;
                 }
@@ -492,12 +538,14 @@ pub(super) fn plan(
             if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
                 check[i] = true;
-                if in_spec(i) && in_spec(e.1) {
+                if e.2 && in_spec(i) && in_spec(e.1) {
                     pred[i] = Some(e.1);
                 }
-                e.1 = i;
+                // (Every site fills its way: from here on, it holds the
+                // value on every path.)
+                *e = (id, i, true);
             } else {
-                live.push((id, i));
+                live.push((id, i, true));
                 fresh_first[i] = fresh.contains(&r);
             }
         }
@@ -576,7 +624,11 @@ pub(super) fn plan(
             && t > i
             && t <= n
         {
-            snap[t] = Some((live.clone(), fresh.clone()));
+            let st = (live.clone(), fresh.clone());
+            snap[t] = Some(match snap[t].take() {
+                Some(prev) => merge(&mut fill, prev, st),
+                None => st,
+            });
         }
     }
     // In a promoted loop, a receiver is usually the one the same site saw
