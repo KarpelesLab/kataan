@@ -294,6 +294,11 @@ pub struct CallMemo {
     pub target: *const CallTarget,
     /// Its captured values.
     pub caps: *const u64,
+    /// For a method call: the site's `props::MethodSite` entry whose lookup
+    /// last found `bits`, through its recorded holder address, or `0` — the
+    /// call sequence's own `GuardMemo` (it revalidates the entry, then
+    /// skips the lookup and the identification).
+    pub entry: u64,
 }
 
 impl CallMemo {
@@ -303,6 +308,7 @@ impl CallMemo {
             stamp: 0,
             target: core::ptr::null(),
             caps: core::ptr::null(),
+            entry: 0,
         }
     }
 }
@@ -1159,6 +1165,75 @@ fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail
     a.g_load(r::R10, r::R15, l.stack);
 }
 
+/// A method call's memo check through the ways' [`CallMemo::entry`]s, with
+/// the receiver's walked heap slot in `rcx` (kept): the way whose entry
+/// records the receiver's layout and still holds, with the method at the
+/// entry's holder address still that memo's callee value — then the value
+/// into `[rbp + scratch]`, `r11` = the way, `r8` = the captures, and on to
+/// `identified` (exactly what the lookup and the memo check would find).
+/// Otherwise to `slow`. Clobbers `rax`, `rdx`, `rdi`, `r9`, `r11`.
+fn emit_call_fast(
+    a: &mut X64Assembler,
+    site: *const CallSite,
+    scratch: i32,
+    slow: Label,
+    identified: Label,
+) {
+    use super::props::entry_off;
+    use core::mem::offset_of;
+    let jl = super::compute_jit_layout();
+    let m = |w: usize, f: usize| {
+        site_off(offset_of!(CallSite, memo) + w * core::mem::size_of::<CallMemo>() + f)
+    };
+    let found: alloc::vec::Vec<Label> = (0..CallSite::WAYS).map(|_| a.new_label()).collect();
+    a.dbg_mark("c-fast");
+    a.g_load(r::RAX, r::RCX, jl.off_shape);
+    a.g_load(r::RDX, r::RCX, jl.props.off_proto);
+    a.g_movabs(r::R11, site as u64);
+    for (w, &f) in found.iter().enumerate() {
+        let next = a.new_label();
+        a.g_load(r::RDI, r::R11, m(w, offset_of!(CallMemo, entry)));
+        a.g_test(r::RDI);
+        a.g_jcc(cc::E, next);
+        a.g_cmp_mem(r::RAX, r::RDI, entry_off::SHAPE);
+        a.g_jcc(cc::NE, next);
+        a.g_cmp_mem(r::RDX, r::RDI, entry_off::PROTO);
+        a.g_jcc(cc::E, f);
+        a.bind(next);
+    }
+    a.jmp(slow);
+    for (w, &f) in found.iter().enumerate() {
+        a.bind(f);
+        a.dbg_mark("c-found");
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, m(w, offset_of!(CallMemo, stamp)));
+        a.g_jcc(cc::NE, slow);
+        a.g_cmp_mem(r::R9, r::RDI, entry_off::STAMP);
+        a.g_jcc(cc::NE, slow);
+        // No accessors on the receiver (as the lookup requires).
+        let no_acc = a.new_label();
+        a.g_load(r::R9, r::RCX, jl.props.off_extra);
+        a.g_test(r::R9);
+        a.g_jcc(cc::E, no_acc);
+        a.g_load(r::R9, r::R9, jl.props.extra_acc_len);
+        a.g_test(r::R9);
+        a.g_jcc(cc::NE, slow);
+        a.bind(no_acc);
+        a.p_cmp32_imm8(r::RDI, entry_off::ACC, 0);
+        a.g_jcc(cc::NE, slow);
+        a.g_load(r::R9, r::RDI, entry_off::VALUE);
+        a.g_test(r::R9);
+        a.g_jcc(cc::E, slow);
+        a.g_load(r::RAX, r::R9, 0);
+        a.g_cmp_mem(r::RAX, r::R11, m(w, offset_of!(CallMemo, bits)));
+        a.g_jcc(cc::NE, slow);
+        a.g_store(RBP, scratch, r::RAX);
+        a.g_load(r::R8, r::R11, m(w, offset_of!(CallMemo, caps)));
+        a.g_load(r::R11, r::R11, m(w, offset_of!(CallMemo, target)));
+        a.jmp(identified);
+    }
+}
+
 /// Emits the native call sequence of one call site (see the module docs). On
 /// any guard failure it jumps to `e.slow`, having changed nothing.
 pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
@@ -1175,6 +1250,10 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     let memo_stamp = |w: usize| site_off(memo(w) + offset_of!(CallMemo, stamp));
     let memo_target = |w: usize| site_off(memo(w) + offset_of!(CallMemo, target));
     let memo_caps = |w: usize| site_off(memo(w) + offset_of!(CallMemo, caps));
+    let memo_entry = |w: usize| site_off(memo(w) + offset_of!(CallMemo, entry));
+    // A method call's lookup leaves its entry in rdi, and rsi nonzero when
+    // the memo may record it (see `p_method_lookup_from`).
+    let method = matches!(e.callee, CalleeSrc::Method { .. });
     // `identified`: the way is in r11 and the captures in r8 already (a memo
     // hit, or a constructor the site's `fast` cache prepared).
     let identified = a.new_label();
@@ -1197,6 +1276,13 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_cmp_mem(r::R9, r::R11, memo_stamp(0));
         a.g_jcc(cc::NE, decode);
         a.g_load(r::R8, r::R11, memo_caps(0));
+        if method {
+            let skip = a.new_label();
+            a.g_test(r::RSI);
+            a.g_jcc(cc::E, skip);
+            a.g_store(r::R11, memo_entry(0), r::RDI);
+            a.bind(skip);
+        }
         a.g_load(r::R11, r::R11, memo_target(0));
         a.jmp(identified);
         let cold = a.cold_begin();
@@ -1241,7 +1327,14 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             let have = a.new_label();
             a.g_cmp_byte_imm(r::R15, l.hosted, 0);
             a.g_jcc(cc::E, lookup);
-            a.p_method_lookup(jl, l.realm, (r::RBX, reg(recv)), site, lookup, None);
+            // The receiver's heap slot; the memos' entries first (see
+            // `CallMemo::entry`), then the chain cache.
+            a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), lookup);
+            let slow = a.new_label();
+            emit_call_fast(a, e.site, scratch, slow, identified);
+            a.bind(slow);
+            a.p_method_lookup_walked(jl, l.realm, site, lookup, None);
+            a.g_mov(r::RDI, r::R11);
             a.g_store(RBP, scratch, r::RAX);
             let cold = memo_check(a);
             a.p_callee_info(jl, l.realm);
@@ -1253,6 +1346,8 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_lea(r::RCX, RBP, scratch);
             a.g_movabs(r::RAX, helper);
             a.call_rax();
+            // (No entry to memoize.)
+            a.g_movabs(r::RSI, 0);
             a.bind(have);
             (RBP, scratch, Some(cold))
         }
@@ -1393,6 +1488,15 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_store(r::R10, memo_stamp(0), r::R9);
         a.g_store(r::R10, memo_target(0), r::R11);
         a.g_store(r::R10, memo_caps(0), r::R8);
+        if method {
+            let keep = a.new_label();
+            a.g_mov(r::RAX, r::RDI);
+            a.g_test(r::RSI);
+            a.g_jcc(cc::NE, keep);
+            a.g_movabs(r::RAX, 0);
+            a.bind(keep);
+            a.g_store(r::R10, memo_entry(0), r::RAX);
+        }
     }
     if let Some(cold) = cold {
         a.jmp(identified);
