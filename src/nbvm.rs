@@ -15292,8 +15292,17 @@ impl Compiler {
             }
         } else {
             // A function body declaring `using` resources disposes them on exit.
+            // A string-literal expression statement (a directive such as
+            // `"use strict"`) has no effect and a function body's completion
+            // value is unobservable: no op (it would allocate the string on
+            // every call).
             c.using_scope(body, |c| {
-                body.iter().try_for_each(|s| c.stmt(s).map(|_| ()))
+                body.iter()
+                    .filter(|s| {
+                        !matches!(s, Stmt::Expr { expression, .. }
+                            if matches!(**expression, crate::ast::Expr::Str { .. }))
+                    })
+                    .try_for_each(|s| c.stmt(s).map(|_| ()))
             })?;
         }
         if is_main {

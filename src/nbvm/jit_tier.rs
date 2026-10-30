@@ -2581,7 +2581,9 @@ pub(crate) extern "C" fn jit_construct_info(
 /// derived class constructor (`proto` `None`: `this` starts unbound), or a
 /// base constructor without an instance-field initializer whose `new.target`
 /// is a class constructor, whose `prototype` (`proto`) is then non-writable
-/// and non-configurable; the site holding a way for it. Every cell involved
+/// and non-configurable, or an ordinary function, whose `prototype` data
+/// property's slot the record then checks for `proto` on every use; the site
+/// holding a way for it. Every cell involved
 /// and its auxiliary object are watched, so a later change to their own
 /// properties or `[[Prototype]]` (which picks a forwarding constructor's
 /// super constructor) retires the record with the prototype epoch.
@@ -2596,6 +2598,7 @@ fn fill_construct_fast(
     if site.fast.ctor == ctor
         && site.fast.nt == nt
         && site.fast.stamp == crate::object::proto_epoch()
+        && proto.map_or(0, Handle::to_raw) == site.fast.proto
     {
         return;
     }
@@ -2617,8 +2620,10 @@ fn fill_construct_fast(
     {
         return;
     }
+    let mut pslot: *const u64 = core::ptr::null();
     if let Some(p) = proto {
-        // `new.target`: a class constructor, its `prototype` fixed.
+        // `new.target`: a class constructor, its `prototype` fixed, or an
+        // ordinary function, its `prototype` checked on every use.
         let Some(nth) = NanBox::from_bits(nt).as_handle().map(Handle::from_raw) else {
             return;
         };
@@ -2637,14 +2642,30 @@ fn fill_construct_fast(
         let Some(nt_aux) = ctx.realm.jit_aux_of(nth) else {
             return;
         };
-        let fixed = class
-            && ctx.realm.jit_object(nt_aux).is_some_and(|o| {
-                o.is_readonly("prototype")
-                    && o.is_non_configurable("prototype")
-                    && o.get("prototype").and_then(|v| v.as_handle()) == Some(p.to_raw())
-            });
-        if !fixed {
+        let pv = NanBox::handle(p.to_raw());
+        let Some(o) = ctx.realm.jit_object(nt_aux) else {
             return;
+        };
+        if class
+            && o.is_readonly("prototype")
+            && o.is_non_configurable("prototype")
+            && o.get("prototype").and_then(|v| v.as_handle()) == Some(p.to_raw())
+        {
+            // Fixed: no per-use check.
+        } else {
+            // An ordinary function's `prototype`, a writable data property:
+            // the record checks its value where it lives (the auxiliary
+            // object's slot, which stays put while the watched object keeps
+            // its layout).
+            let Some(ptr) = o
+                .shaped_shape()
+                .and_then(|sh| sh.lookup("prototype"))
+                .filter(|&k| o.slot(k).map(NanBox::to_bits) == Some(pv.to_bits()))
+                .and_then(|k| o.jit_slot_ptr(k))
+            else {
+                return;
+            };
+            pslot = ptr.cast::<u64>();
         }
         ctx.realm.watch_link(nth.to_raw(), Some(nt_aux.to_raw()));
     }
@@ -2659,6 +2680,8 @@ fn fill_construct_fast(
         stamp: crate::object::proto_epoch(),
         proto: proto.map_or(0, Handle::to_raw),
         derived: u64::from(proto.is_none()),
+        pslot,
+        pbits: proto.map_or(0, |p| NanBox::handle(p.to_raw()).to_bits()),
         target,
         caps,
     };

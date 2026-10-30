@@ -228,7 +228,9 @@ impl CallMemo {
 /// * a base constructor (`derived == 0`) — a VM function constructor
 ///   without instance fields — with `new.target` a class constructor whose
 ///   `prototype` is non-writable and non-configurable (so always the object
-///   `proto`): allocate an ordinary object whose `[[Prototype]]` is `proto`
+///   `proto`), or an ordinary function whose `prototype` data property's
+///   value lives at `pslot` and is checked there on every use (it is
+///   writable): allocate an ordinary object whose `[[Prototype]]` is `proto`
 ///   as `this`;
 /// * a derived class constructor (`derived == 1`): `this` starts unbound
 ///   (the TDZ sentinel) and `super(…)` binds it.
@@ -252,6 +254,14 @@ pub struct ConstructFast {
     pub proto: u64,
     /// `1` for a derived constructor (no allocation), else `0`.
     pub derived: u64,
+    /// For a `new.target` whose `prototype` may change (an ordinary
+    /// function's, a writable data property): the address of that property's
+    /// value in its auxiliary object, valid while the epoch is `stamp` (the
+    /// object is watched, see `Object::jit_slot_ptr`), which must still hold
+    /// `pbits`. Null when the record's identities fix `proto`.
+    pub pslot: *const u64,
+    /// The `NanBox` bits of `proto` (the value `pslot` must hold).
+    pub pbits: u64,
     /// The way that enters its body.
     pub target: *const CallTarget,
     /// Its captured values.
@@ -268,6 +278,8 @@ impl ConstructFast {
             stamp: 0,
             proto: 0,
             derived: 0,
+            pslot: core::ptr::null(),
+            pbits: 0,
             target: core::ptr::null(),
             caps: core::ptr::null(),
         }
@@ -466,6 +478,31 @@ impl X64Assembler {
 fn load_proto_epoch(a: &mut X64Assembler, dst: u8) {
     a.g_movabs(dst, crate::object::proto_epoch_addr() as u64);
     a.g_load(dst, dst, 0);
+}
+
+/// The [`ConstructFast`] record (at `[site + fast]`, the site's address in
+/// `site`) of a base constructor, already matched at the current epoch,
+/// still proves its `proto`: its `pslot`, when set, holds `pbits` (an
+/// ordinary function's writable `prototype`). Else to `miss`. Clobbers
+/// `rax`.
+fn check_construct_proto(a: &mut X64Assembler, site: u8, fast: usize, miss: Label) {
+    use core::mem::offset_of;
+    let fixed = a.new_label();
+    a.g_load(
+        r::RAX,
+        site,
+        site_off(fast + offset_of!(ConstructFast, pslot)),
+    );
+    a.g_test(r::RAX);
+    a.g_jcc(cc::E, fixed);
+    a.g_load(r::RAX, r::RAX, 0);
+    a.g_cmp_mem(
+        r::RAX,
+        site,
+        site_off(fast + offset_of!(ConstructFast, pbits)),
+    );
+    a.g_jcc(cc::NE, miss);
+    a.bind(fixed);
 }
 
 /// Where a call sequence's callee comes from.
@@ -1148,6 +1185,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_movabs(r::RAX, NanBox::tdz().to_bits());
             a.jmp(made);
             a.bind(base);
+            check_construct_proto(a, r::R11, fast, prep);
             a.g_load(
                 r::RSI,
                 r::R11,
@@ -1649,6 +1687,7 @@ fn emit_inline_new_this(
         i32::try_from(offset_of!(CallTarget, key)).ok()?,
     );
     a.g_jcc(cc::NE, miss);
+    check_construct_proto(a, r::R11, fast, miss);
     a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
     let made = a.new_label();
     let by_helper = a.new_label();

@@ -7964,6 +7964,21 @@ impl JitFunction {
                             exec_op!(pc);
                             a.bind(done);
                         }
+                        // A sloppy function's `this` binding
+                        // (`OrdinaryCallBindThis`): an ordinary object cell
+                        // is its own `ToObject`, so nothing to do; anything
+                        // else (`undefined`, a primitive, another kind of
+                        // cell) is the interpreter's op.
+                        crate::nbvm::Op::BindThis { this } if ok(*this) => {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            walk_to_slot!(*this, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
+                            a.je(done);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(done);
+                        }
                         // A captured variable's binding cell: inline from
                         // the heap's free list, else the interpreter's op.
                         crate::nbvm::Op::NewBox { dst } if ok(*dst) => {

@@ -5,7 +5,7 @@
 //! optimized together with its caller's (the receiver cache, the numeric
 //! types, the promoted loop registers all see through it). The sites are
 //! method calls, calls of a value, property reads that call an inherited
-//! getter, and `new` of a small base class constructor (whose guard also
+//! getter, and `new` of a small base constructor (whose guard also
 //! allocates `this`, as the site's `call_seq::ConstructFast` record says,
 //! into the callee's `this` register; see [`construct_ok`]).
 //!
@@ -116,16 +116,15 @@ pub fn callee_ok(proto: &FnProto) -> bool {
 }
 
 /// Whether `proto` can be inlined at a `new` site (`Op::Construct`): a
-/// small base class constructor — the only kind a site's
-/// `call_seq::ConstructFast` record, which the guard requires, serves with an
-/// allocated `this` — whose body never returns explicitly (falling off its
+/// small base constructor (a base class constructor or an ordinary
+/// function) — the kinds a site's `call_seq::ConstructFast` record, which
+/// the guard requires, serves with an allocated `this` — whose body never returns explicitly (falling off its
 /// end yields `this`), reads `new.target` only through `Op::LoadNewTarget`
 /// (the constructor itself, which such a `new` passes as `new.target`), and
 /// is otherwise what [`callee_ok`] accepts.
 #[must_use]
 pub fn construct_ok(proto: &FnProto) -> bool {
-    if !proto.class_ctor
-        || proto.derived
+    if proto.derived
         || proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
@@ -489,7 +488,7 @@ pub fn expand<'a>(
             // registers the body may read before writing them (the others'
             // values are never seen).
             let this_slot = p.n_params + p.n_captures;
-            for r in window_regs(p) {
+            for r in window_regs(p, construct) {
                 if construct && r == this_slot {
                     continue;
                 }
@@ -519,10 +518,10 @@ pub fn expand<'a>(
             }
             // The body: callee pc `j` at `body + body_pc(p, j)`.
             let body = ops.len();
-            let tgt = |t: usize| body + body_pc(p, t);
+            let tgt = |t: usize| body + body_pc(p, t, construct);
             for (j, bop) in p.ops.iter().enumerate() {
                 let bw = c.warm.get(j).cloned().flatten();
-                match width(p, j) {
+                match width(p, j, construct) {
                     0 => continue,
                     w if matches!(bop, Op::Return { .. }) => {
                         let Op::Return { src } = bop else {
@@ -609,8 +608,10 @@ pub fn expand<'a>(
 /// move of the result and (but for the last op) a jump to the end; a sloppy
 /// function's `this` binding is dropped when nothing reads `this` (as the
 /// lowering drops it in the function's own code: computing the bound value
-/// has no effect); anything else is itself.
-fn width(p: &FnProto, j: usize) -> usize {
+/// has no effect) or, at a `new` site (`construct`), when it binds the
+/// guard's freshly allocated object (`OrdinaryCallBindThis` of an object is
+/// that object); anything else is itself.
+fn width(p: &FnProto, j: usize, construct: bool) -> usize {
     match &p.ops[j] {
         Op::Return { .. } => {
             if j + 1 == p.ops.len() && !falls_off(p) {
@@ -619,6 +620,7 @@ fn width(p: &FnProto, j: usize) -> usize {
                 2
             }
         }
+        Op::BindThis { this } if construct && *this as usize == p.n_params + p.n_captures => 0,
         Op::BindThis { this }
             if !p
                 .ops
@@ -645,8 +647,10 @@ fn falls_off(p: &FnProto) -> bool {
 
 /// The offset, in the spliced body, of callee pc `t`; `t == len` is its end
 /// (the fall-off op, if any).
-fn body_pc(p: &FnProto, t: usize) -> usize {
-    (0..t.min(p.ops.len())).map(|j| width(p, j)).sum()
+fn body_pc(p: &FnProto, t: usize, construct: bool) -> usize {
+    (0..t.min(p.ops.len()))
+        .map(|j| width(p, j, construct))
+        .sum()
 }
 
 /// The ops one inlined site takes before its call op: guard, branch, window,
@@ -655,18 +659,18 @@ fn body_pc(p: &FnProto, t: usize) -> usize {
 fn block_len(c: &Candidate<'_>, construct: bool) -> usize {
     let p = c.proto;
     let this_slot = p.n_params + p.n_captures;
-    let window = window_regs(p)
+    let window = window_regs(p, construct)
         .into_iter()
         .filter(|&r| !(construct && r == this_slot))
         .count();
-    2 + window + body_pc(p, p.ops.len()) + usize::from(falls_off(p)) + 2
+    2 + window + body_pc(p, p.ops.len(), construct) + usize::from(falls_off(p)) + 2
 }
 
 /// The callee registers an inlined site initializes as a call's register
 /// window would be (its parameters, `this`, every other register
 /// `undefined`; the captures are the guard's): those the spliced body may
-/// read before it writes them, ascending.
-fn window_regs(p: &FnProto) -> Vec<usize> {
+/// read before it writes them, ascending (`construct`: as for [`width`]).
+fn window_regs(p: &FnProto, construct: bool) -> Vec<usize> {
     let n = p.ops.len();
     let nr = p.n_regs;
     // Backward liveness over the spliced body (its branches go forward, so
@@ -690,7 +694,7 @@ fn window_regs(p: &FnProto) -> Vec<usize> {
                 *o |= *l;
             }
         }
-        if width(p, j) > 0 {
+        if width(p, j, construct) > 0 {
             super::numeric::def_use(op, &mut defs, &mut uses);
             for &d in &defs {
                 if let Some(x) = out.get_mut(d as usize) {
