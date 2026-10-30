@@ -1026,6 +1026,32 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             super::vm_iter_step(ctx, regs, *done, *iter, *next)
                 .map(|v| regs[*dst as usize] = v.unwrap_or(NanBox::undefined())),
         ),
+        // `for (const [k, v] of map)`: exactly its interpreter arm.
+        Op::IterNextEntry {
+            dst,
+            fused,
+            key,
+            val,
+            done,
+            iter,
+            next,
+        } => Some(
+            if let Some(step) = super::iter_fast::entry_step(ctx, regs, *done, *iter, *next) {
+                regs[*fused as usize] = NanBox::boolean(true);
+                match step {
+                    Some((k, v)) => {
+                        regs[*key as usize] = k;
+                        regs[*val as usize] = v;
+                    }
+                    None => regs[*done as usize] = NanBox::boolean(true),
+                }
+                Ok(())
+            } else {
+                regs[*fused as usize] = NanBox::boolean(false);
+                super::vm_iter_step(ctx, regs, *done, *iter, *next)
+                    .map(|v| regs[*dst as usize] = v.unwrap_or(NanBox::undefined()))
+            },
+        ),
         Op::IterClose { iter, done, quiet } if regs[*iter as usize].is_number() => {
             if regs[*done as usize].as_boolean() == Some(true) {
                 Some(Ok(()))

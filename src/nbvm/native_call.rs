@@ -434,6 +434,8 @@ pub(super) fn try_call(
         if site.op == FastOp::None {
             return None;
         }
+    } else if !prim {
+        ctx.realm.method_site_note_recv(h, &mut site.chain);
     }
     let (op, method) = (site.op, site.method);
     run_op(ctx, funcs, op, method, recv, h, prim, regs, args)

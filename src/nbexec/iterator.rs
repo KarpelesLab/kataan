@@ -3069,12 +3069,16 @@ pub(crate) fn realm_builtin_entry_step(
         .and_then(|l| l.read(realm, h))
     {
         Some([coll, state]) => (coll, state),
-        None => (
-            realm.get_property(h, GEN_COLL)?,
-            realm
+        None => {
+            let coll = realm.get_property(h, GEN_COLL)?;
+            let state = realm
                 .get_property(h, GEN_CSTATE)
-                .unwrap_or(NanBox::undefined()),
-        ),
+                .unwrap_or(NanBox::undefined());
+            if realm.coll_iter_layout.is_none() {
+                realm.coll_iter_layout = HiddenLayout::learn(realm, h, COLL_ITER_KEYS, &[]);
+            }
+            (coll, state)
+        }
     };
     let coll = Handle::from_raw(coll.as_handle()?);
     let Some(state) = state.as_handle().map(Handle::from_raw) else {

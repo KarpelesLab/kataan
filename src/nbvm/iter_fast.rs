@@ -103,41 +103,40 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
     };
     if !own_named
         && let Some(p) = proto
-        && realm.array_iter_memo.open_stamp == crate::object::proto_epoch()
-        && realm.array_iter_memo.open_proto == p.to_raw()
-        && let Some((iter_at, next_at)) = &realm.array_iter_memo.open
+        && let Some((ok, f, n)) = open_memo_hit(realm, p)
     {
-        let ai = realm.vm_array_iter();
-        if let (Some(f), Some(n)) = (realm.stamped_slot(iter_at), realm.stamped_slot(next_at)) {
-            let ok = f
-                .as_handle()
-                .is_some_and(|fh| ai.values_fns.iter().any(|x| x.to_raw() == fh))
-                && ai
-                    .next_fn
-                    .is_some_and(|nf| n.as_handle() == Some(nf.to_raw()));
-            // For a plain array, publish the open to compiled code.
-            #[cfg(all(
-                feature = "jit",
-                feature = "alloc",
-                target_os = "linux",
-                target_arch = "x86_64"
-            ))]
-            if ok && root.is_some() {
-                let jit = crate::realm::builtins_fast::ArrayIterJit {
-                    stamp: realm.array_iter_memo.open_stamp,
-                    iter_holder: iter_at.0,
-                    iter_shape: crate::jit::shape_word(&iter_at.1),
-                    iter_slot: u64::from(iter_at.2),
-                    iter_fn: f.to_bits(),
-                    next_holder: next_at.0,
-                    next_shape: crate::jit::shape_word(&next_at.1),
-                    next_slot: u64::from(next_at.2),
-                    next_fn: n.to_bits(),
-                };
-                realm.array_iter_jit = jit;
-            }
-            return ok;
+        // For a plain array, publish the open to compiled code.
+        #[cfg(all(
+            feature = "jit",
+            feature = "alloc",
+            target_os = "linux",
+            target_arch = "x86_64"
+        ))]
+        if ok
+            && root.is_some()
+            && let Some((iter_at, next_at)) = &realm.array_iter_memo.open
+        {
+            let jit = crate::realm::builtins_fast::ArrayIterJit {
+                stamp: realm.array_iter_memo.open_stamp,
+                iter_holder: iter_at.0,
+                iter_shape: crate::jit::shape_word(&iter_at.1),
+                iter_slot: u64::from(iter_at.2),
+                iter_fn: f.to_bits(),
+                next_holder: next_at.0,
+                next_shape: crate::jit::shape_word(&next_at.1),
+                next_slot: u64::from(next_at.2),
+                next_fn: n.to_bits(),
+            };
+            realm.array_iter_jit = jit;
         }
+        #[cfg(not(all(
+            feature = "jit",
+            feature = "alloc",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )))]
+        let _ = (f, n);
+        return ok;
     }
     if !can_open_walk(realm, h) {
         return false;
@@ -145,22 +144,48 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
     // Memoize the answer for arrays like this one (no own named properties,
     // this prototype), watching both chains.
     if !own_named && let Some(p) = proto {
-        realm.array_iter_memo.open_stamp = 0;
-        realm.array_iter_jit = crate::realm::builtins_fast::ArrayIterJit::default();
-        let ai = realm.vm_array_iter();
-        let (Some(iter_proto), Some(key)) = (ai.iter_proto, ai.iter_key.clone()) else {
-            return true;
-        };
-        if let Some(Some(iter_at)) = realm.watch_get_chain(p, &key)
-            && let Some(Some(next_at)) = realm.watch_get_chain(iter_proto, "next")
-        {
-            let m = &mut realm.array_iter_memo;
-            m.open = Some((iter_at, next_at));
-            m.open_proto = p.to_raw();
-            m.open_stamp = crate::object::proto_epoch();
-        }
+        arm_open_memo(realm, p);
     }
     true
+}
+
+/// The memoized [`can_open`] answer for an array with no own named
+/// properties and the prototype `p`, while the memo's stamp is current:
+/// whether both found values are still the intrinsics, and those values.
+fn open_memo_hit(realm: &Realm, p: Handle) -> Option<(bool, NanBox, NanBox)> {
+    let m = &realm.array_iter_memo;
+    if m.open_stamp != crate::object::proto_epoch() || m.open_proto != p.to_raw() {
+        return None;
+    }
+    let (iter_at, next_at) = m.open.as_ref()?;
+    let (f, n) = (realm.stamped_slot(iter_at)?, realm.stamped_slot(next_at)?);
+    let ai = realm.vm_array_iter();
+    let ok = f
+        .as_handle()
+        .is_some_and(|fh| ai.values_fns.iter().any(|x| x.to_raw() == fh))
+        && ai
+            .next_fn
+            .is_some_and(|nf| n.as_handle() == Some(nf.to_raw()));
+    Some((ok, f, n))
+}
+
+/// Memoizes the lookups behind [`can_open`] for arrays with no own named
+/// properties and the prototype `p`, watching both chains.
+fn arm_open_memo(realm: &mut Realm, p: Handle) {
+    realm.array_iter_memo.open_stamp = 0;
+    realm.array_iter_jit = crate::realm::builtins_fast::ArrayIterJit::default();
+    let ai = realm.vm_array_iter();
+    let (Some(iter_proto), Some(key)) = (ai.iter_proto, ai.iter_key.clone()) else {
+        return;
+    };
+    if let Some(Some(iter_at)) = realm.watch_get_chain(p, &key)
+        && let Some(Some(next_at)) = realm.watch_get_chain(iter_proto, "next")
+    {
+        let m = &mut realm.array_iter_memo;
+        m.open = Some((iter_at, next_at));
+        m.open_proto = p.to_raw();
+        m.open_stamp = crate::object::proto_epoch();
+    }
 }
 
 /// [`can_open`] by the lookups themselves.
@@ -203,7 +228,33 @@ fn can_open_walk(realm: &Realm, h: Handle) -> bool {
 /// `%Array.prototype.values%`, the iterator's `next` is the intrinsic one,
 /// and no `return` is reachable for the close after the two steps — exactly
 /// what [`can_open`] and [`close`] would find for that array.
-fn fresh_pair_is_plain(realm: &Realm) -> bool {
+///
+/// While the prototype epoch is unchanged, the answer comes from the same
+/// stamped memo [`can_open`] keeps (plus [`close`]'s "no `return`" stamp),
+/// re-reading only the two found values; a positive walk arms both.
+fn fresh_pair_is_plain(realm: &mut Realm) -> bool {
+    let Some(array_proto) = realm.fresh_array_proto() else {
+        return false;
+    };
+    if realm.array_iter_memo.close_stamp == crate::object::proto_epoch()
+        && let Some((ok, _, _)) = open_memo_hit(realm, array_proto)
+    {
+        return ok;
+    }
+    if !fresh_pair_walk(realm) {
+        return false;
+    }
+    arm_open_memo(realm, array_proto);
+    if let Some(proto) = realm.vm_array_iter().iter_proto
+        && let Some(None) = realm.watch_get_chain(proto, "return")
+    {
+        realm.array_iter_memo.close_stamp = crate::object::proto_epoch();
+    }
+    true
+}
+
+/// [`fresh_pair_is_plain`] by the lookups themselves.
+fn fresh_pair_walk(realm: &Realm) -> bool {
     let ai = realm.vm_array_iter();
     let (Some(proto), Some(next_fn), Some(key), Some(array_proto)) = (
         ai.iter_proto,
@@ -250,7 +301,7 @@ pub(super) fn entry_step(
     if it.is_number() || regs[done as usize].as_boolean() == Some(true) {
         return None;
     }
-    if !fresh_pair_is_plain(&ctx.realm) {
+    if !fresh_pair_is_plain(&mut ctx.realm) {
         return None;
     }
     let step = crate::nbexec::realm_builtin_entry_step(&mut ctx.realm, nx, it)?;

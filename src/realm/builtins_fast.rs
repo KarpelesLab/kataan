@@ -527,6 +527,11 @@ impl Realm {
         if !cache.armed || cache.swaps != self.cell_swaps || cache.prim {
             return None;
         }
+        let epoch = crate::object::proto_epoch();
+        if cache.stamp == epoch && cache.recv_stamp == epoch && cache.recv_memo == recv.to_raw() {
+            let first = cache.links.first().map(|l| Handle::from_raw(l.0));
+            return self.site_stamped_get(first, key, cache);
+        }
         let cur = if cache.own {
             Some(recv)
         } else {
@@ -536,6 +541,33 @@ impl Realm {
             return self.site_stamped_get(cur, key, cache);
         }
         self.site_links_get_stamping(cur, key, cache)
+    }
+
+    /// After a [`method_site_get`](Self::method_site_get) hit on the Map/Set
+    /// `recv` with every link watched at the current prototype epoch: watches
+    /// `recv` (its cell and auxiliary object, so a new own property or a
+    /// `[[Prototype]]` change bumps the epoch) and remembers that, at this
+    /// epoch, its lookup continues at the first link, so the next hits on it
+    /// skip the receiver probe.
+    pub fn method_site_note_recv(&mut self, recv: Handle, cache: &mut MethodSiteCache) {
+        let epoch = crate::object::proto_epoch();
+        if cache.own
+            || cache.prim
+            || cache.stamp != epoch
+            || (cache.recv_stamp == epoch && cache.recv_memo == recv.to_raw())
+            || !matches!(self.heap.get(recv), Some(Cell::Collection { .. }))
+            || cache.recv_notes >= RECV_NOTES
+            || self.is_host_exotic(recv)
+        {
+            return;
+        }
+        cache.recv_notes += 1;
+        let aux = self.aux_props.get(&recv.to_raw()).map(|a| a.to_raw());
+        self.watch_link(recv.to_raw(), aux);
+        if crate::object::proto_epoch() == epoch {
+            cache.recv_memo = recv.to_raw();
+            cache.recv_stamp = epoch;
+        }
     }
 
     /// [`site_links_get`](Self::site_links_get) for a cache whose stamp is
@@ -667,6 +699,7 @@ impl Realm {
     ) -> Option<NanBox> {
         cache.armed = false;
         cache.stamp = 0;
+        cache.recv_stamp = 0;
         cache.links.clear();
         cache.holder_shape = None;
         cache.own = false;
@@ -1065,6 +1098,10 @@ pub struct ChainKeyCache {
     swaps: u32,
 }
 
+/// The most receivers one method site watches for its receiver memo (see
+/// [`Realm::method_site_note_recv`]).
+const RECV_NOTES: u8 = 32;
+
 /// A method-call site's memo of where `recv[key]` resolves (see
 /// [`Realm::method_site_get`]): like [`ChainKeyCache`] from the receiver's
 /// prototype on, plus the holder's slot under its recorded shape and one
@@ -1085,6 +1122,17 @@ pub struct MethodSiteCache {
     /// `stamp`, no link changed, so a hit needs only the receiver's side.
     stamp: u64,
     recv_shape: Option<Rc<Shape>>,
+    /// A Map/Set receiver (raw handle) known, at the prototype epoch
+    /// `recv_stamp`, not to own the key and to have the first link as its
+    /// `[[Prototype]]`, with the cell (and its auxiliary object, if any)
+    /// watched: while the epoch is unchanged, neither can have changed (see
+    /// [`Realm::method_site_note_recv`]).
+    recv_memo: u64,
+    recv_stamp: u64,
+    /// How many receivers this site has watched for `recv_memo` (capped at
+    /// [`RECV_NOTES`], so a site that sees ever new Maps adds a bounded
+    /// number of entries to the realm's never-pruned watched set).
+    recv_notes: u8,
     /// Whether the receiver itself is the holder (the only link).
     own: bool,
     /// Whether the site was filled for a primitive receiver (the walk starts
