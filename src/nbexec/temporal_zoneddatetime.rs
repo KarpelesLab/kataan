@@ -2851,7 +2851,31 @@ impl Interp {
             return dur;
         }
         let (sd, st) = local_of(tz, start_epoch);
-        let ed = local_of(tz, end_epoch).0;
+        let (end_date, end_time) = local_of(tz, end_epoch);
+        // `DifferenceZonedDateTime`: the date part runs to an intermediate date
+        // backed off from the end date (by up to two days forward, one backward)
+        // until the start wall time on it does not pass `end_epoch` — so a later
+        // start time-of-day does not count a day, week or month not yet reached
+        // (Jul 21 18:00 → Aug 21 13:06 is 30 days and some hours, not a month).
+        let ed = if end_date == sd {
+            end_date
+        } else {
+            let st_ns = time_to_nanos(st);
+            let mut corr: i64 =
+                i64::from((time_to_nanos(end_time) - st_ns).signum() as i64 == -sign);
+            let max_corr: i64 = if sign > 0 { 2 } else { 1 };
+            loop {
+                let inter = epoch_days_to_iso(iso_to_epoch_days(end_date) - corr * sign);
+                let inter_ns = wall_to_epoch(
+                    tz,
+                    iso_to_epoch_days(inter) as i128 * iso::NS_PER_DAY + st_ns,
+                );
+                if (end_epoch - inter_ns).signum() as i64 != -sign || corr >= max_corr {
+                    break inter;
+                }
+                corr += 1;
+            }
+        };
         // Full unrounded date difference at `largest` (calendar-aware for non-ISO).
         // NudgeToCalendarUnit keeps the units coarser than `unit` and rounds only the
         // `unit` component — it does NOT re-express the whole span in `unit`s (which

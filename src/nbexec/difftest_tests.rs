@@ -2657,3 +2657,22 @@ fn temporal_bubble_relative_duration_after_rounding() {
         "P143M2W|P11Y11M3W|P5W|P11M30D|-P18M|P1Y10M|P1Y10M|P11M"
     );
 }
+
+/// `DifferenceZonedDateTime` backs the end date off (up to two days forward,
+/// one backward) until the start's wall time on it does not pass the end
+/// instant, so a later start time-of-day does not count a day, week or month
+/// not yet reached. The calendar-unit rounding path took the raw wall-date
+/// difference instead: Jul 21 18:00 → Aug 21 13:06 counted a whole month
+/// (then rounded to `P1M` instead of `P4W`).
+#[test]
+fn temporal_zoned_calendar_rounding_day_correction() {
+    let src = r#"
+        function z(s) { return Temporal.ZonedDateTime.from(s); }
+        [String(z("2003-07-21T18:00[Australia/Lord_Howe]").until(z("2003-08-21T13:06[Australia/Lord_Howe]"), { largestUnit: "months", smallestUnit: "weeks", roundingMode: "halfCeil" })),
+         String(z("2014-10-06T05:00[America/Santiago]").until(z("2007-03-06T10:50[America/Santiago]"), { largestUnit: "years", smallestUnit: "weeks", roundingMode: "halfCeil" })),
+         String(z("2023-09-15T09:00[America/New_York]").until(z("2023-10-20T05:39[America/New_York]"), { largestUnit: "weeks", smallestUnit: "days", roundingMode: "halfTrunc", roundingIncrement: 5 })),
+         String(z("2024-01-31T18:00[UTC]").until(z("2024-02-29T06:00[UTC]"), { largestUnit: "months", smallestUnit: "days", roundingMode: "trunc" }))
+        ].join("|")
+    "#;
+    assert_eq!(run(src), "P4W|-P7Y6M4W|P4W5D|P28D");
+}
