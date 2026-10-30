@@ -1930,6 +1930,25 @@ fn decimal_shift(n: f64, k: i32) -> f64 {
     alloc::format!("{m}e{}", e + k).parse().unwrap_or(n)
 }
 
+/// An exactly rounded number: `(negative, integer digits, fraction digits,
+/// grouping, percent)`, digits as values 0-9.
+#[cfg(feature = "intl")]
+type ExactDigits = (bool, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, bool, bool);
+
+/// The exact decimal expansion `(negative, integer, fraction)` of a finite
+/// double of magnitude at least 2^46 (so at most six binary fraction digits,
+/// which `{:.10}` prints exactly), trailing fraction zeros trimmed.
+#[cfg(feature = "intl")]
+fn exact_double_digits(n: f64) -> (bool, String, String) {
+    let s = alloc::format!("{:.10}", n.abs());
+    let (int, frac) = s.split_once('.').unwrap_or((s.as_str(), ""));
+    (
+        n.is_sign_negative(),
+        String::from(int),
+        String::from(frac.trim_end_matches('0')),
+    )
+}
+
 #[cfg(feature = "intl")]
 fn plural_notation_operand_string(n: f64, notation: &str) -> Option<String> {
     let a = n.abs();
@@ -4893,10 +4912,9 @@ impl Interp {
     /// this option set, recovered by formatting a probe pair through the very same
     /// code path and splitting the range rendering around the two endpoint
     /// renderings. (The exact path is reached only for standard-notation decimal
-    /// style, which carries no unit/currency modifier, so the range is exactly
-    /// `prefix + start + infix + end + suffix`.) Like `formatToParts`, the exact
-    /// renderer produces a flat string rather than tagged digit runs, so each
-    /// endpoint contributes a single `literal` part.
+    /// and percent style, which carry no unit/currency modifier, so the range is
+    /// exactly `prefix + start + infix + end + suffix`.) Each endpoint contributes
+    /// its own typed parts.
     #[cfg(feature = "intl")]
     fn nf_range_exact_parts(
         &mut self,
@@ -4906,19 +4924,23 @@ impl Interp {
         x: f64,
         y: f64,
     ) -> Option<Vec<(&'static str, String, &'static str)>> {
-        let exact_start = self.try_exact_decimal_format(inst, start);
-        let exact_end = self.try_exact_decimal_format(inst, end);
+        let exact_start = self.try_exact_decimal_parts(inst, start, x);
+        let exact_end = self.try_exact_decimal_parts(inst, end, y);
         if exact_start.is_none() && exact_end.is_none() {
             return None;
         }
-        let a = match exact_start {
-            Some(s) => s,
-            None => self.intl_format_value(inst, NanBox::number(x)),
+        // Each endpoint's typed parts in the resolved numbering system: the
+        // exact renderer's or the ordinary `formatToParts` split.
+        let pa = match exact_start {
+            Some(p) => p,
+            None => self.number_handle_parts(inst, NanBox::number(x)),
         };
-        let b = match exact_end {
-            Some(s) => s,
-            None => self.intl_format_value(inst, NanBox::number(y)),
+        let pb = match exact_end {
+            Some(p) => p,
+            None => self.number_handle_parts(inst, NanBox::number(y)),
         };
+        let a: String = pa.iter().map(|(_, v)| v.as_str()).collect();
+        let b: String = pb.iter().map(|(_, v)| v.as_str()).collect();
         let locale = self
             .realm
             .get_property(inst, "\u{0}locale")
@@ -4929,33 +4951,84 @@ impl Interp {
         // separator's spacing heuristic) but is otherwise a trivially distinct pair.
         let px = if x.is_sign_negative() { -1.0 } else { 1.0 };
         let py = if y.is_sign_negative() { -2.0 } else { 2.0 };
-        let mut out: Vec<(&'static str, String, &'static str)> = Vec::new();
-        let lit = |text: &str, out: &mut Vec<(&'static str, String, &'static str)>| {
-            if !text.is_empty() {
-                out.push(("literal", String::from(text), "shared"));
-            }
+        let single = |v: f64| -> Vec<(&'static str, String)> {
+            intl::number::format_to_parts(&locale, v, &opts)
+                .into_iter()
+                .map(|p| (p.kind.as_str(), p.value))
+                .collect()
         };
-        if a == b {
-            // Both ends render alike: the locale's `approximately` form, all shared.
-            let one = intl::number::format(&locale, px, &opts);
-            let approx = intl::number::format_range(&locale, px, px, &opts);
-            let (pre, post) = approx.split_once(one.as_str())?;
-            lit(pre, &mut out);
-            out.push(("literal", a, "shared"));
-            lit(post, &mut out);
-            return Some(out);
+        let one = single(px);
+        let range: Vec<(&'static str, String, &'static str)> = if a == b {
+            // Both ends render alike: the locale's `approximately` form.
+            intl::number::format_range_to_parts(&locale, px, px, &opts)
+        } else {
+            intl::number::format_range_to_parts(&locale, px, py, &opts)
         }
-        let fx = intl::number::format(&locale, px, &opts);
-        let fy = intl::number::format(&locale, py, &opts);
-        let range = intl::number::format_range(&locale, px, py, &opts);
-        let (pre, rest) = range.split_once(fx.as_str())?;
-        let (sep, post) = rest.rsplit_once(fy.as_str())?;
-        lit(pre, &mut out);
-        out.push(("literal", a, "startRange"));
-        lit(sep, &mut out);
-        out.push(("literal", b, "endRange"));
-        lit(post, &mut out);
-        Some(out)
+        .into_iter()
+        .map(|p| (p.kind.as_str(), p.value, p.source.as_str()))
+        .collect();
+        // Where `probe` occurs as a run of `range[from..]` (kind and text).
+        let find = |probe: &[(&'static str, String)], from: usize| -> Option<usize> {
+            (from..=range.len().checked_sub(probe.len())?).find(|&at| {
+                probe
+                    .iter()
+                    .zip(&range[at..])
+                    .all(|((k, v), (rk, rv, _))| k == rk && v == rv)
+            })
+        };
+        // Splice the endpoint parts in place of the probe renderings; the glue
+        // (approximately sign, range separator, shared affixes) keeps the crate's
+        // own types.
+        let whole = (|| {
+            let mut out: Vec<(&'static str, String, &'static str)> = Vec::new();
+            let sa = find(&one, 0)?;
+            out.extend_from_slice(&range[..sa]);
+            if a == b {
+                out.extend(pa.iter().map(|(k, v)| (*k, v.clone(), "shared")));
+                out.extend_from_slice(&range[sa + one.len()..]);
+                return Some(out);
+            }
+            let two = single(py);
+            let sb = find(&two, sa + one.len())?;
+            out.extend(pa.iter().map(|(k, v)| (*k, v.clone(), "startRange")));
+            out.extend_from_slice(&range[sa + one.len()..sb]);
+            out.extend(pb.iter().map(|(k, v)| (*k, v.clone(), "endRange")));
+            out.extend_from_slice(&range[sb + two.len()..]);
+            Some(out)
+        })();
+        if whole.is_some() {
+            return whole;
+        }
+        // The range collapsed an affix both ends share (`de`'s `100–200 %`), so
+        // a probe rendering is not a run of it: replace just each number core
+        // (integer/group/decimal/fraction run) with the endpoint's own.
+        let is_core = |k: &str| matches!(k, "integer" | "group" | "decimal" | "fraction");
+        let core_of = |p: &[(&'static str, String)]| -> Vec<(&'static str, String)> {
+            p.iter()
+                .skip_while(|(k, _)| !is_core(k))
+                .take_while(|(k, _)| is_core(k))
+                .cloned()
+                .collect()
+        };
+        let cores = [core_of(&pa), core_of(&pb)];
+        let want = if a == b { 1 } else { 2 };
+        let mut out: Vec<(&'static str, String, &'static str)> = Vec::new();
+        let mut runs = 0;
+        let mut i = 0;
+        while i < range.len() {
+            if is_core(range[i].0) && runs < want {
+                let src = range[i].2;
+                while i < range.len() && is_core(range[i].0) {
+                    i += 1;
+                }
+                out.extend(cores[runs].iter().map(|(k, v)| (*k, v.clone(), src)));
+                runs += 1;
+            } else {
+                out.push(range[i].clone());
+                i += 1;
+            }
+        }
+        (runs == want).then_some(out)
     }
 
     /// The tagged `(type, value, source)` parts of an `Intl.NumberFormat` range
@@ -8434,6 +8507,16 @@ impl Interp {
         if let Some(s) = self.try_rounding_priority(handle, n) {
             return s;
         }
+        // A percentage of 2^53 or more is scaled exactly (the crate's `f64`
+        // ×100 is not); the cheap magnitude test keeps ordinary values off the
+        // option probe.
+        #[cfg(feature = "intl")]
+        if n.is_finite()
+            && n.abs() * 100.0 >= 9007199254740992.0
+            && let Some(s) = self.try_exact_decimal_format(handle, NanBox::number(n))
+        {
+            return s;
+        }
         let s = self.intl_format_number_inner(handle, n);
         self.apply_numbering_digits(handle, s)
     }
@@ -8483,19 +8566,39 @@ impl Interp {
         Some((neg, String::from(int_part), String::from(frac_part)))
     }
 
-    /// Exact-decimal `Intl.NumberFormat.prototype.format` for a high-precision
-    /// string / BigInt argument (ECMA-402 `ToIntlMathematicalValue` keeps the full
-    /// value; the crate's `f64` path would round it). Handles only
-    /// standard-notation plain-decimal formatting with fraction-digit options —
-    /// everything else returns `None` to fall back to the numeric path.
+    /// The exact, option-rounded decimal digits `(negative, integer, fraction,
+    /// grouping, percent)` of a value the crate's `f64` path would render wrongly,
+    /// or `None` to leave it to that path. Two sources qualify:
+    ///
+    /// - a high-precision string / BigInt `value` (ECMA-402
+    ///   `ToIntlMathematicalValue` keeps the full value; see
+    ///   [`extract_exact_decimal`](Self::extract_exact_decimal));
+    /// - for `style: "percent"`, a Number `n` whose percentage reaches 2^53. The
+    ///   crate scales by 100 in `f64` and then prints the product's binary
+    ///   expansion, so `1e21` came out as `99,999,999,999,999,991,611,392%`;
+    ///   PartitionNumberPattern multiplies the mathematical value, which here is
+    ///   the double's exact decimal expansion shifted two places.
+    ///
+    /// Only standard-notation decimal/percent formatting with the default
+    /// rounding increment is handled.
     #[cfg(feature = "intl")]
-    fn try_exact_decimal_format(&mut self, handle: Handle, value: NanBox) -> Option<String> {
+    fn exact_rounded_digits(
+        &mut self,
+        handle: Handle,
+        value: NanBox,
+        n: Option<f64>,
+    ) -> Option<ExactDigits> {
         use intl::number::{Notation, NumberStyle, UseGrouping};
         let opts = self.number_format_options(handle);
-        // Only standard-notation decimal style is shaped by `assemble_decimal`'s
-        // probe; currency/percent/unit affixes and scientific/engineering/compact
-        // mantissa shaping stay on the crate's f64 path.
-        if opts.notation != Notation::Standard || !matches!(opts.style, NumberStyle::Decimal) {
+        // Only standard-notation decimal/percent style is shaped by the
+        // probe-built scaffold; currency/unit affixes and scientific/engineering/
+        // compact mantissa shaping stay on the crate's f64 path.
+        let percent = match opts.style {
+            NumberStyle::Decimal => false,
+            NumberStyle::Percent => true,
+            _ => return None,
+        };
+        if opts.notation != Notation::Standard {
             return None;
         }
         let increment = self
@@ -8509,7 +8612,35 @@ impl Interp {
             // so leave it to the f64 path.
             return None;
         }
-        let (neg, int_part, frac_part) = self.extract_exact_decimal(value)?;
+        if percent {
+            // morePrecision/lessPrecision pick between two roundings; the exact
+            // renderer below does only one.
+            let priority = self
+                .realm
+                .get_property(handle, islot!("roundingPriority"))
+                .map(|v| self.realm.to_display_string(v))
+                .unwrap_or_default();
+            if matches!(priority.as_str(), "morePrecision" | "lessPrecision") {
+                return None;
+            }
+        }
+        let (neg, mut int_part, mut frac_part) = match self.extract_exact_decimal(value) {
+            Some(d) => d,
+            None => {
+                let n = n.filter(|n| {
+                    percent && n.is_finite() && n.abs() * 100.0 >= 9007199254740992.0
+                })?;
+                exact_double_digits(n)
+            }
+        };
+        if percent {
+            // x × 100, exactly: move two fraction digits into the integer part.
+            while frac_part.len() < 2 {
+                frac_part.push('0');
+            }
+            int_part.push_str(&frac_part[..2]);
+            frac_part.drain(..2);
+        }
         let min_int = (opts.minimum_integer_digits.max(1)) as usize;
 
         let (mut int_digits, frac_digits) = if opts.minimum_significant_digits.is_some()
@@ -8526,8 +8657,13 @@ impl Interp {
                 opts.rounding_mode,
             )?
         } else {
-            let max_frac = opts.maximum_fraction_digits.unwrap_or(3) as usize;
             let min_frac = opts.minimum_fraction_digits.unwrap_or(0) as usize;
+            // An omitted maximum is the style default (percent 0, decimal 3),
+            // raised to the minimum.
+            let max_frac = opts.maximum_fraction_digits.map_or_else(
+                || (if percent { 0 } else { 3 }).max(min_frac),
+                |m| m as usize,
+            );
             let mut int_digits: alloc::vec::Vec<u8> = int_part.bytes().map(|b| b - b'0').collect();
             let mut frac_digits: alloc::vec::Vec<u8> =
                 frac_part.bytes().map(|b| b - b'0').collect();
@@ -8556,7 +8692,162 @@ impl Interp {
             int_digits.insert(0, 0);
         }
         let grouping = !matches!(opts.use_grouping, UseGrouping::Never);
-        Some(self.assemble_decimal(handle, neg, &int_digits, &frac_digits, grouping))
+        Some((neg, int_digits, frac_digits, grouping, percent))
+    }
+
+    /// Exact-decimal `Intl.NumberFormat.prototype.format` for a high-precision
+    /// string / BigInt argument, or for a percentage of a Number too large for the
+    /// crate's `f64` scaling (see [`exact_rounded_digits`](Self::exact_rounded_digits)).
+    #[cfg(feature = "intl")]
+    fn try_exact_decimal_format(&mut self, handle: Handle, value: NanBox) -> Option<String> {
+        let n = value.as_number();
+        let (neg, int, frac, grouping, percent) = self.exact_rounded_digits(handle, value, n)?;
+        if percent {
+            let parts = self.assemble_exact_parts(handle, neg, &int, &frac, grouping, true);
+            let out: String = parts.into_iter().map(|(_, v)| v).collect();
+            return Some(self.apply_numbering_digits(handle, out));
+        }
+        Some(self.assemble_decimal(handle, neg, &int, &frac, grouping))
+    }
+
+    /// The `formatToParts` counterpart of
+    /// [`try_exact_decimal_format`](Self::try_exact_decimal_format): `raw` is the
+    /// uncoerced argument (a string / BigInt keeps its digits) and `n` its
+    /// numeric value. The parts carry the resolved numbering system's digits.
+    #[cfg(feature = "intl")]
+    fn try_exact_decimal_parts(
+        &mut self,
+        handle: Handle,
+        raw: NanBox,
+        n: f64,
+    ) -> Option<Vec<(&'static str, String)>> {
+        let (neg, int, frac, grouping, percent) =
+            self.exact_rounded_digits(handle, raw, Some(n))?;
+        let parts = self.assemble_exact_parts(handle, neg, &int, &frac, grouping, percent);
+        Some(
+            parts
+                .into_iter()
+                .map(|(k, v)| (k, self.apply_numbering_digits(handle, v)))
+                .collect(),
+        )
+    }
+
+    /// `formatToParts` of `raw` (uncoerced) whose numeric value is `n`: the exact
+    /// renderer when the value needs it, else [`number_handle_parts`](Self::number_handle_parts).
+    pub(crate) fn number_handle_parts_of(
+        &mut self,
+        handle: Handle,
+        raw: NanBox,
+        n: f64,
+    ) -> Vec<(&'static str, String)> {
+        #[cfg(feature = "intl")]
+        if let Some(p) = self.try_exact_decimal_parts(handle, raw, n) {
+            return p;
+        }
+        #[cfg(not(feature = "intl"))]
+        let _ = raw;
+        self.number_handle_parts(handle, NanBox::number(n))
+    }
+
+    /// The typed parts of an exactly rounded value: the sign/affix parts come from
+    /// the crate's own parts for a probe at this option set (forced to one
+    /// fraction digit, so the decimal separator and the suffix are told apart),
+    /// and the integer groups from the locale's grouping probes. Latn digits.
+    #[cfg(feature = "intl")]
+    fn assemble_exact_parts(
+        &mut self,
+        handle: Handle,
+        neg: bool,
+        int: &[u8],
+        frac: &[u8],
+        grouping: bool,
+        percent: bool,
+    ) -> Vec<(&'static str, String)> {
+        let locale = self
+            .realm
+            .get_property(handle, "\u{0}locale")
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_else(|| String::from("en"));
+        let mut o = self.number_format_options(handle);
+        o.minimum_fraction_digits = Some(1);
+        o.maximum_fraction_digits = Some(1);
+        o.minimum_significant_digits = None;
+        o.maximum_significant_digits = None;
+        o.minimum_integer_digits = 1;
+        o.rounding_mode = intl::number::RoundingMode::HalfExpand;
+        // 2.5 / 25.0%: exact in binary, so the probe has one integer digit run
+        // and one fraction digit.
+        let probe_v = match (percent, neg) {
+            (false, false) => 2.5,
+            (false, true) => -2.5,
+            (true, false) => 0.25,
+            (true, true) => -0.25,
+        };
+        let mut prefix: Vec<(&'static str, String)> = Vec::new();
+        let mut suffix: Vec<(&'static str, String)> = Vec::new();
+        let mut dec_sep = String::new();
+        let mut seen_number = false;
+        for p in intl::number::format_to_parts(&locale, probe_v, &o) {
+            let kind = p.kind.as_str();
+            match kind {
+                "integer" | "group" => seen_number = true,
+                "decimal" => {
+                    seen_number = true;
+                    dec_sep = p.value;
+                }
+                "fraction" => seen_number = true,
+                _ if seen_number => suffix.push((kind, p.value)),
+                _ => prefix.push((kind, p.value)),
+            }
+        }
+        let int_str: String = int.iter().map(|d| (b'0' + d) as char).collect();
+        let nu = self
+            .realm
+            .get_property(handle, islot!("numberingSystem"))
+            .map(|v| self.realm.to_display_string(v))
+            .unwrap_or_default();
+        let mut out = prefix;
+        let group = if grouping {
+            let scale = if percent { 0.01 } else { 1.0 };
+            let sign = if neg { -1.0 } else { 1.0 };
+            let nine = self.intl_format_number_inner(handle, sign * 123456789.0 * scale);
+            let (group_sep, primary, secondary) = extract_grouping(&nine, &nu, &dec_sep);
+            let four = self.intl_format_number_inner(handle, sign * 1111.0 * scale);
+            let lone = extract_group_sep(&four, &nu);
+            let min_grouping = if lone.is_empty() || lone == dec_sep {
+                2
+            } else {
+                1
+            };
+            let grouped = group_digits(&int_str, &group_sep, primary, secondary, min_grouping);
+            if group_sep.is_empty() || grouped == int_str {
+                None
+            } else {
+                Some((grouped, group_sep))
+            }
+        } else {
+            None
+        };
+        match group {
+            Some((grouped, sep)) => {
+                for (i, g) in grouped.split(sep.as_str()).enumerate() {
+                    if i > 0 {
+                        out.push(("group", sep.clone()));
+                    }
+                    out.push(("integer", String::from(g)));
+                }
+            }
+            None => out.push(("integer", int_str)),
+        }
+        if !frac.is_empty() {
+            out.push(("decimal", dec_sep));
+            out.push((
+                "fraction",
+                frac.iter().map(|d| (b'0' + d) as char).collect(),
+            ));
+        }
+        out.extend(suffix);
+        out
     }
 
     /// Assemble a locale-scaffolded decimal string from latn `int`/`frac` digit
@@ -10800,7 +11091,9 @@ impl Interp {
                     Some(s) => self.new_str(s),
                     None => NanBox::number(value),
                 };
-                let number_parts = self.number_handle_parts(nf, value_box);
+                // (A combined fractional string keeps its exact digits.)
+                let value_n = self.realm.to_number(value_box);
+                let number_parts = self.number_handle_parts_of(nf, value_box, value_n);
                 let mut list: Vec<(&'static str, String, Option<&'static str>)> = if !need_separator
                 {
                     Vec::new()

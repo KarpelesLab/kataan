@@ -3792,7 +3792,7 @@ impl Interp {
                         // ToIntlMathematicalValue: coerce (ToPrimitive/ToNumber, BigInt
                         // via its value) before splitting into parts.
                         let n = self.coerce_intl_number(arg(0))?;
-                        self.number_handle_parts(h, NanBox::number(n))
+                        self.number_handle_parts_of(h, arg(0), n)
                     }
                     _ => {
                         // A plain (non-Intl) receiver: classify the coerced display string.

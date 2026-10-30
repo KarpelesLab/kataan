@@ -2525,3 +2525,42 @@ fn intl_locale_info_honors_extension_keywords() {
         "buddhist phonebk h11 thai|japanese emoji h24 fullwide|gregory|h12|h23|h23|h12|h12"
     );
 }
+
+/// `style: "percent"` multiplies the mathematical value by 100 exactly: the
+/// crate's `f64` ×100 turned `1e21` into `99,999,999,999,999,991,611,392%`.
+/// Covers BigInt/Number operands, significant/fraction digits, a locale with
+/// a spaced suffix, `toLocaleString`, `formatToParts`, and `formatRange(ToParts)`
+/// (including a range that shares its `%`, and the `approximately` form). The
+/// ordinary small-value path is unchanged (`1.005` is still `101%`, as in ICU).
+#[cfg(feature = "intl")]
+#[test]
+fn intl_percent_scales_exactly() {
+    let src = r#"
+        function parts(nf, v) { return nf.formatToParts(v).map(function (p) { return p.type + ":" + p.value; }).join(" "); }
+        function rparts(nf, a, b) { return nf.formatRangeToParts(a, b).map(function (p) { return p.type + ":" + p.value + ":" + p.source; }).join(" "); }
+        function digits(lead, src) {
+            var s = "integer:" + lead + src;
+            for (var i = 0; i < 7; i++) s += " group:," + src + " integer:000" + src;
+            return s + " percentSign:%" + src;
+        }
+        var p = new Intl.NumberFormat("en", { style: "percent" });
+        var de = new Intl.NumberFormat("de", { style: "percent" });
+        [p.format(1e21), p.format(-1.5e21), p.format(10n ** 21n), p.format(123456789012345678901n),
+         new Intl.NumberFormat("en", { style: "percent", maximumSignificantDigits: 2 }).format(1.25e21),
+         new Intl.NumberFormat("en", { style: "percent", minimumFractionDigits: 1, useGrouping: false }).format(1e21),
+         de.format(1e21) === "100.000.000.000.000.000.000.000 %", (1e21).toLocaleString("en", { style: "percent" }),
+         p.format(0.07), p.format(1.005),
+         parts(p, 1e21) === digits("100", ""), parts(p, 10n ** 21n) === digits("100", ""),
+         rparts(p, 1e21, 2e21) === digits("100", ":startRange") + " literal: – :shared " + digits("200", ":endRange"),
+         rparts(p, 1e21, 1e21) === "approximatelySign:~:shared " + digits("100", ":shared"),
+         de.formatRange(1e21, 2e21) === "100.000.000.000.000.000.000.000–200.000.000.000.000.000.000.000 %"
+        ].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "100,000,000,000,000,000,000,000%|-150,000,000,000,000,000,000,000%|\
+         100,000,000,000,000,000,000,000%|12,345,678,901,234,567,890,100%|\
+         130,000,000,000,000,000,000,000%|100000000000000000000000.0%|true|\
+         100,000,000,000,000,000,000,000%|7%|101%|true|true|true|true|true"
+    );
+}
