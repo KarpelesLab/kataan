@@ -3694,6 +3694,42 @@ fn vm_construct(
     })
 }
 
+/// `x instanceof y` without the host when the outcome needs nothing but the
+/// heap: `y` a VM function that inherits the default `@@hasInstance`
+/// (`Realm::inherits_default_has_instance`), so the result is
+/// OrdinaryHasInstance(y, x); its `prototype` an object; `x`'s
+/// `[[Prototype]]` chain free of proxies (whose `getPrototypeOf` may trap).
+/// `None` (nothing done) for anything else, which the host decides — and
+/// throws for.
+fn instance_of_fast(realm: &Realm, x: NanBox, y: NanBox) -> Option<bool> {
+    let f = Handle::from_raw(y.as_handle()?);
+    if !realm.inherits_default_has_instance(f) {
+        return None;
+    }
+    let p = realm
+        .get_property(f, "prototype")
+        .filter(|p| is_object_value(realm, *p))?
+        .as_handle()
+        .map(Handle::from_raw)?;
+    let Some(mut cur) = x.as_handle().map(Handle::from_raw) else {
+        return Some(false);
+    };
+    if !is_object_value(realm, x) {
+        return Some(false);
+    }
+    for _ in 0..100_000 {
+        if realm.proxy_at(cur).is_some() {
+            return None;
+        }
+        match realm.object_proto(cur) {
+            None => return Some(false),
+            Some(n) if n == p => return Some(true),
+            Some(n) => cur = n,
+        }
+    }
+    None
+}
+
 /// Whether `v` is an Object (not a primitive — note strings are heap handles
 /// too).
 fn is_object_value(realm: &Realm, v: NanBox) -> bool {
@@ -8655,6 +8691,10 @@ fn run_frame_at_ic(
                 b,
             } => {
                 let (x, y) = (regs[*a as usize], regs[*b as usize]);
+                if *instanceof && let Some(r) = instance_of_fast(&ctx.realm, x, y) {
+                    regs[*dst as usize] = NanBox::boolean(r);
+                    continue;
+                }
                 match with_host(ctx, |h| h.relational(*instanceof, x, y)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),

@@ -4746,6 +4746,7 @@ impl Interp {
                 .set_hidden_property(func_proto, &key, has_instance);
             self.realm.set_readonly_property(func_proto, &key);
             self.realm.set_non_configurable_property(func_proto, &key);
+            self.realm.set_has_instance_key(&key);
         }
         self.setup_first_class_prototype_id("Set", SET_PROTO_METHODS, N_SET_PROTO_FN);
         self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);

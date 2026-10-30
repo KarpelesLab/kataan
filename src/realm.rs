@@ -345,6 +345,11 @@ pub struct Realm {
     /// still be overridden explicitly (`Object.setPrototypeOf(fn, p)`), recorded
     /// in [`native_protos`](Realm::native_protos).
     function_proto_intrinsic: Option<Handle>,
+    /// The property key (`"\0sym:<id>"`) of `Symbol.hasInstance`, recorded
+    /// when `%Function.prototype%[@@hasInstance]` (non-writable,
+    /// non-configurable) is installed, so the VM can tell that a function
+    /// inherits it there (see [`Realm::inherits_default_has_instance`]).
+    has_instance_key: Option<alloc::string::String>,
     /// Per bytecode-VM function id: its `name` (a string handle) and `length`,
     /// from which a VM closure's own `name`/`length` data properties are
     /// synthesized (no per-closure storage; see [`Realm::vm_fn_meta_value`]).
@@ -821,6 +826,7 @@ impl Realm {
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
+            has_instance_key: None,
             vm_fn_meta: Vec::new(),
             vm_fn_source: Vec::new(),
             vm_total_depth: 0,
@@ -1156,6 +1162,30 @@ impl Realm {
     #[must_use]
     pub fn is_function_proto_intrinsic(&self, handle: Handle) -> bool {
         self.function_proto_intrinsic == Some(handle)
+    }
+
+    /// Records `key` as `Symbol.hasInstance`'s property key (see
+    /// [`has_instance_key`](Realm::has_instance_key)).
+    pub(crate) fn set_has_instance_key(&mut self, key: &str) {
+        self.has_instance_key = Some(alloc::string::String::from(key));
+    }
+
+    /// Whether `GetMethod(f, @@hasInstance)` on the VM function `f` is
+    /// `%Function.prototype%[@@hasInstance]`: `f` owns no such property and
+    /// its `[[Prototype]]` is `%Function.prototype%`, whose own one is
+    /// non-writable and non-configurable (installed so at setup). Single-realm
+    /// runs only (another realm's intrinsics name another symbol's key).
+    #[must_use]
+    pub(crate) fn inherits_default_has_instance(&self, f: Handle) -> bool {
+        !self.multi_realm
+            && self.is_vm_function(f)
+            && self
+                .object_proto(f)
+                .is_some_and(|p| self.is_function_proto_intrinsic(p))
+            && self
+                .has_instance_key
+                .as_deref()
+                .is_some_and(|k| !self.has_own(f, k))
     }
 
     /// Every live typed-array view whose backing bytes cell is `bytes_handle`.
