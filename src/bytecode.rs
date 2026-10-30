@@ -577,6 +577,10 @@ fn verify_op_with(
         }
         Op::DeleteGlobal { dst, .. } | Op::NewBox { dst } => reg(*dst),
         Op::RequireObjectCoercible { src } | Op::CheckTdz { src } => reg(*src),
+        Op::SwitchStr { dst, src, .. } => {
+            reg(*dst)?;
+            reg(*src)
+        }
         Op::NewBigInt { dst, .. } | Op::LoadNewTarget { dst } => reg(*dst),
         Op::MakeClass { dst, f, sup } => {
             reg(*dst)?;
@@ -1493,6 +1497,16 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(80, out);
             w_reg(*src, out);
         }
+        Op::SwitchStr { dst, src, table } => {
+            w_u8(195, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+            w_u32(table.len() as u32, out);
+            for (k, i) in table {
+                w_bytes(k, out);
+                w_u32(*i, out);
+            }
+        }
         Op::CheckTdz { src } => {
             w_u8(83, out);
             w_reg(*src, out);
@@ -2387,6 +2401,18 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             name: r.string()?,
         },
         80 => Op::RequireObjectCoercible { src: r.reg()? },
+        195 => {
+            let dst = r.reg()?;
+            let src = r.reg()?;
+            let n = r.u32()? as usize;
+            let mut table = Vec::with_capacity(n.min(r.remaining()));
+            for _ in 0..n {
+                table.push((r.byte_string()?, r.u32()?));
+            }
+            // The lookup binary-searches: keep the order it relies on.
+            table.sort_by(|a, b| crate::realm::switch_key_order(&a.0, &b.0));
+            Op::SwitchStr { dst, src, table }
+        }
         83 => Op::CheckTdz { src: r.reg()? },
         84 => Op::NewBigInt {
             dst: r.reg()?,

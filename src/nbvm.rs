@@ -569,6 +569,17 @@ pub enum Op {
     /// `dst = a new heap string` from raw WTF-8 bytes — a literal that holds a
     /// lone surrogate (which a `String` can't carry).
     NewStringWtf8 { dst: Reg, bytes: Vec<u8> },
+    /// `dst =` the case index of the entry of `table` whose key is the
+    /// contents of the string `src`, else `-1` (a non-string, or no key
+    /// matches) — a `switch` whose case tests are all string literals: the
+    /// first case `src === "…"` selects (see `realm::str_switch`). `table`
+    /// holds each distinct literal's bytes with its first case's index,
+    /// sorted by length then bytes.
+    SwitchStr {
+        dst: Reg,
+        src: Reg,
+        table: Vec<(Vec<u8>, u32)>,
+    },
     /// `dst = a new array of `len` `undefined` elements`.
     NewArray { dst: Reg, len: usize },
     /// `dst = [elems...]`: an array literal of plain elements (no holes or
@@ -8788,6 +8799,10 @@ fn run_frame_at_ic(
                 let handle = ctx.realm.new_string_wtf8(bytes.clone());
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
+            Op::SwitchStr { dst, src, table } => {
+                let i = ctx.realm.string_switch_index(regs[*src as usize], table);
+                regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
+            }
             Op::NewArray { dst, len } => {
                 // Defence in depth: the verifier rejects oversized lengths, but the
                 // call-free `run` entrypoint runs unverified ops, so cap here too.
@@ -12873,6 +12888,35 @@ fn may_assign(e: &crate::ast::Expr) -> bool {
 }
 
 /// [`may_assign`] over an argument list.
+/// The fewest string-literal case tests a `switch` dispatches by table
+/// ([`Op::SwitchStr`]); a shorter one compares case by case.
+const SWITCH_STR_MIN: usize = 3;
+
+/// The [`Op::SwitchStr`] table of a `switch` whose case tests are all string
+/// literals without lone surrogates (so each literal's bytes are exactly its
+/// string's): each distinct literal with the index of its first case, sorted
+/// by length then bytes. `None` for any other `switch`.
+fn string_switch_table(cases: &[crate::ast::SwitchCase]) -> Option<Vec<(Vec<u8>, u32)>> {
+    let mut table: Vec<(Vec<u8>, u32)> = Vec::new();
+    let mut n = 0;
+    for (i, case) in cases.iter().enumerate() {
+        let Some(test) = &case.test else { continue };
+        let Expr::Str { value, .. } = test else {
+            return None;
+        };
+        crate::wtf8::as_str(value)?;
+        n += 1;
+        if !table.iter().any(|(k, _)| **k == **value) {
+            table.push((value.to_vec(), u32::try_from(i).ok()?));
+        }
+    }
+    if n < SWITCH_STR_MIN {
+        return None;
+    }
+    table.sort_by(|a, b| crate::realm::switch_key_order(&a.0, &b.0));
+    Some(table)
+}
+
 fn args_may_assign(arguments: &[crate::ast::Argument]) -> bool {
     arguments.iter().any(|a| match a {
         crate::ast::Argument::Item(x) | crate::ast::Argument::Spread(x) => may_assign(x),
@@ -17200,7 +17244,44 @@ impl Compiler {
                     // Dispatch: jump to the first matching `case` body (else default,
                     // else the end). Bodies (compiled next) fall through.
                     let mut case_jumps: Vec<(usize, usize)> = Vec::new();
+                    // Every test a string literal: one lookup finds the first
+                    // case with the discriminant's contents (see
+                    // `Op::SwitchStr`), then a Number compare per distinct
+                    // literal picks its body. Literals have no effect, so not
+                    // evaluating them is unobservable.
+                    let by_table = string_switch_table(cases);
+                    let tabled = by_table.is_some();
+                    if let Some(table) = by_table {
+                        let idx = c.alloc();
+                        let mut picks: Vec<u32> = table.iter().map(|(_, i)| *i).collect();
+                        picks.sort_unstable();
+                        c.ops.push(Op::SwitchStr {
+                            dst: idx,
+                            src: d,
+                            table,
+                        });
+                        for i in picks {
+                            let k = c.alloc();
+                            c.ops.push(Op::LoadConst {
+                                dst: k,
+                                value: NanBox::number(f64::from(i)),
+                            });
+                            let eq = c.alloc();
+                            c.ops.push(Op::StrictEq {
+                                dst: eq,
+                                a: idx,
+                                b: k,
+                            });
+                            let skip = c.emit_jump_if_false(eq);
+                            let to_body = c.emit_jump();
+                            case_jumps.push((i as usize, to_body));
+                            c.patch(skip);
+                        }
+                    }
                     for (i, case) in cases.iter().enumerate() {
+                        if tabled {
+                            break; // dispatched by the table above
+                        }
                         if let Some(test) = &case.test {
                             let t = c.expr(test)?;
                             let eq = c.alloc();

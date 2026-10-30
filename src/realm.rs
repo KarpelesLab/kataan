@@ -30,7 +30,9 @@ mod coll_index;
 mod concat_fast;
 pub(crate) mod hidden_layout;
 mod shortest;
+mod str_switch;
 pub use coll_index::CollIndex;
+pub use str_switch::switch_key_order;
 mod handle_map;
 
 use crate::atom::{Atom, AtomTable};

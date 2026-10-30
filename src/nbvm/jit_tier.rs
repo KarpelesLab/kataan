@@ -1054,6 +1054,11 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
             Some(Ok(()))
         }
+        Op::SwitchStr { dst, src, table } => {
+            let i = ctx.realm.string_switch_index(regs[*src as usize], table);
+            regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
+            Some(Ok(()))
+        }
         // A string literal (`'k' + i` evaluates its `'k'` every iteration).
         Op::NewString { dst, value } => {
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_literal_string(value).to_raw());
