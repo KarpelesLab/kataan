@@ -4341,6 +4341,12 @@ struct TierState {
     body: Option<alloc::rc::Rc<Vec<Op>>>,
     ic: Vec<PropertyCache>,
     ic_body: usize,
+    /// More cache vectors for `ic_body`, for activations that start while
+    /// another activation of the function has `ic` out (recursion): without
+    /// them every nested activation sized a fresh vector of one cache per
+    /// instruction and dropped it on return, which in a recursive evaluator
+    /// was ~40% of the run. At most [`SPARE_ICS`].
+    spare_ic: Vec<Vec<PropertyCache>>,
     /// The function's native code: `None` until compilation was tried, then
     /// the compiled code or `None` (not eligible). Compiled code may call the
     /// code of the functions it statically calls by address; those live in
@@ -4357,6 +4363,39 @@ struct TierState {
     /// as `jit`: compiled call sites hold its address.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     twin: Option<Option<alloc::rc::Rc<crate::jit::JitProto>>>,
+}
+
+/// How many spare inline-cache vectors a function keeps for its recursive
+/// activations (see `TierState::spare_ic`).
+const SPARE_ICS: usize = 32;
+
+impl TierState {
+    /// The caches for an activation starting now: the function's own, else a
+    /// spare left by an earlier recursive activation, else none (warmed from
+    /// cold).
+    fn take_ic(&mut self) -> Vec<PropertyCache> {
+        if self.ic.is_empty() {
+            self.spare_ic.pop().unwrap_or_default()
+        } else {
+            core::mem::take(&mut self.ic)
+        }
+    }
+
+    /// Hands back an activation's caches, warmed for the body at `body`: they
+    /// become the function's own, or (when an activation that started later
+    /// already handed its back) a spare. Caches for another body replace
+    /// everything (the spares were for the old body).
+    fn put_back_ic(&mut self, ic: Vec<PropertyCache>, body: usize) {
+        if self.ic_body != body {
+            self.spare_ic.clear();
+            self.ic = ic;
+            self.ic_body = body;
+        } else if self.ic.is_empty() {
+            self.ic = ic;
+        } else if !ic.is_empty() && self.spare_ic.len() < SPARE_ICS {
+            self.spare_ic.push(ic);
+        }
+    }
 }
 
 /// A function's persistent tier state (its activation count, optimized body,
@@ -4847,11 +4886,7 @@ fn call_with_inner(
                     if entry.calls == TIER_UP_THRESHOLD && entry.body.is_none() {
                         entry.body = Some(alloc::rc::Rc::new(optimize_ops(&proto.ops)));
                     }
-                    (
-                        entry.body.clone(),
-                        core::mem::take(&mut entry.ic),
-                        entry.ic_body,
-                    )
+                    (entry.body.clone(), entry.take_ic(), entry.ic_body)
                 }
                 // Never held across a call, so this cannot happen; run cold.
                 Err(_) => (None, Vec::new(), 0),
@@ -4890,8 +4925,7 @@ fn call_with_inner(
             // The interpreter's caches were not used: hand them back intact,
             // and the window back to the pool.
             if let Ok(mut entry) = proto.tier.0.try_borrow_mut() {
-                entry.ic = ic;
-                entry.ic_body = ic_body;
+                entry.put_back_ic(ic, ic_body);
             }
             if ctx.realm.vm_reg_pool.len() < 64 {
                 regs.clear();
@@ -4946,8 +4980,7 @@ fn call_with_inner(
         }
         let exit = run_frame_at_ic(ctx, funcs, body, &mut regs, 0, Vec::new(), None, &mut ic);
         if let Ok(mut entry) = proto.tier.0.try_borrow_mut() {
-            entry.ic = ic;
-            entry.ic_body = body.as_ptr() as usize;
+            entry.put_back_ic(ic, body.as_ptr() as usize);
         }
         // A finished activation's window goes back to the pool (a suspended
         // generator keeps its own, below).

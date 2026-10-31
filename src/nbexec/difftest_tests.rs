@@ -3167,3 +3167,35 @@ fn object_spread_and_rest_copy_own_enumerable() {
         "{\"2\":\"two\",\"10\":\"ten\",\"z\":0,\"b\":1,\"a\":2,\"n\":3}|2,10,z,b,a,n|sym|false|{\"x\":1,\"y\":\"Y\"}|1|Y|2|{\"2\":\"two\",\"10\":\"ten\",\"b\":1}|sym|{\"0\":\"h\",\"1\":\"i\"}|{\"own\":2}|{\"0\":\"a\",\"1\":\"b\"}|{\"0\":7,\"1\":8}|{\"q\":2,\"p\":1}|9|false|{\"w\":1}|a,c,b"
     );
 }
+
+/// A recursive function whose activations overlap reads properties through
+/// inline caches each activation warmed (or took over from another one) on
+/// objects of several shapes, while some of those objects change shape
+/// (delete, a new key) and one property becomes an accessor mid-walk.
+#[test]
+fn recursive_activations_share_inline_caches() {
+    let src = r#"
+        function walk(n, d) {
+            if (n === null) return 0;
+            var own = n.v + (n.w || 0) * 2;
+            if (d % 3 === 0 && n.v > 50) { n.extra = d; delete n.w; }
+            return own + walk(n.l, d + 1) * 3 % 1000003 + walk(n.r, d + 1);
+        }
+        function mk(d, k) {
+            if (d === 0) return null;
+            var o = k % 3 === 0 ? { v: k, l: null, r: null } : k % 3 === 1 ? { l: null, v: k, w: d, r: null } : { r: null, l: null, w: 1, v: k };
+            o.l = mk(d - 1, k * 2 + 1);
+            o.r = mk(d - 1, k * 2 + 2);
+            return o;
+        }
+        var t = mk(9, 0), r = [];
+        for (var i = 0; i < 6; i++) r.push(walk(t, i));
+        Object.defineProperty(t.l, "v", { get: function () { return 1000; } });
+        r.push(walk(t, 0), walk(t.l, 1));
+        r.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "1992567,1982559,1897987,1863161,1863161,1863161,1866158,1367809"
+    );
+}
