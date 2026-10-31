@@ -2917,3 +2917,32 @@ fn captured_binding_reads_in_compiled_loops() {
     "#;
     assert_eq!(run(src), "-12497493|ReferenceError,12000");
 }
+
+/// A global `var` written from a hot (compiled) top-level loop is also a
+/// property of the global object: both must see every write, whether the
+/// value is a Number (an integer or a double loop), a heap object or string
+/// (the global object's write barrier), and whether it comes from the loop,
+/// through `globalThis`, or from a strict function.
+#[test]
+fn global_var_writes_from_compiled_loops_reach_the_global_object() {
+    let src = r#"
+        var a = 0, b = 1.5, o = null, bad = 0, gx = 0, sum = 0, sv = 0, t = 0;
+        for (var i = 0; i < 30000; i++) { a = (a + i * 3) | 0; b = b * 0.999 + 0.5; }
+        for (var j = 0; j < 20000; j++) {
+            o = { j: j };
+            if (globalThis.o !== o || globalThis.j !== j) bad++;
+        }
+        for (var w = 0; w < 20000; w++) {
+            if (w % 3 === 0) globalThis.gx = w; else gx = -w;
+            sum = (sum + gx) | 0;
+        }
+        function strictWrite(v) { "use strict"; sv = v; return sv; }
+        for (var u = 0; u < 20000; u++) t = (t + strictWrite(u)) | 0;
+        [a === globalThis.a, b === globalThis.b, globalThis.i, bad, globalThis.o.j,
+         gx, globalThis.gx, sum, globalThis.sv, t].join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,true,30000,0,19999,-19999,-19999,-66663334,19999,199990000"
+    );
+}

@@ -6674,6 +6674,27 @@ impl Realm {
     /// The generational write barrier: records an old→young edge (container is
     /// in the old generation, `value` is a young heap object) in the heap's
     /// remembered set, so a minor collection keeps the young object alive.
+    /// The address of the global object `g`'s own data property `key`'s value
+    /// when [`set_property`](Self::set_property) of it would store exactly
+    /// there (plus the write barrier): see `Object::jit_data_ptr`.
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn jit_data_ptr(&mut self, g: Handle, key: &str) -> Option<*mut NanBox> {
+        self.heap.get_mut(g)?.as_object_mut()?.jit_data_ptr(key)
+    }
+
+    /// The write barrier of a store of `value` into `container` that
+    /// compiled code made itself (`nbvm::global_mirror`).
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn jit_write_barrier(&mut self, container: Handle, value: NanBox) {
+        self.write_barrier(container, value);
+    }
+
     fn write_barrier(&mut self, container: Handle, value: NanBox) {
         if let Some(raw) = value.as_handle() {
             let target = Handle::from_raw(raw);

@@ -48,6 +48,9 @@ pub(crate) fn array_species_is_default(realm: &Realm, h: Handle) -> bool {
     array_hof::default_species(realm, h)
 }
 mod free_memo;
+mod global_mirror;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use global_mirror::plan_body as plan_global_mirrors;
 mod iter_fast;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 mod jit_tier;
@@ -3884,6 +3887,8 @@ pub struct StoreGlobalCache {
     epoch: core::cell::Cell<u32>,
     /// 0: not filled; 1: no own property; 2: an own property.
     owned: core::cell::Cell<u8>,
+    /// Compiled code's global-object mirror (`crate::jit::global_mirror`).
+    pub(crate) jit: global_mirror::MirrorCache,
 }
 
 /// The fast path of `PutValue` for a global-environment name: when the
@@ -6492,6 +6497,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call_layout: jit_tier::call_layout(),
         unwind: jit_tier::jit_helper_unwind,
         global_ref: jit_tier::jit_helper_global_ref,
+        global_mirror: global_mirror::jit_helper_global_mirror,
         math1: jit_tier::jit_helper_math1,
         site_fill: jit_tier::jit_helper_site_fill,
         new_object: jit_tier::jit_helper_new_object,

@@ -1313,6 +1313,7 @@ impl Object {
     /// Defines an accessor property `name` with `getter`/`setter` (either may be
     /// `undefined`). Replaces an existing accessor of the same name.
     pub fn define_accessor(&mut self, name: &str, getter: NanBox, setter: NanBox) {
+        self.global_attrs_changed();
         self.materialize_implied_attrs();
         // Start tracking unified key order the moment an accessor is involved: seed
         // the log with the current data keys (their chronological order) so this and
@@ -1948,6 +1949,7 @@ impl Object {
     /// Marks own property `key` non-writable (idempotent).
     pub fn set_readonly(&mut self, key: &str) {
         if !self.is_readonly(key) {
+            self.global_attrs_changed();
             if self.flags & JIT_FLAG_READONLY == 0 {
                 self.layout_changed();
             }
@@ -2067,7 +2069,46 @@ impl Object {
 
     /// Marks the object frozen (`Object.freeze`) — implies sealed + non-extensible.
     pub fn freeze(&mut self) {
+        self.global_attrs_changed();
         self.flags |= OBJ_FLAG_FROZEN | OBJ_FLAG_SEALED | OBJ_FLAG_NON_EXTENSIBLE;
+    }
+
+    /// For a global object ([`JIT_FLAG_GLOBAL`]): a change to whether a write
+    /// to one of its existing data properties stores (`set`'s frozen and
+    /// non-writable checks, or an accessor taking the key) — which compiled
+    /// code's global-object mirror holds answered under the global binding
+    /// epoch (`nbvm::global_mirror`), so it bumps that.
+    #[inline]
+    fn global_attrs_changed(&self) {
+        if self.flags & JIT_FLAG_GLOBAL != 0 {
+            crate::env::bump_global_binding_epoch();
+        }
+    }
+
+    /// The address of own data property `key`'s value when [`set`](Self::set)
+    /// of it would store exactly there and do nothing else: a dictionary-mode
+    /// object, not frozen, the key a writable data property without a
+    /// same-named accessor. For compiled code's global-object mirror
+    /// (`nbvm::global_mirror`): the address stays put until the dictionary
+    /// gains or loses a key (a key epoch bump), and the facts hold until a
+    /// [`global_attrs_changed`](Self::global_attrs_changed) one.
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn jit_data_ptr(&mut self, key: &str) -> Option<*mut NanBox> {
+        if !self.is_dict()
+            || self.is_frozen()
+            || crate::realm::is_private_key(key)
+            || self.is_readonly(key)
+            || self.accessor(key).is_some()
+        {
+            return None;
+        }
+        self.dict_mut()
+            .map
+            .get_mut(key)
+            .map(|d| core::ptr::from_mut(&mut d.value))
     }
 
     /// Prevents new properties (`Object.preventExtensions`).

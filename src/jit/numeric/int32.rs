@@ -162,9 +162,13 @@ pub(super) fn plan(
                 resolved,
                 ..
             } => {
+                // (A global `var`'s write also goes to the global object,
+                // which a write-back at an exit cannot do for a heap handle:
+                // `global_mirror`.)
                 promote &= (*src as usize) < n_regs
                     && !(*strict && resolved.is_some())
-                    && !name.starts_with('\u{1}');
+                    && !name.starts_with('\u{1}')
+                    && super::super::global_mirror::mirror_cell(op).is_none();
                 if !gnames.contains(&name.as_str()) {
                     gnames.push(name);
                 }
@@ -630,6 +634,7 @@ impl NumGen {
     /// `rcx` and `xmm0`.
     fn gstore(&self, a: &mut X64Assembler, p: &IntPlan) {
         for g in p.globals.iter().filter(|g| g.dirty) {
+            // (No promoted global is a global `var`: see `plan`.)
             a.load_rcx(self.gslot_disp(g.slot));
             match (g.xmm, Self::ggpr(p, g.vreg)) {
                 (Some(x), _) => a.sse_mem_rcx(0x11, x), // movsd [rcx], x
@@ -1160,6 +1165,10 @@ impl NumGen {
                     a.jcc(CC_E, stub);
                     self.icvt(a, 0, src)?;
                     a.raw(&[0xf2, 0x0f, 0x11, 0x01]); // movsd [rcx], xmm0
+                    // (An int32, converted: a Number.)
+                    if let Some(cell) = super::super::global_mirror::mirror_cell(self.bc(pc)?) {
+                        a.gm_store_xmm(cell, 0);
+                    }
                     a.bind(resume);
                     self.stub(stub, resume, reg, StubKind::GlobalRef { pc, retry });
                 }

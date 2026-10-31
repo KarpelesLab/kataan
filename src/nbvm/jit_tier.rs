@@ -466,6 +466,9 @@ pub(super) fn enter_on_call(
     if proto.is_async || proto.is_generator {
         return None;
     }
+    if proto.tier.jit().is_none() {
+        super::global_mirror::prefill(ctx, proto);
+    }
     let jit = jit_for(funcs, id, ic)?;
     if jit.is_generic() {
         return match run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false)? {
@@ -518,6 +521,9 @@ pub(super) fn osr(
     let proto = funcs.get(id)?;
     if proto.is_generator || proto.ops.len() != program.len() {
         return None;
+    }
+    if proto.tier.jit().is_none() {
+        super::global_mirror::prefill(ctx, proto);
     }
     let jit: Rc<crate::jit::JitProto> = jit_for(funcs, id, ic)?;
     if !jit.has_entry(target) {
@@ -583,6 +589,7 @@ fn recompile(
     ic: &[crate::ic::PropertyCache],
 ) -> Option<Rc<crate::jit::JitProto>> {
     let proto = funcs.get(id)?;
+    super::global_mirror::prefill(ctx, proto);
     if let Some(Some(cur)) = proto.tier.jit()
         && !Rc::ptr_eq(&cur, old)
     {
@@ -771,7 +778,10 @@ pub(crate) extern "C" fn jit_helper_unwind(
 /// mirroring the write onto the global object (the running scope is the global
 /// scope, the binding is plain and initialized, the global object has no
 /// like-named own property — and is a global object, `JIT_FLAG_GLOBAL`, whose
-/// key changes the global binding epoch tracks). `0` otherwise. The address
+/// key changes the global binding epoch tracks) — or, for an op whose compiled
+/// code mirrors the write (`super::global_mirror`), when it would mirror it
+/// onto a writable data property it can store into directly, whose address it
+/// leaves in the op's mirror cache. `0` otherwise. The address
 /// stays valid, and the facts true, until Rust code next runs (which alone can
 /// add or free a binding, change the running scope or realm, or give the
 /// global object a property) — and past that for as long as the global binding
@@ -787,18 +797,16 @@ pub(crate) extern "C" fn jit_helper_unwind(
 pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: u64) -> u64 {
     // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
     #[allow(unsafe_code)]
-    let ctx = unsafe { &*(ctx as *const Ctx) };
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
     // SAFETY: `op` points into the `JitProto`'s owned bytecode, alive while its
     // code runs.
     #[allow(unsafe_code)]
     let op = unsafe { &*(op as usize as *const Op) };
-    let Some(host) = ctx.host.as_deref() else {
-        return 0;
-    };
     let p = match op {
-        Op::LoadGlobal { name, cache, .. } => {
-            host.global_scope().jit_binding_ptr(name, cache, false)
-        }
+        Op::LoadGlobal { name, cache, .. } => ctx
+            .host
+            .as_deref()
+            .and_then(|host| host.global_scope().jit_binding_ptr(name, cache, false)),
         Op::StoreGlobal {
             name,
             strict,
@@ -806,23 +814,48 @@ pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: 
             cache,
             ..
         } if !(*strict && resolved.is_some()) && !name.starts_with('\u{1}') => {
-            host.global_scope_if_current().and_then(|(scope, global)| {
-                let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
-                let g = Handle::from_raw(global.as_handle()?);
-                // Only a global object whose key changes bump the global
-                // binding epoch (which the compiled cache holds the answer
-                // across calls under).
-                let tracked = ctx
-                    .realm
-                    .jit_object(g)
-                    .is_some_and(|o| o.jit_flags() & crate::object::JIT_FLAG_GLOBAL != 0);
-                let owned = super::global_owns_cached(&ctx.realm, g, name, cache);
-                (tracked && !owned).then_some(p)
-            })
+            global_store_ref(ctx, name, cache)
         }
         _ => None,
     };
     p.map_or(0, |p| p as usize as u64)
+}
+
+/// [`jit_helper_global_ref`] of a `StoreGlobal` of `name`.
+fn global_store_ref(
+    ctx: &mut Ctx,
+    name: &str,
+    cache: &super::StoreGlobalCache,
+) -> Option<*mut NanBox> {
+    let (p, g) = ctx
+        .host
+        .as_deref()?
+        .global_scope_if_current()
+        .and_then(|(scope, global)| {
+            let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
+            Some((p, Handle::from_raw(global.as_handle()?)))
+        })?;
+    // Only a global object whose key changes bump the global binding epoch
+    // (which the compiled cache holds the answer across calls under).
+    let tracked = ctx
+        .realm
+        .jit_object(g)
+        .is_some_and(|o| o.jit_flags() & crate::object::JIT_FLAG_GLOBAL != 0);
+    if !tracked {
+        return None;
+    }
+    if !super::global_owns_cached(&ctx.realm, g, name, cache) {
+        cache.jit.set(0);
+        return Some(p);
+    }
+    // A global `var`: the write also goes to the global object's property,
+    // when the op's code mirrors it (`super::global_mirror`).
+    if !cache.jit.on() {
+        return None;
+    }
+    let m = ctx.realm.jit_data_ptr(g, name)?;
+    cache.jit.set(m as usize as u64);
+    Some(p)
 }
 
 /// `Math.f(x)` for an `Op::CallMethod` of one argument at `op`: the result

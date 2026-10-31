@@ -26,6 +26,8 @@ mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fieldrep;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod global_mirror;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_persist;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod handle;
@@ -3150,6 +3152,9 @@ pub struct GenericHelpers {
     /// `jit_helper_global_ref(ctx, op) -> *mut NanBox | 0`: validates a global
     /// binding for direct access from a compiled loop (`numeric`).
     pub global_ref: JitTruthyHelper,
+    /// `jit_helper_global_mirror(ctx, op, v) -> 0 | 1`: the global-object mirror
+    /// of a global `var` write of the heap handle `v` (`global_mirror`).
+    pub global_mirror: JitAddHelper,
     /// `jit_helper_math1(ctx, recv, x, op) -> bits | throw sentinel`: a
     /// one-argument built-in `Math.f(x)` call (`numeric`).
     pub math1: JitBinHelper,
@@ -3801,6 +3806,7 @@ impl JitProto {
             .collect();
         let call_sites: Vec<*const CallSite> = calls.iter().map(|c| c.get().cast_const()).collect();
         let bytecode: alloc::boxed::Box<[crate::nbvm::Op]> = proto.ops.clone().into_boxed_slice();
+        global_mirror::plan(&bytecode);
         // One persistent inline cache per property-access site.
         let mut caches: alloc::boxed::Box<[core::cell::UnsafeCell<crate::ic::PropertyCache>]> = (0
             ..keys.len())
@@ -6817,6 +6823,9 @@ impl JitFunction {
         let mut cold_globals: Vec<(Label, Label, Label, usize, i32, usize)> = Vec::new();
         // The global binding cache's resets on a changed epoch: (entry, refill).
         let mut cold_epochs: Vec<(Label, Label, Label)> = Vec::new();
+        // A global `var` write's mirror of a heap handle (`global_mirror`):
+        // (entry, resume, pc), the value in `rcx`.
+        let mut cold_mirrors: Vec<(Label, Label, usize)> = Vec::new();
         // One label per op (any op can be a branch target or an OSR entry) plus
         // one for the end of the stream (a branch to `len` falls off the end).
         let labels: Vec<Label> = (0..=ops.len()).map(|_| a.new_label()).collect();
@@ -7230,6 +7239,12 @@ impl JitFunction {
                     crate::nbvm::Op::StoreGlobal { src, .. } if ok(src) => {
                         a.g_load(call_seq::r::RCX, call_seq::r::RBX, disp(src));
                         a.g_store(call_seq::r::RAX, 0, call_seq::r::RCX);
+                        // A global `var`'s write goes to the global object too.
+                        if let Some(cell) = global_mirror::mirror_cell(bytecode.get(op_idx)?) {
+                            let h = a.new_label();
+                            a.gm_store_gpr(cell, call_seq::r::R11, call_seq::r::RCX, h);
+                            cold_mirrors.push((h, done, op_idx));
+                        }
                     }
                     _ => return None,
                 }
@@ -9782,6 +9797,19 @@ impl JitFunction {
                 a.gp_restore(persist, 0, &gc_persisted, recheck);
             }
             a.jmp(fetch);
+        }
+        for (entry, back, pc) in core::mem::take(&mut cold_mirrors) {
+            let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
+            a.bind(entry);
+            a.mov_rdi_r15();
+            a.movabs_argreg(1, op_ptr as i64);
+            a.g_mov(call_seq::r::RDX, call_seq::r::RCX);
+            a.movabs_rax(helpers.global_mirror as usize as i64);
+            a.call_rax();
+            a.test_rax_rax();
+            a.je(back);
+            exec_op!(pc);
+            a.jmp(back);
         }
         // The global binding cache's refills: a validated address is cached
         // and used, else the interpreter runs the op.

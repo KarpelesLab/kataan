@@ -1314,12 +1314,28 @@ impl NumGen {
                 if (src as usize) >= self.env.n_regs {
                     return None;
                 }
+                let mirror = super::global_mirror::mirror_cell(self.bc(pc)?);
                 a.load_rcx(sd);
                 match self.xmm_of(reg, src) {
-                    Some(x) => a.sse_mem_rcx(0x11, x), // movsd [rcx], xmm
+                    Some(x) => {
+                        a.sse_mem_rcx(0x11, x); // movsd [rcx], xmm
+                        // (A promoted register holds any value's bits, a
+                        // heap handle's among them.)
+                        if let Some(cell) = mirror {
+                            a.movq_gpr_x(RAX, x);
+                            let bail = self.spec_bail(a, pc)?;
+                            a.gm_store_gpr(cell, RCX, RAX, bail);
+                        }
+                    }
                     None => {
                         self.load_gpr(a, reg, RAX, src);
                         a.raw(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+                        // (A heap handle's mirror needs the write barrier:
+                        // the plain copy's op does it.)
+                        if let Some(cell) = mirror {
+                            let bail = self.spec_bail(a, pc)?;
+                            a.gm_store_gpr(cell, RCX, RAX, bail);
+                        }
                     }
                 }
             }
@@ -1896,15 +1912,32 @@ impl NumGen {
                         if (src as usize) >= self.env.n_regs {
                             return None;
                         }
+                        let mirror = super::global_mirror::mirror_cell(bc);
                         a.load_rcx(sd);
                         a.raw(&[0x48, 0x85, 0xc9]); // test rcx, rcx
                         a.jcc(CC_E, stub);
                         match self.xmm_of(reg, src) {
-                            // movsd [rcx], xmm
-                            Some(x) => a.sse_mem_rcx(0x11, x),
+                            Some(x) => {
+                                a.sse_mem_rcx(0x11, x); // movsd [rcx], xmm
+                                // (A promoted register holds any value's
+                                // bits, a heap handle's among them.)
+                                if let Some(cell) = mirror {
+                                    a.movq_gpr_x(RAX, x);
+                                    let h = a.new_label();
+                                    a.gm_store_gpr(cell, RCX, RAX, h);
+                                    self.stub(h, resume, reg, StubKind::Exec { pc: pc as u32 });
+                                }
+                            }
                             None => {
                                 self.load_gpr(a, reg, RAX, src);
                                 a.raw(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+                                // A heap handle's mirror needs the write
+                                // barrier: the interpreter runs the op.
+                                if let Some(cell) = mirror {
+                                    let h = a.new_label();
+                                    a.gm_store_gpr(cell, RCX, RAX, h);
+                                    self.stub(h, resume, reg, StubKind::Exec { pc: pc as u32 });
+                                }
                             }
                         }
                     }
