@@ -189,6 +189,24 @@ pub struct CallSite {
     /// An inlined method call's guard memos, one per way (see
     /// `GuardMemo`).
     pub guard: [GuardMemo; 3],
+    /// A `GetMethod` op's memo of its last lookup (see
+    /// `emit_get_method`), kept in the call site of the call it feeds.
+    pub getm: GetMethodMemo,
+}
+
+/// An `Op::GetMethod`'s memo: what its last lookup that hit at a
+/// prototype level proved (`lookup`, see [`LookupMemo`]), at prototype
+/// epoch `stamp`. While the epoch is still `stamp`, a receiver with the
+/// lookup's shape and `[[Prototype]]` and no accessors has the method's
+/// value at the lookup's address, which the read then loads without the
+/// lookup.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GetMethodMemo {
+    /// The lookup.
+    pub lookup: LookupMemo,
+    /// The prototype epoch at which it was recorded.
+    pub stamp: u64,
 }
 
 /// What a method lookup that hit proved, as a memo keeps it: the site's
@@ -460,6 +478,10 @@ impl CallSite {
             fncall: FnCallMemo::empty(),
             poly: [IdentMemo::empty(); 2],
             guard: [GuardMemo::empty(); 3],
+            getm: GetMethodMemo {
+                lookup: LookupMemo::empty(),
+                stamp: 0,
+            },
         }
     }
 
@@ -1229,6 +1251,59 @@ fn emit_lookup_fill(a: &mut X64Assembler, base: u8, off: i32) {
     a.g_store(base, f(offset_of!(LookupMemo, proto)), r::RDX);
     a.g_load(r::RDX, r::RDI, entry_off::VALUE);
     a.g_store(base, f(offset_of!(LookupMemo, value)), r::RDX);
+}
+
+/// `Op::GetMethod`'s read of the method at `[recv_base + recv_disp]`
+/// through `method`'s chain cache, as `X64Assembler::p_method_lookup` makes
+/// it (the method value in `rax` on a hit, else to `miss`), first through
+/// the call site `site`'s [`GetMethodMemo`]: a receiver of the memo's
+/// layout at the memo's epoch, without accessors, has the method at the
+/// memo's address. A lookup that hits at a prototype level refills the
+/// memo. Clobbers what the lookup does.
+pub(crate) fn emit_get_method(
+    a: &mut X64Assembler,
+    realm_off: i32,
+    recv: (u8, i32),
+    method: *const super::props::MethodSite,
+    site: *const CallSite,
+    miss: Label,
+) {
+    use core::mem::offset_of;
+    let jl = super::compute_jit_layout();
+    let m = |f: usize| site_off(offset_of!(CallSite, getm) + f);
+    let lk = |f: usize| m(offset_of!(GetMethodMemo, lookup) + f);
+    let lookup = a.new_label();
+    let have = a.new_label();
+    a.p_walk_plain(jl, realm_off, recv, miss);
+    a.g_movabs(r::R11, site as u64);
+    a.g_load(r::RAX, r::RCX, jl.off_shape);
+    a.g_cmp_mem(r::RAX, r::R11, lk(offset_of!(LookupMemo, shape)));
+    a.g_jcc(cc::NE, lookup);
+    a.g_load(r::RAX, r::RCX, jl.props.off_proto);
+    a.g_cmp_mem(r::RAX, r::R11, lk(offset_of!(LookupMemo, proto)));
+    a.g_jcc(cc::NE, lookup);
+    load_proto_epoch(a, r::R9);
+    a.g_cmp_mem(r::R9, r::R11, m(offset_of!(GetMethodMemo, stamp)));
+    a.g_jcc(cc::NE, lookup);
+    emit_no_accessors(a, lookup);
+    a.g_load(r::R9, r::R11, lk(offset_of!(LookupMemo, value)));
+    a.g_load(r::RAX, r::R9, 0);
+    a.jmp(have);
+    // (Out of line: the lookup, from the walked receiver in `rcx`, leaves
+    // its entry in `r11` and `rsi` nonzero when the memo may record it.)
+    let cold = a.cold_begin();
+    a.bind(lookup);
+    a.p_method_lookup_walked(jl, realm_off, method, miss, None);
+    a.g_test(r::RSI);
+    a.g_jcc(cc::E, have);
+    a.g_mov(r::RDI, r::R11);
+    a.g_movabs(r::R11, site as u64);
+    emit_lookup_fill(a, r::R11, lk(0));
+    load_proto_epoch(a, r::R9);
+    a.g_store(r::R11, m(offset_of!(GetMethodMemo, stamp)), r::R9);
+    a.jmp(have);
+    a.cold_end(cold);
+    a.bind(have);
 }
 
 /// A method call's memo check through the ways' [`CallMemo::lookup`]s,

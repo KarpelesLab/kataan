@@ -8607,17 +8607,29 @@ impl JitFunction {
                     let helper = a.new_label();
                     let done = a.new_label();
                     // An `Op::GetMethod`'s read, as `CallMethod` looks its
-                    // method up: the site's chain cache inline (own or
-                    // inherited data), else the helper (which serves a
-                    // built-in through the site's memo).
-                    a.p_method_lookup(
-                        &layout,
-                        helpers.call_layout.realm,
-                        (call_seq::r::RBX, disp(obj)),
-                        s.method_ptr,
-                        helper,
-                        None,
-                    );
+                    // method up: the call site's memo of the last lookup,
+                    // else the site's chain cache inline (own or inherited
+                    // data), else the helper (which serves a built-in
+                    // through the site's memo).
+                    if call_site.is_null() {
+                        a.p_method_lookup(
+                            &layout,
+                            helpers.call_layout.realm,
+                            (call_seq::r::RBX, disp(obj)),
+                            s.method_ptr,
+                            helper,
+                            None,
+                        );
+                    } else {
+                        call_seq::emit_get_method(
+                            &mut a,
+                            helpers.call_layout.realm,
+                            (call_seq::r::RBX, disp(obj)),
+                            s.method_ptr,
+                            call_site,
+                            helper,
+                        );
+                    }
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(helper);
