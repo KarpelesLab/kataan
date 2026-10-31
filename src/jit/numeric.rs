@@ -940,6 +940,9 @@ fn region_call(op: &GenericOp, bc: &Op) -> bool {
         GenericOp::CallValue { .. }
         | GenericOp::CallWithMethod { .. }
         | GenericOp::CallKey { .. } => true,
+        // A captured binding's read: its fast path is loads, and its slow
+        // path leaves a fast version for the plain copy (`spec_bail`).
+        GenericOp::CellGet { .. } => false,
         _ => allocating_region_op(op, bc),
     }
 }
@@ -1671,6 +1674,11 @@ impl NumGen {
                 a.load_rax(disp(src));
                 a.frame_epilogue();
             }
+            // A TDZ check already made, in the speculative version
+            // (`plan_reuse`).
+            GenericOp::CheckTdz { .. }
+                if reg.is_some_and(|ri| self.regions[ri].spec.is_some())
+                    && self.reuse_planned(pc).is_some() => {}
             GenericOp::CheckTdz { src, pc: opc } if reg.is_some() => {
                 let stub = a.new_label();
                 let resume = a.new_label();
@@ -2083,6 +2091,17 @@ impl NumGen {
                 a.jcc(CC_E, stub);
                 a.bind(resume);
                 self.stub(stub, resume, reg, StubKind::Exec { pc: opc });
+            }
+            // A captured binding's read whose value a register already
+            // holds, in the speculative version (`plan_reuse`).
+            GenericOp::CellGet { dst, .. }
+                if reg.is_some_and(|ri| self.regions[ri].spec.is_some())
+                    && let Some(src) = self.reuse_planned(pc) =>
+            {
+                if (dst as usize) >= self.env.n_regs || (src as usize) >= self.env.n_regs {
+                    return None;
+                }
+                self.copy_reg(a, reg, dst, src);
             }
             // A property read whose value a register already holds, in the
             // speculative version (`plan_reuse`).
@@ -4611,9 +4630,19 @@ fn float_bin_operands(op: &GenericOp, dst: u16) -> Option<(u16, u16, bool)> {
 /// object's own property or make it an accessor (a `SetElem` / global write
 /// might, so either ends what is known), so the later read yields that very
 /// value.
+///
+/// Likewise a captured binding's read (`CellGet`) after one of the same cell
+/// register, with neither register written since: in that version nothing
+/// writes a binding cell (a `CellSet` is a call, `region_call`). And a
+/// `CheckTdz` of a register already checked (or a copy of one, unwritten
+/// since) is listed as `(pc, src)` too: it has nothing to check.
 fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Vec<(usize, u16)> {
     // (object register, key, register holding its value).
     let mut avail: Vec<(u16, &str, u16)> = Vec::new();
+    // (cell register, register holding its value).
+    let mut cells: Vec<(u16, u16)> = Vec::new();
+    // Registers known not to hold the TDZ sentinel.
+    let mut checked: Vec<u16> = Vec::new();
     let mut out = Vec::new();
     let (mut d, mut u) = (Vec::new(), Vec::new());
     // A loop nest's in-body branch targets (its inner loops' headers and
@@ -4633,8 +4662,38 @@ fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Ve
         };
         if joins.contains(&pc) {
             avail.clear();
+            cells.clear();
+            checked.clear();
         }
         match (op, bc) {
+            (GenericOp::CellGet { .. }, Op::CellGet { dst, cell }) => {
+                let (dst, cell) = (*dst, *cell);
+                let hit = cells.iter().find(|e| e.0 == cell).map(|e| e.1);
+                if let Some(src) = hit
+                    && src != dst
+                {
+                    out.push((pc, src));
+                }
+                let known = hit.is_some_and(|src| checked.contains(&src));
+                avail.retain(|e| e.0 != dst && e.2 != dst);
+                cells.retain(|e| e.0 != dst && e.1 != dst);
+                checked.retain(|&x| x != dst);
+                if known {
+                    checked.push(dst);
+                }
+                if hit.is_none() && cell != dst {
+                    cells.push((cell, dst));
+                }
+                continue;
+            }
+            (GenericOp::CheckTdz { .. }, Op::CheckTdz { src }) => {
+                if checked.contains(src) {
+                    out.push((pc, *src));
+                } else {
+                    checked.push(*src);
+                }
+                continue;
+            }
             (GenericOp::GetProp { .. }, Op::GetProp { dst, obj, key }) => {
                 let (dst, obj) = (*dst, *obj);
                 let hit = avail
@@ -4647,6 +4706,8 @@ fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Ve
                     out.push((pc, src));
                 }
                 avail.retain(|e| e.0 != dst && e.2 != dst);
+                cells.retain(|e| e.0 != dst && e.1 != dst);
+                checked.retain(|&x| x != dst);
                 if hit.is_none() && obj != dst {
                     avail.push((obj, key.as_str(), dst));
                 }
@@ -4680,10 +4741,14 @@ fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Ve
             ) => {
                 def_use(bc, &mut d, &mut u);
                 avail.retain(|e| !d.contains(&e.0) && !d.contains(&e.2));
+                cells.retain(|e| !d.contains(&e.0) && !d.contains(&e.1));
+                checked.retain(|x| !d.contains(x));
             }
             (GenericOp::CallMethod { .. }, _) if super::inline_math(bc).is_some() => {
                 def_use(bc, &mut d, &mut u);
                 avail.retain(|e| !d.contains(&e.0) && !d.contains(&e.2));
+                cells.retain(|e| !d.contains(&e.0) && !d.contains(&e.1));
+                checked.retain(|x| !d.contains(x));
             }
             (
                 GenericOp::Interp { .. },
@@ -4695,8 +4760,14 @@ fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Ve
             ) => {
                 def_use(bc, &mut d, &mut u);
                 avail.retain(|e| !d.contains(&e.0) && !d.contains(&e.2));
+                cells.retain(|e| !d.contains(&e.0) && !d.contains(&e.1));
+                checked.retain(|x| !d.contains(x));
             }
-            _ => avail.clear(),
+            _ => {
+                avail.clear();
+                cells.clear();
+                checked.clear();
+            }
         }
     }
     out
@@ -4762,7 +4833,7 @@ fn spec_step(
     fields: &[Option<(u64, u32)>],
     s: &mut [u8],
 ) {
-    if let Op::GetProp { dst, .. } = op
+    if let Op::GetProp { dst, .. } | Op::CellGet { dst, .. } = op
         && let Some(&(_, src)) = reuse.iter().find(|x| x.0 == pc)
         && let Some(&t) = s.get(src as usize)
         && let Some(x) = s.get_mut(*dst as usize)

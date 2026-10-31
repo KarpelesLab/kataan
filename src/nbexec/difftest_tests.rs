@@ -2886,3 +2886,34 @@ fn object_literal_anonymous_function_values_are_named_by_key() {
          false|false|true|length,name|function|k|k|get|set|true|true|function||0|\"\"|\" \"|\"\"|\"\""
     );
 }
+
+/// A captured binding read in a hot (compiled) loop: read twice per
+/// iteration, it is the binding's current value even when an element getter
+/// the loop runs reassigns it between the two reads, and a read before the
+/// binding's initialization still throws.
+#[test]
+fn captured_binding_reads_in_compiled_loops() {
+    let src = r#"
+        function mk() {
+            let arr = []; for (let i = 0; i < 5000; i++) arr.push(i);
+            const other = []; for (let i = 0; i < 5000; i++) other.push(-i);
+            Object.defineProperty(arr, 2500, { get() { arr = other; return 7; } });
+            return function () {
+                let s = 0;
+                for (let i = 0; i < arr.length; i++) s = (s + arr[i] + arr[i]) | 0;
+                return s;
+            };
+        }
+        function tdz() {
+            const res = [];
+            function f() { let s = 0; for (let i = 0; i < 3000; i++) s += v + v; return s; }
+            try { res.push(f()); } catch (e) { res.push(e.constructor.name); }
+            let v = 2;
+            res.push(f());
+            return res.join();
+        }
+        for (let k = 0; k < 30; k++) tdz();
+        mk()() + "|" + tdz()
+    "#;
+    assert_eq!(run(src), "-12497493|ReferenceError,12000");
+}

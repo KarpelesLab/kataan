@@ -7895,7 +7895,11 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(slow);
-                    exec_op!(pc);
+                    // (A speculative loop's fast version leaves for its copy.)
+                    match num.spec_bail(&mut a, op_idx) {
+                        Some(bail) => a.jmp(bail),
+                        None => exec_op!(pc),
+                    }
                     a.bind(done);
                 }
                 GenericOp::CellSet { cell, src, pc } => {
