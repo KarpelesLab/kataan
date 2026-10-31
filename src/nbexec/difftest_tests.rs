@@ -3426,3 +3426,137 @@ fn json_stringify_symbol_wrapper_is_an_object() {
     "#;
     assert_eq!(run(src), "[{}]|{\"a\":{}}|{\"extra\":5}|[true,\"s\",2]");
 }
+
+/// A typed array's `.length` read by compiled code (`jit::typed`'s inline
+/// length, and a speculative loop's hoisted view) honours what makes
+/// `Realm::typed_accessor_intact` false, as the interpreter does: an own
+/// `length` on the view, a getter or data property on a concrete prototype
+/// or `%TypedArray%.prototype` (and the original getter put back), a
+/// subclass's `get length()`, and `Object.setPrototypeOf` of a view or of a
+/// concrete prototype (checked against node).
+#[test]
+fn typed_array_length_in_compiled_code_honours_redefinitions() {
+    assert_eq!(
+        run(r#"
+        var ta = new Int32Array(3), s = 0, t = 0;
+        function rd(a) { return a.length; }
+        for (var i = 0; i < 20000; i++) { s += rd(ta); if (i === 10000) Object.defineProperty(ta, 'length', { value: 5 }); }
+        var tb = new Uint8Array(4), u = 0;
+        function rd2(a) { var k = 0; for (var j = 0; j < 3000; j++) k += a.length; return k; }
+        u += rd2(tb); Object.defineProperty(Uint8Array.prototype, 'length', { get() { return 9; } }); u += rd2(tb);
+        var tc = new Float64Array(2), w = 0;
+        for (var q = 0; q < 20000; q++) { w += tc.length; if (q === 15000) Object.defineProperty(Object.getPrototypeOf(Int8Array.prototype), 'length', { get() { return 7; } }); }
+        [s, u, w].join(' ')
+    "#),
+        "79998 39000 64995"
+    );
+    // Own `length` on one typed array; another stays intact. Hot + speculative loops.
+    assert_eq!(
+        run(r#"
+        function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s; }
+        function lens(a, n) { var k = 0; for (var j = 0; j < n; j++) k += a.length; return k; }
+        var a = new Int16Array(8), b = new Int16Array(8);
+        for (var i = 0; i < 8; i++) { a[i] = i; b[i] = 2 * i; }
+        var r = [];
+        for (var t = 0; t < 300; t++) r[0] = sum(a) + sum(b) + lens(a, 50);
+        Object.defineProperty(a, 'length', { value: 3, configurable: true });
+        for (var t = 0; t < 300; t++) r[1] = sum(a) + sum(b) + lens(a, 50) + lens(b, 50);
+        Object.defineProperty(a, 'length', { get: function () { return 2; }, configurable: true });
+        r[2] = sum(a) + lens(a, 10);
+        delete a.length;
+        for (var t = 0; t < 300; t++) r[3] = sum(a) + lens(a, 50);
+        var c = new Float32Array(4); c.extra = 1;
+        for (var t = 0; t < 300; t++) r[4] = lens(c, 20) + sum(c);
+        Reflect.set({}, 'length', 6, c);
+        r[5] = lens(c, 20) + (c.length);
+        r.join(' ')
+    "#),
+        "484 609 21 428 80 126"
+    );
+    // A getter on a concrete prototype, then a data property, then deleted.
+    assert_eq!(
+        run(r#"
+        function lens(a, n) { var k = 0; for (var j = 0; j < n; j++) k += a.length; return k; }
+        function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i] | 0; return s; }
+        var u = new Uint32Array(6), f = new Float64Array(6);
+        for (var i = 0; i < 6; i++) { u[i] = i + 1; f[i] = i + 0.5; }
+        var r = [];
+        for (var t = 0; t < 400; t++) r[0] = lens(u, 40) + lens(f, 40) + sum(u);
+        Object.defineProperty(Uint32Array.prototype, 'length', { get: function () { return 4; }, configurable: true });
+        for (var t = 0; t < 400; t++) r[1] = lens(u, 40) + lens(f, 40) + sum(u);
+        Object.defineProperty(Uint32Array.prototype, 'length', { value: 2, configurable: true });
+        for (var t = 0; t < 400; t++) r[2] = lens(u, 40) + sum(u);
+        delete Uint32Array.prototype.length;
+        for (var t = 0; t < 400; t++) r[3] = lens(u, 40) + lens(f, 40) + sum(u);
+        r.join(' ')
+    "#),
+        "501 410 83 501"
+    );
+    // %TypedArray%.prototype.length redefined (getter, then the original back).
+    assert_eq!(
+        run(r#"
+        var TAP = Object.getPrototypeOf(Int8Array.prototype);
+        var orig = Object.getOwnPropertyDescriptor(TAP, 'length');
+        function lens(a, n) { var k = 0; for (var j = 0; j < n; j++) k += a.length; return k; }
+        function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s; }
+        var x = new Uint8ClampedArray(5); x.fill(3);
+        var r = [];
+        for (var t = 0; t < 400; t++) r[0] = lens(x, 40) + sum(x);
+        Object.defineProperty(TAP, 'length', { get: function () { return this.byteLength * 2; }, configurable: true });
+        for (var t = 0; t < 400; t++) r[1] = lens(x, 40) + sum(x);
+        Object.defineProperty(TAP, 'length', orig);
+        for (var t = 0; t < 400; t++) r[2] = lens(x, 40) + sum(x);
+        Object.defineProperty(TAP, 'length', { get: Object.getOwnPropertyDescriptor(TAP, 'byteOffset').get, configurable: true });
+        x = new Uint8Array(new ArrayBuffer(10), 3, 4);
+        for (var t = 0; t < 400; t++) r[3] = lens(x, 40);
+        r.join(' ')
+    "#),
+        "215 NaN 215 120"
+    );
+    // Subclasses: one with `get length()`, one plain; and one that gains it later.
+    assert_eq!(
+        run(r#"
+        class Odd extends Int32Array { get length() { return 100; } }
+        class Plain extends Int32Array {}
+        class Later extends Float64Array {}
+        function lens(a, n) { var k = 0; for (var j = 0; j < n; j++) k += a.length; return k; }
+        function sum(a) { var s = 0; for (var i = 0; i < a.length && i < 50; i++) s += a[i] | 0; return s; }
+        var p = new Plain(4), o = new Odd(4), l = new Later(3), z = new Int32Array(4);
+        p.fill(1); o.fill(2); z.fill(3);
+        var r = [];
+        for (var t = 0; t < 300; t++) r[0] = lens(p, 30) + lens(z, 30) + sum(p) + sum(z);
+        for (var t = 0; t < 300; t++) r[1] = lens(o, 30) + sum(o) + lens(p, 30);
+        for (var t = 0; t < 300; t++) r[2] = lens(l, 30);
+        Object.defineProperty(Later.prototype, 'length', { get: function () { return -1; } });
+        for (var t = 0; t < 300; t++) r[3] = lens(l, 30) + lens(z, 30);
+        var q = Reflect.construct(Uint16Array, [5], function F() {});
+        for (var t = 0; t < 300; t++) r[4] = lens(q, 30);
+        r.join(' ')
+    "#),
+        "256 3128 90 90 NaN"
+    );
+    // setPrototypeOf of a typed array, and of a concrete prototype.
+    assert_eq!(
+        run(r#"
+        function lens(a, n) { var k = 0; for (var j = 0; j < n; j++) k += a.length; return k; }
+        var a = new Int8Array(7), b = new Int8Array(2);
+        var r = [];
+        for (var t = 0; t < 300; t++) r[0] = lens(a, 30) + lens(b, 30);
+        Object.setPrototypeOf(a, { length: 11 });
+        for (var t = 0; t < 300; t++) r[1] = lens(a, 30) + lens(b, 30);
+        var c = new Uint16Array(3);
+        var mid = Object.create(Object.getPrototypeOf(Int8Array.prototype));
+        Object.setPrototypeOf(c, mid);
+        for (var t = 0; t < 300; t++) r[2] = lens(c, 30);
+        Object.defineProperty(mid, 'length', { value: 21 });
+        for (var t = 0; t < 300; t++) r[3] = lens(c, 30);
+        Object.setPrototypeOf(Int16Array.prototype, { get length() { return 5; } });
+        var d = new Int16Array(9);
+        for (var t = 0; t < 300; t++) r[4] = lens(d, 30);
+        Object.setPrototypeOf(b, null);
+        for (var t = 0; t < 300; t++) r[5] = String(b.length) + lens(new Int8Array(1), 3);
+        r.join(' ')
+    "#),
+        "270 390 90 630 150 undefined3"
+    );
+}

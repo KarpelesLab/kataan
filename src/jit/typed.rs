@@ -374,6 +374,12 @@ impl X64Assembler {
         self.g_add_mem(r::RAX, r::RCX, t.off_byte_offset);
         self.g_store(r::RBP, v.base, r::RAX);
         self.g_mem(false, &[0x0f, 0xb6], r::RAX, r::RCX, t.off_kind); // movzx eax, byte
+        // Bit 8 (above the byte every access compares): `.length` may not be
+        // the length slot (see `t_hoisted_len`).
+        let intact = self.new_label();
+        self.t_len_intact(realm, r::R8, intact);
+        self.raw(&[0x0d, 0x00, 0x01, 0x00, 0x00]); // or eax, 0x100
+        self.bind(intact);
         self.g_store(r::RBP, v.kind, r::RAX);
         self.jmp(done);
         self.bind(none);
@@ -404,16 +410,57 @@ impl X64Assembler {
         }
     }
 
-    /// A hoisted view's `length` (see [`t_len`](Self::t_len)): `rax`.
-    pub(crate) fn t_hoisted_len(&mut self, v: ViewSlots) {
+    /// To `intact` when a typed array's `.length` is its length slot: no
+    /// typed array has an own property and nothing on a typed array's
+    /// prototype chain shadows or redefines the built-in getter, as
+    /// `Realm::jit_typed_len_refresh` proved at the current prototype epoch
+    /// (else on, for its helper, which re-proves it). `realm` is the realm
+    /// pointer's `ctx` (`r15`) displacement. Clobbers `tmp`, `r11`.
+    fn t_len_intact(&mut self, realm: i32, tmp: u8, intact: Label) {
+        let stamp =
+            i32::try_from(crate::realm::Realm::jit_typed_len_stamp_offset()).unwrap_or(i32::MAX);
+        self.g_load(r::R11, r::R15, realm);
+        self.g_movabs(tmp, crate::object::proto_epoch_addr() as u64);
+        self.g_load(tmp, tmp, 0);
+        self.g_cmp_mem(tmp, r::R11, stamp);
+        self.g_jcc(cc::E, intact);
+    }
+
+    /// A hoisted view's `length` (see [`t_len`](Self::t_len)) when the
+    /// register at frame displacement `recv` holds it (as
+    /// [`t_hoisted`](Self::t_hoisted)): `rax`, else to `miss` — also when
+    /// its entry check found `.length` maybe not the length slot (bit 8 of
+    /// the kind slot). The entry check suffices: anything that could change
+    /// that runs Rust code, after which the loop re-enters through it.
+    /// Clobbers `rax`.
+    pub(crate) fn t_hoisted_len(&mut self, v: ViewSlots, recv: i32, miss: Label) {
+        match v.held {
+            // One compare: a served kind is below `NO_VIEW`, with bit 8 clear.
+            None => {
+                self.g_mem(true, &[0x81], 7, r::RBP, v.kind); // cmp qword [..], imm32
+                self.code
+                    .extend_from_slice(&i32::from(NO_VIEW).to_le_bytes());
+                self.g_jcc(cc::AE, miss);
+            }
+            Some(_) => {
+                self.t_hoisted(v, recv, miss);
+                self.g_cmp_byte_imm(r::RBP, v.kind + 1, 0);
+                self.g_jcc(cc::NE, miss);
+            }
+        }
         self.g_load(r::RAX, r::RBP, v.len);
     }
 
     /// The view's `length` (what `Realm::array_length` answers for a view
-    /// wholly inside its store, so in bounds): with `rcx` / `r9` from
+    /// wholly inside its store, so in bounds, while
+    /// [`t_len_intact`](Self::t_len_intact) holds): with `rcx` / `r9` from
     /// [`t_view`](Self::t_view), `rax` = the length (an integer) and on to
     /// `got`, else to `miss`. Clobbers `r11`.
-    pub(crate) fn t_len(&mut self, t: &TypedLayout, miss: Label, got: Label) {
+    pub(crate) fn t_len(&mut self, t: &TypedLayout, realm: i32, miss: Label, got: Label) {
+        let intact = self.new_label();
+        self.t_len_intact(realm, r::RAX, intact);
+        self.jmp(miss);
+        self.bind(intact);
         for (last, s) in [(UINT8_CLAMPED, 0), (UINT16, 1), (FLOAT32, 2), (FLOAT64, 3)] {
             let next = self.new_label();
             self.g_cmp_byte_imm(r::RCX, t.off_kind, last);

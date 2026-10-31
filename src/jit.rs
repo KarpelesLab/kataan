@@ -9421,8 +9421,7 @@ impl JitFunction {
                     // (`typed::ViewSlots`): its length with no walk.
                     if let Some(v) = num.hoisted_view(op_idx, arr).filter(|_| typed) {
                         let not_view = a.new_label();
-                        a.t_hoisted(v, disp(arr), not_view);
-                        a.t_hoisted_len(v);
+                        a.t_hoisted_len(v, disp(arr), not_view);
                         a.jmp(got);
                         a.bind(not_view);
                     }
@@ -9457,7 +9456,7 @@ impl JitFunction {
                         }
                         a.bind(walked);
                         a.t_view(&layout, tl, slow);
-                        a.t_len(tl, slow, got);
+                        a.t_len(tl, helpers.call_layout.realm, slow, got);
                     }
                     a.bind(slow);
                     if let Some(b) = bail {

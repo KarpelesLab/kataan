@@ -63,6 +63,12 @@ use alloc::rc::Rc;
 /// A [`Realm::typed_length_memo`] stamp: the concrete prototype and
 /// `%TypedArray%.prototype` handles, their key epochs, and `cell_swaps`.
 type TypedLengthStamp = (u64, u64, u32, u32, u32);
+
+/// How many distinct typed-array prototypes
+/// [`Realm::typed_len_protos`] records before compiled code's inline
+/// `.length` gives up (the intrinsic concrete prototypes plus a few
+/// subclasses').
+const TYPED_LEN_PROTOS_MAX: usize = 16;
 use alloc::vec::Vec;
 
 /// Hidden `[[PromiseState]]` slot for a **Promise subclass** instance
@@ -249,6 +255,25 @@ pub struct Realm {
     /// built-in `length` getter: the concrete prototype and `%TypedArray%.prototype` with their key
     /// epochs (an accessor (re)definition bumps them too) and `cell_swaps` then.
     typed_length_memo: core::cell::Cell<Option<TypedLengthStamp>>,
+    /// Every `[[Prototype]]` a typed array has been given (see
+    /// [`note_typed_proto`](Realm::note_typed_proto)), up to
+    /// [`TYPED_LEN_PROTOS_MAX`]: what
+    /// [`jit_typed_len_refresh`](Realm::jit_typed_len_refresh) validates.
+    typed_len_protos: Vec<Handle>,
+    /// Sticky: some typed array may not reach the built-in `length` getter
+    /// through one of [`typed_len_protos`](Realm::typed_len_protos) — it got
+    /// own properties (an auxiliary object), a `null` prototype, or one
+    /// prototype too many. Compiled code's inline `.length` is then off for good.
+    typed_len_tainted: bool,
+    /// The prototype epoch at which every typed array's `.length` was proved
+    /// to be its `[[ArrayLength]]` slot (see
+    /// [`jit_typed_len_refresh`](Realm::jit_typed_len_refresh)); `0` = not
+    /// proved. Compiled code's inline typed `.length` requires it current.
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    jit_typed_len_stamp: u64,
     /// One-slot memo of the most recent regex subject widened to UTF-16, kept
     /// because the matcher takes `&[u16]` and every `test`/`exec`/`split`/…
     /// otherwise re-transcodes the whole subject — making a match cost O(subject)
@@ -833,6 +858,9 @@ impl Realm {
             proto_index_accessor_dirty: false,
             chain_index_free_memo: None,
             typed_length_memo: core::cell::Cell::new(None),
+            typed_len_protos: Vec::new(),
+            typed_len_tainted: false,
+            jit_typed_len_stamp: 0,
             regex_subject_units: None,
             unit_strings: alloc::vec::Vec::new(),
             unit_cursor: None,
@@ -971,9 +999,91 @@ impl Realm {
             return;
         }
         self.cell_link_changed(handle);
+        self.note_typed_proto(handle, Some(proto));
         self.native_protos.insert(handle.to_raw(), proto);
         self.gc_side_log.push(handle.to_raw());
         self.mark_array_proto_set(handle);
+    }
+
+    /// Records the `[[Prototype]]` `proto` a cell at `handle` is getting,
+    /// when it is a typed array: in
+    /// [`typed_len_protos`](Realm::typed_len_protos) (a new one retires the
+    /// [`jit_typed_len_stamp`](Realm::jit_typed_len_stamp)), or, for `null`
+    /// or once the list is full, as the sticky
+    /// [`typed_len_tainted`](Realm::typed_len_tainted).
+    fn note_typed_proto(&mut self, handle: Handle, proto: Option<Handle>) {
+        if self.typed_len_tainted || !matches!(self.heap.get(handle), Some(Cell::TypedArray { .. }))
+        {
+            return;
+        }
+        match proto {
+            Some(p) if self.typed_len_protos.contains(&p) => {}
+            Some(p) if self.typed_len_protos.len() < TYPED_LEN_PROTOS_MAX => {
+                self.typed_len_protos.push(p);
+                self.jit_typed_len_stamp = 0;
+            }
+            _ => self.taint_typed_len(),
+        }
+    }
+
+    /// Turns compiled code's inline typed-array `.length` off for good (see
+    /// [`typed_len_tainted`](Realm::typed_len_tainted)).
+    fn taint_typed_len(&mut self) {
+        self.typed_len_tainted = true;
+        self.jit_typed_len_stamp = 0;
+    }
+
+    /// Proves, for compiled code's inline typed-array `.length`, that every
+    /// typed array's `[[Get]]` of `length` is its `[[ArrayLength]]` slot (what
+    /// [`typed_accessor_intact`](Realm::typed_accessor_intact) answers for one
+    /// view), and stamps [`jit_typed_len_stamp`](Realm::jit_typed_len_stamp)
+    /// with the prototype epoch then: no typed array has own properties
+    /// (`typed_len_tainted`), and the chain from each prototype one was ever
+    /// given ([`typed_len_protos`](Realm::typed_len_protos)) reaches the
+    /// built-in getter through ordinary objects, each of which is watched
+    /// ([`JIT_FLAG_WATCHED`](crate::object::JIT_FLAG_WATCHED)) from here on, so
+    /// any change to one of them — a `length` defined or deleted, an accessor
+    /// redefined, a `[[Prototype]]` set — bumps the epoch past the stamp.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn jit_typed_len_refresh(&mut self) {
+        if self.typed_len_tainted
+            || self.typed_len_protos.is_empty()
+            || self.jit_typed_len_stamp == crate::object::proto_epoch()
+        {
+            return;
+        }
+        for i in 0..self.typed_len_protos.len() {
+            let p = self.typed_len_protos[i];
+            if self
+                .chain_builtin_getter(Some(p), "length", crate::nbexec::N_TYPED_ARRAY_ACCESSOR)
+                .is_none()
+            {
+                self.jit_typed_len_stamp = 0;
+                return;
+            }
+            // Watch the links up to the holder (the walk above proved them
+            // ordinary objects).
+            let mut cur = Some(p);
+            while let Some(c) = cur
+                && let Some(o) = self.heap.get_mut(c).and_then(Cell::as_object_mut)
+            {
+                o.watch();
+                if o.accessor("length").is_some() {
+                    break;
+                }
+                cur = o.proto();
+            }
+        }
+        self.jit_typed_len_stamp = crate::object::proto_epoch();
+    }
+
+    /// The byte offset, within a `Realm`, of `jit_typed_len_stamp` (a `u64`),
+    /// which compiled code's inline typed-array `.length` requires equal to
+    /// the prototype epoch.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_typed_len_stamp_offset() -> usize {
+        core::mem::offset_of!(Realm, jit_typed_len_stamp)
     }
 
     /// The hook for a change to a non-object cell's `[[Prototype]]` or
@@ -1551,6 +1661,10 @@ impl Realm {
         }
         let obj = self.new_object();
         self.cell_link_changed(handle);
+        // An own property on a typed array (maybe a `length`).
+        if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
+            self.taint_typed_len();
+        }
         self.aux_props.insert(handle.to_raw(), obj);
         self.mark_array_side_state(handle);
         obj
@@ -4474,6 +4588,7 @@ impl Realm {
         {
             self.cell_link_changed(handle);
             self.mark_array_proto_set(handle);
+            self.note_typed_proto(handle, proto);
             match proto {
                 Some(p) => {
                     self.native_protos.insert(handle.to_raw(), p);
@@ -6946,6 +7061,7 @@ impl Realm {
         // class prototypes: both are keyed by an identity the heap graph does not
         // reach, so their values are strong roots.
         out.extend(self.native_protos.values().copied());
+        out.extend(self.typed_len_protos.iter().copied());
         out.extend(self.vm_fn_default_proto);
         out.extend(self.regexp_default_proto);
         out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
@@ -7639,9 +7755,15 @@ impl Realm {
             intl_protos,
             host_persistent,
             host_native_state,
+            typed_len_protos,
             ..
         } = self;
         let stats = gc::compact_with(heap, &mut all, &mut |forward| {
+            // A live one moves with its cell; a dead one (no typed array
+            // links it any more) only costs a needless validation.
+            for p in typed_len_protos.iter_mut() {
+                *p = forward(*p);
+            }
             // A typed array's backing-buffer handle lives in the `Cell::TypedArray`
             // itself and is forwarded by the moving collector with every other cell
             // reference, so the view→buffer link survives compaction intrinsically —

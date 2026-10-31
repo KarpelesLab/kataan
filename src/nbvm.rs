@@ -6470,6 +6470,13 @@ pub(crate) extern "C" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv:
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
+    // A typed array's: re-prove the inline path's precondition (a stale
+    // stamp sent it here).
+    if let Some(h) = NanBox::from_bits(recv).as_handle()
+        && ctx.realm.typed_kind(Handle::from_raw(h)).is_some()
+    {
+        ctx.realm.jit_typed_len_refresh();
+    }
     match vm_array_len(ctx, funcs, NanBox::from_bits(recv)) {
         Ok(v) => v.to_bits(),
         Err(e) => {
