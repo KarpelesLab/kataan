@@ -665,6 +665,18 @@ impl Region {
 /// when the test would fail (`jit::compile_generic`), so the test needs no
 /// code and the fallback arm, never reached, need not be there ??? nor does
 /// its call keep the loop from having a fast version.
+///
+/// An inlined call (`super::inline`) has the same shape: its guard
+/// (`Op::InlineGuard`), whose test is `g + 1`, the inlined body as the fast
+/// arm, the call op itself as the fallback arm (a polymorphic site's last
+/// way's guard; the earlier ways' misses branch to the next way's guard,
+/// an ordinary in-body branch). In the fast version the guard's miss
+/// leaves for the plain copy at the guard (`jit::compile_generic`), which
+/// identifies the callee again and makes the call: the inlined body's ops
+/// are the fast version's own, and its activation, pending from the guard
+/// to its `InlineLeave`, is never materialized there (no Rust code runs in
+/// a fast version; a leave inside the body resumes in the copy with the
+/// activation still pending, which the copy's first call materializes).
 fn guard_diamonds(
     r: &Region,
     ops: &[GenericOp],
@@ -673,12 +685,22 @@ fn guard_diamonds(
 ) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     for g in r.head..r.end {
-        let (
-            Some(&GenericOp::PlainPrims { dst, .. }),
-            Some(&GenericOp::JumpIfFalse { cond, target: f }),
-        ) = (ops.get(g), ops.get(g + 1))
+        let (Some(guard), Some(&GenericOp::JumpIfFalse { cond, target: f })) =
+            (ops.get(g), ops.get(g + 1))
         else {
             continue;
+        };
+        let dst = match *guard {
+            GenericOp::PlainPrims { dst, .. } => dst,
+            // An inlined call's (last) guard: its fallback arm is the call
+            // op alone. (Not a `new`'s, whose guard allocates.)
+            GenericOp::InlineGuard { dst, call, .. }
+                if call as usize == f
+                    && !matches!(ops.get(f), Some(GenericOp::Construct { .. })) =>
+            {
+                dst
+            }
+            _ => continue,
         };
         if cond != dst || f <= g + 2 || f > r.end {
             continue;
@@ -822,6 +844,9 @@ pub(super) struct NumEnv {
     /// layout had as a Number-only slot when compiled, the address of the
     /// layout's may-be-non-Number mask and the slot (see [`Spec::fields`]).
     pub(super) fields: Vec<Option<(u64, u32)>>,
+    /// Per pc: for an inlined call's guard, its call's `CallSite` (whose
+    /// `spec_misses` count a guard diamond's misses in a fast version).
+    pub(super) guard_sites: Vec<Option<u64>>,
 }
 
 /// A region truthiness test's receiver-cache way: its key and slot-address
@@ -1027,13 +1052,16 @@ fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
         // A guard's type test (inline, its slow path a pure check).
         GenericOp::PlainPrims { .. } => true,
         // `!x` (a boolean or Number inline) and an array iteration's step in
-        // by-index mode (`for (… of array)`, inline while the array lasts).
+        // by-index mode (`for (… of array)`, inline while the array lasts),
+        // and a sloppy function's `this` binding (`OrdinaryCallBindThis`,
+        // nothing to do for an object: an inlined method's).
         GenericOp::Not { .. } => true,
         GenericOp::Interp { .. } => {
             matches!(
                 bc,
                 Op::IterNext { iter, next, .. } if usize::from(*next) == usize::from(*iter) + 1
-            ) || allocating_region_op(op, bc)
+            ) || matches!(bc, Op::BindThis { .. })
+                || allocating_region_op(op, bc)
         }
         _ => allocating_region_op(op, bc),
     }
@@ -1068,11 +1096,12 @@ fn allocating_region_op(op: &GenericOp, bc: &Op) -> bool {
 fn region_call(op: &GenericOp, bc: &Op) -> bool {
     match op {
         GenericOp::CallMethod { .. } => super::inline_math(bc).is_none(),
-        // (A `CallWithMethod` of `Math.imul` computed inline counts too:
-        // the `GetMethod` before it reads the built-in through a helper.)
-        GenericOp::CallValue { .. }
-        | GenericOp::CallWithMethod { .. }
-        | GenericOp::CallKey { .. } => true,
+        // A `CallWithMethod` of a `Math` function computed inline
+        // (`Math.min(a, Math.max(b, x))`, `Math.abs(p.x - q.x)`): in a
+        // fast version every other case leaves for the plain copy
+        // (`jit::emit_got_math`).
+        GenericOp::CallWithMethod { .. } => super::inline_math_got(bc).is_none(),
+        GenericOp::CallValue { .. } | GenericOp::CallKey { .. } => true,
         // A captured binding's read: its fast path is loads, and its slow
         // path leaves a fast version for the plain copy (`spec_bail`).
         GenericOp::CellGet { .. } => false,
@@ -1688,6 +1717,23 @@ impl NumGen {
             for &(addr, mask) in &sp.fields {
                 a.p_fields_still_numbers(addr, mask, copy);
             }
+            // No inlined call's guard of a diamond has missed too often
+            // (each miss leaves for the copy: `guard_diamonds`).
+            for &(test, _, _) in &self.regions[ri].cold {
+                let Some(&Some(site)) = self.env.guard_sites.get(test - 1) else {
+                    continue;
+                };
+                a.g_movabs(super::call_seq::r::R11, site);
+                a.g_mem(
+                    true,
+                    &[0x81],
+                    7,
+                    super::call_seq::r::R11,
+                    super::call_seq::SPEC_MISSES,
+                );
+                a.raw(&(super::call_seq::SPEC_MISS_LIMIT as i32).to_le_bytes());
+                a.jcc(CC_AE, copy);
+            }
         }
         Some(())
     }
@@ -1735,6 +1781,23 @@ impl NumGen {
             copy: self.copy,
         });
         Some(entry)
+    }
+
+    /// For an inlined call's guard at `pc` in a speculative region's fast
+    /// version whose test (`pc + 1`) is a guard diamond's ([`guard_diamonds`]):
+    /// the leave for the guard in the plain copy, which its miss takes (the
+    /// fast version has neither the test nor the call). `None` elsewhere;
+    /// `Some(None)` when there is no such leave (the body cannot compile).
+    pub(super) fn guard_miss_bail(
+        &mut self,
+        a: &mut X64Assembler,
+        pc: usize,
+    ) -> Option<Option<Label>> {
+        let ri = self.region_at(pc)?;
+        if !self.regions[ri].cold.iter().any(|c| c.0 == pc + 1) {
+            return None;
+        }
+        Some(self.spec_bail(a, pc))
     }
 
     /// Region `ri`'s [`Cover`] at `pc`: the operands its stub checks
@@ -2464,6 +2527,23 @@ impl NumGen {
         }
         a.movsd_mem_x(disp(r), x);
         None
+    }
+
+    /// For an inlined call's guard at region op `pc`: stores its promoted
+    /// arguments to the register file, where the activation's
+    /// materialization reads them (`call_seq::emit_inline_stub`; the
+    /// inlined body never writes them, so they stay true there until its
+    /// end). `plan_regions` leaves them promoted: the guard itself does not
+    /// read them.
+    pub(super) fn guard_args(&self, a: &mut X64Assembler, pc: usize, args: &[u16]) {
+        for (i, &r) in args.iter().enumerate() {
+            if args[..i].contains(&r) {
+                continue;
+            }
+            if let Some(x) = self.result_xmm(pc, r) {
+                a.movsd_mem_x(disp(r), x);
+            }
+        }
     }
 
     /// Whether register `r` provably holds a Number on entry to op `pc` (in
@@ -3930,6 +4010,15 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
                 defs.push(*dst);
             }
         }
+        Op::CallValue {
+            dst, callee, args, ..
+        } => {
+            uses.push(*callee);
+            uses.extend(args.iter().copied());
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
         Op::Jump { .. } | Op::InlineLeave => {}
         // The guard writes its result and (on a hit) the inlined body's
         // captures, and reads the call's callee and arguments.
@@ -3945,6 +4034,11 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
             defs.extend((0..*n_caps).map(|i| caps.wrapping_add(i)));
             uses.push(*callee);
             uses.extend(args.iter().copied());
+        }
+        // `this` bound in place (its slow path only): a use and a def.
+        Op::BindThis { this } => {
+            defs.push(*this);
+            uses.push(*this);
         }
         // A step writes its value, `done` and the cursor, but not on every
         // path: each is a use as well (live across it), and a def (written).
@@ -4161,7 +4255,26 @@ fn plan_regions(
                         }
                         _ => [None, None],
                     };
-                    pinned.extend(u.iter().copied().filter(|&r| !free.contains(&Some(r))));
+                    // An inlined call's guard does not read its arguments
+                    // (only its activation's materialization does, from the
+                    // register file, where the guard first stores the
+                    // promoted ones: `NumGen::guard_args`).
+                    // Nor does the call op a guard's miss reaches (the
+                    // guard's `call`, whose arguments are the guard's: the
+                    // miss jumps straight there, the arguments stored).
+                    let guard = match &bytecode[pc] {
+                        g @ Op::InlineGuard { .. } => Some(g),
+                        _ => bytecode[head..=end]
+                            .iter()
+                            .find(|g| matches!(g, Op::InlineGuard { call, .. } if *call == pc)),
+                    };
+                    let (guard_args, callee): (&[u16], _) = match guard {
+                        Some(Op::InlineGuard { args, callee, .. }) => (args, Some(*callee)),
+                        _ => (&[], None),
+                    };
+                    pinned.extend(u.iter().copied().filter(|&r| {
+                        !free.contains(&Some(r)) && (Some(r) == callee || !guard_args.contains(&r))
+                    }));
                 }
             }
         }
@@ -5202,8 +5315,8 @@ fn spec_step(
     // `Math.f(x…)` computed inline: past it (in the fast version every other
     // case — another method, a non-Number argument — leaves for the copy)
     // each argument and the result are Numbers.
-    if let Op::CallMethod { dst, args, .. } = op
-        && super::inline_math(op).is_some()
+    if let Op::CallMethod { dst, args, .. } | Op::CallWithMethod { dst, args, .. } = op
+        && (super::inline_math(op).is_some() || super::inline_math_got(op).is_some())
     {
         for &r in args.iter().chain(core::iter::once(dst)) {
             if let Some(x) = s.get_mut(r as usize) {
@@ -5746,6 +5859,14 @@ mod tests {
             .unwrap_or_else(|| panic!("no function {name}"))
     }
 
+    /// Compiles `src` as a hosted run does (the bytecode the tier compiles).
+    fn hosted_protos(src: &str) -> Vec<crate::nbvm::FnProto> {
+        let program = crate::parser::Parser::parse_program(src).expect("parse");
+        let mut funcs = Vec::new();
+        crate::nbvm::compile_program_into(&program, true, &mut funcs).expect("compile");
+        funcs
+    }
+
     /// The pc of the first op of `proto` matching `pred`.
     fn pc_of(proto: &crate::nbvm::FnProto, pred: impl Fn(&Op) -> bool) -> usize {
         proto.ops.iter().position(pred).expect("op present")
@@ -6112,6 +6233,87 @@ mod tests {
             unreachable!()
         };
         assert_ne!(ty(muls[1], x), T_NUM);
+    }
+
+    #[test]
+    fn inlined_call_loops_have_a_speculative_version() {
+        // `t += sq(i % 7) + clamp(i - 20)`, both calls inlined: each guard's
+        // test and fallback call form a guard diamond, the fast version has
+        // neither, and the inlined bodies' arithmetic is proven.
+        let src = "function sq(x){ return x * x; } function clamp(x){ return x < 0 ? 0 : (x > 255 ? 255 : x); } function f(n){ let t = 0; for (let i = 0; i < n; i = i + 1) { t = t + sq(i % 7) + clamp(i - 20); } return t; }";
+        let funcs = hosted_protos(src);
+        let by = |name: &str| funcs.iter().find(|p| p.name == name).expect("fn");
+        let (f, sq, clamp) = (by("f"), by("sq"), by("clamp"));
+        let calls: Vec<usize> = (0..f.ops.len())
+            .filter(|&pc| matches!(f.ops[pc], Op::CallValue { .. }))
+            .collect();
+        assert_eq!(calls.len(), 2);
+        let e = crate::jit::inline::expand(f, &[], &|pc, _| {
+            let callee = if pc == calls[0] { sq } else { clamp };
+            alloc::vec![crate::jit::inline::Candidate {
+                key: 1 + u64::from(pc == calls[1]),
+                proto: callee,
+                warm: Vec::new(),
+                nested: Vec::new(),
+            }]
+        })
+        .expect("inlined");
+        let mut p = f.clone();
+        p.ops = e.ops;
+        p.n_regs = e.n_regs;
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let mut regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1);
+        let r = &mut regions[0];
+        r.cold = guard_diamonds(r, &ops, &[], &[]);
+        assert_eq!(r.cold.len(), 2, "both guards' diamonds");
+        for &(test, fallback, join) in &r.cold {
+            assert!(matches!(p.ops[test - 1], Op::InlineGuard { .. }));
+            assert!(matches!(p.ops[fallback], Op::CallValue { .. }));
+            assert_eq!(join, fallback + 1);
+        }
+        let types = infer(&p.ops, p.n_regs);
+        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs, &[]);
+        let sp = r.spec.as_ref().expect("a speculative version");
+        // `x * x` in `sq`'s body: its operand (the argument `i % 7`) is a
+        // Number there.
+        let mul = (r.head..=r.end)
+            .find(|&pc| matches!(p.ops[pc], Op::Mul { .. }))
+            .expect("the inlined multiply");
+        let Op::Mul { a, .. } = p.ops[mul] else {
+            unreachable!()
+        };
+        assert_eq!(sp.types[(mul - r.head) * p.n_regs + a as usize], T_NUM);
+        // The guards' arguments stay promoted (the guard does not read them).
+        let Op::InlineGuard { args, .. } = &p.ops[r.cold[0].0 - 1] else {
+            unreachable!()
+        };
+        assert!(r.slots.iter().any(|s| s.reg == args[0]));
+    }
+
+    #[test]
+    fn nested_math_calls_are_not_region_calls() {
+        // `Math.min(255, Math.max(0, a[i] - 50))`: the outer call's argument
+        // is a call, so the compiler could not guard it (a `CallWithMethod`):
+        // computed inline (its every other case leaving a fast version), it
+        // keeps the loop call-free; a method of another name does not.
+        let p = hosted_protos(
+            "function f(a, o){ let s = 0; for (let i = 0; i < a.length; i = i + 1) { s = s + Math.min(255, Math.max(0, a[i] - 50)) + o.g(a[i]); } return s; }",
+        )
+        .into_iter()
+        .find(|p| p.name == "f")
+        .expect("f");
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let with = |key: &str| {
+            p.ops
+                .iter()
+                .position(|o| matches!(o, Op::CallWithMethod { key: k, .. } if k.as_str() == key))
+                .expect("a CallWithMethod")
+        };
+        let min = with("min");
+        assert!(!region_call(&ops[min], &p.ops[min]));
+        let g = with("g");
+        assert!(region_call(&ops[g], &p.ops[g]));
     }
 
     #[test]

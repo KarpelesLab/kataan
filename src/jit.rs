@@ -2323,19 +2323,150 @@ impl MathInline {
 }
 
 /// The built-in a `CallWithMethod` (a method call whose arguments were
-/// not guarded: `Math.imul(h ^ bytes[i], p)`) computes inline when its
-/// callee is that built-in and its arguments Numbers: `Math.imul` of two
-/// arguments, `Math.clz32` of one.
+/// not guarded: `Math.imul(h ^ bytes[i], p)`, `Math.min(a, Math.max(b,
+/// x))`, `Math.abs(p.x - q.x)`) computes inline when its callee is that
+/// built-in and its arguments Numbers: the [`inline_math`] functions, by
+/// the same rules.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-fn inline_math_got(op: &crate::nbvm::Op) -> Option<u16> {
+fn inline_math_got(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
     let crate::nbvm::Op::CallWithMethod { key, args, .. } = op else {
         return None;
     };
-    match (key.as_str(), args.len()) {
-        ("imul", 2) => Some(crate::nbexec::N_MATH_IMUL),
-        ("clz32", 1) => Some(crate::nbexec::N_MATH_CLZ32),
-        _ => None,
+    inline_math_key(key, args.len())
+}
+
+/// Emits `Math.f(args…)` computed inline for a `CallWithMethod` whose
+/// callee register `callee` holds the built-in `id` (`f` its inline form):
+/// the site's identity memo (at `site`) must record the callee value as
+/// that built-in, and every argument (`proven`: known a Number) be a
+/// Number, else to `miss` having changed nothing; the result (a Number;
+/// a NaN the canonical `nan`) is stored to `dst`. Arguments are read from
+/// the register file.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn emit_got_math(
+    a: &mut X64Assembler,
+    (id, f): (u16, MathInline),
+    (callee, args, proven, dst): (u16, &[u16], &[bool], u16),
+    site: u64,
+    nan: u64,
+    miss: Label,
+) -> Option<()> {
+    use call_seq::r::{R11, RAX};
+    let disp = |r: u16| i32::from(r) * 8;
+    a.load_rax(disp(callee));
+    a.g_movabs(R11, site);
+    a.g_cmp_mem(RAX, R11, call_seq::IDENT_KEY);
+    a.jne(miss);
+    a.g_mem(true, &[0x83], 7, R11, call_seq::IDENT_STAMP);
+    a.raw(&[0xff]); // cmp qword [..], -1 (u64::MAX)
+    a.jne(miss);
+    a.g_mem(true, &[0x81], 7, R11, call_seq::IDENT_VALUE);
+    a.raw(&(i32::from(id) + 1).to_le_bytes()); // cmp qword [..], id + 1
+    a.jne(miss);
+    // Every argument a Number (so no conversion runs).
+    for (&r, &p) in args.iter().zip(proven) {
+        if !p {
+            a.load_rax(disp(r));
+            a.movabs_r11(0x7ffc_0000_0000_0000_i64); // `is_number(bits) == (bits & QNAN) != QNAN`
+            a.and_rax_r11();
+            a.cmp_rax_r11();
+            a.je(miss);
+        }
     }
+    let x = *args.first()?;
+    let done = a.new_label();
+    let is_nan = a.new_label();
+    match f {
+        MathInline::Imul | MathInline::Clz32 => {
+            // `ToInt32` of each (`ToUint32` is its low bits too) is the low
+            // bits of its truncation, unless that is the "indefinite"
+            // integer (NaN, +-inf, |x| >= 2^63), which the call computes.
+            for (k, &r) in args.iter().enumerate() {
+                a.movsd_xmm0_mem(disp(r));
+                a.cvttsd2si_rax_xmm0();
+                a.movabs_r11(i64::MIN);
+                a.cmp_rax_r11();
+                a.je(miss);
+                if k == 0 && args.len() == 2 {
+                    a.raw(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+                }
+            }
+            if let MathInline::Imul = f {
+                if args.len() != 2 {
+                    return None;
+                }
+                a.raw(&[0x0f, 0xaf, 0xc1]); // imul eax, ecx
+                a.to_int32_rax();
+            } else {
+                // 31 - bsr, or 32 for a zero.
+                let zero = a.new_label();
+                let counted = a.new_label();
+                a.raw(&[0x0f, 0xbd, 0xc0]); // bsr eax, eax
+                a.je(zero);
+                a.raw(&[0x83, 0xf0, 0x1f]); // xor eax, 31
+                a.jmp(counted);
+                a.bind(zero);
+                a.raw(&[0xb8, 32, 0, 0, 0]); // mov eax, 32
+                a.bind(counted);
+            }
+            a.cvtsi2sd_xmm0_rax();
+            a.movsd_mem_xmm0(disp(dst));
+        }
+        MathInline::MaxMin(max) => {
+            // NaN if any is NaN, else the largest (smallest), `+0` above
+            // `-0` -- for equal operands the AND (OR) of their bits.
+            a.movsd_xmm0_mem(disp(x));
+            for &m in &args[1..] {
+                let unequal = a.new_label();
+                let next = a.new_label();
+                a.movsd_xmm1_mem(disp(m));
+                a.ucomisd_xmm0_xmm1();
+                a.jp(is_nan);
+                a.jne(unequal);
+                a.raw(if max {
+                    &[0x66, 0x0f, 0x54, 0xc1] // andpd xmm0, xmm1
+                } else {
+                    &[0x66, 0x0f, 0x56, 0xc1] // orpd xmm0, xmm1
+                });
+                a.jmp(next);
+                a.bind(unequal);
+                a.raw(if max {
+                    &[0xf2, 0x0f, 0x5f, 0xc1] // maxsd xmm0, xmm1
+                } else {
+                    &[0xf2, 0x0f, 0x5d, 0xc1] // minsd xmm0, xmm1
+                });
+                a.bind(next);
+            }
+            a.movsd_mem_xmm0(disp(dst));
+        }
+        MathInline::Abs => {
+            // The sign bit cleared; a NaN (then above the infinity's bits)
+            // stores the canonical NaN instead.
+            a.load_rax(disp(x));
+            a.g_movabs(R11, i64::MAX as u64);
+            a.g_and(RAX, R11);
+            a.movabs_r11(f64::INFINITY.to_bits() as i64);
+            a.cmp_rax_r11();
+            a.jg(is_nan);
+            a.store_rax(disp(dst));
+        }
+        MathInline::Sqrt | MathInline::Round(_) => {
+            // (A NaN result is the canonical one: `roundsd` keeps an
+            // argument NaN, `sqrtsd` too or makes the hardware's default.)
+            a.movsd_xmm0_mem(disp(x));
+            match f {
+                MathInline::Round(mode) => a.roundsd_xmm0(mode),
+                _ => a.sqrtsd_xmm0(),
+            }
+            a.movsd_mem_xmm0(disp(dst));
+        }
+    }
+    a.jmp(done);
+    a.bind(is_nan);
+    a.movabs_rax(nan as i64);
+    a.store_rax(disp(dst));
+    a.bind(done);
+    Some(())
 }
 
 /// The built-in id and inline form of a `CallMethod` of one argument (for
@@ -2343,28 +2474,34 @@ fn inline_math_got(op: &crate::nbvm::Op) -> Option<u16> {
 /// tier computes inline.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
+    let crate::nbvm::Op::CallMethod { key, args, .. } = op else {
+        return None;
+    };
+    inline_math_key(key, args.len())
+}
+
+/// [`inline_math`] by the method's key and argument count.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn inline_math_key(key: &str, argc: usize) -> Option<(u16, MathInline)> {
     use crate::nbexec::{
         N_MATH_ABS, N_MATH_CEIL, N_MATH_CLZ32, N_MATH_FLOOR, N_MATH_IMUL, N_MATH_MAX, N_MATH_MIN,
         N_MATH_SQRT, N_MATH_TRUNC,
     };
-    let crate::nbvm::Op::CallMethod { key, args, .. } = op else {
-        return None;
-    };
-    match key.as_str() {
-        "max" if (1..=4).contains(&args.len()) => {
+    match key {
+        "max" if (1..=4).contains(&argc) => {
             return Some((N_MATH_MAX, MathInline::MaxMin(true)));
         }
-        "min" if (1..=4).contains(&args.len()) => {
+        "min" if (1..=4).contains(&argc) => {
             return Some((N_MATH_MIN, MathInline::MaxMin(false)));
         }
-        "imul" if args.len() == 2 => return Some((N_MATH_IMUL, MathInline::Imul)),
+        "imul" if argc == 2 => return Some((N_MATH_IMUL, MathInline::Imul)),
         _ => {}
     }
-    if args.len() != 1 {
+    if argc != 1 {
         return None;
     }
     let sse41 = has_sse41();
-    Some(match key.as_str() {
+    Some(match key {
         "sqrt" => (N_MATH_SQRT, MathInline::Sqrt),
         "abs" => (N_MATH_ABS, MathInline::Abs),
         "floor" if sse41 => (N_MATH_FLOOR, MathInline::Round(0x09)),
@@ -6629,6 +6766,25 @@ impl JitFunction {
                 realm: helpers.call_layout.realm,
                 layout: helpers.call_layout,
                 heap: layout,
+                // Per inlined call's guard, its call's cache (whose miss
+                // count turns a fast version off, `call_seq::SPEC_MISSES`).
+                guard_sites: ops
+                    .iter()
+                    .map(|op| match *op {
+                        GenericOp::InlineGuard { call, .. } => {
+                            let c = match ops.get(call as usize)? {
+                                GenericOp::CallMethod { cache, .. }
+                                | GenericOp::CallValue { cache, .. }
+                                | GenericOp::CallWithMethod { cache, .. }
+                                | GenericOp::Construct { cache, .. } => *cache,
+                                GenericOp::GetProp { call, .. } => *call,
+                                _ => return None,
+                            };
+                            call_sites.get(c as usize).map(|p| *p as u64)
+                        }
+                        _ => None,
+                    })
+                    .collect(),
                 // A compiled-in read of a slot its layout had as Number-only
                 // (`numeric::Spec::fields`).
                 fields: ops
@@ -6846,6 +7002,32 @@ impl JitFunction {
                 .max()
                 .unwrap_or(0),
         };
+        // The guards in a speculative loop that prove their callee for
+        // the next times (`call_seq::InlineEmit::proved`), each two slots
+        // under the inline slots: by op, its index.
+        let mut n_proved = 0usize;
+        let proved_slot: Vec<Option<usize>> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, o)| match *o {
+                GenericOp::InlineGuard { poly: 0, call, .. }
+                    if num.in_spec(i)
+                        && matches!(
+                            ops.get(call as usize),
+                            Some(GenericOp::CallValue { .. } | GenericOp::CallWithMethod { .. })
+                        ) =>
+                {
+                    n_proved += 1;
+                    Some(n_proved - 1)
+                }
+                _ => None,
+            })
+            .collect();
+        let proved_base = inl_base - 8 * (4 + 3 * i32::from(has_nested));
+        let inl_proved = |k: usize| {
+            let k = k as i32;
+            (proved_base - 16 * k - 8, proved_base - 16 * k - 16)
+        };
         // Per op, the inlined activations enclosing it, outer first, as a
         // call sequence there pushes them (`call_seq::InlineCtx`): each its
         // guard's callee slot and its call's arguments, as its stub's.
@@ -6929,7 +7111,8 @@ impl JitFunction {
                 + gc_frame_slots
                 + 3 * math_sites.len()
                 + 4 * usize::from(has_inline)
-                + 3 * usize::from(has_nested)) as u32
+                + 3 * usize::from(has_nested)
+                + 2 * n_proved) as u32
                 * 8)
             + 15)
             & !15;
@@ -6950,6 +7133,7 @@ impl JitFunction {
                 .map(rc_key)
                 .chain((0..math_sites.len()).flat_map(|m| [m_slot(m, 0), m_slot(m, 2)]))
                 .chain(has_inline.then_some(inl_slots.ok))
+                .chain((0..n_proved).map(|k| inl_proved(k).0))
                 .collect(),
         );
         // (Also the promoted loops' epoch slots: emptying them with the
@@ -7580,6 +7764,37 @@ impl JitFunction {
                     // (A promoted loop's guard makes no call.)
                     let new_alloc = (new_target.is_some() && !num.in_region(op_idx))
                         .then_some(construct_alloc_helper);
+                    // In a speculative loop's fast version, a guard
+                    // diamond's miss leaves for the guard in the plain copy
+                    // (`numeric::guard_diamonds`: no test, no call here).
+                    let cold_miss = match num.guard_miss_bail(&mut a, op_idx) {
+                        Some(l) => Some(l?),
+                        None => None,
+                    };
+                    // (Counted: a guard that keeps missing turns the fast
+                    // version off, `call_seq::SPEC_MISS_LIMIT`.)
+                    let cold_miss = match cold_miss {
+                        Some(bail) => {
+                            let count = a.new_label();
+                            let memo = *call_sites.get(match ops.get(call as usize)? {
+                                GenericOp::CallMethod { cache, .. }
+                                | GenericOp::CallValue { cache, .. }
+                                | GenericOp::CallWithMethod { cache, .. }
+                                | GenericOp::Construct { cache, .. } => *cache as usize,
+                                GenericOp::GetProp { call, .. } => *call as usize,
+                                _ => return None,
+                            })?;
+                            Some((count, memo, bail))
+                        }
+                        None => None,
+                    };
+                    // (The arguments a promoted loop keeps in SSE registers,
+                    // into the register file for the activation.)
+                    if let crate::nbvm::Op::InlineGuard { args: gargs, .. } =
+                        bytecode.get(op_idx)?
+                    {
+                        num.guard_args(&mut a, op_idx, gargs);
+                    }
                     let stub = a.new_label();
                     let memo = call_sites
                         .get(match ops.get(call as usize)? {
@@ -7614,7 +7829,9 @@ impl JitFunction {
                             new_alloc,
                             new_way,
                             poly,
+                            proved: proved_slot[op_idx].map(inl_proved),
                             fused_miss: match ops.get(op_idx + 1) {
+                                _ if cold_miss.is_some() => cold_miss.map(|c| c.0),
                                 Some(&GenericOp::JumpIfFalse { target, .. })
                                     if fused_test.get(op_idx + 1) == Some(&true) =>
                                 {
@@ -7624,6 +7841,16 @@ impl JitFunction {
                             },
                         },
                     )?;
+                    // (Out of line, after the guard's code: a cold chunk
+                    // must not start where the op's label is bound.)
+                    if let Some((count, memo, bail)) = cold_miss {
+                        let cold = a.cold_begin();
+                        a.bind(count);
+                        a.g_movabs(call_seq::r::R11, memo as u64);
+                        a.g_inc_mem(call_seq::r::R11, call_seq::SPEC_MISSES);
+                        a.jmp(bail);
+                        a.cold_end(cold);
+                    }
                     inline_stubs.push((stub, argv.clone(), new_target, inl_level[op_idx] == 2));
                 }
                 GenericOp::InlineLeave => {
@@ -7632,7 +7859,13 @@ impl JitFunction {
                     } else {
                         inl_slots
                     };
-                    call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
+                    // (In a speculative loop's fast version the activation
+                    // is still pending: nothing there calls.)
+                    if num.in_spec(op_idx) {
+                        call_seq::emit_inline_leave_pending(&mut a, &s);
+                    } else {
+                        call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
+                    }
                 }
                 GenericOp::CallMethod {
                     pc,
@@ -8568,13 +8801,21 @@ impl JitFunction {
                         // else (`undefined`, a primitive, another kind of
                         // cell) is the interpreter's op.
                         crate::nbvm::Op::BindThis { this } if ok(*this) => {
-                            let slow = a.new_label();
+                            // (In a speculative loop's fast version, which
+                            // makes no call, anything else leaves for the
+                            // plain copy.)
+                            let bail = num.spec_bail(&mut a, op_idx);
+                            let slow = bail.unwrap_or_else(|| a.new_label());
                             let done = a.new_label();
                             walk_to_slot!(*this, slow);
                             a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
                             a.je(done);
-                            a.bind(slow);
-                            exec_op!(pc);
+                            if bail.is_some() {
+                                a.jmp(slow);
+                            } else {
+                                a.bind(slow);
+                                exec_op!(pc);
+                            }
                             a.bind(done);
                         }
                         // A captured variable's binding cell: inline from
@@ -10079,111 +10320,90 @@ impl JitFunction {
                     let si = sites.get(ic as usize)?;
                     let slow = a.new_label();
                     let done = a.new_label();
-                    // `Math.imul(a, b)` / `Math.clz32(x)` whose arguments
-                    // the compiler could not guard (an element read among
-                    // them): when the callee is the very built-in the
-                    // site's helper last served (its identity memo, filled
-                    // only in Rust: key, `stamp == u64::MAX` and its id + 1)
-                    // and every argument is a Number, computed in place.
-                    if let Some(id) = inline_math_got(bytecode.get(op_idx)?) {
-                        let call = a.new_label();
+                    // `Math.f(…)` whose arguments the compiler could not
+                    // guard (an element read, a property read, a nested
+                    // call among them): when the callee is the very
+                    // built-in the site's helper last served (its identity
+                    // memo, filled only in Rust: key, `stamp == u64::MAX`
+                    // and its id + 1) and every argument is a Number,
+                    // computed in place (`emit_got_math`). In a speculative
+                    // loop's fast version anything else leaves for the
+                    // plain copy, which makes the call: the op makes none.
+                    let got = inline_math_got(bytecode.get(op_idx)?);
+                    let bail = if got.is_some() {
+                        num.spec_bail(&mut a, op_idx)
+                    } else {
+                        None
+                    };
+                    if let Some((id, f)) = got {
+                        let call = bail.unwrap_or_else(|| a.new_label());
+                        let proven: Vec<bool> =
+                            args.iter().map(|&r| num.is_number_at(op_idx, r)).collect();
+                        emit_got_math(
+                            &mut a,
+                            (id, f),
+                            (callee, args, &proven, dst),
+                            site_ptr as u64,
+                            canonical_nan,
+                            call,
+                        )?;
+                        a.jmp(done);
+                        if bail.is_none() {
+                            a.bind(call);
+                        }
+                    }
+                    if bail.is_some() {
+                        a.bind(done);
+                    } else {
+                        call_seq::emit_call(
+                            &mut a,
+                            &call_seq::CallEmit {
+                                dst,
+                                callee: call_seq::CalleeSrc::Reg(callee),
+                                this: Some(recv),
+                                args,
+                                site: site_ptr,
+                                layout: &helpers.call_layout,
+                                throw_exit,
+                                slow,
+                                done,
+                            },
+                        )?;
+                        let cold = a.cold_begin();
+                        a.bind(slow);
+                        let native = a.new_label();
+                        // The built-in the site's helper last served (its bits
+                        // in the site's identity memo): straight to the helper
+                        // that serves it.
                         a.load_rax(disp(callee));
                         a.g_movabs(call_seq::r::R11, site_ptr as u64);
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::R11, call_seq::IDENT_KEY);
-                        a.jne(call);
-                        a.g_mem(true, &[0x83], 7, call_seq::r::R11, call_seq::IDENT_STAMP);
-                        a.raw(&[0xff]); // cmp qword [..], -1 (u64::MAX)
-                        a.jne(call);
-                        a.g_mem(true, &[0x81], 7, call_seq::r::R11, call_seq::IDENT_VALUE);
-                        a.raw(&(i32::from(id) + 1).to_le_bytes()); // cmp qword [..], id + 1
-                        a.jne(call);
-                        // Every argument a Number, truncated (the "indefinite"
-                        // integer of NaN, ±∞, |x| ≥ 2^63 takes the call).
-                        for (k, &r) in args.iter().enumerate() {
-                            if !num.is_number_at(op_idx, r) {
-                                a.load_rax(disp(r));
-                                a.movabs_r11(QNAN as i64);
-                                a.and_rax_r11();
-                                a.cmp_rax_r11();
-                                a.je(call);
-                            }
-                            a.movsd_xmm0_mem(disp(r));
-                            a.cvttsd2si_rax_xmm0();
-                            a.movabs_r11(i64::MIN);
-                            a.cmp_rax_r11();
-                            a.je(call);
-                            if k == 0 && args.len() == 2 {
-                                a.raw(&[0x48, 0x89, 0xc1]); // mov rcx, rax
-                            }
-                        }
-                        if args.len() == 2 {
-                            a.raw(&[0x0f, 0xaf, 0xc1]); // imul eax, ecx
-                            a.to_int32_rax();
-                        } else {
-                            // 31 - bsr, or 32 for a zero.
-                            let zero = a.new_label();
-                            let counted = a.new_label();
-                            a.raw(&[0x0f, 0xbd, 0xc0]); // bsr eax, eax
-                            a.je(zero);
-                            a.raw(&[0x83, 0xf0, 0x1f]); // xor eax, 31
-                            a.jmp(counted);
-                            a.bind(zero);
-                            a.raw(&[0xb8, 32, 0, 0, 0]); // mov eax, 32
-                            a.bind(counted);
-                        }
-                        a.cvtsi2sd_xmm0_rax();
-                        a.movsd_mem_xmm0(disp(dst));
+                        a.g_jcc(call_seq::cc::E, native);
+                        let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, si.cache_ptr as i64);
+                        a.movabs_argreg(5, site_ptr as i64);
+                        a.movabs_rax(call_with_method_helper as i64);
+                        a.call_rax();
+                        throw_check!();
                         a.jmp(done);
-                        a.bind(call);
+                        a.bind(native);
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, si.cache_ptr as i64);
+                        a.movabs_argreg(5, site_ptr as i64);
+                        a.movabs_rax(call_native_got_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                        a.jmp(done);
+                        a.cold_end(cold);
+                        a.bind(done);
                     }
-                    call_seq::emit_call(
-                        &mut a,
-                        &call_seq::CallEmit {
-                            dst,
-                            callee: call_seq::CalleeSrc::Reg(callee),
-                            this: Some(recv),
-                            args,
-                            site: site_ptr,
-                            layout: &helpers.call_layout,
-                            throw_exit,
-                            slow,
-                            done,
-                        },
-                    )?;
-                    let cold = a.cold_begin();
-                    a.bind(slow);
-                    let native = a.new_label();
-                    // The built-in the site's helper last served (its bits
-                    // in the site's identity memo): straight to the helper
-                    // that serves it.
-                    a.load_rax(disp(callee));
-                    a.g_movabs(call_seq::r::R11, site_ptr as u64);
-                    a.g_cmp_mem(call_seq::r::RAX, call_seq::r::R11, call_seq::IDENT_KEY);
-                    a.g_jcc(call_seq::cc::E, native);
-                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
-                    a.mov_rdi_r15();
-                    a.mov_rsi_rbx();
-                    a.movabs_argreg(2, n_regs as i64);
-                    a.movabs_argreg(3, op_ptr as i64);
-                    a.movabs_argreg(4, si.cache_ptr as i64);
-                    a.movabs_argreg(5, site_ptr as i64);
-                    a.movabs_rax(call_with_method_helper as i64);
-                    a.call_rax();
-                    throw_check!();
-                    a.jmp(done);
-                    a.bind(native);
-                    a.mov_rdi_r15();
-                    a.mov_rsi_rbx();
-                    a.movabs_argreg(2, n_regs as i64);
-                    a.movabs_argreg(3, op_ptr as i64);
-                    a.movabs_argreg(4, si.cache_ptr as i64);
-                    a.movabs_argreg(5, site_ptr as i64);
-                    a.movabs_rax(call_native_got_helper as i64);
-                    a.call_rax();
-                    throw_check!();
-                    a.jmp(done);
-                    a.cold_end(cold);
-                    a.bind(done);
                 }
                 GenericOp::CallValue {
                     dst,

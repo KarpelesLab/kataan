@@ -318,13 +318,17 @@ fn branch_targets(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[usi
 
 /// Whether bytecode op `pc` (a `GenericOp::Interp` or `CallMethod`) usually
 /// runs without a call: a global access (the global binding cache), the
-/// inline `RequireObjectCoercible` check, or an inline `Math.f(x)`.
+/// inline `RequireObjectCoercible` check, an inline `Math.f(x)`, or a
+/// sloppy function's `this` binding (an object's is nothing to do).
 fn usually_inline(bytecode: &[Op], pc: usize) -> bool {
     match bytecode.get(pc) {
         Some(
             Op::LoadGlobal { .. } | Op::StoreGlobal { .. } | Op::RequireObjectCoercible { .. },
         ) => true,
         Some(op @ Op::CallMethod { .. }) => super::inline_math(op).is_some(),
+        Some(op @ Op::CallWithMethod { .. }) => super::inline_math_got(op).is_some(),
+        // A sloppy function's `this` binding of an object.
+        Some(Op::BindThis { .. }) => true,
         _ => false,
     }
 }
@@ -773,14 +777,18 @@ pub(super) fn plan(
                 fresh_first[i] = fresh.contains(&r);
             }
         }
-        let inline = matches!(op, GenericOp::Interp { .. } | GenericOp::CallMethod { .. })
-            && match bytecode.get(i) {
-                // A global access without a cache slot calls a helper.
-                Some(Op::LoadGlobal { .. } | Op::StoreGlobal { .. }) => {
-                    globals.site.get(i).copied().flatten().is_some() || in_region(i)
-                }
-                _ => usually_inline(bytecode, i),
-            };
+        let inline = matches!(
+            op,
+            GenericOp::Interp { .. }
+                | GenericOp::CallMethod { .. }
+                | GenericOp::CallWithMethod { .. }
+        ) && match bytecode.get(i) {
+            // A global access without a cache slot calls a helper.
+            Some(Op::LoadGlobal { .. } | Op::StoreGlobal { .. }) => {
+                globals.site.get(i).copied().flatten().is_some() || in_region(i)
+            }
+            _ => usually_inline(bytecode, i),
+        };
         if ends_knowledge(op) && !inline {
             live.clear();
         }

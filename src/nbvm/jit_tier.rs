@@ -2297,6 +2297,15 @@ pub(crate) extern "C" fn jit_helper_get_method_site(
         if let Some(v) =
             super::native_call::try_get(ctx, NanBox::from_bits(obj), site_ref.key(), cache)
         {
+            // (And where the site's inline chain cache finds it, so the
+            // compiled read hits inline next time: `Math.min` read for a
+            // `CallWithMethod` the tier computes inline.)
+            if let Some(h) = NanBox::from_bits(obj).as_handle() {
+                // SAFETY: as above (the site is touched only here now).
+                #[allow(unsafe_code)]
+                let site = unsafe { &mut *site };
+                site.fill(&mut ctx.realm, Handle::from_raw(h));
+            }
             return v.to_bits();
         }
     }

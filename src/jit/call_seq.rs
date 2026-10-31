@@ -192,7 +192,20 @@ pub struct CallSite {
     /// A `GetMethod` op's memo of its last lookup (see
     /// `emit_get_method`), kept in the call site of the call it feeds.
     pub getm: GetMethodMemo,
+    /// How many times an inlined call's guard of this site missed in a
+    /// speculative loop's fast version, leaving it for the plain copy (see
+    /// `numeric::guard_diamonds`): at `SPEC_MISS_LIMIT` the fast version
+    /// is no longer entered (the copy makes the call without leaving
+    /// anything first), and the body asks to be recompiled.
+    pub spec_misses: u64,
 }
+
+/// The guard misses after which a speculative loop's fast version is no
+/// longer entered ([`CallSite::spec_misses`]).
+pub(crate) const SPEC_MISS_LIMIT: u64 = 1024;
+
+/// `CallSite`-relative offset of [`CallSite::spec_misses`].
+pub(crate) const SPEC_MISSES: i32 = core::mem::offset_of!(CallSite, spec_misses) as i32;
 
 /// An `Op::GetMethod`'s memo: what its last lookup that hit at a
 /// prototype level proved (`lookup`, see [`LookupMemo`]), at prototype
@@ -482,6 +495,7 @@ impl CallSite {
                 lookup: LookupMemo::empty(),
                 stamp: 0,
             },
+            spec_misses: 0,
         }
     }
 
@@ -2019,6 +2033,17 @@ pub(crate) struct InlineEmit<'a> {
     /// lookup miss, `undefined`, which no way identifies); the later ways
     /// take it from there ([`CalleeSrc::Frame`]).
     pub poly: u16,
+    /// The guard's **proof** slots (`rbp`-relative): the callee value it
+    /// last identified, with its limits checked, and that value's
+    /// captures' pointer. The first is one of the receiver cache's keys,
+    /// emptied by the prologue and after every call, so while it holds a
+    /// value nothing that identification, those checks or the pointer
+    /// depend on can have changed (the epoch, the heap, the stack, the
+    /// depths, the realm: only Rust code changes them), and the same
+    /// value is the same callee (a function value's identity and captures
+    /// are fixed): it is identified by one compare. A plain call of a
+    /// register's value only (`CalleeSrc::Reg`, monomorphic, not a `new`).
+    pub proved: Option<(i32, i32)>,
 }
 
 /// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
@@ -2087,6 +2112,22 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     let lookup_miss = if chain_first { a.new_label() } else { miss };
     let done = a.new_label();
     let identified = a.new_label();
+    // 0. The callee value this guard proved since the last call: the
+    //    same callee, its limits checked.
+    let proved = e
+        .proved
+        .filter(|_| ways <= 1 && e.new_target.is_none() && matches!(e.callee, CalleeSrc::Reg(_)));
+    let proven = a.new_label();
+    if let (Some((bits, caps)), &CalleeSrc::Reg(c)) = (proved, &e.callee) {
+        let full = a.new_label();
+        a.g_load(r::RAX, r::RBX, reg(c));
+        a.g_cmp_mem(r::RAX, RBP, bits);
+        a.g_jcc(cc::NE, full);
+        a.g_store(RBP, e.slots.callee, r::RAX);
+        a.g_load(r::R8, RBP, caps);
+        a.jmp(proven);
+        a.bind(full);
+    }
     // 1. The callee value, into the `callee` slot (and rax).
     match e.callee {
         CalleeSrc::Reg(c) => a.g_load(r::RAX, r::RBX, reg(c)),
@@ -2227,6 +2268,12 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.g_jcc(cc::A, miss);
     a.g_store_imm32(RBP, e.slots.ok, 0);
     a.bind(checked);
+    if let Some((bits, caps)) = proved {
+        a.g_load(r::RAX, RBP, e.slots.callee);
+        a.g_store(RBP, bits, r::RAX);
+        a.g_store(RBP, caps, r::R8);
+        a.bind(proven);
+    }
     // 3b. A `new`: `this`, as the call's `[[Construct]]` would make it.
     let n_caps = e.n_caps - u16::from(e.new_target.is_some());
     if let Some(ctor) = e.new_target {
@@ -2561,6 +2608,22 @@ pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &Inline
     a.g_dec_mem(r::R9, l.total_depth);
     a.g_store_imm32(RBP, s.hdr, super::RECV_CACHE_EMPTY);
     a.bind(done);
+}
+
+/// [`emit_inline_leave`] in a speculative loop's fast version, which makes
+/// no call: the activation its guard made pending is still pending (only a
+/// call materializes one), so it is dropped — `pend` emptied, or for an
+/// inner level's given back what it held when the guard hit (the outer
+/// activation's stub: that one is pending too), its `save` emptied.
+pub(crate) fn emit_inline_leave_pending(a: &mut X64Assembler, s: &InlineSlots) {
+    a.dbg_mark("leave-p");
+    if let Some(save) = s.save {
+        a.g_load(r::RCX, RBP, save);
+        a.g_store(RBP, s.pend, r::RCX);
+        a.g_store_imm32(RBP, save, super::RECV_CACHE_EMPTY);
+    } else {
+        a.g_store_imm32(RBP, s.pend, super::RECV_CACHE_EMPTY);
+    }
 }
 
 impl X64Assembler {

@@ -52,6 +52,11 @@ pub(super) struct TierUp {
     /// cache has since settled on a single callee is worth a recompilation
     /// that may inline it.
     pub(super) cold_calls: Vec<(usize, u16)>,
+    /// `(pc, call cache)` of every inlined call's guard: one whose misses
+    /// turned a speculative loop's fast version off
+    /// (`call_seq::CallSite::spec_misses`) is worth a recompilation, which
+    /// inlines what the call site has seen since.
+    pub(super) guard_calls: Vec<(usize, u16)>,
     /// How many recompilations produced this body (`0`: the first compile).
     pub(super) generation: u8,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
@@ -119,6 +124,24 @@ impl TierUp {
             extents,
             num_slots: Vec::new(),
             cold_calls: Vec::new(),
+            guard_calls: ops
+                .iter()
+                .enumerate()
+                .filter_map(|(pc, op)| {
+                    let GenericOp::InlineGuard { call, .. } = *op else {
+                        return None;
+                    };
+                    let cache = match *ops.get(call as usize)? {
+                        GenericOp::CallMethod { cache, .. }
+                        | GenericOp::CallValue { cache, .. }
+                        | GenericOp::CallWithMethod { cache, .. }
+                        | GenericOp::Construct { cache, .. } => cache,
+                        GenericOp::GetProp { call, .. } => call,
+                        _ => return None,
+                    };
+                    Some((pc, cache))
+                })
+                .collect(),
             generation: 0,
             countdown: core::cell::Cell::new(1),
         }
@@ -186,6 +209,21 @@ impl JitProto {
                     .iter()
                     .any(|&(pc, _)| (head..=end).contains(&pc))
             });
+        // A guard whose misses turned the loop's fast version off.
+        if let Ok(i) = t.extents.binary_search_by_key(&header, |l| l.0) {
+            let (head, end) = t.extents[i];
+            if t.guard_calls.iter().any(|&(pc, cache)| {
+                (head..=end).contains(&pc)
+                    && s.calls.get(cache as usize).is_some_and(|c| {
+                        // SAFETY: as for the property caches below.
+                        #[allow(unsafe_code)]
+                        let c = unsafe { &*c.get() };
+                        c.spec_misses >= super::call_seq::SPEC_MISS_LIMIT
+                    })
+            }) {
+                return true;
+            }
+        }
         if props.is_none() && calls.is_none() {
             return false;
         }
