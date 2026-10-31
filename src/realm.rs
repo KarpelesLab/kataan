@@ -29,6 +29,11 @@ pub(crate) mod builtins_fast;
 pub(crate) mod coll_fast;
 mod coll_index;
 mod concat_fast;
+mod fn_chain;
+pub use fn_chain::FnChain;
+mod gen_state;
+mod private_fast;
+pub use private_fast::PrivCache;
 pub(crate) mod hidden_layout;
 mod msg_text;
 mod shortest;
@@ -104,6 +109,9 @@ pub struct Realm {
     /// object starts with (see [`Realm::init_builtin_fn_props`]), made on
     /// first use.
     builtin_fn_shape: Option<Rc<Shape>>,
+    /// The `{value, done}` layout of an iterator result object (see
+    /// `Realm::new_iter_result`), grown from `root_shape` once.
+    iter_result_shape: Option<Rc<Shape>>,
     /// The layouts of the `arguments` objects [`Realm::new_arguments_object`]
     /// makes, by `3 * argc + kind` (unmapped, mapped, mapped with its
     /// parameter cells; see `args_fast`), made on first use.
@@ -788,6 +796,7 @@ impl Realm {
             heap,
             root_shape: Shape::root(),
             builtin_fn_shape: None,
+            iter_result_shape: None,
             args_shapes: alloc::vec::Vec::new(),
             args_cells_attached: false,
             atoms: AtomTable::new(),
@@ -5536,6 +5545,7 @@ impl Realm {
                             slot: 0,
                             accessor: false,
                             absent: true,
+                            fn_links: None,
                         }));
                         return;
                     }
@@ -5546,6 +5556,7 @@ impl Realm {
                 slot,
                 accessor,
                 absent: false,
+                fn_links: None,
             }));
             return;
         }

@@ -145,6 +145,10 @@ pub struct ChainCache {
     /// Whether no object on the chain has the key: `shapes` is then the whole
     /// chain, and its last object's `[[Prototype]]` is null.
     pub absent: bool,
+    /// For a chain that starts at a VM closure (a static class member read,
+    /// `C.kind` with `kind` on a parent class), which `shapes` cannot describe:
+    /// the links instead (see `Realm::fn_chain_get`). `None` otherwise.
+    pub fn_links: Option<alloc::boxed::Box<crate::realm::FnChain>>,
 }
 
 impl PropertyCache {

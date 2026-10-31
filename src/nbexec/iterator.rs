@@ -483,10 +483,7 @@ impl Interp {
 
     /// Builds an iterator-result object `{ value, done }`.
     pub(crate) fn iter_result(&mut self, value: NanBox, done: bool) -> NanBox {
-        let r = self.realm.new_object();
-        self.realm.set_property(r, "value", value);
-        self.realm.set_property(r, "done", NanBox::boolean(done));
-        NanBox::handle(r.to_raw())
+        NanBox::handle(self.realm.new_iter_result(value, done).to_raw())
     }
 
     /// Whether `h` carries the `[[UnderlyingIterator]]`-bearing internal state of

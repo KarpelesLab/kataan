@@ -1,0 +1,92 @@
+//! In-place access to a suspended VM frame's state arrays, and the
+//! iterator-result object, for the generator resume path (`nbvm::gen_fast`).
+//!
+//! A suspended generator keeps its frame in engine-internal arrays (never
+//! user-visible: they hang off a hidden slot). Resuming moves the register
+//! file out of its array and suspending moves it back, instead of copying it
+//! into a fresh array per `yield`.
+
+use super::Realm;
+use crate::cell::Cell;
+use crate::heap::Handle;
+use crate::nanbox::NanBox;
+use alloc::vec::Vec;
+
+impl Realm {
+    /// Moves the elements out of the engine-internal array at `h`, leaving
+    /// it empty; `None` when `h` is not an array.
+    pub(crate) fn internal_array_take(&mut self, h: Handle) -> Option<Vec<NanBox>> {
+        let a = self.heap.get_mut(h)?.as_array_mut()?;
+        Some(core::mem::take(a.vec_mut()))
+    }
+
+    /// Makes `elems` the elements of the engine-internal array at `h` (as
+    /// [`internal_array_take`](Self::internal_array_take) left it), through
+    /// the write barrier. `false`, having changed nothing, when `h` is not an
+    /// array.
+    pub(crate) fn internal_array_put(&mut self, h: Handle, elems: Vec<NanBox>) -> bool {
+        if !matches!(self.heap.get(h), Some(Cell::Array(_))) {
+            return false;
+        }
+        // (The barrier of a young array records nothing, so only an old one
+        // or an incremental cycle's shading needs the walk.)
+        if self.incremental.is_some() || self.heap.age(h).is_some_and(|a| a >= crate::gc::OLD_AGE) {
+            for &x in &elems {
+                if x.as_handle().is_some() {
+                    self.write_barrier(h, x);
+                }
+            }
+        }
+        if let Some(a) = self.heap.get_mut(h).and_then(Cell::as_array_mut) {
+            *a.vec_mut() = elems;
+        }
+        true
+    }
+
+    /// Overwrites element `i` of the engine-internal array at `h` with the
+    /// Number `n` (a no-op past its end). Numbers need no write barrier.
+    pub(crate) fn internal_array_set_number(&mut self, h: Handle, i: usize, n: f64) {
+        if let Some(slot) = self
+            .heap
+            .get_mut(h)
+            .and_then(Cell::as_array_mut)
+            .and_then(|a| a.as_mut_slice().get_mut(i))
+        {
+            *slot = NanBox::number(n);
+        }
+    }
+
+    /// Replaces the elements of the engine-internal array at `h` with the
+    /// Numbers `ns`.
+    pub(crate) fn internal_array_set_numbers(&mut self, h: Handle, ns: impl Iterator<Item = f64>) {
+        if let Some(a) = self.heap.get_mut(h).and_then(Cell::as_array_mut) {
+            let v = a.vec_mut();
+            v.clear();
+            v.extend(ns.map(NanBox::number));
+        }
+    }
+
+    /// CreateIterResultObject(`value`, `done`): a fresh ordinary object with
+    /// the data properties `value` and `done`, in that order — built in its
+    /// final layout at once.
+    pub fn new_iter_result(&mut self, value: NanBox, done: bool) -> Handle {
+        let root = alloc::rc::Rc::clone(&self.root_shape);
+        let shape = match &self.iter_result_shape {
+            Some(s) => alloc::rc::Rc::clone(s),
+            None => {
+                let s = root.transition("value").transition("done");
+                self.iter_result_shape = Some(alloc::rc::Rc::clone(&s));
+                s
+            }
+        };
+        match self.new_object_in_shape(&root, &shape, &[value, NanBox::boolean(done)]) {
+            Some(h) => h,
+            None => {
+                let o = self.new_object();
+                self.set_property(o, "value", value);
+                self.set_property(o, "done", NanBox::boolean(done));
+                o
+            }
+        }
+    }
+}

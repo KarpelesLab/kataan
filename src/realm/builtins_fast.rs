@@ -837,7 +837,7 @@ impl Realm {
 
     /// Whether [`watch_link`](Self::watch_link) holds for the link `raw`
     /// (with auxiliary object `aux`) as it is now.
-    fn link_watched(&self, raw: u64, aux: Option<u64>) -> bool {
+    pub(crate) fn link_watched(&self, raw: u64, aux: Option<u64>) -> bool {
         let watched = |raw: u64| match self.heap.get(Handle::from_raw(raw)) {
             Some(Cell::Object(o)) => o.jit_flags() & crate::object::JIT_FLAG_WATCHED != 0,
             _ => false,

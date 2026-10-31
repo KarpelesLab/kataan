@@ -795,12 +795,12 @@ fn verify_op_with(
             reg(*mode)
         }
         Op::InitGenerator { f } => reg(*f),
-        Op::PrivateGet { dst, obj, key } | Op::PrivateIn { dst, obj, key } => {
+        Op::PrivateGet { dst, obj, key, .. } | Op::PrivateIn { dst, obj, key, .. } => {
             reg(*dst)?;
             reg(*obj)?;
             reg(*key)
         }
-        Op::PrivateSet { obj, key, src } | Op::PrivateDefine { obj, key, src } => {
+        Op::PrivateSet { obj, key, src, .. } | Op::PrivateDefine { obj, key, src } => {
             reg(*obj)?;
             reg(*key)?;
             reg(*src)
@@ -1854,19 +1854,19 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_str(name, out);
             w_u8(*kind, out);
         }
-        Op::PrivateGet { dst, obj, key } => {
+        Op::PrivateGet { dst, obj, key, .. } => {
             w_u8(99, out);
             for r in [dst, obj, key] {
                 w_reg(*r, out);
             }
         }
-        Op::PrivateSet { obj, key, src } => {
+        Op::PrivateSet { obj, key, src, .. } => {
             w_u8(100, out);
             for r in [obj, key, src] {
                 w_reg(*r, out);
             }
         }
-        Op::PrivateIn { dst, obj, key } => {
+        Op::PrivateIn { dst, obj, key, .. } => {
             w_u8(101, out);
             for r in [dst, obj, key] {
                 w_reg(*r, out);
@@ -2671,16 +2671,19 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             obj: r.reg()?,
             key: r.reg()?,
+            cache: crate::realm::PrivCache::default(),
         },
         100 => Op::PrivateSet {
             obj: r.reg()?,
             key: r.reg()?,
             src: r.reg()?,
+            cache: crate::realm::PrivCache::default(),
         },
         101 => Op::PrivateIn {
             dst: r.reg()?,
             obj: r.reg()?,
             key: r.reg()?,
+            cache: crate::realm::PrivCache::default(),
         },
         102 => Op::PrivateDefine {
             obj: r.reg()?,

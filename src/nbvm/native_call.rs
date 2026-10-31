@@ -40,10 +40,10 @@ use crate::heap::Handle;
 use crate::ic::PropertyCache;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
-    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_JSON_PARSE, N_JSON_STRINGIFY,
-    N_MAP_PROTO_FN, N_NUMBER_PROTO_FN, N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE,
-    N_OBJECT_ENTRIES, N_OBJECT_KEYS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD,
-    N_STRING_PROTO_FN,
+    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_GEN_NEXT, N_GEN_RETURN,
+    N_GEN_THROW, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN, N_NUMBER_PROTO_FN,
+    N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_KEYS,
+    N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -148,6 +148,9 @@ enum FastOp {
     /// A `DataView.prototype` `get*` / `set*` accessor (not BigInt or
     /// Float16), served by `nbexec::dataview_fast`.
     DataView(crate::nbexec::DvAccess),
+    /// `%GeneratorPrototype%.next` / `throw` / `return` (the resumption
+    /// mode, 0 / 1 / 2) on a VM generator: resumed in the VM (`gen_fast`).
+    GenResume(u8),
     /// A built-in whose implementation is the host's (`Object.assign`,
     /// `JSON.stringify`, `JSON.parse`, and every built-in not served
     /// otherwise): the resolved function is called through the host
@@ -208,6 +211,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
         Some(N_OBJECT_CREATE) => return FastOp::ObjCreate,
         Some(N_OBJECT_ASSIGN | N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
+        Some(N_GEN_NEXT) => return FastOp::GenResume(0),
+        Some(N_GEN_THROW) => return FastOp::GenResume(1),
+        Some(N_GEN_RETURN) => return FastOp::GenResume(2),
         #[cfg(feature = "std")]
         Some(id) if super::math_fast::is_math_native(id) => return FastOp::Math(id),
         _ => {}
@@ -649,6 +655,9 @@ fn run_op(
         args.get(i)
             .map_or(NanBox::undefined(), |r| regs[*r as usize])
     };
+    if let FastOp::GenResume(mode) = op {
+        return super::gen_fast::call(ctx, funcs, recv, mode, arg(0));
+    }
     if let FastOp::ArrayHof(op) = op {
         let argv = super::ArgBuf::from_regs(regs, args);
         return super::array_hof::run(ctx, funcs, regs, recv, op, &argv);
@@ -672,7 +681,9 @@ fn run_op(
     }
     let realm = &mut ctx.realm;
     let v = match op {
-        FastOp::None | FastOp::ArrayHof(_) | FastOp::StrReplaceAll => return None,
+        FastOp::None | FastOp::ArrayHof(_) | FastOp::StrReplaceAll | FastOp::GenResume(_) => {
+            return None;
+        }
         #[cfg(feature = "std")]
         FastOp::Math(id) => super::math_fast::compute(realm, id, args, regs)?,
         FastOp::ArrayPush => {

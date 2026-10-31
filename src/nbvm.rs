@@ -51,6 +51,7 @@ mod free_memo;
 mod global_mirror;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use global_mirror::plan_body as plan_global_mirrors;
+mod gen_fast;
 mod iter_fast;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 mod jit_tier;
@@ -58,6 +59,7 @@ mod jit_tier;
 mod math_fast;
 pub(crate) mod native_call;
 pub mod objlit;
+mod private_ops;
 mod str_replace;
 pub use str_replace::{ReplacePlan, ReplaceStep};
 mod vm_eval;
@@ -332,12 +334,30 @@ pub enum Op {
     /// key in the realm's private-element namespace, unique per evaluation).
     NewPrivateName { dst: Reg, name: String, kind: u8 },
     /// `dst = obj.#k` (brand-checked; an accessor calls its getter).
-    PrivateGet { dst: Reg, obj: Reg, key: Reg },
+    PrivateGet {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+        /// The site's layout memo (`crate::realm::PrivCache`).
+        cache: crate::realm::PrivCache,
+    },
     /// `obj.#k = src` (brand-checked; a method is read-only, an accessor calls
     /// its setter).
-    PrivateSet { obj: Reg, key: Reg, src: Reg },
+    PrivateSet {
+        obj: Reg,
+        key: Reg,
+        src: Reg,
+        /// The site's layout memo (`crate::realm::PrivCache`).
+        cache: crate::realm::PrivCache,
+    },
     /// `dst = #k in obj`.
-    PrivateIn { dst: Reg, obj: Reg, key: Reg },
+    PrivateIn {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+        /// The site's layout memo (`crate::realm::PrivCache`).
+        cache: crate::realm::PrivCache,
+    },
     /// Adds private field/method `#k` = `src` to `obj` (a `TypeError` if
     /// already present).
     PrivateDefine { obj: Reg, key: Reg, src: Reg },
@@ -1784,6 +1804,7 @@ fn is_string_value(realm: &Realm, v: NanBox) -> bool {
 /// a throwing `next` leaves the iterator marked done.
 fn vm_iter_step(
     ctx: &mut Ctx,
+    funcs: &[FnProto],
     regs: &mut [NanBox],
     done: Reg,
     iter: Reg,
@@ -1806,6 +1827,15 @@ fn vm_iter_step(
         return Ok(step);
     }
     regs[done as usize] = NanBox::boolean(true);
+    // A VM generator with the intrinsic `next`: resumed here (`gen_fast`).
+    if nx.as_handle().is_some_and(|n| {
+        ctx.realm.native_at(Handle::from_raw(n)) == Some(crate::nbexec::N_GEN_NEXT)
+    }) && let Some(r) = gen_fast::for_of_step(ctx, funcs, it)
+    {
+        let step = r?;
+        regs[done as usize] = NanBox::boolean(step.is_none());
+        return Ok(step);
+    }
     match with_host(ctx, |h| h.iter_step(it, nx)) {
         Some(Ok(Some(v))) => {
             regs[done as usize] = NanBox::boolean(false);
@@ -2302,9 +2332,18 @@ fn init_fn_prototype(realm: &mut Realm, f: Handle) {
 
 /// The private key string of `k`, its kind byte, and the object `o`'s handle
 /// (a `TypeError` for a non-object).
-fn private_parts(ctx: &mut Ctx, o: NanBox, k: NanBox) -> Result<(Handle, String, u8), VmError> {
-    let key = ctx.realm.to_display_string(k);
-    let kind = key.as_bytes().last().copied().unwrap_or(PRIV_FIELD);
+fn private_parts(
+    ctx: &mut Ctx,
+    o: NanBox,
+    k: NanBox,
+) -> Result<(Handle, private_ops::KeyText, u8), VmError> {
+    let key = private_ops::KeyText::of(&ctx.realm, k);
+    let kind = key
+        .as_str()
+        .as_bytes()
+        .last()
+        .copied()
+        .unwrap_or(PRIV_FIELD);
     match o
         .as_handle()
         .map(Handle::from_raw)
@@ -2341,11 +2380,11 @@ fn private_brand(ctx: &mut Ctx, h: Handle, key: &str) -> Result<(), VmError> {
 /// `o.#k` (PrivateGet).
 fn private_get(ctx: &mut Ctx, funcs: &[FnProto], o: NanBox, k: NanBox) -> Result<NanBox, VmError> {
     let (h, key, kind) = private_parts(ctx, o, k)?;
-    private_brand(ctx, h, &key)?;
+    private_brand(ctx, h, key.as_str())?;
     if kind == PRIV_ACCESSOR {
         let g = ctx
             .realm
-            .get_property(h, &alloc::format!("{key}:g"))
+            .get_property(h, key.with_suffix(":g").as_str())
             .unwrap_or(NanBox::undefined());
         if g.as_handle().is_none() {
             let e = vm_error(
@@ -2359,7 +2398,7 @@ fn private_get(ctx: &mut Ctx, funcs: &[FnProto], o: NanBox, k: NanBox) -> Result
     }
     Ok(ctx
         .realm
-        .get_property(h, &key)
+        .get_property(h, key.as_str())
         .unwrap_or(NanBox::undefined()))
 }
 
@@ -2372,7 +2411,7 @@ fn private_set(
     v: NanBox,
 ) -> Result<(), VmError> {
     let (h, key, kind) = private_parts(ctx, o, k)?;
-    private_brand(ctx, h, &key)?;
+    private_brand(ctx, h, key.as_str())?;
     match kind {
         PRIV_METHOD => {
             let e = vm_error(ctx, "TypeError", "Private method is not writable");
@@ -2381,7 +2420,7 @@ fn private_set(
         PRIV_ACCESSOR => {
             let st = ctx
                 .realm
-                .get_property(h, &alloc::format!("{key}:s"))
+                .get_property(h, key.with_suffix(":s").as_str())
                 .unwrap_or(NanBox::undefined());
             if st.as_handle().is_none() {
                 let e = vm_error(
@@ -2394,7 +2433,7 @@ fn private_set(
             call_closure(ctx, funcs, st, &[v], o).map(|_| ())
         }
         _ => {
-            ctx.realm.set_hidden_property(h, &key, v);
+            ctx.realm.set_hidden_property(h, key.as_str(), v);
             Ok(())
         }
     }
@@ -2409,7 +2448,7 @@ fn private_define(
     slots: &[(&str, NanBox)],
 ) -> Result<(), VmError> {
     let (h, key, _) = private_parts(ctx, o, k)?;
-    if ctx.realm.has_own(h, &key) {
+    if ctx.realm.has_own(h, key.as_str()) {
         let e = vm_error(
             ctx,
             "TypeError",
@@ -2430,7 +2469,7 @@ fn private_define(
     }
     for (suffix, v) in slots {
         ctx.realm
-            .set_hidden_property(h, &alloc::format!("{key}{suffix}"), *v);
+            .set_hidden_property(h, key.with_suffix(suffix).as_str(), *v);
     }
     Ok(())
 }
@@ -3275,10 +3314,7 @@ pub(crate) fn resume_vm_agen(
 
 /// CreateIterResultObject(value, done).
 fn iter_result(ctx: &mut Ctx, value: NanBox, done: bool) -> NanBox {
-    let o = ctx.realm.new_object();
-    ctx.realm.set_property(o, "value", value);
-    ctx.realm.set_property(o, "done", NanBox::boolean(done));
-    NanBox::handle(o.to_raw())
+    NanBox::handle(ctx.realm.new_iter_result(value, done).to_raw())
 }
 
 /// GeneratorResume / GeneratorResumeAbrupt of the VM generator `gen`: `mode`
@@ -3294,128 +3330,8 @@ fn vm_generator_resume(
         .as_handle()
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
-    let sh = ctx
-        .realm
-        .get_property(gh, VM_GEN)
-        .and_then(|s| s.as_handle())
-        .map(Handle::from_raw)
-        .ok_or(VmError::NotAnObject)?;
-    let e = ctx
-        .realm
-        .array_elements(sh)
-        .map(<[_]>::to_vec)
-        .unwrap_or_default();
-    let num = |i: usize| e.get(i).and_then(|x| x.as_number()).unwrap_or(0.0);
-    let (id, state, pc, dst) = (num(0) as usize, num(1), num(2) as usize, num(3) as Reg);
-    let set_state = |ctx: &mut Ctx, st: f64| ctx.realm.set_element(sh, 1, NanBox::number(st));
-    if state == GEN_EXECUTING {
-        let e = vm_error(ctx, "TypeError", "Generator is already running");
-        return Err(VmError::Thrown(e));
-    }
-    // Suspended inside a `yield*` (the delegation step) or at a capturing
-    // `YieldResume`: every resumption kind lands in registers.
-    let delegate = (state == GEN_SUSPENDED_YIELD)
-        .then(|| funcs.get(id))
-        .flatten()
-        .and_then(|p| {
-            if let Some(Op::YieldDelegate { dst, mode, .. }) = p.ops.get(pc) {
-                return Some((*dst, *mode));
-            }
-            match pc.checked_sub(1).and_then(|i| p.ops.get(i)) {
-                Some(Op::YieldResume { dst, mode, .. }) => Some((*dst, *mode)),
-                _ => None,
-            }
-        });
-    // A `return(v)` at a `yield` inside a try / for-of / destructuring region
-    // must run that region's cleanup (iterator closes) — the interpreter's.
-    if delegate.is_none()
-        && mode == 2
-        && state == GEN_SUSPENDED_YIELD
-        && e.get(5)
-            .and_then(|h| h.as_handle())
-            .and_then(|h| ctx.realm.array_length(Handle::from_raw(h)))
-            .is_some_and(|n| n > 0)
-    {
-        return Err(VmError::Unsupported);
-    }
-    if delegate.is_none()
-        && (state == GEN_COMPLETED || (state == GEN_SUSPENDED_START && mode != 0) || mode == 2)
-    {
-        set_state(ctx, GEN_COMPLETED);
-        return match mode {
-            1 => Err(VmError::Thrown(v)),
-            2 => Ok(iter_result(ctx, v, true)),
-            _ => Ok(iter_result(ctx, NanBox::undefined(), true)),
-        };
-    }
-    let mut regs: Vec<NanBox> = e
-        .get(4)
-        .and_then(|r| r.as_handle())
-        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
-        .map(<[_]>::to_vec)
-        .unwrap_or_default();
-    let handlers: Vec<(usize, Reg)> = e
-        .get(5)
-        .and_then(|r| r.as_handle())
-        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
-        .map(|hs| {
-            hs.chunks(2)
-                .map(|c| {
-                    (
-                        c[0].as_number().unwrap_or(0.0) as usize,
-                        c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let inject = if let Some((ddst, dmode)) = delegate {
-        regs[ddst as usize] = v;
-        regs[dmode as usize] = NanBox::number(f64::from(mode));
-        None
-    } else {
-        if mode == 0
-            && state == GEN_SUSPENDED_YIELD
-            && let Some(slot) = regs.get_mut(dst as usize)
-        {
-            *slot = v;
-        }
-        (mode == 1).then_some(v)
-    };
-    let Some(proto) = funcs.get(id) else {
-        return Err(VmError::Unsupported);
-    };
-    set_state(ctx, GEN_EXECUTING);
-    let r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, pc, handlers, inject);
-    match r {
-        Ok(FrameExit::Yield {
-            value,
-            pc,
-            handlers,
-            dst,
-        }) => {
-            let st = gen_state_array(ctx, id, GEN_SUSPENDED_YIELD, pc, dst, regs, &handlers);
-            ctx.realm.set_hidden_property(gh, VM_GEN, st);
-            // A `yield*` step hands the inner result object through as is.
-            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
-                Ok(value)
-            } else {
-                Ok(iter_result(ctx, value, false))
-            }
-        }
-        Ok(FrameExit::Return(ret)) => {
-            set_state(ctx, GEN_COMPLETED);
-            Ok(iter_result(ctx, ret.unwrap_or(NanBox::undefined()), true))
-        }
-        Ok(FrameExit::Tail { .. }) => {
-            set_state(ctx, GEN_COMPLETED);
-            Err(VmError::Unsupported)
-        }
-        Err(err) => {
-            set_state(ctx, GEN_COMPLETED);
-            Err(err)
-        }
-    }
+    let out = gen_fast::resume(ctx, funcs, gh, mode, v)?;
+    Ok(gen_fast::result_object(ctx, out))
 }
 
 /// [`vm_generator_resume`] for the host (a %GeneratorPrototype% method called
@@ -5854,11 +5770,23 @@ fn vm_get_prop(
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
             return Ok(v);
         }
-        // A VM closure's own data property (kept in its auxiliary object).
-        if let Some(v) = ctx.realm.vm_fn_cached_get(h, key, cache) {
-            return Ok(v);
-        }
-        match ctx.realm.chain_cached_get(h, key, cache) {
+        // A VM closure's chain (a static member, `C.kind`, or its own data
+        // property): its own cache, whose hit also proves what the closure
+        // owns. Else the closure's own data property (in its auxiliary
+        // object) through the site's slot cache.
+        let closure = ctx.realm.is_vm_function(h);
+        let hit = if closure {
+            match ctx.realm.fn_chain_get(h, key, cache) {
+                None => match ctx.realm.vm_fn_cached_get(h, key, cache) {
+                    Some(v) => return Ok(v),
+                    None => None,
+                },
+                hit => hit,
+            }
+        } else {
+            ctx.realm.chain_cached_get(h, key, cache)
+        };
+        match hit {
             Some(crate::realm::ChainHit::Data(v)) => return Ok(v),
             Some(crate::realm::ChainHit::Absent) => return Ok(NanBox::undefined()),
             Some(crate::realm::ChainHit::Accessor(getter, _, own)) => {
@@ -5875,6 +5803,8 @@ fn vm_get_prop(
                     return Ok(NanBox::undefined());
                 }
             }
+            // (`fn_chain_get` re-armed the site on its miss.)
+            None if closure => {}
             None => ctx.realm.chain_cache_fill(h, key, cache),
         }
     }
@@ -7655,7 +7585,7 @@ fn run_frame_at_ic(
                 done,
                 iter,
                 next,
-            } => match vm_iter_step(ctx, regs, *done, *iter, *next) {
+            } => match vm_iter_step(ctx, funcs, regs, *done, *iter, *next) {
                 Ok(v) => regs[*dst as usize] = v.unwrap_or(NanBox::undefined()),
                 Err(e) => handle_throw!(e),
             },
@@ -7679,7 +7609,7 @@ fn run_frame_at_ic(
                     }
                 } else {
                     regs[*fused as usize] = NanBox::boolean(false);
-                    match vm_iter_step(ctx, regs, *done, *iter, *next) {
+                    match vm_iter_step(ctx, funcs, regs, *done, *iter, *next) {
                         Ok(v) => regs[*dst as usize] = v.unwrap_or(NanBox::undefined()),
                         Err(e) => handle_throw!(e),
                     }
@@ -7694,7 +7624,7 @@ fn run_frame_at_ic(
                 let mut out = Vec::new();
                 let mut failed = None;
                 while regs[*done as usize].as_boolean() != Some(true) {
-                    match vm_iter_step(ctx, regs, *done, *iter, *next) {
+                    match vm_iter_step(ctx, funcs, regs, *done, *iter, *next) {
                         Ok(Some(v)) => out.push(v),
                         Ok(None) => {}
                         Err(e) => {
@@ -7855,51 +7785,11 @@ fn run_frame_at_ic(
                 let k = alloc::format!("\0#{name}@v{id}{}", char::from(*kind));
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(&k).to_raw());
             }
-            Op::PrivateGet { dst, obj, key } => {
-                let (o, k) = (regs[*obj as usize], regs[*key as usize]);
-                match private_get(ctx, funcs, o, k) {
-                    Ok(v) => regs[*dst as usize] = v,
-                    Err(e) => handle_throw!(e),
-                }
-            }
-            Op::PrivateSet { obj, key, src } => {
-                let (o, k, v) = (
-                    regs[*obj as usize],
-                    regs[*key as usize],
-                    regs[*src as usize],
-                );
-                if let Err(e) = private_set(ctx, funcs, o, k, v) {
-                    handle_throw!(e);
-                }
-            }
-            Op::PrivateIn { dst, obj, key } => {
-                let (o, k) = (regs[*obj as usize], regs[*key as usize]);
-                match o
-                    .as_handle()
-                    .map(Handle::from_raw)
-                    .filter(|_| is_object_value(&ctx.realm, o))
-                {
-                    Some(h) => {
-                        let ks = ctx.realm.to_display_string(k);
-                        regs[*dst as usize] = NanBox::boolean(ctx.realm.has_own(h, &ks));
-                    }
-                    None => {
-                        let e = vm_error(
-                            ctx,
-                            "TypeError",
-                            "Cannot use 'in' operator to search for a private field in a non-object",
-                        );
-                        handle_throw!(VmError::Thrown(e));
-                    }
-                }
-            }
-            Op::PrivateDefine { obj, key, src } => {
-                let (o, k, v) = (
-                    regs[*obj as usize],
-                    regs[*key as usize],
-                    regs[*src as usize],
-                );
-                if let Err(e) = private_define(ctx, o, k, &[("", v)]) {
+            Op::PrivateGet { .. }
+            | Op::PrivateSet { .. }
+            | Op::PrivateIn { .. }
+            | Op::PrivateDefine { .. } => {
+                if let Err(e) = private_ops::exec(ctx, funcs, op, regs) {
                     handle_throw!(e);
                 }
             }
@@ -16953,7 +16843,12 @@ impl Compiler {
             } else {
                 Op::SetProp { obj, key, src }
             }),
-            MemberPlace::Private(obj, key) => self.ops.push(Op::PrivateSet { obj, key, src }),
+            MemberPlace::Private(obj, key) => self.ops.push(Op::PrivateSet {
+                obj,
+                key,
+                src,
+                cache: crate::realm::PrivCache::default(),
+            }),
             MemberPlace::Super(home, this, key) => self.ops.push(Op::SuperSet {
                 home,
                 key,
@@ -18939,7 +18834,12 @@ impl Compiler {
                     let key = self.private_key(n)?;
                     let obj = self.expr(right)?;
                     let dst = self.alloc();
-                    self.ops.push(Op::PrivateIn { dst, obj, key });
+                    self.ops.push(Op::PrivateIn {
+                        dst,
+                        obj,
+                        key,
+                        cache: crate::realm::PrivCache::default(),
+                    });
                     return Ok(dst);
                 }
                 if self.hosted && matches!(op, BinaryOp::In | BinaryOp::Instanceof) {
@@ -19744,6 +19644,7 @@ impl Compiler {
                         dst: f,
                         obj: recv,
                         key,
+                        cache: crate::realm::PrivCache::default(),
                     });
                     let args = self.spread_args(arguments)?;
                     let dst = self.alloc();
@@ -21734,7 +21635,12 @@ impl Compiler {
         {
             let key = self.private_key(n)?;
             let dst = self.alloc();
-            self.ops.push(Op::PrivateGet { dst, obj, key });
+            self.ops.push(Op::PrivateGet {
+                dst,
+                obj,
+                key,
+                cache: crate::realm::PrivCache::default(),
+            });
             return Ok(dst);
         }
         let dst = self.alloc();
@@ -21923,7 +21829,12 @@ impl Compiler {
             && self.hosted
         {
             let key = self.private_key(n)?;
-            self.ops.push(Op::PrivateSet { obj, key, src });
+            self.ops.push(Op::PrivateSet {
+                obj,
+                key,
+                src,
+                cache: crate::realm::PrivCache::default(),
+            });
             return Ok(());
         }
         match property {

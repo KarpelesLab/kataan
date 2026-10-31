@@ -1282,11 +1282,11 @@ const N_GEN_ITER_NEXT: u16 = 346;
 /// The eager-generator iterator's `return` method.
 const N_GEN_ITER_RETURN: u16 = 347;
 /// A lazy generator's `next(v)` — resumes the suspended frame, injecting `v`.
-const N_GEN_NEXT: u16 = 520;
+pub(crate) const N_GEN_NEXT: u16 = 520;
 /// A lazy generator's `return(v)` — resumes as `return v` (runs `finally`s).
-const N_GEN_RETURN: u16 = 521;
+pub(crate) const N_GEN_RETURN: u16 = 521;
 /// A lazy generator's `throw(e)` — resumes by throwing `e` at the suspension.
-const N_GEN_THROW: u16 = 522;
+pub(crate) const N_GEN_THROW: u16 = 522;
 /// An async generator's `next(v)` — like `N_GEN_NEXT` but *always* returns a
 /// promise, so even a brand-check failure (a `this` that is not an async
 /// generator) rejects rather than throwing synchronously.

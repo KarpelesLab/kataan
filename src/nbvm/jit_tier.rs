@@ -1089,6 +1089,12 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
             Some(Ok(()))
         }
+        // `this.#x`, `this.#x = v`, `#x in o`, a private field's add: exactly
+        // their interpreter arm.
+        Op::PrivateGet { .. }
+        | Op::PrivateSet { .. }
+        | Op::PrivateIn { .. }
+        | Op::PrivateDefine { .. } => Some(super::private_ops::exec(ctx, funcs, op, regs)),
         // `x instanceof F` decided from the heap alone (the interpreter arm's
         // own first step); anything else takes the one-op frame.
         Op::Relational {
@@ -1165,7 +1171,7 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             iter,
             next,
         } => Some(
-            super::vm_iter_step(ctx, regs, *done, *iter, *next)
+            super::vm_iter_step(ctx, funcs, regs, *done, *iter, *next)
                 .map(|v| regs[*dst as usize] = v.unwrap_or(NanBox::undefined())),
         ),
         // `for (const [k, v] of map)`: exactly its interpreter arm.
@@ -1190,7 +1196,7 @@ pub(crate) extern "C" fn jit_helper_exec_op(
                 Ok(())
             } else {
                 regs[*fused as usize] = NanBox::boolean(false);
-                super::vm_iter_step(ctx, regs, *done, *iter, *next)
+                super::vm_iter_step(ctx, funcs, regs, *done, *iter, *next)
                     .map(|v| regs[*dst as usize] = v.unwrap_or(NanBox::undefined()))
             },
         ),
@@ -1748,7 +1754,14 @@ pub(crate) fn compiled_getter(
     {
         return None;
     }
-    match ctx.realm.chain_cached_get(h, key, cache)? {
+    let hit = if ctx.realm.is_vm_function(h) {
+        // A static getter (`C.kind`): through the closure-chain cache, as
+        // `vm_get_prop` reads it.
+        ctx.realm.fn_chain_get(h, key, cache)?
+    } else {
+        ctx.realm.chain_cached_get(h, key, cache)?
+    };
+    match hit {
         crate::realm::ChainHit::Accessor(getter, _, _)
             if getter
                 .as_handle()
