@@ -3412,3 +3412,17 @@ fn regexp_call_reads_match_once() {
         "Symbol(Symbol.match),Symbol(Symbol.toPrimitive),toString,Symbol(Symbol.toStringTag)|Symbol(Symbol.match),constructor,source,flags|/s/i|Symbol(Symbol.match),Symbol(Symbol.toPrimitive),toString,Symbol(Symbol.toStringTag)"
     );
 }
+
+/// `JSON.stringify` of a Symbol wrapper object (`Object(Symbol())`): it has no
+/// `[[NumberData]]`/`[[StringData]]`/`[[BooleanData]]`/`[[BigIntData]]` slot,
+/// so SerializeJSONProperty serializes it as an ordinary object (`{}` plus its
+/// own enumerable properties) rather than dropping it like a symbol.
+#[test]
+fn json_stringify_symbol_wrapper_is_an_object() {
+    let src = r#"
+        var s = Object(Symbol("x")); s.extra = 5;
+        [JSON.stringify([Object(Symbol())]), JSON.stringify({ a: Object(Symbol()) }), JSON.stringify(s),
+         JSON.stringify([Object(true), Object("s"), Object(2)])].join("|")
+    "#;
+    assert_eq!(run(src), "[{}]|{\"a\":{}}|{\"extra\":5}|[true,\"s\",2]");
+}

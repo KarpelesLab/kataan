@@ -374,12 +374,16 @@ impl Interp {
                 // `ToNumber(value)` and a `[[StringData]]` wrapper is
                 // `ToString(value)` — both applied to the *wrapper*, so a custom
                 // `valueOf`/`toString` is honored. Boolean/BigInt wrappers use the
-                // boxed primitive directly.
+                // boxed primitive directly. A Symbol wrapper has none of those
+                // slots: it is an ordinary object (`{}`), not a dropped symbol.
                 match prim.unpack() {
                     Unpacked::Number(_) => self.coerce_to_number(value)?,
                     Unpacked::Handle(r) if self.realm.is_string_handle(Handle::from_raw(r)) => {
                         let s = self.coerce_to_string(value)?;
                         self.new_str(&s)
+                    }
+                    Unpacked::Handle(r) if self.realm.symbol_at(Handle::from_raw(r)).is_some() => {
+                        value
                     }
                     _ => prim,
                 }
