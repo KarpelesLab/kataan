@@ -2430,21 +2430,23 @@ fn sync_generator_suspension(op: &crate::nbvm::Op) -> bool {
 }
 
 /// Whether the generic tier compiles `proto` with op `op` (its suspensions
-/// only in a sync generator).
+/// only in a sync generator, and `await` only in an async function).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn generic_accepts(proto: &crate::nbvm::FnProto, op: &crate::nbvm::Op) -> bool {
     generic_refuses(op).is_none()
         || (proto.is_generator && !proto.is_async && sync_generator_suspension(op))
+        || (proto.is_async && !proto.is_generator && matches!(op, crate::nbvm::Op::Await { .. }))
 }
 
-/// Where a sync generator's compiled body is re-entered on resumption, in the
-/// function's own numbering: after each `yield` and after the body's start,
-/// and at each `yield*` step (which runs again).
+/// Where a sync generator's or an async function's compiled body is
+/// re-entered on resumption, in the function's own numbering: after each
+/// `yield` and after the body's start, and at each `yield*` step (which runs
+/// again); after each `await`.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 #[must_use]
 pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
     use crate::nbvm::Op;
-    if !proto.is_generator || proto.is_async {
+    if proto.is_generator == proto.is_async {
         return Vec::new();
     }
     proto
@@ -2452,8 +2454,9 @@ pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(pc, op)| match op {
-            Op::YieldResume { .. } | Op::GeneratorStart => Some(pc + 1),
-            Op::YieldDelegate { .. } => Some(pc),
+            Op::YieldResume { .. } | Op::GeneratorStart if proto.is_generator => Some(pc + 1),
+            Op::YieldDelegate { .. } if proto.is_generator => Some(pc),
+            Op::Await { .. } if proto.is_async => Some(pc + 1),
             _ => None,
         })
         .filter(|&pc| pc < proto.ops.len())
@@ -8265,9 +8268,11 @@ impl JitFunction {
                         // function's own pc), and the body leaves as at a
                         // loop header — everything is in the register file.
                         // A `yield*` step that finished falls through.
+                        // An async function's `await` suspends the same way.
                         op @ (crate::nbvm::Op::YieldResume { .. }
                         | crate::nbvm::Op::GeneratorStart
-                        | crate::nbvm::Op::YieldDelegate { .. }) => {
+                        | crate::nbvm::Op::YieldDelegate { .. }
+                        | crate::nbvm::Op::Await { .. }) => {
                             let own = match pc_orig.get(pc as usize) {
                                 Some(&o) if o != u32::MAX => o as usize,
                                 Some(_) => return None,

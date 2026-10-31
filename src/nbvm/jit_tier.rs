@@ -638,7 +638,9 @@ pub(crate) extern "C" fn jit_helper_suspend(
     #[allow(unsafe_code)]
     let op = unsafe { &*op };
     match op {
-        Op::YieldResume { dst, src, .. } => {
+        // (An async function's `await` suspends as a `yield` does: its
+        // resumption binds the awaited value to `dst`, or throws there.)
+        Op::YieldResume { dst, src, .. } | Op::Await { dst, src } => {
             ctx.jit_rt.suspended = Some((pc + 1, regs[*src as usize], *dst));
             NanBox::jit_exit_bits()
         }
@@ -1181,6 +1183,25 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             let callee = regs[*callee as usize];
             match call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined()) {
                 Some(r) => Some(r.map(|v| regs[*dst as usize] = v)),
+                // Any other VM closure (an interpreted, async or generator
+                // function): the interpreter arm's call, without a one-op
+                // frame around it.
+                None if let Some((id, caps)) = callee.as_handle().and_then(|h| {
+                    ctx.realm
+                        .vm_function(Handle::from_raw(h))
+                        .map(|(f, c)| (f as usize, super::ArgBuf::from_slice(c)))
+                }) =>
+                {
+                    let argv = super::ArgBuf::from_regs(regs, args);
+                    ctx.pending_callee = Some(callee);
+                    let pub_mark = ctx.frame_shadow.len();
+                    ctx.frame_shadow.extend_from_slice(regs);
+                    ctx.frames_published += 1;
+                    let r = super::call_with(ctx, funcs, id, &argv, &caps, NanBox::undefined());
+                    ctx.frames_published -= 1;
+                    ctx.frame_shadow.truncate(pub_mark);
+                    Some(r.map(|v| regs[*dst as usize] = v))
+                }
                 // `String(n)`, `parseInt(s)`, …: `call_closure`'s own first step.
                 None if ctx.host.is_some() => {
                     let argv = super::ArgBuf::from_regs(regs, args);

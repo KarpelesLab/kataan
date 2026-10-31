@@ -2990,13 +2990,42 @@ pub(crate) fn resume_vm_async(
         // The body's inline caches persist across resumptions, as a
         // generator's do (see `gen_fast`).
         let body = proto.ops.as_ptr() as usize;
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        let (mut hot, mut resumes) = (false, 0);
         let mut ic = match proto.tier.0.try_borrow_mut() {
-            Ok(mut t) if t.ic_body == body => core::mem::take(&mut t.ic),
+            Ok(mut t) => {
+                #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+                {
+                    t.resumes = t.resumes.saturating_add(1);
+                    resumes = t.resumes;
+                    hot = inject.is_none()
+                        && !matches!(t.jit, Some(None))
+                        && jit_tier::resume_is_hot(t.resumes);
+                }
+                if t.ic_body == body {
+                    core::mem::take(&mut t.ic)
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
         };
-        let r = run_frame_at_ic(
-            ctx, table, &proto.ops, &mut regs, pc, handlers, inject, &mut ic,
-        );
+        // A hot body resumes in native code, on the same register file (a
+        // rejection, thrown at the `await`, is the interpreter's).
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        let compiled = if hot {
+            jit_tier::resume_generator(ctx, table, id, &mut regs, pc, &handlers, &ic, resumes)
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+        let compiled = None;
+        let r = match compiled {
+            Some(r) => r,
+            None => run_frame_at_ic(
+                ctx, table, &proto.ops, &mut regs, pc, handlers, inject, &mut ic,
+            ),
+        };
         if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
             t.ic = ic;
             t.ic_body = body;

@@ -311,6 +311,16 @@ impl Interp {
                 Some(c) => c,
                 None => self.read_member(h, "constructor")?,
             };
+            // (With a single realm, its `Promise` constructor is the only
+            // function cell of that native.)
+            if !self.realm.multi_realm
+                && ctor
+                    .as_handle()
+                    .and_then(|c| self.realm.native_at(Handle::from_raw(c)))
+                    == Some(N_PROMISE)
+            {
+                return Ok(h);
+            }
             let default_c = self
                 .intrinsic_global("Promise")
                 .unwrap_or(NanBox::undefined());
