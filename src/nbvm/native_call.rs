@@ -493,7 +493,8 @@ pub(super) fn try_call(
             return None;
         }
     } else if !prim {
-        ctx.realm.method_site_note_recv(h, &mut site.chain);
+        let objects = matches!(site.op, FastOp::GenResume(_));
+        ctx.realm.method_site_note_recv(h, &mut site.chain, objects);
     }
     let (op, method) = (site.op, site.method);
     run_op(ctx, funcs, op, method, recv, h, prim, regs, args)

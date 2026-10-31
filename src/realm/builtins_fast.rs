@@ -589,13 +589,26 @@ impl Realm {
     /// `[[Prototype]]` change bumps the epoch) and remembers that, at this
     /// epoch, its lookup continues at the first link, so the next hits on it
     /// skip the receiver probe.
-    pub fn method_site_note_recv(&mut self, recv: Handle, cache: &mut MethodSiteCache) {
+    ///
+    /// `objects`: an ordinary object receiver is noted too (a site calling a
+    /// generator's `next`, whose receivers are generator objects: rarely
+    /// reshaped, so watching them costs nothing).
+    pub fn method_site_note_recv(
+        &mut self,
+        recv: Handle,
+        cache: &mut MethodSiteCache,
+        objects: bool,
+    ) {
         let epoch = crate::object::proto_epoch();
         if cache.own
             || cache.prim
             || cache.stamp != epoch
             || (cache.recv_stamp == epoch && cache.recv_memo == recv.to_raw())
-            || !matches!(self.heap.get(recv), Some(Cell::Collection { .. }))
+            || !match self.heap.get(recv) {
+                Some(Cell::Collection { .. }) => true,
+                Some(Cell::Object(_)) => objects,
+                _ => false,
+            }
             || cache.recv_notes >= RECV_NOTES
             || self.is_host_exotic(recv)
         {

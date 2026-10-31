@@ -177,6 +177,18 @@ impl PropertyCache {
         Some(slot)
     }
 
+    /// The cached slot when `object_shape` is the cached shape, without
+    /// counting the hit or arming anything: the probe of a caller that
+    /// falls back to [`lookup`](Self::lookup) on `None`.
+    #[inline]
+    #[must_use]
+    pub fn hit_slot(&self, object_shape: &Rc<Shape>) -> Option<u32> {
+        match &self.shape {
+            Some(cached) if Rc::ptr_eq(cached, object_shape) => Some(self.slot),
+            _ => None,
+        }
+    }
+
     /// The **transition** use of a cache, for a site that adds one fixed
     /// property to objects (an object literal's `key: value`): the cached
     /// shape is the *result* of the add, so a hit — `from` is exactly its

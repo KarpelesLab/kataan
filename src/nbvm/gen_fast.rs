@@ -47,12 +47,9 @@ const S_EXECUTING: u8 = GEN_EXECUTING as u8;
 const S_COMPLETED: u8 = GEN_COMPLETED as u8;
 
 /// The generator object `gh`'s frame cell, when it is a sync VM generator.
+#[inline]
 fn state_of(ctx: &mut Ctx, gh: Handle) -> Option<Handle> {
-    ctx.realm
-        .object_get_cached(gh, VM_GEN, &mut ctx.gen_ic)
-        .or_else(|| ctx.realm.get_property(gh, VM_GEN))
-        .and_then(|s| s.as_handle())
-        .map(Handle::from_raw)
+    ctx.realm.generator_frame(gh, VM_GEN, &mut ctx.gen_ic)
 }
 
 /// GeneratorResume / GeneratorResumeAbrupt of the VM generator `gh`: `mode`

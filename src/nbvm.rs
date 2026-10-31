@@ -3133,10 +3133,7 @@ fn agen_state(ctx: &mut Ctx, generator: NanBox) -> Result<AgenState, VmError> {
         .ok_or(VmError::NotAnObject)?;
     let sh = ctx
         .realm
-        .object_get_cached(gh, VM_AGEN, &mut ctx.agen_ic)
-        .or_else(|| ctx.realm.get_property(gh, VM_AGEN))
-        .and_then(|s| s.as_handle())
-        .map(Handle::from_raw)
+        .generator_frame(gh, VM_AGEN, &mut ctx.agen_ic)
         .ok_or(VmError::NotAnObject)?;
     agen_state_at(ctx, sh)
 }

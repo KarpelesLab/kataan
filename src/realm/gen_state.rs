@@ -19,6 +19,31 @@ impl Realm {
         self.heap.alloc(Cell::Frame(alloc::boxed::Box::new(frame)))
     }
 
+    /// The frame cell a generator object `h` names in its hidden slot `key`
+    /// (`VM_GEN` / `VM_AGEN`), read through the inline cache `cache`: on a
+    /// hit, one shape compare and one slot read. `None` when `h` is no such
+    /// generator.
+    #[inline]
+    pub(crate) fn generator_frame(
+        &self,
+        h: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<Handle> {
+        let v = match self.heap.get(h)? {
+            Cell::Object(o) => match o.shaped_shape().and_then(|s| cache.hit_slot(s)) {
+                Some(slot) => o.slot(slot),
+                None => o.cached_get(key, cache),
+            },
+            _ => None,
+        };
+        let v = match v {
+            Some(v) => v,
+            None => self.get_property(h, key)?,
+        };
+        v.as_handle().map(Handle::from_raw)
+    }
+
     /// The suspended frame at `h` (`None` for any other cell).
     pub(crate) fn vm_frame(&self, h: Handle) -> Option<&VmFrame> {
         match self.heap.get(h)? {
@@ -166,6 +191,24 @@ impl Realm {
     /// the data properties `value` and `done`, in that order — built in its
     /// final layout at once.
     pub fn new_iter_result(&mut self, value: NanBox, done: bool) -> Handle {
+        // The usual case, the layout made: `new_object_in_shape`'s steps for
+        // exactly these two slots (the second never holds a reference).
+        if let Some(shape) = &self.iter_result_shape
+            && 2 < self.limits.object_dictionary_threshold
+            && let Some(mut obj) = crate::object::Object::with_data(
+                alloc::rc::Rc::clone(shape),
+                &[value, NanBox::boolean(done)],
+            )
+        {
+            let proto = self.default_object_proto;
+            obj.set_proto(proto);
+            let h = self.heap.alloc(Cell::Object(obj));
+            if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
+                marker.mark_grey(p);
+            }
+            self.write_barrier(h, value);
+            return h;
+        }
         let root = alloc::rc::Rc::clone(&self.root_shape);
         let shape = match &self.iter_result_shape {
             Some(s) => alloc::rc::Rc::clone(s),
