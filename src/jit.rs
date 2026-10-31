@@ -4293,7 +4293,14 @@ pub struct X64Assembler {
         not(all(target_os = "linux", target_arch = "x86_64")),
         allow(dead_code)
     )]
-    pub(crate) dbg_marks: Vec<(Label, &'static str)>,
+    pub(crate) dbg_marks: Vec<(Label, &'static str, Option<usize>)>,
+    /// The op being emitted, which profiling marks are reported against
+    /// (`name@op`), wherever their code ends up (a cold region).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) dbg_op: Option<usize>,
     /// Per-label byte offset (`usize::MAX` until [`bind`](Self::bind)).
     labels: Vec<usize>,
     /// Pending `rel32` jump fixups: `(operand offset in `code`, target label)`.
@@ -4487,7 +4494,7 @@ impl X64Assembler {
         if *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_OPMAP").is_some()) {
             let l = self.new_label();
             self.bind(l);
-            self.dbg_marks.push((l, name));
+            self.dbg_marks.push((l, name, self.dbg_op));
         }
     }
 
@@ -4682,6 +4689,7 @@ impl X64Assembler {
         self.last_bind = start;
         debug_assert!(self.cold_binds.is_none(), "cold regions do not nest");
         self.cold_binds = Some(Vec::new());
+        self.dbg_mark("cold");
         mark
     }
 
@@ -6567,6 +6575,19 @@ impl JitFunction {
         let fused_test = recv_cache::fused_guard_tests(ops, osr_entries, &catch_targets, |i| {
             rc.sites[i].is_none()
         });
+        // `if (!x)`: the not branches itself (see `recv_cache::not_branches`;
+        // outside promoted loops, whose emitter is `numeric`'s, and not on a
+        // proven boolean, whose `Not` is two instructions anyway).
+        let (not_branch, not_tested) =
+            recv_cache::not_branches(ops, bytecode, osr_entries, &catch_targets, |i| {
+                !num.in_region(i)
+                    && match ops[i] {
+                        GenericOp::Not { a: r, .. } => !num.is_bool_at(i, r),
+                        _ => true,
+                    }
+            });
+        // Per op: a `Not` emitted with its test (`not_branch`).
+        let mut not_fused = alloc::vec![false; ops.len()];
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
         let rc_key = |w: usize| rc_base - 8 * (3 * w as i32 + 1);
         let rc_cell = |w: usize| rc_base - 8 * (3 * w as i32 + 2);
@@ -7081,18 +7102,15 @@ impl JitFunction {
                 a.bind(have);
             }};
         }
-        // An exact non-negative integer index in `reg` → `rax`, else `$miss`
-        // (`$num`: `reg` is proven a Number at op `$at`).
+        // An exact integer index in `reg` → `rax`, else `$miss` (the
+        // callers' bounds check rejects a negative one). A non-Number needs
+        // no test of its own: every other `NanBox` reads as a NaN `f64`,
+        // which the exactness test rejects (`$num`, that `reg` is proven a
+        // Number, is then moot).
         macro_rules! int_index {
             ($reg:expr, $miss:expr) => {{ int_index!($reg, $miss, false) }};
             ($reg:expr, $miss:expr, $num:expr) => {{
-                if !$num {
-                    a.load_rax(disp($reg));
-                    a.movabs_r11(QNAN as i64);
-                    a.and_rax_r11();
-                    a.cmp_rax_r11();
-                    a.je($miss); // boxed (non-number) index
-                }
+                let _: bool = $num;
                 a.movsd_xmm0_mem(disp($reg)); // xmm0 = index f64
                 a.cvttsd2si_rax_xmm0(); // rax = trunc(index)
                 a.cvtsi2sd_xmm1_rax(); // xmm1 = (f64)rax
@@ -7174,6 +7192,7 @@ impl JitFunction {
         num.alloc_copy_labels(&mut a);
         for (op_idx, copy) in num.schedule(ops.len()) {
             let op = &ops[op_idx];
+            a.dbg_op = Some(op_idx);
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
             num.set_copy(copy);
             if copy {
@@ -7216,6 +7235,10 @@ impl JitFunction {
                 }
                 a.bind(done);
                 cold_globals.push((fetch, back, done, op_idx, slot, k));
+                continue;
+            }
+            // The test of an `if (!x)` whose not branched itself.
+            if not_tested[op_idx] && not_fused[op_idx - 1] {
                 continue;
             }
             if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
@@ -9342,6 +9365,25 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                     a.bind(done);
                 }
+                GenericOp::Not { dst, a: ra } if let Some(nb) = not_branch[op_idx] => {
+                    if !ok(dst) || !ok(ra) || nb.target > ops.len() {
+                        return None;
+                    }
+                    let to = num.branch_label(&labels, op_idx + 1, nb.target)?;
+                    truthy_rax!(op_idx, ra, None);
+                    not_fused[op_idx] = true;
+                    if nb.dead {
+                        a.test_rax_rax();
+                        a.jne(to); // `x` truthy: `!x` false → branch
+                    } else {
+                        a.xor_rax_imm(1);
+                        a.movabs_r11(tag_false as i64);
+                        a.add_rax_r11();
+                        a.store_rax(disp(dst));
+                        a.cmp_rax_r11();
+                        a.je(to);
+                    }
+                }
                 GenericOp::Not { dst, a: ra } => {
                     if !ok(dst) || !ok(ra) {
                         return None;
@@ -9702,6 +9744,7 @@ impl JitFunction {
             }
         }
         num.set_copy(false);
+        a.dbg_op = None;
         // (Out of line, a call sequence runs the stub of whatever inlined
         // activation is pending first.)
         a.set_inline_ctx(None);
@@ -9760,6 +9803,7 @@ impl JitFunction {
         // The out-of-line halves of promoted-loop `GetProp`s: the spill-array
         // read, and the slow paths' reload of the promoted result.
         for (spill, back, done, past, pc) in core::mem::take(&mut cold_reloads) {
+            a.dbg_mark("x-reload");
             a.bind(spill);
             a.p_obj_slot_load_spill(&layout, back);
             a.bind(done);
@@ -9770,6 +9814,7 @@ impl JitFunction {
         // of another shape (in `rax`; its heap slot in `rcx`): the site's
         // cache, else the miss path. The value goes back in `rax`.
         for (cached, back, miss, spill, cache) in core::mem::take(&mut cold_caches) {
+            a.dbg_mark("x-cache");
             a.bind(cached);
             // Not the layout: a way that proves it may not keep this object.
             for &w in &shape_ways {
@@ -9799,6 +9844,7 @@ impl JitFunction {
         // way's full walk: the store guards first, for a write (to `miss`),
         // then the layout (else to the site's cache path).
         for (verify, store_miss, shape, cached, resume) in core::mem::take(&mut cold_verifies) {
+            a.dbg_mark("x-verify");
             a.bind(verify);
             if let Some(miss) = store_miss {
                 a.p_test_byte_imm(
@@ -9816,6 +9862,7 @@ impl JitFunction {
         }
         // The receiver cache's full walks: each refills its way and resumes.
         for (walk, back, recv, miss, w, fam) in core::mem::take(&mut cold_walks) {
+            a.dbg_mark("x-walk");
             a.bind(walk);
             walk_to_slot!(recv, miss);
             family_checks!(fam, miss);
@@ -9824,6 +9871,7 @@ impl JitFunction {
             a.jmp(back);
         }
         for (entry, bail) in core::mem::take(&mut cold_bails) {
+            a.dbg_mark("x-bail");
             a.bind(entry);
             // A layout-proving way may hold the receiver whose other layout
             // sent it here (a full walk fills the way before the shape
@@ -9844,6 +9892,7 @@ impl JitFunction {
             // promoted loop, its calls bracket the promoted registers.)
             a.set_call_spill(spill);
             a.bind(helper);
+            a.dbg_mark("x-get");
             let slow = a.new_label();
             let getter = a.new_label();
             a.p_method_lookup(
@@ -9965,7 +10014,8 @@ impl JitFunction {
             want.extend((0..ops.len()).filter_map(|i| num.copy_label(i)));
             want.extend(a.dbg_marks.iter().map(|m| m.0));
         }
-        let marks: Vec<&'static str> = a.dbg_marks.iter().map(|m| m.1).collect();
+        let marks: Vec<(&'static str, Option<usize>)> =
+            a.dbg_marks.iter().map(|m| (m.1, m.2)).collect();
         let (code, at) = a.finish_at(&want);
         let f = Self::from_code(&code);
         if let (Some(path), Some(f)) = (opmap, f.as_ref()) {
@@ -9973,7 +10023,7 @@ impl JitFunction {
             if let Ok(mut out) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
+                .open(&path)
             {
                 let mut s = alloc::format!("B {:x} {} {}\n", f.code_ptr(), code.len(), ops.len());
                 for i in 0..ops.len() {
@@ -9988,11 +10038,18 @@ impl JitFunction {
                         k += 1;
                     }
                 }
-                for m in &marks {
-                    s.push_str(&alloc::format!("M {} {}\n", at[k], m));
+                for &(m, op) in &marks {
+                    match op {
+                        Some(op) => s.push_str(&alloc::format!("M {} {}@{}\n", at[k], m, op)),
+                        None => s.push_str(&alloc::format!("M {} {}\n", at[k], m)),
+                    }
                     k += 1;
                 }
                 let _ = out.write_all(s.as_bytes());
+                // The machine code beside it, for an annotated listing.
+                let mut bin = std::path::PathBuf::from(&path);
+                bin.set_extension(alloc::format!("{:x}.bin", f.code_ptr()));
+                let _ = std::fs::write(bin, &code);
             }
         }
         f.map(|f| (f, (at[0], at[1])))

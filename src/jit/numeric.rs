@@ -2288,16 +2288,11 @@ impl NumGen {
 
     /// `rax` = the exact non-negative-or-not integer value of the Number in
     /// `xmm x` (an element read's promoted index), else to `miss` (a
-    /// fraction, NaN, out of `i64`'s range; with `check`, first a
-    /// non-Number). Clobbers `xmm1` (and, checking, `r11`).
+    /// fraction, NaN, out of `i64`'s range). A non-Number (`check`: `x` is
+    /// not proven a Number) needs no test of its own: every other `NanBox`
+    /// reads as a NaN, which the exactness test rejects. Clobbers `xmm1`.
     pub(super) fn index_from_xmm(a: &mut X64Assembler, x: u8, check: bool, miss: Label) {
-        if check {
-            a.movq_gpr_x(RAX, x);
-            a.movabs_r11(QNAN as i64);
-            a.and_rax_r11();
-            a.cmp_rax_r11();
-            a.jcc(CC_E, miss);
-        }
+        let _ = check;
         a.cvttsd2si_gpr_x(RAX, x);
         a.cvtsi2sd_x_gpr(1, RAX);
         a.sse_rr(0x66, 0x2e, x, 1); // ucomisd x, xmm1
@@ -2805,10 +2800,30 @@ impl NumGen {
         }
     }
 
+    /// The integer constant register `r` surely holds on entry to op `pc`: the
+    /// `LoadConst` just before writes it, and nothing else reaches `pc`.
+    fn const_int_at(&self, pc: usize, r: u16) -> Option<i64> {
+        if pc == 0 || self.is_target.get(pc).copied().unwrap_or(true) {
+            return None;
+        }
+        let Some(Op::LoadConst { dst, value }) = self.bc(pc - 1) else {
+            return None;
+        };
+        let v = value.as_number().filter(|_| *dst == r)?;
+        // (`-0.0` is not an integer constant here: `x % -0` is NaN.)
+        (v == v.trunc() && v.abs() < 9.0e15 && !(v == 0.0 && v.is_sign_negative()))
+            .then_some(v as i64)
+    }
+
     /// `dst = x % y`: inline when both are integral Numbers that convert
     /// exactly to i64, with `y` neither `0` nor `-1` (no `idiv` overflow): the
     /// integer remainder is then fmod's exact result (the sign of a zero
     /// result follows `x`, `-0` included); else the helper (`fmod`).
+    ///
+    /// The exactness test also rejects any operand that is not a Number:
+    /// every other `NanBox` reads as a NaN `f64`, whose round trip through
+    /// an integer compares unordered. A divisor the `LoadConst` just before
+    /// sets (`const_int_at`) is compiled in.
     #[allow(clippy::too_many_arguments)]
     fn int_mod(
         &mut self,
@@ -2822,23 +2837,25 @@ impl NumGen {
     ) {
         let resume = a.new_label();
         let stub = a.new_label();
-        for r in [x, y] {
-            if self.ty(pc, r) != T_NUM {
-                self.num_guard(a, reg, r, stub);
+        match self.const_int_at(pc, y).filter(|&k| k != 0 && k != -1) {
+            // rcx = the divisor, compiled in.
+            Some(k) => a.g_movabs(RCX, k as u64),
+            None => {
+                // rcx = int(y), exact (an out-of-range y converts to
+                // i64::MIN, which only -2^63 itself converts back to), neither
+                // 0 nor -1.
+                let xy = self.xmm_src(a, reg, y, 1);
+                a.cvttsd2si_gpr_x(RCX, xy);
+                a.raw(&[0x48, 0x85, 0xc9]); // test rcx, rcx
+                a.jcc(CC_E, stub);
+                a.raw(&[0x48, 0x83, 0xf9, 0xff]); // cmp rcx, -1
+                a.jcc(CC_E, stub);
+                a.cvtsi2sd_x_gpr(0, RCX);
+                a.sse_rr(0x66, 0x2e, 0, xy); // ucomisd xmm0, y
+                a.jcc(CC_NE, stub);
+                a.jcc(CC_P, stub);
             }
         }
-        // rcx = int(y), exact (an out-of-range y converts to i64::MIN, which
-        // only -2^63 itself converts back to), neither 0 nor -1.
-        let xy = self.xmm_src(a, reg, y, 1);
-        a.cvttsd2si_gpr_x(RCX, xy);
-        a.raw(&[0x48, 0x85, 0xc9]); // test rcx, rcx
-        a.jcc(CC_E, stub);
-        a.raw(&[0x48, 0x83, 0xf9, 0xff]); // cmp rcx, -1
-        a.jcc(CC_E, stub);
-        a.cvtsi2sd_x_gpr(0, RCX);
-        a.sse_rr(0x66, 0x2e, 0, xy); // ucomisd xmm0, y
-        a.jcc(CC_NE, stub);
-        a.jcc(CC_P, stub);
         // rax = int(x), exact.
         let xx = self.xmm_src(a, reg, x, 1);
         a.cvttsd2si_gpr_x(RAX, xx);

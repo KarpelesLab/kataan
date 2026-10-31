@@ -248,6 +248,55 @@ pub(super) fn fused_guard_tests(
     out
 }
 
+/// A `Not` the `JumpIfFalse` right after tests (`t = !x; if (!t) goto L`,
+/// i.e. `if (!x) …`): the not's emitter branches on `x`'s truthiness itself
+/// and the test is emitted as nothing. Only a forward branch that nothing
+/// else reaches (no branch to it, not an entry), on a register other than
+/// `x`. [`NotBranch::dead`]: no other op names `t`, so the boolean need not
+/// be stored at all.
+#[derive(Clone, Copy)]
+pub(super) struct NotBranch {
+    /// Where the test branches when `x` is truthy.
+    pub(super) target: usize,
+    /// Nothing reads the not's result but the test.
+    pub(super) dead: bool,
+}
+
+/// Per op, its [`NotBranch`] fusion (on the `Not`; the `JumpIfFalse`
+/// after it is marked in the second vector).
+pub(super) fn not_branches(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    osr_entries: &[usize],
+    catch_targets: &[usize],
+    eligible: impl Fn(usize) -> bool,
+) -> (Vec<Option<NotBranch>>, Vec<bool>) {
+    let n = ops.len();
+    let target = branch_targets(ops, osr_entries, catch_targets);
+    let mut nots = vec![None; n];
+    let mut tests = vec![false; n];
+    for i in 1..n {
+        if let (GenericOp::Not { dst, a }, GenericOp::JumpIfFalse { cond, target: t }) =
+            (ops[i - 1], ops[i])
+            && cond == dst
+            && dst != a
+            && t > i
+            && t <= n
+            && !target[i]
+            && eligible(i - 1)
+            && eligible(i)
+        {
+            let dead = bytecode
+                .iter()
+                .enumerate()
+                .all(|(j, o)| j == i - 1 || j == i || !crate::bytecode::op_mentions_reg(o, dst));
+            nots[i - 1] = Some(NotBranch { target: t, dead });
+            tests[i] = true;
+        }
+    }
+    (nots, tests)
+}
+
 /// Which op indices (up to `ops.len()`) are branch targets or entries.
 fn branch_targets(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[usize]) -> Vec<bool> {
     let n = ops.len();
@@ -575,13 +624,24 @@ pub(super) fn plan(
     // than first comparing it with what its way held last iteration.
     let mut fresh: Vec<u16> = Vec::new();
     let mut fresh_first = vec![false; n];
+    // The property reads since the last op that may have changed a
+    // property: (the receiver's value id, the key, the result's value id).
+    // A later read of the same key on the same value likely gets the same
+    // value (`this.items.length … this.items[i]`), so its result takes that
+    // id: its sites then compare the way an earlier site on the first
+    // result filled. Only a guess (a getter, or a store between, makes
+    // another value), so such an id is never a site's certain predecessor
+    // (`guessed`): a key compare decides every hit.
+    let mut reads: Vec<(u32, &str, u32)> = Vec::new();
+    let mut guessed: Vec<u32> = Vec::new();
     // Per site: the previous site of the same iteration on its value, both
     // in a speculative loop.
     let mut pred: Vec<Option<usize>> = vec![None; n];
     // A branch target reached only by one forward branch (no fall-through
     // into it, no other branch, not an entry) knows what that branch knew:
-    // `if (!p) return; p.x`. (`ids` is not restored: a register the skipped
-    // code wrote just loses its value's identity, which only costs a hit.)
+    // `if (!p) return; p.x`, and which register held which value there
+    // (the code it skips may have written them: the loop body of
+    // `while (q.link) q = q.link; q.link = p`).
     //
     // A target reached only forward (no back-edge, not an entry) by several
     // paths may find a value walked on some of them: its sites compare the
@@ -600,6 +660,11 @@ pub(super) fn plan(
     let entry: Vec<usize> = osr_entries.iter().chain(catch_targets).copied().collect();
     #[allow(clippy::type_complexity)]
     let mut snap: Vec<Option<(Vec<(u32, usize, bool)>, Vec<u16>)>> = vec![None; n + 1];
+    // Per target, the value ids and the property reads at its one forward
+    // branch (`Some(None)` once a second one is seen).
+    #[allow(clippy::type_complexity)]
+    let mut snap_ids: Vec<Option<Option<(Vec<(u16, u32)>, Vec<(u32, &str, u32)>)>>> =
+        vec![None; n + 1];
     // The union of two paths' states (see above).
     let merge = |fill: &mut Vec<bool>,
                  (mut l, mut f): (Vec<(u32, usize, bool)>, Vec<u16>),
@@ -641,6 +706,7 @@ pub(super) fn plan(
         if let Some(t) = new_this(op) {
             ids.retain(|&(x, _)| x != t);
         }
+        let mut joined_reads = None;
         if target[i] {
             let falls_in = i > 0
                 && !matches!(
@@ -651,6 +717,10 @@ pub(super) fn plan(
                 Some((l, f)) if into[i] == 1 && !falls_in && !entry.contains(&i) => {
                     live = l;
                     fresh = f;
+                    if let Some(Some((v, r))) = snap_ids[i].take() {
+                        ids = v;
+                        joined_reads = Some(r);
+                    }
                 }
                 Some(st) if !back[i] && !entry.contains(&i) => {
                     let here = (core::mem::take(&mut live), core::mem::take(&mut fresh));
@@ -663,11 +733,24 @@ pub(super) fn plan(
                     live = l;
                     fresh = f;
                 }
+                // A loop's header, entered by falling in: a value walked
+                // before the loop may still be in its way on the first
+                // iteration (`q = this.queue; while (q.link) …`). Its sites
+                // there compare the way first, and the walk before fills
+                // it; nothing is certain across the back-edge (or after an
+                // entry there, which finds every way empty).
+                _ if back[i] && falls_in => {
+                    for e in &mut live {
+                        e.2 = false;
+                    }
+                    fresh.clear();
+                }
                 _ => {
                     live.clear();
                     fresh.clear();
                 }
             }
+            reads = joined_reads.unwrap_or_default();
         }
         if let Some((r, fam)) = site_recv(op, i) {
             let id = id_of(&mut ids, &mut next_id, r) * 3 + fam as u32;
@@ -679,7 +762,7 @@ pub(super) fn plan(
             if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
                 check[i] = true;
-                if e.2 && !truthy && in_spec(i) && in_spec(e.1) {
+                if e.2 && !truthy && in_spec(i) && in_spec(e.1) && !guessed.contains(&(id / 3)) {
                     pred[i] = Some(e.1);
                 }
                 // (Every site fills its way: from here on, it holds the
@@ -723,6 +806,31 @@ pub(super) fn plan(
                     fresh.push(dst);
                 }
             }
+            // A property read: a repeat of an earlier one (see `reads`), or a
+            // fresh value.
+            GenericOp::GetProp { dst, obj, .. }
+                if reused(i).is_none()
+                    && let Some(Op::GetProp { key, .. }) = bytecode.get(i) =>
+            {
+                let oid = id_of(&mut ids, &mut next_id, obj);
+                let prev = reads
+                    .iter()
+                    .find(|r| r.0 == oid && r.1 == key.as_str())
+                    .map(|r| r.2);
+                ids.retain(|&(x, _)| x != dst);
+                fresh.retain(|&x| x != dst);
+                match prev {
+                    Some(vid) => {
+                        ids.push((dst, vid));
+                        guessed.push(vid);
+                    }
+                    None => {
+                        fresh.push(dst);
+                        let vid = id_of(&mut ids, &mut next_id, dst);
+                        reads.push((oid, key.as_str(), vid));
+                    }
+                }
+            }
             _ => {
                 if let Some(d) = op_dst(op) {
                     ids.retain(|&(x, _)| x != d);
@@ -763,6 +871,27 @@ pub(super) fn plan(
         {
             fresh.retain(|x| x != dst);
         }
+        // (Anything but a read, a copy or plain arithmetic may store a
+        // property, or run code that does.)
+        if !matches!(
+            op,
+            GenericOp::GetProp { .. }
+                | GenericOp::GetElem { .. }
+                | GenericOp::ArrayLen { .. }
+                | GenericOp::Move { .. }
+                | GenericOp::Const { .. }
+                | GenericOp::Nop
+                | GenericOp::Not { .. }
+                | GenericOp::JumpIfFalse { .. }
+                | GenericOp::Compare { .. }
+                | GenericOp::StrictEq { .. }
+                | GenericOp::Lt { .. }
+                | GenericOp::Arith { .. }
+                | GenericOp::Add { .. }
+                | GenericOp::NumAdd { .. }
+        ) {
+            reads.clear();
+        }
         if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
             && t > i
             && t <= n
@@ -771,6 +900,10 @@ pub(super) fn plan(
             snap[t] = Some(match snap[t].take() {
                 Some(prev) => merge(&mut fill, prev, st),
                 None => st,
+            });
+            snap_ids[t] = Some(match snap_ids[t].take() {
+                None => Some((ids.clone(), reads.clone())),
+                Some(_) => None,
             });
         }
     }
