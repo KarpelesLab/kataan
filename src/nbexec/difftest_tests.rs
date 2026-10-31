@@ -3936,3 +3936,33 @@ fn global_object_heap_stores_keep_young_values_alive() {
     "#;
     assert_eq!(run(src), "984854,46080,4999,4999,4999");
 }
+
+/// `setTimeout` / `setInterval` validate their arguments at scheduling time:
+/// a non-callable callback is a TypeError then (it used to be queued, and
+/// its firing failed the whole event loop), the delay runs the full
+/// `ToNumber` (an object's `valueOf`), and a delay past the 32-bit timer
+/// range (`2**31`) is the minimum delay, as in Node (it used to fire last).
+#[test]
+fn timer_arguments_checked_at_schedule_time() {
+    let src = r#"
+        var log = [];
+        setTimeout(function () { log.push("big"); }, 2 ** 31);
+        setTimeout(function () { log.push("five"); }, 5);
+        setTimeout(function () { log.push("s3"); }, "3");
+        setTimeout(function () { log.push("obj4"); }, { valueOf: function () { return 4; } });
+        setTimeout(function () { log.push("nan"); }, NaN);
+        var errs = [];
+        [undefined, "code", 5, {}].forEach(function (cb) {
+            try { setTimeout(cb, 1); errs.push("no"); } catch (e) { errs.push(e instanceof TypeError); }
+            try { setInterval(cb, 1); errs.push("no"); } catch (e) { errs.push(e instanceof TypeError); }
+        });
+        setTimeout(function () { console.log(log.join(" ") + " " + errs.join()); }, 50);
+    "#;
+    let program = Parser::parse_program(src).expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.output(),
+        "big nan s3 obj4 five true,true,true,true,true,true,true,true\n"
+    );
+}

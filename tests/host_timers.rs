@@ -184,3 +184,19 @@ fn clear_interval_from_outside_before_first_fire() {
     );
     assert_eq!(out, ["cleared"]);
 }
+
+/// As in Node, a delay is at least 1ms (so `setTimeout(a, 1)` then
+/// `setTimeout(b, 0)` runs `a` first: 0 used to sort before 1), a delay past
+/// the 32-bit range is 1ms, and a non-callable callback is a TypeError when
+/// it is scheduled rather than an event-loop failure when it fires.
+#[test]
+fn delays_clamp_like_node_and_callbacks_are_checked() {
+    let out = run("var log = [];\
+         setTimeout(function () { log.push('one'); }, 1);\
+         setTimeout(function () { log.push('zero'); }, 0);\
+         setTimeout(function () { log.push('big'); }, 2 ** 31);\
+         setTimeout(function () { log.push('two'); }, 2);\
+         var ok = 0; try { setTimeout('x', 1); } catch (e) { ok = e instanceof TypeError; }\
+         setTimeout(function () { console.log(log.join(' ') + ' ' + ok); }, 10);");
+    assert_eq!(out, ["one zero big two true"]);
+}

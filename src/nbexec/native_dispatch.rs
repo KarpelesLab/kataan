@@ -3856,7 +3856,7 @@ impl Interp {
             // and returns a numeric timer id (usable with `clearTimeout`).
             N_SET_TIMEOUT => {
                 let callback = arg(0);
-                let delay = self.realm.to_number(arg(1)).max(0.0);
+                let delay = self.timer_delay_arg(callback, arg(1))?;
                 let extra: Vec<NanBox> = args.iter().skip(2).copied().collect();
                 let id = self.schedule_timer(delay, callback, extra, false);
                 NanBox::number(id as f64)
@@ -3865,7 +3865,7 @@ impl Interp {
             // callback runs again every `delay` ms (at least 1) until cleared.
             N_SET_INTERVAL => {
                 let callback = arg(0);
-                let delay = self.realm.to_number(arg(1)).max(0.0);
+                let delay = self.timer_delay_arg(callback, arg(1))?;
                 let extra: Vec<NanBox> = args.iter().skip(2).copied().collect();
                 let id = self.schedule_timer(delay, callback, extra, true);
                 NanBox::number(id as f64)

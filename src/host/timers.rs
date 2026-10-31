@@ -299,22 +299,24 @@ mod imp {
         is_interval: bool,
     ) -> Result<NanBox, NanBox> {
         let cb = args.first().copied().unwrap_or_else(|| cx.undefined());
+        // A non-callable callback is a TypeError now, as in Node (it used to
+        // be queued and then fail the whole event loop when it fired).
+        if !cx.is_callable(cb) {
+            return Err(cx.type_error("The timer callback must be a function"));
+        }
         let delay = match args.get(1).copied() {
             Some(v) => cx.to_number(v)?,
             None => 0.0,
         };
-        // Clamp to a sane, finite delay. Intervals floor at 1ms so the virtual
-        // clock always advances (a 0ms interval would spin at a fixed clock).
-        let delay = if delay.is_finite() && delay > 0.0 {
+        // As in Node, every delay is at least 1ms, and one that is not a
+        // number in (0, 2^31 - 1] is 1ms: `setTimeout(a, 1); setTimeout(b, 0)`
+        // runs `a` first, and a 0ms interval still advances the virtual clock.
+        let delay = if (1.0..=2_147_483_647.0).contains(&delay) {
             delay
         } else {
-            0.0
+            1.0
         };
-        let period = if is_interval {
-            Some(delay.max(1.0))
-        } else {
-            None
-        };
+        let period = if is_interval { Some(delay) } else { None };
         let extra: Vec<u32> = args.iter().skip(2).map(|v| cx.persist(*v)).collect();
         let cb_idx = cx.persist(cb);
         let id = STORE.with(|s| {

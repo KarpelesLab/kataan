@@ -565,6 +565,33 @@ impl Interp {
         r
     }
 
+    /// Validates `setTimeout`/`setInterval`'s arguments and returns the delay:
+    /// a non-callable callback is a TypeError at scheduling time (as in Node;
+    /// it used to be queued and then crash the event loop when it fired), the
+    /// delay goes through the full `ToNumber` (so an object's `valueOf` runs),
+    /// and a delay past the 32-bit timer range (> 2^31 - 1 ms) is the minimum
+    /// delay, as Node and WebIDL's `long` conversion both make it.
+    pub(crate) fn timer_delay_arg(
+        &mut self,
+        callback: NanBox,
+        delay: NanBox,
+    ) -> Result<f64, ExecError> {
+        if !self.is_callable_value(callback) {
+            return Err(self.type_error("The timer callback must be a function"));
+        }
+        let d = if delay.is_undefined() {
+            0.0
+        } else {
+            let n = self.coerce_to_number(delay)?;
+            self.realm.to_number(n)
+        };
+        Ok(if d.is_finite() && d > 0.0 && d <= 2_147_483_647.0 {
+            d
+        } else {
+            0.0
+        })
+    }
+
     /// Queues a macrotask (a `setTimeout`-style callback) on the virtual clock and
     /// returns its timer id (for `clearTimeout`). The fire-time is
     /// `at = virtual_now + max(delay, TICK)`: the `TICK` floor guarantees the clock
