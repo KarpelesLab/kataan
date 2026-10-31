@@ -22303,15 +22303,11 @@ impl Compiler {
         tdz: bool,
     ) -> Result<Binding, CompileError> {
         let reg = self.alloc();
-        self.ops.push(Op::NewArray { dst: reg, len: 1 });
+        // (A box cell: what every closure capture reads fastest.)
+        self.ops.push(Op::NewBox { dst: reg });
         if tdz {
             let t = self.constant(NanBox::tdz())?;
-            let idx = self.constant(NanBox::number(0.0))?;
-            self.ops.push(Op::SetElem {
-                arr: reg,
-                index: idx,
-                src: t,
-            });
+            self.ops.push(Op::CellSet { cell: reg, src: t });
         }
         let b = Binding {
             reg,

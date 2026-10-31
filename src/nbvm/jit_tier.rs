@@ -3666,11 +3666,14 @@ fn wants_to_leave(ctx: &mut Ctx, header: usize) -> bool {
     // `regs`, alive (its caller holds it) while that activation runs.
     #[allow(unsafe_code)]
     let jit = unsafe { &*ctx.jit_rt.exit_jit };
-    if !exit_stress() && !jit.wants_recompile(header) {
+    // (The function's own pc: an inlining body numbers its ops otherwise.
+    // An inlined callee's loop has none — its activation is pending, the
+    // interpreter has no frame to resume — so it never leaves.)
+    let own = jit.orig_pc(header);
+    if own == usize::MAX || (!exit_stress() && !jit.wants_recompile(header)) {
         return false;
     }
-    // (The function's own pc: an inlining body numbers its ops otherwise.)
-    ctx.jit_rt.resume = Some(jit.orig_pc(header));
+    ctx.jit_rt.resume = Some(own);
     true
 }
 

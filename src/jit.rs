@@ -4216,13 +4216,19 @@ impl JitProto {
                 ..si
             })
             .collect();
-        // Loop headers: the targets of backward branches.
+        // Loop headers: the targets of backward branches (the function's
+        // own: an inlined callee's loop is never entered from the
+        // interpreter, see `inline::loop_ok`).
+        let own_pc = |t: usize| match &pc_map {
+            Some(m) => m.1.get(t).is_some_and(|&p| p != u32::MAX),
+            None => true,
+        };
         let mut osr_entries: Vec<usize> = ops
             .iter()
             .enumerate()
             .filter_map(|(i, op)| match *op {
                 GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. }
-                    if target <= i =>
+                    if target <= i && own_pc(target) =>
                 {
                     Some(target)
                 }
@@ -7382,24 +7388,7 @@ impl JitFunction {
         macro_rules! family_checks {
             ($fam:expr, $miss:expr) => {{
                 match $fam {
-                    recv_cache::Family::Obj => {
-                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_object_disc);
-                        a.jne($miss);
-                        // (One compare when the object-data tag is the very
-                        // byte and value the cell tag was just compared to.)
-                        if (layout.off_od_tag, layout.obj_shaped_disc)
-                            != (layout.off_cell_tag, layout.cell_object_disc)
-                        {
-                            a.cmp_byte_at_rcx_imm(layout.off_od_tag, layout.obj_shaped_disc);
-                            a.jne($miss);
-                        }
-                        a.p_test_byte_imm(
-                            call_seq::r::RCX,
-                            layout.props.off_jit_flags,
-                            props::FLAG_EXOTIC,
-                        );
-                        a.jne($miss);
-                    }
+                    recv_cache::Family::Obj => a.p_object_not_exotic(&layout, $miss),
                     recv_cache::Family::Arr => {
                         a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
                         a.jne($miss);
@@ -9313,8 +9302,7 @@ impl JitFunction {
                     let fresh = fresh_add[op_idx].and_then(|f| {
                         let b = s.add?;
                         let g = rc.sites[f.guard]?;
-                        let ok = !num.in_region(op_idx)
-                            && s.baked.is_none()
+                        let ok = s.baked.is_none()
                             && !s.method_ptr.is_null()
                             && b.slot < crate::object::INLINE_SLOTS as u32
                             && g.family == recv_cache::Family::Obj
@@ -9328,6 +9316,9 @@ impl JitFunction {
                     let fresh_done = a.new_label();
                     if let Some((b, w, first)) = fresh {
                         let regular = a.new_label();
+                        // (In a promoted loop: the value, if in an SSE
+                        // register, to the register file the add reads.)
+                        let _ = num.operand_xmm(&mut a, op_idx, val, false);
                         a.load_rax(disp(obj));
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(w));
                         a.jne(regular);

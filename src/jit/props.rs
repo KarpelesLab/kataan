@@ -806,6 +806,29 @@ impl X64Assembler {
     /// Jumps to `miss` unless `rcx` is the slot of an ordinary (non-exotic)
     /// shaped object.
     fn p_plain_shaped(&mut self, l: &JitLayout, miss: Label) {
+        self.p_object_not_exotic(l, miss);
+    }
+
+    /// To `miss` unless the slot in `rcx` holds a shaped object cell whose
+    /// flags byte has no [`FLAG_EXOTIC`]: the cell tag compare, the
+    /// object-data tag's (when it is a byte of its own) and the flags test.
+    /// When the cell tag is the byte before the flags byte, the object's
+    /// discriminant is `0` and it is also the object-data tag's, one
+    /// `test word` makes all three (the word's low byte must be zero, its
+    /// high byte have no exotic bit). Changes no register.
+    pub(crate) fn p_object_not_exotic(&mut self, l: &JitLayout, miss: Label) {
+        if l.props.off_jit_flags == l.off_cell_tag + 1
+            && l.cell_object_disc == 0
+            && (l.off_od_tag, l.obj_shaped_disc) == (l.off_cell_tag, l.cell_object_disc)
+        {
+            // test word [rcx + disp32], imm16
+            self.code.extend_from_slice(&[0x66, 0xf7, 0x81]);
+            self.code.extend_from_slice(&l.off_cell_tag.to_le_bytes());
+            self.code
+                .extend_from_slice(&(0x00ff_u16 | (u16::from(FLAG_EXOTIC) << 8)).to_le_bytes());
+            self.jne(miss);
+            return;
+        }
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
         self.jne(miss);
         self.p_shaped_after_object(l, miss);
@@ -2135,6 +2158,44 @@ impl X64Assembler {
         self.jmp(other);
     }
 
+    /// The header of a fresh `Cell::Object` of `n` slots and key epoch `n`
+    /// in the slot at `rcx`: its cell (and object-data) tag, a zero flags
+    /// byte, the slot count and the key epoch — one 8-byte store when the
+    /// layout puts them in that order in the slot's first word, else one
+    /// store each.
+    fn p_store_obj_header(&mut self, l: &JitLayout, n: u32) {
+        let p = &l.props;
+        let t = l.off_cell_tag;
+        if (l.off_od_tag, l.obj_shaped_disc) == (t, l.cell_object_disc)
+            && p.off_jit_flags == t + 1
+            && l.off_slots_len == t + 2
+            && p.off_epoch == t + 4
+            && n <= u32::from(u16::MAX)
+        {
+            let word = u64::from(l.cell_object_disc) | u64::from(n) << 16 | u64::from(n) << 32;
+            self.g_movabs(r::R11, word);
+            self.g_store(r::RCX, t, r::R11);
+            return;
+        }
+        self.p_store_rcx_imm(1, t, u32::from(l.cell_object_disc));
+        self.p_store_rcx_imm(1, l.off_od_tag, u32::from(l.obj_shaped_disc));
+        self.p_store_rcx_imm(1, p.off_jit_flags, 0);
+        self.p_store_rcx_imm(2, l.off_slots_len, n);
+        self.p_store_rcx_imm(4, p.off_epoch, n);
+    }
+
+    /// A freshly filled slot at `rcx`: age 0, occupied (one 2-byte store
+    /// when the occupancy byte follows the age byte).
+    fn p_store_slot_young(&mut self, l: &JitLayout) {
+        let age = l.props.off_slot_age;
+        if l.off_slot_occ == age + 1 {
+            self.p_store_rcx_imm(2, age, u32::from(l.slot_occupied_disc) << 8);
+        } else {
+            self.p_store_rcx_imm(1, age, 0);
+            self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        }
+    }
+
     /// `mov byte|word|dword [rcx + disp32], imm` (`bytes` 1, 2 or 4).
     fn p_store_rcx_imm(&mut self, bytes: u8, disp: i32, imm: u32) {
         match bytes {
@@ -2181,11 +2242,7 @@ impl X64Assembler {
         self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
         self.g_mov(r::RCX, r::RAX);
         // `Cell::Object(Object::new(root))`, field by field.
-        self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(l.cell_object_disc));
-        self.p_store_rcx_imm(1, l.off_od_tag, u32::from(l.obj_shaped_disc));
-        self.p_store_rcx_imm(1, p.off_jit_flags, 0);
-        self.p_store_rcx_imm(2, l.off_slots_len, 0);
-        self.p_store_rcx_imm(4, p.off_epoch, 0);
+        self.p_store_obj_header(l, 0);
         self.g_load(r::R11, r::R9, p.root_shape);
         self.g_inc_mem(r::R11, p.rc_strong);
         self.g_store(r::RCX, l.off_shape, r::R11);
@@ -2195,8 +2252,7 @@ impl X64Assembler {
         // traced, `Object`'s docs.)
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
-        self.p_store_rcx_imm(1, p.off_slot_age, 0);
-        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        self.p_store_slot_young(l);
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
@@ -2264,11 +2320,7 @@ impl X64Assembler {
         self.g_mov(r::RCX, r::RAX);
         // `Cell::Object(Object::with_data(shape, vals))` with the
         // default prototype, field by field.
-        self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(l.cell_object_disc));
-        self.p_store_rcx_imm(1, l.off_od_tag, u32::from(l.obj_shaped_disc));
-        self.p_store_rcx_imm(1, p.off_jit_flags, 0);
-        self.p_store_rcx_imm(2, l.off_slots_len, n);
-        self.p_store_rcx_imm(4, p.off_epoch, n);
+        self.p_store_obj_header(l, n);
         self.g_movabs(r::R11, cache);
         self.g_load(r::R11, r::R11, LitShapeCache::SHAPE_OFF);
         self.g_inc_mem(r::R11, p.rc_strong);
@@ -2284,8 +2336,7 @@ impl X64Assembler {
         // `Object`'s docs: left as they are.)
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
-        self.p_store_rcx_imm(1, p.off_slot_age, 0);
-        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        self.p_store_slot_young(l);
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
@@ -2355,8 +2406,7 @@ impl X64Assembler {
         }
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
-        self.p_store_rcx_imm(1, p.off_slot_age, 0);
-        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        self.p_store_slot_young(l);
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
@@ -2394,8 +2444,7 @@ impl X64Assembler {
         self.g_store(r::RCX, p.off_box_val, r::R11);
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
-        self.p_store_rcx_imm(1, p.off_slot_age, 0);
-        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        self.p_store_slot_young(l);
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();
@@ -2464,8 +2513,7 @@ impl X64Assembler {
         }
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
-        self.p_store_rcx_imm(1, p.off_slot_age, 0);
-        self.p_store_rcx_imm(1, l.off_slot_occ, u32::from(l.slot_occupied_disc));
+        self.p_store_slot_young(l);
         // rax = NanBox::handle(generation << 32 | index).
         self.shl_rax_imm(32);
         self.p_or_rax_rdx();

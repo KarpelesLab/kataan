@@ -39,11 +39,15 @@
 //! the only code that can observe them (`f.caller`, `f.arguments`, the depth
 //! of a nested call, a collection's audit); see
 //! `call_seq::emit_inline_guard`. A throw out of the inlined body ends the
-//! activation at the body's throw exit. Only small straight-line callees are
-//! inlined — no loop, `try`, `arguments`, `new.target`, `super`, eval or
-//! suspension in them — so nothing can leave the compiled code inside one
-//! (an on-stack exit is at a loop header, which an inlined body has none
-//! of). An inlined body may call: a call op in it (or a getter, a
+//! activation at the body's throw exit. Only small callees are inlined — no
+//! `try`, `arguments`, `new.target`, `super`, eval or suspension in them —
+//! so nothing can leave the compiled code inside one. A callee may loop
+//! (`loop_ok`): an on-stack exit is at a loop header, and an inlined
+//! loop's back-edge polls (interrupts, agents, the GC safepoint, all of
+//! which run Rust code, so it first pushes the pending activation as a call
+//! would) but never leaves there (`jit_tier::wants_to_leave` refuses a
+//! header that is not the function's own, and the header is never an
+//! on-stack-replacement entry). An inlined body may call: a call op in it (or a getter, a
 //! `valueOf`, … that a property access or an operator calls) first pushes
 //! the pending activation, like any Rust code run inside it, and a throw
 //! out of the callee ends the inlined activation as any other throw does.
@@ -200,12 +204,40 @@ fn callee_ok_sized(proto: &FnProto, spliced: bool) -> bool {
     }
     let n = proto.ops.len();
     proto.ops.iter().enumerate().all(|(pc, op)| match op {
-        Op::Jump { target } | Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
+        Op::Jump { target } => loop_ok(proto, pc, *target),
+        Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
         _ => {
             let mut o = op.clone();
             remap(&mut o, &|r| r, &|t| t)
         }
     })
+}
+
+/// Whether callee op `pc`, `Jump { target }`, is a branch the splice takes:
+/// forward (to an op or the end), or a loop's back-edge — to an earlier op
+/// no branch from outside the loop enters it past (a loop the body enters
+/// only at its header). An inlined loop is never left at its header: its
+/// back-edge polls as any other, but the activation it runs in is pending,
+/// so the interpreter could not resume there (`jit_tier::wants_to_leave`
+/// refuses).
+fn loop_ok(proto: &FnProto, pc: usize, target: usize) -> bool {
+    if target > pc {
+        return target <= proto.ops.len();
+    }
+    proto.ops.iter().enumerate().all(|(i, o)| match o {
+        Op::Jump { target: t } | Op::JumpIfFalse { target: t, .. } => {
+            (target..=pc).contains(&i) || !(target < *t && *t <= pc)
+        }
+        _ => true,
+    })
+}
+
+/// Whether `p` has a loop (a backward branch).
+fn loops(p: &FnProto) -> bool {
+    p.ops
+        .iter()
+        .enumerate()
+        .any(|(pc, o)| matches!(o, Op::Jump { target } if *target <= pc))
 }
 
 /// Whether `proto` can be inlined at a `new` site (`Op::Construct`): a
@@ -236,7 +268,8 @@ fn construct_ok_sized(proto: &FnProto, spliced: bool) -> bool {
     }
     let n = proto.ops.len();
     proto.ops.iter().enumerate().all(|(pc, op)| match op {
-        Op::Jump { target } | Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
+        Op::Jump { target } => loop_ok(proto, pc, *target),
+        Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
         Op::LoadNewTarget { .. } => true,
         Op::Return { .. } => false,
         _ => {
@@ -582,8 +615,10 @@ pub fn expand<'a>(
             let c = site_body(c);
             // A polymorphic site's way inlines only a body that calls
             // nothing but through its own inlined calls' guards (an inner
-            // call's activation pushes cost about what the call saved).
-            if poly && !calls_only_inlined(&c.proto) {
+            // call's activation pushes cost about what the call saved). So
+            // does one that loops: its calls would push the activation on
+            // every iteration.
+            if (poly || loops(&c.proto)) && !calls_only_inlined(&c.proto) {
                 continue;
             }
             let spliced = matches!(c.proto, alloc::borrow::Cow::Owned(_));
@@ -913,11 +948,45 @@ fn block_len(p: &FnProto, construct: bool) -> usize {
 fn window_regs(p: &FnProto, construct: bool) -> Vec<usize> {
     let n = p.ops.len();
     let nr = p.n_regs;
-    // Backward liveness over the spliced body (its branches go forward, so
-    // one pass): `live[j]`, the registers live into callee op `j`.
+    // Backward liveness over the spliced body: `live[j]`, the registers live
+    // into callee op `j` (one pass when every branch goes forward; a loop's
+    // back-edge takes more, until nothing changes).
     let mut live: Vec<Vec<bool>> = alloc::vec![alloc::vec![false; nr]; n + 1];
     let (mut defs, mut uses) = (Vec::new(), Vec::new());
-    for j in (0..n).rev() {
+    let mut changed = true;
+    while core::mem::take(&mut changed) {
+        for j in (0..n).rev() {
+            live_step(
+                p,
+                j,
+                construct,
+                &mut live,
+                &mut defs,
+                &mut uses,
+                &mut changed,
+            );
+        }
+    }
+    let caps = p.n_params..p.n_params + p.n_captures;
+    (0..nr)
+        .filter(|r| !caps.contains(r) && live[0][*r])
+        .collect()
+}
+
+/// One step of [`window_regs`]' liveness: `live[j]` from its successors'
+/// (`changed` set when it grows).
+fn live_step(
+    p: &FnProto,
+    j: usize,
+    construct: bool,
+    live: &mut [Vec<bool>],
+    defs: &mut Vec<Reg>,
+    uses: &mut Vec<Reg>,
+    changed: &mut bool,
+) {
+    let n = p.ops.len();
+    let nr = p.n_regs;
+    {
         let op = &p.ops[j];
         let succ: [Option<usize>; 2] = match op {
             Op::Jump { target } => [Some(*target), None],
@@ -935,22 +1004,21 @@ fn window_regs(p: &FnProto, construct: bool) -> Vec<usize> {
             }
         }
         if width(p, j, construct) > 0 {
-            super::numeric::def_use(op, &mut defs, &mut uses);
-            for &d in &defs {
+            super::numeric::def_use(op, defs, uses);
+            for &d in defs.iter() {
                 if let Some(x) = out.get_mut(d as usize) {
                     *x = false;
                 }
             }
-            for &u in &uses {
+            for &u in uses.iter() {
                 if let Some(x) = out.get_mut(u as usize) {
                     *x = true;
                 }
             }
         }
-        live[j] = out;
+        if live[j] != out {
+            live[j] = out;
+            *changed = true;
+        }
     }
-    let caps = p.n_params..p.n_params + p.n_captures;
-    (0..nr)
-        .filter(|r| !caps.contains(r) && live[0][*r])
-        .collect()
 }
