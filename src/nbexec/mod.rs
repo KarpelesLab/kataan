@@ -2945,6 +2945,7 @@ mod object;
 mod promise;
 mod regexp;
 mod resource;
+mod structured_clone;
 mod temporal;
 mod temporal_astro;
 mod temporal_calendar;

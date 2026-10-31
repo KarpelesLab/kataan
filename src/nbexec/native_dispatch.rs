@@ -3214,10 +3214,7 @@ impl Interp {
                 let bytes = self.coerce_to_string_bytes(arg(0))?;
                 self.new_str_bytes(legacy_unescape(&bytes))
             }
-            N_STRUCTURED_CLONE => {
-                let mut seen: Vec<(u64, NanBox)> = Vec::new();
-                self.structured_clone(arg(0), &mut seen)?
-            }
+            N_STRUCTURED_CLONE => self.structured_clone_call(args.len(), arg(0), arg(1))?,
             // `$262_detachArrayBuffer(buffer)` — the Test262 `$262.detachArrayBuffer`
             // host hook. Detaches the buffer (empties its store + every view, flags it
             // detached) and returns `null` per the abstract `DetachArrayBuffer`.

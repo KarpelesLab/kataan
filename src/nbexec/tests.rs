@@ -4236,11 +4236,11 @@ fn structured_clone_deep_copy() {
         run("let s={v:1}; let c=structuredClone({x:s,y:s}); c.x===c.y"),
         "true"
     );
-    // Primitives pass through; functions throw.
+    // Primitives pass through; functions throw a DataCloneError.
     assert_eq!(run("structuredClone(42)"), "42");
     assert_eq!(
-        run("try{structuredClone({f:function(){}});'no'}catch(e){e instanceof TypeError}"),
-        "true"
+        run("try{structuredClone({f:function(){}});'no'}catch(e){e.name}"),
+        "DataCloneError"
     );
 }
 

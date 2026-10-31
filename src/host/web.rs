@@ -4,16 +4,15 @@
 //! [`Ctx`]). Installed via [`install`].
 //!
 //! Implemented here: `TextEncoder` / `TextDecoder`, `atob` / `btoa`, `URL` /
-//! `URLSearchParams`, `structuredClone`, `performance`, and a full-formatting
-//! `console`.
+//! `URLSearchParams`, `performance`, and a full-formatting `console`
+//! (`structuredClone` is an engine global, `Interp`'s own full HTML
+//! structured clone).
 //!
 //! Simplifications (deliberate, noted inline): URL host parsing does no IDNA /
 //! punycode (hosts are stored roughly as given, ASCII-lowercased for special
 //! schemes) and its path normalization covers the common `.`/`..` cases;
 //! `url.searchParams` returns a fresh (non-live) `URLSearchParams`;
-//! `TextDecoder` supports utf-8 / utf-16le / utf-16be; `structuredClone` cycle
-//! detection keys on raw heap handles (correct for a single non-GC-relocating
-//! clone).
+//! `TextDecoder` supports utf-8 / utf-16le / utf-16be.
 
 use alloc::format;
 use alloc::rc::Rc;
@@ -33,7 +32,6 @@ pub fn install(interp: &mut Interp) {
     install_encoding(interp);
     install_base64(interp);
     install_url(interp);
-    install_structured_clone(interp);
     install_performance(interp);
     install_console(interp);
 }
@@ -1266,132 +1264,6 @@ fn url_accessor(
             Ok(NanBox::undefined())
         },
     );
-}
-
-// ===========================================================================
-// structuredClone
-// ===========================================================================
-
-fn install_structured_clone(interp: &mut Interp) {
-    interp.register_global_fn("structuredClone", 1, |cx, _this, args| {
-        let mut memo: Vec<(u64, NanBox)> = Vec::new();
-        clone_value(cx, arg(args, 0), &mut memo)
-    });
-}
-
-fn data_clone_error(cx: &mut Ctx, what: &str) -> NanBox {
-    named_error(
-        cx,
-        "DataCloneError",
-        &format!("{what} could not be cloned."),
-    )
-}
-
-fn clone_value(cx: &mut Ctx, v: NanBox, memo: &mut Vec<(u64, NanBox)>) -> Result<NanBox, NanBox> {
-    match cx.type_of(v) {
-        "undefined" | "boolean" | "number" | "string" | "bigint" => Ok(v),
-        "symbol" => Err(data_clone_error(cx, "A Symbol object")),
-        "function" => Err(data_clone_error(cx, "A function")),
-        _ => {
-            if matches!(v.unpack(), Unpacked::Null) {
-                return Ok(v);
-            }
-            let raw = match v.as_handle() {
-                Some(r) => r,
-                None => return Ok(v),
-            };
-            if let Some((_, cloned)) = memo.iter().find(|(k, _)| *k == raw) {
-                return Ok(*cloned);
-            }
-            let tag = builtin_tag(cx, v);
-            match tag.as_str() {
-                "Array" => {
-                    let n = cx.array_len(v).unwrap_or(0);
-                    let out = cx.new_array(Vec::new());
-                    memo.push((raw, out));
-                    for i in 0..n {
-                        let e = cx.array_get(v, i);
-                        let ce = clone_value(cx, e, memo)?;
-                        cx.array_set(out, i, ce);
-                    }
-                    Ok(out)
-                }
-                "Date" => {
-                    let ctor = global_get(cx, "Date");
-                    let get_time = cx.get(v, "getTime")?;
-                    let t = cx.call(get_time, v, &[])?;
-                    let d = cx.construct(ctor, &[t])?;
-                    memo.push((raw, d));
-                    Ok(d)
-                }
-                "RegExp" => {
-                    let ctor = global_get(cx, "RegExp");
-                    let source = cx.get(v, "source")?;
-                    let flags = cx.get(v, "flags")?;
-                    let r = cx.construct(ctor, &[source, flags])?;
-                    memo.push((raw, r));
-                    Ok(r)
-                }
-                "Map" => {
-                    let ctor = global_get(cx, "Map");
-                    let m = cx.construct(ctor, &[])?;
-                    memo.push((raw, m));
-                    let set_fn = cx.get(m, "set")?;
-                    for (k, val) in map_entries(cx, v)? {
-                        let ck = clone_value(cx, k, memo)?;
-                        let cv = clone_value(cx, val, memo)?;
-                        cx.call(set_fn, m, &[ck, cv])?;
-                    }
-                    Ok(m)
-                }
-                "Set" => {
-                    let ctor = global_get(cx, "Set");
-                    let s = cx.construct(ctor, &[])?;
-                    memo.push((raw, s));
-                    let add_fn = cx.get(s, "add")?;
-                    for val in set_values(cx, v)? {
-                        let cv = clone_value(cx, val, memo)?;
-                        cx.call(add_fn, s, &[cv])?;
-                    }
-                    Ok(s)
-                }
-                "ArrayBuffer" => {
-                    let slice = cx.get(v, "slice")?;
-                    let copy = cx.call(slice, v, &[NanBox::number(0.0)])?;
-                    memo.push((raw, copy));
-                    Ok(copy)
-                }
-                t if t.ends_with("Array") || t == "DataView" => {
-                    // Typed array / DataView: clone the buffer, rebuild the view.
-                    let ctor = cx.get(v, "constructor")?;
-                    let buffer = cx.get(v, "buffer")?;
-                    let cloned_buffer = clone_value(cx, buffer, memo)?;
-                    let off = cx.get(v, "byteOffset")?;
-                    let result = if t == "DataView" {
-                        let len = cx.get(v, "byteLength")?;
-                        cx.construct(ctor, &[cloned_buffer, off, len])?
-                    } else {
-                        let len = cx.get(v, "length")?;
-                        cx.construct(ctor, &[cloned_buffer, off, len])?
-                    };
-                    memo.push((raw, result));
-                    Ok(result)
-                }
-                _ => {
-                    // Plain object (best-effort for anything else): copy own
-                    // enumerable string keys.
-                    let out = cx.new_object();
-                    memo.push((raw, out));
-                    for k in cx.own_keys(v) {
-                        let val = cx.get(v, &k)?;
-                        let cv = clone_value(cx, val, memo)?;
-                        cx.set(out, &k, cv);
-                    }
-                    Ok(out)
-                }
-            }
-        }
-    }
 }
 
 /// `[...map]` → the `[k, v]` entries (via `Array.from`).

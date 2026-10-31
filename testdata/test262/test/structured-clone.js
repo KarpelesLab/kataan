@@ -31,7 +31,7 @@ assert.sameValue(pair.x === pair.y, true, "shared reference stays shared");
 assert.sameValue(structuredClone(42), 42, "number");
 assert.sameValue(structuredClone("hi"), "hi", "string");
 assert.sameValue(structuredClone(null), null, "null");
-// Functions are not cloneable.
+// Functions are not cloneable (a DataCloneError, per HTML).
 var threw = false;
-try { structuredClone({ f: function () {} }); } catch (e) { threw = e instanceof TypeError; }
+try { structuredClone({ f: function () {} }); } catch (e) { threw = e.name === "DataCloneError"; }
 assert.sameValue(threw, true, "functions throw");

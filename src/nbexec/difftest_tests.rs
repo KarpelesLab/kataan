@@ -3966,3 +3966,45 @@ fn timer_arguments_checked_at_schedule_time() {
         "big nan s3 obj4 five true,true,true,true,true,true,true,true\n"
     );
 }
+
+/// `structuredClone` is the HTML structured clone: RegExps, typed arrays,
+/// DataViews, primitive wrappers and Errors are rebuilt (they came back as
+/// empty plain objects), an array keeps its holes and extra properties,
+/// getters run, a `transfer`red buffer is moved, and an uncloneable value
+/// (Proxy, WeakMap, Promise, `arguments`, a function or symbol property) is a
+/// DataCloneError.
+#[test]
+fn structured_clone_follows_the_html_algorithm() {
+    let src = r#"
+        var r = [];
+        var re = /ab+c/gi; re.lastIndex = 2;
+        var cr = structuredClone(re);
+        r.push(cr instanceof RegExp, cr.source, cr.flags, cr.lastIndex);
+        var ab = new ArrayBuffer(8); new Uint8Array(ab).set([1, 2, 3, 4, 5, 6, 7, 8]);
+        var two = structuredClone({ a: new Uint16Array(ab, 2, 2), b: new DataView(ab, 4) });
+        r.push(two.a.buffer === two.b.buffer, two.a.byteOffset, two.a.length, two.a[0], two.b.getUint8(0));
+        var wr = structuredClone([new Number(4), new String("hey"), Object(5n)]);
+        r.push(typeof wr[0], wr[0] + 1, wr[1].length, typeof wr[2].valueOf());
+        var e = structuredClone(new TypeError("tm", { cause: { c: 1 } }));
+        r.push(e instanceof TypeError, e.message, e.cause.c, Object.keys(e).length);
+        var a = [1, , 3]; a.extra = "x";
+        var ca = structuredClone(a);
+        r.push(ca.length, 1 in ca, ca.extra);
+        var cg = structuredClone({ get g() { return 7; } });
+        r.push(JSON.stringify(Object.getOwnPropertyDescriptor(cg, "g")));
+        var tr = new ArrayBuffer(4); new Uint8Array(tr)[0] = 9;
+        var ct = structuredClone({ x: tr }, { transfer: [tr] });
+        r.push(tr.byteLength, ct.x.byteLength, new Uint8Array(ct.x)[0]);
+        [new Proxy({}, {}), new WeakMap(), Promise.resolve(), (function () { return arguments; })(),
+         { f: function () {} }, { s: Symbol() }].forEach(function (v) {
+            try { structuredClone(v); r.push("cloned"); } catch (err) { r.push(err.name); }
+        });
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,ab+c,gi,0,true,2,2,1027,5,object,5,3,bigint,true,tm,1,0,3,false,x,\
+         {\"value\":7,\"writable\":true,\"enumerable\":true,\"configurable\":true},0,4,9,\
+         DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError"
+    );
+}
