@@ -2542,8 +2542,8 @@ fn private_define(
     Ok(())
 }
 
-/// The hidden slot of a VM generator object: its suspended frame, as the array
-/// `[func id, state, pc, dst, registers, handlers (flat catch-pc/reg pairs)]`.
+/// The hidden slot of a VM generator object: its suspended frame's cell
+/// ([`crate::cell::VmFrame`]).
 pub(crate) const VM_GEN: &str = "\0vmgen";
 
 const GEN_SUSPENDED_START: f64 = 0.0;
@@ -2579,8 +2579,12 @@ fn enter_frame_realm(host: &mut dyn VmHost, holder: NanBox) -> bool {
         return false;
     }
     let callee = holder.as_handle().and_then(|h| {
-        host.realm_slot()
-            .get_property(Handle::from_raw(h), FRAME_CALLEE)
+        let realm = host.realm_slot();
+        let h = Handle::from_raw(h);
+        match realm.vm_frame(h) {
+            Some(f) => Some(f.callee).filter(|c| c.as_handle().is_some()),
+            None => realm.get_property(h, FRAME_CALLEE),
+        }
     });
     callee.is_some_and(|c| host.enter_fn_realm(c))
 }
@@ -2649,45 +2653,27 @@ fn make_generator(
         .realm
         .new_object_with_proto(proto.as_handle().map(Handle::from_raw));
     note_frame_callee(ctx, g, callee);
-    let state = gen_state_array(ctx, id, GEN_SUSPENDED_START, pc, 0, regs, &handlers);
-    if is_async {
-        // An async generator also carries its request queue (state slot 6).
-        let q = ctx.realm.new_array(Vec::new());
-        if let Some(sh) = state.as_handle().map(Handle::from_raw) {
-            ctx.realm.array_push(sh, NanBox::handle(q.to_raw()));
-        }
-        ctx.realm.set_hidden_property(g, VM_AGEN, state);
+    // An async generator also carries its request queue.
+    let aux = if is_async {
+        NanBox::handle(ctx.realm.new_array(Vec::new()).to_raw())
     } else {
-        ctx.realm.set_hidden_property(g, VM_GEN, state);
-    }
+        NanBox::undefined()
+    };
+    let fh = ctx.realm.new_vm_frame(crate::cell::VmFrame {
+        func: id as u32,
+        pc: pc as u32,
+        dst: 0,
+        state: GEN_SUSPENDED_START as u8,
+        regs,
+        handlers,
+        aux,
+        resume_fns: (NanBox::undefined(), NanBox::undefined()),
+        callee: NanBox::undefined(),
+    });
+    let slot = if is_async { VM_AGEN } else { VM_GEN };
+    ctx.realm
+        .set_hidden_property(g, slot, NanBox::handle(fh.to_raw()));
     Ok(NanBox::handle(g.to_raw()))
-}
-
-/// Packs a suspended frame into its state array (see [`VM_GEN`]).
-fn gen_state_array(
-    ctx: &mut Ctx,
-    id: usize,
-    state: f64,
-    pc: usize,
-    dst: Reg,
-    regs: Vec<NanBox>,
-    handlers: &[(usize, Reg)],
-) -> NanBox {
-    let r = ctx.realm.new_array(regs);
-    let hs: Vec<NanBox> = handlers
-        .iter()
-        .flat_map(|(t, reg)| [NanBox::number(*t as f64), NanBox::number(f64::from(*reg))])
-        .collect();
-    let h = ctx.realm.new_array(hs);
-    let arr = ctx.realm.new_array(alloc::vec![
-        NanBox::number(id as f64),
-        NanBox::number(state),
-        NanBox::number(pc as f64),
-        NanBox::number(f64::from(dst)),
-        NanBox::handle(r.to_raw()),
-        NanBox::handle(h.to_raw()),
-    ]);
-    NanBox::handle(arr.to_raw())
 }
 
 /// One [`Op::YieldDelegate`] step on the register file `regs` (the
@@ -2816,24 +2802,19 @@ fn is_mapped_arguments(realm: &Realm, v: NanBox) -> bool {
         .is_some_and(|h| realm.has_argument_map_marker(Handle::from_raw(h)))
 }
 
-/// The hidden slot of a VM async function's controller object: the array
-/// `[func id, result promise, pc, dst, registers, handlers, on fulfilled,
-/// on rejected]`, made at the frame's first `await` and updated in place at
-/// each later one (the register file moves out of its array for a run and
-/// back in at the next `await`, as a generator's does). The last two are
-/// the host's resume reactions for the frame (see
-/// [`VmHost::async_resume_fns`]), made once and reused by every `await`.
-pub(crate) const VM_ASYNC: &str = "\0vmasync";
-
 /// Runs a hosted async frame's outcome to its next suspension: settles the
-/// result promise `p` on completion, or parks the frame on its controller
-/// (`frame`: the controller and its [`VM_ASYNC`] state array, created on the
-/// first `await`) and registers the host's resume reactions.
+/// result promise `p` on completion, or parks the frame in its frame cell
+/// (`frame`, created at the first `await`: a [`crate::cell::VmFrame`] that
+/// is also the controller its resume reactions are bound to — see
+/// [`VmHost::async_resume_fns`], made once and reused by every `await`) and
+/// registers the host's resume reactions. The register file moves out of
+/// the cell for a run and back in at the next `await`, as a generator's
+/// does.
 fn drive_async(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     id: usize,
-    mut frame: Option<(Handle, Handle)>,
+    mut frame: Option<Handle>,
     p: NanBox,
     mut regs: Vec<NanBox>,
     mut r: Result<FrameExit, VmError>,
@@ -2865,62 +2846,67 @@ fn drive_async(
                 handlers,
                 dst,
             }) => {
-                let sh = match frame {
-                    Some((_, sh)) => sh,
+                let fh = match frame {
+                    Some(fh) => fh,
                     None => {
-                        let c = ctx.realm.new_object();
                         // The async function's own activation is the innermost
                         // VM callee here (its first `await`).
-                        let callee = ctx.realm.vm_callee_stack.last().copied();
-                        note_frame_callee(ctx, c, callee);
-                        let r_arr = ctx.realm.new_array(Vec::new());
-                        let h_arr = ctx.realm.new_array(Vec::new());
-                        let st = ctx.realm.new_array(alloc::vec![
-                            NanBox::number(id as f64),
-                            p,
-                            NanBox::number(0.0),
-                            NanBox::number(0.0),
-                            NanBox::handle(r_arr.to_raw()),
-                            NanBox::handle(h_arr.to_raw()),
-                            NanBox::undefined(),
-                            NanBox::undefined(),
-                        ]);
-                        ctx.realm
-                            .set_hidden_property(c, VM_ASYNC, NanBox::handle(st.to_raw()));
-                        let cv = NanBox::handle(c.to_raw());
-                        let (on_f, on_r) = with_host(ctx, |h| h.async_resume_fns(cv))
+                        let callee = ctx
+                            .realm
+                            .vm_callee_stack
+                            .last()
+                            .copied()
+                            .filter(|c| ctx.realm.multi_realm && c.as_handle().is_some())
+                            .unwrap_or(NanBox::undefined());
+                        let fh = ctx.realm.new_vm_frame(crate::cell::VmFrame {
+                            func: id as u32,
+                            pc: 0,
+                            dst: 0,
+                            state: 0,
+                            regs: Vec::new(),
+                            handlers: Vec::new(),
+                            aux: p,
+                            resume_fns: (NanBox::undefined(), NanBox::undefined()),
+                            callee,
+                        });
+                        let cv = NanBox::handle(fh.to_raw());
+                        // (The new cell is rooted by nothing yet: no collection
+                        // runs before it is reachable from the reactions.)
+                        let fns = with_host(ctx, |h| h.async_resume_fns(cv))
                             .ok_or(VmError::Unsupported)?;
-                        ctx.realm.set_element(st, 6, on_f);
-                        ctx.realm.set_element(st, 7, on_r);
-                        frame = Some((c, st));
-                        st
+                        if let Some(f) = ctx.realm.vm_frame_mut(fh) {
+                            f.resume_fns = fns;
+                        }
+                        ctx.realm.vm_frame_stored(fh);
+                        frame = Some(fh);
+                        fh
                     }
                 };
-                let (regs_h, hs_h, fns) = {
-                    let e = ctx.realm.array_elements(sh).unwrap_or(&[]);
-                    let h = |i: usize| e.get(i).and_then(|x| x.as_handle()).map(Handle::from_raw);
-                    let f = |i: usize| e.get(i).copied().unwrap_or(NanBox::undefined());
-                    (h(4), h(5), (f(6), f(7)))
+                let fns = match ctx.realm.vm_frame_mut(fh) {
+                    Some(f) => {
+                        f.regs = regs;
+                        f.handlers = handlers;
+                        f.pc = pc as u32;
+                        f.dst = dst;
+                        f.resume_fns
+                    }
+                    None => return Err(VmError::Unsupported),
                 };
-                let (Some(regs_h), Some(hs_h)) = (regs_h, hs_h) else {
-                    return Err(VmError::Unsupported);
-                };
-                ctx.realm.internal_array_put(regs_h, regs);
-                ctx.realm.internal_array_set_numbers(
-                    hs_h,
-                    handlers
-                        .iter()
-                        .flat_map(|(t, reg)| [*t as f64, f64::from(*reg)]),
-                );
-                ctx.realm
-                    .internal_array_set_numbers_from(sh, 2, &[pc as f64, f64::from(dst)]);
+                ctx.realm.vm_frame_stored(fh);
                 match with_host(ctx, |h| h.await_resume(value, fns)) {
                     Some(Ok(())) => return Ok(()),
                     // PromiseResolve threw: that throw happens at the `await`.
                     Some(Err(HostError::Thrown(e))) => {
                         let proto = funcs.get(id).ok_or(VmError::Unsupported)?;
-                        regs = ctx.realm.internal_array_take(regs_h).unwrap_or_default();
-                        r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, pc, handlers, Some(e));
+                        let (rg, hs) = match ctx.realm.vm_frame_mut(fh) {
+                            Some(f) => (
+                                core::mem::take(&mut f.regs),
+                                core::mem::take(&mut f.handlers),
+                            ),
+                            None => return Err(VmError::Unsupported),
+                        };
+                        regs = rg;
+                        r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, pc, hs, Some(e));
                     }
                     _ => return Err(VmError::Unsupported),
                 }
@@ -2931,10 +2917,10 @@ fn drive_async(
     }
 }
 
-/// Resumes the hosted async frame parked on `controller` with the settled
-/// awaited value (`fulfilled`) or by throwing the rejection reason at the
-/// `await` — the host's `N_ASYNC_RESUME_*` reaction for a VM frame.
-/// `state` is the controller's [`VM_ASYNC`] state array.
+/// Resumes the hosted async frame parked in its frame cell `controller` with
+/// the settled awaited value (`fulfilled`) or by throwing the rejection
+/// reason at the `await` — the host's `N_ASYNC_RESUME_*` reaction for a VM
+/// frame. `state` is the frame cell itself.
 ///
 /// # Errors
 /// A VM fault (the body's own throw rejects its promise instead).
@@ -2950,38 +2936,17 @@ pub(crate) fn resume_vm_async(
     let mut ctx = hosted_ctx(host.take_realm(), host);
     let result = (|| {
         let ctx = &mut ctx;
-        let ch = controller
-            .as_handle()
-            .map(Handle::from_raw)
-            .ok_or(VmError::NotAnObject)?;
-        let sh = state.ok_or(VmError::NotAnObject)?;
-        let (id, p, pc, dst, regs_h, hs_h) = {
-            let e = ctx.realm.array_elements(sh).unwrap_or(&[]);
-            let num = |i: usize| e.get(i).and_then(|x| x.as_number()).unwrap_or(0.0);
-            let h = |i: usize| e.get(i).and_then(|x| x.as_handle()).map(Handle::from_raw);
-            (
-                num(0) as usize,
-                e.get(1).copied().unwrap_or(NanBox::undefined()),
-                num(2) as usize,
-                num(3) as Reg,
-                h(4),
-                h(5),
-            )
-        };
-        let mut regs = regs_h
-            .and_then(|h| ctx.realm.internal_array_take(h))
-            .unwrap_or_default();
-        let handlers: Vec<(usize, Reg)> = match hs_h.and_then(|h| ctx.realm.array_elements(h)) {
-            Some(hs) if !hs.is_empty() => hs
-                .chunks(2)
-                .map(|c| {
-                    (
-                        c[0].as_number().unwrap_or(0.0) as usize,
-                        c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
-                    )
-                })
-                .collect(),
-            _ => Vec::new(),
+        let fh = state.ok_or(VmError::NotAnObject)?;
+        let (id, p, pc, dst, mut regs, handlers) = match ctx.realm.vm_frame_mut(fh) {
+            Some(f) => (
+                f.func as usize,
+                f.aux,
+                f.pc as usize,
+                f.dst,
+                core::mem::take(&mut f.regs),
+                core::mem::take(&mut f.handlers),
+            ),
+            None => return Err(VmError::NotAnObject),
         };
         let inject = if fulfilled {
             if let Some(slot) = regs.get_mut(dst as usize) {
@@ -3040,7 +3005,7 @@ pub(crate) fn resume_vm_async(
             t.ic = ic;
             t.ic_body = body;
         }
-        let r = drive_async(ctx, table, id, Some((ch, sh)), p, regs, r);
+        let r = drive_async(ctx, table, id, Some(fh), p, regs, r);
         ctx.frame_shadow.truncate(mark);
         if r.is_ok() && !ctx.microtasks.is_empty() {
             Err(VmError::Unsupported)
@@ -3056,8 +3021,9 @@ pub(crate) fn resume_vm_async(
     result
 }
 
-/// The hidden slot of a VM async generator: its [`VM_GEN`]-shaped state plus
-/// the request queue (slot 6: an array of `[kind, value, promise]`).
+/// The hidden slot of a VM async generator: its suspended frame's cell
+/// ([`crate::cell::VmFrame`], whose `aux` is the request queue: an array of
+/// `[kind, value, promise]`).
 pub(crate) const VM_AGEN: &str = "\0vmagen";
 
 /// An async generator whose `return` request awaits its value (completed).
@@ -3066,7 +3032,7 @@ const GEN_AWAITING_RETURN: f64 = 4.0;
 /// the body (a rejection throws at the `yield`).
 const GEN_RETURN_AWAIT: f64 = 5.0;
 
-/// The pieces of an async generator's state array.
+/// The pieces of an async generator's frame cell.
 struct AgenState {
     state: Handle,
     id: usize,
@@ -3087,59 +3053,50 @@ fn agen_state(ctx: &Ctx, generator: NanBox) -> Result<AgenState, VmError> {
         .and_then(|s| s.as_handle())
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
-    let e = ctx
-        .realm
-        .array_elements(sh)
-        .map(<[_]>::to_vec)
-        .unwrap_or_default();
-    let num = |i: usize| e.get(i).and_then(|x| x.as_number()).unwrap_or(0.0);
-    let queue = e
-        .get(6)
-        .and_then(|q| q.as_handle())
+    let f = ctx.realm.vm_frame(sh).ok_or(VmError::NotAnObject)?;
+    let queue = f
+        .aux
+        .as_handle()
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
     Ok(AgenState {
         state: sh,
-        id: num(0) as usize,
-        status: num(1),
-        pc: num(2) as usize,
-        dst: num(3) as Reg,
+        id: f.func as usize,
+        status: f64::from(f.state),
+        pc: f.pc as usize,
+        dst: f.dst,
         queue,
     })
 }
 
-/// Loads the suspended frame (registers, handlers) of state array `sh`.
-fn load_frame(ctx: &Ctx, sh: Handle) -> (Vec<NanBox>, Vec<(usize, Reg)>) {
-    let e = ctx
-        .realm
-        .array_elements(sh)
-        .map(<[_]>::to_vec)
-        .unwrap_or_default();
-    let regs: Vec<NanBox> = e
-        .get(4)
-        .and_then(|r| r.as_handle())
-        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
-        .map(<[_]>::to_vec)
-        .unwrap_or_default();
-    let handlers = e
-        .get(5)
-        .and_then(|r| r.as_handle())
-        .and_then(|r| ctx.realm.array_elements(Handle::from_raw(r)))
-        .map(|hs| {
-            hs.chunks(2)
-                .map(|c| {
-                    (
-                        c[0].as_number().unwrap_or(0.0) as usize,
-                        c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    (regs, handlers)
+/// Sets the status of the async generator frame `sh`.
+fn agen_set_status(ctx: &mut Ctx, sh: Handle, status: f64) {
+    if let Some(f) = ctx.realm.vm_frame_mut(sh) {
+        f.state = status as u8;
+    }
 }
 
-/// Saves a suspended frame into state array `sh` with status `status`.
+/// Whether the suspended frame `sh` is inside a handler region.
+fn frame_has_handlers(ctx: &Ctx, sh: Handle) -> bool {
+    ctx.realm
+        .vm_frame(sh)
+        .is_some_and(|f| !f.handlers.is_empty())
+}
+
+/// Moves the suspended frame's register file and handlers out of the frame
+/// cell `sh` (for a run: [`save_frame`] moves them back at the next
+/// suspension).
+fn load_frame(ctx: &mut Ctx, sh: Handle) -> (Vec<NanBox>, Vec<(usize, Reg)>) {
+    match ctx.realm.vm_frame_mut(sh) {
+        Some(f) => (
+            core::mem::take(&mut f.regs),
+            core::mem::take(&mut f.handlers),
+        ),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
+/// Saves a suspended frame into its cell `sh` with status `status`.
 fn save_frame(
     ctx: &mut Ctx,
     sh: Handle,
@@ -3147,23 +3104,20 @@ fn save_frame(
     pc: usize,
     dst: Reg,
     regs: Vec<NanBox>,
-    handlers: &[(usize, Reg)],
+    handlers: Vec<(usize, Reg)>,
 ) {
-    let r = ctx.realm.new_array(regs);
-    let hs: Vec<NanBox> = handlers
-        .iter()
-        .flat_map(|(t, reg)| [NanBox::number(*t as f64), NanBox::number(f64::from(*reg))])
-        .collect();
-    let h = ctx.realm.new_array(hs);
-    ctx.realm.set_element(sh, 1, NanBox::number(status));
-    ctx.realm.set_element(sh, 2, NanBox::number(pc as f64));
-    ctx.realm.set_element(sh, 3, NanBox::number(f64::from(dst)));
-    ctx.realm.set_element(sh, 4, NanBox::handle(r.to_raw()));
-    ctx.realm.set_element(sh, 5, NanBox::handle(h.to_raw()));
+    if let Some(f) = ctx.realm.vm_frame_mut(sh) {
+        f.state = status as u8;
+        f.pc = pc as u32;
+        f.dst = dst;
+        f.regs = regs;
+        f.handlers = handlers;
+    }
+    ctx.realm.vm_frame_stored(sh);
 }
 
-/// Settles the front request's promise and dequeues it (the queue in slot 6
-/// of state array `state` is replaced by the rest).
+/// Settles the front request's promise and dequeues it (the queue of frame
+/// cell `state` is replaced by the rest).
 fn agen_settle_front(ctx: &mut Ctx, state: Handle, queue: Handle, v: NanBox, fulfilled: bool) {
     let items = ctx
         .realm
@@ -3183,8 +3137,10 @@ fn agen_settle_front(ctx: &mut Ctx, state: Handle, queue: Handle, v: NanBox, ful
         .and_then(|r| r.get(2).copied())
         .unwrap_or(NanBox::undefined());
     let rest = ctx.realm.new_array(items[1..].to_vec());
-    ctx.realm
-        .set_element(state, 6, NanBox::handle(rest.to_raw()));
+    if let Some(f) = ctx.realm.vm_frame_mut(state) {
+        f.aux = NanBox::handle(rest.to_raw());
+    }
+    ctx.realm.vm_frame_stored(state);
     with_host(ctx, |h| h.settle_promise(p, v, fulfilled));
 }
 
@@ -3234,7 +3190,7 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
         let mut status = st.status;
         if status == GEN_SUSPENDED_START && kind != 0 {
             status = GEN_COMPLETED;
-            ctx.realm.set_element(st.state, 1, NanBox::number(status));
+            agen_set_status(ctx, st.state, status);
         }
         // A `YieldResume` (inside an async `yield*`) takes every resumption
         // into its registers.
@@ -3255,16 +3211,14 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
         if status == GEN_SUSPENDED_YIELD && kind == 2 && captured.is_none() {
             // Cleanup of an enclosing try / for-of / destructuring region on a
             // `return` is the interpreter's (see `vm_generator_resume`).
-            if !load_frame(ctx, st.state).1.is_empty() {
+            if frame_has_handlers(ctx, st.state) {
                 return Err(VmError::Unsupported);
             }
-            ctx.realm
-                .set_element(st.state, 1, NanBox::number(GEN_RETURN_AWAIT));
+            agen_set_status(ctx, st.state, GEN_RETURN_AWAIT);
             match with_host(ctx, |h| h.await_value(v, generator)) {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(HostError::Thrown(e))) => {
-                    ctx.realm
-                        .set_element(st.state, 1, NanBox::number(GEN_EXECUTING));
+                    agen_set_status(ctx, st.state, GEN_EXECUTING);
                     let (mut regs, handlers) = load_frame(ctx, st.state);
                     let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
                     let r =
@@ -3285,19 +3239,16 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
                     continue;
                 }
                 1 => {
-                    ctx.realm
-                        .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                    agen_set_status(ctx, st.state, GEN_COMPLETED);
                     agen_settle_front(ctx, st.state, st.queue, v, false);
                     continue;
                 }
                 _ => {
-                    ctx.realm
-                        .set_element(st.state, 1, NanBox::number(GEN_AWAITING_RETURN));
+                    agen_set_status(ctx, st.state, GEN_AWAITING_RETURN);
                     match with_host(ctx, |h| h.await_value(v, generator)) {
                         Some(Ok(())) => return Ok(()),
                         Some(Err(HostError::Thrown(e))) => {
-                            ctx.realm
-                                .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                            agen_set_status(ctx, st.state, GEN_COMPLETED);
                             agen_settle_front(ctx, st.state, st.queue, e, false);
                             continue;
                         }
@@ -3325,8 +3276,7 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
                 }
             }
         };
-        ctx.realm
-            .set_element(st.state, 1, NanBox::number(GEN_EXECUTING));
+        agen_set_status(ctx, st.state, GEN_EXECUTING);
         let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
         let r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, st.pc, handlers, inject);
         if !agen_step(ctx, funcs, generator, st.id, regs, r)? {
@@ -3361,7 +3311,7 @@ fn agen_step(
                     .and_then(|i| proto.ops.get(i))
                     .is_some_and(|op| matches!(op, Op::Await { .. }));
                 if is_await {
-                    save_frame(ctx, st.state, GEN_EXECUTING, pc, dst, regs, &handlers);
+                    save_frame(ctx, st.state, GEN_EXECUTING, pc, dst, regs, handlers);
                     match with_host(ctx, |h| h.await_value(value, generator)) {
                         Some(Ok(())) => return Ok(false),
                         Some(Err(HostError::Thrown(e))) => {
@@ -3373,21 +3323,19 @@ fn agen_step(
                         _ => return Err(VmError::Unsupported),
                     }
                 }
-                save_frame(ctx, st.state, GEN_SUSPENDED_YIELD, pc, dst, regs, &handlers);
+                save_frame(ctx, st.state, GEN_SUSPENDED_YIELD, pc, dst, regs, handlers);
                 let res = iter_result(ctx, value, false);
                 agen_settle_front(ctx, st.state, st.queue, res, true);
                 return Ok(true);
             }
             Ok(FrameExit::Return(v)) => {
-                ctx.realm
-                    .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                agen_set_status(ctx, st.state, GEN_COMPLETED);
                 let res = iter_result(ctx, v.unwrap_or(NanBox::undefined()), true);
                 agen_settle_front(ctx, st.state, st.queue, res, true);
                 return Ok(true);
             }
             Err(VmError::Thrown(e)) => {
-                ctx.realm
-                    .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+                agen_set_status(ctx, st.state, GEN_COMPLETED);
                 agen_settle_front(ctx, st.state, st.queue, e, false);
                 return Ok(true);
             }
@@ -3445,13 +3393,11 @@ pub(crate) fn resume_vm_agen(
         let ctx = &mut ctx;
         let st = agen_state(ctx, generator)?;
         if st.status == GEN_RETURN_AWAIT && fulfilled {
-            ctx.realm
-                .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+            agen_set_status(ctx, st.state, GEN_COMPLETED);
             let res = iter_result(ctx, v, true);
             agen_settle_front(ctx, st.state, st.queue, res, true);
         } else if st.status == GEN_AWAITING_RETURN {
-            ctx.realm
-                .set_element(st.state, 1, NanBox::number(GEN_COMPLETED));
+            agen_set_status(ctx, st.state, GEN_COMPLETED);
             if fulfilled {
                 let res = iter_result(ctx, v, true);
                 agen_settle_front(ctx, st.state, st.queue, res, true);
@@ -3459,8 +3405,7 @@ pub(crate) fn resume_vm_agen(
                 agen_settle_front(ctx, st.state, st.queue, v, false);
             }
         } else {
-            ctx.realm
-                .set_element(st.state, 1, NanBox::number(GEN_EXECUTING));
+            agen_set_status(ctx, st.state, GEN_EXECUTING);
             let (mut regs, handlers) = load_frame(ctx, st.state);
             let inject = if fulfilled {
                 if let Some(slot) = regs.get_mut(st.dst as usize) {

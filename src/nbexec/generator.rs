@@ -4,7 +4,8 @@
 //! `%AsyncGeneratorPrototype%` / `%AsyncGeneratorFunction.prototype%`, iterator
 //! result objects, and `%AsyncFromSyncIteratorPrototype%` (async `yield*` /
 //! `for await` over a sync iterator). The frames themselves — registers, pc,
-//! handlers — live in the VM (`crate::nbvm`, `VM_GEN` / `VM_ASYNC` / `VM_AGEN`).
+//! handlers — live in the VM (`crate::nbvm`: `VM_GEN` / `VM_AGEN`, and an
+//! async function's frame cell).
 
 use super::*;
 

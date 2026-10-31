@@ -70,6 +70,62 @@ pub struct PromiseState {
     pub already_resolved: bool,
 }
 
+/// A suspended bytecode-VM activation: a sync or async generator's frame
+/// (reached through its generator object's hidden slot) or an async
+/// function's (the cell is itself the frame's controller, the target of its
+/// `await` resume reactions). One cell holds everything a resumption needs, so a
+/// resume reads the state and moves the register file out with one heap
+/// access, and a suspension moves it back with another.
+///
+/// Never a user-visible value. While the activation runs, `regs` is empty:
+/// the register file is the running frame's (rooted as any running frame's
+/// is), and comes back at the next suspension.
+pub struct VmFrame {
+    /// The function-table index of the activation's function.
+    pub func: u32,
+    /// The resumption point (the op a resumption continues at).
+    pub pc: u32,
+    /// Where a `next(v)` resumption's value lands.
+    pub dst: u16,
+    /// The generator state (`GEN_*` in `nbvm`); unused by an async
+    /// function's frame.
+    pub state: u8,
+    /// The register file.
+    pub regs: Vec<NanBox>,
+    /// The active exception handlers, innermost last: `(catch pc, register)`.
+    pub handlers: Vec<(usize, u16)>,
+    /// An async function's result promise, or an async generator's request
+    /// queue (an array of `[kind, value, promise]`); else `undefined`.
+    pub aux: NanBox,
+    /// An async function's resume reactions `(on fulfilled, on rejected)`,
+    /// made once at its first `await` and reused by every later one.
+    pub resume_fns: (NanBox, NanBox),
+    /// The function value this is an activation of, recorded only while
+    /// several realms exist (resuming re-enters that function's realm).
+    pub callee: NanBox,
+}
+
+impl VmFrame {
+    /// Every value the frame holds (for tracing and relocation).
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut NanBox> {
+        self.regs.iter_mut().chain([
+            &mut self.aux,
+            &mut self.resume_fns.0,
+            &mut self.resume_fns.1,
+            &mut self.callee,
+        ])
+    }
+
+    fn values(&self) -> impl Iterator<Item = &NanBox> {
+        self.regs.iter().chain([
+            &self.aux,
+            &self.resume_fns.0,
+            &self.resume_fns.1,
+            &self.callee,
+        ])
+    }
+}
+
 /// The free/release hook for an externally-owned byte region, run once when the
 /// backing [`ByteStore::External`] is dropped (swept). `ptr`/`len` are exactly
 /// the values passed to [`ByteStore::external`].
@@ -403,6 +459,9 @@ pub enum Cell {
     },
     /// A `BigInt` primitive — true arbitrary precision (a pure-Rust bignum).
     BigInt(crate::bignum::BigInt),
+    /// A suspended VM activation ([`VmFrame`]): engine-internal, never a
+    /// user-visible value.
+    Frame(alloc::boxed::Box<VmFrame>),
     /// A `Proxy`: wraps a `target` object, routing property operations through a
     /// `handler` object's traps (`get`/`set`/`has`/`deleteProperty`).
     Proxy {
@@ -1375,7 +1434,11 @@ impl Cell {
             | Cell::Proxy { .. } => "object",
             // An internal byte backing store, or a Temporal data carrier, is never
             // a user-visible value; it is reached only through its owning object.
-            Cell::Bytes(_) | Cell::TemporalData(_) | Cell::Env(_) | Cell::Box(_) => "object",
+            Cell::Bytes(_)
+            | Cell::TemporalData(_)
+            | Cell::Env(_)
+            | Cell::Box(_)
+            | Cell::Frame(_) => "object",
         }
     }
 
@@ -1472,6 +1535,7 @@ impl Trace for Cell {
             Cell::Object(o) => o.slot_count(),
             Cell::Array(elems) => elems.len(),
             Cell::Collection { entries, .. } => entries.len(),
+            Cell::Frame(f) => f.regs.len(),
             _ => 0,
         }
     }
@@ -1539,6 +1603,15 @@ impl Trace for Cell {
             }
             // A VM-held host environment keeps its bindings alive.
             Cell::Env(env) => env.for_each_handle(&mut visit),
+            // A suspended frame keeps its registers (and promise, resume
+            // reactions, callee) alive.
+            Cell::Frame(f) => {
+                for v in f.values() {
+                    if let Some(raw) = v.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
             // A VM closure keeps its captured cells alive.
             Cell::VmFunction { captures, .. } => {
                 for c in captures {
@@ -1625,6 +1698,7 @@ impl crate::gc::Relocate for Cell {
             Cell::Object(o) => o.relocate_handles(forward),
             Cell::Array(elems) => elems.iter_mut().for_each(fwd),
             Cell::Box(v) => fwd(v),
+            Cell::Frame(f) => f.values_mut().for_each(fwd),
             Cell::Env(env) => env.relocate_handles(forward),
             Cell::VmFunction { captures, .. } => captures.iter_mut().for_each(fwd),
             Cell::Collection { entries, index, .. } => {

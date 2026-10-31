@@ -2,11 +2,12 @@
 //! `next` / `throw` / `return`), and its direct forms for the VM's own
 //! callers.
 //!
-//! A generator object keeps its suspended frame in a hidden state array
-//! ([`VM_GEN`]): `[func id, state, pc, dst, registers, handlers]`. A resume
-//! moves the register file out of its array and runs the frame; a `yield`
-//! moves it back and updates the other entries in place, so a `yield` costs
-//! no allocation beyond its iterator result.
+//! A generator object keeps its suspended frame in a hidden slot ([`VM_GEN`])
+//! naming its frame cell (`crate::cell::VmFrame`: function, state, resume
+//! point, register file, handler stack). A resume moves the register file
+//! and handler stack out of the cell and runs the frame; a `yield` moves
+//! them back and updates the rest in place, so a `yield` costs no
+//! allocation beyond its iterator result.
 //!
 //! Called from the VM itself — `gen.next(v)` at a method-call site that
 //! proved the method is the intrinsic (`native_call`), or a `for-of` step
@@ -21,7 +22,7 @@
 
 use super::{
     Ctx, FnProto, FrameExit, GEN_COMPLETED, GEN_EXECUTING, GEN_SUSPENDED_START,
-    GEN_SUSPENDED_YIELD, Op, Reg, STACK_EXHAUSTED, VM_GEN, VmError, host_get_str, run_frame_at_ic,
+    GEN_SUSPENDED_YIELD, Op, STACK_EXHAUSTED, VM_GEN, VmError, host_get_str, run_frame_at_ic,
     vm_error,
 };
 use crate::heap::Handle;
@@ -39,7 +40,13 @@ pub(super) enum GenOut {
     Done(NanBox),
 }
 
-/// The generator object `gh`'s state array, when it is a sync VM generator.
+/// The generator states, as a frame cell holds them.
+const S_START: u8 = GEN_SUSPENDED_START as u8;
+const S_YIELD: u8 = GEN_SUSPENDED_YIELD as u8;
+const S_EXECUTING: u8 = GEN_EXECUTING as u8;
+const S_COMPLETED: u8 = GEN_COMPLETED as u8;
+
+/// The generator object `gh`'s frame cell, when it is a sync VM generator.
 fn state_of(ctx: &mut Ctx, gh: Handle) -> Option<Handle> {
     ctx.realm
         .object_get_cached(gh, VM_GEN, &mut ctx.gen_ic)
@@ -57,99 +64,93 @@ pub(super) fn resume(
     mode: u8,
     v: NanBox,
 ) -> Result<GenOut, VmError> {
-    let sh = state_of(ctx, gh).ok_or(VmError::NotAnObject)?;
-    resume_state(ctx, funcs, sh, mode, v)
+    let fh = state_of(ctx, gh).ok_or(VmError::NotAnObject)?;
+    resume_state(ctx, funcs, fh, mode, v)
 }
 
-/// [`resume`] of the generator whose state array is `sh`.
+/// Marks the frame `fh` completed.
+fn complete(ctx: &mut Ctx, fh: Handle) {
+    if let Some(f) = ctx.realm.vm_frame_mut(fh) {
+        f.state = S_COMPLETED;
+    }
+}
+
+/// [`resume`] of the generator whose frame cell is `fh`.
 fn resume_state(
     ctx: &mut Ctx,
     funcs: &[FnProto],
-    sh: Handle,
+    fh: Handle,
     mode: u8,
     v: NanBox,
 ) -> Result<GenOut, VmError> {
-    let (id, state, pc, dst, regs_h, hs_h) = {
-        let e = ctx.realm.array_elements(sh).unwrap_or(&[]);
-        let num = |i: usize| e.get(i).and_then(|x| x.as_number()).unwrap_or(0.0);
-        let h = |i: usize| e.get(i).and_then(|x| x.as_handle()).map(Handle::from_raw);
-        (
-            num(0) as usize,
-            num(1),
-            num(2) as usize,
-            num(3) as Reg,
-            h(4),
-            h(5),
-        )
+    let (id, state, pc, dst, has_handlers) = match ctx.realm.vm_frame(fh) {
+        Some(f) => (
+            f.func as usize,
+            f.state,
+            f.pc as usize,
+            f.dst,
+            !f.handlers.is_empty(),
+        ),
+        None => return Err(VmError::NotAnObject),
     };
-    if state == GEN_EXECUTING {
+    if state == S_EXECUTING {
         let e = vm_error(ctx, "TypeError", "Generator is already running");
         return Err(VmError::Thrown(e));
     }
+    let proto = funcs.get(id);
     // Suspended inside a `yield*` (the delegation step) or at a capturing
     // `YieldResume`: every resumption kind lands in registers.
-    let delegate = (state == GEN_SUSPENDED_YIELD)
-        .then(|| funcs.get(id))
-        .flatten()
-        .and_then(|p| {
-            if let Some(Op::YieldDelegate { dst, mode, .. }) = p.ops.get(pc) {
-                return Some((*dst, *mode));
-            }
-            match pc.checked_sub(1).and_then(|i| p.ops.get(i)) {
-                Some(Op::YieldResume { dst, mode, .. }) => Some((*dst, *mode)),
-                _ => None,
-            }
-        });
-    let handlers: Vec<(usize, Reg)> = match hs_h.and_then(|h| ctx.realm.array_elements(h)) {
-        Some(hs) if !hs.is_empty() => hs
-            .chunks(2)
-            .map(|c| {
-                (
-                    c[0].as_number().unwrap_or(0.0) as usize,
-                    c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    let had_handlers = handlers.len();
+    let delegate = (state == S_YIELD).then_some(proto).flatten().and_then(|p| {
+        if let Some(Op::YieldDelegate { dst, mode, .. }) = p.ops.get(pc) {
+            return Some((*dst, *mode));
+        }
+        match pc.checked_sub(1).and_then(|i| p.ops.get(i)) {
+            Some(Op::YieldResume { dst, mode, .. }) => Some((*dst, *mode)),
+            _ => None,
+        }
+    });
     // A `return(v)` at a `yield` inside a try / for-of / destructuring region
     // must run that region's cleanup (iterator closes) — the interpreter's.
-    if delegate.is_none() && mode == 2 && state == GEN_SUSPENDED_YIELD && !handlers.is_empty() {
+    if delegate.is_none() && mode == 2 && state == S_YIELD && has_handlers {
         return Err(VmError::Unsupported);
     }
-    if delegate.is_none()
-        && (state == GEN_COMPLETED || (state == GEN_SUSPENDED_START && mode != 0) || mode == 2)
+    if delegate.is_none() && (state == S_COMPLETED || (state == S_START && mode != 0) || mode == 2)
     {
-        ctx.realm.internal_array_set_number(sh, 1, GEN_COMPLETED);
+        complete(ctx, fh);
         return match mode {
             1 => Err(VmError::Thrown(v)),
             2 => Ok(GenOut::Done(v)),
             _ => Ok(GenOut::Done(NanBox::undefined())),
         };
     }
-    let Some(proto) = funcs.get(id) else {
+    let Some(proto) = proto else {
         return Err(VmError::Unsupported);
     };
-    // The register file moves out of its array for the run (and back in at
-    // the next `yield`); a completed generator's stays empty.
-    let mut regs = regs_h
-        .and_then(|h| ctx.realm.internal_array_take(h))
-        .unwrap_or_default();
+    // The register file and handler stack move out of the frame for the run
+    // (and back in at the next `yield`); a completed generator's stay empty.
+    let (mut regs, handlers) = match ctx.realm.vm_frame_mut(fh) {
+        Some(f) => {
+            f.state = S_EXECUTING;
+            (
+                core::mem::take(&mut f.regs),
+                core::mem::take(&mut f.handlers),
+            )
+        }
+        None => return Err(VmError::NotAnObject),
+    };
     let inject = if let Some((ddst, dmode)) = delegate {
         regs[ddst as usize] = v;
         regs[dmode as usize] = NanBox::number(f64::from(mode));
         None
     } else {
         if mode == 0
-            && state == GEN_SUSPENDED_YIELD
+            && state == S_YIELD
             && let Some(slot) = regs.get_mut(dst as usize)
         {
             *slot = v;
         }
         (mode == 1).then_some(v)
     };
-    ctx.realm.internal_array_set_number(sh, 1, GEN_EXECUTING);
     // The body's inline caches persist across resumptions, as they do across
     // calls (see `TierState`): taken out for the run (a nested resume of
     // the same function runs cold) and put back after it.
@@ -201,26 +202,14 @@ fn resume_state(
             handlers,
             dst,
         }) => {
-            if let Some(rh) = regs_h {
-                ctx.realm.internal_array_put(rh, regs);
+            if let Some(f) = ctx.realm.vm_frame_mut(fh) {
+                f.regs = regs;
+                f.handlers = handlers;
+                f.pc = pc as u32;
+                f.dst = dst;
+                f.state = S_YIELD;
             }
-            // (Most bodies suspend outside any handler region, as they
-            // resumed: then the handler array stays as it is, empty.)
-            if let Some(hh) = hs_h
-                && !(handlers.is_empty() && had_handlers == 0)
-            {
-                ctx.realm.internal_array_set_numbers(
-                    hh,
-                    handlers
-                        .iter()
-                        .flat_map(|(t, reg)| [*t as f64, f64::from(*reg)]),
-                );
-            }
-            ctx.realm.internal_array_set_numbers_from(
-                sh,
-                1,
-                &[GEN_SUSPENDED_YIELD, pc as f64, f64::from(dst)],
-            );
+            ctx.realm.vm_frame_stored(fh);
             // A `yield*` step hands the inner result object through as is.
             if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
                 Ok(GenOut::Delegated(value))
@@ -229,17 +218,28 @@ fn resume_state(
             }
         }
         Ok(FrameExit::Return(ret)) => {
-            ctx.realm.internal_array_set_number(sh, 1, GEN_COMPLETED);
+            complete(ctx, fh);
+            recycle(ctx, regs);
             Ok(GenOut::Done(ret.unwrap_or(NanBox::undefined())))
         }
         Ok(FrameExit::Tail { .. }) => {
-            ctx.realm.internal_array_set_number(sh, 1, GEN_COMPLETED);
+            complete(ctx, fh);
             Err(VmError::Unsupported)
         }
         Err(err) => {
-            ctx.realm.internal_array_set_number(sh, 1, GEN_COMPLETED);
+            complete(ctx, fh);
+            recycle(ctx, regs);
             Err(err)
         }
+    }
+}
+
+/// A finished frame's register file goes back to the pool, as an ordinary
+/// call's does.
+fn recycle(ctx: &mut Ctx, mut regs: Vec<NanBox>) {
+    if ctx.realm.vm_reg_pool.len() < 64 {
+        regs.clear();
+        ctx.realm.vm_reg_pool.push(regs);
     }
 }
 
@@ -273,16 +273,16 @@ fn nested<T>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx) -> Result<T, VmError>) -> R
     r
 }
 
-/// The state array of the generator object `g` when the direct path may
+/// The frame cell of the generator object `g` when the direct path may
 /// resume it: a hosted, single-realm run, and `g` a sync VM generator of a
 /// function in `funcs`.
 fn direct_target(ctx: &mut Ctx, funcs: &[FnProto], g: NanBox) -> Option<Handle> {
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }
-    let sh = state_of(ctx, Handle::from_raw(g.as_handle()?))?;
-    let id = ctx.realm.array_elements(sh)?.first()?.as_number()? as usize;
-    (id < funcs.len()).then_some(sh)
+    let fh = state_of(ctx, Handle::from_raw(g.as_handle()?))?;
+    let id = ctx.realm.vm_frame(fh)?.func as usize;
+    (id < funcs.len()).then_some(fh)
 }
 
 /// `g.next(v)` / `g.throw(v)` / `g.return(v)` (`mode` 0 / 1 / 2) for a call

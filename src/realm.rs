@@ -7590,6 +7590,7 @@ impl Realm {
                 Some(Cell::Object(_)) => "object",
                 Some(Cell::Array(_)) => "array",
                 Some(Cell::Box(_)) => "binding box",
+                Some(Cell::Frame(_)) => "suspended frame",
                 Some(Cell::VmFunction { .. }) => "closure",
                 Some(Cell::Env(_)) => "environment",
                 Some(Cell::Collection { .. }) => "collection",
@@ -8027,7 +8028,9 @@ impl Realm {
                         None => "[object Object]".into(),
                     }
                 }
-                Some(Cell::Object(_) | Cell::Env(_) | Cell::Box(_)) => "[object Object]".into(),
+                Some(Cell::Object(_) | Cell::Env(_) | Cell::Box(_) | Cell::Frame(_)) => {
+                    "[object Object]".into()
+                }
                 // A callable stringifies as `Function.prototype.toString` would —
                 // the retained literal source text (ECMA-262 20.2.3.5) when the
                 // function was defined from source, else the NativeFunction form

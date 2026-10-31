@@ -636,12 +636,12 @@ impl Interp {
         Ok(())
     }
 
-    /// The suspended VM frame `target` holds: the controller of a VM async
-    /// function's frame (`Some(Ok(its state))`) or a VM async generator
-    /// (`Some(Err(()))`).
+    /// The suspended VM frame `target` holds: a VM async function's frame
+    /// cell, its own controller (`Some(Ok(Some(target)))`), or a VM async
+    /// generator (`Some(Err(()))`).
     pub(crate) fn async_frame_of(&self, target: Handle) -> Option<Result<Option<Handle>, ()>> {
-        if let Some(st) = self.realm.get_property(target, crate::nbvm::VM_ASYNC) {
-            return Some(Ok(st.as_handle().map(Handle::from_raw)));
+        if self.realm.vm_frame(target).is_some() {
+            return Some(Ok(Some(target)));
         }
         self.realm
             .get_property(target, crate::nbvm::VM_AGEN)
