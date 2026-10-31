@@ -971,6 +971,8 @@ const KNOWN_GLOBALS: &[&str] = &[
     "structuredClone",
     "setTimeout",
     "clearTimeout",
+    "setInterval",
+    "clearInterval",
     "queueMicrotask",
     "decodeURI",
     "decodeURIComponent",

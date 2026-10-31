@@ -571,11 +571,15 @@ impl Interp {
     /// advances on every dispatch, so a self-rescheduling `setTimeout(fn, 0)` (the
     /// Test262 `$262.agent.tryYield`/`getReportAsync` polling idiom) cannot starve a
     /// later timer (a parked `waitAsync` timeout) forever — the clock ticks past it.
+    ///
+    /// With `repeat` (`setInterval`) the timer is re-queued `max(delay, TICK)`
+    /// after each firing, keeping its id, until it is cleared.
     pub(crate) fn schedule_timer(
         &mut self,
         delay: f64,
         callback: NanBox,
         args: Vec<NanBox>,
+        repeat: bool,
     ) -> u64 {
         // Minimum virtual advance per timer dispatch (a la the HTML nested-timeout
         // clamp): keeps `virtual_now` strictly increasing across dispatches.
@@ -596,6 +600,7 @@ impl Interp {
             seq,
             callback,
             args,
+            period: repeat.then_some(delay.max(TICK)),
         });
         id
     }
@@ -610,6 +615,20 @@ impl Interp {
         // Advance the virtual clock to this timer's fire-time (never backwards).
         if t.at > self.virtual_now {
             self.virtual_now = t.at;
+        }
+        // An interval is re-queued (same id, next fire-time) *before* its
+        // callback runs, so a `clearInterval` from inside the callback wins.
+        if let Some(period) = t.period {
+            let seq = self.timer_seq;
+            self.timer_seq += 1;
+            self.macrotasks.push(Timer {
+                id: t.id,
+                at: t.at + period,
+                seq,
+                callback: t.callback,
+                args: t.args.clone(),
+                period: t.period,
+            });
         }
         self.call(t.callback, &t.args)?;
         Ok(())

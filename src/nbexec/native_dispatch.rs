@@ -3858,11 +3858,21 @@ impl Interp {
                 let callback = arg(0);
                 let delay = self.realm.to_number(arg(1)).max(0.0);
                 let extra: Vec<NanBox> = args.iter().skip(2).copied().collect();
-                let id = self.schedule_timer(delay, callback, extra);
+                let id = self.schedule_timer(delay, callback, extra, false);
                 NanBox::number(id as f64)
             }
-            // `clearTimeout(id)` — cancels a pending `setTimeout`.
-            N_CLEAR_TIMEOUT => {
+            // `setInterval(cb, delay?, ...args)` — like `setTimeout`, but the
+            // callback runs again every `delay` ms (at least 1) until cleared.
+            N_SET_INTERVAL => {
+                let callback = arg(0);
+                let delay = self.realm.to_number(arg(1)).max(0.0);
+                let extra: Vec<NanBox> = args.iter().skip(2).copied().collect();
+                let id = self.schedule_timer(delay, callback, extra, true);
+                NanBox::number(id as f64)
+            }
+            // `clearTimeout(id)` / `clearInterval(id)` — cancels a pending timer
+            // (either kind, as in browsers and Node).
+            N_CLEAR_TIMEOUT | N_CLEAR_INTERVAL => {
                 // Timer ids are small positive integers: any other number
                 // names no timer.
                 if let Some(id) = arg(0).as_number()

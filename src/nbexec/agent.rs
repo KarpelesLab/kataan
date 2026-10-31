@@ -547,7 +547,7 @@ impl Interp {
                 let cb = self
                     .realm
                     .new_bound_native(N_ATOMICS_ASYNC_TIMEOUT, promise);
-                self.schedule_timer(t, NanBox::handle(cb.to_raw()), Vec::new());
+                self.schedule_timer(t, NanBox::handle(cb.to_raw()), Vec::new(), false);
             }
         }
         self.realm

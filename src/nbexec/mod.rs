@@ -1064,7 +1064,7 @@ struct Job {
     cap: Option<(NanBox, NanBox)>,
 }
 
-/// A pending `setTimeout` callback.
+/// A pending `setTimeout` / `setInterval` callback.
 struct Timer {
     id: u64,
     /// Absolute virtual fire-time (ms on the [`Interp::virtual_now`] clock).
@@ -1072,6 +1072,8 @@ struct Timer {
     seq: u64,
     callback: NanBox,
     args: Vec<NanBox>,
+    /// `Some(ms)` for a `setInterval`: after firing it is due again `ms` later.
+    period: Option<f64>,
 }
 
 /// The macrotask queue is a max-heap whose greatest element is the timer due
@@ -1118,9 +1120,14 @@ struct TimerQueue {
 
 impl TimerQueue {
     fn push(&mut self, t: Timer) {
-        if self.live.is_empty() || t.id < self.base {
-            self.live.clear();
+        if self.live.is_empty() {
             self.base = t.id;
+        }
+        // An interval re-queued after firing keeps its (older) id: widen the
+        // window down to it.
+        while t.id < self.base {
+            self.live.push_front(false);
+            self.base -= 1;
         }
         let idx = (t.id - self.base) as usize;
         while self.live.len() <= idx {
@@ -1245,6 +1252,8 @@ const N_INTL_NUMBER_FORMAT: u16 = 166;
 const N_INTL_DATETIME_FORMAT: u16 = 167;
 const N_SET_TIMEOUT: u16 = 211;
 const N_CLEAR_TIMEOUT: u16 = 212;
+const N_SET_INTERVAL: u16 = 1290;
+const N_CLEAR_INTERVAL: u16 = 1291;
 const N_QUEUE_MICROTASK: u16 = 213;
 const N_ARRAY_BUFFER_IS_VIEW: u16 = 214;
 const N_INTL_FORMAT: u16 = 215;
@@ -4056,6 +4065,8 @@ impl Interp {
             ("structuredClone", N_STRUCTURED_CLONE),
             ("setTimeout", N_SET_TIMEOUT),
             ("clearTimeout", N_CLEAR_TIMEOUT),
+            ("setInterval", N_SET_INTERVAL),
+            ("clearInterval", N_CLEAR_INTERVAL),
             ("queueMicrotask", N_QUEUE_MICROTASK),
             ("btoa", N_BTOA),
             ("atob", N_ATOB),

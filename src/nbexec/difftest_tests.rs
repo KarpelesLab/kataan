@@ -3815,3 +3815,36 @@ fn generic_array_methods_read_a_typed_arrays_length_property() {
          | 1,2 | 3 | 6 | 2 | true | 5,6 | 2 | 2 | 5+6+7+8"
     );
 }
+
+/// The engine's own host (the `kataan run` CLI) provides `setInterval` /
+/// `clearInterval` beside `setTimeout`: an interval re-fires every `delay`
+/// virtual ms (at least 1) in fire-time order with the other timers, passes
+/// its extra arguments each time, keeps its id, and stops when cleared, from
+/// inside its own callback or from another timer (a fire-time tie goes to
+/// the timer queued first, as in `hostrun`). `clearTimeout` and
+/// `clearInterval` cancel either kind.
+#[test]
+fn set_interval_repeats_until_cleared() {
+    let src = r#"
+        var log = [], n = 0;
+        var a = setInterval(function (tag) {
+            log.push(tag + (++n));
+            if (n === 4) clearInterval(a);
+        }, 10, "a");
+        var b = setInterval(function () { log.push("b"); }, 25);
+        setTimeout(function () { log.push("t30"); }, 30);
+        setTimeout(function () { clearTimeout(b); log.push("stop-b"); }, 60);
+        var z = setInterval(function () { log.push("zero"); clearInterval(z); }, 0);
+        var never = setInterval(function () { log.push("never"); }, 5);
+        clearInterval(never);
+        Promise.resolve().then(function () { log.push("micro"); });
+        setTimeout(function () { console.log(log.join(" ") + " ids=" + (typeof a) + (a !== b)); }, 100);
+    "#;
+    let program = Parser::parse_program(src).expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    assert_eq!(
+        interp.output(),
+        "micro zero a1 a2 b t30 a3 a4 b stop-b ids=numbertrue\n"
+    );
+}
