@@ -88,6 +88,23 @@ impl Realm {
         }
     }
 
+    /// `Get(promise, "constructor")` when it runs no code: `h` is a promise
+    /// with no own properties whose `[[Prototype]]` is the intrinsic
+    /// `%Promise.prototype%`, and that object's own `constructor` is a data
+    /// property — its value. `None` otherwise (the full `[[Get]]`).
+    pub(crate) fn plain_promise_constructor(&self, h: Handle) -> Option<NanBox> {
+        if !matches!(self.heap.get(h), Some(Cell::Promise(_)))
+            || self.aux_props.get(&h.to_raw()).is_some()
+        {
+            return None;
+        }
+        let proto = self.promise_proto_intrinsic?;
+        if self.native_protos.get(&h.to_raw()).copied() != Some(proto) {
+            return None;
+        }
+        self.heap.get(proto)?.as_object()?.get("constructor")
+    }
+
     /// CreateIterResultObject(`value`, `done`): a fresh ordinary object with
     /// the data properties `value` and `done`, in that order — built in its
     /// final layout at once.

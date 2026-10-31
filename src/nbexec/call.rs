@@ -1554,33 +1554,12 @@ impl Interp {
                 // An async coroutine resume reaction: `target` is the controller
                 // object; resume the parked body with the settled value (fulfil) or
                 // by throwing the rejection reason at the `await` point.
-                // A bytecode-VM async generator parked on an `await`.
+                // A bytecode-VM async generator or async function frame
+                // parked on an `await`.
                 N_ASYNC_RESUME_FULFILL | N_ASYNC_RESUME_REJECT
-                    if self
-                        .realm
-                        .get_property(target, crate::nbvm::VM_AGEN)
-                        .is_some() =>
+                    if self.async_frame_of(target).is_some() =>
                 {
-                    if let Some(table) = self.vm_table.clone() {
-                        let fulfilled = id == N_ASYNC_RESUME_FULFILL;
-                        let g = NanBox::handle(target.to_raw());
-                        crate::nbvm::resume_vm_agen(self, &table, g, fulfilled, arg0)
-                            .map_err(super::vm_to_exec)?;
-                    }
-                }
-                // A bytecode-VM async frame parks on its own controller.
-                N_ASYNC_RESUME_FULFILL | N_ASYNC_RESUME_REJECT
-                    if self
-                        .realm
-                        .get_property(target, crate::nbvm::VM_ASYNC)
-                        .is_some() =>
-                {
-                    if let Some(table) = self.vm_table.clone() {
-                        let fulfilled = id == N_ASYNC_RESUME_FULFILL;
-                        let c = NanBox::handle(target.to_raw());
-                        crate::nbvm::resume_vm_async(self, &table, c, fulfilled, arg0)
-                            .map_err(super::vm_to_exec)?;
-                    }
+                    self.run_async_resume(id, target, arg0)?;
                 }
                 // `AsyncFromSyncIteratorContinuation` reactions on the settled
                 // `valueWrapper`: `target` is the `[done, syncIterator]` state.

@@ -218,7 +218,7 @@ impl Interp {
             } else {
                 r.on_rejected
             };
-            self.microtasks.push(Job {
+            self.microtasks.push_back(Job {
                 handler,
                 value,
                 result: r.result,
@@ -280,7 +280,7 @@ impl Interp {
         let on_r = self.realm.new_bound_native(N_THENABLE_REJECT, record);
         self.install_fn_name_length(on_f, "", 1);
         self.install_fn_name_length(on_r, "", 1);
-        self.microtasks.push(Job {
+        self.microtasks.push_back(Job {
             handler: then,
             value,
             result: handle,
@@ -307,7 +307,10 @@ impl Interp {
             && self.realm.promise_state(Handle::from_raw(raw)).is_some()
         {
             let h = Handle::from_raw(raw);
-            let ctor = self.read_member(h, "constructor")?;
+            let ctor = match self.realm.plain_promise_constructor(h) {
+                Some(c) => c,
+                None => self.read_member(h, "constructor")?,
+            };
             let default_c = self
                 .intrinsic_global("Promise")
                 .unwrap_or(NanBox::undefined());
@@ -471,8 +474,38 @@ impl Interp {
         finally: bool,
         cap: Option<(NanBox, NanBox)>,
     ) -> Handle {
-        use crate::cell::PromiseStatus::{Fulfilled, Pending};
         let result = self.fresh_promise();
+        self.add_reaction(handle, on_f, on_r, finally, cap, result);
+        result
+    }
+
+    /// Await's PerformPromiseThen(`handle`, `on_f`, `on_r`), which has no
+    /// result capability: the reaction's `result` is `sink`, a handle that is
+    /// not a promise (the resume reaction itself), so the job's settling of
+    /// it is a no-op and no throwaway promise is made.
+    pub(crate) fn register_await_reaction(
+        &mut self,
+        handle: Handle,
+        on_f: NanBox,
+        on_r: NanBox,
+        sink: Handle,
+    ) {
+        debug_assert!(self.realm.promise_state(sink).is_none());
+        self.add_reaction(handle, on_f, on_r, false, None, sink);
+    }
+
+    /// Registers (or, on a settled promise, queues) a reaction whose outcome
+    /// goes to `result` (or `cap`).
+    fn add_reaction(
+        &mut self,
+        handle: Handle,
+        on_f: NanBox,
+        on_r: NanBox,
+        finally: bool,
+        cap: Option<(NanBox, NanBox)>,
+        result: Handle,
+    ) {
+        use crate::cell::PromiseStatus::{Fulfilled, Pending};
         let state = self.realm.promise_state(handle).expect("a promise");
         let settled = {
             let s = state.borrow();
@@ -491,7 +524,7 @@ impl Interp {
             }),
             Some((fulfilled, value)) => {
                 let handler = if fulfilled { on_f } else { on_r };
-                self.microtasks.push(Job {
+                self.microtasks.push_back(Job {
                     handler,
                     value,
                     result,
@@ -502,7 +535,6 @@ impl Interp {
                 });
             }
         }
-        result
     }
 
     /// Drains the microtask queue (the event loop), running each promise
@@ -553,16 +585,9 @@ impl Interp {
     /// ties by insertion order), advancing the virtual clock to that fire-time. A
     /// no-op when none are pending.
     pub(crate) fn run_one_macrotask(&mut self) -> Result<(), ExecError> {
-        let Some(idx) = self
-            .macrotasks
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.at.total_cmp(&b.at).then(a.seq.cmp(&b.seq)))
-            .map(|(i, _)| i)
-        else {
+        let Some(t) = self.macrotasks.pop() else {
             return Ok(());
         };
-        let t = self.macrotasks.remove(idx);
         // Advance the virtual clock to this timer's fire-time (never backwards).
         if t.at > self.virtual_now {
             self.virtual_now = t.at;
@@ -602,9 +627,66 @@ impl Interp {
         Ok(())
     }
 
+    /// The suspended VM frame `target` holds: the controller of a VM async
+    /// function's frame (`Some(Ok(its state))`) or a VM async generator
+    /// (`Some(Err(()))`).
+    pub(crate) fn async_frame_of(&self, target: Handle) -> Option<Result<Option<Handle>, ()>> {
+        if let Some(st) = self.realm.get_property(target, crate::nbvm::VM_ASYNC) {
+            return Some(Ok(st.as_handle().map(Handle::from_raw)));
+        }
+        self.realm
+            .get_property(target, crate::nbvm::VM_AGEN)
+            .map(|_| Err(()))
+    }
+
+    /// Await's resume reaction `id` (`N_ASYNC_RESUME_FULFILL` /
+    /// `N_ASYNC_RESUME_REJECT`, bound to `target`) called with the settled
+    /// `value`: resumes the suspended VM frame `target` holds. `false`, having
+    /// done nothing, when it holds none.
+    pub(crate) fn run_async_resume(
+        &mut self,
+        id: u16,
+        target: Handle,
+        value: NanBox,
+    ) -> Result<bool, ExecError> {
+        let Some(frame) = self.async_frame_of(target) else {
+            return Ok(false);
+        };
+        let Some(table) = self.vm_table.clone() else {
+            return Ok(true);
+        };
+        let fulfilled = id == N_ASYNC_RESUME_FULFILL;
+        let t = NanBox::handle(target.to_raw());
+        match frame {
+            Ok(state) => crate::nbvm::resume_vm_async(self, &table, t, state, fulfilled, value),
+            Err(()) => crate::nbvm::resume_vm_agen(self, &table, t, fulfilled, value),
+        }
+        .map_err(super::vm_to_exec)?;
+        Ok(true)
+    }
+
     /// Runs the next queued promise reaction.
     pub(crate) fn run_one_microtask(&mut self) -> Result<(), ExecError> {
-        let job = self.microtasks.remove(0);
+        let Some(job) = self.microtasks.pop_front() else {
+            return Ok(());
+        };
+        // Await's reaction (which has no result capability): the resume of
+        // the suspended frame, without the call machinery. A throw out of it
+        // ends the job, as the ordinary path's settling of the reaction's
+        // (unobservable) result does.
+        if job.thenable.is_none()
+            && !job.finally
+            && job.cap.is_none()
+            && let Some(h) = job.handler.as_handle().map(Handle::from_raw)
+            && let Some((id, target)) = self.realm.bound_native_at(h)
+            && matches!(id, N_ASYNC_RESUME_FULFILL | N_ASYNC_RESUME_REJECT)
+        {
+            match self.run_async_resume(id, target, job.value) {
+                Ok(true) | Err(ExecError::Throw(_)) => return Ok(()),
+                Ok(false) => {}
+                Err(other) => return Err(other),
+            }
+        }
         // PromiseResolveThenableJob: `handler` is the thenable's `then` method;
         // call `then.call(thenable, resolve, reject)`. A throw rejects via the
         // job's `reject` (the bound resolve/reject of `result`).

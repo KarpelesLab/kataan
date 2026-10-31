@@ -3872,7 +3872,7 @@ impl Interp {
                     return Err(self.type_error("queueMicrotask requires a callable callback"));
                 }
                 let result = self.fresh_promise();
-                self.microtasks.push(Job {
+                self.microtasks.push_back(Job {
                     handler: callback,
                     value: NanBox::undefined(),
                     result,

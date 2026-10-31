@@ -357,10 +357,10 @@ pub struct Interp {
     /// nested call / the body never sees the outer parameter set.
     eval_param_names: Option<Vec<String>>,
     /// The promise-reaction microtask queue, drained after the script.
-    microtasks: Vec<Job>,
+    microtasks: alloc::collections::VecDeque<Job>,
     /// Pending `setTimeout` callbacks (macrotasks), run after the microtask queue
     /// drains — ordered by absolute virtual fire-time `at`, then insertion (`seq`).
-    macrotasks: Vec<Timer>,
+    macrotasks: alloc::collections::BinaryHeap<Timer>,
     /// Monotonic id handed out by `setTimeout` (for `clearTimeout`).
     timer_next_id: u64,
     /// Monotonic insertion counter breaking equal-`at` ties.
@@ -1065,6 +1065,28 @@ struct Timer {
     callback: NanBox,
     args: Vec<NanBox>,
 }
+
+/// The macrotask queue is a max-heap whose greatest element is the timer due
+/// first: the least fire-time `at`, ties by insertion order (`seq`).
+impl Ord for Timer {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        other.at.total_cmp(&self.at).then(other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for Timer {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Timer {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Timer {}
 
 impl Default for Interp {
     fn default() -> Self {
@@ -2913,8 +2935,8 @@ impl Interp {
             current_home_object: None,
             in_field_initializer: false,
             eval_param_names: None,
-            microtasks: Vec::new(),
-            macrotasks: Vec::new(),
+            microtasks: alloc::collections::VecDeque::new(),
+            macrotasks: alloc::collections::BinaryHeap::new(),
             timer_next_id: 1,
             timer_seq: 0,
             virtual_now: 0.0,
@@ -5247,9 +5269,23 @@ impl Interp {
                 .get(INTRINSIC_GLOBAL_OWNER)
                 .and_then(|v| v.as_handle())
                 == Some(gt.to_raw())
-            && let Some(v) = self
-                .realm
-                .get_property(gt, &alloc::format!("{INTRINSIC_GLOBAL_PREFIX}{name}"))
+            && let Some(v) = {
+                // The captured key, built on the stack for the usual short name.
+                let mut buf = [0u8; 48];
+                let (p, n) = (INTRINSIC_GLOBAL_PREFIX.as_bytes(), name.as_bytes());
+                match buf.get_mut(..p.len() + n.len()) {
+                    Some(key) => {
+                        key[..p.len()].copy_from_slice(p);
+                        key[p.len()..].copy_from_slice(n);
+                        core::str::from_utf8(key)
+                            .ok()
+                            .and_then(|k| self.realm.get_property(gt, k))
+                    }
+                    None => self
+                        .realm
+                        .get_property(gt, &alloc::format!("{INTRINSIC_GLOBAL_PREFIX}{name}")),
+                }
+            }
         {
             return Some(v);
         }
@@ -9735,18 +9771,46 @@ impl crate::nbvm::VmHost for Interp {
     }
 
     fn await_value(&mut self, v: NanBox, controller: NanBox) -> Result<(), crate::nbvm::HostError> {
-        let Some(c) = controller.as_handle().map(Handle::from_raw) else {
+        if controller.as_handle().is_none() {
             return Err(crate::nbvm::HostError::Fault);
+        }
+        let fns = self.async_resume_fns(controller);
+        self.await_resume(v, fns)
+    }
+
+    fn async_resume_fns(&mut self, controller: NanBox) -> (NanBox, NanBox) {
+        let Some(c) = controller.as_handle().map(Handle::from_raw) else {
+            return (NanBox::undefined(), NanBox::undefined());
         };
-        let inner = self.promise_resolve_checked(v).map_err(exec_to_host)?;
         let on_f = self.realm.new_bound_native(N_ASYNC_RESUME_FULFILL, c);
         let on_r = self.realm.new_bound_native(N_ASYNC_RESUME_REJECT, c);
-        self.register_then(
-            inner,
-            NanBox::handle(on_f.to_raw()),
-            NanBox::handle(on_r.to_raw()),
-            false,
-        );
+        (NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw()))
+    }
+
+    fn await_resume(
+        &mut self,
+        v: NanBox,
+        (on_f, on_r): (NanBox, NanBox),
+    ) -> Result<(), crate::nbvm::HostError> {
+        let Some(sink) = on_f.as_handle().map(Handle::from_raw) else {
+            return Err(crate::nbvm::HostError::Fault);
+        };
+        // A primitive: PromiseResolve makes a promise already fulfilled with
+        // it, so PerformPromiseThen queues the reaction job at once.
+        if v.as_handle().is_none() {
+            self.microtasks.push_back(Job {
+                handler: on_f,
+                value: v,
+                result: sink,
+                fulfilled: true,
+                finally: false,
+                thenable: None,
+                cap: None,
+            });
+            return Ok(());
+        }
+        let inner = self.promise_resolve_checked(v).map_err(exec_to_host)?;
+        self.register_await_reaction(inner, on_f, on_r, sink);
         Ok(())
     }
 

@@ -1242,7 +1242,7 @@ impl Interp {
     /// `Await(undefined)` that `DisposeResources` performs for a resource with no
     /// dispose method.
     fn settle_after_tick(&mut self, p: Handle, value: NanBox, fulfilled: bool) {
-        self.microtasks.push(super::Job {
+        self.microtasks.push_back(super::Job {
             handler: NanBox::undefined(),
             value,
             result: p,
