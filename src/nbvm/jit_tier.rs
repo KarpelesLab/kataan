@@ -907,7 +907,9 @@ fn recompile(
             *h = c.callee_hint();
         }
     }
-    let mut new = crate::jit::JitProto::compile_generic_inlining(
+    // (And no speculative version for a loop whose fast version kept
+    // leaving it.)
+    let mut new = crate::jit::JitProto::compile_generic_respec(
         proto,
         &super::jit_generic_helpers(),
         &warm,
@@ -917,6 +919,7 @@ fn recompile(
                 .is_some_and(|p| !(p.is_async && !p.is_generator))
         },
         &|pc, _| inline_candidate(funcs, id, &hints, pc),
+        &old.spec_off(),
     )?;
     new.note_cold_calls(&cold_call_pcs(proto, &hints));
     new.set_generation(old.generation() + 1);

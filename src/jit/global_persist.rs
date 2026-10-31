@@ -44,6 +44,31 @@ pub(super) const EMPTY: u64 = u64::MAX;
 /// epoch, then one per slot.
 pub(super) const BODY_WORDS: usize = 1 + 8;
 
+/// The counters past the cache, each starting at zero: per region (the
+/// first [`COUNTERS`] of a body), how often a speculative region's integer
+/// version gave up (`LEN + region`), and how many times in a row an
+/// integer version's entry found a loop-carried value that is not an int32
+/// (`LEN + COUNTERS + region`): see `numeric::int32`; and how often (lately:
+/// halved at each of its back-edge polls) a speculative region's fast
+/// version left for its plain copy (`LEN + 2 * COUNTERS + region`): see
+/// `numeric::Spec`.
+pub(super) const COUNTERS: usize = 16;
+
+/// Byte offset of region `ri`'s bail counter.
+pub(super) fn counter_off(ri: usize) -> i32 {
+    off(LEN + ri)
+}
+
+/// Byte offset of region `ri`'s entry-failure counter.
+pub(super) fn entry_off(ri: usize) -> i32 {
+    off(LEN + COUNTERS + ri)
+}
+
+/// Byte offset of region `ri`'s speculative-leave counter.
+pub(super) fn leave_off(ri: usize) -> i32 {
+    off(LEN + 2 * COUNTERS + ri)
+}
+
 /// A body's persistent cache array (owned by its `JitProto`; the code holds
 /// its address).
 pub(super) struct Persist {
@@ -54,10 +79,23 @@ impl Persist {
     /// A fresh array, every entry and epoch empty.
     pub(super) fn new() -> Self {
         Self {
-            words: (0..LEN)
-                .map(|_| core::cell::UnsafeCell::new(EMPTY))
+            words: (0..LEN + 3 * COUNTERS)
+                .map(|w| core::cell::UnsafeCell::new(if w < LEN { EMPTY } else { 0 }))
                 .collect(),
         }
+    }
+
+    /// Region `ri`'s speculative-leave count ([`leave_off`]).
+    pub(super) fn leaves(&self, ri: usize) -> u64 {
+        self.words.get(LEN + 2 * COUNTERS + ri).map_or(0, |w| {
+            // SAFETY: the compiled code writes the word only while it runs,
+            // on this thread, which is not running it now (a back-edge poll
+            // or a call out of it reads it here).
+            #[allow(unsafe_code)]
+            unsafe {
+                *w.get()
+            }
+        })
     }
 
     /// The array's address (stable: the boxed slice never moves).

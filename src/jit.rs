@@ -2349,6 +2349,24 @@ fn inline_math_got(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
 /// Number, else to `miss` having changed nothing; the result (a Number;
 /// a NaN the canonical `nan`) is stored to `dst`. Arguments are read from
 /// the register file.
+/// [`emit_got_math`]'s check that register `callee` holds built-in `id`
+/// (through the site's identity memo at `site`), else to `miss`. Clobbers
+/// `rax` and `r11` only.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn emit_got_ident(a: &mut X64Assembler, id: u16, callee: u16, site: u64, miss: Label) {
+    use call_seq::r::{R11, RAX};
+    a.load_rax(i32::from(callee) * 8);
+    a.g_movabs(R11, site);
+    a.g_cmp_mem(RAX, R11, call_seq::IDENT_KEY);
+    a.jne(miss);
+    a.g_mem(true, &[0x83], 7, R11, call_seq::IDENT_STAMP);
+    a.raw(&[0xff]); // cmp qword [..], -1 (u64::MAX)
+    a.jne(miss);
+    a.g_mem(true, &[0x81], 7, R11, call_seq::IDENT_VALUE);
+    a.raw(&(i32::from(id) + 1).to_le_bytes()); // cmp qword [..], id + 1
+    a.jne(miss);
+}
+
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn emit_got_math(
     a: &mut X64Assembler,
@@ -2360,16 +2378,7 @@ fn emit_got_math(
 ) -> Option<()> {
     use call_seq::r::{R11, RAX};
     let disp = |r: u16| i32::from(r) * 8;
-    a.load_rax(disp(callee));
-    a.g_movabs(R11, site);
-    a.g_cmp_mem(RAX, R11, call_seq::IDENT_KEY);
-    a.jne(miss);
-    a.g_mem(true, &[0x83], 7, R11, call_seq::IDENT_STAMP);
-    a.raw(&[0xff]); // cmp qword [..], -1 (u64::MAX)
-    a.jne(miss);
-    a.g_mem(true, &[0x81], 7, R11, call_seq::IDENT_VALUE);
-    a.raw(&(i32::from(id) + 1).to_le_bytes()); // cmp qword [..], id + 1
-    a.jne(miss);
+    emit_got_ident(a, id, callee, site, miss);
     // Every argument a Number (so no conversion runs).
     for (&r, &p) in args.iter().zip(proven) {
         if !p {
@@ -3176,6 +3185,12 @@ pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::Str
     alloc::string::String::from("register / branch target out of range, or emit failure")
 }
 
+/// A generic-tier body as compiled: its code, its native-call entries'
+/// offsets, and its speculative loops' `(header, region)`
+/// (`tierup::TierUp::spec_regions`).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+type GenericCompiled = (JitFunction, (usize, usize), Vec<(usize, usize)>);
+
 /// A bytecode-VM function compiled to native code, callable from the VM with
 /// `NanBox` values. This is the end-to-end fast path: it owns the compiled
 /// machine code and performs the unbox→native→rebox round-trip with an integer
@@ -3971,6 +3986,22 @@ impl JitProto {
         plain: &dyn Fn(u32) -> bool,
         pick: &dyn Fn(usize, &crate::nbvm::Op) -> Vec<inline::Candidate<'a>>,
     ) -> Option<Self> {
+        Self::compile_generic_respec(proto, helpers, warm, plain, pick, &[])
+    }
+
+    /// [`compile_generic_inlining`](Self::compile_generic_inlining), with no
+    /// speculative version for the loops at the function's own header pcs
+    /// `no_spec` (an earlier body's that kept leaving theirs: see
+    /// [`Self::spec_off`]).
+    #[must_use]
+    pub fn compile_generic_respec<'a>(
+        proto: &crate::nbvm::FnProto,
+        helpers: &GenericHelpers,
+        warm: &[Option<crate::ic::WarmEntry>],
+        plain: &dyn Fn(u32) -> bool,
+        pick: &dyn Fn(usize, &crate::nbvm::Op) -> Vec<inline::Candidate<'a>>,
+        no_spec: &[usize],
+    ) -> Option<Self> {
         // The register `call_with_inner` puts `new.target` in, if any (a
         // native-call entry fills it from the call header; one at or below the
         // `this` slot would collide with an input, so such a body gets none).
@@ -4203,7 +4234,16 @@ impl JitProto {
         osr_entries.sort_unstable();
         osr_entries.dedup();
         let persist = global_persist::Persist::new();
-        let (func, native_entry) = JitFunction::compile_generic(
+        // (In the body's numbering.)
+        let no_spec_body: Vec<usize> = no_spec
+            .iter()
+            .filter_map(|&pc| match &pc_map {
+                Some(m) => m.0.get(pc).map(|&p| p as usize),
+                None => Some(pc),
+            })
+            .collect();
+        tier_up.spec_off = no_spec.to_vec();
+        let (func, native_entry, spec_heads) = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
             &ops,
@@ -4216,7 +4256,9 @@ impl JitProto {
             (proto.n_params, proto.n_captures, new_target),
             &inline_closures,
             pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
+            &no_spec_body,
         )?;
+        tier_up.spec_regions = spec_heads;
         Some(Self {
             func,
             n_params: proto.n_params,
@@ -6700,7 +6742,8 @@ impl JitFunction {
         (n_params, n_caps, new_target): (usize, usize, Option<usize>),
         inline_closures: &[bool],
         pc_orig: &[u32],
-    ) -> Option<(Self, (usize, usize))> {
+        no_spec: &[usize],
+    ) -> Option<GenericCompiled> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
             return None;
@@ -6809,6 +6852,7 @@ impl JitFunction {
                 global_ref: helpers.global_ref as usize as u64,
                 math1: helpers.math1 as usize as u64,
                 persist,
+                no_spec: no_spec.to_vec(),
                 realm: helpers.call_layout.realm,
                 layout: helpers.call_layout,
                 heap: layout,
@@ -6960,6 +7004,7 @@ impl JitFunction {
         // Per way, its receiver's `extra` part pointer, as a speculative
         // loop's site last loaded it (see `extra_in_frame`).
         let rc_extra = |w: usize| rc_base - 8 * (3 * w as i32 + 3);
+        num.set_rc_relied((0..ops.len()).map(|pc| typed::relied_on(&rc, pc)).collect());
         // A promoted loop's truthiness tests on objects go through their
         // ways (`numeric::TruthyWay`).
         num.set_truthy_ways(
@@ -7587,16 +7632,13 @@ impl JitFunction {
         // A speculative region's plain copy is emitted right after it
         // (`numeric::NumGen::schedule`).
         num.alloc_copy_labels(&mut a);
-        for (op_idx, copy) in num.schedule(ops.len()) {
+        for (op_idx, pass) in num.schedule(ops.len()) {
             let op = &ops[op_idx];
             a.dbg_op = Some(op_idx);
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
-            num.set_copy(copy);
-            if copy {
-                a.bind(num.copy_label(op_idx)?);
-            } else {
-                a.bind(labels[op_idx]);
-            }
+            // (The body, a speculative region's plain copy, or its integer
+            // version: `numeric::NumGen::schedule`.)
+            a.bind(num.begin_op(&labels, op_idx, pass)?);
             // A global binding read or write through the global binding
             // cache: the cached address, else (out of line) a fresh one from
             // `jit_helper_global_ref`, else the interpreter.
@@ -7876,6 +7918,7 @@ impl JitFunction {
                             new_way,
                             poly,
                             proved: proved_slot[op_idx].map(inl_proved),
+                            keep: &num.guard_keep(op_idx),
                             fused_miss: match ops.get(op_idx + 1) {
                                 _ if cold_miss.is_some() => cold_miss.map(|c| c.0),
                                 Some(&GenericOp::JumpIfFalse { target, .. })
@@ -7955,6 +7998,14 @@ impl JitFunction {
                         if !ok(dst) || !ok(recv) || margs.iter().any(|&m| !ok(m)) {
                             return None;
                         }
+                        // (`Math.imul`'s promoted arguments into the
+                        // register file, which every path but the integer
+                        // version's own reads: `numeric::int_math_op`.)
+                        if margs.len() == 2 && !num.int_math_at(op_idx) {
+                            for &m in margs.iter() {
+                                num.operand_xmm(&mut a, op_idx, m, false);
+                            }
+                        }
                         let fill = a.new_label();
                         let general = a.new_label();
                         let nan = a.new_label();
@@ -8012,6 +8063,11 @@ impl JitFunction {
                         a.p_is_native(&layout, helpers.call_layout.realm, native_id, general);
                         a.g_store(call_seq::r::RBP, m_slot(mi, 2), call_seq::r::R9);
                         a.bind(proven);
+                        // In a speculative region's integer version, over
+                        // its int registers.
+                        if num.emit_int_math(&mut a, op_idx)? {
+                            a.jmp(done);
+                        }
                         for &m in margs.iter() {
                             if !num.is_number_at(op_idx, m) {
                                 a.movabs_r11(QNAN as i64);
@@ -10408,14 +10464,29 @@ impl JitFunction {
                         let call = bail.unwrap_or_else(|| a.new_label());
                         let proven: Vec<bool> =
                             args.iter().map(|&r| num.is_number_at(op_idx, r)).collect();
-                        emit_got_math(
-                            &mut a,
-                            (id, f),
-                            (callee, args, &proven, dst),
-                            site_ptr as u64,
-                            canonical_nan,
-                            call,
-                        )?;
+                        // (`Math.imul`'s promoted arguments into the
+                        // register file, which every path but the integer
+                        // version's own reads: `numeric::int_math_op`.)
+                        if args.len() == 2 && !num.int_math_at(op_idx) {
+                            for &m in args.iter() {
+                                num.operand_xmm(&mut a, op_idx, m, false);
+                            }
+                        }
+                        // In a speculative region's integer version: the
+                        // built-in, then over its int registers.
+                        if num.int_math_at(op_idx) {
+                            emit_got_ident(&mut a, id, callee, site_ptr as u64, call);
+                            num.emit_int_math(&mut a, op_idx)?;
+                        } else {
+                            emit_got_math(
+                                &mut a,
+                                (id, f),
+                                (callee, args, &proven, dst),
+                                site_ptr as u64,
+                                canonical_nan,
+                                call,
+                            )?;
+                        }
                         a.jmp(done);
                         if bail.is_none() {
                             a.bind(call);
@@ -10532,6 +10603,9 @@ impl JitFunction {
             if let Some(l) = past_reload.or(ool_past) {
                 a.bind(l);
             }
+            // (In a speculative region's integer version: its int registers
+            // back, `numeric::NumGen::int_save`.)
+            num.after_generic_op(&mut a);
         }
         num.set_copy(false);
         a.dbg_op = None;
@@ -10858,7 +10932,8 @@ impl JitFunction {
                 let _ = std::fs::write(bin, &code);
             }
         }
-        f.map(|f| (f, (at[0], at[1])))
+        let spec_heads = num.spec_heads();
+        f.map(|f| (f, (at[0], at[1]), spec_heads))
     }
 
     /// Wraps already-emitted machine `code` into a callable region (the entry

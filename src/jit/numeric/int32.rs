@@ -39,7 +39,7 @@
 //! validation) they are converted into the register file and reloaded after;
 //! the interpreter, the helpers and the collector see exact Numbers.
 
-use super::{CC_E, CC_NE, NumGen, RAX, RCX, RDX, Region, StubKind, def_use, disp};
+use super::{CC_AE, CC_E, CC_NE, NumGen, RAX, RCX, RDX, Region, StubKind, def_use, disp};
 use super::{GenericOp, Label, X64Assembler};
 use crate::nanbox::NanBox;
 use crate::nbvm::Op;
@@ -51,6 +51,14 @@ mod elems;
 /// never touched by the emitters' fast paths (`rax`/`rcx`/`rdx`/`r11` are
 /// their scratch, `rbx`/`r15` are pinned).
 const GPRS: [u8; 5] = [6, 7, 8, 9, 10];
+
+/// How many times in a row an integer version's entry may find a
+/// loop-carried value that is not an int32 and have it tried again after an
+/// iteration elsewhere (`NumGen::entry_retry`).
+const ENTRY_RETRIES: i32 = 8;
+
+/// How many int GPRs there are (their save slots, `NumGen::int_save`).
+pub(super) const N_GPRS: usize = GPRS.len();
 
 /// x86 condition codes beyond the parent's.
 const CC_O: u8 = 0x0;
@@ -114,6 +122,12 @@ pub(super) struct PGlobal {
 }
 
 impl IntPlan {
+    /// Whether `r` is one of its int registers.
+    #[cfg(test)]
+    pub(super) fn has_int(&self, r: u16) -> bool {
+        self.ints.binary_search(&r).is_ok()
+    }
+
     /// Where the integer version's in-region branches to the header land.
     pub(super) fn inner(&self) -> Option<Label> {
         self.inner
@@ -154,7 +168,83 @@ pub(super) fn plan(
     n_regs: usize,
     dbl_xmm: &[u8],
     elems: bool,
+    spec: Option<&[(usize, usize, usize)]>,
+    live: &dyn Fn(usize, u16) -> bool,
 ) -> Option<IntPlan> {
+    // A speculative region's integer version (`spec`, with its guard
+    // diamonds as `(test, fallback, join)`, whose fallback arms neither fast
+    // version has): see `NumGen::emit_spec_int_op`.
+    let (spec, cold) = (spec.is_some(), spec.unwrap_or(&[]));
+    let arm_of = |pc: usize| cold.iter().find(|&&(_, f, e)| (f..e).contains(&pc));
+    // There, a temporary's int intervals are its **live ranges** in the
+    // fast versions: the runs of pcs where it is live or mentioned, or a
+    // branch carries its value across (so a value only flows within one
+    // run, which then holds one GPR), the fallback arms left out — a
+    // mention there counts at its guard (an arm is only reached through
+    // its test, so the register is live there, where the plain copy may
+    // be entered). Two inlined calls' bodies reusing one register window
+    // then hold their registers apart, as does a value dead in between.
+    let spec_info: Vec<(u16, usize, usize, u32, bool)>;
+    let info = if spec {
+        let mut v = Vec::new();
+        for &(r, first, last, m, w) in info {
+            if carried(r) {
+                v.push((r, first, last, m, w));
+                continue;
+            }
+            // (One mentioned only in fallback arms is no int register.)
+            if (head..=end)
+                .all(|pc| arm_of(pc).is_some() || !super::op_regs(&bytecode[pc]).contains(&r))
+            {
+                continue;
+            }
+            let n = end - head + 1;
+            let mut occ = alloc::vec![false; n];
+            for pc in head..=end {
+                if !super::op_regs(&bytecode[pc]).contains(&r) {
+                    if arm_of(pc).is_none() && live(pc, r) {
+                        occ[pc - head] = true;
+                    }
+                    continue;
+                }
+                match arm_of(pc) {
+                    Some(&(t, _, _)) => occ[t - 1 - head] = true,
+                    None => occ[pc - head] = true,
+                }
+            }
+            for pc in head..=end {
+                if arm_of(pc).is_some() {
+                    continue;
+                }
+                let t = match bytecode[pc] {
+                    Op::Jump { target } | Op::JumpIfFalse { target, .. } => target,
+                    _ => continue,
+                };
+                if t > head && t <= end && arm_of(t).is_none() && live(t, r) {
+                    for o in &mut occ[pc.min(t) - head..=pc.max(t) - head] {
+                        *o = true;
+                    }
+                }
+            }
+            let mut i = 0;
+            while i < n {
+                if !occ[i] {
+                    i += 1;
+                    continue;
+                }
+                let s0 = i;
+                while i + 1 < n && occ[i + 1] {
+                    i += 1;
+                }
+                v.push((r, head + s0, head + i, m, w));
+                i += 1;
+            }
+        }
+        spec_info = v;
+        &spec_info[..]
+    } else {
+        info
+    };
     use crate::nbvm::{VB_LOOSE_EQ, VB_LOOSE_NEQ, VB_SHR, VB_USHR};
     let body = &bytecode[head..=end];
     // An element read's result is speculated an int32 only when bitwise
@@ -172,7 +262,10 @@ pub(super) fn plan(
                 return false;
             }
             seen.push(x);
-            for op in body {
+            for (i, op) in body.iter().enumerate() {
+                if arm_of(head + i).is_some() {
+                    continue;
+                }
                 def_use(op, &mut d, &mut u);
                 if !u.contains(&x) {
                     continue;
@@ -181,6 +274,9 @@ pub(super) fn plan(
                     Op::ValueBin { op, .. } if (1..=VB_USHR).contains(op) => {}
                     Op::GetKey { key, obj, .. } if *key == x && *obj != x => {}
                     Op::Move { dst, .. } => work.push(*dst),
+                    // (`Math.imul`, which takes its `ToInt32`.)
+                    Op::CallMethod { .. } | Op::CallWithMethod { .. }
+                        if spec && super::int_math_op(op).is_some() => {}
                     _ => return false,
                 }
             }
@@ -225,7 +321,8 @@ pub(super) fn plan(
     let free_xmm: Vec<u8> = (super::FIRST_XMM..super::FIRST_XMM + super::MAX_PROMOTED as u8)
         .filter(|x| !dbl_xmm.contains(x))
         .collect();
-    if !promote
+    if spec
+        || !promote
         || gnames.len() > 4
         || gnames.len() > free_xmm.len()
         || n_regs + gnames.len() > 0xffff
@@ -253,8 +350,31 @@ pub(super) fn plan(
     }
     let info = &info_v[..];
     let carried = |r: u16| (r as usize) >= n_regs || carried(r);
-    let mut defs: Vec<(u16, Vec<usize>)> = info.iter().map(|x| (x.0, Vec::new())).collect();
+    let mut defs: Vec<(u16, Vec<usize>)> = Vec::new();
+    for x in info {
+        if !defs.iter().any(|e| e.0 == x.0) {
+            defs.push((x.0, Vec::new()));
+        }
+    }
     for (i, op) in body.iter().enumerate() {
+        if spec {
+            // (Every register any op of the fast versions writes: the
+            // generic emitter's ops too, whose results are never int
+            // registers.)
+            if arm_of(head + i).is_some() {
+                continue;
+            }
+            let (mut d, mut u) = (Vec::new(), Vec::new());
+            def_use(op, &mut d, &mut u);
+            d.sort_unstable();
+            d.dedup();
+            for r in d {
+                if let Some(e) = defs.iter_mut().find(|e| e.0 == r) {
+                    e.1.push(head + i);
+                }
+            }
+            continue;
+        }
         let d = match op {
             Op::StoreGlobal { name, .. } => vreg_of(name),
             Op::GetKey { dst, .. } | Op::ArrayLen { dst, .. } if elems => Some(*dst),
@@ -275,10 +395,16 @@ pub(super) fn plan(
     // register initialized before the loop with a non-int32 number constant,
     // directly or through a move, will not pass them.
     let outside = |pc: usize| pc < head || pc > end;
+    // (A uint32 constant, `h = 0x811c9dc5`, becomes an int32 once the loop
+    // writes it, and an entry that finds it tries again after an iteration:
+    // `NumGen::entry_retry`.)
     let dbl_const = |r: u16| {
-        bytecode.iter().any(
-            |op| matches!(op, Op::LoadConst { dst, value } if *dst == r && value.is_number() && const_i32(*value).is_none()),
-        )
+        bytecode.iter().any(|op| {
+            matches!(op, Op::LoadConst { dst, value } if *dst == r
+                && value.as_number().is_some_and(|n| {
+                    const_i32(*value).is_none() && !(n > 0.0 && n < 4_294_967_296.0 && f64::from(n as u32) == n)
+                }))
+        })
     };
     let starts_double = |r: u16| {
         bytecode.iter().enumerate().any(|(pc, op)| {
@@ -296,6 +422,7 @@ pub(super) fn plan(
         .filter(|&r| !(carried(r) && starts_double(r)))
         .collect();
     cset.sort_unstable();
+    cset.dedup();
     let mut du_d = Vec::new();
     let mut du_u = Vec::new();
     loop {
@@ -304,7 +431,11 @@ pub(super) fn plan(
         loop {
             let c = cset.clone();
             let inn = |r: u16| c.binary_search(&r).is_ok();
-            let int_def = |op: &Op| match op {
+            // (A `Math.imul` argument may also be a constant: its bits.)
+            let imul_arg = |r: u16, pc: usize| {
+                inn(r) || super::const_int32_bits(&|q| bytecode.get(q), head, end, r, pc).is_some()
+            };
+            let int_def = |pc: usize, op: &Op| match op {
                 Op::LoadConst { value, .. } => const_i32(*value).is_some(),
                 Op::Move { src, .. } => inn(*src),
                 Op::Add { a, b, .. }
@@ -312,16 +443,24 @@ pub(super) fn plan(
                 | Op::Sub { a, b, .. }
                 | Op::Mul { a, b, .. }
                 | Op::Mod { a, b, .. } => inn(*a) && inn(*b),
-                Op::ValueBin { op, .. } => (1..=VB_SHR).contains(op) || (elems && *op == VB_USHR),
+                Op::ValueBin { op, .. } => {
+                    (1..=VB_SHR).contains(op) || ((elems || spec) && *op == VB_USHR)
+                }
                 Op::ToNumeric { src, .. } | Op::Step { src, .. } | Op::Neg { a: src, .. } => {
                     inn(*src)
                 }
-                Op::GetKey { dst, .. } => elems && elem_reader_ok(*dst),
-                Op::ArrayLen { .. } => elems,
+                // (In a speculative region's, checked after the generic
+                // emitter's read: `NumGen::int_post`.)
+                Op::GetKey { dst, .. } => (elems || spec) && elem_reader_ok(*dst),
+                Op::ArrayLen { .. } => elems || spec,
                 // A promoted global reads / writes its pseudo-register.
-                Op::LoadGlobal { name, .. } => vreg_of(name).is_none_or(inn),
+                Op::LoadGlobal { name, .. } => !spec && vreg_of(name).is_none_or(inn),
                 Op::StoreGlobal { src, .. } => inn(*src),
                 Op::BitNot { .. } => true,
+                // `Math.imul` over int registers (`NumGen::emit_int_math`).
+                Op::CallMethod { .. } | Op::CallWithMethod { .. } if spec => {
+                    super::int_math_op(op).is_some_and(|(x, y)| imul_arg(x, pc) && imul_arg(y, pc))
+                }
                 _ => false,
             };
             let useful = |r: u16, du_d: &mut Vec<u16>, du_u: &mut Vec<u16>| {
@@ -347,7 +486,12 @@ pub(super) fn plan(
                         Op::Lt { a, b, .. } | Op::StrictEq { a, b, .. } => inn(*a) && inn(*b),
                         Op::Compare { op, a, b, .. } => *op <= 3 && inn(*a) && inn(*b),
                         // An element read's index.
-                        Op::GetKey { key, obj, .. } => elems && *key == r && *obj != r,
+                        Op::GetKey { key, obj, .. } => (elems || spec) && *key == r && *obj != r,
+                        Op::CallMethod { dst, .. } | Op::CallWithMethod { dst, .. }
+                            if spec && super::int_math_op(op).is_some() =>
+                        {
+                            inn(*dst)
+                        }
                         _ => super::written_reg(op).is_some_and(inn),
                     }
                 })
@@ -357,7 +501,7 @@ pub(super) fn plan(
                 .copied()
                 .filter(|&r| {
                     let ds = defs_of(r);
-                    if !ds.iter().all(|&pc| int_def(&bytecode[pc])) {
+                    if !ds.iter().all(|&pc| int_def(pc, &bytecode[pc])) {
                         return false;
                     }
                     let speculative = carried(r)
@@ -377,7 +521,7 @@ pub(super) fn plan(
             return None;
         }
         // Constant temporaries need no register.
-        let mut consts = Vec::new();
+        let mut consts: Vec<(u16, i32, usize, usize)> = Vec::new();
         for x in info {
             let ds = defs_of(x.0);
             if cset.binary_search(&x.0).is_ok()
@@ -389,10 +533,39 @@ pub(super) fn plan(
                 consts.push((x.0, v, x.1, x.2));
             }
         }
+        if spec {
+            // So is a live range (`spec_info`) whose one def is a move of a
+            // constant (an inlined call's constant argument), to a fixpoint.
+            loop {
+                let before = consts.len();
+                for x in info {
+                    if !cset.binary_search(&x.0).is_ok()
+                        || carried(x.0)
+                        || consts.iter().any(|c| c.0 == x.0 && c.2 == x.1)
+                    {
+                        continue;
+                    }
+                    let ds: Vec<usize> = defs_of(x.0)
+                        .iter()
+                        .copied()
+                        .filter(|&pc| x.1 <= pc && pc <= x.2)
+                        .collect();
+                    if let [d] = ds[..]
+                        && let Op::Move { src, .. } = bytecode[d]
+                        && let Some(c) = consts.iter().find(|c| c.0 == src && c.2 <= d && d <= c.3)
+                    {
+                        consts.push((x.0, c.1, x.1, x.2));
+                    }
+                }
+                if consts.len() == before {
+                    break;
+                }
+            }
+        }
         // Allocate GPRs: carried registers pinned (most used first), then the
         // temporaries by a linear scan over their live intervals.
         let needs = |x: &&(u16, usize, usize, u32, bool)| {
-            cset.binary_search(&x.0).is_ok() && !consts.iter().any(|c| c.0 == x.0)
+            cset.binary_search(&x.0).is_ok() && !consts.iter().any(|c| c.0 == x.0 && c.2 == x.1)
         };
         let mut carried_v: Vec<&(u16, usize, usize, u32, bool)> =
             info.iter().filter(needs).filter(|x| carried(x.0)).collect();
@@ -462,6 +635,7 @@ pub(super) fn plan(
             | Op::Step { dst, .. }
             | Op::ValueBin { dst, .. } => inn(*dst),
             Op::Lt { a, b, .. } | Op::Compare { a, b, .. } => inn(*a) && inn(*b),
+            Op::CallMethod { dst, .. } | Op::CallWithMethod { dst, .. } => spec && inn(*dst),
             _ => false,
         }) || !gnames.is_empty();
         if !benefit {
@@ -501,11 +675,18 @@ pub(super) fn plan(
         // bitwise ops or other wrapped ops, with nothing but constants, those,
         // in between (nothing else can bail or flush while a wrapped value is
         // live: it is not the true Number).
-        let cval = |r: u16| consts.iter().find(|c| c.0 == r).map(|c| c.1);
+        // (A register's constant when every live range of it is that one.)
+        let cval = |r: u16| {
+            let c = consts.iter().find(|c| c.0 == r)?.1;
+            info.iter()
+                .filter(|x| x.0 == r)
+                .all(|x| consts.iter().any(|k| k.0 == r && k.2 == x.1 && k.1 == c))
+                .then_some(c)
+        };
         // (In `elems` mode an element read's or a `>>>`'s value may be held
         // as its `ToInt32` bits the same way: `IntPlan::wrap_bits`.)
         let bits_op = |op: &Op| {
-            elems
+            (elems || spec)
                 && match op {
                     Op::GetKey { dst, .. } => Some(*dst),
                     Op::ValueBin { op, dst, .. } if *op == VB_USHR => Some(*dst),
@@ -575,7 +756,7 @@ pub(super) fn plan(
                     let Some(d) = d else {
                         return false;
                     };
-                    let Some(x) = info.iter().find(|x| x.0 == d) else {
+                    let Some(x) = info.iter().find(|x| x.0 == d && x.1 <= p && p <= x.2) else {
                         return false;
                     };
                     bound.iter().any(|b| b.0 == d)
@@ -597,7 +778,7 @@ pub(super) fn plan(
         }
         let (wrap_bits, wraps): (Vec<usize>, Vec<usize>) =
             wraps.into_iter().partition(|&p| bits_op(&bytecode[p]));
-        if elems {
+        if elems || spec {
             // A `>>>` result that is not held as bits is not an int32.
             let lost: Vec<u16> = body
                 .iter()
@@ -615,6 +796,8 @@ pub(super) fn plan(
                 cset.retain(|r| !lost.contains(r));
                 continue;
             }
+        }
+        if elems {
             // Every element / `.length` read's result, and every element
             // read's index, an int register: else the double versions.
             let all = body.iter().all(|op| match op {
@@ -647,7 +830,7 @@ impl NumGen {
 
     /// Whether register `r` is an int register of the integer version being
     /// emitted (or whose stub is).
-    pub(super) fn is_int(&self, r: u16) -> bool {
+    pub(crate) fn is_int(&self, r: u16) -> bool {
         self.iplan()
             .is_some_and(|p| p.ints.binary_search(&r).is_ok())
     }
@@ -656,7 +839,7 @@ impl NumGen {
     fn ik(&self, r: u16) -> Option<IK> {
         let p = self.iplan()?;
         let pc = self.cur_pc;
-        if let Some(c) = p.consts.iter().find(|c| c.0 == r) {
+        if let Some(c) = p.consts.iter().find(|c| c.0 == r && c.2 <= pc && pc <= c.3) {
             return Some(IK::Imm(c.1));
         }
         p.slots
@@ -972,6 +1155,10 @@ impl NumGen {
         }
         self.cur_pc = head;
         a.bind(entry);
+        // A value not an int32 runs an iteration of the double version, whose
+        // back-edge tries again (`entry_retry`).
+        let efail = self.entry_retry(a, ri, dbl_entry, dbl_entry);
+        let p = self.regions[ri].int.as_ref()?;
         // Entry: the promoted globals' bindings must qualify (before anything is
         // loaded: these are calls), every carried int register must be an exact
         // int32 now.
@@ -980,7 +1167,7 @@ impl NumGen {
             if s.carried && !self.is_greg(s.reg) {
                 a.load_rax(disp(s.reg));
                 a.exact_i32_check(RCX);
-                a.jcc(CC_NE, dbl_entry);
+                a.jcc(CC_NE, efail);
                 a.mov32_rr(s.gpr, RCX);
             }
         }
@@ -989,7 +1176,8 @@ impl NumGen {
                 a.movsd_x_mem(s.xmm, disp(s.reg));
             }
         }
-        self.gload(a, p, dbl_entry);
+        self.gload(a, p, efail);
+        self.entry_ok(a, ri);
         self.refresh_globals(a, ri, false);
         let inner = ilabels[head];
         a.bind(inner);
@@ -1029,10 +1217,10 @@ impl NumGen {
         let ii = |s: &Self, r: u16| s.is_int(r);
         match ops[pc] {
             // (`elems`: only planned with int results.)
-            GenericOp::GetElem { dst, obj, index } if ii(self, dst) => {
+            GenericOp::GetElem { dst, obj, index } if ii(self, dst) && !self.spec_int_mode() => {
                 self.iget_elem(a, dst, obj, index)?;
             }
-            GenericOp::ArrayLen { dst, arr } if ii(self, dst) => {
+            GenericOp::ArrayLen { dst, arr } if ii(self, dst) && !self.spec_int_mode() => {
                 self.iarray_len(a, dst, arr)?;
             }
             GenericOp::Const { dst, .. } if ii(self, dst) => {
@@ -1044,8 +1232,9 @@ impl NumGen {
                 }
             }
             GenericOp::Move { dst, src } if ii(self, dst) => {
+                // (A constant live range: the move of its constant, nothing.)
                 let IK::Gpr(d) = self.ik(dst)? else {
-                    return None;
+                    return Some(true);
                 };
                 let s = self.ival(a, src, RAX)?;
                 a.mov32_rr(d, s);
@@ -1174,6 +1363,18 @@ impl NumGen {
                 a.cmp_rax_r11();
                 a.je(self.leave_exit?);
                 a.store_rax_frame8(super::COUNTDOWN);
+                if self.regions[ri].spec_int {
+                    // As the speculative version's back-edge: the global
+                    // bindings validated again (else the plain copy runs on,
+                    // the register file up to date), the views hoisted.
+                    self.refresh_globals(a, ri, true);
+                    self.spec_globals_ready(a, ri, target)?;
+                    self.hoist_views(a, ri);
+                    self.ireload(a, ri);
+                    a.bind(skip);
+                    a.jmp(inner);
+                    return Some(true);
+                }
                 let p = self.regions[ri].int.as_ref()?;
                 let has_globals = !p.globals.is_empty();
                 let (vfail, lfail) = (a.new_label(), a.new_label());
@@ -1272,7 +1473,7 @@ impl NumGen {
                     a.bind(resume);
                     self.stub(stub, resume, reg, StubKind::GlobalRef { pc, retry });
                 }
-                Op::StoreGlobal { src, .. } if ii(self, src) => {
+                Op::StoreGlobal { src, .. } if ii(self, src) && !self.spec_int_mode() => {
                     let k = *self.gslot.get(pc)?;
                     if k == u32::MAX {
                         return None;
@@ -1543,6 +1744,449 @@ impl NumGen {
             }
         }
         Some(())
+    }
+}
+
+/// A speculative region's **integer version** (`NumGen::emit_spec_int_op`).
+///
+/// A loop whose calls are all inlined (or are `Math` functions computed
+/// inline) has a speculative double version ([`super::Spec`]) and a plain
+/// copy; it may have an integer version as well, emitted as a pass of the
+/// generic emitter (`NumGen::schedule`) between the two, so that the
+/// generic emitter's ops (an inlined call's guard, a property read, ...)
+/// run in it as in the speculative version, and the numeric ops as the
+/// integer version runs them. It is the speculative version with int
+/// registers:
+///
+/// - its entry checks are the speculative version's (global bindings,
+///   field facts, guard misses, hoisted views, the registers assumed
+///   Numbers) and the integer version's (each carried int register an
+///   exact int32, else the speculative version runs), and its bail
+///   counter is under [`super::INT_BAIL_LIMIT`];
+/// - every bail (an int check failing, a slow path) leaves for the op in
+///   the plain copy, the register file written back as the speculative
+///   version's leaves do, and counts: the copy's back-edge enters the
+///   region again, so the next iteration tries the integer version again,
+///   until the count says it keeps failing;
+/// - the generic emitter's code may use any caller-saved register, so the
+///   int registers live at its op are saved in frame slots before it and
+///   reloaded after it (a leave from inside it reloads them first).
+///
+/// A guard's miss, a property read's miss and every other slow path of the
+/// generic emitter's leave for the plain copy as in the speculative version
+/// (through the integer version's write-back).
+impl NumGen {
+    /// Whether the integer version being emitted is a speculative region's.
+    fn spec_int_mode(&self) -> bool {
+        self.imode.is_some_and(|ri| self.regions[ri].spec_int)
+    }
+
+    /// The int slots live at `pc`, as `(gpr, its save slot index)`.
+    fn live_int_gprs(&self, pc: usize) -> Vec<(u8, usize)> {
+        let Some(p) = self.iplan() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(u8, usize)> = p
+            .slots
+            .iter()
+            .filter(|s| s.start <= pc && pc <= s.end)
+            .filter_map(|s| GPRS.iter().position(|&g| g == s.gpr).map(|i| (s.gpr, i)))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Before the generic emitter's code for op `pc` of a speculative
+    /// region's integer version: the int GPRs live there into their save
+    /// slots.
+    fn int_save(&self, a: &mut X64Assembler, pc: usize) {
+        for (g, i) in self.live_int_gprs(pc) {
+            a.g_store(super::super::call_seq::r::RBP, self.int_save_disp(i), g);
+        }
+    }
+
+    /// The int GPRs live at `pc` back from their save slots.
+    pub(super) fn int_restore(&self, a: &mut X64Assembler, pc: usize) {
+        for (g, i) in self.live_int_gprs(pc) {
+            a.g_load(g, super::super::call_seq::r::RBP, self.int_save_disp(i));
+        }
+    }
+
+    /// After the generic emitter's code for an op (any op): in a speculative
+    /// region's integer version, the int registers it saved come back.
+    pub(crate) fn after_generic_op(&mut self, a: &mut X64Assembler) {
+        self.int_saved = false;
+        self.int_math = None;
+        if core::mem::take(&mut self.int_reload) {
+            // (Those it reads last need not, nor its result.)
+            let pc = self.cur_pc;
+            let Some(p) = self.iplan() else {
+                return;
+            };
+            let mut back: Vec<(u8, usize)> = p
+                .slots
+                .iter()
+                .filter(|s| s.carried || (s.start < pc && s.end > pc))
+                .filter_map(|s| GPRS.iter().position(|&g| g == s.gpr).map(|i| (s.gpr, i)))
+                .collect();
+            back.sort_unstable();
+            back.dedup();
+            for (g, i) in back {
+                a.g_load(g, super::super::call_seq::r::RBP, self.int_save_disp(i));
+            }
+        }
+        if let Some(dst) = self.int_post.take() {
+            // The value read, where the double version keeps it: an exact
+            // int32 into its int register, else (the op done) the rest of
+            // the iteration in the plain copy, from the next op.
+            let pc = self.cur_pc;
+            let Some(IK::Gpr(d)) = self.ik(dst) else {
+                return;
+            };
+            match self.xmm_of(self.imode, dst) {
+                Some(x) => a.movq_gpr_x(RAX, x),
+                None => a.load_rax(disp(dst)),
+            }
+            if self.iplan().is_some_and(|p| p.wrap_bits.contains(&pc)) {
+                // Held as its `ToInt32` bits (`IntPlan::wrap_bits`): any
+                // integral value below 2^63 in magnitude (the low 32 bits of
+                // its exact truncation).
+                a.movq_x_gpr(0, RAX);
+                a.cvttsd2si_gpr_x(RCX, 0);
+                a.cvtsi2sd_x_gpr(0, RCX);
+                a.movq_gpr_x(R11, 0);
+                a.cmp_rax_r11();
+            } else {
+                a.exact_i32_check(RCX);
+            }
+            let entry = a.new_label();
+            let resume = a.new_label();
+            a.jcc(CC_NE, entry);
+            a.mov32_rr(d, RCX);
+            a.bind(resume);
+            self.stub(
+                entry,
+                resume,
+                self.imode,
+                StubKind::PostBail {
+                    pc: pc as u32 + 1,
+                    dst,
+                },
+            );
+        }
+    }
+
+    /// A [`StubKind::PostBail`]: the int register `dst`'s value (its bits
+    /// in `rax`) into the register file over the write-back at `pc`, which
+    /// the plain copy then runs from. Counted as a bail.
+    pub(super) fn emit_post_bail(&mut self, a: &mut X64Assembler, ri: usize, pc: usize, dst: u16) {
+        a.movq_x_gpr(1, RAX);
+        self.cur_pc = pc;
+        self.iflush(a, ri);
+        a.movsd_mem_x(disp(dst), 1);
+        let r11 = super::super::call_seq::r::R11;
+        a.g_movabs(r11, self.env.persist);
+        a.g_inc_mem(r11, super::super::global_persist::counter_off(ri));
+        if let Some(l) = self.copy_label(pc) {
+            a.jmp(l);
+        }
+    }
+
+    /// Whether op `pc`'s `Math.imul` is the integer version's
+    /// ([`Self::emit_int_math`]).
+    pub(crate) fn int_math_at(&self, pc: usize) -> bool {
+        self.int_math == Some(pc)
+    }
+
+    /// In the generic emitter's code for op `pc`, once it has found the
+    /// built-in: `Math.imul` of int registers into its int register
+    /// (`true`), their values from their save slots (`int_save`), as the
+    /// code before may have clobbered their GPRs. `false` anywhere else.
+    pub(crate) fn emit_int_math(&self, a: &mut X64Assembler, pc: usize) -> Option<bool> {
+        if self.int_math != Some(pc) {
+            return Some(false);
+        }
+        let (x, y) = super::int_math_op(self.bc(pc)?)?;
+        let (Some(Op::CallMethod { dst, .. }) | Some(Op::CallWithMethod { dst, .. })) = self.bc(pc)
+        else {
+            return None;
+        };
+        let (head, end) = {
+            let r = &self.regions[self.imode?];
+            (r.head, r.end)
+        };
+        for (r, g) in [(x, RAX), (y, RCX)] {
+            if !self.is_int(r) {
+                let bits = super::const_int32_bits(&|q| self.bc(q), head, end, r, pc)?;
+                a.mov32_imm(g, bits);
+                continue;
+            }
+            match self.ik(r)? {
+                IK::Imm(v) => a.mov32_imm(g, v),
+                IK::Gpr(s) if self.int_reload => {
+                    let i = GPRS.iter().position(|&q| q == s)?;
+                    a.g_load(g, super::super::call_seq::r::RBP, self.int_save_disp(i));
+                }
+                IK::Gpr(s) => a.mov32_rr(g, s),
+            }
+        }
+        a.imul32_rr(RAX, RCX);
+        let IK::Gpr(d) = self.ik(*dst)? else {
+            return None;
+        };
+        a.mov32_rr(d, RAX);
+        Some(true)
+    }
+
+    /// Int register `r` (live at the current pc) into the register file.
+    pub(super) fn int_to_file(&self, a: &mut X64Assembler, r: u16) {
+        if self.icvt(a, 0, r).is_some() {
+            a.movsd_mem_x(disp(r), 0);
+        }
+    }
+
+    /// At an integer version's entry: unless region `ri`'s entries have
+    /// found a loop-carried value that is not an int32 [`ENTRY_RETRIES`]
+    /// times in a row (then to `off`), on into the entry's checks; returns
+    /// where a failed one goes — counted, then to `retry` (one iteration
+    /// elsewhere, after which the region's integer version is tried
+    /// again: a hash's `h = 0x811c9dc5` or a CRC's `c = 0xffffffff` is a
+    /// uint32 before the first iteration and an int32 after it). Clobbers
+    /// `r11`.
+    fn entry_retry(&self, a: &mut X64Assembler, ri: usize, off: Label, retry: Label) -> Label {
+        if self.env.persist == 0 || ri >= super::super::global_persist::COUNTERS {
+            return off;
+        }
+        let efail = a.new_label();
+        let r11 = super::super::call_seq::r::R11;
+        let eoff = super::super::global_persist::entry_off(ri);
+        let checks = a.new_label();
+        a.g_movabs(r11, self.env.persist);
+        a.g_mem(true, &[0x81], 7, r11, eoff);
+        a.raw(&ENTRY_RETRIES.to_le_bytes());
+        a.jcc(CC_AE, off);
+        a.jmp(checks);
+        a.bind(efail);
+        a.g_movabs(r11, self.env.persist);
+        a.g_inc_mem(r11, eoff);
+        a.jmp(retry);
+        a.bind(checks);
+        efail
+    }
+
+    /// Past an integer version's entry checks: their failures in a row are
+    /// none. Clobbers `r11`.
+    fn entry_ok(&self, a: &mut X64Assembler, ri: usize) {
+        if self.env.persist == 0 || ri >= super::super::global_persist::COUNTERS {
+            return;
+        }
+        let r11 = super::super::call_seq::r::R11;
+        a.g_movabs(r11, self.env.persist);
+        a.g_store_imm32(r11, super::super::global_persist::entry_off(ri), 0);
+    }
+
+    /// At the back-edge of region `ri`'s double version (not a speculative
+    /// region's, the register file not yet written back, the promoted
+    /// registers live): when its integer version's entry failed for a
+    /// value and asked to be tried again ([`Self::entry_retry`]), write the
+    /// registers back and enter it; else fall through. Clobbers `rax`,
+    /// `r11`.
+    pub(super) fn retry_int(&self, a: &mut X64Assembler, ri: usize) -> Option<()> {
+        let rg = &self.regions[ri];
+        let entry = match rg.int.as_ref() {
+            Some(p) if !rg.spec_int => p.entry?,
+            _ => return Some(()),
+        };
+        if self.env.persist == 0 || ri >= super::super::global_persist::COUNTERS {
+            return Some(());
+        }
+        let r11 = super::super::call_seq::r::R11;
+        let eoff = super::super::global_persist::entry_off(ri);
+        let stay = a.new_label();
+        a.g_movabs(r11, self.env.persist);
+        a.g_load(RAX, r11, eoff);
+        a.test_rax_rax();
+        a.jcc(CC_E, stay);
+        a.g_mem(true, &[0x81], 7, r11, eoff);
+        a.raw(&ENTRY_RETRIES.to_le_bytes());
+        a.jcc(CC_AE, stay);
+        self.flush(a, Some(ri));
+        a.jmp(entry);
+        a.bind(stay);
+        Some(())
+    }
+
+    /// The entry of speculative region `ri`'s integer version (its header's
+    /// label just bound): see the type's docs. A failed speculative check
+    /// leaves for the plain copy, as the speculative version's own entry
+    /// does; a failed int check (or a bail count at its limit) enters the
+    /// speculative version.
+    pub(super) fn spec_int_entry(&mut self, a: &mut X64Assembler, ri: usize) -> Option<()> {
+        let head = self.regions[ri].head;
+        self.cur_pc = head;
+        let p = self.regions[ri].int.as_ref()?;
+        let dbl = p.dbl_entry?;
+        let copy = self.copy_label(head)?;
+        let r11 = super::super::call_seq::r::R11;
+        a.g_movabs(r11, self.env.persist);
+        a.g_mem(
+            true,
+            &[0x81],
+            7,
+            r11,
+            super::super::global_persist::counter_off(ri),
+        );
+        a.raw(&super::INT_BAIL_LIMIT.to_le_bytes());
+        a.jcc(CC_AE, dbl);
+        // A value not an int32 runs an iteration of the plain copy, whose
+        // back-edge enters the region again (`entry_retry`).
+        let efail = self.entry_retry(a, ri, dbl, copy);
+        self.refresh_globals(a, ri, true);
+        self.spec_globals_ready(a, ri, head)?;
+        self.hoist_views(a, ri);
+        let p = self.regions[ri].int.as_ref()?;
+        for s in &self.regions[ri].slots {
+            if s.carried && p.ints.binary_search(&s.reg).is_err() {
+                a.movsd_x_mem(s.xmm, disp(s.reg));
+            }
+        }
+        let checks: Vec<u16> = self.regions[ri].spec.as_ref()?.checks.clone();
+        for r in checks {
+            if !self.is_int(r) {
+                self.num_guard(a, Some(ri), r, copy);
+            }
+        }
+        let p = self.regions[ri].int.as_ref()?;
+        for s in &p.slots {
+            if s.carried {
+                a.load_rax(disp(s.reg));
+                a.exact_i32_check(RCX);
+                a.jcc(CC_NE, efail);
+                a.mov32_rr(s.gpr, RCX);
+            }
+        }
+        self.entry_ok(a, ri);
+        let inner = a.new_label();
+        a.bind(inner);
+        if let Some(p) = self.regions[ri].int.as_mut() {
+            p.inner = Some(inner);
+        }
+        Some(())
+    }
+
+    /// Op `pc` of a speculative region's integer version (`labels`: the
+    /// version's): as `emit_int_op` / the double emitter, else (`false`)
+    /// the generic emitter's, the int registers saved around it.
+    pub(super) fn emit_spec_int_op(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        throw_exit: Label,
+        pc: usize,
+        ops: &[GenericOp],
+        reg: Option<usize>,
+    ) -> Option<bool> {
+        if self.emit_int_op(a, labels, throw_exit, pc, ops)? {
+            return Some(true);
+        }
+        // An element or `.length` read of a hoisted view into an int
+        // register: no walk (`ihoisted_get`), unless a later site relies on
+        // the receiver cache this read fills (as the generic emitter's
+        // own typed path does not either, `typed::relied_on`).
+        match ops[pc] {
+            GenericOp::GetElem { dst, obj, index }
+                if self.is_int(dst)
+                    && self.is_int(index)
+                    && !self.rc_relied.get(pc).copied().unwrap_or(true)
+                    && let Some(v) = self.hoisted_view(pc, obj) =>
+            {
+                self.ihoisted_get(a, dst, obj, index, v)?;
+                return Some(true);
+            }
+            GenericOp::ArrayLen { dst, arr }
+                if self.is_int(dst)
+                    && !self.rc_relied.get(pc).copied().unwrap_or(true)
+                    && let Some(v) = self.hoisted_view(pc, arr) =>
+            {
+                self.ihoisted_len(a, dst, arr, v)?;
+                return Some(true);
+            }
+            _ => {}
+        }
+        // `Math.imul` into an int register: the generic emitter's code finds
+        // the built-in, then this emitter's computes (`emit_int_math`).
+        match self.bc(pc) {
+            // (Its built-in check clobbers no int GPR: `emit_got_ident`.)
+            Some(Op::CallWithMethod { dst, .. }) if self.is_int(*dst) => {
+                self.int_math = Some(pc);
+                return Some(false);
+            }
+            Some(Op::CallMethod { dst, .. }) if self.is_int(*dst) => {
+                self.int_save(a, pc);
+                self.int_saved = true;
+                self.int_reload = true;
+                self.int_math = Some(pc);
+                return Some(false);
+            }
+            _ => {}
+        }
+        // (An inlined call's guard reads only its callee, pinned; it stores
+        // its int arguments into the register file itself: `guard_args`.)
+        if !matches!(ops[pc], GenericOp::InlineGuard { .. }) {
+            self.ishadow_uses(a, pc)?;
+        }
+        if self.emit_dbl(a, labels, throw_exit, pc, ops, reg)? {
+            return Some(true);
+        }
+        if !super::generic_region_op(&ops[pc], self.bc(pc)?) {
+            return None;
+        }
+        // An element or `.length` read into an int register: the generic
+        // emitter's read, then checked (`after_generic_op`).
+        if let GenericOp::GetElem { dst, .. } | GenericOp::ArrayLen { dst, .. } = ops[pc]
+            && self.is_int(dst)
+        {
+            self.int_post = Some(dst);
+        }
+        // (Code that keeps the int GPRs needs no save; an inlined call's
+        // guard saves them itself, around what may clobber them:
+        // `guard_keep`.)
+        match ops[pc] {
+            // (`rcx` / `rax` only.)
+            GenericOp::InlineLeave | GenericOp::PlainPrims { .. } => {}
+            GenericOp::InlineGuard { .. } => self.int_saved = true,
+            _ => {
+                self.int_save(a, pc);
+                self.int_saved = true;
+                self.int_reload = true;
+            }
+        }
+        Some(false)
+    }
+
+    /// For the inlined call's guard at `pc`: the int GPRs it keeps (in a
+    /// speculative region's integer version), as `(gpr, save slot)`.
+    pub(crate) fn guard_keep(&self, pc: usize) -> Vec<(u8, i32)> {
+        if !self.int_saved || !self.spec_int_mode() {
+            return Vec::new();
+        }
+        self.live_int_gprs(pc)
+            .into_iter()
+            .map(|(g, i)| (g, self.int_save_disp(i)))
+            .collect()
+    }
+
+    /// A bail of speculative region `ri`'s integer version at `pc`: the
+    /// register file written back, counted, then op `pc` in the plain copy.
+    pub(super) fn spec_int_bail(&self, a: &mut X64Assembler, ri: usize, pc: usize) {
+        self.iflush(a, ri);
+        let r11 = super::super::call_seq::r::R11;
+        a.g_movabs(r11, self.env.persist);
+        a.g_inc_mem(r11, super::super::global_persist::counter_off(ri));
+        if let Some(l) = self.copy_label(pc) {
+            a.jmp(l);
+        }
     }
 }
 

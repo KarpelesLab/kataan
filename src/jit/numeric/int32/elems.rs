@@ -119,6 +119,54 @@ impl NumGen {
         Some(())
     }
 
+    /// `dst = obj[index]` in a speculative region's integer version, `obj`
+    /// a hoisted view ([`typed::ViewSlots`], `NumGen::hoisted_view`): no
+    /// walk, and no register touched but `rax` / `r11`. Anything else (not
+    /// that view, out of bounds, a float kind) bails before anything is
+    /// done.
+    pub(super) fn ihoisted_get(
+        &mut self,
+        a: &mut X64Assembler,
+        dst: u16,
+        obj: u16,
+        index: u16,
+        v: typed::ViewSlots,
+    ) -> Option<()> {
+        let IK::Gpr(d) = self.ik(dst)? else {
+            return None;
+        };
+        let wrap = self.iplan()?.wrap_bits.contains(&self.cur_pc);
+        let bail = self.ibail(a);
+        match self.ik(index)? {
+            IK::Gpr(g) => a.movsxd(RAX, g),
+            IK::Imm(v) => a.movabs_rax(i64::from(v)),
+        }
+        a.t_hoisted_get_i32(v, disp(obj), wrap, bail);
+        a.mov32_rr(d, RAX);
+        Some(())
+    }
+
+    /// `dst = obj.length` in a speculative region's integer version, `obj`
+    /// a hoisted view: its length (at most `i32::MAX`), else a bail.
+    pub(super) fn ihoisted_len(
+        &mut self,
+        a: &mut X64Assembler,
+        dst: u16,
+        obj: u16,
+        v: typed::ViewSlots,
+    ) -> Option<()> {
+        let IK::Gpr(d) = self.ik(dst)? else {
+            return None;
+        };
+        let bail = self.ibail(a);
+        a.t_hoisted_len(v, disp(obj), bail);
+        // cmp rax, 0x7fffffff; ja bail (an unsigned length past i32::MAX)
+        a.raw(&[0x48, 0x3d, 0xff, 0xff, 0xff, 0x7f]);
+        a.jcc(super::super::CC_A, bail);
+        a.mov32_rr(d, RAX);
+        Some(())
+    }
+
     /// `dst = arr.length` in the integer version (`dst` an int register):
     /// a plain array's or a typed-array view's, at most `i32::MAX`.
     pub(super) fn iarray_len(&mut self, a: &mut X64Assembler, dst: u16, arr: u16) -> Option<()> {

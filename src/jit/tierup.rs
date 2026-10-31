@@ -59,6 +59,13 @@ pub(super) struct TierUp {
     pub(super) guard_calls: Vec<(usize, u16)>,
     /// How many recompilations produced this body (`0`: the first compile).
     pub(super) generation: u8,
+    /// `(header, region)` of the speculative loops: one whose fast version
+    /// keeps leaving for its plain copy (`numeric`'s leave counter, in the
+    /// persistent array) is worth a recompilation without it.
+    pub(super) spec_regions: Vec<(usize, usize)>,
+    /// The function's own header pcs of the loops this body was compiled
+    /// with no speculative version for (inherited by its recompilations).
+    pub(super) spec_off: Vec<usize>,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
     pub(super) countdown: core::cell::Cell<u8>,
 }
@@ -124,6 +131,8 @@ impl TierUp {
             extents,
             num_slots: Vec::new(),
             cold_calls: Vec::new(),
+            spec_regions: Vec::new(),
+            spec_off: Vec::new(),
             guard_calls: ops
                 .iter()
                 .enumerate()
@@ -177,6 +186,28 @@ impl JitProto {
             .collect();
     }
 
+    /// The function's own header pcs of the loops a recompilation of this
+    /// body should give no speculative version: this body's own such loops,
+    /// and those whose fast version kept leaving for its plain copy.
+    #[must_use]
+    pub fn spec_off(&self) -> Vec<usize> {
+        let Some(s) = self.sites.as_ref() else {
+            return Vec::new();
+        };
+        let t = &s.tier_up;
+        let mut out = t.spec_off.clone();
+        for &(h, ri) in &t.spec_regions {
+            let pc = self.orig_pc(h);
+            if pc != usize::MAX
+                && s.persist.leaves(ri) >= super::numeric::SPEC_LEAVE_LIMIT
+                && !out.contains(&pc)
+            {
+                out.push(pc);
+            }
+        }
+        out
+    }
+
     /// Marks this body as the `generation`th recompilation of its function.
     pub fn set_generation(&mut self, generation: u8) {
         if let Some(s) = self.sites.as_mut() {
@@ -197,6 +228,13 @@ impl JitProto {
         let t = &s.tier_up;
         if t.generation >= MAX_GENERATION {
             return false;
+        }
+        // A speculative loop whose fast version keeps leaving.
+        if t.spec_regions
+            .iter()
+            .any(|&(h, ri)| h == header && s.persist.leaves(ri) >= super::numeric::SPEC_LEAVE_LIMIT)
+        {
+            return true;
         }
         let props = t.loops.binary_search_by_key(&header, |l| l.0).ok();
         let calls = t

@@ -365,6 +365,49 @@ impl X64Assembler {
         self.jmp(miss);
     }
 
+    /// [`t_get_i32`](Self::t_get_i32) of a hoisted view (a speculative
+    /// region's integer version, `numeric::int32`), touching no register
+    /// but `rax` and `r11`: with `rax` an integer index, to `miss` unless
+    /// the register at frame displacement `recv` holds view `v` and the
+    /// index is below its length, then `eax` = the element of an integer
+    /// kind (a Uint32 one past `i32::MAX` only when `wrap`), else to `miss`.
+    pub(crate) fn t_hoisted_get_i32(&mut self, v: ViewSlots, recv: i32, wrap: bool, miss: Label) {
+        if let Some(h) = v.held {
+            // (The value the facts are about: the index rides in `r11`.)
+            self.g_mov(r::R11, r::RAX);
+            self.load_rax(recv);
+            self.g_cmp_mem(r::RAX, r::RBP, h);
+            self.g_jcc(cc::NE, miss);
+            self.g_mov(r::RAX, r::R11);
+        }
+        self.g_cmp_mem(r::RAX, r::RBP, v.len);
+        self.g_jcc(cc::AE, miss); // past the length, or negative
+        // (No view, `NO_VIEW`, is no kind below: to `miss` with no load.)
+        self.g_load(r::R11, r::RBP, v.base);
+        let got = self.new_label();
+        for kind in [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED] {
+            let next = self.new_label();
+            self.g_cmp_byte_imm(r::RBP, v.kind, kind);
+            self.g_jcc(cc::NE, next);
+            let sib = (size_log2(kind) << 6) | 0x03; // [r11 + rax << s]
+            match kind {
+                INT8 => self.raw(&[0x41, 0x0f, 0xbe, 0x04, sib]), // movsx eax, byte
+                UINT8 | UINT8_CLAMPED => self.raw(&[0x41, 0x0f, 0xb6, 0x04, sib]),
+                INT16 => self.raw(&[0x41, 0x0f, 0xbf, 0x04, sib]), // movsx eax, word
+                UINT16 => self.raw(&[0x41, 0x0f, 0xb7, 0x04, sib]), // movzx eax, word
+                _ => self.raw(&[0x41, 0x8b, 0x04, sib]),           // mov eax, dword
+            }
+            if kind == UINT32 && !wrap {
+                self.raw(&[0x85, 0xc0]); // test eax, eax
+                self.g_jcc(CC_S, miss); // past i32::MAX
+            }
+            self.jmp(got);
+            self.bind(next);
+        }
+        self.jmp(miss);
+        self.bind(got);
+    }
+
     /// A hoisted view's entry check ([`ViewSlots`]): when the register at
     /// frame displacement `recv` holds a view the inline path serves (as
     /// [`t_view`](Self::t_view) and a kind below Float16), wholly inside its

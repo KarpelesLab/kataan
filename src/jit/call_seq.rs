@@ -2044,6 +2044,13 @@ pub(crate) struct InlineEmit<'a> {
     /// are fixed): it is identified by one compare. A plain call of a
     /// register's value only (`CalleeSrc::Reg`, monomorphic, not a `new`).
     pub proved: Option<(i32, i32)>,
+    /// Registers to keep, as `(register, rbp-relative save slot)`: the
+    /// guard's code that may clobber them stores them first and reloads
+    /// them after (a speculative region's integer version's int registers,
+    /// `numeric::NumGen::int_save`). With a proof that needs no captures,
+    /// only the guard's identification does (the proved path touches
+    /// `rax` alone); else the whole guard. A miss leaves with them saved.
+    pub keep: &'a [(u8, i32)],
 }
 
 /// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
@@ -2118,15 +2125,35 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         .proved
         .filter(|_| ways <= 1 && e.new_target.is_none() && matches!(e.callee, CalleeSrc::Reg(_)));
     let proven = a.new_label();
+    // (Kept around the identification only: see `keep`.)
+    let keep_full = proved.is_some() && e.n_caps == 0 && matches!(e.callee, CalleeSrc::Reg(_));
+    let save = |a: &mut X64Assembler| {
+        for &(g, d) in e.keep {
+            a.g_store(RBP, d, g);
+        }
+    };
+    let reload = |a: &mut X64Assembler| {
+        for &(g, d) in e.keep {
+            a.g_load(g, RBP, d);
+        }
+    };
+    if !keep_full {
+        save(a);
+    }
     if let (Some((bits, caps)), &CalleeSrc::Reg(c)) = (proved, &e.callee) {
         let full = a.new_label();
         a.g_load(r::RAX, r::RBX, reg(c));
         a.g_cmp_mem(r::RAX, RBP, bits);
         a.g_jcc(cc::NE, full);
         a.g_store(RBP, e.slots.callee, r::RAX);
-        a.g_load(r::R8, RBP, caps);
+        if !keep_full {
+            a.g_load(r::R8, RBP, caps);
+        }
         a.jmp(proven);
         a.bind(full);
+        if keep_full {
+            save(a);
+        }
     }
     // 1. The callee value, into the `callee` slot (and rax).
     match e.callee {
@@ -2272,6 +2299,9 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.g_load(r::RAX, RBP, e.slots.callee);
         a.g_store(RBP, bits, r::RAX);
         a.g_store(RBP, caps, r::R8);
+        if keep_full {
+            reload(a);
+        }
         a.bind(proven);
     }
     // 3b. A `new`: `this`, as the call's `[[Construct]]` would make it.
@@ -2313,11 +2343,17 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.dbg_mark("g-miss");
     a.g_movabs(r::RAX, NanBox::boolean(false).to_bits());
     a.g_store(r::RBX, reg(e.dst), r::RAX);
+    if keep_full && e.fused_miss.is_none() {
+        reload(a);
+    }
     if let (Some(to), Some(cold)) = (e.fused_miss, cold) {
         a.jmp(to);
         a.cold_end(cold);
     }
     a.bind(done);
+    if !keep_full {
+        reload(a);
+    }
     Some(())
 }
 
