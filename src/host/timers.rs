@@ -71,7 +71,7 @@ mod imp {
     use crate::NanBox;
     use crate::nbexec::Ctx;
     use crate::parser::Parser;
-    use alloc::collections::VecDeque;
+    use alloc::collections::{BTreeMap, VecDeque};
     use alloc::vec::Vec;
     use core::cell::RefCell;
 
@@ -111,8 +111,67 @@ mod imp {
         seq: u64,
         /// The virtual clock (advanced to each fired timer's due time).
         clock: f64,
-        timers: Vec<TimerEntry>,
+        /// Pending timers by id (so clearing one is O(log n)).
+        timers: BTreeMap<u64, TimerEntry>,
+        /// The same timers in firing order: `(due, seq)` to id.
+        order: BTreeMap<DueKey, u64>,
         ticks: VecDeque<Tick>,
+    }
+
+    /// A timer's place in firing order: earliest `due`, ties by `seq`.
+    #[derive(Clone, Copy)]
+    struct DueKey {
+        due: f64,
+        seq: u64,
+    }
+
+    impl Ord for DueKey {
+        fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+            self.due
+                .total_cmp(&other.due)
+                .then(self.seq.cmp(&other.seq))
+        }
+    }
+
+    impl PartialOrd for DueKey {
+        fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl PartialEq for DueKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+
+    impl Eq for DueKey {}
+
+    impl TimerStore {
+        fn insert(&mut self, t: TimerEntry) {
+            self.order.insert(
+                DueKey {
+                    due: t.due,
+                    seq: t.seq,
+                },
+                t.id,
+            );
+            self.timers.insert(t.id, t);
+        }
+
+        fn remove(&mut self, id: u64) -> Option<TimerEntry> {
+            let t = self.timers.remove(&id)?;
+            self.order.remove(&DueKey {
+                due: t.due,
+                seq: t.seq,
+            });
+            Some(t)
+        }
+
+        /// The id of the timer due first.
+        fn first(&self) -> Option<u64> {
+            self.order.first_key_value().map(|(_, id)| *id)
+        }
     }
 
     std::thread_local! {
@@ -265,7 +324,7 @@ mod imp {
             let seq = s.seq;
             s.seq += 1;
             let due = s.clock + delay;
-            s.timers.push(TimerEntry {
+            s.insert(TimerEntry {
                 id,
                 due,
                 seq,
@@ -290,7 +349,7 @@ mod imp {
             let seq = s.seq;
             s.seq += 1;
             let due = s.clock;
-            s.timers.push(TimerEntry {
+            s.insert(TimerEntry {
                 id,
                 due,
                 seq,
@@ -311,10 +370,12 @@ mod imp {
         };
         let removed = STORE.with(|s| {
             let mut s = s.borrow_mut();
-            s.timers
-                .iter()
-                .position(|t| (t.id as f64) == id)
-                .map(|pos| s.timers.remove(pos))
+            // Ids are small positive integers: any other number names no timer.
+            if (0.0..9_007_199_254_740_992.0).contains(&id) && (id as u64) as f64 == id {
+                s.remove(id as u64)
+            } else {
+                None
+            }
         });
         if let Some(t) = removed {
             cx.release_persistent(t.cb);
@@ -364,14 +425,7 @@ mod imp {
             drain_jobs(interp)?;
 
             // 2. The earliest-due timer, if any remain.
-            let Some(idx) = STORE.with(|s| {
-                let s = s.borrow();
-                s.timers
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| a.due.total_cmp(&b.due).then(a.seq.cmp(&b.seq)))
-                    .map(|(i, _)| i)
-            }) else {
+            let Some(id) = STORE.with(|s| s.borrow().first()) else {
                 break;
             };
 
@@ -380,24 +434,22 @@ mod imp {
             // within the callback (which removes the entry) wins over the reschedule.
             let (cb, arg_idxs, one_shot) = STORE.with(|s| {
                 let mut s = s.borrow_mut();
-                let due = s.timers[idx].due;
+                let mut entry = s.remove(id).expect("first timer is pending");
+                let due = entry.due;
                 if s.clock < due {
                     s.clock = due;
                 }
-                let cb = s.timers[idx].cb;
-                let arg_idxs = s.timers[idx].args.clone();
-                match s.timers[idx].period {
+                match entry.period {
                     Some(period) => {
                         let seq = s.seq;
                         s.seq += 1;
-                        s.timers[idx].due = due + period;
-                        s.timers[idx].seq = seq;
-                        (cb, arg_idxs, false)
+                        entry.due = due + period;
+                        entry.seq = seq;
+                        let out = (entry.cb, entry.args.clone(), false);
+                        s.insert(entry);
+                        out
                     }
-                    None => {
-                        let entry = s.timers.remove(idx);
-                        (entry.cb, entry.args, true)
-                    }
+                    None => (entry.cb, entry.args, true),
                 }
             });
 

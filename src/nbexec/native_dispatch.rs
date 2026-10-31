@@ -3858,8 +3858,13 @@ impl Interp {
             }
             // `clearTimeout(id)` — cancels a pending `setTimeout`.
             N_CLEAR_TIMEOUT => {
-                if let Some(id) = arg(0).as_number() {
-                    self.macrotasks.retain(|t| (t.id as f64) != id);
+                // Timer ids are small positive integers: any other number
+                // names no timer.
+                if let Some(id) = arg(0).as_number()
+                    && (0.0..9_007_199_254_740_992.0).contains(&id)
+                    && (id as u64) as f64 == id
+                {
+                    self.macrotasks.cancel(id as u64);
                 }
                 NanBox::undefined()
             }

@@ -360,7 +360,7 @@ pub struct Interp {
     microtasks: alloc::collections::VecDeque<Job>,
     /// Pending `setTimeout` callbacks (macrotasks), run after the microtask queue
     /// drains — ordered by absolute virtual fire-time `at`, then insertion (`seq`).
-    macrotasks: alloc::collections::BinaryHeap<Timer>,
+    macrotasks: TimerQueue,
     /// Monotonic id handed out by `setTimeout` (for `clearTimeout`).
     timer_next_id: u64,
     /// Monotonic insertion counter breaking equal-`at` ties.
@@ -1087,6 +1087,95 @@ impl PartialEq for Timer {
 }
 
 impl Eq for Timer {}
+
+/// The pending `setTimeout` macrotasks: a heap ordered by fire-time (see
+/// [`Timer`]'s `Ord`) plus a liveness flag per timer id, so `clearTimeout` is
+/// O(1) instead of a linear scan and heap rebuild per call. A cleared timer
+/// stays in the heap as a dead entry (skipped when popped, never rooted) until
+/// dead entries outnumber live ones, when the heap is compacted, which keeps
+/// clearing amortized O(log n) and the heap at most twice the live count.
+///
+/// Ids are handed out in increasing order, so liveness is a window of flags
+/// starting at the oldest still-tracked id (`base`); the window's front is
+/// trimmed as soon as it is dead.
+#[derive(Default)]
+struct TimerQueue {
+    heap: alloc::collections::BinaryHeap<Timer>,
+    /// `live[i]`: whether the timer with id `base + i` is pending.
+    live: alloc::collections::VecDeque<bool>,
+    base: u64,
+    /// How many `live` flags are set.
+    count: usize,
+}
+
+impl TimerQueue {
+    fn push(&mut self, t: Timer) {
+        if self.live.is_empty() || t.id < self.base {
+            self.live.clear();
+            self.base = t.id;
+        }
+        let idx = (t.id - self.base) as usize;
+        while self.live.len() <= idx {
+            self.live.push_back(false);
+        }
+        if !self.live[idx] {
+            self.live[idx] = true;
+            self.count += 1;
+        }
+        self.heap.push(t);
+    }
+
+    fn slot(&self, id: u64) -> Option<usize> {
+        let idx = usize::try_from(id.checked_sub(self.base)?).ok()?;
+        (idx < self.live.len() && self.live[idx]).then_some(idx)
+    }
+
+    /// Clears `id`'s flag, returning whether it was pending.
+    fn take(&mut self, id: u64) -> bool {
+        let Some(idx) = self.slot(id) else {
+            return false;
+        };
+        self.live[idx] = false;
+        self.count -= 1;
+        while self.live.front() == Some(&false) {
+            self.live.pop_front();
+            self.base += 1;
+        }
+        if self.count == 0 {
+            self.heap.clear();
+        }
+        true
+    }
+
+    /// The live timer due first, discarding any cleared entries ahead of it.
+    fn pop(&mut self) -> Option<Timer> {
+        while let Some(t) = self.heap.pop() {
+            if self.take(t.id) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// Whether no live timer is pending.
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Cancels the timer with id `id` (a no-op for an unknown or fired id).
+    fn cancel(&mut self, id: u64) {
+        if self.take(id) && self.heap.len() > 64 && self.heap.len() > 2 * self.count {
+            let mut heap = core::mem::take(&mut self.heap);
+            heap.retain(|t| self.slot(t.id).is_some());
+            self.heap = heap;
+        }
+    }
+
+    /// The live timers, in no particular order.
+    fn iter(&self) -> impl Iterator<Item = &Timer> {
+        self.heap.iter().filter(|t| self.slot(t.id).is_some())
+    }
+}
 
 impl Default for Interp {
     fn default() -> Self {
@@ -2936,7 +3025,7 @@ impl Interp {
             in_field_initializer: false,
             eval_param_names: None,
             microtasks: alloc::collections::VecDeque::new(),
-            macrotasks: alloc::collections::BinaryHeap::new(),
+            macrotasks: TimerQueue::default(),
             timer_next_id: 1,
             timer_seq: 0,
             virtual_now: 0.0,

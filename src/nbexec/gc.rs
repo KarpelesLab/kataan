@@ -224,7 +224,7 @@ impl Interp {
         for j in &self.microtasks {
             gc_root_job(j, out);
         }
-        for t in &self.macrotasks {
+        for t in self.macrotasks.iter() {
             gc_root_timer(t, out);
         }
     }

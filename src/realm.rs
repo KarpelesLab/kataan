@@ -492,6 +492,9 @@ pub struct Realm {
     /// index — never a raw `Handle` that compaction would invalidate. `None` slots
     /// are freed indices, reused by the next `persist`.
     host_persistent: Vec<Option<NanBox>>,
+    /// The `None` slots of `host_persistent` (a stack, so `persist` reuses one
+    /// in O(1) rather than scanning the table for it).
+    host_persistent_free: Vec<u32>,
     /// Forward-safety root hook for the generic JIT tier (`JIT_DESIGN.md` §5).
     /// A future allocation-triggered GC that fires while a JIT frame is live would
     /// find its spilled live NanBox temps here (flushed from `nbvm::Ctx::jit_shadow`
@@ -907,6 +910,7 @@ impl Realm {
             boolean_proto_intrinsic: None,
             intl_protos: alloc::collections::BTreeMap::new(),
             host_persistent: Vec::new(),
+            host_persistent_free: Vec::new(),
             jit_shadow_roots: Vec::new(),
             host_native_state: alloc::collections::BTreeMap::new(),
             legacy_regexp: LegacyRegExpState::default(),
@@ -7206,9 +7210,9 @@ impl Realm {
     /// valid across compaction until [`release_persistent`](Self::release_persistent).
     /// A freed slot is reused before growing the table.
     pub fn persist(&mut self, value: NanBox) -> u32 {
-        if let Some(i) = self.host_persistent.iter().position(Option::is_none) {
-            self.host_persistent[i] = Some(value);
-            i as u32
+        if let Some(i) = self.host_persistent_free.pop() {
+            self.host_persistent[i as usize] = Some(value);
+            i
         } else {
             self.host_persistent.push(Some(value));
             (self.host_persistent.len() - 1) as u32
@@ -7226,8 +7230,10 @@ impl Realm {
     /// Releases persistent handle `idx`, so its value is no longer a GC root and the
     /// slot can be reused. A double release / unknown index is a harmless no-op.
     pub fn release_persistent(&mut self, idx: u32) {
-        if let Some(slot) = self.host_persistent.get_mut(idx as usize) {
-            *slot = None;
+        if let Some(slot) = self.host_persistent.get_mut(idx as usize)
+            && slot.take().is_some()
+        {
+            self.host_persistent_free.push(idx);
         }
     }
 
