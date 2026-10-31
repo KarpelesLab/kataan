@@ -6990,6 +6990,26 @@ impl Interp {
         NanBox::handle(self.realm.new_string_wtf8(bytes).to_raw())
     }
 
+    /// `Ok` while a string being built has `len` bytes at most the string
+    /// length cap (`realm.limits.max_string_len`, the cap `+` enforces), and the
+    /// `RangeError("Invalid string length")` to throw once it is past it. A
+    /// builder checks as it grows, so an over-long result throws before the
+    /// buffer reaches gigabytes.
+    #[inline]
+    pub(crate) fn check_str_len(&mut self, len: usize) -> Result<(), ExecError> {
+        if len > self.realm.limits.max_string_len {
+            return Err(self.string_length_error());
+        }
+        Ok(())
+    }
+
+    /// The `RangeError("Invalid string length")` a string past the length cap throws.
+    #[cold]
+    pub(crate) fn string_length_error(&mut self) -> ExecError {
+        let m = self.new_str("Invalid string length");
+        ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m)))
+    }
+
     /// The UTF-16 units `[a, b)` of the string `rope` (whose bytes, flat or
     /// materialized, are `bytes`) as a new string value, sharing a flat
     /// rope's buffer when the result is long (see [`Rope::slice_units`](crate::rope::Rope::slice_units)).
@@ -8932,7 +8952,11 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// units of WTF-8 `bytes`. The unreserved set (`A-Za-z0-9-_.!~*'()`) is always
 /// kept; `extra` adds the characters preserved by `encodeURI` (the reserved set).
 /// Returns `None` (→ `URIError`) on an unpaired surrogate.
-fn uri_encode(bytes: &[u8], extra: &str) -> Option<Vec<u8>> {
+///
+/// The encoding stops as soon as the output passes `cap` bytes, returning
+/// that over-long prefix: the caller turns it into the string-length
+/// RangeError without the buffer growing any further.
+fn uri_encode(bytes: &[u8], extra: &str, cap: usize) -> Option<Vec<u8>> {
     fn hex(n: u32) -> u8 {
         char::from_digit(n, 16).unwrap().to_ascii_uppercase() as u8
     }
@@ -8941,6 +8965,9 @@ fn uri_encode(bytes: &[u8], extra: &str) -> Option<Vec<u8>> {
     let mut buf = [0u8; 4];
     let mut i = 0;
     while i < units.len() {
+        if out.len() > cap {
+            return Some(out);
+        }
         let u = units[i];
         let cp: u32 = if (0xD800..=0xDBFF).contains(&u) {
             // A high surrogate must be followed by a low surrogate.
@@ -9040,12 +9067,17 @@ fn uri_decode(bytes: &[u8], preserve_reserved: bool) -> Option<Vec<u8>> {
 /// WTF-8 `bytes`: a unit in the unescaped set (`A-Za-z0-9` plus `@*_+-./`) is
 /// kept; a unit `< 256` becomes `%XX`; any larger unit becomes `%uXXXX`. The
 /// result is pure ASCII, so its WTF-8 form is its UTF-8 form.
-fn legacy_escape(bytes: &[u8]) -> Vec<u8> {
+///
+/// Like [`uri_encode`], stops once the output passes `cap` bytes.
+fn legacy_escape(bytes: &[u8], cap: usize) -> Vec<u8> {
     fn hex(n: u32) -> u8 {
         char::from_digit(n, 16).unwrap().to_ascii_uppercase() as u8
     }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     for u in crate::wtf8::utf16_units(bytes) {
+        if out.len() > cap {
+            break;
+        }
         let keep = matches!(u, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A)
             || matches!(u as u8 as char, '@' | '*' | '_' | '+' | '-' | '.' | '/') && u < 0x80;
         if keep {
@@ -10897,21 +10929,31 @@ impl Interp {
         };
         let mut out: Vec<u16> = Vec::with_capacity(s.len());
         let mut end_of_last = 0;
+        // A `$`-free template substitutes as itself, so its length is known
+        // before it is appended (the string length cap is checked first).
+        let plain_template = !is_fn && !template.contains(&u16::from(b'$'));
         for p in positions {
             out.extend_from_slice(&s[end_of_last.min(p)..p]);
             if is_fn {
                 let r = self.call(repl, &[matched, NanBox::number(p as f64), whole])?;
                 let rb = self.arg_string_bytes_fallible(r)?;
+                self.check_str_len(out.len() + rb.len())?;
                 out.extend(crate::wtf8::utf16_units(&rb));
+            } else if plain_template {
+                self.check_str_len(out.len() + template.len())?;
+                out.extend_from_slice(&template);
             } else {
                 out.extend(get_substitution_units(&template, &s, p, pat.len()));
             }
+            self.check_str_len(out.len())?;
             end_of_last = p + pat.len();
         }
         if end_of_last < s.len() {
             out.extend_from_slice(&s[end_of_last..]);
         }
-        Ok(self.new_str_bytes(crate::wtf8::from_utf16(&out)))
+        let out = crate::wtf8::from_utf16(&out);
+        self.check_str_len(out.len())?;
+        Ok(self.new_str_bytes(out))
     }
 }
 

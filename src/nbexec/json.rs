@@ -292,7 +292,7 @@ impl Interp {
             && let Some(h) = value.as_handle().map(Handle::from_raw)
         {
             if self.realm.typeof_is_string(h) {
-                self.json_quote_string(cx, h);
+                self.json_quote_string(cx, h)?;
                 return Ok(true);
             }
             if self.realm.is_plain_array_cell(h)
@@ -328,7 +328,11 @@ impl Interp {
     }
 
     /// `QuoteJSONString` of the string cell `h`, appended to `cx.out`.
-    fn json_quote_string(&mut self, cx: &mut JsonOut<'_>, h: Handle) {
+    /// Throws the string-length RangeError when the quoted text would take
+    /// the output past the cap (checked before the string is copied in).
+    fn json_quote_string(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<(), ExecError> {
+        let n = self.realm.string_byte_len(h).unwrap_or(0);
+        self.check_str_len(cx.out.len() + n + 2)?;
         // Collapse a rope once so the quoting borrows one leaf.
         self.realm.flatten_string(h);
         if let Some(bytes) = self.realm.string_leaf_bytes(h) {
@@ -336,6 +340,7 @@ impl Interp {
         } else if let Some(bytes) = self.realm.string_bytes(h) {
             json_quote_wtf8_into(&mut cx.out, &bytes);
         }
+        self.check_str_len(cx.out.len())
     }
 
     /// The type-dispatch tail of SerializeJSONProperty: appends an already-
@@ -407,7 +412,7 @@ impl Interp {
             Unpacked::Handle(raw) => {
                 let h = Handle::from_raw(raw);
                 if self.realm.is_string_handle(h) {
-                    self.json_quote_string(cx, h);
+                    self.json_quote_string(cx, h)?;
                     return Ok(true);
                 }
                 if self.realm.bigint_at(h).is_some() {
@@ -640,6 +645,7 @@ impl Interp {
             let mark = cx.out.len();
             if any {
                 cx.out.push(',');
+                self.check_str_len(cx.out.len())?;
             }
             if pretty {
                 cx.out.push('\n');
@@ -693,6 +699,7 @@ impl Interp {
             let mark = cx.out.len();
             if any {
                 cx.out.push(',');
+                self.check_str_len(cx.out.len())?;
             }
             if pretty {
                 cx.out.push('\n');
@@ -754,6 +761,7 @@ impl Interp {
         for i in 0..len {
             if i > 0 {
                 cx.out.push(',');
+                self.check_str_len(cx.out.len())?;
             }
             if pretty {
                 cx.out.push('\n');

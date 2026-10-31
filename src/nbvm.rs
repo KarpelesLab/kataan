@@ -11613,6 +11613,11 @@ fn builtin_method(
                             .collect()
                     })
                     .unwrap_or_default();
+                // Past the string length cap: the interpreter's join throws.
+                let total = parts.iter().map(|p| p.len() + sep.len()).sum::<usize>();
+                if total > ctx.realm.limits.max_string_len {
+                    return None;
+                }
                 NanBox::handle(ctx.realm.new_string(&parts.join(&sep)).to_raw())
             }
             "includes" => {

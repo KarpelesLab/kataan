@@ -138,7 +138,7 @@ fn replace_matches(
             crate::wtf8::append_utf16(&mut out, &units[next.min(pos)..pos]);
             append_to_string(ctx, &mut out, r)?;
             next = pos + (end - start);
-            if out.len() > crate::rope::MAX_STRING_LEN {
+            if out.len() > ctx.realm.limits.max_string_len {
                 let e = vm_error(ctx, "RangeError", "Invalid string length");
                 return Err(VmError::Thrown(e));
             }

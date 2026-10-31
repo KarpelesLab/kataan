@@ -3738,3 +3738,43 @@ fn promoted_loop_globals_revalidate_after_a_call() {
     "#;
     assert_eq!(run(src), "939496004,-1785025331,-711174563,3000,number");
 }
+
+/// Every string-producing builtin enforces the string length cap the way `+`
+/// does: a result past `max_string_len` throws `RangeError("Invalid string
+/// length")`, checked while the buffer grows (join, String.raw, replaceAll,
+/// JSON.stringify, escape and encodeURIComponent used to build the whole
+/// over-long string, gigabytes at the default cap). Results at or under the
+/// cap are unaffected.
+#[test]
+fn string_builders_enforce_the_length_cap() {
+    let low = crate::limits::Limits {
+        max_string_len: 100,
+        ..crate::limits::Limits::default()
+    };
+    let src = r#"
+        var s = "abcdefghij", a12 = Array(12).fill(s), a9 = Array(9).fill(s);
+        var sp = []; sp.length = 60;
+        var cases = [
+            () => a12.join(""), () => a9.join(""),
+            () => [s, s, s].join(s.repeat(5)),
+            () => a12.join(), () => String(a12), () => a12.toString(), () => a12.toLocaleString(),
+            () => sp.join("xy"),
+            () => "aaaaaaaaaaaa".replaceAll("a", s), () => "aaaaaaaaa".replaceAll("a", s),
+            () => "aaaaaaaaaaaa".replace(/a/g, s), () => "aaaaaaaaaaaa".replaceAll("a", () => s),
+            () => String.raw({ raw: a12 }), () => String.raw({ raw: [s, s] }, s.repeat(9)),
+            () => JSON.stringify(a12), () => JSON.stringify({ a: s.repeat(5), b: s.repeat(5) }),
+            () => JSON.stringify(Array(40).fill(12345)),
+            () => escape("Ā".repeat(20)), () => escape("Ā".repeat(10)),
+            () => encodeURIComponent("Ā".repeat(20)), () => encodeURI("Ā".repeat(10)),
+            () => new Float64Array(30).fill(0.25).join(), () => new Float64Array(30).fill(0.25).toLocaleString(),
+        ];
+        cases.map(function (f) {
+            try { return "ok" + f().length; } catch (e) { return e.name === "RangeError" && e.message === "Invalid string length" ? "R" : e.name; }
+        }).join(" ")
+    "#;
+    let out = eval_source_on(src, low).expect("runs").1;
+    assert_eq!(
+        out,
+        "R ok90 R R R R R R R ok90 R R R R R R R R ok60 R ok60 R R"
+    );
+}

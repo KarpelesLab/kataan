@@ -2019,7 +2019,7 @@ impl Interp {
                         append_units(&mut accumulated, &units[next_source_position..pos]);
                         self.append_to_string_bytes(&mut accumulated, r)?;
                         next_source_position = pos + (end - m.caps.whole().0);
-                        if accumulated.len() > crate::rope::MAX_STRING_LEN {
+                        if accumulated.len() > self.realm.limits.max_string_len {
                             let m = self.new_str("Invalid string length");
                             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                         }
@@ -2062,7 +2062,7 @@ impl Interp {
                         );
                         crate::wtf8::append(&mut accumulated, &replacement);
                         next_source_position = pos + matched_units.len();
-                        if accumulated.len() > crate::rope::MAX_STRING_LEN {
+                        if accumulated.len() > self.realm.limits.max_string_len {
                             let m = self.new_str("Invalid string length");
                             return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                         }
@@ -2115,7 +2115,7 @@ impl Interp {
                 );
                 crate::wtf8::append(&mut accumulated, &replacement);
                 next_source_position = pos + m_len;
-                if accumulated.len() > crate::rope::MAX_STRING_LEN {
+                if accumulated.len() > self.realm.limits.max_string_len {
                     let m = self.new_str("Invalid string length");
                     return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                 }
@@ -2205,7 +2205,7 @@ impl Interp {
             // template of `$1`s over a large subject multiplies without bound. Stop
             // at the engine's string ceiling with the same `RangeError` a runaway
             // concatenation raises, rather than letting the allocator abort.
-            if out.len() > crate::rope::MAX_STRING_LEN {
+            if out.len() > self.realm.limits.max_string_len {
                 let m = self.new_str("Invalid string length");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
             }

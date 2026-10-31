@@ -1066,9 +1066,18 @@ fn run_op(
                     }
                     Unpacked::Handle(_) => {
                         let part = str_arg(realm, e)?;
-                        crate::wtf8::append(&mut out, part.as_leaf_bytes()?);
+                        let bytes = part.as_leaf_bytes()?;
+                        // Past the string length cap: the host's join throws
+                        // the RangeError (before this buffer grows further).
+                        if out.len() + bytes.len() + sep.len() > realm.limits.max_string_len {
+                            return None;
+                        }
+                        crate::wtf8::append(&mut out, bytes);
                     }
                 }
+            }
+            if out.len() > realm.limits.max_string_len {
+                return None;
             }
             NanBox::handle(realm.new_string_wtf8(out).to_raw())
         }

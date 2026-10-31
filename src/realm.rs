@@ -1986,6 +1986,14 @@ impl Realm {
 
     /// Appends the WTF-8 bytes (lossless) of the string at `handle` to `out`;
     /// `false` (nothing written) if it is not a string.
+    /// The WTF-8 byte length of the string at `handle` (O(1); `None` when it
+    /// is not a string). Builders compare it against the string length cap
+    /// before appending.
+    #[must_use]
+    pub fn string_byte_len(&self, handle: Handle) -> Option<usize> {
+        self.heap.get(handle).and_then(Cell::as_str).map(Rope::len)
+    }
+
     pub fn append_string_bytes(&self, handle: Handle, out: &mut alloc::vec::Vec<u8>) -> bool {
         match self.heap.get(handle).and_then(Cell::as_str) {
             Some(r) => {

@@ -1200,12 +1200,14 @@ impl Interp {
                 for i in 0..lit_count {
                     let piece = self.read_member(rh, &alloc::format!("{i}"))?;
                     let bytes = self.coerce_to_string_bytes(piece)?;
+                    self.check_str_len(out.len() + bytes.len())?;
                     crate::wtf8::append(&mut out, &bytes);
                     if i + 1 == lit_count {
                         break;
                     }
                     if let Some(s) = subs.get(i) {
                         let sb = self.coerce_to_string_bytes(*s)?;
+                        self.check_str_len(out.len() + sb.len())?;
                         crate::wtf8::append(&mut out, &sb);
                     }
                 }
@@ -4000,6 +4002,7 @@ impl Interp {
                     if self.realm.typed_kind(handle).is_some() {
                         let len = elems.len();
                         let mut parts: Vec<Vec<u8>> = Vec::with_capacity(len);
+                        let mut total = 0usize;
                         for i in 0..len {
                             let e = self
                                 .realm
@@ -4012,6 +4015,8 @@ impl Interp {
                                 }
                                 _ => self.arg_string_bytes_fallible(e)?,
                             });
+                            total += parts[i].len() + sep.len();
+                            self.check_str_len(total)?;
                         }
                         return Ok(Some(self.new_str_bytes(join_parts(parts))));
                     }
@@ -4035,6 +4040,7 @@ impl Interp {
                     let mut live = precise_array;
                     for (k, dense) in elems.iter().enumerate() {
                         if k > 0 {
+                            self.check_str_len(out.len() + sep.len())?;
                             crate::wtf8::append(&mut out, &sep);
                         }
                         let e = if live {
@@ -4051,6 +4057,16 @@ impl Interp {
                                 crate::realm::builtins_fast::push_number_bytes(&mut out, n);
                             }
                             Unpacked::Handle(raw)
+                                if self
+                                    .realm
+                                    .string_byte_len(Handle::from_raw(raw))
+                                    .is_some_and(|n| {
+                                        out.len() + n > self.realm.limits.max_string_len
+                                    }) =>
+                            {
+                                return Err(self.string_length_error());
+                            }
+                            Unpacked::Handle(raw)
                                 if crate::wtf8::trailing_high_surrogate(&out).is_none()
                                     && self.realm.typeof_is_string(Handle::from_raw(raw))
                                     && self
@@ -4062,9 +4078,11 @@ impl Interp {
                             _ => {
                                 live |= self.is_object_value(e);
                                 let b = self.arg_string_bytes_fallible(e)?;
+                                self.check_str_len(out.len() + b.len())?;
                                 crate::wtf8::append(&mut out, &b);
                             }
                         }
+                        self.check_str_len(out.len())?;
                     }
                     return Ok(Some(self.new_str_bytes(out)));
                 }
@@ -4082,6 +4100,7 @@ impl Interp {
                     // preserve the curated gate.)
                     if let Some(len) = self.realm.typed_len(handle) {
                         let mut parts: Vec<String> = Vec::with_capacity(len);
+                        let mut total = 0usize;
                         for i in 0..len {
                             let e = self
                                 .realm
@@ -4109,7 +4128,10 @@ impl Interp {
                             // `Number.prototype` sees `typeof this === "number"`.
                             let m = self.get_with_receiver(bh, "toLocaleString", e)?;
                             let r = self.call_with_this(m, e, &[arg(0), arg(1)])?;
-                            parts.push(self.coerce_to_string(r)?);
+                            let s = self.coerce_to_string(r)?;
+                            total += s.len() + 1;
+                            self.check_str_len(total - 1)?;
+                            parts.push(s);
                         }
                         return Ok(Some(self.new_str(&parts.join(","))));
                     }
@@ -4121,6 +4143,7 @@ impl Interp {
                     // the array, so after the first one the remaining elements are
                     // read live rather than from the snapshot.
                     let mut parts: Vec<String> = Vec::with_capacity(elems.len());
+                    let mut total = 0usize;
                     let mut live = precise_array;
                     for (k, dense) in elems.iter().enumerate() {
                         let e = if live {
@@ -4158,6 +4181,8 @@ impl Interp {
                                 self.coerce_to_string(r)?
                             }
                         };
+                        total += s.len() + 1;
+                        self.check_str_len(total - 1)?;
                         parts.push(s);
                     }
                     return Ok(Some(self.new_str(&parts.join(","))));

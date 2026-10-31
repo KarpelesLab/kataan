@@ -3176,8 +3176,11 @@ impl Interp {
                 } else {
                     ""
                 };
-                match uri_encode(&bytes, extra) {
-                    Some(out) => self.new_str_bytes(out),
+                match uri_encode(&bytes, extra, self.realm.limits.max_string_len) {
+                    Some(out) => {
+                        self.check_str_len(out.len())?;
+                        self.new_str_bytes(out)
+                    }
                     None => {
                         let m = self.new_str("URI malformed");
                         return Err(ExecError::Throw(self.make_error(N_URI_ERROR, Some(m))));
@@ -3200,7 +3203,9 @@ impl Interp {
             // argument is ToString-coerced first (its error propagates).
             N_ESCAPE => {
                 let bytes = self.coerce_to_string_bytes(arg(0))?;
-                self.new_str_bytes(legacy_escape(&bytes))
+                let out = legacy_escape(&bytes, self.realm.limits.max_string_len);
+                self.check_str_len(out.len())?;
+                self.new_str_bytes(out)
             }
             // `unescape(string)` (Annex B.2.2): the inverse of `escape`. Reads
             // `%uXXXX` (4 hex digits) and `%XX` (2 hex digits) escapes; any
