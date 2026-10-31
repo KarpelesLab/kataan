@@ -3679,3 +3679,22 @@ fn integer_loops_over_element_reads() {
         )
     );
 }
+
+/// A `+` whose string result would pass the maximum string length throws a
+/// `RangeError` on every path: the generic `+` (a call's operands, an
+/// object's `toString`, a property value) used the non-throwing concatenation
+/// and went on with the error's text "Invalid string length" as the value.
+#[test]
+fn over_long_concatenation_throws_range_error() {
+    let src = r#"
+        var r = [];
+        function h1(a, b) { return a + b; }
+        function t(f) { try { var v = f(); r.push("noerr:" + typeof v); } catch (e) { r.push(e.constructor.name); } }
+        t(function () { var s = "x"; for (var i = 0; i < 40; i++) s = s + s; return s; });
+        t(function () { var s = "x"; for (var i = 0; i < 40; i++) s = h1(s, s); return s; });
+        t(function () { var o = { x: "x" }; for (var i = 0; i < 40; i++) o.x = h1(o.x, o.x) + 1; return o.x; });
+        t(function () { var s = "w", o = { toString: function () { return s; } }; for (var i = 0; i < 40; i++) s = s + o; return s; });
+        r.join()
+    "#;
+    assert_eq!(run(src), "RangeError,RangeError,RangeError,RangeError");
+}

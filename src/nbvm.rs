@@ -5608,7 +5608,7 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
             .is_some_and(|h| ctx.realm.typeof_is_string(Handle::from_raw(h)))
     };
     if (a.is_number() || prim_str(a)) && (b.is_number() || prim_str(b)) {
-        return Ok(ctx.realm.add(a, b));
+        return vm_add_prims(ctx, a, b);
     }
     if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Add, a, b) {
         return r;
@@ -5618,7 +5618,20 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     if let Some(e) = symbol_coercion_error(&mut ctx.realm, x, y, SYM_STR_ERR) {
         return Err(VmError::Thrown(e));
     }
-    Ok(ctx.realm.add(x, y))
+    vm_add_prims(ctx, x, y)
+}
+
+/// `+` over two primitives: a concatenation past the maximum string length
+/// throws a `RangeError` (never the error's text as a value).
+fn vm_add_prims(ctx: &mut Ctx, a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+    match ctx.realm.add_checked(a, b) {
+        Some(v) => Ok(v),
+        None => Err(VmError::Thrown(vm_error(
+            ctx,
+            "RangeError",
+            "Invalid string length",
+        ))),
+    }
 }
 
 /// The interpreter's real native-builtin dispatch (`Op::CallNative`'s semantics),
