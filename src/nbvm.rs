@@ -6363,7 +6363,18 @@ pub(crate) extern "C" fn jit_helper_get_elem(
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    match vm_get_elem(ctx, funcs, NanBox::from_bits(recv), NanBox::from_bits(key)) {
+    let (recv, key) = (NanBox::from_bits(recv), NanBox::from_bits(key));
+    // An in-range element of a typed array wholly inside its buffer (what
+    // `vm_get_elem` would reach after its plain-array / arguments / string
+    // checks).
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && (0.0..9_007_199_254_740_992.0).contains(&n)
+        && (n as u64) as f64 == n
+        && let Some(v) = ctx.realm.typed_get_fast(Handle::from_raw(h), n as usize)
+    {
+        return v.to_bits();
+    }
+    match vm_get_elem(ctx, funcs, recv, key) {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
@@ -10242,8 +10253,16 @@ fn typed_array_index_get(ctx: &mut Ctx, recv: NanBox, key: NanBox) -> Option<Nan
 /// view: `TypedArraySetElement` (ToNumber of a Number has no effect; the index
 /// is valid), done directly. `false` when the generic path must run.
 fn typed_array_index_set(ctx: &mut Ctx, recv: NanBox, key: NanBox, value: NanBox) -> bool {
-    if value.as_number().is_none() {
+    let Some(v) = value.as_number() else {
         return false;
+    };
+    // A view wholly inside its buffer takes the write in one step.
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && (0.0..9_007_199_254_740_992.0).contains(&n)
+        && (n as u64) as f64 == n
+        && ctx.realm.typed_set_fast(Handle::from_raw(h), n as usize, v)
+    {
+        return true;
     }
     let Some((h, i)) = typed_array_index(ctx, recv, key) else {
         return false;

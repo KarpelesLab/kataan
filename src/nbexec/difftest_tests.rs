@@ -3017,3 +3017,36 @@ fn global_var_binding_follows_global_object_property() {
         "1,5,6,8,TypeError,TypeError,f2,500,40,1,number,20,22,22,2,31,1,2,TypeError"
     );
 }
+
+/// Typed-array element writes of every non-BigInt kind take each Number to the
+/// kind's value (`ToInt8`..`ToUint32` modular, `ToUint8Clamp` round-half-even,
+/// Float32 rounding, -0 kept by the float kinds), whether the write takes the
+/// in-bounds one-step path or the general one (fractions, NaN, values past
+/// 2**53); and a view a resizable buffer shrank below reads `undefined` and
+/// ignores writes until the buffer grows back.
+#[test]
+fn typed_array_element_writes_every_kind() {
+    let src = r#"
+        var vals = [200, -1, 300, -5, 1.5, 2.5, 2147483648, -2147483649, 1e10, -1e10, 1152921504606846977, NaN, -0, Infinity, 0.1, 65537.75];
+        var kinds = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];
+        var out = [];
+        for (var k = 0; k < kinds.length; k++) {
+            var ta = new kinds[k](vals.length);
+            for (var rep = 0; rep < 3; rep++) for (var i = 0; i < vals.length; i++) ta[i] = vals[i];
+            var row = [];
+            for (var i = 0; i < ta.length; i++) row.push(Object.is(ta[i], -0) ? "-0" : String(ta[i]));
+            out.push(row.join(" "));
+        }
+        var rab = new ArrayBuffer(8, { maxByteLength: 16 });
+        var fixed = new Uint16Array(rab, 0, 4), track = new Uint16Array(rab, 2);
+        fixed[3] = 7; track[0] = 9;
+        rab.resize(4);
+        fixed[0] = 5; track[0] = 11;
+        out.push([fixed[0], fixed.length, track[0], track.length, new Uint16Array(rab)[1], new Uint16Array(rab)[0]].join());
+        rab.resize(16);
+        out.push([fixed[0], fixed[3], track.length, track[6]].join());
+        out.join("|")
+    "#;
+    let exp = "-56 -1 44 -5 1 2 0 -1 0 0 0 0 0 0 0 1|200 255 44 251 1 2 0 255 0 0 0 0 0 0 0 1|200 0 255 0 2 2 255 0 255 0 255 0 0 255 0 255|200 -1 300 -5 1 2 0 -1 -7168 7168 0 0 0 0 0 1|200 65535 300 65531 1 2 0 65535 58368 7168 0 0 0 0 0 1|200 -1 300 -5 1 2 -2147483648 2147483647 1410065408 -1410065408 0 0 0 0 0 65537|200 4294967295 300 4294967291 1 2 2147483648 2147483647 1410065408 2884901888 0 0 0 0 0 65537|200 -1 300 -5 1.5 2.5 2147483648 -2147483648 10000000000 -10000000000 1152921504606847000 NaN -0 Infinity 0.10000000149011612 65537.75|200 -1 300 -5 1.5 2.5 2147483648 -2147483649 10000000000 -10000000000 1152921504606847000 NaN -0 Infinity 0.1 65537.75|,0,11,1,11,0|0,0,7,0";
+    assert_eq!(run(src), exp);
+}

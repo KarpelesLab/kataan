@@ -33,6 +33,7 @@ pub(crate) mod hidden_layout;
 mod msg_text;
 mod shortest;
 mod str_switch;
+mod typed_fast;
 pub use coll_index::CollIndex;
 pub use str_switch::switch_key_order;
 mod handle_map;
@@ -2143,6 +2144,9 @@ impl Realm {
     /// `BigInt64Array`/`BigUint64Array` element decodes to a freshly allocated
     /// `BigInt` (hence `&mut self`).
     pub fn typed_get(&mut self, handle: Handle, i: usize) -> Option<NanBox> {
+        if let Some(v) = self.typed_get_fast(handle, i) {
+            return Some(v);
+        }
         let (buffer, byte_offset, length, kind) = self.heap.get(handle)?.as_typed_array()?;
         // A fixed-length view whose resizable buffer shrank below its extent is
         // out of bounds: every integer-indexed read is `undefined` (IsValidInteger
@@ -2169,6 +2173,11 @@ impl Realm {
     /// it into the shared bytes. A write past the view's length is ignored (typed
     /// arrays are fixed-length). Returns `false` if `handle` is not a view.
     pub fn typed_set(&mut self, handle: Handle, i: usize, value: NanBox) -> bool {
+        if let Some(n) = value.as_number()
+            && self.typed_set_fast(handle, i, n)
+        {
+            return true;
+        }
         let Some((buffer, byte_offset, length, kind)) =
             self.heap.get(handle).and_then(Cell::as_typed_array)
         else {
@@ -2195,7 +2204,7 @@ impl Realm {
         };
         let size = typed_elem_size(kind);
         // Checked offset math: never wrap (debug panic / silent corruption) on a
-        // patho                        .map_or(dense, |s| s.len.max(dense)), `i`.
+        // pathological index `i`.
         let Some(start) = i.checked_mul(size).and_then(|o| byte_offset.checked_add(o)) else {
             return true;
         };
