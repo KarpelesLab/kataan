@@ -4448,6 +4448,16 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     call_spill: Vec<(u8, i32, bool)>,
+    /// While the generic tier emits an op inside a promoted loop with no
+    /// speculative version (`numeric`): its global binding epoch slot and
+    /// validated binding address slots (`[rbp+disp]`), the epoch first,
+    /// which every `call` re-checks after it returns (see
+    /// `numeric::NumGen::call_globals`). Empty elsewhere.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    call_globals: Vec<i32>,
     /// In a body that inlines calls (`inline`): the native-frame slot of a
     /// pending inlined activation's materialization stub, which every
     /// `call` first runs when set (`call_seq::emit_inline_guard`).
@@ -4671,6 +4681,25 @@ impl X64Assembler {
     )]
     pub(crate) fn call_spill_now(&self) -> Vec<(u8, i32, bool)> {
         self.call_spill.clone()
+    }
+
+    /// Sets the global binding slots every `call` re-checks (see the
+    /// `call_globals` field).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn set_call_globals(&mut self, slots: Vec<i32>) {
+        self.call_globals = slots;
+    }
+
+    /// The global binding slots every `call` currently re-checks.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn call_globals_now(&self) -> Vec<i32> {
+        self.call_globals.clone()
     }
 
     /// Sets the slots only the frame prologue empties (see the `entry_clear`
@@ -7291,7 +7320,7 @@ impl JitFunction {
             u16,
             *mut MethodSite,
             *const CallSite,
-            Vec<(u8, i32, bool)>,
+            (Vec<(u8, i32, bool)>, Vec<i32>),
         )> = Vec::new();
         // The slow paths of a speculative loop's fast version that leave for
         // its plain copy instead: (slow path entry, the leave).
@@ -7394,6 +7423,7 @@ impl JitFunction {
             let in_region = num.in_region(op_idx);
             if in_region {
                 a.set_call_spill(num.call_spill(op_idx));
+                a.set_call_globals(num.call_globals(op_idx));
             }
             // Where a fast path that left its result in the SSE register it
             // is promoted to resumes (past the slow paths' reload).
@@ -8828,7 +8858,7 @@ impl JitFunction {
                             obj,
                             s.method_ptr,
                             call_site,
-                            a.call_spill_now(),
+                            (a.call_spill_now(), a.call_globals_now()),
                         ));
                     }
                     if ool_past.is_none() {
@@ -10205,6 +10235,7 @@ impl JitFunction {
             }
             if in_region {
                 a.set_call_spill(Vec::new());
+                a.set_call_globals(Vec::new());
                 if ool_past.is_none() {
                     num.after_generic(&mut a, op_idx);
                 }
@@ -10374,7 +10405,8 @@ impl JitFunction {
             // An inherited data property or getter, through the site's
             // chain cache: the value, or the getter's native call. (In a
             // promoted loop, its calls bracket the promoted registers.)
-            a.set_call_spill(spill);
+            a.set_call_spill(spill.0);
+            a.set_call_globals(spill.1);
             a.bind(helper);
             a.dbg_mark("x-get");
             let slow = a.new_label();
@@ -10419,6 +10451,7 @@ impl JitFunction {
             a.store_rax(disp(dst));
             a.jmp(done);
             a.set_call_spill(Vec::new());
+            a.set_call_globals(Vec::new());
         }
         // Throw exit. In a body with `try` regions, first offer the pending fault
         // to the activation's innermost handler (exactly the interpreter's

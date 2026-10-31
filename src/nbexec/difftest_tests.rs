@@ -3698,3 +3698,43 @@ fn over_long_concatenation_throws_range_error() {
     "#;
     assert_eq!(run(src), "RangeError,RangeError,RangeError,RangeError");
 }
+
+/// A promoted loop with no speculative version (here: it calls `Math.imul`)
+/// keeps its global ops' validated binding addresses between back-edge
+/// polls; a call one of its generic ops made (a typed store's `valueOf`, a
+/// getter) could change what they mean and the loop went on using them: a
+/// global `var` made non-writable mid-loop was still written, and bindings
+/// added by an indirect `eval` (which may move the binding table) were read
+/// through stale addresses (`Math` came back as something else).
+#[test]
+fn promoted_loop_globals_revalidate_after_a_call() {
+    let src = r#"
+        var h = 0, x = 0, y = 0, i = 0, cnt = 0;
+        var tgt = new Float64Array(16), keys = [];
+        for (var q = 0; q < 3000; q++) keys.push(q & 15);
+        keys[1000] = { valueOf: function () { Object.defineProperty(globalThis, "x", { writable: false }); return 3; } };
+        for (i = 0; i < 3000; i++) {
+            x = (x + h) | 0;
+            h = Math.imul(i, 16777619);
+            tgt[i & 15] = keys[i];
+        }
+        var r = [x];
+        var o = {};
+        Object.defineProperty(o, "p", { get: function () {
+            cnt++;
+            if (cnt === 1500) Object.defineProperty(globalThis, "y", { writable: false });
+            if (cnt % 500 === 0) { var s = ""; for (var k = 0; k < 200; k++) s += "var nv" + cnt + "_" + k + " = " + k + ";"; (0, eval)(s); }
+            return 1;
+        } });
+        function second() {
+            for (var j = 0; j < 3000; j++) {
+                y = (y + h + o.p) | 0;
+                h = Math.imul(h ^ j, 16777619);
+            }
+        }
+        second();
+        r.push(y, h, cnt, typeof nv3000_199);
+        r.join()
+    "#;
+    assert_eq!(run(src), "939496004,-1785025331,-711174563,3000,number");
+}

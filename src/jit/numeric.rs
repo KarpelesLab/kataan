@@ -2406,6 +2406,29 @@ impl NumGen {
             .collect()
     }
 
+    /// The global binding slots of op `pc`'s region that every call the
+    /// generic emitter's code for the op makes re-checks after it returns
+    /// (`X64Assembler::set_call_globals`): the region's epoch slot, then its
+    /// validated binding address slots ??? when the region has global ops and
+    /// no speculative version (whose fast version makes no call that rejoins
+    /// it). A call (a slow path, a getter, a `valueOf`, a callee) may run
+    /// Rust code that changes what those addresses mean, e.g. a
+    /// `defineProperty` making a global `var` non-writable, or a new global
+    /// binding moving the others; they are then dropped exactly as a
+    /// back-edge poll drops them ([`Self::refresh_globals`]), else the loop
+    /// would go on using them until its next poll. Empty otherwise.
+    pub(super) fn call_globals(&self, pc: usize) -> Vec<i32> {
+        let Some(ri) = self.region_at(pc) else {
+            return Vec::new();
+        };
+        if self.regions[ri].spec.is_some() || self.region_gslots[ri].is_empty() {
+            return Vec::new();
+        }
+        let mut v = vec![self.gslot_disp((self.n_gslots + ri) as u32)];
+        v.extend(self.region_gslots[ri].iter().map(|&k| self.gslot_disp(k)));
+        v
+    }
+
     /// The SSE register a region op `pc`'s result register `dst` is promoted
     /// to: the generic emitter's fast path may leave the result there only
     /// (the register is dirty, so a flush stores it), and must then skip the
@@ -5547,6 +5570,30 @@ impl X64Assembler {
             let (x, d, _) = self.call_spill[i];
             self.movsd_x_mem(x, d);
         }
+        self.recheck_globals_after_call();
+    }
+
+    /// After a `call`, for the [`call_globals`](NumGen::call_globals) slots:
+    /// when the global binding epoch is not the one the region noted, notes
+    /// it and drops the validated binding addresses. Clobbers only `r11`
+    /// (and the flags), so the call's result in `rax` survives.
+    fn recheck_globals_after_call(&mut self) {
+        let Some((&noted, slots)) = self.call_globals.split_first() else {
+            return;
+        };
+        let slots = slots.to_vec();
+        let keep = self.new_label();
+        self.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
+        self.raw(&[0x4d, 0x8b, 0x1b]); // mov r11, [r11]
+        self.raw(&[0x4c, 0x3b, 0x9d]); // cmp r11, [rbp + noted]
+        self.raw(&noted.to_le_bytes());
+        self.jcc(CC_E, keep);
+        self.raw(&[0x4c, 0x89, 0x9d]); // mov [rbp + noted], r11
+        self.raw(&noted.to_le_bytes());
+        for d in slots {
+            self.mov_frame_zero(d);
+        }
+        self.bind(keep);
     }
 
     /// Appends raw instruction bytes.
