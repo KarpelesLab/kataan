@@ -7,6 +7,425 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/kataan/compare/v0.0.9...v0.0.10) - 2026-10-31
+
+### Added
+
+- *(nbvm)* cross-realm dynamic functions, realm-aware eval environments, eval-code fixes
+- *(nbvm)* eval in derived constructors, `var` reference order, eval?.(), with-object tail calls
+- *(nbvm)* direct eval in class bodies, field initializers and ShadowRealm code on the VM
+- *(entry)* Interp::run and every product entry point run on the hosted VM
+- *(nbvm)* VM functions keep their source text for Function.prototype.toString
+- *(nbvm)* eval code, $262.evalScript and Function() bodies run on the VM
+- *(nbvm)* $262.agent tests run on the VM; tagged-template PTC; callee-before-args
+- *(nbvm)* dynamic-scope functions (direct eval) in module code resolve in the module environment
+- *(nbvm)* module top-level using, import.meta(), namespace super-set/field triggers, ShadowRealm imports on the VM
+- *(nbvm)* direct eval in functions and `with` run on the VM (dynamic scoping)
+- *(nbvm)* using / await using at module top level
+- *(nbvm)* optional calls, super spread calls, super compound/update/destructuring targets, delete super/optional chains, arrow super()
+- *(nbvm)* ES modules run on the VM
+- *(nbvm)* await using, using in for heads and try/catch blocks; for-head TDZ
+- *(nbvm)* parameter TDZ, left-to-right parameter binding, arguments in defaults
+- *(nbvm)* string/template literals carrying lone surrogates (NewStringWtf8)
+- *(nbvm)* KATAAN_VM_PURE — fail any run that tree-walks user code
+- *(nbvm)* const assignment TypeError, eval-referencing fns stay on host, cross-context recursion guard
+- *(nbvm)* sync using declarations
+- *(nbvm)* spec generator return()/throw() through finally and iterator closes
+- *(nbvm)* finally runs on every exit from try/catch
+- *(nbvm)* computed keys in hosted object patterns
+- *(nbvm)* block-level function declarations and Annex B.3.3
+- *(nbvm)* observable mapped arguments via parameter cells
+- *(nbvm)* direct eval at a hosted script's top level
+- *(nbvm)* assignment-target for-of/for-in heads; safe generator return()
+- *(nbvm)* yield* in async generators
+- *(nbvm)* yield*, for await, member updates; hoisted sibling functions
+- *(nbvm)* hosted async generators
+- *(nbvm)* hosted async functions; realm-synthesized VM fn name/length
+- *(nbvm)* generators as suspended VM frames; for-of over the iterator protocol
+- *(nbvm)* private class elements in hosted runs
+- *(nbvm)* hosted object literals define their members
+- *(nbvm)* runtime classes and new.target in hosted runs
+- *(nbvm)* allow mapped arguments when aliasing is unobservable
+- *(nbvm)* spread calls, host Function/indirect eval, CopyDataProperties
+- *(nbvm)* BigInt literals and BigInt-aware operators in hosted runs
+- *(nbvm)* arguments, new on plain functions, and real function cells (ROADMAP §2.0 stage 4)
+- *(nbvm)* calls across the VM and the interpreter (ROADMAP §2.0 stage 3)
+- *(nbvm)* a global environment for hosted VM runs (ROADMAP §2.0 stage 2)
+- *(nbvm)* run bytecode programs inside an Interp (ROADMAP §2.0 stage 1)
+- *(nbvm)* KATAAN_VM_STRICT reports VM refusals instead of silently falling back
+- *(gc)* collect inside function bodies reached through audited calls
+- *(module)* import … with { type: "bytes" } (import-bytes), and give embedder typed-array views a prototype
+
+### Fixed
+
+- *(jit)* inline typed-array `.length` honours own and redefined `length`
+- *(json)* JSON.stringify serializes a Symbol wrapper as an object
+- *(regexp)* RegExp(pattern) reads pattern[@@match] once
+- *(realm)* captured intrinsics survive a rebound globalThis
+- *(annexb)* a block function's global copy is a sloppy [[Set]]
+- *(builtins)* slot-backed accessors honor own and redefined properties
+- *(globals)* a global var binding follows its global-object property
+- *(errors)* name the callee and the key in call and nullish-access errors
+- *(intrinsics)* engine-created objects use captured intrinsics, not live globals
+- *(regex)* u-mode backreferences case-fold by code point
+- *(regex)* legacy case-insensitive class ranges try the whole case class
+- *(regex)* u-mode case-insensitive ranges reach the long s and Kelvin sign from ASCII
+- *(temporal)* non-ISO PlainDateTime difference rounds day/time units
+- *(temporal)* zoned calendar-unit rounding applies DifferenceZonedDateTime's day correction
+- *(temporal)* BubbleRelativeDuration carries one unit instead of re-differencing
+- *(temporal)* calendar-unit rounding with an increment weighs the whole window
+- *(regex)* case-insensitive u/v class membership uses the simple-fold class
+- *(regex)* \P{...} under the v and i flags complements the folded set
+- *(intl)* percent style multiplies the mathematical value by 100 exactly
+- *(intl)* Locale info getters honor the tag's own -u- keywords and the locale's hour cycle
+- *(intl)* compact PluralRules select on the rounded compact mantissa
+- *(intl)* NumberFormat formatToParts renders what format renders
+- *(intl)* accounting currency parentheses follow each locale's CLDR pattern
+- *(intl)* supportedLocalesOf keeps only the locales the constructors serve
+- *(intl)* DateTimeFormat resolvedOptions reports the pattern's field widths
+- *(intl)* scientific, engineering and compact mantissas round on decimal digits
+- *(intl)* DisplayNames of a language tag keeps its script and region
+- *(intl)* NumberFormat significant-digit results keep the right digits
+- *(intl)* Collator caseFirst "upper" orders uppercase before lowercase
+- *(array)* a far write or length leaves the store sparse instead of allocating its holes
+- *(keys)* a property key keeps a lone surrogate instead of folding it into U+FFFD
+- *(intl)* internal slots are internal keys; Segments is an ordinary object
+- *(compile)* nested functions compile in linear time
+- *(json)* stringify and the reviver walk are bounded by the stack, not 2,000 levels
+- *(array)* map, filter, flat, flatMap and concat honor a length past the dense store
+- *(array)* join and toLocaleString honor a length past the dense store
+- *(number)* parseInt rounds a long digit string once, not at every digit
+- *(convert)* ToPrimitive runs the methods of objects without plain keys
+- *(jit)* a construct's cached captures are stale once its allocation moves the heap
+- *(array)* lowering length drops the attributes of the deleted elements
+- *(object)* groupBy steps its items and closes them when the callback throws
+- *(array)* mutators move elements before a read-only length throws
+- *(array)* the built-ins honor a length past the dense store, sparsely
+- *(stack)* nesting bounded by native stack headroom, not level counts; iterative JSON.parse
+- *(object)* user string keys can no longer name internal slots
+- *(array)* at and with count from a length past the dense store
+- *(function)* a bound function's name is a rope join, linear in re-binds
+- *(array)* a join cycle through several arrays renders empty, not a crash
+- *(array)* join and toLocaleString read elements live after user code
+- *(regex)* a quantified group iterated thousands of times still matches
+- *(vm)* a method call reads its callee before its arguments
+- *(date)* setYear with a year past the time-value range is NaN
+- *(array)* includes/indexOf on an empty array-like skip fromIndex
+- *(annexb)* a block function that cannot var-hoist stays block-scoped
+- *(eval)* a rejected eval keeps the caller's Annex B block functions
+- *(global)* declarations create global properties in spec order
+- *(instanceof)* `x instanceof Function` walks the prototype chain
+- *(string)* a String wrapper prototype exposes its length and indices
+- *(vm)* a write through a typed-array prototype honours its [[Set]]
+- *(typedarray)* [[Delete]] of an element index reports failure
+- *(proxy)* a trap's descriptor comes back in FromPropertyDescriptor order
+- *(json)* stringify's nesting is bounded by max_json_depth
+- *(class)* a static method's source text excludes `static`
+- *(with)* `typeof x` resolves its reference once
+- *(proxy)* calling or constructing needs a callable / constructor target
+- *(arrays)* read elements live after an argument's coercion runs code
+- *(vm)* a body's var environment holds only its own var names
+- *(temporal)* date differences don't count a month the day overshoots
+- *(vm)* a labelled let loop whose body captures its binding compiles
+- *(class)* an anonymous class in a static field is named before its static elements run
+- *(host)* the Test262 $262_* host hooks are opt-in
+- *(jit)* a speculative loop's layout miss empties the layout-proving ways before leaving
+- *(intl)* percent formatting rounds the scaled value
+- *(intl)* roundingIncrement is checked against the resolved fraction digits
+- *(intl)* a currency's default fraction digits are its ISO 4217 minor units
+- *(intl)* PluralRules#select takes its operands from the formatted number
+- *(intl)* negative zero in scientific/engineering notation is -0E0
+- *(numbers)* ++/-- on an object whose value is a BigInt yields a BigInt
+- *(functions)* Function.prototype.toString on a proxy makes no trap call
+- *(classes)* a class named by a property key gets its name before its static elements
+- *(arrays)* an array with a non-writable length cannot grow
+- *(strings)* a String wrapper's non-canonical numeric keys are ordinary properties
+- *(intl)* compact notation rounds to two significant digits in any numbering system
+- *(date)* Date.parse reads offsets, two-digit years and the common human forms
+- *(object)* defineProperties/create convert every descriptor before defining any
+- *(sab)* SharedArrayBuffer has its @@species getter
+- *(promise)* Promise.withResolvers.length is 0
+- *(gc)* an async function's result promise stays rooted while its body runs
+- *(array)* `Array.fromAsync` over a sync iterable keeps the spec's ticks
+- *(module)* a dynamic import resolves its promise with the namespace
+- *(microtask)* `queueMicrotask` rejects a non-callable and calls with no arguments
+- *(promise)* resolving functions honour `[[AlreadyResolved]]`
+- *(promise)* `then` with a subclass species settles its capability in the reaction job
+- *(iterator)* `drop` skips results without reading their `value`
+- *(async)* closing a `for await` over a sync iterator awaits the wrapper's return
+- *(class)* an arrow in a field initializer sees the instance's `this`
+- *(arguments)* freezing a mapped arguments object severs its aliases
+- *(strings)* look a search value's symbol method up once; concat ToStrings
+- *(cli)* an uncaught exception keeps the program's earlier output
+- *(templates)* tagged-template sites are not keyed by a dangling address
+- *(object)* isFrozen/isSealed of an array test its descriptors
+- *(json)* JSON.stringify serializes a typed array's named properties
+- *(array)* a string-keyed index store past the dense cap is stored, not refused
+- *(proxy)* the defineProperty invariant reads the target's real descriptor
+- *(proxy)* Object.entries/values ask getOwnPropertyDescriptor without an ownKeys trap
+- *(math)* hypot does not overflow its intermediate squares
+- *(array)* splice() and toSpliced() without a start remove nothing
+- *(numbers)* ToInt32/ToUint32/ToUint16 wrap past 2^63
+- *(errors)* error instances inherit their name
+- *(for-in)* walk proxies and indexed prototypes on the chain
+- *(array)* generic methods read only what their algorithm names
+- *(proxy)* hasOwn, seal and bind call the traps their algorithms name
+- *(builtins)* convert only the arguments an algorithm reads
+- *(ci)* JIT-only code gated for macOS/Windows; deep binary chains compile iteratively
+- *(globals)* a bare write to a global-object accessor runs its setter
+- *(globals)* `delete globalThis.x` drops the global binding it mirrors
+- *(globals)* `globalThis.name = v` leaves a global let/const/class binding alone
+- *(array)* default sort orders by UTF-16 code unit
+- *(strings)* lone surrogates survive replace, join, String(), String.raw, Error text and padding
+- *(realm)* adding an index to a non-extensible array fails (strict throws)
+- *(number)* IsIntegralNumber past 2^63 (Number.isInteger(1e20) was false)
+- *(number)* Number→String rounding in ToString, toPrecision/toExponential and radix toString
+- *(nbvm)* `continue` through a switch or label chain reaches its loop
+- restore the vendor/test262 submodule (bfdc6e7 committed a worktree symlink)
+- *(dispatch)* method calls follow [[Get]] on the receiver, then call what they find
+- *(builtins)* map/filter with a custom @@species follow ArraySpeciesCreate exactly
+- *(jit)* stores into array holes, and comparison results as values
+- *(nbvm)* read an operand before a later operand assigns its variable
+- *(nbvm)* cross-realm tail calls and resumed frames enter the callee's realm
+- *(gc)* linear delete/allocation beside large dictionary objects
+- *(nbvm)* VM functions of another realm run with that realm current
+- *(agent)* run $262.agent worker scripts on the hosted VM
+- *(nbvm)* caller stack across nested VM runs, generator default prototype from the function's realm
+- *(nbvm)* strict writes through the global object's prototype chain
+- *(nbvm)* function realms for errors and sloppy `this`, super() evaluation order
+- *(nbvm)* legacy fn.arguments, debugger statement
+- *(nbvm)* empty-description symbol method names, tail calls into eval-table functions, String wrapper writes
+- *(nbvm)* legacy fn.caller, GetPrototypeFromConstructor via the host, proxy setters over array holes
+- *(nbvm)* primitive receivers, iterator results, for(let) head TDZ, replaced Array.prototype methods
+- *(nbvm)* sparse arrays, ordinary-object index writes, optional-call chains, VM fn key order
+- *(nbvm)* remove runtime Unsupported/NotAnObject fallbacks; key, for-in, scope fixes
+- *(nbvm)* switch case block is one scope; TDZ for uncaptured lexicals
+- *(nbvm)* symbol operands, String wrapper properties, NamedEvaluation
+- *(nbvm)* relational operators, array length/sparse writes, captured lexical TDZ
+- *(nbvm)* lexical this in arrow functions
+- *(nbvm)* TDZ cells for hoisted-fn captures, const captures, legacy caller, pattern cells
+- *(nbvm)* catch patterns, template ToString, computed-key setters, tagged templates
+- *(nbvm)* hosted delete, object-pattern coercibility, getter-only writes
+- *(nbvm)* name the destructuring member-place type (clippy type_complexity)
+- *(nbvm)* array destructuring through the iterator protocol in hosted runs
+- *(nbvm)* hosted operators coerce objects through the interpreter; member assignment order
+- *(nbvm)* hosted writes use the interpreter's [[Set]] where the VM store is wrong
+- *(nbvm)* VM correctness — reads, calls, this, generators, and GC in hosted runs
+- *(intl)* bump intl to 0.6.2 — region number symbols and CLDR search collations
+- *(intl)* select the CLDR search collation for usage:"search", and group exact decimals by the locale's real pattern
+- *(test262)* give every script that calls import() its file as the import base
+- *(class)* resolve a class's superclass from the class object, not by re-evaluating `extends`
+- *(instanceof)* decide built-in instanceof by the prototype chain, not the cell brand
+- *(class)* a proxy is transparent to private elements, on read as well as write
+- *(builtins)* preserve NaN bit patterns in typed-array slice, tighten Date parsing, close yield* iterators
+- *(realm)* give arrays a real per-object realm, and resolve intrinsics from the running realm
+- *(realm)* repair is_internal_key's doc comment and escape an intra-doc link
+- *(class)* integrity levels must not reach private elements
+- *(nbexec)* var-hoist destructuring patterns, stop hiding user NUL keys, revive typed arrays
+- *(nbexec)* legacy `fn.arguments`, `with`-scoped delete, and global accessor redefinition
+- *(proxy)* observe traps through [[Get]], guard function realms, and keep private names off [[Set]]
+- *(lexer)* `await` and `yield` are contextual, so `/` after them is not always a regex
+- *(nbvm)* collect garbage inside function bodies, not just the outermost frame
+- *(nbexec)* slice Function.prototype.toString from the defining source; run harness as its own Script
+
+### Other
+
+- *(async)* engine-made promises link their prototype implicitly; an async call recycles its registers
+- *(jit)* async function bodies compile to the generic tier and resume in native code
+- *(async)* an `await` reuses its frame's state and makes no promise; job queues are no longer quadratic
+- *(jit)* integer versions for loops over element reads (hash / bit-set loops)
+- *(jit)* speculative loops accept in-body branches; fractional typed-array integer stores inline
+- *(jit)* sync generator bodies compile to the generic tier and resume in native code
+- *(jit)* speculative loops hoist typed-array views; guarded Math calls keep the fast version; Math.imul over element reads inline
+- *(vm)* define a class field on an ordinary object without the host's descriptor path
+- *(vm)* cache static-member chains, private-element sites, resume generators in the VM
+- *(jit)* typed-array elements and `.length` inline; Math.imul / clz32 inline
+- *(vm)* recursive activations reuse spare inline-cache vectors
+- *(vm)* object spread / rest copy a plain object without descriptor objects
+- *(vm)* DataView get*/set* from a call site skip the by-name dispatch
+- *(vm)* typed-array element reads and Number writes in one step
+- *(jit)* compiled code writes global `var` bindings without the interpreter
+- *(jit)* a compiled-in layout compares the shape word in place
+- *(jit)* `%` without operand tag tests, `if (!x)` branches itself, receiver ways across joins and repeated reads
+- *(jit)* `GetMethod` reads through a memo of its last lookup
+- *(jit)* method memos keep what their lookup proved; brand-free ways are truthy
+- *(jit)* a call from an inlined body pushes its pending frames in its own commit
+- *(jit)* loops that read captured bindings get a speculative version
+- *(jit)* the canonical NaN is x86's default NaN, so arithmetic needs no NaN fix-up
+- *(jit)* a method call's sequence revalidates the lookup its memo last hit
+- *(jit)* inline polymorphic call sites; inline guards revalidate the lookup they last hit
+- *(jit)* `this instanceof F` and a sloppy `this` without a one-op frame
+- *(vm)* compare against a string literal without making the literal
+- *(vm)* `Object.create(proto)` allocates at the call site
+- *(vm)* mapped arguments keep their parameter map on the object
+- *(jit)* a layout records its Number-only slots; a speculative loop reads them unchecked
+- *(jit)* inline callees that call, and their own inlined calls
+- *(vm)* `x instanceof F` for a VM function without the host
+- *(jit)* `f.call(thisArg, …)` calls `f` through the call sequence
+- *(jit)* plain-function constructors take the class constructor fast paths
+- *(vm)* dispatch a string-literal switch by one table lookup
+- *(vm)* make arguments objects in one step from a kept layout
+- *(gc)* a minor sweep frees a dead young cell in about 30 instructions, not 52
+- *(jit)* merge a speculative stretch's NaN checks into the one that stands for them
+- *(objlit)* name anonymous functions under static keys at compile time
+- *(instanceof)* decide `x instanceof ScriptFn` without generic [[Get]]s
+- *(jit)* two-instruction handle tests, fresh-object adds in inlined constructors
+- *(jit)* an inline one-argument Math function reads a raw NaN as it is
+- *(jit)* re-enter a speculative nest's fast version at its inner header
+- *(jit)* spill the cheapest interval when a promoted region runs out of SSE registers
+- *(jit)* promote call-free loop nests as one region
+- *(jit)* promoted loops check arithmetic operands through the result, store from SSE registers, and index without exactness tests
+- *(roadmap)* benchmark ratios at 34d0fff7
+- *(map_set)* compiled Map/Set calls take one lean helper; 'k' + i builds one small string
+- *(jit)* a native call bumps one depth counter and checks one activation flag
+- *(jit)* a rooted handle's walk checks only handle-ness and bounds
+- *(jit)* loops that allocate or use captured bindings get promoted registers
+- *(jit)* the heap arena lives in r12/r13 for a generic body's activation
+- *(realm)* build the intrinsics without per-key attribute lists; 2x cheaper startup
+- *(jit)* the back-edge poll's no-op case inline; an inline guard keeps `this`'s way layout-proving
+- *(jit)* a native-call entry leaves unset the registers its body writes before reading
+- *(object,array)* indexed attribute lists; O(1) amortized shift
+- *(string)* substring/slice/substr share the receiver's buffer
+- *(jit)* inline computed-key calls by callee function; recompile when a cold call site settles
+- *(regex)* trim per-call fixed costs of test/exec/replace
+- *(regex)* one-pass global @@replace/@@match, cheaper literal test/exec
+- *(jit)* inline small base class constructors at `new` sites
+- *(jit)* a promoted loop's truthiness test on an object fills its receiver way
+- *(shape)* a shape with many children finds them by key, not by scan
+- *(collections)* stamped memos for Map/Set method sites and `for (const [k, v] of map)`
+- *(json)* exact shortest number digits, direct string/array dispatch in stringify, verbatim cached keys in parse
+- *(jit)* per-way call memos, a cheap no-op back-edge poll, leaner receiver checks
+- *(jit)* numeric predicates take the Int tier, their 0/1 boxed as a boolean
+- *(array)* unboxed-tier callbacks run straight off dense storage; map/filter build their result once
+- *(jit)* fold a Math receiver's RequireObjectCoercible into the inline call
+- *(jit)* fast-version field loads go straight to SSE registers
+- *(jit)* keep validated global read addresses across activations
+- *(jit)* type facts past guarded operands; receiver cache in every loop
+- *(jit)* pooled extra parts, compiled-in constructor adds, out-of-line store paths
+- *(jit,objects)* compiled property adds fill the near spill too
+- *(objects)* spilled slots 5-12 live in the extra part itself; literals of up to 12 keys build in one step
+- *(roadmap)* benchmark table at fd93e0a4 (inlining, one-step literals, closures)
+- *(jit)* small monomorphic callees inlined into compiled callers (methods, values, getters)
+- *(jit,arrays)* a for-of open over a plain array is inline
+- *(jit)* an array iteration's end is inline
+- *(jit)* a speculative loop reuses a property value a register already holds
+- *(jit)* for-of loops promoted; truthiness walks fill the receiver cache; one walk per CellGet
+- *(objects)* object literals are made in one step in their final shape; functions' own properties skip the generic [[Set]]
+- *(jit)* closures without a captures allocation, calls inside promoted loops, cheaper call entry
+- *(roadmap)* benchmark table at b3f37ff9 (generational GC, small arrays, regalloc groundwork)
+- *(gc)* a minor collection visits only the side-table entries made since the last collection
+- *(arrays,jit)* push/pop of a side-free array in one cell access; native callback entry inlined again
+- *(jit)* Math.max/min computed inline; string .length skips the array probes; built-in method sites skip the closure lookup
+- *(jit,nbvm)* try-bearing bodies get a native-call entry; Rust-side compiled calls enter it; replace() callbacks run in the VM
+- *(arrays)* small arrays keep their elements in the cell; compiled code makes array literals inline
+- *(alloc)* a pool fast path with no lifecycle checks; the minor sweep releases cells inline
+- *(nbvm)* String/Number/parseInt/... over primitives skip the host; natives dispatch first in call_with_this
+- *(nbvm)* a for-of pushes its close-on-throw handler once, not per iteration
+- *(regex)* literal-first scan for `A B* x` patterns, one-step match arrays, direct exec/test dispatch
+- *(jit)* speculative loops read globals unchecked and once per iteration, keep element indices promoted, step counters in place
+- *(gc)* generational collection — minor collections of a 16k nursery behind a borrow-based write barrier
+- *(jit)* hot loops make no call between header and back-edge; later sites reuse the first receiver check; for-of steps inline
+- *(strings)* first array for-of takes the by-index path; function replace builds its arguments from the match; HandleKeyedMap drops its BTreeMap
+- *(jit)* inherited method and getter lookups read the holder's value at its recorded address; leaner inline adds after a store miss
+- *(jit)* derived-class construction in compiled code: `new` of a derived class, `super(…)` and default constructors take the native call sequence
+- *(jit)* a recompilation keeps the layouts its predecessor compiled in
+- *(api)* engine internals are #[doc(hidden)], outside the semver surface
+- *(jit)* a compiled loop whose property sites learned new layouts leaves at its header and continues in a recompiled body
+- *(jit)* call sites memoize their callee's identity; `new` of a base class allocates inline and enters the constructor directly
+- *(strings)* interned one-unit strings, linear `s[i]`, one-step template literals, one cell per string literal
+- *(roadmap)* benchmark table at ed4765fe (sort at parity with node)
+- *(jit)* a receiver-cache hit that proves the compiled-in layout skips the shape compare; unread LoadConst/Move pairs compile to nothing
+- *(jit)* property sites start from the interpreter's warm caches; monomorphic ones compile their shape and slot in as immediates
+- *(iter)* lazy String Iterator; `for (const [k, v] of map)` binds without the pair
+- *(jit)* promoted operand guards test NaN-ness only; a proven-Number index skips its tag check
+- *(heap)* 64-byte cells, 72-byte heap slots (was 112/120)
+- *(calls)* every built-in method site calls its native directly; stale chain stamps revalidate out of line; JIT code cache colouring
+- *(jit)* promoted arithmetic in its own register, moves coalesced, number stores skip the barrier, inline Math calls memoize their checks
+- *(jit)* promoted loops keep field arithmetic in SSE registers; speculative double version with an exact plain copy
+- *(calls)* native-entry callbacks, a prototype epoch for chain caches, cheaper built-in sites
+- *(iter)* for-of steps built-in Set/Map and string iterators by slot, not by name
+- *(gc)* symbol-key liveness found while marking; statically dispatched trace; sweep drops cells in place
+- *(roadmap)* benchmark table at 1d39450
+- *(json)* number digits appended in place; no indent string without a gap
+- *(jit)* fresh-literal InitProps and walked adds skip proven guards; drop jumps to the next instruction
+- *(builtins)* open-addressed Map/Set index, cheaper built-in call guards, allocation-free number and string paths
+- *(jit)* global binding cache survives calls under an epoch; direct allocation helpers; inline integer %
+- *(regex)* split/match/search without per-position exec; linear matcher covers u/v and one alternation
+- *(nbvm)* captured variables live in a one-value binding cell, not a one-element array
+- *(regex)* linear matcher for straight-sequence patterns; cheaper exec/replace plumbing
+- *(jit)* inline Math.f(x), cached global binding addresses, inline CallKey callee reads
+- *(strings)* inline small strings, allocation-free join/Object.keys/JSON plans
+- *(jit)* receiver cache keeps walked heap slots across a body's property ops
+- *(alloc)* pure-Rust size-class pooling allocator for the CLI and corpus runner
+- *(roadmap)* benchmark table at 9dc93cb (loop_arith faster than node)
+- *(jit)* Math.f(x), global reads and RequireObjectCoercible without the one-op interpreter
+- *(jit)* inline add-cache hits for `this.x = v`; closures built without an interpreter frame
+- *(jit)* promoted loops keep global bindings in registers
+- *(nbvm)* typed-array integer-index reads and writes skip the generic path
+- *(jit)* wrapping int32 expression trees and direct global loads in promoted loops
+- *(nbvm)* loop heads no closure in the loop names live in registers
+- *(jit)* array cells carry a side-state flag; element paths stop calling jit_arena
+- *(jit)* int32 speculation in promoted loops (integer version of a region)
+- *(nbvm)* built-in method sites for Number, Array search/join/slice, String transforms and Object/JSON statics
+- *(object)* inline property slots and compiled object-literal adds
+- *(jit)* inherited properties and getters read through the chain cache
+- *(roadmap)* benchmark table at c616086 (fib 1.6x, sort 1.8x, json 2.0x node)
+- *(nbvm)* built-in method sites for statics, Function call/apply and string search
+- *(jit)* inline heap base, chain-cached method calls, construct and add caches
+- *(jit)* typed arithmetic, promoted loop registers and inline globals in the generic tier
+- *(nbvm)* serve Array pop and String indexOf from the built-in method sites
+- *(nbvm)* run the array higher-order built-ins' loops in the VM
+- *(nbvm)* per-site built-in method entry for CallMethod
+- *(jit)* polymorphic call-site caches, and computed-member calls in native code
+- *(builtins,regex,rope)* JSON shape plans and byte parser, unmaterialized regex matches, small-string joins
+- *(nbvm,host)* cheaper native-to-VM callbacks
+- *(jit)* a machine-code call sequence into compiled callees, and direct `new`
+- *(objmodel)* shape brand flags for wrapper/IsHTMLDDA tests; cheaper plain-add check
+- *(objmodel)* hashed native_protos, shape wrapper flag, no-alloc index keys
+- *(roadmap)* benchmark progress against node (bench/run.sh)
+- *(objmodel)* hashed shape index, ordinary [[Get]] fast path, hashed aux table
+- *(nbvm)* keep tier state in the FnProto so host callbacks start warm
+- *(jit)* enter compiled callees directly from compiled calls
+- *(nbvm)* step built-in Map/Set and snapshot iterators without a host call
+- *(builtins,regex)* direct iterator/result reads, intrinsic exec, greedy loop without a position vector
+- *(nbvm)* fix the loop_arith regression; array .length; closures skip the proto side table
+- *(nbvm)* iterate plain arrays by index; compute built-in Math calls in the VM
+- *(jit)* compile exception handlers; cheaper inline-path receiver checks
+- *(builtins)* early Array push, one-buffer JSON.stringify, keyed default sort
+- *(nbvm)* persistent and prototype-chain inline caches; cheaper calls
+- *(realm,builtins)* O(1) aux_props misses; direct element reads in array callbacks
+- *(host)* skip GetFunctionRealm probes with no cross-realm functions; cheap string check for host operators
+- bound richards_like's packet population (it was quadratic by design)
+- *(jit)* make the machine-code JIT a default feature
+- *(jit)* frame-ABI generic tier, interpreter-op fallback, OSR, KATAAN_JIT_LOG
+- *(object)* shrink Object from 208 to 96 bytes (Cell 216 -> 104)
+- *(test262)* recycle a worker whose address space passes 1 GiB
+- *(nbvm)* slot-cached global bindings; Box<Realm> pointer swap at the host boundary
+- *(gc)* flat per-slot mark set and a one-pass sweep
+- *(nbvm)* object/array literals without descriptor objects
+- *(realm)* Map/Set delete in place as tombstones; O(1) live iteration
+- clean-room microbenchmarks against node (bench/run.sh)
+- *(nbvm)* number fast paths for +, -, *, /, %, <, bitwise, shifts and ==
+- rust 1.99 lints (needless borrow, single-element loop, spanless rustdoc lint)
+- one engine — ROADMAP §2.0 done, README, CLI help, test docs
+- *(nbexec)* GC coverage for collections inside VM function bodies
+- *(nbexec)* delete the tree-walker's AST executor
+- *(nbexec)* no interpreter closures on the VM path
+- *(nbexec)* no tree-walker fallbacks — a VM refusal or fault is an error
+- *(roadmap)* inventory of what still executes on the tree-walker
+- *(nbvm)* drop private intra-doc link in vm_module (rustdoc -D warnings)
+- *(test262)* KATAAN_TEST262_LIST runs an exact list of test paths
+- *(roadmap)* §2.0 progress — 51,404 of the corpus on the VM
+- *(roadmap)* §2.0 progress — 51,328 of the corpus on the VM
+- *(roadmap)* §2.0 progress — 50,604 of the corpus on the VM
+- *(roadmap)* §2.0 progress — 39,933 of the corpus on the VM
+- record the VM-coverage progress; the VM does not compile generators
+- *(roadmap)* §2.0 one engine — the bytecode VM as a tier of the interpreter
+- *(readme)* bring the README in line with the code
+- *(test262)* heartbeat the progress file between a test's sloppy and strict runs
+- headline status — 53,372/53,377 with staging gated, 5 ledgered failures, in-function GC
+- *(test262)* gate staging/ in the nightly corpus run and the bless workflow
+
 ## [0.0.9](https://github.com/KarpelesLab/kataan/compare/v0.0.8...v0.0.9) - 2026-09-05
 
 ### Added
