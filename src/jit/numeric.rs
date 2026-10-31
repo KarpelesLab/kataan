@@ -6292,6 +6292,18 @@ mod tests {
     }
 
     #[test]
+    fn callees_with_guarded_math_calls_inline() {
+        // A hosted `Math.imul(…)` over operator arguments compiles to a
+        // `PlainPrims` guard diamond, which the splice renumbers.
+        let src =
+            "function h(x){ x = Math.imul(x ^ (x >>> 16), 0x45d9f3b); return x ^ (x >>> 16); }";
+        let funcs = hosted_protos(src);
+        let h = funcs.iter().find(|p| p.name == "h").expect("fn");
+        assert!(h.ops.iter().any(|o| matches!(o, Op::PlainPrims { .. })));
+        assert!(crate::jit::inline::callee_ok(h));
+    }
+
+    #[test]
     fn nested_math_calls_are_not_region_calls() {
         // `Math.min(255, Math.max(0, a[i] - 50))`: the outer call's argument
         // is a call, so the compiler could not guard it (a `CallWithMethod`):

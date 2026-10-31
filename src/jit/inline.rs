@@ -351,7 +351,9 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             *obj = reg(*obj);
             *src = reg(*src);
         }
-        Op::Concat { dst, parts } | Op::NewArrayFrom { dst, elems: parts } => {
+        Op::Concat { dst, parts }
+        | Op::NewArrayFrom { dst, elems: parts }
+        | Op::PlainPrims { dst, regs: parts } => {
             *dst = reg(*dst);
             for p in parts.iter_mut() {
                 *p = reg(*p);
