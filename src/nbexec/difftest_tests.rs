@@ -4008,3 +4008,23 @@ fn structured_clone_follows_the_html_algorithm() {
          DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError"
     );
 }
+
+/// The engine's `console` has `info` / `debug` (printing like `log`) and
+/// `error` / `warn` (the diagnostic stream: stderr, so not in the captured
+/// `console.log` output). A program calling `console.error` died with
+/// "error is not a function".
+#[test]
+fn console_has_error_warn_info_debug() {
+    let src = r#"
+        console.log("a");
+        console.error("to stderr", 1);
+        console.warn("warned");
+        console.info("i", 2);
+        console.debug("d");
+        console.log([console.info.name, console.error.name, typeof console.warn].join());
+    "#;
+    let program = Parser::parse_program(src).expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    assert_eq!(interp.output(), "a\ni 2\nd\ninfo,error,function\n");
+}

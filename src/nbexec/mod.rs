@@ -1254,6 +1254,8 @@ const N_SET_TIMEOUT: u16 = 211;
 const N_CLEAR_TIMEOUT: u16 = 212;
 const N_SET_INTERVAL: u16 = 1290;
 const N_CLEAR_INTERVAL: u16 = 1291;
+/// `console.error` / `console.warn` (the diagnostic stream).
+const N_CONSOLE_ERROR: u16 = 1292;
 const N_QUEUE_MICROTASK: u16 = 213;
 const N_ARRAY_BUFFER_IS_VIEW: u16 = 214;
 const N_INTL_FORMAT: u16 = 215;
@@ -3904,7 +3906,20 @@ impl Interp {
             self.realm.mark_hidden(math, &tag_key);
             self.realm.set_readonly_property(math, &tag_key);
         }
-        install_namespace(self, "console", &[("log", N_CONSOLE_LOG)]);
+        // `info` / `debug` print like `log`; `error` / `warn` go to the
+        // diagnostic stream (see `N_CONSOLE_ERROR`). A program calling
+        // `console.error` used to die with "error is not a function".
+        install_namespace(
+            self,
+            "console",
+            &[
+                ("log", N_CONSOLE_LOG),
+                ("info", N_CONSOLE_LOG),
+                ("debug", N_CONSOLE_LOG),
+                ("error", N_CONSOLE_ERROR),
+                ("warn", N_CONSOLE_ERROR),
+            ],
+        );
         // `Atomics` — single-agent read-modify-write over an integer `TypedArray`.
         install_namespace(
             self,

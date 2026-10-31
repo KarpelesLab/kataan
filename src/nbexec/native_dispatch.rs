@@ -830,6 +830,24 @@ impl Interp {
                 self.output.push('\n');
                 NanBox::undefined()
             }
+            // `console.error(...)` / `console.warn(...)`: formatted like `log`,
+            // written to the process's stderr (as in Node and browsers' error
+            // console). Without `std` there is no stderr, so the line joins the
+            // captured `console.log` output.
+            N_CONSOLE_ERROR => {
+                let line: Vec<String> = args
+                    .iter()
+                    .map(|a| self.realm.to_display_string(*a))
+                    .collect();
+                #[cfg(feature = "std")]
+                std::eprintln!("{}", line.join(" "));
+                #[cfg(not(feature = "std"))]
+                {
+                    self.output.push_str(&line.join(" "));
+                    self.output.push('\n');
+                }
+                NanBox::undefined()
+            }
             N_JSON_STRINGIFY => {
                 let value = arg(0);
                 let result = self.json_stringify(value, arg(1), arg(2))?;
