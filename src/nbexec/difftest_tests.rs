@@ -3199,3 +3199,40 @@ fn recursive_activations_share_inline_caches() {
         "1992567,1982559,1897987,1863161,1863161,1863161,1866158,1367809"
     );
 }
+
+/// Typed-array element reads, writes and `.length` in hot loops (compiled
+/// inline by the machine-code tier, `jit::typed`) agree with the general
+/// path for every non-BigInt kind and edge values, including a fixed-length
+/// view a resizable buffer shrank out of bounds mid-loop; and `Math.imul` /
+/// `Math.clz32` computed inline agree with the built-ins (checked against
+/// node).
+#[test]
+fn typed_array_elements_and_int_math_in_compiled_loops() {
+    let src = r#"
+        var vals = [200, -1, 300, -5, 1.5, 2.5, 2147483648, -2147483649, 1e10, NaN, -0, Infinity, 255.5, 65537.75, 2 ** 63, -(2 ** 63)];
+        var kinds = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];
+        function fill(ta) { for (var i = 0; i < vals.length; i++) ta[i] = vals[i]; }
+        function sum(ta) { var s = 0; for (var i = 0; i < ta.length; i++) s += ta[i] === ta[i] ? ta[i] : 1000; return s; }
+        var out = [];
+        for (var k = 0; k < kinds.length; k++) {
+            var ta = new kinds[k](vals.length), s = 0;
+            for (var rep = 0; rep < 300; rep++) { fill(ta); s = sum(ta); }
+            out.push(Object.is(ta[10], -0) ? "-0" : String(ta[10]), s);
+        }
+        var rab = new ArrayBuffer(16, { maxByteLength: 32 }), fixed = new Uint16Array(rab, 0, 8), t = 0;
+        for (var i = 0; i < 3000; i++) {
+            if (i === 1000) rab.resize(8);
+            if (i === 2000) rab.resize(16);
+            fixed[i & 7] = i;
+            t += fixed[(i + 3) & 7] === undefined ? 1 : fixed[(i + 3) & 7] + fixed.length;
+        }
+        var h = 0x811c9dc5 | 0, c = 0;
+        for (var i = 0; i < 5000; i++) { h = Math.imul(h ^ (i & 255), 16777619); c += Math.clz32(h); }
+        out.push(t, h, c, Math.imul(2 ** 63, 3), Math.imul(1e100, 7), Math.clz32(-1), Math.clz32(0.5));
+        out.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "0,-16,0,1264,0,1989,0,-6416,0,255728,0,1410131696,0,14295033584,-0,Infinity,-0,Infinity,2997025,-1926801507,5124,0,0,0,32"
+    );
+}

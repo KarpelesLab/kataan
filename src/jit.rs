@@ -44,6 +44,8 @@ mod recv_cache;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod typed;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, FnCallMemo, HDR_CONSTRUCT,
@@ -2301,6 +2303,23 @@ enum MathInline {
     Round(u8),
     /// `Math.max` (`true`) / `Math.min` (`false`) of its arguments.
     MaxMin(bool),
+    /// `Math.imul` of its two arguments (`ToInt32` each, the low 32 bits of
+    /// the product).
+    Imul,
+    /// `Math.clz32`: the leading zero bits of `ToUint32` of its argument.
+    Clz32,
+}
+
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+impl MathInline {
+    /// Whether the result is a NaN exactly when the argument is (a function
+    /// of one argument computed in SSE registers): what lets its argument
+    /// stay in its promoted register, and a deferred NaN check flow through
+    /// it (`numeric::plan_defer`). `Math.clz32` maps a NaN to `32`, so its
+    /// argument's check cannot be deferred past it.
+    fn float_like(self) -> bool {
+        matches!(self, Self::Sqrt | Self::Abs | Self::Round(_))
+    }
 }
 
 /// The built-in id and inline form of a `CallMethod` of one argument (for
@@ -2309,7 +2328,8 @@ enum MathInline {
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
     use crate::nbexec::{
-        N_MATH_ABS, N_MATH_CEIL, N_MATH_FLOOR, N_MATH_MAX, N_MATH_MIN, N_MATH_SQRT, N_MATH_TRUNC,
+        N_MATH_ABS, N_MATH_CEIL, N_MATH_CLZ32, N_MATH_FLOOR, N_MATH_IMUL, N_MATH_MAX, N_MATH_MIN,
+        N_MATH_SQRT, N_MATH_TRUNC,
     };
     let crate::nbvm::Op::CallMethod { key, args, .. } = op else {
         return None;
@@ -2321,6 +2341,7 @@ fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
         "min" if (1..=4).contains(&args.len()) => {
             return Some((N_MATH_MIN, MathInline::MaxMin(false)));
         }
+        "imul" if args.len() == 2 => return Some((N_MATH_IMUL, MathInline::Imul)),
         _ => {}
     }
     if args.len() != 1 {
@@ -2333,6 +2354,7 @@ fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
         "floor" if sse41 => (N_MATH_FLOOR, MathInline::Round(0x09)),
         "ceil" if sse41 => (N_MATH_CEIL, MathInline::Round(0x0a)),
         "trunc" if sse41 => (N_MATH_TRUNC, MathInline::Round(0x0b)),
+        "clz32" => (N_MATH_CLZ32, MathInline::Clz32),
         _ => return None,
     })
 }
@@ -5136,7 +5158,11 @@ impl X64Assembler {
     }
     /// `cvtsi2sd xmm0, rax` — convert the integer in `rax` to an `f64` in `xmm0`.
     pub fn cvtsi2sd_xmm0_rax(&mut self) {
-        self.code.extend_from_slice(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0]);
+        // `xorps xmm0, xmm0` first: `cvtsi2sd` writes only the low lane, so
+        // it would otherwise wait for the last write of `xmm0` (a false
+        // dependency that chains every conversion into one long one).
+        self.code
+            .extend_from_slice(&[0x0f, 0x57, 0xc0, 0xf2, 0x48, 0x0f, 0x2a, 0xc0]);
     }
     /// `<addsd|subsd|mulsd|divsd> xmm0, [rbp+disp]`.
     pub fn fbin_xmm0_mem(&mut self, op: FBinOp, disp: i32) {
@@ -5715,7 +5741,9 @@ impl X64Assembler {
     /// a `ucomisd xmm0, xmm1` can verify the index was an exact integer (a
     /// fractional index like `a[1.5]` fails the round-trip → helper).
     pub fn cvtsi2sd_xmm1_rax(&mut self) {
-        self.code.extend_from_slice(&[0xf2, 0x48, 0x0f, 0x2a, 0xc8]);
+        // (`xorps xmm1, xmm1` first: see `cvtsi2sd_xmm0_rax`.)
+        self.code
+            .extend_from_slice(&[0x0f, 0x57, 0xc9, 0xf2, 0x48, 0x0f, 0x2a, 0xc8]);
     }
 }
 
@@ -6524,7 +6552,7 @@ impl JitFunction {
                 sites.all(|pc| matches!(bytecode.get(pc), Some(crate::nbvm::Op::LoadGlobal { .. })))
             })
             .collect();
-        let rc = recv_cache::plan(
+        let mut rc = recv_cache::plan(
             ops,
             bytecode,
             &gc_plan,
@@ -6544,6 +6572,11 @@ impl JitFunction {
             osr_entries,
             &catch_targets,
         );
+        // Once typed arrays have been indexed, an element site may well see
+        // one, whose inline path (`typed`) has no use for an array's way.
+        if crate::realm::typed_elems_seen() {
+            typed::drop_array_sites(&mut rc);
+        }
         // The ways whose every site compiles in one layout `S` (see
         // `recv_cache::shape_ways`): a hit there proves the receiver has `S`.
         let way_shape = recv_cache::shape_ways(&rc, ops, |op| match *op {
@@ -7495,7 +7528,8 @@ impl JitFunction {
                         crate::nbvm::Op::CallMethod { args: margs, .. }
                             if margs.len() == 1 && (margs[0] as usize) < n_regs =>
                         {
-                            let inline = inline_math(bytecode.get(op_idx)?).is_some()
+                            let inline = inline_math(bytecode.get(op_idx)?)
+                                .is_some_and(|(_, f)| f.float_like())
                                 && !si.method_ptr.is_null();
                             num.operand_xmm(&mut a, op_idx, margs[0], inline)
                         }
@@ -7622,6 +7656,51 @@ impl JitFunction {
                             a.movabs_rax(canonical_nan as i64);
                             a.store_rax(disp(dst));
                             a.jmp(done);
+                        } else if matches!(f, MathInline::Imul | MathInline::Clz32) {
+                            // Every argument is a Number: `ToInt32` of each
+                            // (`ToUint32` is its low bits too) is the low
+                            // bits of its truncation, unless that is the
+                            // "indefinite" integer (NaN, ±∞, |x| ≥ 2^63 —
+                            // or -2^63 itself), which the call computes.
+                            match arg_x {
+                                Some(ax) => numeric::NumGen::xmm0_from_xmm(&mut a, ax),
+                                None => a.movsd_xmm0_mem(disp(x)),
+                            }
+                            a.cvttsd2si_rax_xmm0();
+                            a.movabs_r11(i64::MIN);
+                            a.cmp_rax_r11();
+                            a.je(general);
+                            if let MathInline::Imul = f {
+                                a.raw(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+                                a.movsd_xmm0_mem(disp(*margs.get(1)?));
+                                a.cvttsd2si_rax_xmm0();
+                                a.cmp_rax_r11();
+                                a.je(general);
+                                a.raw(&[0x0f, 0xaf, 0xc1]); // imul eax, ecx
+                                a.to_int32_rax();
+                            } else {
+                                // 31 - bsr, or 32 for a zero (whose `bsr`
+                                // sets ZF, its result undefined).
+                                let zero = a.new_label();
+                                let counted = a.new_label();
+                                a.raw(&[0x0f, 0xbd, 0xc0]); // bsr eax, eax
+                                a.je(zero);
+                                a.raw(&[0x83, 0xf0, 0x1f]); // xor eax, 31
+                                a.jmp(counted);
+                                a.bind(zero);
+                                a.raw(&[0xb8, 32, 0, 0, 0]); // mov eax, 32
+                                a.bind(counted);
+                            }
+                            a.cvtsi2sd_xmm0_rax();
+                            if let Some(xr) = num.result_xmm(op_idx, dst) {
+                                let past = a.new_label();
+                                numeric::NumGen::set_xmm_from_xmm0(&mut a, xr);
+                                a.jmp(past);
+                                past_reload = Some(past);
+                            } else {
+                                a.movsd_mem_xmm0(disp(dst));
+                                a.jmp(done);
+                            }
                         } else if let MathInline::Abs = f {
                             // The sign bit cleared. That turns the canonical
                             // NaN (sign set) into `0x7ff8…`, so a NaN (whose
@@ -7661,7 +7740,9 @@ impl JitFunction {
                             }
                             match f {
                                 MathInline::Round(mode) => a.roundsd_xmm0(mode),
-                                MathInline::MaxMin(_) => return None,
+                                MathInline::MaxMin(_) | MathInline::Imul | MathInline::Clz32 => {
+                                    return None;
+                                }
                                 _ => a.sqrtsd_xmm0(),
                             }
                             // (A NaN is the canonical one: `roundsd` keeps an
@@ -9048,54 +9129,100 @@ impl JitFunction {
                     let bail = num.spec_bail(&mut a, op_idx);
                     let helper = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
+                    // A typed-array view's element (`typed::t_get`) is tried
+                    // where the array path misses — except at a receiver-
+                    // cache site of a speculative loop's fast version that a
+                    // later site takes as having filled its way
+                    // (`recv_cache::SitePlan::known`), which only an array
+                    // does: there a view leaves for the plain copy, which
+                    // reads it inline.
+                    let typed = bail.is_none() || !typed::relied_on(&rc, op_idx);
+                    let not_arr = if typed { a.new_label() } else { helper };
+                    let got = a.new_label();
+                    // Without a receiver-cache site, one walk serves both:
+                    // its cell tag picks the array path or the view's (with
+                    // the walk's slot in `rcx`), and the array path's misses
+                    // go straight to the helper.
+                    let merged = typed && rc.sites[op_idx].is_none();
+                    let walked = a.new_label();
+                    let arr_miss = if merged { helper } else { not_arr };
                     // ===== inline dense-array element GET fast path =====
                     // Receiver cell tag == Array, index an exact non-negative
                     // integer in `[0, dense_len)`, and — matching the interpreter's
                     // `vm_array_index_get` — bail on a hole (the helper walks the
                     // prototype chain). Everything else → `jit_helper_get_elem`.
-                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Arr);
+                    if merged {
+                        walk_to_slot!(obj, helper);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                        a.jne(walked);
+                        a.p_array_plain(&layout, helpers.call_layout.realm, false, helper);
+                    } else {
+                        recv_slot!(op_idx, obj, not_arr, recv_cache::Family::Arr);
+                    }
                     // (A promoted loop's index may be in its SSE register.)
                     // An index proven integral needs no exactness test: its
                     // truncation is its value, or (NaN, ±∞, past `i64`) the
                     // "indefinite" integer, which the bounds check rejects.
                     let integral = num.is_integral_at(op_idx, index);
                     let index_x = num.result_xmm(op_idx, index);
-                    match index_x {
-                        Some(x) if integral => numeric::NumGen::trunc_from_xmm(&mut a, x),
-                        Some(x) => numeric::NumGen::index_from_xmm(
-                            &mut a,
-                            x,
-                            !num.is_number_at(op_idx, index),
-                            helper,
-                        ),
-                        None if integral => {
-                            a.movsd_xmm0_mem(disp(index));
-                            a.cvttsd2si_rax_xmm0();
-                        }
-                        None => int_index!(index, helper, num.is_number_at(op_idx, index)),
+                    macro_rules! elem_index {
+                        ($miss:expr) => {
+                            match index_x {
+                                Some(x) if integral => numeric::NumGen::trunc_from_xmm(&mut a, x),
+                                Some(x) => numeric::NumGen::index_from_xmm(
+                                    &mut a,
+                                    x,
+                                    !num.is_number_at(op_idx, index),
+                                    $miss,
+                                ),
+                                None if integral => {
+                                    a.movsd_xmm0_mem(disp(index));
+                                    a.cvttsd2si_rax_xmm0();
+                                }
+                                None => int_index!(index, $miss, num.is_number_at(op_idx, index)),
+                            }
+                        };
                     }
+                    elem_index!(arr_miss);
                     a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
-                    a.jae(helper); // OOB / negative
+                    a.jae(arr_miss); // OOB / negative
                     a.mov_rax_at_r11_rax8(); // rax = elems[idx]
                     a.movabs_r11(NanBox::hole().to_bits() as i64);
                     a.cmp_rax_r11();
-                    a.je(helper);
+                    a.je(arr_miss);
+                    a.bind(got);
                     if let Some(x) = num.result_xmm(op_idx, dst) {
                         let past = a.new_label();
                         numeric::NumGen::set_xmm_from_rax(&mut a, x);
                         if bail.is_some() {
                             // No slow path rejoins: nothing to reload.
                             ool_past = Some(past);
+                            if typed {
+                                a.jmp(past);
+                            }
                         } else {
                             a.jmp(past);
                             past_reload = Some(past);
                         }
                     } else {
                         a.store_rax(disp(dst));
-                        if bail.is_none() {
+                        if bail.is_none() || typed {
                             a.jmp(done);
                         }
+                    }
+                    if typed {
+                        // A typed-array view's element, into `rax` and on
+                        // through `got`.
+                        let tl = typed::typed_layout();
+                        if !merged {
+                            a.bind(not_arr);
+                            walk_to_slot!(obj, helper);
+                        }
+                        a.bind(walked);
+                        a.t_view(&layout, tl, helper);
+                        elem_index!(helper);
+                        a.t_get(tl, helper, got);
                     }
                     // jit_helper_get_elem(ctx, recv, key).
                     if bail.is_none() {
@@ -9122,19 +9249,57 @@ impl JitFunction {
                     if !ok(obj) || !ok(index) || !ok(val) {
                         return None;
                     }
-                    let helper = a.new_label();
+                    // In a speculative loop's fast version every slow path
+                    // leaves for the plain copy (`NumGen::spec_bail`).
+                    let bail = num.spec_bail(&mut a, op_idx);
+                    let helper = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
+                    // Where the array path misses: a typed-array view's
+                    // element write (`typed::t_set`) — not at a receiver-
+                    // cache site of a speculative loop's fast version (see
+                    // `GetElem`).
+                    let typed = bail.is_none() || !typed::relied_on(&rc, op_idx);
+                    let not_arr = if typed { a.new_label() } else { helper };
+                    // One walk for both without a receiver-cache site (see
+                    // `GetElem`).
+                    let merged = typed && rc.sites[op_idx].is_none();
+                    let walked = a.new_label();
+                    // A promoted index or value: the fast paths take it from
+                    // its SSE register in a speculative loop's fast version,
+                    // else it is stored to the register file first
+                    // (`NumGen::operand_xmm`).
+                    let index_x = num.operand_xmm(&mut a, op_idx, index, true);
+                    let val_x = num.operand_xmm(&mut a, op_idx, val, true);
+                    let integral = num.is_integral_at(op_idx, index);
+                    macro_rules! store_index {
+                        ($miss:expr) => {
+                            match index_x {
+                                Some(x) if integral => numeric::NumGen::trunc_from_xmm(&mut a, x),
+                                Some(x) => numeric::NumGen::index_from_xmm(&mut a, x, false, $miss),
+                                None => int_index!(index, $miss, num.is_number_at(op_idx, index)),
+                            }
+                        };
+                    }
                     // ===== inline dense-array element SET fast path =====
                     // In place only when identical to `vm_set_elem`: a store the
                     // write barrier has nothing to do for (`p_barrier_check`),
                     // an array without side-table state (`p_array_plain`: not
                     // frozen/sealed, no per-index override, within
                     // `max_array_len`), and an in-bounds exact integer index.
-                    recv_slot!(op_idx, obj, helper, recv_cache::Family::Arr);
+                    if merged {
+                        walk_to_slot!(obj, helper);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                        a.jne(walked);
+                    } else {
+                        recv_slot!(op_idx, obj, not_arr, recv_cache::Family::Arr);
+                    }
                     a.p_array_plain(&layout, helpers.call_layout.realm, true, helper);
-                    a.load_rax(disp(val));
-                    a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
-                    int_index!(index, helper);
+                    if val_x.is_none() {
+                        // (A promoted value is a Number: nothing to check.)
+                        a.load_rax(disp(val));
+                        a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
+                    }
+                    store_index!(helper);
                     a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
                     a.jae(helper);
@@ -9143,19 +9308,52 @@ impl JitFunction {
                     a.movabs_argreg(2, NanBox::hole().to_bits() as i64);
                     a.cmp_at_r11_rax8_rdx();
                     a.je(helper);
-                    a.load_rdx(disp(val));
+                    match val_x {
+                        Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
+                        None => a.load_rdx(disp(val)),
+                    }
                     a.mov_at_r11_rax8_rdx(); // elems[idx] = val
                     a.jmp(done);
+                    if typed {
+                        // A typed-array view's element: a Number value (any
+                        // other's `ToNumber` is the helper's, before anything
+                        // else), stored in place.
+                        let tl = typed::typed_layout();
+                        if merged {
+                            a.bind(walked);
+                        } else {
+                            a.bind(not_arr);
+                        }
+                        if !num.is_number_at(op_idx, val) {
+                            a.load_rax(disp(val));
+                            a.movabs_r11(QNAN as i64);
+                            a.and_rax_r11();
+                            a.cmp_rax_r11();
+                            a.je(helper);
+                        }
+                        if !merged {
+                            walk_to_slot!(obj, helper);
+                        }
+                        a.t_view(&layout, tl, helper);
+                        store_index!(helper);
+                        match val_x {
+                            Some(x) => numeric::NumGen::xmm0_from_xmm(&mut a, x),
+                            None => a.movsd_xmm0_mem(disp(val)),
+                        }
+                        a.t_set(tl, helper, done);
+                    }
                     // jit_helper_set_elem(ctx, recv, key, val).
-                    a.bind(helper);
-                    a.mov_rdi_r15();
-                    a.load_argreg(1, disp(obj));
-                    a.load_argreg(2, disp(index));
-                    a.load_argreg(3, disp(val));
-                    a.movabs_argreg(4, i64::from(strict));
-                    a.movabs_rax(set_elem_helper as i64);
-                    a.call_rax();
-                    throw_check!();
+                    if bail.is_none() {
+                        a.bind(helper);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(obj));
+                        a.load_argreg(2, disp(index));
+                        a.load_argreg(3, disp(val));
+                        a.movabs_argreg(4, i64::from(strict));
+                        a.movabs_rax(set_elem_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                    }
                     a.bind(done);
                 }
                 GenericOp::ArrayLen { dst, arr } => {
@@ -9164,11 +9362,28 @@ impl JitFunction {
                     }
                     let helper = a.new_label();
                     let done = a.new_label();
+                    let bail = num.spec_bail(&mut a, op_idx);
+                    // A typed-array view's length (`typed::t_len`) where the
+                    // array path misses (as for `GetElem`, one walk serves
+                    // both without a receiver-cache site), then the helper.
+                    let typed = bail.is_none() || !typed::relied_on(&rc, op_idx);
+                    let merged = typed && rc.sites[op_idx].is_none();
+                    let slow = a.new_label();
+                    let walked = a.new_label();
+                    let got = a.new_label();
                     // ===== inline dense-array `.length` fast path =====
                     // Only for a receiver whose spec `.length` provably equals the
                     // dense element count (`p_array_plain`); else the helper.
-                    recv_slot!(op_idx, arr, helper, recv_cache::Family::Arr);
+                    if merged {
+                        walk_to_slot!(arr, slow);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                        a.jne(walked);
+                        a.p_array_plain(&layout, helpers.call_layout.realm, false, slow);
+                    } else {
+                        recv_slot!(op_idx, arr, helper, recv_cache::Family::Arr);
+                    }
                     a.p_arr_len(&layout, call_seq::r::RAX);
+                    a.bind(got);
                     if let Some(x) = num.result_xmm(op_idx, dst) {
                         let past = a.new_label();
                         numeric::NumGen::set_xmm_from_int_rax(&mut a, x);
@@ -9179,8 +9394,17 @@ impl JitFunction {
                         a.movsd_mem_xmm0(disp(dst));
                         a.jmp(done);
                     }
-                    let bail = num.spec_bail(&mut a, op_idx);
                     a.bind(helper);
+                    if typed {
+                        let tl = typed::typed_layout();
+                        if !merged {
+                            walk_to_slot!(arr, slow);
+                        }
+                        a.bind(walked);
+                        a.t_view(&layout, tl, slow);
+                        a.t_len(tl, slow, got);
+                    }
+                    a.bind(slow);
                     if let Some(b) = bail {
                         a.jmp(b);
                     }

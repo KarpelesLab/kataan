@@ -196,6 +196,16 @@ pub(crate) struct SlotLayout {
     pub vacant_tag: u8,
 }
 
+/// The offsets of a [`Handle`]'s arena index (`u32`) and generation (`u16`)
+/// within it, for compiled code that walks a handle stored in a cell.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) const fn jit_handle_offsets() -> (usize, usize) {
+    (
+        core::mem::offset_of!(Handle, index),
+        core::mem::offset_of!(Handle, generation),
+    )
+}
+
 /// Derives [`SlotLayout`] for `Slot<T>` from a real live instance. `value`
 /// supplies a `T` so the slot can be built; only its byte layout is inspected.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

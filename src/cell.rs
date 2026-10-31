@@ -84,6 +84,11 @@ pub type ExternFree = unsafe fn(ptr: *mut u8, len: usize);
 /// and writes it in place and never moves it (the moving GC relocates the
 /// `Cell`'s 24-byte header, not the region the pointer addresses), and frees it
 /// via the optional [`ExternFree`] hook when the cell is collected.
+///
+/// `repr(u8)`: a defined layout (a tag byte first, then the variant's
+/// fields), so compiled code can tell an `Owned` store from the others and
+/// read its `Vec` at probed offsets (`jit_typed_layout`).
+#[repr(u8)]
 pub enum ByteStore {
     /// Engine-owned bytes.
     Owned(Vec<u8>),
@@ -967,6 +972,129 @@ pub(crate) fn jit_native_layout() -> (u8, usize) {
         unreachable!("just built a Cell::Native")
     };
     (disc, core::ptr::addr_of!(*id) as usize - base)
+}
+
+/// The byte layout compiled code reads a typed-array element through
+/// (offsets relative to the `Cell`): a `Cell::TypedArray` view's fields, and
+/// the `Vec` of the `Cell::Bytes` it views when that store is `Owned`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypedCellLayout {
+    /// The `Cell::TypedArray` discriminant byte.
+    pub typed_disc: u8,
+    /// The view's `buffer` handle's arena index (a `u32`).
+    pub buffer_index_off: usize,
+    /// The view's `buffer` handle's generation (a `u16`).
+    pub buffer_gen_off: usize,
+    /// The view's `byte_offset` (a `usize`).
+    pub byte_offset_off: usize,
+    /// The view's `length` (a `usize`).
+    pub length_off: usize,
+    /// The view's `kind` (a `u8`).
+    pub kind_off: usize,
+    /// The `Cell::Bytes` discriminant byte.
+    pub bytes_disc: u8,
+    /// The `ByteStore` tag byte.
+    pub store_tag_off: usize,
+    /// The tag of `ByteStore::Owned`.
+    pub owned_tag: u8,
+    /// An `Owned` store's `Vec` data pointer.
+    pub data_ptr_off: usize,
+    /// An `Owned` store's `Vec` length.
+    pub data_len_off: usize,
+}
+
+/// Derives [`TypedCellLayout`] from real `Cell::TypedArray` and `Cell::Bytes`
+/// instances.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_typed_layout() -> TypedCellLayout {
+    let (index_in_handle, gen_in_handle) = crate::heap::jit_handle_offsets();
+    let view = Cell::TypedArray {
+        buffer: Handle::from_raw(0x0001_0000_0002),
+        array_buffer: Handle::from_raw(0x0001_0000_0003),
+        byte_offset: 8,
+        length: 4,
+        kind: 5,
+    };
+    let base = core::ptr::addr_of!(view) as usize;
+    // SAFETY: `view` is a live, initialized `Cell`; its tag byte (the first,
+    // see [`Cell`]) is in bounds and always a valid `u8`.
+    #[allow(unsafe_code)]
+    let typed_disc = unsafe { *(base as *const u8) };
+    let Cell::TypedArray {
+        buffer,
+        byte_offset,
+        length,
+        kind,
+        ..
+    } = &view
+    else {
+        unreachable!("just built a Cell::TypedArray")
+    };
+    let buffer_off = core::ptr::addr_of!(*buffer) as usize - base;
+    let byte_offset_off = core::ptr::addr_of!(*byte_offset) as usize - base;
+    let length_off = core::ptr::addr_of!(*length) as usize - base;
+    let kind_off = core::ptr::addr_of!(*kind) as usize - base;
+    // Capacity 16, length 3: the `Vec`'s three words all differ.
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&[1u8, 2, 3]);
+    let bytes = Cell::Bytes(ByteStore::Owned(data));
+    let bbase = core::ptr::addr_of!(bytes) as usize;
+    // SAFETY: as above, for `bytes`.
+    #[allow(unsafe_code)]
+    let bytes_disc = unsafe { *(bbase as *const u8) };
+    let Cell::Bytes(store) = &bytes else {
+        unreachable!("just built a Cell::Bytes")
+    };
+    let store_tag_off = core::ptr::addr_of!(*store) as usize - bbase;
+    // SAFETY: `ByteStore` is `repr(u8)`: its first byte is its tag, an
+    // initialized `u8`.
+    #[allow(unsafe_code)]
+    let owned_tag = unsafe { *(core::ptr::addr_of!(*store).cast::<u8>()) };
+    let ByteStore::Owned(v) = store else {
+        unreachable!("just built an Owned store")
+    };
+    let vec_base = core::ptr::addr_of!(*v) as usize;
+    // The `Vec`'s pointer and length words, found by their values.
+    let words: [usize; 3] = {
+        // SAFETY: a `Vec` is three initialized `usize` words (asserted).
+        assert_eq!(core::mem::size_of::<Vec<u8>>(), 24);
+        #[allow(unsafe_code)]
+        unsafe {
+            core::ptr::read(core::ptr::addr_of!(*v).cast::<[usize; 3]>())
+        }
+    };
+    let ptr_word = words
+        .iter()
+        .position(|&w| w == v.as_ptr() as usize)
+        .expect("a Vec holds its data pointer");
+    assert_ne!(v.len(), v.capacity());
+    let len_word = words
+        .iter()
+        .position(|&w| w == v.len())
+        .expect("a Vec holds its length");
+    let off = vec_base - bbase;
+    let other = Cell::Bytes(ByteStore::Shared(alloc::sync::Arc::new(
+        SharedBlock::zeroed(1),
+    )));
+    // SAFETY: as above.
+    #[allow(unsafe_code)]
+    let shared_tag =
+        unsafe { *((core::ptr::addr_of!(other) as usize + store_tag_off) as *const u8) };
+    assert_ne!(shared_tag, owned_tag, "store tags differ");
+    TypedCellLayout {
+        typed_disc,
+        buffer_index_off: buffer_off + index_in_handle,
+        buffer_gen_off: buffer_off + gen_in_handle,
+        byte_offset_off,
+        length_off,
+        kind_off,
+        bytes_disc,
+        store_tag_off,
+        owned_tag,
+        data_ptr_off: off + 8 * ptr_word,
+        data_len_off: off + 8 * len_word,
+    }
 }
 
 /// Derives [`CellLayout`] from real `Cell::Object` and `Cell::Array` instances.

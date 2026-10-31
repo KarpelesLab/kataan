@@ -2554,8 +2554,8 @@ const N_MATH_ATANH: u16 = 152;
 const N_MATH_EXPM1: u16 = 153;
 const N_MATH_LOG1P: u16 = 154;
 const N_MATH_FROUND: u16 = 155;
-const N_MATH_CLZ32: u16 = 156;
-const N_MATH_IMUL: u16 = 157;
+pub(crate) const N_MATH_CLZ32: u16 = 156;
+pub(crate) const N_MATH_IMUL: u16 = 157;
 const N_MATH_F16ROUND: u16 = 248;
 /// `Date.prototype[Symbol.toPrimitive]` (a named native, length 1).
 const N_DATE_TO_PRIMITIVE: u16 = 243;

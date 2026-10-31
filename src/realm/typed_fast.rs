@@ -54,6 +54,32 @@ fn slot(cell: &Cell, i: usize) -> Option<(Handle, usize, usize, u8)> {
     Some((buffer, off + i * size, end, kind))
 }
 
+/// Set once a typed-array element has been read or written through these
+/// helpers (by the interpreter or a compiled body's helper call): the
+/// machine-code tier then plans its element sites for typed arrays too
+/// (`jit::typed`). A hint only — any value is correct.
+static TYPED_ELEMS_SEEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Notes a typed-array element access (see [`TYPED_ELEMS_SEEN`]).
+#[inline]
+fn note_typed_access() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !TYPED_ELEMS_SEEN.load(Relaxed) {
+        TYPED_ELEMS_SEEN.store(true, Relaxed);
+    }
+}
+
+/// Whether a typed-array element access has been seen (see
+/// [`TYPED_ELEMS_SEEN`]).
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(crate) fn typed_elems_seen() -> bool {
+    TYPED_ELEMS_SEEN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 impl Realm {
     /// `view[i]` for an in-range `i` of a non-BigInt view wholly inside its
     /// buffer; `None` sends the read down [`Realm::typed_get`]'s general path.
@@ -65,6 +91,7 @@ impl Realm {
             return None;
         }
         let slice = bytes.get(start..start + typed_elem_size(kind))?;
+        note_typed_access();
         Some(NanBox::number(decode_typed_element(kind, slice)))
     }
 
@@ -108,6 +135,7 @@ impl Realm {
             return false;
         };
         dst.copy_from_slice(&enc[..size]);
+        note_typed_access();
         true
     }
 }

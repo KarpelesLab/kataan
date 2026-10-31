@@ -13,9 +13,9 @@ use super::{Realm, Reg};
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
 use crate::nbexec::{
-    N_MATH_ABS, N_MATH_ATAN, N_MATH_ATAN2, N_MATH_CBRT, N_MATH_CEIL, N_MATH_COS, N_MATH_EXP,
-    N_MATH_FLOOR, N_MATH_HYPOT, N_MATH_LOG, N_MATH_MAX, N_MATH_MIN, N_MATH_POW, N_MATH_ROUND,
-    N_MATH_SIGN, N_MATH_SIN, N_MATH_SQRT, N_MATH_TAN, N_MATH_TRUNC,
+    N_MATH_ABS, N_MATH_ATAN, N_MATH_ATAN2, N_MATH_CBRT, N_MATH_CEIL, N_MATH_CLZ32, N_MATH_COS,
+    N_MATH_EXP, N_MATH_FLOOR, N_MATH_HYPOT, N_MATH_IMUL, N_MATH_LOG, N_MATH_MAX, N_MATH_MIN,
+    N_MATH_POW, N_MATH_ROUND, N_MATH_SIGN, N_MATH_SIN, N_MATH_SQRT, N_MATH_TAN, N_MATH_TRUNC,
 };
 
 /// The native a `Math` member of this name is installed as.
@@ -40,6 +40,8 @@ fn native_for(key: &str) -> Option<u16> {
         "tan" => N_MATH_TAN,
         "atan" => N_MATH_ATAN,
         "atan2" => N_MATH_ATAN2,
+        "imul" => N_MATH_IMUL,
+        "clz32" => N_MATH_CLZ32,
         _ => return None,
     })
 }
@@ -88,6 +90,8 @@ pub(super) fn is_math_native(id: u16) -> bool {
             | N_MATH_TAN
             | N_MATH_ATAN
             | N_MATH_ATAN2
+            | N_MATH_IMUL
+            | N_MATH_CLZ32
     )
 }
 
@@ -169,6 +173,12 @@ pub(super) fn compute(realm: &Realm, id: u16, args: &[Reg], regs: &[NanBox]) -> 
         N_MATH_TAN => arg(0).tan(),
         N_MATH_ATAN => arg(0).atan(),
         N_MATH_ATAN2 => arg(0).atan2(arg(1)),
+        N_MATH_IMUL => f64::from(
+            realm
+                .to_int32(NanBox::number(arg(0)))
+                .wrapping_mul(realm.to_int32(NanBox::number(arg(1)))),
+        ),
+        N_MATH_CLZ32 => f64::from(realm.to_uint32(NanBox::number(arg(0))).leading_zeros()),
         _ => return None,
     };
     Some(NanBox::number(r))

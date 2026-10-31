@@ -888,6 +888,7 @@ fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
         | GenericOp::GetMethod { .. }
         | GenericOp::SetProp { .. }
         | GenericOp::GetElem { .. }
+        | GenericOp::SetElem { .. }
         | GenericOp::ArrayLen { .. }
         | GenericOp::CallMethod { .. }
         | GenericOp::CallValue { .. }
@@ -2316,6 +2317,7 @@ impl NumGen {
     /// `xmm0 = (f64) (r8 + 1)`.
     pub(super) fn inc_r8_to_xmm0(a: &mut X64Assembler) {
         a.raw(&[0x49, 0xff, 0xc0]); // inc r8
+        a.raw(&[0x0f, 0x57, 0xc0]); // xorps xmm0, xmm0 (no false dependency)
         a.raw(&[0xf2, 0x49, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0, r8
     }
 
@@ -3881,26 +3883,33 @@ fn plan_regions(
                     // An element read's index may stay promoted: the
                     // emitter reads it from its SSE register
                     // (`NumGen::index_from_xmm`).
-                    // So may a property store's value and an inline
-                    // `Math.f(x)`'s argument (`NumGen::operand_xmm`).
+                    // So may a property store's value, an element store's
+                    // index and value, and an inline `Math.f(x)`'s argument
+                    // (`NumGen::operand_xmm`).
                     let free = match (&ops[pc], &bytecode[pc]) {
-                        (_, Op::GetKey { obj, key, .. }) if key != obj => Some(*key),
+                        (_, Op::GetKey { obj, key, .. }) if key != obj => [Some(*key), None],
                         (
                             GenericOp::SetProp { .. },
                             Op::SetProp { obj, src, .. } | Op::SetPropStrict { obj, src, .. },
-                        ) if src != obj => Some(*src),
+                        ) if src != obj => [Some(*src), None],
+                        (
+                            GenericOp::SetElem { .. },
+                            Op::SetKey { obj, key, src } | Op::SetKeyStrict { obj, key, src },
+                        ) => [
+                            Some(*key).filter(|k| k != obj),
+                            Some(*src).filter(|v| v != obj),
+                        ],
                         (GenericOp::CallMethod { .. }, Op::CallMethod { recv, args, .. })
                             if args.len() == 1
                                 && args[0] != *recv
-                                && super::inline_math(&bytecode[pc]).is_some_and(|(_, f)| {
-                                    !matches!(f, super::MathInline::MaxMin(_))
-                                }) =>
+                                && super::inline_math(&bytecode[pc])
+                                    .is_some_and(|(_, f)| f.float_like()) =>
                         {
-                            Some(args[0])
+                            [Some(args[0]), None]
                         }
-                        _ => None,
+                        _ => [None, None],
                     };
-                    pinned.extend(u.iter().copied().filter(|&r| Some(r) != free));
+                    pinned.extend(u.iter().copied().filter(|&r| !free.contains(&Some(r))));
                 }
             }
         }
@@ -4194,8 +4203,7 @@ fn plan_defer(
                         dst, recv, args, ..
                     },
                 ) if args.len() == 1
-                    && super::inline_math(bc)
-                        .is_some_and(|(_, f)| !matches!(f, super::MathInline::MaxMin(_))) =>
+                    && super::inline_math(bc).is_some_and(|(_, f)| f.float_like()) =>
                 {
                     Some((*dst, *recv, args[0]))
                 }

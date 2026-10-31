@@ -37,6 +37,8 @@ mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;
 pub use str_switch::switch_key_order;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use typed_fast::typed_elems_seen;
 mod handle_map;
 
 use crate::atom::{Atom, AtomTable};

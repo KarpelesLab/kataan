@@ -797,7 +797,7 @@ pub(crate) fn emit_quiet_poll(a: &mut X64Assembler, l: &CallLayout, countdown: i
 impl X64Assembler {
     /// `[REX] opcode ModRM(mod=10, reg, base) [SIB] disp32` — a register/memory
     /// operand form with a 32-bit displacement off any base register.
-    fn g_mem(&mut self, w: bool, opcode: &[u8], reg: u8, base: u8, disp: i32) {
+    pub(crate) fn g_mem(&mut self, w: bool, opcode: &[u8], reg: u8, base: u8, disp: i32) {
         let rex = 0x40 | (u8::from(w) << 3) | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
         self.code.push(rex);
         self.code.extend_from_slice(opcode);
