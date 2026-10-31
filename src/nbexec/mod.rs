@@ -2427,6 +2427,9 @@ const ARRAY_VALUES_INTRINSIC: &str = "\u{0}arrvalues";
 /// through these ([`Interp::intrinsic_global`]), never through the live global
 /// bindings a script may rebind (`Map = …`, `TypeError = …`).
 const INTRINSIC_GLOBAL_PREFIX: &str = "\u{0}intr:";
+/// A global-scope binding (unnameable from source) holding the realm's global
+/// object once its intrinsics are captured under [`INTRINSIC_GLOBAL_PREFIX`].
+const INTRINSIC_GLOBAL_OWNER: &str = "\u{0}intr-owner";
 /// `ArrayBuffer` byte store (an array of 0–255 numbers) and `DataView` linkage.
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
 /// Marks an `ArrayBuffer` as detached (after `transfer()`): its `byteLength` reads 0 and its
@@ -5214,6 +5217,10 @@ impl Interp {
         self.realm.set_property(global, "globalThis", gbox);
         self.realm.mark_hidden(global, "globalThis");
         self.current.declare("globalThis", gbox);
+        // The realm's own record of its global object, which (unlike the
+        // writable `globalThis` binding) no script can rebind: it tells
+        // `intrinsic_global` the captured intrinsics are this realm's.
+        self.current.declare(INTRINSIC_GLOBAL_OWNER, gbox);
         self.global_this = gbox;
         // `%ArrayIteratorPrototype%` up front, not on the first array
         // iteration: the bytecode VM's by-index `for-of` needs its `next`
@@ -5232,7 +5239,7 @@ impl Interp {
         if let Some(gt) = self.global_this.as_handle().map(Handle::from_raw)
             && self
                 .global_scope
-                .get("globalThis")
+                .get(INTRINSIC_GLOBAL_OWNER)
                 .and_then(|v| v.as_handle())
                 == Some(gt.to_raw())
             && let Some(v) = self
@@ -6770,7 +6777,7 @@ impl Interp {
             let captured = alloc::format!("{INTRINSIC_GLOBAL_PREFIX}{name}");
             self.realm.get_property(gt, &captured).or_else(|| {
                 self.realm
-                    .get_property(gt, "WebAssembly")
+                    .get_property(gt, &alloc::format!("{INTRINSIC_GLOBAL_PREFIX}WebAssembly"))
                     .and_then(|ns| ns.as_handle())
                     .map(Handle::from_raw)
                     .and_then(|ns| self.realm.get_property(ns, name))

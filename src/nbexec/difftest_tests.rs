@@ -3365,3 +3365,31 @@ fn annexb_block_function_global_copy_is_a_sloppy_set() {
         "number,number,number,number,set:function/get,function,string"
     );
 }
+
+/// Engine paths that need an intrinsic (`new Map` linking `%Map.prototype%`,
+/// `RegExp(p)` constructing `%RegExp%`, `ToObject` reaching
+/// `%BigInt.prototype%`) read the realm's captured intrinsics. Whether those
+/// are this realm's was decided by comparing the writable `globalThis`
+/// binding with the global object, so after `globalThis = 0` every such path
+/// fell back to the live (user-replaced) global binding.
+#[test]
+fn intrinsics_survive_rebinding_global_this() {
+    let src = r#"
+        var R = RegExp, M = Map, S = Set, B = BigInt;
+        globalThis = 0;
+        RegExp = function FakeRegExp() { return { fake: true }; };
+        Map = function FakeMap() {}; Map.prototype = { fakeMap: 1 };
+        Set = function FakeSet() {}; Set.prototype = { fakeSet: 1 };
+        BigInt = function FakeBigInt() {}; BigInt.prototype = { fakeBig: 1 };
+        var r = [];
+        var re = R("a+");
+        r.push(re.fake === undefined, re instanceof R);
+        var m = new M([[1, 2]]);
+        r.push(Object.getPrototypeOf(m) === M.prototype, m.get(1));
+        var s = new S([1]);
+        r.push(Object.getPrototypeOf(s) === S.prototype, s.has(1));
+        r.push(Object.getPrototypeOf(Object(1n)) === B.prototype);
+        r.join()
+    "#;
+    assert_eq!(run(src), "true,true,true,2,true,true,true");
+}
