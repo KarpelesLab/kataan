@@ -806,6 +806,18 @@ impl X64Assembler {
         self.g_mem(true, &[0xff], 1, base, disp);
     }
 
+    /// `add qword [base+disp], imm8` (sign-extended).
+    pub(crate) fn g_add_mem_imm8(&mut self, base: u8, disp: i32, imm: i32) {
+        self.g_mem(true, &[0x83], 0, base, disp);
+        self.code.push(imm as i8 as u8);
+    }
+
+    /// The inlined activations enclosing the ops emitted next (see
+    /// [`InlineCtx`]; `None` outside an inlined body).
+    pub(crate) fn set_inline_ctx(&mut self, ctx: Option<InlineCtx>) {
+        self.inline_ctx = ctx;
+    }
+
     /// `cmp byte [base+disp], imm8`.
     pub(crate) fn g_cmp_byte_imm(&mut self, base: u8, disp: i32, imm: u8) {
         self.g_mem(false, &[0x80], 7, base, disp);
@@ -1143,13 +1155,8 @@ pub(crate) fn emit_falloff_value(a: &mut X64Assembler) {
 /// call depth under the limit. (The context's own `call_depth` is never
 /// above the realm's `vm_total_depth`, which every activation counts, so its
 /// limit is implied.) Leaves `r10` = the register stack, `r9` = the realm;
-/// clobbers `rax`.
-fn emit_limit_checks(a: &mut X64Assembler, l: &CallLayout, fail: Label) {
-    emit_limit_checks_deep(a, l, 0, fail);
-}
-
-/// [`emit_limit_checks`] for an activation `extra` levels above the next
-/// one (`extra` activations not yet counted in the depth come first).
+/// clobbers `rax`. The activation is `extra` levels above the next one
+/// (`extra` activations not yet counted in the depth come first).
 fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail: Label) {
     a.g_cmp_byte_imm(RBP, ACT_OK, 0);
     a.g_jcc(cc::NE, fail);
@@ -1240,8 +1247,6 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     use crate::nanbox::NanBox;
     let l = e.layout;
     let reg = |x: u16| i32::from(x) * 8;
-    let argc = e.args.len();
-    let hdr = |i: usize| i32::try_from(i * 8).ok();
     let jl = super::compute_jit_layout();
     use core::mem::offset_of;
     // Way `w`'s memo fields (see `CallMemo`).
@@ -1503,24 +1508,143 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.cold_end(cold);
     }
     a.bind(identified);
-    // (In an inlined body: its activation, if still pending, is pushed
-    // first — the callee's header goes above it. Preserves every register.)
-    a.inline_frame_hook();
+    // In an inlined body (`InlineCtx`): when every enclosing activation is
+    // still pending, the sequence pushes their headers along with its own
+    // and pops them with it, leaving them pending; else whatever is still
+    // pending is pushed first by its stub (the callee's header goes above
+    // it; the stub preserves every register) and the plain sequence
+    // follows.
+    let ictx = a.inline_ctx.clone().filter(|c| !c.acts.is_empty());
+    let entered = a.new_label();
+    if let Some(c) = &ictx {
+        let plain = a.new_label();
+        let hook = a.new_label();
+        a.g_mem(true, &[0x83], 7, RBP, c.pend); // cmp qword [rbp+pend], -1
+        a.code.push(0xff);
+        a.g_jcc(cc::E, plain);
+        if let Some(save) = c.save {
+            // (An inner activation pending over a materialized outer one:
+            // its stub pushes it.)
+            a.g_cmp_store_zero_skip(save, hook);
+        }
+        emit_enter(a, e, (callee_base, callee_disp), &c.acts)?;
+        a.jmp(entered);
+        a.bind(hook);
+        a.g_mem(false, &[0xff], 2, RBP, c.pend); // call [rbp+pend]
+        a.bind(plain);
+    } else {
+        a.inline_frame_hook();
+    }
+    emit_enter(a, e, (callee_base, callee_disp), &[])?;
+    a.bind(entered);
+    // 8. The outcome: a throw, falling off the end (`undefined`), or a value.
+    emit_outcome(a, e)
+}
+
+/// An inlined activation enclosing a call site, as that site's sequence
+/// pushes it when it is still pending ([`InlineCtx`]): what its stub
+/// ([`emit_inline_stub`]) would push.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingAct {
+    /// The `rbp`-relative slot of its callee value.
+    pub callee: i32,
+    /// The inlined call's argument registers.
+    pub args: alloc::vec::Vec<u16>,
+    /// A `new`'s constructor register (its `new.target`).
+    pub new_target: Option<u16>,
+}
+
+/// The inlined activations enclosing an op (`super::inline`), outer first,
+/// with the slots that say whether they are all still pending: `pend` (not
+/// `RECV_CACHE_EMPTY` while the innermost one is) and, with two levels,
+/// the inner level's `save` (`0` once the outer one is materialized; see
+/// [`NestedSlots`]).
+#[derive(Clone, Debug)]
+pub(crate) struct InlineCtx {
+    /// The enclosing activations, outer first.
+    pub acts: alloc::vec::Vec<PendingAct>,
+    /// [`InlineSlots::pend`].
+    pub pend: i32,
+    /// [`NestedSlots::save`], with two levels.
+    pub save: Option<i32>,
+}
+
+/// Steps 2 to 7 of [`emit_call`] from `identified` (the way in `r11`, the
+/// captures in `r8`, the callee value at `callee`): the limit checks, the
+/// header, the call and the pop, `rax` the callee's result. With `acts`
+/// (the enclosing inlined activations, all pending), their headers are
+/// pushed below the callee's in the same commit (and counted in the depth,
+/// checked for them too) exactly as their stubs would have pushed them, and
+/// popped with it: they are on the stack, linked and counted for as long as
+/// the callee runs, which is the only time anything can observe them, and
+/// pending again after.
+fn emit_enter(
+    a: &mut X64Assembler,
+    e: &CallEmit<'_>,
+    (callee_base, callee_disp): (u8, i32),
+    acts: &[PendingAct],
+) -> Option<()> {
+    use crate::nanbox::NanBox;
+    let l = e.layout;
+    let reg = |x: u16| i32::from(x) * 8;
+    let argc = e.args.len();
+    let hdr = |i: usize| i32::try_from(i * 8).ok();
+    // The pending activations' header offsets from the stack top, and the
+    // callee header's.
+    let mut offs = alloc::vec::Vec::with_capacity(acts.len());
+    let mut below = 0usize;
+    for act in acts {
+        offs.push(hdr(below)?);
+        below += FRAME_HEADER + act.args.len();
+    }
+    let below_b = hdr(below)?;
+    let levels = i32::try_from(acts.len()).ok()?;
     a.dbg_mark("c-limits");
     // 2. The activation may make native calls (`ACT_OK`), one realm, and
-    //    room under the depth limit.
-    emit_limit_checks(a, l, e.slow);
-    // 3. Room for the header, the arguments and the callee's window:
-    //    rcx = header, rsi = window, rax = new top.
+    //    room under the depth limit (for the pending activations too).
+    emit_limit_checks_deep(a, l, levels, e.slow);
+    // 3. Room for the headers, the arguments and the callee's window:
+    //    rcx = the first header, rsi = window, rax = new top.
     a.g_load(r::RCX, r::R10, STACK_TOP);
-    a.g_lea(r::RSI, r::RCX, hdr(FRAME_HEADER + argc)?);
+    a.g_lea(r::RSI, r::RCX, hdr(below + FRAME_HEADER + argc)?);
     a.g_mov(r::RAX, r::RSI);
     a.g_add_mem(r::RAX, r::R11, SITE_FRAME);
     a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
     a.g_jcc(cc::A, e.slow);
     a.dbg_mark("c-header");
-    // 4. The header and the arguments.
+    // 4. The pending activations' headers (as `emit_inline_stub`), then the
+    //    callee's, rcx moved up to it.
     a.g_load(r::RDX, r::R10, STACK_FRAMES);
+    if !acts.is_empty() {
+        a.g_load(r::RDI, r::R9, l.callee_len);
+    }
+    for (k, act) in acts.iter().enumerate() {
+        let o = offs[k];
+        if k > 0 {
+            a.g_lea(r::RDX, r::RCX, offs[k - 1]);
+        }
+        a.g_store(r::RCX, o, r::RDX);
+        a.g_load(r::RDX, RBP, act.callee);
+        a.g_store(r::RCX, o + 8, r::RDX);
+        a.g_store(r::RCX, o + 16, r::RDI);
+        a.g_store_imm32(
+            r::RCX,
+            o + 24,
+            argc_word(act.args.len(), act.new_target.is_some())?,
+        );
+        if let Some(nt) = act.new_target {
+            a.g_load(r::RDX, r::RBX, reg(nt));
+            a.g_store(r::RCX, o + 32, r::RDX);
+        }
+        for (i, &ar) in act.args.iter().enumerate() {
+            a.g_load(r::RDX, r::RBX, reg(ar));
+            a.g_store(r::RCX, o + hdr(FRAME_HEADER + i)?, r::RDX);
+        }
+    }
+    if let Some(&last) = offs.last() {
+        a.g_lea(r::RDX, r::RCX, last);
+        a.g_lea(r::RCX, r::RCX, below_b);
+    }
     a.g_store(r::RCX, 0, r::RDX);
     a.g_load(r::RDX, callee_base, callee_disp);
     a.g_store(r::RCX, 8, r::RDX);
@@ -1540,7 +1664,11 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // 5. Commit: the activation is on the stack and counted.
     a.g_store(r::R10, STACK_FRAMES, r::RCX);
     a.g_store(r::R10, STACK_TOP, r::RAX);
-    a.g_inc_mem(r::R9, l.total_depth);
+    if acts.is_empty() {
+        a.g_inc_mem(r::R9, l.total_depth);
+    } else {
+        a.g_add_mem_imm8(r::R9, l.total_depth, levels + 1);
+    }
     a.dbg_mark("c-entry");
     // 6. entry(ctx, window, argc, argv, caps, this), `ctx` in `r15`.
     a.g_movabs(r::RDX, argc as u64);
@@ -1554,15 +1682,30 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // called.)
     a.g_call_mem_unhooked(r::R11, SITE_CODE);
     a.dbg_mark("c-pop");
-    // 7. Pop the activation (the callee restored everything it changed).
+    // 7. Pop the activation (the callee restored everything it changed),
+    //    and the pending ones' headers under it.
     a.g_load(r::R10, r::R15, l.stack);
     a.g_load(r::RCX, r::R10, STACK_FRAMES);
+    if !acts.is_empty() {
+        a.g_lea(r::RCX, r::RCX, -below_b);
+    }
     a.g_store(r::R10, STACK_TOP, r::RCX);
     a.g_load(r::RDX, r::RCX, 0);
     a.g_store(r::R10, STACK_FRAMES, r::RDX);
     a.g_load(r::R9, r::R15, l.realm);
-    a.g_dec_mem(r::R9, l.total_depth);
-    // 8. The outcome: a throw, falling off the end (`undefined`), or a value.
+    if acts.is_empty() {
+        a.g_dec_mem(r::R9, l.total_depth);
+    } else {
+        a.g_add_mem_imm8(r::R9, l.total_depth, -(levels + 1));
+    }
+    Some(())
+}
+
+/// Step 8 of [`emit_call`]: the callee's result in `rax` (a throw, falling
+/// off the end, or a value) to `e.dst`, then on to `e.done`.
+fn emit_outcome(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
+    use crate::nanbox::NanBox;
+    let reg = |x: u16| i32::from(x) * 8;
     let store = a.new_label();
     a.p_cmp_throw_rax();
     a.g_jcc(cc::E, e.throw_exit);
@@ -1784,6 +1927,8 @@ pub(crate) struct RecvWay {
 /// they would be (the arguments are the caller's registers, which the
 /// inlined body never writes; the stack top and depths move only in Rust
 /// code), and the limits are checked here, so the activation is the call's.
+/// (A native call sequence in the body pushes them itself, under its own
+/// header, for as long as its callee runs: see [`InlineCtx`].)
 pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Option<()> {
     use crate::nanbox::NanBox;
     use core::mem::offset_of;

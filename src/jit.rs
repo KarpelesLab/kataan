@@ -4334,6 +4334,11 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     inline_clear: Vec<i32>,
+    /// The inlined activations enclosing the op being emitted, outer first
+    /// (`call_seq::InlineCtx`): a call sequence there pushes them with its
+    /// own header while they are all still pending.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    inline_ctx: Option<call_seq::InlineCtx>,
     /// Out-of-line code moved off the hot path ([`cold_end`](Self::cold_end)),
     /// placed after everything else by [`finish`](Self::finish).
     #[cfg_attr(
@@ -6636,6 +6641,71 @@ impl JitFunction {
                 .max()
                 .unwrap_or(0),
         };
+        // Per op, the inlined activations enclosing it, outer first, as a
+        // call sequence there pushes them (`call_seq::InlineCtx`): each its
+        // guard's callee slot and its call's arguments, as its stub's.
+        let inl_ctx: Vec<Option<call_seq::InlineCtx>> = {
+            let act = |level: usize, g: usize| -> Option<call_seq::PendingAct> {
+                let GenericOp::InlineGuard { call, .. } = *ops.get(g)? else {
+                    return None;
+                };
+                let (args, new_target) = match *ops.get(call as usize)? {
+                    GenericOp::GetProp { .. } => (Vec::new(), None),
+                    GenericOp::CallMethod { args, .. } => {
+                        (call_args.get(args as usize)?.clone(), None)
+                    }
+                    GenericOp::CallValue { site, .. } | GenericOp::CallWithMethod { site, .. } => {
+                        (call_args.get(site as usize)?.clone(), None)
+                    }
+                    GenericOp::Construct { ctor, site, .. } => {
+                        (call_args.get(site as usize)?.clone(), Some(ctor))
+                    }
+                    _ => return None,
+                };
+                let view = if level == 0 {
+                    inl_slots
+                } else {
+                    inl_slots.inner()?
+                };
+                Some(call_seq::PendingAct {
+                    callee: view.callee,
+                    args,
+                    new_target,
+                })
+            };
+            let ctx_of = |stack: &[usize]| -> Option<call_seq::InlineCtx> {
+                if stack.is_empty() || stack.len() > 2 {
+                    return None;
+                }
+                let acts = stack
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &g)| act(k, g))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(call_seq::InlineCtx {
+                    acts,
+                    pend: inl_slots.pend,
+                    save: if stack.len() == 2 {
+                        Some(inl_slots.nested?.save)
+                    } else {
+                        None
+                    },
+                })
+            };
+            let mut stack: Vec<usize> = Vec::new();
+            let mut out = Vec::with_capacity(ops.len());
+            for (i, op) in ops.iter().enumerate() {
+                out.push(ctx_of(&stack));
+                match op {
+                    GenericOp::InlineGuard { .. } => stack.push(i),
+                    GenericOp::InlineLeave => {
+                        stack.pop();
+                    }
+                    _ => {}
+                }
+            }
+            out
+        };
         // A handler's catch pc as the interpreter knows it (the function's
         // own numbering: see `inline`).
         let orig_pc = |t: usize| -> usize {
@@ -7072,6 +7142,7 @@ impl JitFunction {
         num.alloc_copy_labels(&mut a);
         for (op_idx, copy) in num.schedule(ops.len()) {
             let op = &ops[op_idx];
+            a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
             num.set_copy(copy);
             if copy {
                 a.bind(num.copy_label(op_idx)?);
@@ -9587,6 +9658,9 @@ impl JitFunction {
             }
         }
         num.set_copy(false);
+        // (Out of line, a call sequence runs the stub of whatever inlined
+        // activation is pending first.)
+        a.set_inline_ctx(None);
         // Falling off the end of the stream (or branching to `len`): the
         // sentinel for the interpreter, `undefined` for a native call (see
         // `call_seq::ACT_OK`).

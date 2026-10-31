@@ -47,6 +47,9 @@
 //! `valueOf`, … that a property access or an operator calls) first pushes
 //! the pending activation, like any Rust code run inside it, and a throw
 //! out of the callee ends the inlined activation as any other throw does.
+//! (A native call sequence instead pushes the activations still pending
+//! with its own header and pops them with it, so they stay pending: see
+//! `call_seq::InlineCtx`.)
 //!
 //! An inlined callee's own call sites may be inlined into its spliced body
 //! in turn ([`Candidate::nested`], one more level): such an inner
