@@ -97,6 +97,12 @@ fn resume_state(
         let e = vm_error(ctx, "TypeError", "Generator is already running");
         return Err(VmError::Thrown(e));
     }
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    if mode == 0
+        && let Some(r) = hot_next(ctx, funcs, fh, id, state, pc, dst, v)
+    {
+        return r;
+    }
     let proto = funcs.get(id);
     // Suspended inside a `yield*` (the delegation step) or at a capturing
     // `YieldResume`: every resumption kind lands in registers.
@@ -195,6 +201,18 @@ fn resume_state(
         t.ic = ic;
         t.ic_body = body;
     }
+    finish(ctx, proto, fh, regs, r)
+}
+
+/// The end of a resumption that ran: the frame's new state (and, at a
+/// `yield`, its register file and handlers back in it) and the outcome.
+fn finish(
+    ctx: &mut Ctx,
+    proto: &FnProto,
+    fh: Handle,
+    regs: Vec<NanBox>,
+    r: Result<FrameExit, VmError>,
+) -> Result<GenOut, VmError> {
     match r {
         Ok(FrameExit::Yield {
             value,
@@ -232,6 +250,181 @@ fn resume_state(
             Err(err)
         }
     }
+}
+
+/// A `next(v)` resumption of a generator whose function's compiled body is
+/// hot, straight into that body: the general path's decisions (see
+/// [`resume_state`]) for the common states — suspended at its start, or at a
+/// plain or capturing `yield` (not inside a `yield*` step) — without its
+/// per-resumption bookkeeping (the inline caches stay with the function:
+/// compiled code does not use them). `None` (nothing done) for anything
+/// else, including a resumption due to recompile or exit-stress the body,
+/// which the general path makes.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn hot_next(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    fh: Handle,
+    id: usize,
+    state: u8,
+    pc: usize,
+    dst: u16,
+    v: NanBox,
+) -> Option<Result<GenOut, VmError>> {
+    let proto = funcs.get(id)?;
+    // Where the sent value lands: a capturing `YieldResume`'s `dst` (and
+    // its `mode` register, 0 = next), or the frame's `dst`.
+    let land = match state {
+        S_START => None,
+        S_YIELD => {
+            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
+                return None;
+            }
+            match pc.checked_sub(1).and_then(|i| proto.ops.get(i)) {
+                Some(Op::YieldResume { dst, mode, .. }) => Some((*dst, Some(*mode))),
+                _ => Some((dst, None)),
+            }
+        }
+        _ => return None,
+    };
+    let jit = {
+        let mut t = proto.tier.0.try_borrow_mut().ok()?;
+        let n = t.resumes.saturating_add(1);
+        if !super::jit_tier::resume_is_hot(n) || super::jit_tier::resume_may_recompile(n) {
+            return None;
+        }
+        // (`run_generator_body` refuses a body without an entry at `pc`.)
+        let j = match &t.jit {
+            Some(Some(j)) if j.is_generic() => alloc::rc::Rc::clone(j),
+            _ => return None,
+        };
+        t.resumes = n;
+        j
+    };
+    let (mut regs, mut handlers) = match ctx.realm.vm_frame_mut(fh) {
+        Some(f) => {
+            f.state = S_EXECUTING;
+            (
+                core::mem::take(&mut f.regs),
+                core::mem::take(&mut f.handlers),
+            )
+        }
+        None => return Some(Err(VmError::NotAnObject)),
+    };
+    match land {
+        Some((d, Some(m))) => {
+            regs[d as usize] = v;
+            regs[m as usize] = NanBox::number(0.0);
+        }
+        Some((d, None)) => {
+            if let Some(slot) = regs.get_mut(d as usize) {
+                *slot = v;
+            }
+        }
+        None => {}
+    }
+    use super::jit_tier::GenRun;
+    let r =
+        match super::jit_tier::run_generator_body(ctx, funcs, &jit, &mut regs, pc, &mut handlers) {
+            GenRun::Yield { value, pc, dst } => {
+                if let Some(f) = ctx.realm.vm_frame_mut(fh) {
+                    f.regs = regs;
+                    f.handlers = handlers;
+                    f.pc = pc as u32;
+                    f.dst = dst;
+                    f.state = S_YIELD;
+                }
+                ctx.realm.vm_frame_stored(fh);
+                // A `yield*` step hands the inner result object through as is.
+                return Some(Ok(
+                    if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
+                        GenOut::Delegated(value)
+                    } else {
+                        GenOut::Yield(value)
+                    },
+                ));
+            }
+            GenRun::Exit(r) => r,
+            // (A body that refuses to run — no entry at `pc`, the rare full
+            // register stack — is interpreted, cold.)
+            GenRun::Refused => run_frame_at_ic(
+                ctx,
+                funcs,
+                &proto.ops,
+                &mut regs,
+                pc,
+                handlers,
+                None,
+                &mut Vec::new(),
+            ),
+        };
+    Some(finish(ctx, proto, fh, regs, r))
+}
+
+/// The compiled tier's `for-of` step (`jit_tier::jit_helper_iter_next`)
+/// over a sync VM generator whose `next` is the intrinsic and whose body
+/// runs compiled: [`for_of_step`]'s outcome, written to the loop's `done`
+/// register as `vm_iter_step` writes it, with the checks and the resume
+/// folded into one pass. `None` (nothing done) for anything else, which
+/// takes the general step.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn jit_for_of_step(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &mut [NanBox],
+    done: super::Reg,
+    iter: super::Reg,
+    next: super::Reg,
+) -> Option<Result<Option<NanBox>, VmError>> {
+    let gh = Handle::from_raw(regs[iter as usize].as_handle()?);
+    let nx = Handle::from_raw(regs[next as usize].as_handle()?);
+    if regs[done as usize].as_boolean() == Some(true)
+        || ctx.host.is_none()
+        || ctx.realm.multi_realm
+        || ctx.realm.native_at(nx) != Some(crate::nbexec::N_GEN_NEXT)
+    {
+        return None;
+    }
+    let fh = state_of(ctx, gh)?;
+    let (id, state, pc, dst) = {
+        let f = ctx.realm.vm_frame(fh)?;
+        (f.func as usize, f.state, f.pc as usize, f.dst)
+    };
+    // (Past the recursion limits, the general step throws.)
+    if id >= funcs.len()
+        || ctx.call_depth >= ctx.realm.limits.max_call_depth
+        || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        || crate::stack::exhausted()
+    {
+        return None;
+    }
+    ctx.call_depth += 1;
+    ctx.realm.vm_total_depth += 1;
+    let r = hot_next(ctx, funcs, fh, id, state, pc, dst, NanBox::undefined());
+    ctx.call_depth -= 1;
+    ctx.realm.vm_total_depth -= 1;
+    let out = match r? {
+        Ok(o) => o,
+        Err(e) => {
+            regs[done as usize] = NanBox::boolean(true);
+            return Some(Err(e));
+        }
+    };
+    let step = match out {
+        GenOut::Yield(v) => Ok(Some(v)),
+        GenOut::Done(_) => Ok(None),
+        GenOut::Delegated(r) => (|| {
+            let d = host_get_str(ctx, r, "done")?;
+            if ctx.realm.truthy(d) {
+                return Ok(None);
+            }
+            host_get_str(ctx, r, "value").map(Some)
+        })(),
+    };
+    regs[done as usize] = NanBox::boolean(!matches!(step, Ok(Some(_))));
+    Some(step)
 }
 
 /// A finished frame's register file goes back to the pool, as an ordinary

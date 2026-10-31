@@ -6636,6 +6636,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         site_fill: jit_tier::jit_helper_site_fill,
         new_object: jit_tier::jit_helper_new_object,
         new_array: jit_tier::jit_helper_new_array,
+        iter_next: jit_tier::jit_helper_iter_next,
     }
 }
 

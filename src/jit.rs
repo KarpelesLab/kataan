@@ -3405,6 +3405,9 @@ pub struct GenericHelpers {
     /// `jit_helper_new_array(ctx, regs, n_regs, op) -> 0`: `Op::NewArrayFrom`
     /// / `Op::NewArray`, written to the op's destination (the exec-op ABI).
     pub new_array: JitExecOpHelper,
+    /// `jit_helper_iter_next(ctx, regs, n_regs, op) -> 0`: `Op::IterNext`
+    /// (the exec-op ABI), which resumes a hot generator directly.
+    pub iter_next: JitExecOpHelper,
 }
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
@@ -8749,10 +8752,22 @@ impl JitFunction {
                             a.jmp(fin);
                             a.bind(slow);
                             // (A speculative loop's fast version leaves for
-                            // its plain copy instead.)
+                            // its plain copy instead.) The general step is
+                            // `jit_helper_iter_next`'s, which resumes a hot
+                            // generator directly.
                             match num.spec_bail(&mut a, op_idx) {
                                 Some(bail) => a.jmp(bail),
-                                None => exec_op!(pc),
+                                None => {
+                                    let op_ptr: *const crate::nbvm::Op =
+                                        bytecode.get(pc as usize)?;
+                                    a.mov_rdi_r15();
+                                    a.mov_rsi_rbx();
+                                    a.movabs_argreg(2, n_regs as i64);
+                                    a.movabs_argreg(3, op_ptr as i64);
+                                    a.movabs_rax(helpers.iter_next as usize as i64);
+                                    a.call_rax();
+                                    throw_check!();
+                                }
                             }
                             a.bind(fin);
                         }
@@ -8935,6 +8950,16 @@ impl JitFunction {
                             a.call_rax();
                             throw_check!();
                             a.bind(done);
+                        }
+                        op @ crate::nbvm::Op::IterNext { .. } => {
+                            let op_ptr: *const crate::nbvm::Op = op;
+                            a.mov_rdi_r15();
+                            a.mov_rsi_rbx();
+                            a.movabs_argreg(2, n_regs as i64);
+                            a.movabs_argreg(3, op_ptr as i64);
+                            a.movabs_rax(helpers.iter_next as usize as i64);
+                            a.call_rax();
+                            throw_check!();
                         }
                         _ => exec_op!(pc),
                     }

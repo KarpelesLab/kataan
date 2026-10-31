@@ -593,6 +593,99 @@ pub(super) fn resume_generator(
     }
 }
 
+/// Whether the `n`th resumption of a generator function's generators is
+/// one that may leave its compiled body to be recompiled (see
+/// [`resume_generator`]).
+pub(super) fn resume_may_recompile(n: u32) -> bool {
+    n.is_multiple_of(RECOMPILE_EVERY) || exit_stress()
+}
+
+/// The outcome of [`run_generator_body`].
+pub(super) enum GenRun {
+    /// The body suspended: it yields `value`, and its resumption continues
+    /// at `pc` with the sent value in `dst` (its handlers are back in the
+    /// caller's vector).
+    Yield { value: NanBox, pc: usize, dst: Reg },
+    /// Any other end, as the interpreter's frame outcome.
+    Exit(Result<FrameExit, VmError>),
+    /// The body refused to run (nothing ran).
+    Refused,
+}
+
+/// A hot generator's resumption that may not leave its compiled body (see
+/// [`resume_generator`]): `jit` (a generic body) run from `pc` on the
+/// generator's register file and its handler stack `handlers` — at a
+/// suspension the body's handlers are moved back into `handlers` (no new
+/// vector), and what the body yields is returned without making a frame
+/// outcome. Exactly [`run_compiled_at`]'s run otherwise.
+pub(super) fn run_generator_body(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    jit: &crate::jit::JitProto,
+    regs: &mut [NanBox],
+    pc: usize,
+    handlers: &mut alloc::vec::Vec<(usize, Reg)>,
+) -> GenRun {
+    let saved = ctx.jit_funcs.replace(funcs as *const [FnProto]);
+    let outer_base = ctx.jit_rt.base;
+    let base = ctx.jit_rt.handlers.len();
+    ctx.jit_rt.base = base;
+    if !handlers.is_empty() {
+        ctx.jit_rt.handlers.extend_from_slice(handlers);
+    }
+    let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
+    let st = stack_of(ctx);
+    let n = regs.len().max(jit.n_regs());
+    // SAFETY: as `run_compiled_at`.
+    #[allow(unsafe_code)]
+    let (top, room) = unsafe { ((*st).top, reserve(st, n)) };
+    let raw = if n <= room {
+        // SAFETY: as `run_compiled_at`: `top..top + n` is free stack memory,
+        // claimed for exactly this activation.
+        #[allow(unsafe_code)]
+        let window = unsafe {
+            core::ptr::copy_nonoverlapping(regs.as_ptr().cast::<u64>(), top, regs.len());
+            for i in regs.len()..n {
+                top.add(i).write(NanBox::undefined().to_bits());
+            }
+            (*st).top = top.add(n);
+            core::slice::from_raw_parts_mut(top.cast::<NanBox>(), n)
+        };
+        let raw = jit.call_frame_raw(ctx_ptr, window, pc);
+        if raw.is_some() {
+            regs.copy_from_slice(&window[..regs.len()]);
+        }
+        // SAFETY: as above; the activation is over.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*st).top = top;
+        }
+        raw
+    } else {
+        jit.call_frame_raw(ctx_ptr, regs, pc)
+    };
+    let Some(raw) = raw else {
+        ctx.jit_rt.handlers.truncate(base);
+        ctx.jit_rt.base = outer_base;
+        ctx.jit_funcs = saved;
+        return GenRun::Refused;
+    };
+    if raw == NanBox::jit_exit_bits() {
+        if let Some((pc, value, dst)) = ctx.jit_rt.suspended.take() {
+            handlers.clear();
+            handlers.extend(ctx.jit_rt.handlers.drain(base..));
+            ctx.jit_rt.base = outer_base;
+            ctx.jit_funcs = saved;
+            return GenRun::Yield { value, pc, dst };
+        }
+        return GenRun::Exit(left_at(ctx, base, outer_base, saved));
+    }
+    ctx.jit_rt.handlers.truncate(base);
+    ctx.jit_rt.base = outer_base;
+    ctx.jit_funcs = saved;
+    GenRun::Exit(finish_raw(ctx, raw))
+}
+
 /// How often a generator's resumption may leave its compiled body to be
 /// recompiled (see [`resume_generator`]).
 const RECOMPILE_EVERY: u32 = 64;
@@ -1136,6 +1229,59 @@ pub(crate) extern "C" fn jit_helper_new_array(
 /// entered with, `regs` its `n_regs`-long register file, and `op` a pointer into
 /// the bytecode the calling `JitProto` owns. The reentrancy is single-threaded:
 /// the native caller holds no Rust borrow of either while this runs.
+/// `Op::IterNext` in compiled code (the exec-op ABI): a `for-of` step over
+/// a hot VM generator resumes it directly (`gen_fast::jit_for_of_step`);
+/// any other step is exactly the interpreter arm's.
+///
+/// # Safety
+/// As [`jit_helper_exec_op`].
+pub(crate) extern "C" fn jit_helper_iter_next(
+    ctx: *mut core::ffi::c_void,
+    regs: *mut u64,
+    n_regs: usize,
+    op: *const Op,
+) -> u64 {
+    // SAFETY: the calling `JitProto`'s owned bytecode.
+    #[allow(unsafe_code)]
+    let Op::IterNext {
+        dst,
+        done,
+        iter,
+        next,
+    } = (unsafe { &*op })
+    else {
+        return jit_helper_exec_op(ctx, regs, n_regs, op);
+    };
+    // SAFETY: as `jit_helper_exec_op`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: as `jit_helper_exec_op`.
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    // SAFETY: as `jit_helper_exec_op`.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs) };
+    let (dst, done, iter, next) = (*dst, *done, *iter, *next);
+    let r = match super::gen_fast::jit_for_of_step(ctx, funcs, regs, done, iter, next) {
+        Some(r) => r,
+        None => super::vm_iter_step(ctx, funcs, regs, done, iter, next),
+    };
+    match r {
+        Ok(v) => {
+            regs[dst as usize] = v.unwrap_or(NanBox::undefined());
+            0
+        }
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
 pub(crate) extern "C" fn jit_helper_exec_op(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
