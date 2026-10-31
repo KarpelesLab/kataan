@@ -711,6 +711,8 @@ pub(super) struct TruthyWay {
     pub(super) cell: i32,
     pub(super) check: bool,
     pub(super) shape: Option<u64>,
+    /// The way's layout (`shape`) lacks the `[[IsHTMLDDA]]` brand.
+    pub(super) plain: bool,
 }
 
 /// Out-of-line slow paths, emitted after the body ([`NumGen::finish`]).
@@ -3062,7 +3064,7 @@ impl NumGen {
                         self.env.realm,
                         (w.key, w.cell),
                         w.check,
-                        w.shape,
+                        (w.shape, w.plain),
                         resume,
                         other,
                     );

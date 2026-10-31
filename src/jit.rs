@@ -3458,6 +3458,9 @@ struct Baked {
     /// marked stays marked, so `false` is for good, while `true` is
     /// checked again at run time wherever it matters).
     num: bool,
+    /// Whether the layout holds the `[[IsHTMLDDA]]` brand (a fact of the
+    /// immutable shape).
+    dda: bool,
 }
 
 /// The calling-convention / signature a compiled [`JitProto`] exposes to a
@@ -3834,6 +3837,9 @@ impl JitProto {
                     shape: props::shape_word(&w.shape),
                     slot: w.slot,
                     num: !w.shape.may_be_non_number(w.slot),
+                    dda: w
+                        .shape
+                        .has_brand(crate::shape::brand_bit(crate::shape::BRAND_KEYS[1])),
                 });
                 baked.push(alloc::rc::Rc::clone(&w.shape));
                 tier_baked[site] = Some((alloc::rc::Rc::clone(&w.shape), w.slot));
@@ -6537,6 +6543,19 @@ impl JitFunction {
             rc.sites[at].is_some_and(|p| p.check && way_shape[p.way] == Some(shape))
         };
         let shape_ways: Vec<usize> = (0..rc.ways).filter(|&w| way_shape[w].is_some()).collect();
+        // The ways whose layout lacks the `[[IsHTMLDDA]]` brand: an object
+        // a hit or a fill there proves is truthy.
+        let way_plain: Vec<bool> = way_shape
+            .iter()
+            .map(|s| {
+                s.is_some_and(|s| {
+                    sites
+                        .iter()
+                        .filter_map(|si| si.baked)
+                        .all(|b| b.shape != s || !b.dda)
+                })
+            })
+            .collect();
         // The `InitProp`s of a fresh literal (`recv_cache::fresh_inits`).
         let fresh_init = recv_cache::fresh_inits(ops, bytecode, osr_entries, &catch_targets);
         // The adds to a just-allocated `this` (`recv_cache::fresh_adds`), and
@@ -6567,6 +6586,7 @@ impl JitFunction {
                             cell: rc_cell(p.way),
                             check: p.check,
                             shape: way_shape[p.way],
+                            plain: way_plain[p.way],
                         })
                     }
                     _ => None,
@@ -7003,12 +7023,20 @@ impl JitFunction {
                     }
                     let walk = a.new_label();
                     let proven = a.new_label();
+                    let yes = a.new_label();
+                    // (A hit, or a fill, on a way of a brand-free layout
+                    // proves the object truthy.)
+                    let plain = way_plain[p.way];
                     if p.check {
                         a.load_rax(disp($r));
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(p.way));
                         a.jne(walk);
-                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(p.way));
-                        a.jmp(proven);
+                        if plain {
+                            a.jmp(yes);
+                        } else {
+                            a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(p.way));
+                            a.jmp(proven);
+                        }
                     }
                     a.bind(walk);
                     walk_to_slot!($r, general);
@@ -7024,6 +7052,9 @@ impl JitFunction {
                         }
                         a.g_store(call_seq::r::RBP, rc_key(p.way), call_seq::r::RAX);
                         a.g_store(call_seq::r::RBP, rc_cell(p.way), call_seq::r::RCX);
+                        if plain {
+                            a.jmp(yes);
+                        }
                     }
                     a.bind(skip_fill);
                     a.bind(proven);
@@ -7034,6 +7065,7 @@ impl JitFunction {
                         crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
                     );
                     a.jne(general);
+                    a.bind(yes);
                     a.movabs_rax(1);
                     a.jmp(have);
                 }

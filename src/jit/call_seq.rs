@@ -191,25 +191,53 @@ pub struct CallSite {
     pub guard: [GuardMemo; 3],
 }
 
+/// What a method lookup that hit proved, as a memo keeps it: the site's
+/// `props::MethodSite` entry that hit (at a prototype level, through its
+/// recorded holder address) said that at its stamp — the prototype epoch
+/// the memo records with it — a receiver of layout `shape` whose
+/// `[[Prototype]]` is the raw handle `proto` and which has no accessors
+/// finds the method's value at the address `value` (exactly the entry's
+/// compiled check: `X64Assembler::p_method_lookup`), a data property for
+/// a call and a getter for a property read (whichever the memo's site is).
+/// That is a fact of the epoch, not of the entry: while the epoch is
+/// unchanged no watched object changed layout and no cell moved, so it
+/// still holds after the entry is revalidated or replaced. Empty while
+/// `shape` is `0` (no shape word is null).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LookupMemo {
+    /// The receiver's shape word, or `0`.
+    pub shape: u64,
+    /// The receiver's `[[Prototype]]` (a raw handle).
+    pub proto: u64,
+    /// The address of the method's value.
+    pub value: u64,
+}
+
+impl LookupMemo {
+    const fn empty() -> Self {
+        Self {
+            shape: 0,
+            proto: 0,
+            value: 0,
+        }
+    }
+}
+
 /// An inlined method call's guard memo: the method lookup that last
-/// identified way `w`'s callee — the site's `props::MethodSite` entry
-/// `entry` that hit, at a prototype level through its recorded holder
-/// address — and the callee value it found (`bits`, its captures at `caps`),
-/// at prototype epoch `stamp`.
+/// identified way `w`'s callee (`lookup`) and the callee value it found
+/// (`bits`, its captures at `caps`), at prototype epoch `stamp`.
 ///
-/// While the epoch is still `stamp` and the entry's own stamp (the entry
-/// was not revalidated since, nor replaced by one of another stamp), a
-/// receiver with the entry's shape and `[[Prototype]]` and no accessors
-/// finds the method at the entry's holder address (exactly the entry's
-/// compiled check: `X64Assembler::p_method_lookup`); a value there equal to
-/// `bits` is the callee the memo identified, its captures at `caps` (as
-/// [`IdentMemo`]). So the guard skips both the lookup and the identification.
-/// The entry is read live, so a replaced entry is compared as it now is.
+/// While the epoch is still `stamp`, a receiver with the lookup's shape and
+/// `[[Prototype]]` and no accessors finds the method at the lookup's address
+/// (see [`LookupMemo`]); a value there equal to `bits` is the callee the
+/// memo identified, its captures at `caps` (as [`IdentMemo`]). So the guard
+/// skips both the lookup and the identification.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GuardMemo {
-    /// The `MethodEntry`'s address, or null.
-    pub entry: u64,
+    /// The lookup.
+    pub lookup: LookupMemo,
     /// The callee's `NanBox` bits.
     pub bits: u64,
     /// Its captured values.
@@ -223,7 +251,7 @@ impl GuardMemo {
     #[must_use]
     pub const fn empty() -> Self {
         Self {
-            entry: 0,
+            lookup: LookupMemo::empty(),
             bits: 0,
             caps: 0,
             stamp: 0,
@@ -294,11 +322,11 @@ pub struct CallMemo {
     pub target: *const CallTarget,
     /// Its captured values.
     pub caps: *const u64,
-    /// For a method call: the site's `props::MethodSite` entry whose lookup
-    /// last found `bits`, through its recorded holder address, or `0` — the
-    /// call sequence's own `GuardMemo` (it revalidates the entry, then
-    /// skips the lookup and the identification).
-    pub entry: u64,
+    /// For a method call: what the lookup that last found `bits` (through
+    /// its entry's recorded holder address) proved at `stamp`, or empty —
+    /// the call sequence's own `GuardMemo` (it checks the receiver against
+    /// it, then skips the lookup and the identification).
+    pub lookup: LookupMemo,
 }
 
 impl CallMemo {
@@ -308,7 +336,7 @@ impl CallMemo {
             stamp: 0,
             target: core::ptr::null(),
             caps: core::ptr::null(),
-            entry: 0,
+            lookup: LookupMemo::empty(),
         }
     }
 }
@@ -1172,13 +1200,44 @@ fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail
     a.g_load(r::R10, r::R15, l.stack);
 }
 
-/// A method call's memo check through the ways' [`CallMemo::entry`]s, with
-/// the receiver's walked heap slot in `rcx` (kept): the way whose entry
-/// records the receiver's layout and still holds, with the method at the
-/// entry's holder address still that memo's callee value — then the value
-/// into `[rbp + scratch]`, `r11` = the way, `r8` = the captures, and on to
-/// `identified` (exactly what the lookup and the memo check would find).
-/// Otherwise to `slow`. Clobbers `rax`, `rdx`, `rdi`, `r9`, `r11`.
+/// To `slow` unless the walked receiver (its heap slot in `rcx`) has no
+/// accessors: no `extra` part, or an empty accessor list (as the method
+/// lookup requires). Clobbers `r9`.
+fn emit_no_accessors(a: &mut X64Assembler, slow: Label) {
+    let jl = super::compute_jit_layout();
+    let no_acc = a.new_label();
+    a.g_load(r::R9, r::RCX, jl.props.off_extra);
+    a.g_test(r::R9);
+    a.g_jcc(cc::E, no_acc);
+    a.g_load(r::R9, r::R9, jl.props.extra_acc_len);
+    a.g_test(r::R9);
+    a.g_jcc(cc::NE, slow);
+    a.bind(no_acc);
+}
+
+/// Records in the [`LookupMemo`] at `[base + off]` what the method lookup
+/// that just hit proved (its `props::MethodSite` entry in `rdi`, which hit
+/// through its recorded holder address at the current epoch). Clobbers
+/// `rdx`.
+fn emit_lookup_fill(a: &mut X64Assembler, base: u8, off: i32) {
+    use super::props::entry_off;
+    use core::mem::offset_of;
+    let f = |x: usize| off + site_off(x);
+    a.g_load(r::RDX, r::RDI, entry_off::SHAPE);
+    a.g_store(base, f(offset_of!(LookupMemo, shape)), r::RDX);
+    a.g_load(r::RDX, r::RDI, entry_off::PROTO);
+    a.g_store(base, f(offset_of!(LookupMemo, proto)), r::RDX);
+    a.g_load(r::RDX, r::RDI, entry_off::VALUE);
+    a.g_store(base, f(offset_of!(LookupMemo, value)), r::RDX);
+}
+
+/// A method call's memo check through the ways' [`CallMemo::lookup`]s,
+/// with the receiver's walked heap slot in `rcx` (kept): the way whose
+/// lookup records the receiver's layout, at the current epoch, with the
+/// method at the lookup's address still that memo's callee value — then
+/// the value into `[rbp + scratch]`, `r11` = the way, `r8` = the captures,
+/// and on to `identified` (exactly what the lookup and the memo check would
+/// find). Otherwise to `slow`. Clobbers `rax`, `rdx`, `rdi`, `r9`, `r11`.
 fn emit_call_fast(
     a: &mut X64Assembler,
     site: *const CallSite,
@@ -1186,25 +1245,22 @@ fn emit_call_fast(
     slow: Label,
     identified: Label,
 ) {
-    use super::props::entry_off;
     use core::mem::offset_of;
     let jl = super::compute_jit_layout();
     let m = |w: usize, f: usize| {
         site_off(offset_of!(CallSite, memo) + w * core::mem::size_of::<CallMemo>() + f)
     };
     let found: alloc::vec::Vec<Label> = (0..CallSite::WAYS).map(|_| a.new_label()).collect();
+    let lk = |w: usize, f: usize| m(w, offset_of!(CallMemo, lookup) + f);
     a.dbg_mark("c-fast");
     a.g_load(r::RAX, r::RCX, jl.off_shape);
     a.g_load(r::RDX, r::RCX, jl.props.off_proto);
     a.g_movabs(r::R11, site as u64);
     for (w, &f) in found.iter().enumerate() {
         let next = a.new_label();
-        a.g_load(r::RDI, r::R11, m(w, offset_of!(CallMemo, entry)));
-        a.g_test(r::RDI);
-        a.g_jcc(cc::E, next);
-        a.g_cmp_mem(r::RAX, r::RDI, entry_off::SHAPE);
+        a.g_cmp_mem(r::RAX, r::R11, lk(w, offset_of!(LookupMemo, shape)));
         a.g_jcc(cc::NE, next);
-        a.g_cmp_mem(r::RDX, r::RDI, entry_off::PROTO);
+        a.g_cmp_mem(r::RDX, r::R11, lk(w, offset_of!(LookupMemo, proto)));
         a.g_jcc(cc::E, f);
         a.bind(next);
     }
@@ -1215,22 +1271,9 @@ fn emit_call_fast(
         load_proto_epoch(a, r::R9);
         a.g_cmp_mem(r::R9, r::R11, m(w, offset_of!(CallMemo, stamp)));
         a.g_jcc(cc::NE, slow);
-        a.g_cmp_mem(r::R9, r::RDI, entry_off::STAMP);
-        a.g_jcc(cc::NE, slow);
         // No accessors on the receiver (as the lookup requires).
-        let no_acc = a.new_label();
-        a.g_load(r::R9, r::RCX, jl.props.off_extra);
-        a.g_test(r::R9);
-        a.g_jcc(cc::E, no_acc);
-        a.g_load(r::R9, r::R9, jl.props.extra_acc_len);
-        a.g_test(r::R9);
-        a.g_jcc(cc::NE, slow);
-        a.bind(no_acc);
-        a.p_cmp32_imm8(r::RDI, entry_off::ACC, 0);
-        a.g_jcc(cc::NE, slow);
-        a.g_load(r::R9, r::RDI, entry_off::VALUE);
-        a.g_test(r::R9);
-        a.g_jcc(cc::E, slow);
+        emit_no_accessors(a, slow);
+        a.g_load(r::R9, r::R11, lk(w, offset_of!(LookupMemo, value)));
         a.g_load(r::RAX, r::R9, 0);
         a.g_cmp_mem(r::RAX, r::R11, m(w, offset_of!(CallMemo, bits)));
         a.g_jcc(cc::NE, slow);
@@ -1255,7 +1298,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     let memo_stamp = |w: usize| site_off(memo(w) + offset_of!(CallMemo, stamp));
     let memo_target = |w: usize| site_off(memo(w) + offset_of!(CallMemo, target));
     let memo_caps = |w: usize| site_off(memo(w) + offset_of!(CallMemo, caps));
-    let memo_entry = |w: usize| site_off(memo(w) + offset_of!(CallMemo, entry));
+    let memo_lookup = |w: usize| site_off(memo(w) + offset_of!(CallMemo, lookup));
     // A method call's lookup leaves its entry in rdi, and rsi nonzero when
     // the memo may record it (see `p_method_lookup_from`).
     let method = matches!(e.callee, CalleeSrc::Method { .. });
@@ -1285,7 +1328,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             let skip = a.new_label();
             a.g_test(r::RSI);
             a.g_jcc(cc::E, skip);
-            a.g_store(r::R11, memo_entry(0), r::RDI);
+            emit_lookup_fill(a, r::R11, memo_lookup(0));
             a.bind(skip);
         }
         a.g_load(r::R11, r::R11, memo_target(0));
@@ -1495,12 +1538,18 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_store(r::R10, memo_caps(0), r::R8);
         if method {
             let keep = a.new_label();
-            a.g_mov(r::RAX, r::RDI);
+            let filled = a.new_label();
             a.g_test(r::RSI);
             a.g_jcc(cc::NE, keep);
-            a.g_movabs(r::RAX, 0);
+            a.g_store_imm32(
+                r::R10,
+                memo_lookup(0) + site_off(offset_of!(LookupMemo, shape)),
+                0,
+            );
+            a.jmp(filled);
             a.bind(keep);
-            a.g_store(r::R10, memo_entry(0), r::RAX);
+            emit_lookup_fill(a, r::R10, memo_lookup(0));
+            a.bind(filled);
         }
     }
     if let Some(cold) = cold {
@@ -2162,25 +2211,22 @@ fn emit_guard_fast(
     identified: Label,
     miss: Label,
 ) -> Option<()> {
-    use super::props::entry_off;
     use core::mem::offset_of;
     let jl = super::compute_jit_layout();
     let g = |w: usize, f: usize| {
         site_off(offset_of!(CallSite, guard) + w * core::mem::size_of::<GuardMemo>() + f)
     };
     let found: alloc::vec::Vec<Label> = (0..ways).map(|_| a.new_label()).collect();
+    let lk = |w: usize, f: usize| g(w, offset_of!(GuardMemo, lookup) + f);
     a.dbg_mark("g-fast");
     a.g_load(r::RAX, r::RCX, jl.off_shape);
     a.g_load(r::RDX, r::RCX, jl.props.off_proto);
     a.g_movabs(r::R11, e.memo as u64);
     for (w, &f) in found.iter().enumerate() {
         let next = a.new_label();
-        a.g_load(r::RDI, r::R11, g(w, offset_of!(GuardMemo, entry)));
-        a.g_test(r::RDI);
-        a.g_jcc(cc::E, next);
-        a.g_cmp_mem(r::RAX, r::RDI, entry_off::SHAPE);
+        a.g_cmp_mem(r::RAX, r::R11, lk(w, offset_of!(LookupMemo, shape)));
         a.g_jcc(cc::NE, next);
-        a.g_cmp_mem(r::RDX, r::RDI, entry_off::PROTO);
+        a.g_cmp_mem(r::RDX, r::R11, lk(w, offset_of!(LookupMemo, proto)));
         a.g_jcc(cc::E, f);
         a.bind(next);
     }
@@ -2191,23 +2237,11 @@ fn emit_guard_fast(
         load_proto_epoch(a, r::R9);
         a.g_cmp_mem(r::R9, r::R11, g(w, offset_of!(GuardMemo, stamp)));
         a.g_jcc(cc::NE, slow);
-        a.g_cmp_mem(r::R9, r::RDI, entry_off::STAMP);
-        a.g_jcc(cc::NE, slow);
         // No accessors on the receiver (as the lookup requires).
-        let no_acc = a.new_label();
-        a.g_load(r::R9, r::RCX, jl.props.off_extra);
-        a.g_test(r::R9);
-        a.g_jcc(cc::E, no_acc);
-        a.g_load(r::R9, r::R9, jl.props.extra_acc_len);
-        a.g_test(r::R9);
-        a.g_jcc(cc::NE, slow);
-        a.bind(no_acc);
-        // A data property for a call, a getter for a read.
-        a.p_cmp32_imm8(r::RDI, entry_off::ACC, 0);
-        a.g_jcc(if e.getter { cc::E } else { cc::NE }, slow);
-        a.g_load(r::R9, r::RDI, entry_off::VALUE);
-        a.g_test(r::R9);
-        a.g_jcc(cc::E, slow);
+        emit_no_accessors(a, slow);
+        // (A data property for a call, a getter for a read: the memo's
+        // lookup was this guard's.)
+        a.g_load(r::R9, r::R11, lk(w, offset_of!(LookupMemo, value)));
         a.g_load(r::RAX, r::R9, 0);
         a.g_cmp_mem(r::RAX, r::R11, g(w, offset_of!(GuardMemo, bits)));
         a.g_jcc(cc::NE, slow);
@@ -2236,7 +2270,7 @@ fn emit_guard_fill(a: &mut X64Assembler, e: &InlineEmit<'_>, w: usize) {
     a.g_test(r::RSI);
     a.g_jcc(cc::E, skip);
     a.g_movabs(r::R11, e.memo as u64);
-    a.g_store(r::R11, g(offset_of!(GuardMemo, entry)), r::RDI);
+    emit_lookup_fill(a, r::R11, g(offset_of!(GuardMemo, lookup)));
     a.g_load(r::RAX, RBP, e.slots.callee);
     a.g_store(r::R11, g(offset_of!(GuardMemo, bits)), r::RAX);
     a.g_store(r::R11, g(offset_of!(GuardMemo, caps)), r::R8);

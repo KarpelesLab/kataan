@@ -403,17 +403,13 @@ struct MethodEntry {
     levels: [ChainLevel; CHAIN_MAX],
 }
 
-/// [`MethodEntry`]'s field offsets, for an inlined call's guard memo
-/// (`call_seq::GuardMemo`), which revalidates the entry a lookup last hit.
+/// [`MethodEntry`]'s field offsets, for a call's memo of a lookup that
+/// hit (`call_seq::LookupMemo`), which copies what the entry proved.
 pub(crate) mod entry_off {
     use super::{ChainLevel, MethodEntry};
     use core::mem::offset_of;
     /// `recv_shape` (the shape word; `0` while empty).
     pub(crate) const SHAPE: i32 = offset_of!(MethodEntry, recv_shape) as i32;
-    /// `acc` (a `u32`).
-    pub(crate) const ACC: i32 = offset_of!(MethodEntry, acc) as i32;
-    /// `stamp`.
-    pub(crate) const STAMP: i32 = offset_of!(MethodEntry, stamp) as i32;
     /// `value` (the holder's value address, or `0`).
     pub(crate) const VALUE: i32 = offset_of!(MethodEntry, value) as i32;
     /// `levels[0].handle` (the receiver's recorded `[[Prototype]]`).
@@ -892,7 +888,7 @@ impl X64Assembler {
     /// and the arena in `r10` / `rdx`. On a hit, `r11` is the entry that hit
     /// and `rsi` is nonzero exactly when the value came through the entry's
     /// recorded holder address (`MethodEntry::value`, at a prototype level:
-    /// what `call_seq::GuardMemo` can revalidate).
+    /// what `call_seq::LookupMemo` can record).
     fn p_method_lookup_from(
         &mut self,
         l: &JitLayout,
@@ -2040,9 +2036,11 @@ impl X64Assembler {
     /// Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
     pub(crate) fn p_truthy_handle(&mut self, realm_off: i32, truthy: Label, other: Label) {
         let l = super::compute_jit_layout();
-        self.g_mov(r::R9, r::RAX);
-        self.p_arena(realm_off, &l.props);
-        self.g_mov(r::RAX, r::R9);
+        if !self.pinned() {
+            self.g_mov(r::R9, r::RAX);
+            self.p_arena(realm_off, &l.props);
+            self.g_mov(r::RAX, r::R9);
+        }
         self.p_slot_rooted(l, r::RCX, other);
         // An ordinary object first (the usual condition), then a function
         // or an array (never `[[IsHTMLDDA]]`).
@@ -2072,32 +2070,45 @@ impl X64Assembler {
     /// shaped, non-exotic object is walked and recorded in the way (only
     /// when it has layout `shape`, if given). Such an object without the
     /// `[[IsHTMLDDA]]` brand goes to `truthy`; anything else to `other`,
-    /// having filled nothing. Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
+    /// having filled nothing. With `plain` (the way proves `shape`, which
+    /// lacks the brand), a hit or a fill is truthy without a test.
+    /// Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
     pub(crate) fn p_truthy_way(
         &mut self,
         realm_off: i32,
         (key, cell): (i32, i32),
         check: bool,
-        shape: Option<u64>,
+        (shape, plain): (Option<u64>, bool),
         truthy: Label,
         other: Label,
     ) {
         let l = super::compute_jit_layout();
+        let plain = plain && shape.is_some();
         let proven = self.new_label();
         let walk = self.new_label();
         if check {
             self.g_cmp_mem(r::RAX, r::RBP, key);
             self.jne(walk);
-            self.g_load(r::RCX, r::RBP, cell);
-            self.jmp(proven);
+            if plain {
+                self.jmp(truthy);
+            } else {
+                self.g_load(r::RCX, r::RBP, cell);
+                self.jmp(proven);
+            }
         }
         self.bind(walk);
         // A heap handle has all of `HANDLE_TAG`'s bits (the top 14).
         const _: () = assert!(HANDLE_TAG == !0u64 << 50);
         self.p_is_handle(r::RCX, other);
-        self.g_mov(r::R9, r::RAX);
-        self.p_arena(realm_off, &l.props);
-        self.g_mov(r::RAX, r::R9);
+        // (The value stays in `rax` through a pinned walk.)
+        let bits = if self.pinned() {
+            r::RAX
+        } else {
+            self.g_mov(r::R9, r::RAX);
+            self.p_arena(realm_off, &l.props);
+            self.g_mov(r::RAX, r::R9);
+            r::R9
+        };
         self.p_slot_rooted(l, r::RCX, other);
         self.p_plain_shaped(l, other);
         let skip_fill = self.new_label();
@@ -2107,8 +2118,11 @@ impl X64Assembler {
             self.g_cmp(r::R11, r::RDX);
             self.jne(skip_fill);
         }
-        self.g_store(r::RBP, key, r::R9);
+        self.g_store(r::RBP, key, bits);
         self.g_store(r::RBP, cell, r::RCX);
+        if plain {
+            self.jmp(truthy);
+        }
         self.bind(skip_fill);
         self.bind(proven);
         self.g_load(r::R11, r::RCX, l.off_shape);
