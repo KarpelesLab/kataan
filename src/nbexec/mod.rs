@@ -9884,15 +9884,22 @@ impl crate::nbvm::VmHost for Interp {
         Ok(NanBox::handle(p.to_raw()))
     }
 
-    fn annexb_global(&mut self, name: &str, start: u32, end: u32, value: NanBox) {
+    fn annexb_global(
+        &mut self,
+        name: &str,
+        start: u32,
+        end: u32,
+        value: NanBox,
+    ) -> Result<(), crate::nbvm::HostError> {
         let span = Span { start, end };
         if self
             .annexb_block_fns
             .iter()
             .any(|(n, sp)| n.as_str() == name && *sp == span)
         {
-            self.annexb_update_var(name, value);
+            self.annexb_update_var(name, value).map_err(exec_to_host)?;
         }
+        Ok(())
     }
 
     fn using_resource(&mut self, value: NanBox) -> Result<NanBox, crate::nbvm::HostError> {

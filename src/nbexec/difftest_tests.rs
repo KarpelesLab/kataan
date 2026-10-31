@@ -3332,3 +3332,36 @@ fn builtin_slot_accessors_honor_redefinition() {
     "#;
     assert_eq!(run(src), "5,5,5,7,3,4,42,data,data,7,2,4,-1,2,-2,-3,-4,2");
 }
+
+/// Annex B (B.3.2.2 / B.3.2.3): evaluating a block function declaration copies
+/// its value to the `var` binding with the global Environment Record's
+/// `SetMutableBinding(F, fobj, false)` — a sloppy `[[Set]]` on the global
+/// object. An existing non-writable global keeps its value (configurable or
+/// not, frozen global included) and an existing accessor runs its setter; the
+/// copy used to overwrite the property outright.
+#[test]
+fn annexb_block_function_global_copy_is_a_sloppy_set() {
+    let src = r#"
+        var r = [];
+        Object.defineProperty(globalThis, "f1", { value: 1, writable: false, configurable: false });
+        r.push(eval("{ function f1() {} } typeof f1"), typeof f1);
+        Object.defineProperty(globalThis, "f2", { value: 1, writable: false, configurable: true });
+        (0, eval)("{ function f2() {} }");
+        r.push(typeof f2);
+        var log = [];
+        Object.defineProperty(globalThis, "f3", { get: function () { log.push("get"); return 3; }, set: function (v) { log.push("set:" + typeof v); }, configurable: true });
+        (0, eval)("{ function f3() {} }");
+        r.push(typeof f3, log.join("/"));
+        (0, eval)("{ function f4() {} }");
+        r.push(typeof f4);
+        var existing = "x";
+        Object.freeze(globalThis);
+        (0, eval)("{ function existing() {} }");
+        r.push(typeof existing);
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "number,number,number,number,set:function/get,function,string"
+    );
+}

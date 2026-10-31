@@ -123,14 +123,7 @@ impl Interp {
                     }
                     ENV_INIT_SOFT_CONST => s.declare_soft_const(name, value),
                     ENV_INIT_MARK_CONST => s.mark_const(name),
-                    ENV_INIT_VAR_SET => {
-                        s.declare(name, value);
-                        if s.ptr_eq(&self.global_scope)
-                            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
-                        {
-                            self.realm.set_property(g, name, value);
-                        }
-                    }
+                    ENV_INIT_VAR_SET => self.annexb_set_var(&s, name, value)?,
                     _ => return Err(ExecError::Unsupported("environment init mode")),
                 }
                 Ok((undef, undef))
@@ -952,14 +945,48 @@ impl Interp {
 
     /// Writes a block-level function value to its `var`-hoisted binding in the
     /// current variable environment (Annex B.3.3 / B.3.4 runtime update). When the
-    /// variable environment is the global scope, the global object property is
-    /// updated too (where global `var`/function bindings live).
-    pub(crate) fn annexb_update_var(&mut self, name: &str, value: NanBox) {
-        self.var_scope.declare(name, value);
-        if self.var_scope.ptr_eq(&self.global_scope)
+    /// variable environment is the global scope, see
+    /// [`annexb_set_global`](Self::annexb_set_global).
+    pub(crate) fn annexb_update_var(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
+        let scope = self.var_scope.clone();
+        self.annexb_set_var(&scope, name, value)
+    }
+
+    /// The Annex B copy of a block function's value into the `var` binding of
+    /// `scope`, a variable environment: its `SetMutableBinding(F, fobj, false)`.
+    pub(crate) fn annexb_set_var(
+        &mut self,
+        scope: &Scope,
+        name: &str,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        if scope.ptr_eq(&self.global_scope)
             && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
         {
-            self.realm.set_property(g, name, value);
+            return self.annexb_set_global(g, name, value);
         }
+        scope.declare(name, value);
+        Ok(())
+    }
+
+    /// The global Environment Record's `SetMutableBinding(F, fobj, false)` for an
+    /// Annex B block function (B.3.2.2 / B.3.2.3), where global `var`/function
+    /// bindings live on the global object: a sloppy `[[Set]]`. An existing
+    /// accessor runs its setter (and leaves the binding as the getter reports it);
+    /// an existing non-writable property silently keeps its value.
+    fn annexb_set_global(&mut self, g: Handle, name: &str, value: NanBox) -> Result<(), ExecError> {
+        if self.realm.accessor(g, name).is_some() {
+            let strict = core::mem::replace(&mut self.strict, false);
+            let key = self.new_str(name);
+            let r = self.assign_member_value(g, key, value);
+            self.strict = strict;
+            return r.map(|_| ());
+        }
+        if self.realm.has_own(g, name) && self.realm.property_is_readonly(g, name) {
+            return Ok(());
+        }
+        self.global_scope.declare(name, value);
+        self.realm.set_property(g, name, value);
+        Ok(())
     }
 }

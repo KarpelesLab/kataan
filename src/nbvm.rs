@@ -1400,7 +1400,13 @@ pub trait VmHost {
     /// declaration `name` spanning `start..end` qualifies (the host decided at
     /// GlobalDeclarationInstantiation), its value `value` also updates the
     /// global `var` binding.
-    fn annexb_global(&mut self, name: &str, start: u32, end: u32, value: NanBox);
+    fn annexb_global(
+        &mut self,
+        name: &str,
+        start: u32,
+        end: u32,
+        value: NanBox,
+    ) -> Result<(), HostError>;
     /// `(%GeneratorFunction.prototype%, %GeneratorPrototype%)`, or the async
     /// generator ones.
     fn generator_intrinsics(&mut self, is_async: bool) -> Option<(NanBox, NanBox)>;
@@ -8227,8 +8233,10 @@ fn run_frame_at_ic(
                 src,
             } => {
                 let v = regs[*src as usize];
-                if with_host(ctx, |h| h.annexb_global(name, *start, *end, v)).is_none() {
-                    return Err(VmError::Unsupported);
+                match with_host(ctx, |h| h.annexb_global(name, *start, *end, v)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
                 }
             }
             Op::AddDisposable { stack, src } => {
