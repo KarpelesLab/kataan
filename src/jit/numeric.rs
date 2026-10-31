@@ -593,6 +593,95 @@ struct Region {
     live_inner: Vec<(usize, Vec<u16>)>,
     /// The speculative version's merged NaN checks ([`plan_defer`]).
     defer: DeferPlan,
+    /// The speculative version's **hoisted typed-array views**
+    /// ([`plan_views`]): `(register, first of its frame slots, where its
+    /// entry check finds the value)`.
+    views: Vec<(u16, u32, ViewSrc)>,
+    /// The region's **guard diamonds** ([`guard_diamonds`]), as `(test,
+    /// fallback, join)`: in the speculative version's fast version the
+    /// guard's test (`test`, a `JumpIfFalse`) emits nothing and the
+    /// fallback arm `fallback..join` is not there at all.
+    cold: Vec<(usize, usize, usize)>,
+}
+
+impl Region {
+    /// Whether `pc` lies in a guard diamond's fallback arm ([`Region::cold`]).
+    fn is_cold(&self, pc: usize) -> bool {
+        self.cold.iter().any(|&(_, f, e)| f <= pc && pc < e)
+    }
+}
+
+/// Region `r`'s **guard diamonds**: a call whose arguments the compiler
+/// guarded (`Op::PlainPrims`: every argument a primitive other than a
+/// String, so evaluating them runs no code, and a `Math` function may be
+/// called inline) has two arms ???
+///
+/// ```text
+/// g     PlainPrims t, args
+/// g+1   JumpIfFalse t -> F
+///       the fast arm (the call with its arguments in place)
+/// F-1   Jump E
+/// F     the fallback arm (the method read, the arguments, a real call)
+/// E     (the join)
+/// ```
+///
+/// ??? as `(g + 1, F, E)`, where nothing but the test branches into
+/// `F..E` and no entry lies there. A speculative version's fast version
+/// keeps only the fast arm: its `PlainPrims` leaves for the plain copy
+/// when the test would fail (`jit::compile_generic`), so the test needs no
+/// code and the fallback arm, never reached, need not be there ??? nor does
+/// its call keep the loop from having a fast version.
+fn guard_diamonds(
+    r: &Region,
+    ops: &[GenericOp],
+    entries: &[usize],
+    catches: &[usize],
+) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    for g in r.head..r.end {
+        let (
+            Some(&GenericOp::PlainPrims { dst, .. }),
+            Some(&GenericOp::JumpIfFalse { cond, target: f }),
+        ) = (ops.get(g), ops.get(g + 1))
+        else {
+            continue;
+        };
+        if cond != dst || f <= g + 2 || f > r.end {
+            continue;
+        }
+        let Some(&GenericOp::Jump { target: e }) = ops.get(f - 1) else {
+            continue;
+        };
+        if e <= f || e > r.end {
+            continue;
+        }
+        // Only the test reaches the fallback arm (a branch inside it stays
+        // inside it, its own business), and no entry lies there.
+        let reached_only_by_test = ops.iter().enumerate().all(|(pc, op)| match *op {
+            GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. }
+                if (f..e).contains(&t) =>
+            {
+                pc == g + 1 || ((f..e).contains(&pc) && t > pc)
+            }
+            GenericOp::PushHandler { target: t, .. } => !(f..e).contains(&t),
+            _ => true,
+        });
+        // And nothing in it branches out of it but to the join.
+        let stays = ops[f..e].iter().all(|op| match *op {
+            GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } => {
+                t > f && t <= e
+            }
+            GenericOp::PushHandler { .. } => false,
+            _ => true,
+        });
+        if reached_only_by_test
+            && stays
+            && !entries.iter().chain(catches).any(|x| (f..e).contains(x))
+        {
+            out.push((g + 1, f, e));
+        }
+    }
+    out
 }
 
 /// A speculative version's **merged NaN checks** ([`plan_defer`]): a guarded
@@ -835,6 +924,9 @@ pub(super) struct NumGen {
     /// inner back-edge (and an on-stack replacement there) takes, as
     /// `(header, label)`.
     inner_entries: Vec<(usize, Label)>,
+    /// The hoisted views' frame slots ([`Region::views`]), after the
+    /// regions' epoch slots.
+    n_view_slots: usize,
 }
 
 /// The ops a region may contain: each is emitted here, with calls only on slow
@@ -940,6 +1032,8 @@ fn allocating_region_op(op: &GenericOp, bc: &Op) -> bool {
 fn region_call(op: &GenericOp, bc: &Op) -> bool {
     match op {
         GenericOp::CallMethod { .. } => super::inline_math(bc).is_none(),
+        // (A `CallWithMethod` of `Math.imul` computed inline counts too:
+        // the `GetMethod` before it reads the built-in through a helper.)
         GenericOp::CallValue { .. }
         | GenericOp::CallWithMethod { .. }
         | GenericOp::CallKey { .. } => true,
@@ -989,8 +1083,22 @@ impl NumGen {
             }
         }
         let mut regions = plan_regions(ops, bytecode, catches, env.n_regs);
+        let mut skip = vec![false; n + 1];
         for r in &mut regions {
+            r.cold = guard_diamonds(r, ops, entries, catches);
             r.spec = plan_spec(r, ops, bytecode, &types, env.n_regs, &env.fields);
+            match &r.spec {
+                // The fast version has no guard test and no fallback arm.
+                Some(_) => {
+                    for &(test, fallback, join) in &r.cold {
+                        skip[test] = true;
+                        for s in &mut skip[fallback..join] {
+                            *s = true;
+                        }
+                    }
+                }
+                None => r.cold.clear(),
+            }
         }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
@@ -1028,6 +1136,23 @@ impl NumGen {
                 }
             }
         }
+        // The hoisted views' slots, past the epoch slots (one per region).
+        // Only once typed arrays have been indexed: for an array the
+        // hoisted path's test is one more compare per access.
+        let mut n_view_slots = 0usize;
+        if crate::realm::typed_elems_seen() {
+            let first = n_gslots as usize + regions.len();
+            for r in &mut regions {
+                if r.spec.is_some() {
+                    for (v, src) in plan_views(r, ops, bytecode, env.n_regs) {
+                        r.views.push((v, (first + n_view_slots) as u32, src));
+                        // (A register the region may write: and the value
+                        // the facts are about, `ViewSlots::held`.)
+                        n_view_slots += if src == ViewSrc::Fixed { 3 } else { 4 };
+                    }
+                }
+            }
+        }
         Self {
             types,
             ints,
@@ -1036,7 +1161,7 @@ impl NumGen {
             is_target,
             mentions,
             stubs: Vec::new(),
-            skip: vec![false; n + 1],
+            skip,
             cur_pc: 0,
             gslot,
             region_gslots,
@@ -1053,6 +1178,7 @@ impl NumGen {
             leave_exit: None,
             nest_entries: Vec::new(),
             inner_entries: Vec::new(),
+            n_view_slots,
         }
     }
 
@@ -1131,9 +1257,60 @@ impl NumGen {
     }
 
     /// How many 8-byte native frame slots the emitted code needs: the
-    /// global binding addresses, then one epoch slot per region.
+    /// global binding addresses, then one epoch slot per region, then the
+    /// hoisted views' ([`Region::views`]).
     pub(super) fn frame_slots(&self) -> usize {
-        self.n_gslots + self.regions.len()
+        self.n_gslots + self.regions.len() + self.n_view_slots
+    }
+
+    /// For a typed-array element op `pc` (`GetElem` / `SetElem` /
+    /// `ArrayLen`) in a speculative region's fast version, on receiver
+    /// register `r`: its hoisted view's slots, when the region hoists `r`
+    /// ([`plan_views`]). Its entry check filled them (see
+    /// [`super::typed::ViewSlots`]).
+    pub(super) fn hoisted_view(&self, pc: usize, r: u16) -> Option<super::typed::ViewSlots> {
+        let ri = self.region_at(pc)?;
+        self.regions[ri].spec.as_ref()?;
+        self.hoisted_view_slots(ri, r)
+    }
+
+    /// Speculative region `ri`'s hoisted views' entry checks (see
+    /// [`super::typed::ViewSlots`]), at a point where nothing promoted is
+    /// live and the register file is up to date. Clobbers `rax`, `rcx`,
+    /// `rdx`, `r8`..`r11`.
+    fn hoist_views(&self, a: &mut X64Assembler, ri: usize) {
+        if self.regions[ri].views.is_empty() {
+            return;
+        }
+        let l = super::compute_jit_layout();
+        let t = super::typed::typed_layout();
+        for &(r, _, src) in &self.regions[ri].views {
+            let Some(v) = self.hoisted_view_slots(ri, r) else {
+                continue;
+            };
+            // A global binding's value through its op's validated address
+            // (`spec_globals_ready` just proved them all filled).
+            let from = match src {
+                ViewSrc::Global(pc) => match self.gslot.get(pc) {
+                    Some(&k) if k != u32::MAX => {
+                        super::typed::HoistFrom::Binding(self.gslot_disp(k))
+                    }
+                    _ => super::typed::HoistFrom::Reg(disp(r)),
+                },
+                _ => super::typed::HoistFrom::Reg(disp(r)),
+            };
+            a.t_hoist(l, t, self.env.realm, from, v);
+        }
+    }
+
+    fn hoisted_view_slots(&self, ri: usize, r: u16) -> Option<super::typed::ViewSlots> {
+        let &(_, k, src) = self.regions[ri].views.iter().find(|v| v.0 == r)?;
+        Some(super::typed::ViewSlots {
+            kind: self.gslot_disp(k),
+            len: self.gslot_disp(k + 1),
+            base: self.gslot_disp(k + 2),
+            held: (src != ViewSrc::Fixed).then(|| self.gslot_disp(k + 3)),
+        })
     }
 
     /// The frame slots the prologue must empty: the epoch slots of the
@@ -1625,6 +1802,7 @@ impl NumGen {
             if validate {
                 self.refresh_globals(a, ri, true);
                 self.spec_globals_ready(a, ri, pc)?;
+                self.hoist_views(a, ri);
             }
             for s in &self.regions[ri].slots {
                 if s.carried {
@@ -2087,6 +2265,7 @@ impl NumGen {
                     if validate {
                         self.refresh_globals(a, ri, true);
                         self.spec_globals_ready(a, ri, target)?;
+                        self.hoist_views(a, ri);
                     }
                     self.reload(a, reg);
                     if !validate {
@@ -3510,6 +3689,7 @@ impl NumGen {
                 a.jmp(copy);
                 continue;
             }
+            self.hoist_views(a, ri);
             for s in &self.regions[ri].slots {
                 if s.start <= h && h <= s.end {
                     a.movsd_x_mem(s.xmm, disp(s.reg));
@@ -4081,6 +4261,8 @@ fn plan_regions(
             loops,
             live_inner,
             defer: DeferPlan::default(),
+            views: Vec::new(),
+            cold: Vec::new(),
         });
     }
     out
@@ -4957,6 +5139,10 @@ fn plan_spec(
         return None;
     }
     for (pc, op) in ops.iter().enumerate().take(end + 1).skip(head) {
+        // (A guard diamond's fallback arm is not in the fast version.)
+        if r.is_cold(pc) {
+            continue;
+        }
         if region_call(op, &bytecode[pc]) {
             return None;
         }
@@ -4965,6 +5151,12 @@ fn plan_spec(
             GenericOp::PushHandler { .. } => return None,
             _ => continue,
         };
+        // A guard diamond's test, and its fast arm's jump to the join.
+        if r.cold.iter().any(|&(test, fallback, join)| {
+            (pc, t) == (test, fallback) || (pc + 1, t) == (fallback, join)
+        }) {
+            continue;
+        }
         // (A loop nest's in-body branches are its inner loops': the plain
         // copy keeps them to itself, `NumGen::branch_label`.)
         if pc != end && (head..=end).contains(&t) && r.loops.is_empty() {
@@ -5004,7 +5196,11 @@ fn plan_spec(
         if r.loops.is_empty() {
             for (i, op) in bytecode[head..=end].iter().enumerate() {
                 rows.extend_from_slice(&cur);
-                spec_step(op, head + i, &r.reuse, fields, &mut cur);
+                // (The fast arm's jump skips the fallback arm: its join
+                // is reached with the fast arm's state.)
+                if !r.is_cold(head + i) {
+                    spec_step(op, head + i, &r.reuse, fields, &mut cur);
+                }
             }
         } else {
             cur = spec_nest_rows(r, ops, bytecode, n_regs, fields, cur, &mut rows);
@@ -5038,6 +5234,110 @@ fn plan_spec(
     }
 }
 
+/// The most typed-array views a speculative region hoists (three or four
+/// frame slots and an entry check each).
+const MAX_VIEWS: usize = 4;
+
+/// Where a hoisted view's entry check finds the register's value
+/// ([`plan_views`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewSrc {
+    /// No op of the region writes the register: its value at entry is its
+    /// value throughout (so an access needs no compare).
+    Fixed,
+    /// Only reads of one global binding the region never writes (the
+    /// `LoadGlobal` at this pc among them) write it: the binding's value,
+    /// which every such read in the fast version yields.
+    Global(usize),
+    /// Reads of captured variables or properties write it: its value at
+    /// entry, likely what they read again.
+    Held,
+}
+
+/// The receivers speculative region `r`'s fast version keeps a **hoisted
+/// view** of (`super::typed::ViewSlots`): the registers its element reads,
+/// element writes and `.length` reads are on, found from the ops that name
+/// them: each must be one known to leave the register alone (an element op
+/// on it, or one whose only write is to another register) or, for a
+/// register the region may write ([`ViewSrc`]), a read of a global
+/// binding, a captured variable or a property into it — else the register
+/// is not hoisted.
+fn plan_views(
+    r: &Region,
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    n_regs: usize,
+) -> Vec<(u16, ViewSrc)> {
+    let mut regs: Vec<u16> = Vec::new();
+    for op in &ops[r.head..=r.end] {
+        let recv = match *op {
+            GenericOp::GetElem { obj, .. } | GenericOp::SetElem { obj, .. } => obj,
+            GenericOp::ArrayLen { arr, .. } => arr,
+            _ => continue,
+        };
+        if (recv as usize) < n_regs && !regs.contains(&recv) {
+            regs.push(recv);
+        }
+    }
+    let body = &bytecode[r.head..=r.end];
+    let mut out = Vec::new();
+    for v in regs {
+        // The ops that may write `v`: each must be a read of a binding,
+        // a captured variable or a property into it.
+        let mut writers = Vec::new();
+        let mut ok = true;
+        for (i, op) in body.iter().enumerate() {
+            let leaves = match op {
+                Op::GetKey { dst, .. } | Op::ArrayLen { dst, .. } | Op::GetProp { dst, .. }
+                    if *dst != v =>
+                {
+                    true
+                }
+                Op::SetKey { .. } | Op::SetKeyStrict { .. } | Op::JumpIfFalse { .. } => true,
+                _ => written_reg(op).is_some_and(|d| d != v),
+            };
+            if leaves || !op_regs(op).contains(&v) {
+                continue;
+            }
+            match op {
+                Op::LoadGlobal { dst, .. } | Op::CellGet { dst, .. } if *dst == v => {
+                    writers.push(r.head + i);
+                }
+                Op::GetProp { dst, obj, .. } if *dst == v && *obj != v => writers.push(r.head + i),
+                _ => ok = false,
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let src = match writers.first() {
+            None => ViewSrc::Fixed,
+            Some(&first) => {
+                // One global binding the region never writes: its value
+                // throughout the fast version (no Rust code runs there).
+                let name = |pc: usize| match &bytecode[pc] {
+                    Op::LoadGlobal { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                match name(first) {
+                    Some(n)
+                        if writers.iter().all(|&w| name(w) == Some(n))
+                            && !body.iter().any(
+                                |op| matches!(op, Op::StoreGlobal { name: m, .. } if m == n),
+                            ) =>
+                    {
+                        ViewSrc::Global(first)
+                    }
+                    _ => ViewSrc::Held,
+                }
+            }
+        };
+        out.push((v, src));
+    }
+    out.truncate(MAX_VIEWS);
+    out
+}
+
 /// [`plan_spec`]'s in-state rows for loop nest `r` (into `rows`), its entry
 /// state `entry`: a forward dataflow over the nest's body to a fixpoint (its
 /// inner loops' back-edges and exits are joins). Returns the state the
@@ -5067,9 +5367,15 @@ fn spec_nest_rows(
             if cur.iter().all(|&t| t == T_BOT) && n_regs > 0 {
                 continue;
             }
+            // (Not in the fast version: a guard diamond's fallback arm, and
+            // its test's branch there.)
+            if r.is_cold(pc) {
+                continue;
+            }
             spec_step(&bytecode[pc], pc, &r.reuse, fields, &mut cur);
             let (falls, target) = match ops[pc] {
                 GenericOp::Jump { target } => (false, Some(target)),
+                GenericOp::JumpIfFalse { .. } if r.cold.iter().any(|c| c.0 == pc) => (true, None),
                 GenericOp::JumpIfFalse { target, .. } => (true, Some(target)),
                 _ => (true, None),
             };

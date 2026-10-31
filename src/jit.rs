@@ -2322,6 +2322,22 @@ impl MathInline {
     }
 }
 
+/// The built-in a `CallWithMethod` (a method call whose arguments were
+/// not guarded: `Math.imul(h ^ bytes[i], p)`) computes inline when its
+/// callee is that built-in and its arguments Numbers: `Math.imul` of two
+/// arguments, `Math.clz32` of one.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn inline_math_got(op: &crate::nbvm::Op) -> Option<u16> {
+    let crate::nbvm::Op::CallWithMethod { key, args, .. } = op else {
+        return None;
+    };
+    match (key.as_str(), args.len()) {
+        ("imul", 2) => Some(crate::nbexec::N_MATH_IMUL),
+        ("clz32", 1) => Some(crate::nbexec::N_MATH_CLZ32),
+        _ => None,
+    }
+}
+
 /// The built-in id and inline form of a `CallMethod` of one argument (for
 /// `max`/`min`, one to four) whose key names a `Math` function the generic
 /// tier computes inline.
@@ -9146,19 +9162,6 @@ impl JitFunction {
                     let merged = typed && rc.sites[op_idx].is_none();
                     let walked = a.new_label();
                     let arr_miss = if merged { helper } else { not_arr };
-                    // ===== inline dense-array element GET fast path =====
-                    // Receiver cell tag == Array, index an exact non-negative
-                    // integer in `[0, dense_len)`, and — matching the interpreter's
-                    // `vm_array_index_get` — bail on a hole (the helper walks the
-                    // prototype chain). Everything else → `jit_helper_get_elem`.
-                    if merged {
-                        walk_to_slot!(obj, helper);
-                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
-                        a.jne(walked);
-                        a.p_array_plain(&layout, helpers.call_layout.realm, false, helper);
-                    } else {
-                        recv_slot!(op_idx, obj, not_arr, recv_cache::Family::Arr);
-                    }
                     // (A promoted loop's index may be in its SSE register.)
                     // An index proven integral needs no exactness test: its
                     // truncation is its value, or (NaN, ±∞, past `i64`) the
@@ -9182,6 +9185,28 @@ impl JitFunction {
                                 None => int_index!(index, $miss, num.is_number_at(op_idx, index)),
                             }
                         };
+                    }
+                    // A speculative loop's hoisted view of the receiver
+                    // (`typed::ViewSlots`): its element with no walk.
+                    if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
+                        let not_view = a.new_label();
+                        a.t_hoisted(v, disp(obj), not_view);
+                        elem_index!(helper);
+                        a.t_get(typed::typed_layout(), typed::Src::Hoisted(v), helper, got);
+                        a.bind(not_view);
+                    }
+                    // ===== inline dense-array element GET fast path =====
+                    // Receiver cell tag == Array, index an exact non-negative
+                    // integer in `[0, dense_len)`, and — matching the interpreter's
+                    // `vm_array_index_get` — bail on a hole (the helper walks the
+                    // prototype chain). Everything else → `jit_helper_get_elem`.
+                    if merged {
+                        walk_to_slot!(obj, helper);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                        a.jne(walked);
+                        a.p_array_plain(&layout, helpers.call_layout.realm, false, helper);
+                    } else {
+                        recv_slot!(op_idx, obj, not_arr, recv_cache::Family::Arr);
                     }
                     elem_index!(arr_miss);
                     a.p_arr_len_ptr(&layout);
@@ -9222,7 +9247,7 @@ impl JitFunction {
                         a.bind(walked);
                         a.t_view(&layout, tl, helper);
                         elem_index!(helper);
-                        a.t_get(tl, helper, got);
+                        a.t_get(tl, typed::Src::View, helper, got);
                     }
                     // jit_helper_get_elem(ctx, recv, key).
                     if bail.is_none() {
@@ -9280,6 +9305,33 @@ impl JitFunction {
                             }
                         };
                     }
+                    // A Number value (any other's `ToNumber` is the helper's,
+                    // before anything else) to a typed-array view.
+                    macro_rules! typed_value {
+                        () => {
+                            if !num.is_number_at(op_idx, val) {
+                                a.load_rax(disp(val));
+                                a.movabs_r11(QNAN as i64);
+                                a.and_rax_r11();
+                                a.cmp_rax_r11();
+                                a.je(helper);
+                            }
+                        };
+                    }
+                    // A speculative loop's hoisted view of the receiver
+                    // (`typed::ViewSlots`): the element written with no walk.
+                    if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
+                        let not_view = a.new_label();
+                        a.t_hoisted(v, disp(obj), not_view);
+                        typed_value!();
+                        store_index!(helper);
+                        match val_x {
+                            Some(x) => numeric::NumGen::xmm0_from_xmm(&mut a, x),
+                            None => a.movsd_xmm0_mem(disp(val)),
+                        }
+                        a.t_set(typed::typed_layout(), typed::Src::Hoisted(v), helper, done);
+                        a.bind(not_view);
+                    }
                     // ===== inline dense-array element SET fast path =====
                     // In place only when identical to `vm_set_elem`: a store the
                     // write barrier has nothing to do for (`p_barrier_check`),
@@ -9324,13 +9376,7 @@ impl JitFunction {
                         } else {
                             a.bind(not_arr);
                         }
-                        if !num.is_number_at(op_idx, val) {
-                            a.load_rax(disp(val));
-                            a.movabs_r11(QNAN as i64);
-                            a.and_rax_r11();
-                            a.cmp_rax_r11();
-                            a.je(helper);
-                        }
+                        typed_value!();
                         if !merged {
                             walk_to_slot!(obj, helper);
                         }
@@ -9340,7 +9386,7 @@ impl JitFunction {
                             Some(x) => numeric::NumGen::xmm0_from_xmm(&mut a, x),
                             None => a.movsd_xmm0_mem(disp(val)),
                         }
-                        a.t_set(tl, helper, done);
+                        a.t_set(tl, typed::Src::View, helper, done);
                     }
                     // jit_helper_set_elem(ctx, recv, key, val).
                     if bail.is_none() {
@@ -9371,6 +9417,15 @@ impl JitFunction {
                     let slow = a.new_label();
                     let walked = a.new_label();
                     let got = a.new_label();
+                    // A speculative loop's hoisted view of the receiver
+                    // (`typed::ViewSlots`): its length with no walk.
+                    if let Some(v) = num.hoisted_view(op_idx, arr).filter(|_| typed) {
+                        let not_view = a.new_label();
+                        a.t_hoisted(v, disp(arr), not_view);
+                        a.t_hoisted_len(v);
+                        a.jmp(got);
+                        a.bind(not_view);
+                    }
                     // ===== inline dense-array `.length` fast path =====
                     // Only for a receiver whose spec `.length` provably equals the
                     // dense element count (`p_array_plain`); else the helper.
@@ -9842,7 +9897,12 @@ impl JitFunction {
                     if !ok(dst) || rs.iter().any(|&r| !ok(r)) || pc as usize != op_idx {
                         return None;
                     }
-                    let slow = a.new_label();
+                    // In a speculative loop's fast version (which runs no
+                    // Rust code) a heap value leaves for the plain copy,
+                    // whose guard tells; past the guard the arguments are
+                    // plain (`numeric::guard_diamonds`).
+                    let bail = num.spec_bail(&mut a, op_idx);
+                    let slow = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
                     for &r in rs {
                         if num.is_number_at(op_idx, r) {
@@ -9856,8 +9916,10 @@ impl JitFunction {
                     a.movabs_rax(tag_true as i64);
                     a.store_rax(disp(dst));
                     a.jmp(done);
-                    a.bind(slow);
-                    exec_op!(pc);
+                    if bail.is_none() {
+                        a.bind(slow);
+                        exec_op!(pc);
+                    }
                     a.bind(done);
                 }
                 GenericOp::CallWithMethod {
@@ -9880,6 +9942,63 @@ impl JitFunction {
                     let si = sites.get(ic as usize)?;
                     let slow = a.new_label();
                     let done = a.new_label();
+                    // `Math.imul(a, b)` / `Math.clz32(x)` whose arguments
+                    // the compiler could not guard (an element read among
+                    // them): when the callee is the very built-in the
+                    // site's helper last served (its identity memo, filled
+                    // only in Rust: key, `stamp == u64::MAX` and its id + 1)
+                    // and every argument is a Number, computed in place.
+                    if let Some(id) = inline_math_got(bytecode.get(op_idx)?) {
+                        let call = a.new_label();
+                        a.load_rax(disp(callee));
+                        a.g_movabs(call_seq::r::R11, site_ptr as u64);
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::R11, call_seq::IDENT_KEY);
+                        a.jne(call);
+                        a.g_mem(true, &[0x83], 7, call_seq::r::R11, call_seq::IDENT_STAMP);
+                        a.raw(&[0xff]); // cmp qword [..], -1 (u64::MAX)
+                        a.jne(call);
+                        a.g_mem(true, &[0x81], 7, call_seq::r::R11, call_seq::IDENT_VALUE);
+                        a.raw(&(i32::from(id) + 1).to_le_bytes()); // cmp qword [..], id + 1
+                        a.jne(call);
+                        // Every argument a Number, truncated (the "indefinite"
+                        // integer of NaN, ±∞, |x| ≥ 2^63 takes the call).
+                        for (k, &r) in args.iter().enumerate() {
+                            if !num.is_number_at(op_idx, r) {
+                                a.load_rax(disp(r));
+                                a.movabs_r11(QNAN as i64);
+                                a.and_rax_r11();
+                                a.cmp_rax_r11();
+                                a.je(call);
+                            }
+                            a.movsd_xmm0_mem(disp(r));
+                            a.cvttsd2si_rax_xmm0();
+                            a.movabs_r11(i64::MIN);
+                            a.cmp_rax_r11();
+                            a.je(call);
+                            if k == 0 && args.len() == 2 {
+                                a.raw(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+                            }
+                        }
+                        if args.len() == 2 {
+                            a.raw(&[0x0f, 0xaf, 0xc1]); // imul eax, ecx
+                            a.to_int32_rax();
+                        } else {
+                            // 31 - bsr, or 32 for a zero.
+                            let zero = a.new_label();
+                            let counted = a.new_label();
+                            a.raw(&[0x0f, 0xbd, 0xc0]); // bsr eax, eax
+                            a.je(zero);
+                            a.raw(&[0x83, 0xf0, 0x1f]); // xor eax, 31
+                            a.jmp(counted);
+                            a.bind(zero);
+                            a.raw(&[0xb8, 32, 0, 0, 0]); // mov eax, 32
+                            a.bind(counted);
+                        }
+                        a.cvtsi2sd_xmm0_rax();
+                        a.movsd_mem_xmm0(disp(dst));
+                        a.jmp(done);
+                        a.bind(call);
+                    }
                     call_seq::emit_call(
                         &mut a,
                         &call_seq::CallEmit {

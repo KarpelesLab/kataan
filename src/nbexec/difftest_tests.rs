@@ -3236,3 +3236,58 @@ fn typed_array_elements_and_int_math_in_compiled_loops() {
         "0,-16,0,1264,0,1989,0,-6416,0,255728,0,1410131696,0,14295033584,-0,Infinity,-0,Infinity,2997025,-1926801507,5124,0,0,0,32"
     );
 }
+
+/// Speculative loops keep a typed-array view's facts (kind, length, element
+/// address) from their entry check: a resize, a view swapped into a global
+/// binding by code a slow path runs, `Math.imul` over element reads computed
+/// inline, and a guarded `Math.max` / `Math.min` (the fast version without
+/// its fallback arm) all agree with the built-ins (checked against node).
+#[test]
+fn hoisted_typed_views_and_guarded_math_in_speculative_loops() {
+    let src = r#"
+        var out = [];
+        var rab = new ArrayBuffer(16, { maxByteLength: 64 }), track = new Uint16Array(rab);
+        var keys = [];
+        for (var i = 0; i < 3000; i++) keys.push(i & 7);
+        keys[800] = { valueOf: function () { rab.resize(6); return 1; } };
+        keys[1600] = { valueOf: function () { rab.resize(64); return 2; } };
+        function scan(ta, keys) {
+            var s = 0;
+            for (var i = 0; i < keys.length; i++) {
+                var v = ta[keys[i]];
+                ta[(i + 3) & 7] = i & 127;
+                s = s + ta.length + (v === undefined ? 1000 : v);
+            }
+            return s;
+        }
+        out.push(scan(track, keys), track.length);
+        var TABLE = new Uint32Array(256);
+        for (var n = 0; n < 256; n++) TABLE[n] = (n * 2654435761) >>> 0;
+        var saved = TABLE;
+        function crc(bytes, keys) {
+            var c = 0;
+            for (var i = 0; i < keys.length; i++) c = (TABLE[(c ^ bytes[keys[i] & 63]) & 0xff] ^ (c >>> 3)) | 0;
+            return c;
+        }
+        var bytes = new Uint8Array(64);
+        for (var i = 0; i < 64; i++) bytes[i] = (i * 37) & 255;
+        var ks = [];
+        for (var i = 0; i < 3000; i++) ks.push(i * 7);
+        ks[1000] = { valueOf: function () { TABLE = new Int8Array(256).fill(-3); return 5; } };
+        ks[2000] = { valueOf: function () { TABLE = saved; return 9; } };
+        out.push(crc(bytes, ks));
+        function fnv(a) { var h = 0x811c9dc5 | 0; for (var i = 0; i < a.length; i++) h = Math.imul(h ^ a[i], 16777619); return h >>> 0; }
+        var mixed = new Float64Array([1, 2.5, -1, NaN, Infinity, 4294967296, -0, 1e300]);
+        out.push(fnv(bytes), fnv(mixed), fnv([3, "4", null, true, undefined]));
+        function relu(a, o, k) { var s = 0; for (var i = 0; i < a.length; i++) { var v = a[i] * k - 3; o[i] = Math.max(0, v); s = s + Math.min(v, k); } return s; }
+        var a = new Float64Array(500), o = new Float32Array(500), r = 0;
+        for (var i = 0; i < 500; i++) a[i] = (i % 13) - 2;
+        for (var rep = 0; rep < 20; rep++) r += relu(a, o, rep === 10 ? "2" : (rep & 3) + 1);
+        out.push(r, o[37]);
+        out.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "214232,8,1279939926,4247811845,1551842253,3211497087,2855,33"
+    );
+}

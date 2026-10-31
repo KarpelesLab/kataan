@@ -113,6 +113,53 @@ pub(super) fn drop_array_sites(rc: &mut super::recv_cache::RecvPlan) {
     }
 }
 
+/// A **hoisted view**: the frame slots (`rbp`-relative) where a speculative
+/// loop's fast version keeps what its entry check found about a typed-array
+/// view held in a register (`numeric::NumGen`'s
+/// `hoisted_view`): the view's kind (a byte, [`NO_VIEW`] when the register
+/// holds anything the inline path does not serve), its length, and the
+/// address of its first element.
+///
+/// They stay right from that check to the loop's back-edge: a view's
+/// length, offset and kind never change, and its store's bytes move or
+/// shrink (a resize, a detach, a transfer) only in Rust code, which the
+/// fast version never runs — every one of its slow paths leaves for the
+/// plain copy, and every way back into it (the loop's entry, a back-edge
+/// poll's return, an inner header's entry from the copy) checks afresh
+/// ([`t_hoist`](X64Assembler::t_hoist)). A register the loop never writes
+/// holds the same view throughout; for one it may write, `held` keeps the
+/// value the facts are about, and an access compares the register with it
+/// first (a different value takes the access's ordinary path).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ViewSlots {
+    pub(crate) kind: i32,
+    pub(crate) len: i32,
+    pub(crate) base: i32,
+    pub(crate) held: Option<i32>,
+}
+
+/// Where [`t_hoist`](X64Assembler::t_hoist) finds the value to check: a
+/// register (frame displacement), or a global binding whose validated
+/// address is in a frame slot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HoistFrom {
+    Reg(i32),
+    Binding(i32),
+}
+
+/// [`ViewSlots::kind`] of a register that is not a view the inline path
+/// serves (above every served kind).
+pub(crate) const NO_VIEW: u8 = 0xff;
+
+/// Where an element access finds its view's facts: walked from the receiver
+/// (`rcx` / `r9` from [`t_view`](X64Assembler::t_view)), or in a hoisted
+/// view's frame slots.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Src {
+    View,
+    Hoisted(ViewSlots),
+}
+
 /// The element kinds the fast path serves (`TYPED_ARRAY_KINDS` indices), in
 /// the order a site tests them, with their element size's log2.
 const INT8: u8 = 0;
@@ -163,22 +210,40 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
     }
 
-    /// With `rcx` / `r9` from [`t_view`](Self::t_view) and `rax` an integer
-    /// index: to `miss` unless it is below the view's length; then `r8` =
-    /// the address of the view's first element.
-    fn t_index(&mut self, t: &TypedLayout, miss: Label) {
-        self.g_cmp_mem(r::RAX, r::RCX, t.off_length);
-        self.g_jcc(cc::AE, miss); // past the length, or negative
-        self.g_load(r::R8, r::R9, t.off_data_ptr);
-        self.g_add_mem(r::R8, r::RCX, t.off_byte_offset);
+    /// With `rax` an integer index (and, for [`Src::View`], `rcx` / `r9`
+    /// from [`t_view`](Self::t_view)): to `miss` unless it is below the
+    /// view's length; then `r8` = the address of the view's first element.
+    fn t_index(&mut self, t: &TypedLayout, src: Src, miss: Label) {
+        match src {
+            Src::View => {
+                self.g_cmp_mem(r::RAX, r::RCX, t.off_length);
+                self.g_jcc(cc::AE, miss); // past the length, or negative
+                self.g_load(r::R8, r::R9, t.off_data_ptr);
+                self.g_add_mem(r::R8, r::RCX, t.off_byte_offset);
+            }
+            Src::Hoisted(v) => {
+                self.g_cmp_mem(r::RAX, r::RBP, v.len);
+                self.g_jcc(cc::AE, miss); // past the length, or negative
+                self.g_load(r::R8, r::RBP, v.base);
+            }
+        }
     }
 
-    /// To `other` unless the view's kind is `kind`; then to `miss` unless
-    /// its whole extent lies in its store's bytes. Clobbers `r11`.
-    fn t_kind(&mut self, t: &TypedLayout, kind: u8, other: Label, miss: Label) {
-        self.g_cmp_byte_imm(r::RCX, t.off_kind, kind);
-        self.g_jcc(cc::NE, other);
-        self.t_extent(t, size_log2(kind), miss);
+    /// To `other` unless the view's kind is `kind`; then (a walked view)
+    /// to `miss` unless its whole extent lies in its store's bytes, which
+    /// a hoisted view's entry check proved. Clobbers `r11`.
+    fn t_kind(&mut self, t: &TypedLayout, src: Src, kind: u8, other: Label, miss: Label) {
+        match src {
+            Src::View => {
+                self.g_cmp_byte_imm(r::RCX, t.off_kind, kind);
+                self.g_jcc(cc::NE, other);
+                self.t_extent(t, size_log2(kind), miss);
+            }
+            Src::Hoisted(v) => {
+                self.g_cmp_byte_imm(r::RBP, v.kind, kind);
+                self.g_jcc(cc::NE, other);
+            }
+        }
     }
 
     /// To `miss` unless `byteOffset + length << s` (`s` the element size's
@@ -206,11 +271,12 @@ impl X64Assembler {
         self.code.push(scale << 6);
     }
 
-    /// The element read: with `rcx` / `r9` from [`t_view`](Self::t_view)
-    /// and `rax` an integer index, `rax` = the element (a `NanBox` Number's
-    /// bits) and on to `got`, else to `miss`. Clobbers `r8`, `r11`, `xmm0`.
-    pub(crate) fn t_get(&mut self, t: &TypedLayout, miss: Label, got: Label) {
-        self.t_index(t, miss);
+    /// The element read: with `rax` an integer index (and, for
+    /// [`Src::View`], `rcx` / `r9` from [`t_view`](Self::t_view)), `rax` =
+    /// the element (a `NanBox` Number's bits) and on to `got`, else to
+    /// `miss`. Clobbers `r8`, `r11`, `xmm0`.
+    pub(crate) fn t_get(&mut self, t: &TypedLayout, src: Src, miss: Label, got: Label) {
+        self.t_index(t, src, miss);
         for kind in [
             UINT8,
             INT32,
@@ -223,7 +289,7 @@ impl X64Assembler {
             UINT8_CLAMPED,
         ] {
             let next = self.new_label();
-            self.t_kind(t, kind, next, miss);
+            self.t_kind(t, src, kind, next, miss);
             let s = size_log2(kind);
             match kind {
                 INT8 => self.t_elem(None, false, &[0x0f, 0xbe], r::RAX, s), // movsx eax, byte
@@ -261,6 +327,88 @@ impl X64Assembler {
         self.jmp(miss);
     }
 
+    /// A hoisted view's entry check ([`ViewSlots`]): when the register at
+    /// frame displacement `recv` holds a view the inline path serves (as
+    /// [`t_view`](Self::t_view) and a kind below Float16), wholly inside its
+    /// store's bytes, its kind, length and first element's address go to
+    /// `v`'s slots; else its kind slot says [`NO_VIEW`]. Clobbers `rax`,
+    /// `rcx`, `r8`, `r9`, `r11` (and, unpinned, `rdx` / `r10`).
+    pub(crate) fn t_hoist(
+        &mut self,
+        l: &JitLayout,
+        t: &TypedLayout,
+        realm: i32,
+        from: HoistFrom,
+        v: ViewSlots,
+    ) {
+        let none = self.new_label();
+        let done = self.new_label();
+        let ok = self.new_label();
+        self.p_arena(realm, &l.props);
+        match from {
+            HoistFrom::Reg(d) => self.load_rax(d),
+            HoistFrom::Binding(slot) => {
+                self.g_load(r::RAX, r::RBP, slot);
+                self.g_load(r::RAX, r::RAX, 0);
+            }
+        }
+        if let Some(h) = v.held {
+            self.g_store(r::RBP, h, r::RAX);
+        }
+        self.p_is_handle(r::RCX, none);
+        self.p_slot_rooted(l, r::RCX, none);
+        self.t_view(l, t, none);
+        for (last, s) in [(UINT8_CLAMPED, 0), (UINT16, 1), (FLOAT32, 2), (FLOAT64, 3)] {
+            let next = self.new_label();
+            self.g_cmp_byte_imm(r::RCX, t.off_kind, last);
+            self.g_jcc(cc::A, next);
+            self.t_extent(t, s, none);
+            self.jmp(ok);
+            self.bind(next);
+        }
+        self.jmp(none);
+        self.bind(ok);
+        self.g_load(r::RAX, r::RCX, t.off_length);
+        self.g_store(r::RBP, v.len, r::RAX);
+        self.g_load(r::RAX, r::R9, t.off_data_ptr);
+        self.g_add_mem(r::RAX, r::RCX, t.off_byte_offset);
+        self.g_store(r::RBP, v.base, r::RAX);
+        self.g_mem(false, &[0x0f, 0xb6], r::RAX, r::RCX, t.off_kind); // movzx eax, byte
+        self.g_store(r::RBP, v.kind, r::RAX);
+        self.jmp(done);
+        self.bind(none);
+        self.g_store_imm32(r::RBP, v.kind, i32::from(NO_VIEW));
+        if let Some(h) = v.held {
+            // (No register holds the throw sentinel: no access matches.)
+            self.g_movabs(r::RAX, crate::nanbox::NanBox::jit_throw_bits());
+            self.g_store(r::RBP, h, r::RAX);
+        }
+        self.bind(done);
+    }
+
+    /// To `other` unless hoisted view `v` holds a view ([`NO_VIEW`]) and,
+    /// for a register the loop may write, the register at frame
+    /// displacement `recv` holds the very value its facts are about.
+    /// Clobbers `rax`.
+    pub(crate) fn t_hoisted(&mut self, v: ViewSlots, recv: i32, other: Label) {
+        match v.held {
+            Some(h) => {
+                self.load_rax(recv);
+                self.g_cmp_mem(r::RAX, r::RBP, h);
+                self.g_jcc(cc::NE, other);
+            }
+            None => {
+                self.g_cmp_byte_imm(r::RBP, v.kind, NO_VIEW);
+                self.g_jcc(cc::E, other);
+            }
+        }
+    }
+
+    /// A hoisted view's `length` (see [`t_len`](Self::t_len)): `rax`.
+    pub(crate) fn t_hoisted_len(&mut self, v: ViewSlots) {
+        self.g_load(r::RAX, r::RBP, v.len);
+    }
+
     /// The view's `length` (what `Realm::array_length` answers for a view
     /// wholly inside its store, so in bounds): with `rcx` / `r9` from
     /// [`t_view`](Self::t_view), `rax` = the length (an integer) and on to
@@ -278,26 +426,29 @@ impl X64Assembler {
         self.jmp(miss);
     }
 
-    /// The element write of the Number in `xmm0`: with `rcx` / `r9` from
-    /// [`t_view`](Self::t_view) and `rax` an integer index, stores it and
-    /// on to `done`, else (nothing written) to `miss`. Clobbers `rdx`,
-    /// `r8`, `r11`, `xmm1`.
-    pub(crate) fn t_set(&mut self, t: &TypedLayout, miss: Label, done: Label) {
-        self.t_index(t, miss);
+    /// The element write of the Number in `xmm0`: with `rax` an integer
+    /// index (and, for [`Src::View`], `rcx` / `r9` from
+    /// [`t_view`](Self::t_view)), stores it and on to `done`, else (nothing
+    /// written) to `miss`. Clobbers `rdx`, `r8`, `r11`, `xmm1`.
+    pub(crate) fn t_set(&mut self, t: &TypedLayout, src: Src, miss: Label, done: Label) {
+        self.t_index(t, src, miss);
         // The float kinds store any Number.
         let not64 = self.new_label();
-        self.t_kind(t, FLOAT64, not64, miss);
+        self.t_kind(t, src, FLOAT64, not64, miss);
         self.t_elem(Some(0xf2), false, &[0x0f, 0x11], 0, 3); // movsd [..], xmm0
         self.jmp(done);
         self.bind(not64);
         let not32 = self.new_label();
-        self.t_kind(t, FLOAT32, not32, miss);
+        self.t_kind(t, src, FLOAT32, not32, miss);
         self.raw(&[0xf2, 0x0f, 0x5a, 0xc8]); // cvtsd2ss xmm1, xmm0
         self.t_elem(Some(0xf3), false, &[0x0f, 0x11], 1, 2); // movss [..], xmm1
         self.jmp(done);
         self.bind(not32);
         // The integer kinds (0..=6) store an exact integer's low bits.
-        self.g_cmp_byte_imm(r::RCX, t.off_kind, UINT32);
+        match src {
+            Src::View => self.g_cmp_byte_imm(r::RCX, t.off_kind, UINT32),
+            Src::Hoisted(v) => self.g_cmp_byte_imm(r::RBP, v.kind, UINT32),
+        }
         self.g_jcc(cc::A, miss);
         self.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd0]); // cvttsd2si rdx, xmm0
         self.raw(&[0x0f, 0x57, 0xc9]); // xorps xmm1, xmm1 (no false dependency)
@@ -307,7 +458,7 @@ impl X64Assembler {
         self.g_jcc(CC_P, miss); // NaN
         for kind in [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED] {
             let next = self.new_label();
-            self.t_kind(t, kind, next, miss);
+            self.t_kind(t, src, kind, next, miss);
             let s = size_log2(kind);
             if kind == UINT8_CLAMPED {
                 let low = self.new_label();

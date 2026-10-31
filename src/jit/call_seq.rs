@@ -596,6 +596,10 @@ fn site_off(f: usize) -> i32 {
 pub(crate) const IDENT_KEY: i32 =
     (core::mem::offset_of!(CallSite, ident) + core::mem::offset_of!(IdentMemo, key)) as i32;
 
+/// `CallSite`-relative offset of its [`IdentMemo`]'s `stamp`.
+pub(crate) const IDENT_STAMP: i32 =
+    (core::mem::offset_of!(CallSite, ident) + core::mem::offset_of!(IdentMemo, stamp)) as i32;
+
 /// `CallSite`-relative offset of its [`IdentMemo`]'s `value`.
 pub(crate) const IDENT_VALUE: i32 =
     (core::mem::offset_of!(CallSite, ident) + core::mem::offset_of!(IdentMemo, value)) as i32;

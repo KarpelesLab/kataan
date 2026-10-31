@@ -2013,6 +2013,17 @@ pub(crate) extern "C" fn jit_helper_call_with_method(
             } else {
                 CallSite::EMPTY
             };
+            // Which built-in it is (its id + 1, `0` for none): compiled code
+            // computes `Math.imul` / `Math.clz32` of that very function
+            // itself (`JitProto::compile_generic`'s `CallWithMethod`).
+            site.ident.value = if served.is_some() {
+                method
+                    .as_handle()
+                    .and_then(|h| ctx.realm.native_at(Handle::from_raw(h)))
+                    .map_or(0, |id| u64::from(id) + 1)
+            } else {
+                0
+            };
             // The same memo is an inlined guard's of this call
             // (`call_seq::emit_inline_guard`), which takes a key at the
             // current epoch as its VM function: no epoch is `u64::MAX`, so
