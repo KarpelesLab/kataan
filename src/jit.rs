@@ -7467,9 +7467,12 @@ impl JitFunction {
         // skips its walk. (A way whose fills prove a layout, see
         // `recv_cache::shape_ways`, is filled only with an object of that
         // layout.) A plain object without the `[[IsHTMLDDA]]` brand is
-        // truthy; anything else takes the general test.
+        // truthy; anything else takes the general test. (`$yes`: where a
+        // branch on the result goes for a truthy value — the way's proven
+        // truthy object goes there at once, `rax` unset.)
         macro_rules! truthy_rax {
-            ($at:expr, $r:expr, $bail:expr) => {{
+            ($at:expr, $r:expr, $bail:expr) => {{ truthy_rax!($at, $r, $bail, None::<Label>) }};
+            ($at:expr, $r:expr, $bail:expr, $yes:expr) => {{
                 let general = a.new_label();
                 let have = a.new_label();
                 if let Some(p) = rc.sites[$at] {
@@ -7521,8 +7524,13 @@ impl JitFunction {
                     );
                     a.jne(general);
                     a.bind(yes);
-                    a.movabs_rax(1);
-                    a.jmp(have);
+                    match $yes {
+                        Some(t) => a.jmp(t),
+                        None => {
+                            a.movabs_rax(1);
+                            a.jmp(have);
+                        }
+                    }
                 }
                 a.bind(general);
                 a.emit_truthy_or(
@@ -10166,7 +10174,11 @@ impl JitFunction {
                         return None;
                     }
                     let to = num.branch_label(&labels, op_idx + 1, nb.target)?;
-                    truthy_rax!(op_idx, ra, None);
+                    if nb.dead {
+                        truthy_rax!(op_idx, ra, None, Some(to));
+                    } else {
+                        truthy_rax!(op_idx, ra, None);
+                    }
                     not_fused[op_idx] = true;
                     if nb.dead {
                         a.test_rax_rax();
@@ -10217,18 +10229,18 @@ impl JitFunction {
                     if !ok(cond) || target > ops.len() {
                         return None;
                     }
-                    truthy_rax!(op_idx, cond, None);
-                    a.test_rax_rax();
                     let to = num.branch_label(&labels, op_idx, target)?;
+                    let stay = a.new_label();
+                    truthy_rax!(op_idx, cond, None, Some(stay));
+                    a.test_rax_rax();
                     if target <= op_idx {
-                        let stay = a.new_label();
                         a.jne(stay);
                         backedge!(target);
                         a.jmp(to);
-                        a.bind(stay);
                     } else {
                         a.je(to); // falsy (truthy == 0) → branch
                     }
+                    a.bind(stay);
                 }
                 GenericOp::CallNative { dst, native, site } => {
                     if !ok(dst) {

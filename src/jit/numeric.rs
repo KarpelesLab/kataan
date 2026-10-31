@@ -2611,8 +2611,11 @@ impl NumGen {
                         if (src as usize) >= self.env.n_regs {
                             return None;
                         }
-                        // Only `undefined` / `null` throw.
+                        // Only `undefined` / `null` throw. (The usual
+                        // receiver, a heap handle, passes at once.)
                         a.load_rax(disp(src));
+                        a.p_cmp_handle_floor(super::call_seq::r::RAX);
+                        a.g_jcc(super::call_seq::cc::AE, done);
                         a.movabs_r11(NanBox::undefined().to_bits() as i64);
                         a.cmp_rax_r11();
                         a.jcc(CC_E, slow);
