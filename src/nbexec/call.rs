@@ -2591,7 +2591,11 @@ impl Interp {
             // Step 1 (22.2.4.1): `patternIsRegExp = ? IsRegExp(pattern)` — evaluated
             // first, unconditionally (reads `pattern[@@match]` via Get, so a throwing
             // accessor propagates before any other observable step).
-            let pattern_is_regexp = self.try_is_regexp(pattern)?;
+            // (`RegExp(pattern)` called as a function evaluated it already.)
+            let pattern_is_regexp = match self.regexp_pattern_is_regexp.take() {
+                Some(known) => known,
+                None => self.try_is_regexp(pattern)?,
+            };
             let pat_h = pattern.as_handle().map(Handle::from_raw);
             // The pattern is kept as WTF-8 bytes throughout: a lone surrogate in
             // the source (copied from another RegExp, or from a string argument)

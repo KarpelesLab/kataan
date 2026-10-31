@@ -245,6 +245,10 @@ pub struct Interp {
     /// (read its own `length`/indexed properties) rather than unwrapped to its
     /// boxed primitive and dispatched as a String/Number/Boolean method.
     array_proto_generic: bool,
+    /// One-shot: `RegExp(pattern)` called as a function already ran step 1's
+    /// `IsRegExp(pattern)` (an observable `@@match` read) before handing over to
+    /// the constructor path, which takes this result instead of re-reading it.
+    regexp_pattern_is_regexp: Option<bool>,
     /// The arrays whose `join`/`toString`/`toLocaleString` is in progress, so a
     /// cycle (`a = [b]; b = [a]`) renders the revisited array as `""`, as every
     /// web engine does, instead of recursing natively until the stack overflows.
@@ -2885,6 +2889,7 @@ impl Interp {
             new_target: NanBox::undefined(),
             reflect_new_target: None,
             array_proto_generic: false,
+            regexp_pattern_is_regexp: None,
             join_stack: Vec::new(),
             json_shape_memo: Vec::new(),
             array_like_present: None,

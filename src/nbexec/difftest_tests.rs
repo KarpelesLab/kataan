@@ -3393,3 +3393,22 @@ fn intrinsics_survive_rebinding_global_this() {
     "#;
     assert_eq!(run(src), "true,true,true,2,true,true,true");
 }
+
+/// `RegExp(pattern)` called as a function runs step 1's `IsRegExp(pattern)`
+/// (one observable `@@match` read) once: the function path used to read it
+/// and then hand over to the constructor path, which read it again.
+#[test]
+fn regexp_call_reads_match_once() {
+    let src = r#"
+        function P(log, t0) { return new Proxy(t0, { get: function (t, k, r) { log.push(String(k)); return Reflect.get(t, k, r); } }); }
+        var a = []; RegExp(P(a, { source: "a" }));
+        var b = []; var o = P(b, { [Symbol.match]: true, source: "s", flags: "i", constructor: Object });
+        var re = RegExp(o);
+        var c = []; RegExp(P(c, { source: "a" }), "g");
+        [a.join(), b.join(), String(re), c.join()].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "Symbol(Symbol.match),Symbol(Symbol.toPrimitive),toString,Symbol(Symbol.toStringTag)|Symbol(Symbol.match),constructor,source,flags|/s/i|Symbol(Symbol.match),Symbol(Symbol.toPrimitive),toString,Symbol(Symbol.toStringTag)"
+    );
+}

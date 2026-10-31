@@ -517,8 +517,9 @@ impl Interp {
                 // Step 1 is `IsRegExp(pattern)` — the spec operation, which reads
                 // `pattern[@@match]` through `[[Get]]` (so an accessor or a proxy
                 // trap runs). `is_regexp_arg`'s raw slot peek missed both.
+                let pattern_is_regexp = self.try_is_regexp(pattern)?;
                 if matches!(flags_arg.unpack(), Unpacked::Undefined)
-                    && self.try_is_regexp(pattern)?
+                    && pattern_is_regexp
                     && let Some(ph) = pattern.as_handle().map(Handle::from_raw)
                 {
                     let ctor = self
@@ -532,7 +533,11 @@ impl Interp {
                 let regexp_ctor = self
                     .intrinsic_global("RegExp")
                     .unwrap_or(NanBox::undefined());
-                return self.construct(regexp_ctor, args);
+                // The constructor path's own step 1 must not read `@@match` again.
+                self.regexp_pattern_is_regexp = Some(pattern_is_regexp);
+                let r = self.construct(regexp_ctor, args);
+                self.regexp_pattern_is_regexp = None;
+                return r;
             }
             N_SYMBOL => {
                 // A no-argument `Symbol()` has an `undefined` description, marked
