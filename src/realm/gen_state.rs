@@ -99,7 +99,7 @@ impl Realm {
             return None;
         }
         let proto = self.promise_proto_intrinsic?;
-        if self.native_protos.get(&h.to_raw()).copied() != Some(proto) {
+        if self.object_proto(h) != Some(proto) {
             return None;
         }
         self.heap.get(proto)?.as_object()?.get("constructor")

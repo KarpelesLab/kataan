@@ -382,6 +382,10 @@ pub struct Realm {
     /// [`link_regexp_proto`](Realm::link_regexp_proto) of a single-realm run,
     /// so that evaluating a regex literal inserts no side-table entry.
     regexp_default_proto: Option<Handle>,
+    /// The `[[Prototype]]` of a Promise cell that carries no `native_protos`
+    /// entry, as [`regexp_default_proto`](Realm::regexp_default_proto) is a
+    /// RegExp's (see [`link_promise_proto`](Realm::link_promise_proto)).
+    promise_default_proto: Option<Handle>,
     /// Class tags for *non-object* cells — a derived instance of a native base
     /// (`class S extends Map {}` → a real `Map` cell) records its class here, since
     /// the inline class tag lives only on plain-object cells. Read by
@@ -881,6 +885,7 @@ impl Realm {
             callable_null_protos: alloc::collections::BTreeSet::new(),
             vm_fn_default_proto: None,
             regexp_default_proto: None,
+            promise_default_proto: None,
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
@@ -961,6 +966,26 @@ impl Realm {
         }
         self.jit_vmfn_plain = false;
         self.set_native_proto(f, proto);
+    }
+
+    /// Links the new Promise cell `h` to `proto`, the running realm's
+    /// `%Promise.prototype%`, as [`link_regexp_proto`](Self::link_regexp_proto)
+    /// links a RegExp: in a single-realm run the first such prototype becomes
+    /// the default every unlinked promise reports, so making a promise inserts
+    /// no side-table entry.
+    pub fn link_promise_proto(&mut self, h: Handle, proto: Handle) {
+        if !self.multi_realm && matches!(self.heap.get(h), Some(Cell::Promise(_))) {
+            match self.promise_default_proto {
+                None => {
+                    crate::object::bump_proto_epoch();
+                    self.promise_default_proto = Some(proto);
+                    return;
+                }
+                Some(p) if p == proto => return,
+                Some(_) => {}
+            }
+        }
+        self.set_native_proto(h, proto);
     }
 
     /// Links the new RegExp cell `h` to `proto`, the running realm's
@@ -4453,6 +4478,12 @@ impl Realm {
         {
             return Some(p);
         }
+        // A Promise with no explicit link (see `promise_default_proto`).
+        if let Some(p) = self.promise_default_proto
+            && matches!(cell, Some(Cell::Promise(_)))
+        {
+            return Some(p);
+        }
         // The commonest remaining case first (the last test below, which no
         // other test in between accepts): a dense array.
         if matches!(cell, Some(Cell::Array(_))) {
@@ -7064,6 +7095,7 @@ impl Realm {
         out.extend(self.typed_len_protos.iter().copied());
         out.extend(self.vm_fn_default_proto);
         out.extend(self.regexp_default_proto);
+        out.extend(self.promise_default_proto);
         out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
         out.extend(self.intl_protos.values().copied());
         // Host-pinned values and the JIT's spilled temporaries.

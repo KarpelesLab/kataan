@@ -1194,8 +1194,11 @@ pub(crate) extern "C" fn jit_helper_exec_op(
                 {
                     let argv = super::ArgBuf::from_regs(regs, args);
                     ctx.pending_callee = Some(callee);
+                    // (A window on the register stack is a GC root already.)
                     let pub_mark = ctx.frame_shadow.len();
-                    ctx.frame_shadow.extend_from_slice(regs);
+                    if !on_register_stack(ctx, regs) {
+                        ctx.frame_shadow.extend_from_slice(regs);
+                    }
                     ctx.frames_published += 1;
                     let r = super::call_with(ctx, funcs, id, &argv, &caps, NanBox::undefined());
                     ctx.frames_published -= 1;

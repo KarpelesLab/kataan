@@ -1599,7 +1599,7 @@ impl Interp {
                 .and_then(|v| v.as_handle())
                 .map(Handle::from_raw)
         }) {
-            self.realm.set_native_proto(p, proto);
+            self.realm.link_promise_proto(p, proto);
         }
         p
     }

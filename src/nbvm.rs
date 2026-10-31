@@ -2838,14 +2838,24 @@ fn drive_async(
     mut regs: Vec<NanBox>,
     mut r: Result<FrameExit, VmError>,
 ) -> Result<(), VmError> {
+    // A finished frame's register window goes back to the pool, as an
+    // ordinary call's does.
+    let recycle = |ctx: &mut Ctx, mut regs: Vec<NanBox>| {
+        if ctx.realm.vm_reg_pool.len() < 64 {
+            regs.clear();
+            ctx.realm.vm_reg_pool.push(regs);
+        }
+    };
     loop {
         match r {
             Ok(FrameExit::Return(v)) => {
+                recycle(ctx, regs);
                 let v = v.unwrap_or(NanBox::undefined());
                 with_host(ctx, |h| h.settle_promise(p, v, true));
                 return Ok(());
             }
             Err(VmError::Thrown(e)) => {
+                recycle(ctx, regs);
                 with_host(ctx, |h| h.settle_promise(p, e, false));
                 return Ok(());
             }
