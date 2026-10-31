@@ -10505,6 +10505,14 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
     // Hosted: anything but an array or a string is an ordinary `[[Get]]` (an
     // accessor, an inherited `length`, a VM function's own — maybe deleted —
     // `length`).
+    // A typed array's `length` is the inherited `%TypedArray%.prototype` getter,
+    // read from its slot only while nothing shadows or redefines it.
+    if let Some(len) = ctx.realm.typed_len(handle) {
+        if ctx.host.is_some() && !ctx.realm.typed_accessor_intact(handle, "length") {
+            return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+        }
+        return Ok(NanBox::number(len as f64));
+    }
     if ctx.host.is_some()
         && ctx.realm.array_length(handle).is_none()
         && !ctx.realm.is_string_handle(handle)

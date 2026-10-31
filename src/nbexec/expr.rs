@@ -1632,6 +1632,31 @@ impl Interp {
             }
             return Ok(NanBox::undefined());
         }
+        // A built-in accessor answered from internal slots further down
+        // (`%TypedArray%.prototype.length`, `ArrayBuffer.prototype.byteLength`,
+        // `DataView.prototype.buffer`, `Map.prototype.size`, ...) is valid only
+        // while the read reaches that unmodified getter. An own property
+        // (`Object.defineProperty(ta, "length", ...)`), a shadowing one on a
+        // prototype, or a redefined accessor is read by ordinary `[[Get]]`.
+        if !self.slot_accessor_intact(handle, name) {
+            let this = NanBox::handle(handle.to_raw());
+            if let Some((getter, _)) = self.realm.accessor(handle, name) {
+                if matches!(getter.unpack(), Unpacked::Undefined) {
+                    return Ok(NanBox::undefined());
+                }
+                return self.call_with_this(getter, this, &[]);
+            }
+            if self.realm.has_own(handle, name) {
+                return Ok(self
+                    .realm
+                    .get_property(handle, name)
+                    .unwrap_or(NanBox::undefined()));
+            }
+            return match self.realm.object_proto(handle) {
+                Some(p) => self.get_with_receiver(p, name, this),
+                None => Ok(NanBox::undefined()),
+            };
+        }
         // Proxy `[[Get]]`: the `get` trap, or a trapless forward to the target that
         // preserves the Receiver (so an inherited accessor getter runs with `this`
         // = the proxy). Routed through `get_with_receiver` with Receiver = the
@@ -1904,6 +1929,9 @@ impl Interp {
                 "byteLength" | "detached" | "maxByteLength" | "resizable"
             )
             && self.brand_on_chain(handle, ARRAY_BUFFER_PROTO_BRAND)
+            && self
+                .realm
+                .builtin_accessor_intact(handle, name, N_AB_ACCESSOR)
         {
             return Err(self.branded_accessor_type_error(
                 handle,
@@ -1915,6 +1943,9 @@ impl Interp {
         if self.realm.get_property(handle, DATA_VIEW_BUF).is_none()
             && matches!(name, "buffer" | "byteLength" | "byteOffset")
             && self.brand_on_chain(handle, DATA_VIEW_PROTO_BRAND)
+            && self
+                .realm
+                .builtin_accessor_intact(handle, name, N_DATA_VIEW_ACCESSOR)
         {
             return Err(self.branded_accessor_type_error(
                 handle,
@@ -1934,6 +1965,12 @@ impl Interp {
                 && (self.realm.is_array(handle)
                     || self.realm.string_object_len(handle).is_some()))
             && self.brand_on_chain(handle, TYPED_ARRAY_PROTO_BRAND)
+            // ... and only while the read reaches the built-in getter (which is
+            // what throws); a redefined `%TypedArray%.prototype.length` is read
+            // as whatever it now is.
+            && self
+                .realm
+                .builtin_accessor_intact(handle, name, N_TYPED_ARRAY_ACCESSOR)
         {
             return Err(self.branded_accessor_type_error(
                 handle,
@@ -2230,6 +2267,42 @@ impl Interp {
             return Ok(ctor);
         }
         Ok(direct)
+    }
+
+    /// Whether a read of `name` on `handle` may take `read_member`'s
+    /// internal-slot fast path for a built-in accessor: `false` only when
+    /// `handle` carries that slot and `name` is one of its accessors, but the
+    /// read would not reach the unmodified built-in getter.
+    fn slot_accessor_intact(&self, handle: Handle, name: &str) -> bool {
+        let intact = |id| self.realm.builtin_accessor_intact(handle, name, id);
+        match name {
+            "buffer" | "byteLength" | "byteOffset" | "length"
+                if self.realm.typed_kind(handle).is_some() =>
+            {
+                self.realm.typed_accessor_intact(handle, name)
+            }
+            "byteLength" | "detached" | "maxByteLength" | "resizable" | "immutable"
+            | "growable"
+                if self
+                    .realm
+                    .get_property(handle, ARRAY_BUFFER_BYTES)
+                    .is_some() =>
+            {
+                intact(N_AB_ACCESSOR) || intact(N_SAB_ACCESSOR)
+            }
+            "buffer" | "byteLength" | "byteOffset"
+                if self.realm.get_property(handle, DATA_VIEW_BUF).is_some() =>
+            {
+                intact(N_DATA_VIEW_ACCESSOR)
+            }
+            "size"
+                if self.realm.collection_size(handle).is_some()
+                    && !self.realm.collection_is_weak(handle) =>
+            {
+                intact(N_MAP_SIZE) || intact(N_SET_SIZE)
+            }
+            _ => true,
+        }
     }
 
     /// [`read_member`](Self::read_member) for the common case where it is

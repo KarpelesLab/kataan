@@ -59,6 +59,10 @@ use crate::object::Object;
 use crate::rope::Rope;
 use crate::shape::Shape;
 use alloc::rc::Rc;
+
+/// A [`Realm::typed_length_memo`] stamp: the concrete prototype and
+/// `%TypedArray%.prototype` handles, their key epochs, and `cell_swaps`.
+type TypedLengthStamp = (u64, u64, u32, u32, u32);
 use alloc::vec::Vec;
 
 /// Hidden `[[PromiseState]]` slot for a **Promise subclass** instance
@@ -240,6 +244,11 @@ pub struct Realm {
     /// found free of index keys: `%Array.prototype%`'s auxiliary (named
     /// property) object and its prototype, with their key epochs then.
     chain_index_free_memo: Option<(u64, u32, u64, u32)>,
+    /// The last typed-array prototype chain
+    /// [`typed_accessor_intact`](Realm::typed_accessor_intact) proved reaches the
+    /// built-in `length` getter: the concrete prototype and `%TypedArray%.prototype` with their key
+    /// epochs (an accessor (re)definition bumps them too) and `cell_swaps` then.
+    typed_length_memo: core::cell::Cell<Option<TypedLengthStamp>>,
     /// One-slot memo of the most recent regex subject widened to UTF-16, kept
     /// because the matcher takes `&[u16]` and every `test`/`exec`/`split`/…
     /// otherwise re-transcodes the whole subject — making a match cost O(subject)
@@ -823,6 +832,7 @@ impl Realm {
             nonwritable_array_lengths: alloc::collections::BTreeSet::new(),
             proto_index_accessor_dirty: false,
             chain_index_free_memo: None,
+            typed_length_memo: core::cell::Cell::new(None),
             regex_subject_units: None,
             unit_strings: alloc::vec::Vec::new(),
             unit_cursor: None,
@@ -2098,6 +2108,117 @@ impl Realm {
     #[must_use]
     pub fn typed_array_object(&self, handle: Handle) -> Option<Handle> {
         self.heap.get(handle)?.typed_array_object()
+    }
+
+    /// Whether an ordinary `[[Get]]` of `key` (`buffer`/`byteLength`/`byteOffset`/
+    /// `length`) on the typed array `handle` reaches the built-in
+    /// `%TypedArray%.prototype` getter for that key: the view has no own `key`
+    /// (`Object.defineProperty(ta, "length", …)` makes one), and the first
+    /// prototype holding `key` holds it as an accessor whose getter is the
+    /// `N_TYPED_ARRAY_ACCESSOR` bound native carrying `key` (a concrete prototype
+    /// may shadow it, and the accessor itself is configurable). Engine fast paths that
+    /// answer such a read from the view's internal slots check this first; a
+    /// `false` means "do the ordinary property lookup".
+    #[must_use]
+    pub fn typed_accessor_intact(&self, handle: Handle, key: &str) -> bool {
+        // A typed array's own named properties live in its auxiliary object.
+        if let Some(aux) = self.aux_props.get(&handle.to_raw())
+            && self
+                .heap
+                .get(*aux)
+                .and_then(Cell::as_object)
+                .is_none_or(|o| o.contains(key) || o.accessor(key).is_some())
+        {
+            return false;
+        }
+        let proto = self.object_proto(handle);
+        // The hot `ta.length`: a chain proved intact before, unchanged since.
+        let stamp = if key == "length" {
+            proto.and_then(|p| self.typed_length_stamp(p))
+        } else {
+            None
+        };
+        if stamp.is_some() && self.typed_length_memo.get() == stamp {
+            return true;
+        }
+        let holder = self.chain_builtin_getter(proto, key, crate::nbexec::N_TYPED_ARRAY_ACCESSOR);
+        // Memoize only the common two-link chain (concrete prototype, then the
+        // holder `%TypedArray%.prototype`) the stamp describes.
+        if let Some(h) = holder
+            && let Some(st) = stamp
+            && st.1 == h.to_raw()
+        {
+            self.typed_length_memo.set(stamp);
+        }
+        holder.is_some()
+    }
+
+    /// Whether `[[Get]]` of `key` on `handle` (any object) reaches the built-in
+    /// accessor whose getter is the `getter_id` bound native carrying `key`
+    /// (e.g. `get ArrayBuffer.prototype.byteLength`), or the `getter_id` native
+    /// (`get Map.prototype.size`): `handle` has no own `key`
+    /// and the first prototype holding it holds that accessor. See
+    /// [`typed_accessor_intact`](Realm::typed_accessor_intact).
+    #[must_use]
+    pub fn builtin_accessor_intact(&self, handle: Handle, key: &str, getter_id: u16) -> bool {
+        !self.has_own(handle, key)
+            && self
+                .chain_builtin_getter(self.object_proto(handle), key, getter_id)
+                .is_some()
+    }
+
+    /// Walks the `[[Prototype]]` chain from `start` for the first object holding
+    /// `key`, and returns it when it holds `key` as an accessor whose getter is
+    /// the `getter_id` bound native carrying `key` (or the `getter_id` plain
+    /// native). Only ordinary objects are
+    /// walked: anything else on the chain (a proxy, a typed array, an exotic
+    /// cell) yields `None`, leaving the read to the ordinary lookup.
+    fn chain_builtin_getter(
+        &self,
+        start: Option<Handle>,
+        key: &str,
+        getter_id: u16,
+    ) -> Option<Handle> {
+        let mut cur = start;
+        while let Some(p) = cur {
+            let o = self.heap.get(p)?.as_object()?;
+            if let Some((getter, _)) = o.accessor(key) {
+                let g = Handle::from_raw(getter.as_handle()?);
+                // A plain native getter has an id of its own (`get Map.prototype.size`).
+                if self.native_at(g) == Some(getter_id) {
+                    return Some(p);
+                }
+                let (id, name) = self.bound_native_at(g)?;
+                let named = self
+                    .heap
+                    .get(name)
+                    .and_then(Cell::as_str)
+                    .and_then(Rope::as_leaf_bytes)
+                    == Some(key.as_bytes());
+                return (id == getter_id && named).then_some(p);
+            }
+            if o.contains(key) {
+                return None;
+            }
+            cur = o.proto();
+        }
+        None
+    }
+
+    /// The [`typed_length_memo`](Realm::typed_length_memo) stamp of a typed
+    /// array whose `[[Prototype]]` is `proto`, when `proto` and its own
+    /// prototype are ordinary objects.
+    fn typed_length_stamp(&self, proto: Handle) -> Option<TypedLengthStamp> {
+        let o = self.heap.get(proto)?.as_object()?;
+        let tap = o.proto()?;
+        let t = self.heap.get(tap)?.as_object()?;
+        Some((
+            proto.to_raw(),
+            tap.to_raw(),
+            o.key_epoch(),
+            t.key_epoch(),
+            self.cell_swaps,
+        ))
     }
 
     /// The element count of the typed-array view at `handle`, if it is one.

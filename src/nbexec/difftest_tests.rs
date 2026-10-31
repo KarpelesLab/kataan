@@ -3291,3 +3291,44 @@ fn hoisted_typed_views_and_guarded_math_in_speculative_loops() {
         "214232,8,1279939926,4247811845,1551842253,3211497087,2855,33"
     );
 }
+
+/// A typed array's `length`/`byteLength`/`byteOffset`/`buffer`, an
+/// ArrayBuffer's `byteLength`, a DataView's accessors and a Map's/Set's `size`
+/// are inherited built-in accessors; the engine answers them from internal
+/// slots only while the read reaches that unmodified getter. An own property
+/// (`Object.defineProperty(ta, "length", …)`), a shadowing prototype property,
+/// or a redefined accessor (also when read through an ordinary object that
+/// inherits the prototype) is an ordinary `[[Get]]`.
+#[test]
+fn builtin_slot_accessors_honor_redefinition() {
+    let src = r#"
+        function len(a) { var s = 0; for (var i = 0; i < 50; i++) s += a.length; return s / 50; }
+        var r = [];
+        var ta = new Uint8Array(3);
+        Object.defineProperty(ta, "length", { value: 5, configurable: true });
+        Object.defineProperty(ta, "byteOffset", { value: 7 });
+        r.push(ta.length, len(ta), ta["len" + "gth"], ta.byteOffset);
+        delete ta.length;
+        r.push(ta.length, len(new Int32Array(4)));
+        var TAP = Object.getPrototypeOf(Int8Array.prototype);
+        var d = Object.getOwnPropertyDescriptor(TAP, "length");
+        Object.defineProperty(TAP, "length", { get: function () { return 42; }, configurable: true });
+        r.push(len(new Float64Array(2)));
+        Object.defineProperty(TAP, "length", { value: "data", configurable: true, writable: true });
+        r.push(new Int16Array(3).length, Object.create(Int16Array.prototype).length);
+        Object.defineProperty(TAP, "length", d);
+        Object.defineProperty(Int32Array.prototype, "length", { value: 7, configurable: true });
+        r.push(len(new Int32Array(4)), len(new Uint8Array(2)));
+        delete Int32Array.prototype.length;
+        r.push(len(new Int32Array(4)));
+        var dv = new DataView(new ArrayBuffer(8), 2);
+        Object.defineProperty(DataView.prototype, "byteLength", { get: function () { return -1; }, configurable: true });
+        Object.defineProperty(ArrayBuffer.prototype, "byteLength", { get: function () { return -2; }, configurable: true });
+        Object.defineProperty(Map.prototype, "size", { get: function () { return -3; }, configurable: true });
+        var s = new Set([1]);
+        Object.defineProperty(s, "size", { value: -4 });
+        r.push(dv.byteLength, dv.byteOffset, new ArrayBuffer(4).byteLength, new Map().size, s.size, new Set([1, 2]).size);
+        r.join()
+    "#;
+    assert_eq!(run(src), "5,5,5,7,3,4,42,data,data,7,2,4,-1,2,-2,-3,-4,2");
+}

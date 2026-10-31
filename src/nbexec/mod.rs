@@ -1222,7 +1222,7 @@ const N_TYPED_ARRAY_TO_STRING_TAG: u16 = 241;
 /// A `get %TypedArray%.prototype.<accessor>` getter (`buffer`/`byteLength`/
 /// `byteOffset`/`length`). A bound native whose target string names the accessor;
 /// rejects a `this` lacking a `[[TypedArrayName]]` slot with a TypeError.
-const N_TYPED_ARRAY_ACCESSOR: u16 = 247;
+pub(crate) const N_TYPED_ARRAY_ACCESSOR: u16 = 247;
 /// A `get DataView.prototype.<accessor>` getter (`buffer`/`byteLength`/
 /// `byteOffset`). A bound native whose target string names the accessor; rejects
 /// a `this` lacking a `[[DataView]]` internal slot with a TypeError. (New-id
