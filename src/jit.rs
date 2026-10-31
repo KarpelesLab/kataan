@@ -8484,7 +8484,9 @@ impl JitFunction {
                         if p.known && known.is_some()
                             && !X64Assembler::p_fixed_slot_needs_rcx(&layout, b.slot, have));
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify, cell);
-                    if known.is_none() {
+                    // (A compiled-in layout compares the shape word in place:
+                    // its cache path loads it, out of line.)
+                    if known.is_none() && s.baked.is_none() {
                         a.mov_rax_at_rcx(layout.off_shape);
                     }
                     if let Some(((b, x, p, have), bail)) = direct {
@@ -8495,7 +8497,7 @@ impl JitFunction {
                             cold_verifies.push((verify, None, b.shape, cached, resume));
                         } else {
                             a.g_movabs(call_seq::r::R11, b.shape);
-                            a.cmp_rax_r11();
+                            a.g_cmp_mem(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
                             a.jne(cached);
                         }
                         extra_in_frame[op_idx] = a.p_obj_fixed_slot_ex_xmm(
@@ -8530,7 +8532,7 @@ impl JitFunction {
                             cold_verifies.push((verify, None, b.shape, cached, resume));
                         } else {
                             a.g_movabs(call_seq::r::R11, b.shape);
-                            a.cmp_rax_r11();
+                            a.g_cmp_mem(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
                             a.jne(cached);
                         }
                         match rc.sites[op_idx].filter(|_| num.in_spec(op_idx)) {
@@ -8817,7 +8819,9 @@ impl JitFunction {
                     if in_spec_region {
                         set_proven[op_idx] = true;
                     }
-                    if known.is_none() {
+                    // (A compiled-in layout compares the shape word in place:
+                    // its cache path loads it, out of line.)
+                    if known.is_none() && s.baked.is_none() {
                         a.mov_rax_at_rcx(layout.off_shape);
                     }
                     // Where the in-place store of a compiled-in layout ends
@@ -8840,7 +8844,7 @@ impl JitFunction {
                             cold_verifies.push((verify, Some(helper), b.shape, cached, resume));
                         } else {
                             a.g_movabs(call_seq::r::R11, b.shape);
-                            a.cmp_rax_r11();
+                            a.g_cmp_mem(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
                             a.jne(cached);
                         }
                         if !num.is_number_at(op_idx, val) {
@@ -8891,6 +8895,7 @@ impl JitFunction {
                         a.jmp(stored);
                         cold = Some(a.cold_begin());
                         a.bind(cached);
+                        a.mov_rax_at_rcx(layout.off_shape);
                         // Another layout in a way that proves this one: empty
                         // it (and the others: it may be an add) — also before
                         // leaving for the plain copy, whose hit on the way
@@ -9816,6 +9821,7 @@ impl JitFunction {
         for (cached, back, miss, spill, cache) in core::mem::take(&mut cold_caches) {
             a.dbg_mark("x-cache");
             a.bind(cached);
+            a.mov_rax_at_rcx(layout.off_shape);
             // Not the layout: a way that proves it may not keep this object.
             for &w in &shape_ways {
                 a.store_empty(rc_key(w));
