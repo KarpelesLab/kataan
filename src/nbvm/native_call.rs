@@ -849,7 +849,17 @@ fn run_op(
             NanBox::boolean(realm.has_own(h, key))
         }
         FastOp::StrSlice | FastOp::StrSubstring => {
-            let rope = str_parts(realm, h)?;
+            // A `Concat` is sliced by walking its tree when that is cheap (see
+            // `Rope::slice_units_tree`), and flattened only otherwise.
+            let unflat = realm
+                .typeof_is_string(h)
+                .then(|| realm.string_rope(h))
+                .flatten()
+                .filter(|r| r.as_leaf_bytes().is_none());
+            let rope = match &unflat {
+                Some(r) => r.clone(),
+                None => str_parts(realm, h)?,
+            };
             let units = rope.utf16_len();
             let start = int_arg(arg(0))?.unwrap_or(0.0);
             let end = int_arg(arg(1))?;
@@ -870,6 +880,15 @@ fn run_op(
                 let b = end.map_or(units, clamp);
                 if a > b { (b, a) } else { (a, b) }
             };
+            if unflat.is_some() {
+                if let Some(out) = realm.new_string_slice_tree(&rope, a, b) {
+                    return Some(Ok(NanBox::handle(out.to_raw())));
+                }
+                let rope = str_parts(realm, h)?;
+                return Some(Ok(NanBox::handle(
+                    realm.new_string_slice(&rope, a, b)?.to_raw(),
+                )));
+            }
             NanBox::handle(realm.new_string_slice(&rope, a, b)?.to_raw())
         }
         FastOp::StrStartsWith | FastOp::StrEndsWith | FastOp::StrIncludes => {

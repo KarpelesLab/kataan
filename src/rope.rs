@@ -47,6 +47,21 @@ use crate::wtf8;
 /// ("Invalid string length") rather than a `usize` overflow / OOM bomb.
 pub const MAX_STRING_LEN: usize = crate::limits::DEFAULT_MAX_STRING_LEN;
 
+/// The identity of a rope's root node that does not keep its contents alive
+/// (a weak reference): a cache keyed on "the same string as last time" can
+/// hold one without pinning a huge string. While it exists the node's
+/// allocation is not reused, so [`RopeId::is`] never mistakes a later rope
+/// for the dropped one.
+pub struct RopeId(alloc::rc::Weak<Node>);
+
+impl RopeId {
+    /// Whether `rope` is the rope this id was taken from.
+    #[must_use]
+    pub fn is(&self, rope: &Rope) -> bool {
+        core::ptr::eq(self.0.as_ptr(), Rc::as_ptr(&rope.0))
+    }
+}
+
 /// A string value represented as a tree of concatenated segments. Cloning is a
 /// reference-count bump; concatenation and length are O(1).
 #[derive(Clone)]
@@ -137,6 +152,10 @@ const SLICE_SHARE_MIN: usize = SMALL_CAP + 1;
 /// kept slice can pin: a short piece of a huge string is copied (its cost is
 /// proportional to the piece anyway), so the huge one can still be freed.
 const SLICE_SHARE_RATIO: usize = 16;
+
+/// The most `Concat` nodes [`Rope::slice_units_tree`] visits before leaving
+/// the slice to a flatten.
+const TREE_SLICE_STEPS: usize = 64;
 
 /// Sentinel for "the UTF-16 length has not been computed yet". A real length is
 /// bounded by [`MAX_STRING_LEN`], so it can never collide.
@@ -437,6 +456,104 @@ impl Rope {
         self.slice_units_from((0, 0), start, end).map(|(r, _)| r)
     }
 
+    /// [`Rope::slice_units`] of a `Concat` rope **without flattening it**: the
+    /// UTF-16 range `[start, end)` (clamped, `start < end` expected) is found
+    /// by walking down the tree, so a slice inside one leaf costs a few steps
+    /// plus that leaf's scan rather than a copy (and, for a non-ASCII string,
+    /// a unit scan) of the whole rope. A range spanning several nodes shares
+    /// the subtrees it covers and slices the leaves at its ends.
+    ///
+    /// `None` for a flat rope (use [`Rope::slice_units`]) and whenever the
+    /// walk would be long, past [`TREE_SLICE_STEPS`] nodes (a deep `+=`-built
+    /// tree, where flattening once makes every later read O(1)). The caller
+    /// then flattens as before, so the walk adds a bounded cost at worst.
+    #[must_use]
+    pub fn slice_units_tree(&self, start: usize, end: usize) -> Option<Rope> {
+        if !matches!(&*self.0, Node::Concat { .. }) {
+            return None;
+        }
+        let total = self.utf16_len();
+        let end = end.min(total);
+        let start = start.min(end);
+        if start == end {
+            return Some(Rope::new());
+        }
+        // `(node, its UTF-16 length)`, descending while one child holds the range.
+        let (mut node, mut units) = (self, total);
+        let (mut a, mut b) = (start, end);
+        let mut steps = 0usize;
+        loop {
+            let Node::Concat { left, right, .. } = &*node.0 else {
+                return node.slice_units(a, b);
+            };
+            steps += 1;
+            if steps > TREE_SLICE_STEPS {
+                return None;
+            }
+            let (lu, ru) = Self::child_units(left, right, units);
+            if b <= lu {
+                (node, units) = (left, lu);
+            } else if a >= lu {
+                (node, units) = (right, ru);
+                a -= lu;
+                b -= lu;
+            } else {
+                break;
+            }
+        }
+        // The range spans `node`'s children: join the overlapped pieces left
+        // to right, a fully covered subtree shared whole and a partly covered
+        // leaf sliced, so the result costs O(steps) however long it is
+        // (`try_concat` pairs a surrogate split at a seam).
+        let mut out = Rope::new();
+        let mut stack: Vec<(&Rope, usize, usize, usize)> = alloc::vec![(node, units, a, b)];
+        while let Some((n, nu, a, b)) = stack.pop() {
+            let piece = match &*n.0 {
+                _ if a == 0 && b == nu => n.clone(),
+                Node::Concat { left, right, .. } => {
+                    steps += 1;
+                    if steps > TREE_SLICE_STEPS {
+                        return None;
+                    }
+                    let (lu, ru) = Self::child_units(left, right, nu);
+                    if b > lu {
+                        stack.push((right, ru, a.saturating_sub(lu), b - lu));
+                    }
+                    if a < lu {
+                        stack.push((left, lu, a, b.min(lu)));
+                    }
+                    continue;
+                }
+                _ => n.slice_units(a, b)?,
+            };
+            out = out.try_concat(&piece)?;
+        }
+        Some(out)
+    }
+
+    /// A non-owning identity for this rope (see [`RopeId`]).
+    #[must_use]
+    pub fn id(&self) -> RopeId {
+        RopeId(Rc::downgrade(&self.0))
+    }
+
+    /// The UTF-16 lengths of a `Concat`'s children given the node's own
+    /// (`units`): an all-ASCII node's children are their byte lengths, and
+    /// otherwise only the shorter child is counted (memoized), the other being
+    /// the difference — so a walk down a lopsided tree never rescans its big side.
+    fn child_units(left: &Rope, right: &Rope, units: usize) -> (usize, usize) {
+        if units == left.len() + right.len() {
+            return (left.len(), right.len());
+        }
+        if left.len() <= right.len() {
+            let lu = left.utf16_len();
+            (lu, units - lu)
+        } else {
+            let ru = right.utf16_len();
+            (units - ru, ru)
+        }
+    }
+
     /// [`Rope::slice_units`] scanning a non-ASCII string from `hint`, a
     /// `(byte, unit)` character boundary of it (see [`wtf8::utf16_range`]),
     /// rather than from its start; also returns the first whole character's
@@ -735,6 +852,68 @@ mod tests {
             assert_eq!(got.materialize_bytes(), want, "{a}..{b}");
             assert_eq!(got.utf16_len(), b.min(units.len()) - a);
         }
+    }
+
+    /// A `Concat` slices by walking its tree, exactly (non-ASCII, astral
+    /// characters split at a seam and at the range ends), sharing a leaf it
+    /// stays inside and the whole subtrees a spanning range covers, and gives
+    /// up (leaving the caller to flatten) on a walk past `TREE_SLICE_STEPS`.
+    #[test]
+    fn tree_slices_walk_without_flattening() {
+        let unit_rope = |s: &str| {
+            Rope::from_wtf8(crate::wtf8::from_utf16(
+                &s.encode_utf16().collect::<Vec<_>>(),
+            ))
+        };
+        let a = unit_rope(&"a\u{e9}\u{1F600}b".repeat(50));
+        let b = Rope::leaf(&"0123456789".repeat(30));
+        // `\u{1F601}` split across a seam: the halves are lone surrogates
+        // in their own leaves, joined into one astral by `try_concat` (which
+        // flattens that subtree).
+        let hi = Rope::from_wtf8(crate::wtf8::from_utf16(&[0xD83D]));
+        let lo = Rope::from_wtf8(crate::wtf8::from_utf16(&[0xDE01]));
+        let r = a.concat(&b).concat(&a.concat(&hi).concat(&lo.concat(&b)));
+        let flat = r.materialize_bytes();
+        let units: Vec<u16> = crate::wtf8::utf16_units(&flat).collect();
+        assert_eq!(r.utf16_len(), units.len());
+        let n = units.len();
+        for (s, e) in [
+            (0, n),
+            (0, 1),
+            (5, 40),
+            (2, 3),
+            (249, 260),
+            (250, 550),
+            (299, 900),
+            (n - 310, n - 300),
+            (n - 302, n - 299),
+            (n - 301, n),
+            (1, n - 1),
+            (n, n),
+        ] {
+            let got = r.slice_units_tree(s, e).expect("shallow tree");
+            let want = crate::wtf8::from_utf16(&units[s..e]);
+            assert_eq!(got.materialize_bytes(), want, "{s}..{e}");
+            assert_eq!(got.utf16_len(), e - s, "{s}..{e}");
+        }
+        // Inside one leaf: that leaf's slice (shared when long).
+        let inner = r.slice_units_tree(560, 1000).unwrap();
+        assert!(matches!(*inner.0, Node::Slice { .. }));
+        // The whole range is the rope itself.
+        assert!(r.slice_units_tree(0, n).unwrap().ptr_eq(&r));
+        // Flat ropes have no tree; a deep tree is left to a flatten.
+        assert!(a.slice_units_tree(0, 3).is_none());
+        let mut deep = Rope::leaf(&"x".repeat(100));
+        for _ in 0..200 {
+            deep = deep.concat(&Rope::leaf(&"y".repeat(100)));
+        }
+        assert!(deep.slice_units_tree(0, 3).is_none());
+        assert_eq!(
+            deep.slice_units_tree(deep.len() - 150, deep.len() - 40)
+                .unwrap()
+                .materialize(),
+            "y".repeat(110)
+        );
     }
 
     #[test]

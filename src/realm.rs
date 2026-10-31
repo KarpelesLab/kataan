@@ -111,6 +111,10 @@ pub fn typed_elem_size(kind: u8) -> usize {
 /// `builtins_fast::plain_enumerable_key_ropes`).
 type ShapeKeyRopes = (Rc<crate::shape::Shape>, Rc<[Rope]>);
 
+/// How many slices in a row of one string walk its rope (see
+/// [`Realm::new_string_slice_tree`]) before it is flattened instead.
+const TREE_SLICE_REPEAT: u32 = 32;
+
 /// An object-model context: the heap, the shared root shape, and the atom table.
 pub struct Realm {
     heap: Heap<Cell>,
@@ -321,6 +325,10 @@ pub struct Realm {
     /// Boxed: the realm is moved by value on every host call, so a rarely
     /// used field costs a word, not three.
     slice_cursor: Option<alloc::boxed::Box<(Rope, usize, usize)>>,
+    /// The rope the last [`new_string_slice_tree`](Realm::new_string_slice_tree)
+    /// walked and how many walks in a row it has had: a string sliced over
+    /// and over is flattened once instead of walked every time.
+    tree_slice: Option<alloc::boxed::Box<(crate::rope::RopeId, u32)>>,
     /// How many times [`swap_cell_state`](Realm::swap_cell_state) has moved one
     /// cell's contents into another handle: a cache that identifies objects by
     /// handle and key epoch (`builtins_fast::ChainKeyCache`) is only valid
@@ -878,6 +886,7 @@ impl Realm {
             unit_strings: alloc::vec::Vec::new(),
             unit_cursor: None,
             slice_cursor: None,
+            tree_slice: None,
             cell_swaps: 0,
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -1961,6 +1970,38 @@ impl Realm {
                 None => self.slice_cursor = Some(alloc::boxed::Box::new((rope.clone(), b, u))),
             }
         }
+        Some(self.heap.alloc(Cell::Str(out)))
+    }
+
+    /// The UTF-16 units `[start, end)` of the `Concat` rope `rope`, sliced by
+    /// walking its tree rather than flattening it (see
+    /// [`Rope::slice_units_tree`]). `None` (flatten and slice the flat string
+    /// instead) for a rope short enough that flattening is cheap, a walk that
+    /// would be long, or a rope already walked [`TREE_SLICE_REPEAT`] times in a
+    /// row: a string sliced in a loop pays one flatten, after which every
+    /// slice is O(1), rather than a walk per slice.
+    pub fn new_string_slice_tree(
+        &mut self,
+        rope: &Rope,
+        start: usize,
+        end: usize,
+    ) -> Option<Handle> {
+        /// Below this many bytes a flatten costs about as much as a walk.
+        const TREE_SLICE_MIN_LEN: usize = 1 << 16;
+        if rope.len() < TREE_SLICE_MIN_LEN {
+            return None;
+        }
+        match self.tree_slice.as_deref_mut() {
+            Some((id, n)) if id.is(rope) => {
+                if *n >= TREE_SLICE_REPEAT {
+                    return None;
+                }
+                *n += 1;
+            }
+            Some(memo) => *memo = (rope.id(), 1),
+            None => self.tree_slice = Some(alloc::boxed::Box::new((rope.id(), 1))),
+        }
+        let out = rope.slice_units_tree(start, end)?;
         Some(self.heap.alloc(Cell::Str(out)))
     }
 
