@@ -2308,6 +2308,10 @@ enum MathInline {
     Imul,
     /// `Math.clz32`: the leading zero bits of `ToUint32` of its argument.
     Clz32,
+    /// `Math.round`: the floor, plus one when the fraction it drops is at
+    /// least a half, a zero taking the argument's sign (SSE4.1,
+    /// [`X64Assembler::round_half_xmm0`]).
+    RoundHalf,
 }
 
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -2318,7 +2322,10 @@ impl MathInline {
     /// it (`numeric::plan_defer`). `Math.clz32` maps a NaN to `32`, so its
     /// argument's check cannot be deferred past it.
     fn float_like(self) -> bool {
-        matches!(self, Self::Sqrt | Self::Abs | Self::Round(_))
+        matches!(
+            self,
+            Self::Sqrt | Self::Abs | Self::Round(_) | Self::RoundHalf
+        )
     }
 }
 
@@ -2450,12 +2457,13 @@ fn emit_got_math(
             a.jg(is_nan);
             a.store_rax(disp(dst));
         }
-        MathInline::Sqrt | MathInline::Round(_) => {
+        MathInline::Sqrt | MathInline::Round(_) | MathInline::RoundHalf => {
             // (A NaN result is the canonical one: `roundsd` keeps an
             // argument NaN, `sqrtsd` too or makes the hardware's default.)
             a.movsd_xmm0_mem(disp(x));
             match f {
                 MathInline::Round(mode) => a.roundsd_xmm0(mode),
+                MathInline::RoundHalf => a.round_half_xmm0(),
                 _ => a.sqrtsd_xmm0(),
             }
             a.movsd_mem_xmm0(disp(dst));
@@ -2485,7 +2493,7 @@ fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
 fn inline_math_key(key: &str, argc: usize) -> Option<(u16, MathInline)> {
     use crate::nbexec::{
         N_MATH_ABS, N_MATH_CEIL, N_MATH_CLZ32, N_MATH_FLOOR, N_MATH_IMUL, N_MATH_MAX, N_MATH_MIN,
-        N_MATH_SQRT, N_MATH_TRUNC,
+        N_MATH_ROUND, N_MATH_SQRT, N_MATH_TRUNC,
     };
     match key {
         "max" if (1..=4).contains(&argc) => {
@@ -2507,6 +2515,7 @@ fn inline_math_key(key: &str, argc: usize) -> Option<(u16, MathInline)> {
         "floor" if sse41 => (N_MATH_FLOOR, MathInline::Round(0x09)),
         "ceil" if sse41 => (N_MATH_CEIL, MathInline::Round(0x0a)),
         "trunc" if sse41 => (N_MATH_TRUNC, MathInline::Round(0x0b)),
+        "round" if sse41 => (N_MATH_ROUND, MathInline::RoundHalf),
         "clz32" => (N_MATH_CLZ32, MathInline::Clz32),
         _ => return None,
     })
@@ -5340,6 +5349,40 @@ impl X64Assembler {
         self.code
             .extend_from_slice(&[0x66, 0x0f, 0x3a, 0x0b, 0xc0, mode]);
     }
+
+    /// `xmm0 = Math.round(xmm0)` (SSE4.1): `f = floor(x)`, plus one when
+    /// `x - f` (exact, in `[0, 1)`, or NaN for a NaN or an infinity, whose
+    /// sum stays itself) is at least a half; a zero result takes `x`'s
+    /// sign (`-0.5 <= x < 0` rounds to `-0`). Clobbers `xmm1`, `rax`,
+    /// `rcx`, `r11`.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn round_half_xmm0(&mut self) {
+        let skip = self.new_label();
+        let done = self.new_label();
+        self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc1]); // movq rcx, xmm0
+        self.raw(&[0x66, 0x0f, 0x28, 0xc8]); // movapd xmm1, xmm0
+        self.raw(&[0x66, 0x0f, 0x3a, 0x0b, 0xc9, 0x09]); // roundsd xmm1, xmm1, floor
+        self.raw(&[0xf2, 0x0f, 0x5c, 0xc1]); // subsd xmm0, xmm1
+        // The fraction's bits: a non-negative double (or a NaN, above any
+        // Number's) compares as its bits do.
+        self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+        self.movabs_r11(0.5f64.to_bits() as i64);
+        self.cmp_rax_r11();
+        self.g_jcc(call_seq::cc::B, skip);
+        self.movabs_rax(1.0f64.to_bits() as i64);
+        self.raw(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+        self.raw(&[0xf2, 0x0f, 0x58, 0xc8]); // addsd xmm1, xmm0
+        self.bind(skip);
+        self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc8]); // movq rax, xmm1
+        self.raw(&[0x49, 0x89, 0xc3]); // mov r11, rax
+        self.raw(&[0x49, 0xd1, 0xe3]); // shl r11, 1
+        self.jne(done);
+        self.movabs_r11(i64::MIN); // the sign bit
+        self.raw(&[0x4c, 0x21, 0xd9]); // and rcx, r11
+        self.raw(&[0x48, 0x09, 0xc8]); // or rax, rcx
+        self.bind(done);
+        self.raw(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+    }
     /// `movsd xmm1, [rbp+disp]`.
     pub fn movsd_xmm1_mem(&mut self, disp: i32) {
         self.code.extend_from_slice(&[0xf2, 0x0f, 0x10, 0x8d]);
@@ -8099,10 +8142,11 @@ impl JitFunction {
                             }
                             match f {
                                 MathInline::Round(mode) => a.roundsd_xmm0(mode),
+                                MathInline::RoundHalf => a.round_half_xmm0(),
                                 MathInline::MaxMin(_) | MathInline::Imul | MathInline::Clz32 => {
                                     return None;
                                 }
-                                _ => a.sqrtsd_xmm0(),
+                                MathInline::Sqrt | MathInline::Abs => a.sqrtsd_xmm0(),
                             }
                             // (A NaN is the canonical one: `roundsd` keeps an
                             // argument NaN, `sqrtsd` too or makes the
@@ -12359,6 +12403,69 @@ mod tests {
             );
             assert_eq!(eval_float(&trunc, 2, &[x]).to_bits(), x.trunc().to_bits());
         }
+    }
+
+    /// `Math.round` as the generic tier computes it inline
+    /// (`X64Assembler::round_half_xmm0`) against the spec's definition: the
+    /// integer closest to `x`, ties toward `+∞`, `-0` for `-0.5 <= x < 0`.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn round_half_matches_math_round() {
+        if !std::is_x86_feature_detected!("sse4.1") || !available() {
+            return;
+        }
+        let mut a = X64Assembler::new();
+        a.raw(&[0x66, 0x48, 0x0f, 0x6e, 0xc7]); // movq xmm0, rdi
+        a.round_half_xmm0();
+        a.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+        a.ret();
+        let f = JitFunction::from_code(&a.finish()).expect("jit available");
+        let spec = |x: f64| -> f64 {
+            if !x.is_finite() || x == 0.0 {
+                return x;
+            }
+            if (-0.5..0.0).contains(&x) {
+                return -0.0;
+            }
+            let fl = x.floor();
+            // (Exact: `x - floor(x)` loses nothing for these magnitudes.)
+            if x - fl >= 0.5 { fl + 1.0 } else { fl }
+        };
+        let mut xs = vec![
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.5,
+            -1.5,
+            2.5,
+            -2.5,
+            0.49999999999999994,
+            -0.49999999999999994,
+            0.5000000000000001,
+            -0.5000000000000001,
+            4503599627370495.5,
+            -4503599627370495.5,
+            4503599627370496.0,
+            9007199254740993.0,
+            1e308,
+            -1e308,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -2.0000000000000004,
+            3.4999999999999996,
+        ];
+        for i in -400..400 {
+            xs.push(f64::from(i) * 0.125 + 0.0625 * f64::from(i % 3));
+        }
+        for x in xs {
+            let got = f64::from_bits(f.call1(x.to_bits() as i64) as u64);
+            assert_eq!(got.to_bits(), spec(x).to_bits(), "Math.round({x:e})");
+        }
+        let nan = f64::from_bits(f.call1(f64::NAN.to_bits() as i64) as u64);
+        assert!(nan.is_nan());
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
