@@ -2946,3 +2946,74 @@ fn global_var_writes_from_compiled_loops_reach_the_global_object() {
         "true,true,30000,0,19999,-19999,-19999,-66663334,19999,199990000"
     );
 }
+
+/// A global `var`/function binding IS a property of the global object (the
+/// global Environment Record's object record): changing that property through
+/// `Object.defineProperty`/`defineProperties`, `Reflect.defineProperty` or
+/// `Object.freeze` reaches the binding — a new value is read through the
+/// identifier, a non-writable property rejects identifier writes (strict code
+/// throws a TypeError, sloppy code drops them), and an accessor installed on a
+/// configurable (eval-declared) var runs its getter/setter. The declarative
+/// mirror slot used to keep its old value and stay writable. Global
+/// `let`/`const` are no global-object properties and are left alone.
+#[test]
+fn global_var_binding_follows_global_object_property() {
+    let src = r#"
+        var r = [];
+        var a = 1;
+        Object.defineProperty(globalThis, 'a', { writable: false });
+        a = 2; a++; a += 1;
+        r.push(a);
+        var b = 1;
+        Object.defineProperty(globalThis, 'b', { value: 5 });
+        r.push(b);
+        var c = 1;
+        Reflect.defineProperty(globalThis, 'c', { value: 6, writable: false });
+        c = 7;
+        r.push(c);
+        Object.defineProperties(globalThis, { b: { value: 8, writable: false } });
+        b = 9;
+        r.push(b);
+        try { (function () { 'use strict'; a = 3; })(); r.push('no throw'); } catch (e) { r.push(e.constructor.name); }
+        try { (0, eval)("'use strict'; c = 3"); r.push('no throw'); } catch (e) { r.push(e.constructor.name); }
+        function f() { return 'f1'; }
+        Object.defineProperty(globalThis, 'f', { value: function () { return 'f2'; } });
+        r.push(f());
+        var w = 0;
+        function bump() { w = w + 1; return w; }
+        for (var i = 0; i < 500; i++) bump();
+        Object.defineProperty(globalThis, 'w', { writable: false });
+        for (var i = 0; i < 500; i++) bump();
+        r.push(w);
+        eval('var e = 1;');
+        var gets = 0, store = 0;
+        Object.defineProperty(globalThis, 'e', {
+            get: function () { gets++; return store; },
+            set: function (v) { store = v * 10; },
+            configurable: true
+        });
+        e = 4;
+        r.push(e, gets, typeof e);
+        Object.defineProperty(globalThis, 'e', { value: 20, writable: false, configurable: true });
+        e = 21;
+        r.push(e);
+        Object.defineProperty(globalThis, 'e', { writable: true });
+        e = 22;
+        r.push(e, globalThis.e);
+        let l = 1;
+        globalThis.l = 30;
+        Object.defineProperty(globalThis, 'l', { value: 31, writable: false });
+        l = 2;
+        r.push(l, globalThis.l);
+        var z = 1;
+        Object.freeze(globalThis);
+        z = 2;
+        r.push(z, Math.max(1, 2));
+        try { (function () { 'use strict'; z = 3; })(); r.push('no throw'); } catch (e) { r.push(e.constructor.name); }
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "1,5,6,8,TypeError,TypeError,f2,500,40,1,number,20,22,22,2,31,1,2,TypeError"
+    );
+}

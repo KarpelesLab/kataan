@@ -1140,6 +1140,7 @@ impl Interp {
                         }
                     }
                     self.realm.freeze_object(h);
+                    self.sync_all_global_binding_attrs(h);
                 }
                 arg(0) // returns the (now frozen) object
             }

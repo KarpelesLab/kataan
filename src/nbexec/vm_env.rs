@@ -601,6 +601,7 @@ impl Interp {
                     self.realm.set_non_configurable_property(g, name);
                 }
             }
+            self.sync_global_binding_attrs(g, name);
         }
     }
 
@@ -686,6 +687,9 @@ impl Interp {
                         return Err(self.const_assign());
                     }
                     return Ok(());
+                }
+                if fr.is_readonly_var(name) {
+                    return self.readonly_var_write(name);
                 }
                 fr.declare(name, value);
                 if fr.ptr_eq(&self.global_scope) {
@@ -870,6 +874,11 @@ impl Interp {
             }
             return Ok(());
         }
+        // A global `var` whose global-object property is non-writable: the
+        // write is that property's failed `[[Set]]`.
+        if self.current.is_readonly_var(name) {
+            return self.readonly_var_write(name);
+        }
         if self.current.set(name, value) {
             // A global `var` is mirrored as a property of the global object; keep
             // the two in step so `this.x` sees the assignment.
@@ -924,6 +933,19 @@ impl Interp {
             // on the *global* object (not a binding in the current scope), so it is
             // visible after a block/loop scope is popped.
             self.declare_sloppy_global(name, value)?;
+        }
+        Ok(())
+    }
+
+    /// A write to a global `var` binding whose global-object property is
+    /// non-writable (`Scope::is_readonly_var`): `PutValue`'s `[[Set]]` fails —
+    /// a TypeError in strict code, silently dropped in sloppy code.
+    pub(crate) fn readonly_var_write(&mut self, name: &str) -> Result<(), ExecError> {
+        if self.strict {
+            let m = self.new_str(&alloc::format!(
+                "Cannot assign to read only property '{name}' of object"
+            ));
+            return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
         Ok(())
     }

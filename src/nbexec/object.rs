@@ -782,6 +782,22 @@ impl Interp {
         desc: Handle,
         reflect: bool,
     ) -> Result<bool, ExecError> {
+        let r = self.apply_descriptor_inner(obj, key, desc, reflect);
+        // A global `var`/function binding is its global-object property: the
+        // new value / writability / accessor reaches the binding (a no-op for
+        // any other object). Done even when the definition threw or failed —
+        // a descriptor getter may have changed the property meanwhile.
+        self.sync_global_binding_attrs(obj, key);
+        r
+    }
+
+    fn apply_descriptor_inner(
+        &mut self,
+        obj: Handle,
+        key: &str,
+        desc: Handle,
+        reflect: bool,
+    ) -> Result<bool, ExecError> {
         // A VM closure's synthesized `length`/`name` become a physical slot
         // (same value and attributes, same key position) before being
         // redefined, so a partial descriptor updates a real property.

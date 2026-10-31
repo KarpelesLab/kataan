@@ -28,6 +28,11 @@ const B_CONST: u8 = 1;
 /// [`Binding`] flag: a *soft* immutable binding — a named function
 /// expression's own name (strict reassignment throws, sloppy is a no-op).
 const B_SOFT_CONST: u8 = 2;
+/// [`Binding`] flag: a global `var`/function binding whose global-object
+/// property is non-writable (`Object.defineProperty(globalThis, x, {writable:
+/// false})`, `Object.freeze(globalThis)`): a write is the failed `[[Set]]` of
+/// that property — strict code throws a TypeError, sloppy code drops it.
+const B_READONLY: u8 = 4;
 
 /// One binding of a frame: its value and its kind flags (`B_*`).
 #[derive(Clone, Copy)]
@@ -448,6 +453,42 @@ impl Scope {
             return b.flags & B_SOFT_CONST != 0;
         }
         data.parent.as_ref().is_some_and(|p| p.is_soft_const(name))
+    }
+
+    /// Marks (or clears) *this* frame's binding of `name` as backed by a
+    /// non-writable global-object property (see `B_READONLY`): a write to it
+    /// fails like a `[[Set]]` of that property. No binding, no change.
+    pub fn set_readonly_var(&self, name: &str, on: bool) {
+        let mut data = self.0.borrow_mut();
+        let root = data.parent.is_none();
+        if let Some(b) = data.slot_of_mut(name) {
+            let flags = if on {
+                b.flags | B_READONLY
+            } else {
+                b.flags & !B_READONLY
+            };
+            if flags != b.flags {
+                b.flags = flags;
+                if root {
+                    // Compiled code holds validated "plain binding" addresses
+                    // under the epoch.
+                    bump_global_binding_epoch();
+                }
+            }
+        }
+    }
+
+    /// Whether the nearest binding of `name` is backed by a non-writable
+    /// global-object property (see [`set_readonly_var`](Self::set_readonly_var)).
+    #[must_use]
+    pub fn is_readonly_var(&self, name: &str) -> bool {
+        let data = self.0.borrow();
+        if let Some(b) = data.slot_of(name) {
+            return b.flags & B_READONLY != 0;
+        }
+        data.parent
+            .as_ref()
+            .is_some_and(|p| p.is_readonly_var(name))
     }
 
     /// Whether `name` is bound in *this* scope (not the enclosing chain).

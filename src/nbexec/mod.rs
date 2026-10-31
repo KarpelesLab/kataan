@@ -6661,6 +6661,7 @@ impl Interp {
                     self.realm.set_non_configurable_property(g, name);
                 }
             }
+            self.sync_global_binding_attrs(g, name);
         }
     }
 

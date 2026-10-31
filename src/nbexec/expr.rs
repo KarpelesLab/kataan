@@ -1232,22 +1232,82 @@ impl Interp {
     /// (`delete_local` bumps the global binding epoch, retiring compiled
     /// code's cached address of the binding.)
     pub(crate) fn sync_global_object_delete(&mut self, handle: Handle, name: &str) {
-        let scope = if self.global_this.as_handle() == Some(handle.to_raw()) {
-            self.global_scope.clone()
-        } else if self.main_global_this.as_handle() == Some(handle.to_raw()) {
-            self.main_global_scope.clone()
-        } else if let Some(r) = self
-            .created_realms
-            .iter()
-            .find(|r| r.global_this.as_handle() == Some(handle.to_raw()))
-        {
-            r.global_scope.clone()
-        } else {
+        let Some(scope) = self.global_scope_of_object(handle) else {
             return;
         };
         if scope.has_local(name) && !scope.has_lexical(name) {
             scope.delete_local(name);
         }
+    }
+
+    /// The global scope whose global object is `handle` — the running realm's,
+    /// the main realm's (written from inside another realm) or a
+    /// `$262.createRealm()` realm's — or `None` for any other object.
+    fn global_scope_of_object(&self, handle: Handle) -> Option<Scope> {
+        let raw = Some(handle.to_raw());
+        if self.global_this.as_handle() == raw {
+            Some(self.global_scope.clone())
+        } else if self.main_global_this.as_handle() == raw {
+            Some(self.main_global_scope.clone())
+        } else {
+            self.created_realms
+                .iter()
+                .find(|r| r.global_this.as_handle() == raw)
+                .map(|r| r.global_scope.clone())
+        }
+    }
+
+    /// Brings the global *binding* `name` back in line with the global
+    /// object's property after something other than an ordinary write changed
+    /// that property (`Object.defineProperty`/`defineProperties`,
+    /// `Reflect.defineProperty`, `Object.freeze`/`seal`, a redeclaring
+    /// function declaration). A global `var`/function binding IS that property
+    /// (the global Environment Record's object record is the global object);
+    /// the declarative slot is only its fast mirror, so:
+    /// - a data property's value is copied into the slot, and the slot is
+    ///   marked read-only exactly while the property is non-writable (writes
+    ///   then fail like the property's `[[Set]]`);
+    /// - an accessor retires the slot altogether: identifier resolution then
+    ///   reaches the property through the global-object fallback, which calls
+    ///   the getter/setter (as for any binding-less global property).
+    ///
+    /// A global `let`/`const`/`class` is no property and is left alone, as is
+    /// any object that is not a global object.
+    pub(crate) fn sync_global_binding_attrs(&mut self, handle: Handle, name: &str) {
+        let Some(scope) = self.global_scope_of_object(handle) else {
+            return;
+        };
+        self.sync_binding_from_property(&scope, handle, name);
+    }
+
+    /// [`Self::sync_global_binding_attrs`] for every `var`/function binding
+    /// of the global scope whose global object is `handle` (after
+    /// `Object.freeze`/`Object.seal` of it).
+    pub(crate) fn sync_all_global_binding_attrs(&mut self, handle: Handle) {
+        let Some(scope) = self.global_scope_of_object(handle) else {
+            return;
+        };
+        for (name, _, _) in scope.local_bindings() {
+            self.sync_binding_from_property(&scope, handle, &name);
+        }
+    }
+
+    fn sync_binding_from_property(&mut self, scope: &Scope, g: Handle, name: &str) {
+        if !scope.has_local(name) || scope.has_lexical(name) {
+            return;
+        }
+        if self.realm.accessor(g, name).is_some() {
+            scope.delete_local(name);
+            return;
+        }
+        let Some(v) = self.realm.get_property(g, name) else {
+            return;
+        };
+        if scope.get(name).is_some_and(|v| v.is_tdz()) {
+            return;
+        }
+        scope.set(name, v);
+        scope.set_readonly_var(name, self.realm.property_is_readonly(g, name));
     }
 
     /// `arr[i] = v` for an array index: the dense fast path unless the index carries
