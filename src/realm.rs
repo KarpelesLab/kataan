@@ -3931,35 +3931,58 @@ impl Realm {
 
     /// Allocates a pending `Promise`.
     pub fn new_promise(&mut self) -> Handle {
-        self.heap
-            .alloc(Cell::Promise(alloc::rc::Rc::new(core::cell::RefCell::new(
-                crate::cell::PromiseState {
-                    status: crate::cell::PromiseStatus::Pending,
-                    value: NanBox::undefined(),
-                    reactions: alloc::vec::Vec::new(),
-                    already_resolved: false,
-                },
-            ))))
+        self.heap.alloc(Cell::Promise(crate::cell::PromiseState {
+            status: crate::cell::PromiseStatus::Pending,
+            value: NanBox::undefined(),
+            reactions: alloc::vec::Vec::new(),
+            already_resolved: false,
+        }))
     }
 
-    /// The shared promise state at `handle`, if it is a promise — or a **Promise
-    /// subclass** instance (`class P extends Promise`), whose backing
-    /// `Cell::Promise` is stored in a hidden internal slot so every promise
-    /// operation (then/resolve/reject/combinators/microtasks) works on it.
+    /// The `Cell::Promise` holding the state of the promise at `handle`: the
+    /// cell itself for a promise, or for a **Promise subclass** instance
+    /// (`class P extends Promise`) the backing `Cell::Promise` stored in a
+    /// hidden internal slot, so every promise operation
+    /// (then/resolve/reject/combinators/microtasks) works on it. `None` for
+    /// anything else.
     #[must_use]
-    pub fn promise_state(
-        &self,
-        handle: Handle,
-    ) -> Option<alloc::rc::Rc<core::cell::RefCell<crate::cell::PromiseState>>> {
-        if let Some(p) = self.heap.get(handle)?.as_promise() {
-            return Some(p.clone());
+    #[inline]
+    pub fn promise_cell(&self, handle: Handle) -> Option<Handle> {
+        match self.heap.get(handle)? {
+            Cell::Promise(_) => Some(handle),
+            Cell::Object(_) => self.promise_subclass_cell(handle),
+            _ => None,
         }
-        // A subclass instance: follow the internal slot to its backing promise cell.
-        let inner = self.get_property(handle, PROMISE_STATE_SLOT)?.as_handle()?;
-        self.heap
-            .get(Handle::from_raw(inner))?
-            .as_promise()
-            .cloned()
+    }
+
+    #[inline(never)]
+    fn promise_subclass_cell(&self, handle: Handle) -> Option<Handle> {
+        let inner = Handle::from_raw(self.get_property(handle, PROMISE_STATE_SLOT)?.as_handle()?);
+        matches!(self.heap.get(inner)?, Cell::Promise(_)).then_some(inner)
+    }
+
+    /// Whether `handle` is a promise (or a Promise subclass instance): it has
+    /// a `[[PromiseState]]`.
+    #[must_use]
+    #[inline]
+    pub fn is_promise(&self, handle: Handle) -> bool {
+        self.promise_cell(handle).is_some()
+    }
+
+    /// The state of the promise at `handle` (see [`promise_cell`](Self::promise_cell)).
+    #[must_use]
+    #[inline]
+    pub fn promise_state(&self, handle: Handle) -> Option<&crate::cell::PromiseState> {
+        let cell = self.promise_cell(handle)?;
+        self.heap.get(cell)?.as_promise()
+    }
+
+    /// The state of the promise at `handle`, mutably (through the heap's
+    /// write barrier: the state may come to hold young handles).
+    #[inline]
+    pub fn promise_state_mut(&mut self, handle: Handle) -> Option<&mut crate::cell::PromiseState> {
+        let cell = self.promise_cell(handle)?;
+        self.heap.get_mut(cell)?.as_promise_mut()
     }
 
     /// The string at `handle` as a `String`, or `None` if it is not a string

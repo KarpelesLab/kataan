@@ -2949,7 +2949,7 @@ impl Interp {
                 (false, true) => "Set",
                 (false, false) => "Map",
             }
-        } else if self.realm.promise_state(handle).is_some() {
+        } else if self.realm.is_promise(handle) {
             "Promise"
         } else if self.realm.object_keys(handle).is_some() {
             // A plain object reports `Object`. (Error objects are handled earlier in

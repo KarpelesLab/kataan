@@ -21,9 +21,7 @@ use crate::heap::Handle;
 use crate::nanbox::NanBox;
 use crate::object::Object;
 use crate::rope::Rope;
-use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 /// A `Promise`'s settlement status.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,8 +52,8 @@ pub struct Reaction {
     pub cap: Option<(NanBox, NanBox)>,
 }
 
-/// A `Promise`'s internal state, shared (`Rc`) between the promise and its
-/// resolve/reject functions.
+/// A `Promise`'s internal state, held inline in its heap cell (the resolving
+/// functions and reactions name the promise by handle).
 pub struct PromiseState {
     /// The settlement status.
     pub status: PromiseStatus,
@@ -319,8 +317,9 @@ pub enum Cell {
         /// The bound receiver (e.g. the promise to settle).
         target: Handle,
     },
-    /// A `Promise` (its shared settlement state).
-    Promise(Rc<RefCell<PromiseState>>),
+    /// A `Promise` (its settlement state, mutated through the heap's
+    /// write-barriered `get_mut`).
+    Promise(PromiseState),
     /// A `Date`: milliseconds since the Unix epoch (UTC).
     Date(f64),
     /// The internal-slot **data carrier** for a `Temporal.*` instance (one
@@ -1286,9 +1285,17 @@ impl Cell {
         }
     }
 
-    /// The shared promise state, if this cell is a promise.
+    /// The promise state, if this cell is a promise.
     #[must_use]
-    pub fn as_promise(&self) -> Option<&Rc<RefCell<PromiseState>>> {
+    pub fn as_promise(&self) -> Option<&PromiseState> {
+        match self {
+            Cell::Promise(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The promise state, mutably, if this cell is a promise.
+    pub fn as_promise_mut(&mut self) -> Option<&mut PromiseState> {
         match self {
             Cell::Promise(p) => Some(p),
             _ => None,
@@ -1470,19 +1477,11 @@ impl Trace for Cell {
     }
 
     /// A host environment's bindings (`Rc<RefCell<…>>` scopes, shared with
-    /// the interpreter's environment chain) and a pending promise's state (an
-    /// `Rc<RefCell<…>>` that `then` and the resolving functions update) change
-    /// through a shared borrow of the cell. A settled promise's handles are
-    /// final: its value is written once, by the settlement, and reactions are
-    /// only recorded while it is pending.
+    /// the interpreter's environment chain) change through a shared borrow of
+    /// the cell. (A promise's state is inline and changes only through
+    /// `Heap::get_mut`, which is the write barrier.)
     fn interior_mutable(&self) -> bool {
-        match self {
-            Cell::Env(_) => true,
-            Cell::Promise(p) => p
-                .try_borrow()
-                .map_or(true, |s| s.status == PromiseStatus::Pending),
-            _ => false,
-        }
+        matches!(self, Cell::Env(_))
     }
 
     #[inline(always)]
@@ -1560,8 +1559,7 @@ impl Trace for Cell {
                 }
             }
             // A promise keeps its value and reaction handlers reachable.
-            Cell::Promise(p) => {
-                let s = p.borrow();
+            Cell::Promise(s) => {
                 if let Some(raw) = s.value.as_handle() {
                     visit(Handle::from_raw(raw));
                 }
@@ -1638,8 +1636,7 @@ impl crate::gc::Relocate for Cell {
                 // has just rewritten — drop the index so it is rebuilt.
                 *index = None;
             }
-            Cell::Promise(p) => {
-                let mut s = p.borrow_mut();
+            Cell::Promise(s) => {
                 fwd(&mut s.value);
                 for r in &mut s.reactions {
                     fwd(&mut r.on_fulfilled);

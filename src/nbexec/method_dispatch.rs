@@ -2029,7 +2029,7 @@ impl Interp {
             // is returned unchanged.
             if method == "resolve"
                 && let Some(raw) = arg(0).as_handle()
-                && self.realm.promise_state(Handle::from_raw(raw)).is_some()
+                && self.realm.is_promise(Handle::from_raw(raw))
             {
                 let ctor = self.read_member(Handle::from_raw(raw), "constructor")?;
                 if ctor.as_handle() == recv.as_handle() {
@@ -2054,7 +2054,7 @@ impl Interp {
                     // unchanged (same identity). A promise whose `constructor` was
                     // reassigned (e.g. to `null`) is instead wrapped in a fresh one.
                     if let Some(raw) = arg(0).as_handle()
-                        && self.realm.promise_state(Handle::from_raw(raw)).is_some()
+                        && self.realm.is_promise(Handle::from_raw(raw))
                     {
                         let ctor = self.read_member(Handle::from_raw(raw), "constructor")?;
                         if ctor.as_handle() == recv.as_handle() {
@@ -2080,7 +2080,7 @@ impl Interp {
         // synchronously: a returned value resolves the capability (adopting a
         // thenable), a throw (incl. a non-callable `fn`) rejects it. Gated to a
         // non-promise receiver so a `p.try` on a thenable named "try" is not hijacked.
-        if method == "try" && self.realm.promise_state(handle).is_none() {
+        if method == "try" && !self.realm.is_promise(handle) {
             if !self.is_constructor(recv) {
                 return Err(self.type_error("Promise.try called on a non-constructor"));
             }

@@ -437,13 +437,10 @@ impl Interp {
         let _ = self.run_event_loop();
         let promise = promise?;
         // A rejected top-level capability is the graph's evaluation error.
-        if let Some(state) = self.realm.promise_state(promise) {
-            let st = state.borrow();
-            if st.status == crate::cell::PromiseStatus::Rejected {
-                let v = st.value;
-                drop(st);
-                return Err(ExecError::Throw(v));
-            }
+        if let Some(st) = self.realm.promise_state(promise)
+            && st.status == crate::cell::PromiseStatus::Rejected
+        {
+            return Err(ExecError::Throw(st.value));
         }
         self.run_event_loop()?;
         self.namespace_object(entry_key)
@@ -1180,11 +1177,10 @@ impl Interp {
     /// rejected top-level capability as the thrown evaluation error.
     fn evaluate_module_now(&mut self, key: &str) -> Result<(), ExecError> {
         let promise = self.evaluate_module(key)?;
-        if let Some(state) = self.realm.promise_state(promise) {
-            let st = state.borrow();
-            if st.status == crate::cell::PromiseStatus::Rejected {
-                return Err(ExecError::Throw(st.value));
-            }
+        if let Some(st) = self.realm.promise_state(promise)
+            && st.status == crate::cell::PromiseStatus::Rejected
+        {
+            return Err(ExecError::Throw(st.value));
         }
         Ok(())
     }
@@ -2056,7 +2052,7 @@ impl Interp {
                 if this
                     .realm
                     .promise_state(p)
-                    .is_some_and(|s| s.borrow().status == crate::cell::PromiseStatus::Pending)
+                    .is_some_and(|s| s.status == crate::cell::PromiseStatus::Pending)
                 {
                     pending.push(p);
                 }

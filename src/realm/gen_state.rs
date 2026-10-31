@@ -25,22 +25,26 @@ impl Realm {
     /// the write barrier. `false`, having changed nothing, when `h` is not an
     /// array.
     pub(crate) fn internal_array_put(&mut self, h: Handle, elems: Vec<NanBox>) -> bool {
-        if !matches!(self.heap.get(h), Some(Cell::Array(_))) {
-            return false;
-        }
-        // (The barrier of a young array records nothing, so only an old one
-        // or an incremental cycle's shading needs the walk.)
-        if self.incremental.is_some() || self.heap.age(h).is_some_and(|a| a >= crate::gc::OLD_AGE) {
+        // The generational barrier is the mutable borrow itself (an old array
+        // enters the remembered set, as a per-element `record_edge` would
+        // make it); only an incremental cycle's shading needs the elements.
+        if self.incremental.is_some() {
+            if !matches!(self.heap.get(h), Some(Cell::Array(_))) {
+                return false;
+            }
             for &x in &elems {
                 if x.as_handle().is_some() {
                     self.write_barrier(h, x);
                 }
             }
         }
-        if let Some(a) = self.heap.get_mut(h).and_then(Cell::as_array_mut) {
-            *a.vec_mut() = elems;
+        match self.heap.get_mut(h).and_then(Cell::as_array_mut) {
+            Some(a) => {
+                *a.vec_mut() = elems;
+                true
+            }
+            None => false,
         }
-        true
     }
 
     /// Overwrites element `i` of the engine-internal array at `h` with the
@@ -92,7 +96,12 @@ impl Realm {
     /// with no own properties whose `[[Prototype]]` is the intrinsic
     /// `%Promise.prototype%`, and that object's own `constructor` is a data
     /// property — its value. `None` otherwise (the full `[[Get]]`).
-    pub(crate) fn plain_promise_constructor(&self, h: Handle) -> Option<NanBox> {
+    /// `cache` is the caller's inline cache for that `constructor` read.
+    pub(crate) fn plain_promise_constructor(
+        &self,
+        h: Handle,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
         if !matches!(self.heap.get(h), Some(Cell::Promise(_)))
             || self.aux_props.get(&h.to_raw()).is_some()
         {
@@ -102,7 +111,7 @@ impl Realm {
         if self.object_proto(h) != Some(proto) {
             return None;
         }
-        self.heap.get(proto)?.as_object()?.get("constructor")
+        self.object_get_cached(proto, "constructor", cache)
     }
 
     /// CreateIterResultObject(`value`, `done`): a fresh ordinary object with

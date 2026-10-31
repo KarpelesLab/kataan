@@ -170,7 +170,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
             || realm.bigint_at(*r).is_some()
             || realm.vm_function(*r).is_some()
             || realm.collection_is_set(*r).is_some()
-            || realm.promise_state(*r).is_some()
+            || realm.is_promise(*r)
             || realm.proxy_at(*r).is_some()
             || realm.regexp_flags(*r).is_some()
             || realm.symbol_at(*r).is_some()
@@ -214,9 +214,8 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 })
                 .collect();
             SnapCell::Collection { is_set, entries }
-        } else if let Some(state) = realm.promise_state(h) {
+        } else if let Some(s) = realm.promise_state(h) {
             let (status, value) = {
-                let s = state.borrow();
                 let status = match s.status {
                     crate::cell::PromiseStatus::Pending => 0u8,
                     crate::cell::PromiseStatus::Fulfilled => 1,
@@ -506,8 +505,7 @@ pub fn restore(realm: &mut Realm, snap: &Snapshot) -> Vec<Handle> {
             }
             SnapCell::Promise { status, value } => {
                 let val = resolve(value, &handles);
-                if let Some(state) = realm.promise_state(*h) {
-                    let mut s = state.borrow_mut();
+                if let Some(s) = realm.promise_state_mut(*h) {
                     s.status = match status {
                         1 => crate::cell::PromiseStatus::Fulfilled,
                         2 => crate::cell::PromiseStatus::Rejected,
@@ -1500,8 +1498,7 @@ mod tests {
         realm.set_property(obj, "big", NanBox::handle(big.to_raw()));
         let prom = realm.new_promise();
         {
-            let st = realm.promise_state(prom).unwrap();
-            let mut s = st.borrow_mut();
+            let s = realm.promise_state_mut(prom).unwrap();
             s.status = crate::cell::PromiseStatus::Fulfilled;
             s.value = NanBox::number(8.0);
         }
@@ -1577,7 +1574,6 @@ mod tests {
         );
         {
             let s = realm2.promise_state(prom2).unwrap();
-            let s = s.borrow();
             assert!(matches!(s.status, crate::cell::PromiseStatus::Fulfilled));
             assert_eq!(s.value, NanBox::number(8.0));
         }
@@ -1988,15 +1984,13 @@ mod tests {
         let tag = NanBox::handle(realm.new_string("ok").to_raw());
         realm.set_property(payload, "tag", tag);
         {
-            let st = realm.promise_state(fulfilled).unwrap();
-            let mut s = st.borrow_mut();
+            let s = realm.promise_state_mut(fulfilled).unwrap();
             s.status = crate::cell::PromiseStatus::Fulfilled;
             s.value = NanBox::handle(payload.to_raw());
         }
         let rejected = realm.new_promise();
         {
-            let st = realm.promise_state(rejected).unwrap();
-            let mut s = st.borrow_mut();
+            let s = realm.promise_state_mut(rejected).unwrap();
             s.status = crate::cell::PromiseStatus::Rejected;
             s.value = NanBox::number(42.0);
         }
@@ -2009,8 +2003,7 @@ mod tests {
         let roots = restore(&mut realm2, &reloaded);
 
         // The fulfilled promise's status + object value survive.
-        let st = realm2.promise_state(roots[0]).unwrap();
-        let s = st.borrow();
+        let s = realm2.promise_state(roots[0]).unwrap();
         assert_eq!(s.status, crate::cell::PromiseStatus::Fulfilled);
         let obj = Handle::from_raw(s.value.as_handle().unwrap());
         let tag2 = realm2.get_property(obj, "tag").unwrap();
@@ -2019,8 +2012,7 @@ mod tests {
             Some(String::from("ok"))
         );
         // The rejected promise's reason survives.
-        let st2 = realm2.promise_state(roots[1]).unwrap();
-        let s2 = st2.borrow();
+        let s2 = realm2.promise_state(roots[1]).unwrap();
         assert_eq!(s2.status, crate::cell::PromiseStatus::Rejected);
         assert_eq!(s2.value, NanBox::number(42.0));
     }

@@ -358,6 +358,9 @@ pub struct Interp {
     eval_param_names: Option<Vec<String>>,
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: alloc::collections::VecDeque<Job>,
+    /// The inline cache of `PromiseResolve`'s read of `%Promise.prototype%`'s
+    /// `constructor` (see `Realm::plain_promise_constructor`).
+    promise_ctor_ic: crate::ic::PropertyCache,
     /// Pending `setTimeout` callbacks (macrotasks), run after the microtask queue
     /// drains — ordered by absolute virtual fire-time `at`, then insertion (`seq`).
     macrotasks: TimerQueue,
@@ -924,7 +927,7 @@ impl<'c> Ctx<'c> {
     pub fn is_promise(&self, v: NanBox) -> bool {
         v.as_handle()
             .map(Handle::from_raw)
-            .is_some_and(|h| self.interp.realm.promise_state(h).is_some())
+            .is_some_and(|h| self.interp.realm.is_promise(h))
     }
 
     /// Whether `v` is a constructor (usable as the target of `new` / `construct`).
@@ -3025,6 +3028,7 @@ impl Interp {
             in_field_initializer: false,
             eval_param_names: None,
             microtasks: alloc::collections::VecDeque::new(),
+            promise_ctor_ic: crate::ic::PropertyCache::default(),
             macrotasks: TimerQueue::default(),
             timer_next_id: 1,
             timer_seq: 0,

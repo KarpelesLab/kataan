@@ -1510,8 +1510,7 @@ impl Interp {
                     // `[[AlreadyResolved]]` flag (even when settlement is deferred to
                     // a thenable job), so a later resolve or reject from the same
                     // pair is a no-op.
-                    if let Some(st) = self.realm.promise_state(target) {
-                        let mut st = st.borrow_mut();
+                    if let Some(st) = self.realm.promise_state_mut(target) {
                         if st.already_resolved {
                             return Ok(NanBox::undefined());
                         }
@@ -2477,7 +2476,7 @@ impl Interp {
                 let already = self
                     .realm
                     .promise_state(promise)
-                    .is_some_and(|st| st.borrow().already_resolved);
+                    .is_some_and(|st| st.already_resolved);
                 if !already {
                     self.settle(promise, e, false);
                 }

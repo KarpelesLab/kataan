@@ -200,11 +200,10 @@ impl Interp {
     /// reactions as microtasks.
     pub(crate) fn settle(&mut self, handle: Handle, value: NanBox, fulfilled: bool) {
         use crate::cell::PromiseStatus::{Fulfilled, Pending, Rejected};
-        let Some(state) = self.realm.promise_state(handle) else {
+        let Some(s) = self.realm.promise_state_mut(handle) else {
             return;
         };
         let reactions = {
-            let mut s = state.borrow_mut();
             if s.status != Pending {
                 return;
             }
@@ -304,10 +303,13 @@ impl Interp {
     /// async-generator tick accounting, hence the `Result`.
     pub(crate) fn promise_resolve_checked(&mut self, value: NanBox) -> Result<Handle, ExecError> {
         if let Some(raw) = value.as_handle()
-            && self.realm.promise_state(Handle::from_raw(raw)).is_some()
+            && self.realm.is_promise(Handle::from_raw(raw))
         {
             let h = Handle::from_raw(raw);
-            let ctor = match self.realm.plain_promise_constructor(h) {
+            let ctor = match self
+                .realm
+                .plain_promise_constructor(h, &mut self.promise_ctor_ic)
+            {
                 Some(c) => c,
                 None => self.read_member(h, "constructor")?,
             };
@@ -343,7 +345,7 @@ impl Interp {
             Err(_) => value
                 .as_handle()
                 .map(Handle::from_raw)
-                .filter(|h| self.realm.promise_state(*h).is_some())
+                .filter(|h| self.realm.is_promise(*h))
                 .unwrap_or_else(|| {
                     let p = self.fresh_promise();
                     self.resolve_with(p, value);
@@ -398,7 +400,7 @@ impl Interp {
                 let h = recv
                     .as_handle()
                     .map(Handle::from_raw)
-                    .filter(|h| self.realm.promise_state(*h).is_some());
+                    .filter(|h| self.realm.is_promise(*h));
                 match h {
                     Some(h) => self.perform_promise_then_method(h, arg(0), arg(1)),
                     None => Err(self.type_error("Promise.prototype.then called on a non-promise")),
@@ -444,7 +446,7 @@ impl Interp {
         on_r: NanBox,
     ) -> Result<NanBox, ExecError> {
         // Brand check: `this` must have a `[[PromiseState]]` internal slot.
-        if self.realm.promise_state(handle).is_none() {
+        if !self.realm.is_promise(handle) {
             return Err(self.type_error("Promise.prototype.then called on a non-promise"));
         }
         let c = self.promise_species_constructor(handle)?;
@@ -500,7 +502,7 @@ impl Interp {
         on_r: NanBox,
         sink: Handle,
     ) {
-        debug_assert!(self.realm.promise_state(sink).is_none());
+        debug_assert!(!self.realm.is_promise(sink));
         self.add_reaction(handle, on_f, on_r, false, None, sink);
     }
 
@@ -516,16 +518,13 @@ impl Interp {
         result: Handle,
     ) {
         use crate::cell::PromiseStatus::{Fulfilled, Pending};
-        let state = self.realm.promise_state(handle).expect("a promise");
-        let settled = {
-            let s = state.borrow();
-            match s.status {
-                Pending => None,
-                status => Some((status == Fulfilled, s.value)),
-            }
+        let s = self.realm.promise_state_mut(handle).expect("a promise");
+        let settled = match s.status {
+            Pending => None,
+            status => Some((status == Fulfilled, s.value)),
         };
         match settled {
-            None => state.borrow_mut().reactions.push(crate::cell::Reaction {
+            None => s.reactions.push(crate::cell::Reaction {
                 on_fulfilled: on_f,
                 on_rejected: on_r,
                 result,
@@ -781,26 +780,23 @@ impl Interp {
         // with a callable `then`) is adopted — its `then` is called (one extra
         // tick) and we await the result; a primitive passes straight through. Only
         // objects are wrapped, so the common primitive await stays allocation-free.
-        let state = match value
-            .as_handle()
-            .and_then(|raw| self.realm.promise_state(Handle::from_raw(raw)))
-        {
-            Some(s) => s,
-            None if value.as_handle().is_some() => {
-                // A potential thenable: PromiseResolve adopts it (reading `.then`
-                // exactly once via `resolve_with`); a non-thenable object fulfills
-                // synchronously, so this adds no microtask for the ordinary case.
-                let p = self.promise_resolve(value);
-                self.realm
-                    .promise_state(p)
-                    .expect("fresh promise has state")
-            }
+        let promise = match value.as_handle().map(Handle::from_raw) {
+            Some(h) if self.realm.is_promise(h) => h,
+            // A potential thenable: PromiseResolve adopts it (reading `.then`
+            // exactly once via `resolve_with`); a non-thenable object fulfills
+            // synchronously, so this adds no microtask for the ordinary case.
+            Some(_) => self.promise_resolve(value),
             None => return Ok(value), // a primitive
+        };
+        let status = |this: &Self| {
+            this.realm
+                .promise_state(promise)
+                .map_or(Pending, |s| s.status)
         };
         // Make progress on the event loop until the promise settles: drain
         // microtasks first, then run a `setTimeout` macrotask if still pending (so an
         // `await` / `Promise.all` on a timer-backed promise observes its value).
-        while state.borrow().status == Pending
+        while status(self) == Pending
             && (!self.microtasks.is_empty() || !self.macrotasks.is_empty())
         {
             if self.microtasks.is_empty() {
@@ -809,11 +805,14 @@ impl Interp {
                 self.run_one_microtask()?;
             }
         }
-        let s = state.borrow();
-        match s.status {
-            Fulfilled => Ok(s.value),
-            Rejected => Err(ExecError::Throw(s.value)),
-            Pending => Ok(NanBox::undefined()), // never settles
+        match self
+            .realm
+            .promise_state(promise)
+            .map(|s| (s.status, s.value))
+        {
+            Some((Fulfilled, v)) => Ok(v),
+            Some((Rejected, v)) => Err(ExecError::Throw(v)),
+            _ => Ok(NanBox::undefined()), // never settles
         }
     }
 

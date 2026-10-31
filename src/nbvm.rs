@@ -7137,11 +7137,10 @@ fn symbol_coercion_error(realm: &mut Realm, x: NanBox, y: NanBox, msg: &str) -> 
 /// pending reactions as microtasks. A no-op if already settled or not a promise.
 fn settle(ctx: &mut Ctx, p: Handle, value: NanBox, fulfilled: bool) {
     use crate::cell::PromiseStatus;
-    let Some(state) = ctx.realm.promise_state(p) else {
+    let Some(s) = ctx.realm.promise_state_mut(p) else {
         return;
     };
     let reactions = {
-        let mut s = state.borrow_mut();
         if s.status != PromiseStatus::Pending {
             return;
         }
@@ -7173,15 +7172,12 @@ fn settle(ctx: &mut Ctx, p: Handle, value: NanBox, fulfilled: bool) {
 fn promise_then(ctx: &mut Ctx, p: Handle, on_f: NanBox, on_r: NanBox) -> Handle {
     use crate::cell::{PromiseStatus, Reaction};
     let result = ctx.realm.new_promise();
-    let Some(state) = ctx.realm.promise_state(p) else {
+    let Some(s) = ctx.realm.promise_state_mut(p) else {
         return result;
     };
-    let (status, value) = {
-        let s = state.borrow();
-        (s.status, s.value)
-    };
+    let (status, value) = (s.status, s.value);
     match status {
-        PromiseStatus::Pending => state.borrow_mut().reactions.push(Reaction {
+        PromiseStatus::Pending => s.reactions.push(Reaction {
             on_fulfilled: on_f,
             on_rejected: on_r,
             result,
@@ -11652,7 +11648,7 @@ fn builtin_method(
     }
 
     // --- Promise methods (`then`/`catch`/`finally`) ---
-    if ctx.realm.promise_state(h).is_some() {
+    if ctx.realm.is_promise(h) {
         let result = match key {
             "then" => promise_then(
                 ctx,
