@@ -2145,25 +2145,38 @@ fn vm_set_elem_mode(
     // or a huge length: the host's (sparse) array.
     // An append (`arr[arr.length] = v`) whose index an object on the
     // prototype chain owns (a setter / read-only element) is the host's too.
-    let past_end = key.as_number().is_some_and(|n| {
-        recv.as_handle()
-            .map(Handle::from_raw)
-            .and_then(|h| ctx.realm.array_length(h).map(|len| (h, len)))
-            .is_some_and(|(h, len)| {
+    let past_end = match (recv.as_handle().map(Handle::from_raw), key.as_number()) {
+        (Some(h), Some(n)) => match ctx.realm.array_length(h) {
+            Some(len) => {
                 // (Past the dense storage of a sparse array, too.)
                 let dense = ctx.realm.array_elements(h).map_or(0, <[_]>::len);
+                // The index the prototype chain may own: the append slot, or a
+                // hole (a setter, a proxy's `set` trap). The default chain with
+                // no index keys anywhere owns none (a memoized check), which
+                // spares a key format and chain walk per store into a
+                // `new Array(n)`.
+                let probe = if n == len as f64 {
+                    Some(len)
+                } else if n >= 0.0
+                    && n < dense as f64
+                    && n == (n as usize) as f64
+                    && ctx.realm.array_hole_at(h, n as usize)
+                {
+                    Some(n as usize)
+                } else {
+                    None
+                };
                 n > len as f64
                     || n > dense as f64
-                    || (n == len as f64 && proto_owns_key(&ctx.realm, h, &alloc::format!("{len}")))
-                    // A hole whose index the prototype chain owns (a setter,
-                    // a proxy's `set` trap).
-                    || (n >= 0.0
-                        && n < dense as f64
-                        && n == (n as usize) as f64
-                        && ctx.realm.array_hole_at(h, n as usize)
-                        && proto_owns_key(&ctx.realm, h, &alloc::format!("{}", n as usize)))
-            })
-    });
+                    || probe.is_some_and(|i| {
+                        !ctx.realm.array_chain_index_free(h)
+                            && proto_owns_key(&ctx.realm, h, &alloc::format!("{i}"))
+                    })
+            }
+            None => false,
+        },
+        _ => false,
+    };
     let mut to_host = read_needs_host(ctx, recv)
         || past_end
         || is_mapped_arguments(&ctx.realm, recv)
@@ -2175,14 +2188,16 @@ fn vm_set_elem_mode(
         // An index write on an ordinary object that is non-extensible, or whose
         // prototype chain owns the index (a typed array, a setter), is the
         // host's OrdinarySet.
+        // (The key is formatted only for such an object, not for every
+        // array element store.)
         || key.as_number().is_some_and(|n| {
             recv.as_handle().map(Handle::from_raw).is_some_and(|h| {
-                let k = ctx.realm.to_display_string(NanBox::number(n));
-                ctx.realm.array_length(h).is_none()
-                    && ctx.realm.typed_len(h).is_none()
-                    && (!plain_write_ok(&ctx.realm, h, &k)
+                ctx.realm.array_length(h).is_none() && ctx.realm.typed_len(h).is_none() && {
+                    let k = ctx.realm.to_display_string(NanBox::number(n));
+                    !plain_write_ok(&ctx.realm, h, &k)
                         || ctx.realm.accessor(h, &k).is_some()
-                        || proto_owns_key(&ctx.realm, h, &k))
+                        || proto_owns_key(&ctx.realm, h, &k)
+                }
             })
         });
     if !to_host && key.as_number().is_none() {

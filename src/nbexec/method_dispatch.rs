@@ -6406,6 +6406,19 @@ impl Interp {
     /// `Set(O, ToString(i), v, true)`: a write `[[Set]]` refuses (a read-only
     /// index, a new index on a non-extensible array) is a TypeError.
     fn array_like_set(&mut self, handle: Handle, i: usize, v: NanBox) -> Result<(), ExecError> {
+        // An in-range index of a real array whose indices are plain data (no
+        // per-index accessor or attribute) and whose prototype chain is the
+        // default one with no index keys: `[[Set]]` is the element write
+        // itself. (A refused write, a frozen or non-extensible array's, takes
+        // the general path below, which throws.) The general path allocates a
+        // key string per index: `new Array(2e6).fill(0)` took 420 ms.
+        if self.realm.array_length(handle).is_some_and(|len| i < len)
+            && !self.realm.array_has_index_side_table(handle)
+            && self.realm.array_chain_index_free(handle)
+            && self.realm.set_element(handle, i, v)
+        {
+            return Ok(());
+        }
         let name = alloc::format!("{i}");
         let key = self.new_str(&name);
         self.set_or_throw(handle, key, &name, v)
