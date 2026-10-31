@@ -549,10 +549,13 @@ impl Interp {
     /// Drains the microtask queue (the event loop), running each promise
     /// reaction to completion.
     pub(crate) fn drain_microtasks(&mut self) -> Result<(), ExecError> {
-        while !self.microtasks.is_empty() {
-            self.run_one_microtask()?;
+        let outer = core::mem::replace(&mut self.async_batch, true);
+        let mut r = Ok(());
+        while r.is_ok() && !self.microtasks.is_empty() {
+            r = self.run_one_microtask();
         }
-        Ok(())
+        self.async_batch = outer;
+        r
     }
 
     /// Queues a macrotask (a `setTimeout`-style callback) on the virtual clock and
@@ -796,15 +799,21 @@ impl Interp {
         // Make progress on the event loop until the promise settles: drain
         // microtasks first, then run a `setTimeout` macrotask if still pending (so an
         // `await` / `Promise.all` on a timer-backed promise observes its value).
-        while status(self) == Pending
+        // (Job by job: the wait ends as soon as the promise settles.)
+        let outer = core::mem::replace(&mut self.async_batch, false);
+        let mut r = Ok(());
+        while r.is_ok()
+            && status(self) == Pending
             && (!self.microtasks.is_empty() || !self.macrotasks.is_empty())
         {
-            if self.microtasks.is_empty() {
-                self.run_one_macrotask()?;
+            r = if self.microtasks.is_empty() {
+                self.run_one_macrotask()
             } else {
-                self.run_one_microtask()?;
-            }
+                self.run_one_microtask()
+            };
         }
+        self.async_batch = outer;
+        r?;
         match self
             .realm
             .promise_state(promise)

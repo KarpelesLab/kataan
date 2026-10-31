@@ -66,6 +66,13 @@ impl Realm {
         }
     }
 
+    /// Removes the first element of the engine-internal array at `h` in
+    /// place (an async generator's request queue): no user code can see
+    /// it, so this is a plain shift of its elements.
+    pub(crate) fn internal_array_shift(&mut self, h: Handle) -> Option<NanBox> {
+        self.heap.get_mut(h)?.as_array_mut()?.shift_front()
+    }
+
     /// The own data property `key` of the ordinary object at `h` through the
     /// inline cache `cache` (`None` for any other cell, or no such key).
     pub(crate) fn object_get_cached(

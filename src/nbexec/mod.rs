@@ -358,6 +358,11 @@ pub struct Interp {
     eval_param_names: Option<Vec<String>>,
     /// The promise-reaction microtask queue, drained after the script.
     microtasks: alloc::collections::VecDeque<Job>,
+    /// Whether the running job is one of a plain microtask drain's (not of a
+    /// wait for one promise to settle): a VM resumption job may then run the
+    /// resumption jobs queued right behind it in its own context (see
+    /// `VmHost::peek_batch_job`), as the drain would run them next.
+    async_batch: bool,
     /// The inline cache of `PromiseResolve`'s read of `%Promise.prototype%`'s
     /// `constructor` (see `Realm::plain_promise_constructor`).
     promise_ctor_ic: crate::ic::PropertyCache,
@@ -1408,7 +1413,7 @@ pub(crate) const N_GEN_THROW: u16 = 522;
 /// An async generator's `next(v)` — like `N_GEN_NEXT` but *always* returns a
 /// promise, so even a brand-check failure (a `this` that is not an async
 /// generator) rejects rather than throwing synchronously.
-const N_ASYNC_GEN_NEXT: u16 = 523;
+pub(crate) const N_ASYNC_GEN_NEXT: u16 = 523;
 /// An async generator's `return(v)` — the promise-returning counterpart.
 const N_ASYNC_GEN_RETURN: u16 = 524;
 /// An async generator's `throw(e)` — the promise-returning counterpart.
@@ -1416,11 +1421,11 @@ const N_ASYNC_GEN_THROW: u16 = 525;
 /// Async-coroutine resume on fulfilment: bound to the controller object, called
 /// as a microtask reaction when an awaited promise fulfils — resumes the parked
 /// async body with the fulfilment value at the `await` point.
-const N_ASYNC_RESUME_FULFILL: u16 = 560;
+pub(crate) const N_ASYNC_RESUME_FULFILL: u16 = 560;
 /// Async-coroutine resume on rejection: bound to the controller object, called as
 /// a microtask reaction when an awaited promise rejects — resumes the parked async
 /// body by throwing the rejection reason at the `await` point.
-const N_ASYNC_RESUME_REJECT: u16 = 561;
+pub(crate) const N_ASYNC_RESUME_REJECT: u16 = 561;
 /// `AsyncFromSyncIteratorContinuation`'s value-unwrap closure (27.1.4.4 step 8):
 /// bound to a `[done, syncIterator]` state array, it turns the settled
 /// `valueWrapper` into `CreateIterResultObject(value, done)`.
@@ -3028,6 +3033,7 @@ impl Interp {
             in_field_initializer: false,
             eval_param_names: None,
             microtasks: alloc::collections::VecDeque::new(),
+            async_batch: false,
             promise_ctor_ic: crate::ic::PropertyCache::default(),
             macrotasks: TimerQueue::default(),
             timer_next_id: 1,
@@ -9878,6 +9884,27 @@ impl crate::nbvm::VmHost for Interp {
         let on_f = self.realm.new_bound_native(N_ASYNC_RESUME_FULFILL, c);
         let on_r = self.realm.new_bound_native(N_ASYNC_RESUME_REJECT, c);
         (NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw()))
+    }
+
+    fn peek_batch_job(
+        &self,
+        table: &alloc::rc::Rc<[crate::nbvm::FnProto]>,
+    ) -> Option<(NanBox, NanBox)> {
+        if !self.async_batch
+            || !self
+                .vm_table
+                .as_ref()
+                .is_some_and(|t| alloc::rc::Rc::ptr_eq(t, table))
+        {
+            return None;
+        }
+        let job = self.microtasks.front()?;
+        (job.thenable.is_none() && !job.finally && job.cap.is_none())
+            .then_some((job.handler, job.value))
+    }
+
+    fn pop_job(&mut self) {
+        self.microtasks.pop_front();
     }
 
     fn await_resume(

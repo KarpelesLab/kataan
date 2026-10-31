@@ -504,6 +504,31 @@ pub(super) fn enter_on_call(
     jit.call_guarded(args.get(..proto.n_params)?).map(Ok)
 }
 
+/// [`enter_on_call`] for an async function (hosted): its body compiled (on
+/// first use) and run from the start on the activation's register file, to
+/// its first `await` (a suspension, as its resumption runs: see
+/// [`resume_generator`]) or its end. `None` — not compiled — interprets it.
+pub(super) fn enter_async_on_call(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    regs: &mut [NanBox],
+    ic: &[crate::ic::PropertyCache],
+) -> Option<Result<FrameExit, VmError>> {
+    let proto = funcs.get(id)?;
+    if !proto.is_async || proto.is_generator {
+        return None;
+    }
+    if proto.tier.jit().is_none() {
+        super::global_mirror::prefill(ctx, proto);
+    }
+    let jit = jit_for(funcs, id, ic)?;
+    if !jit.is_generic() {
+        return None;
+    }
+    run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false)
+}
+
 /// On-stack replacement from a hot interpreted loop: `program` is the running
 /// body, `regs` its register file, and `target` the loop header the back-edge is
 /// about to jump to. If `program` is a function-table body (or its optimized
@@ -684,6 +709,37 @@ pub(super) fn run_generator_body(
     ctx.jit_rt.base = outer_base;
     ctx.jit_funcs = saved;
     GenRun::Exit(finish_raw(ctx, raw))
+}
+
+/// [`resume_generator`] for a frame that owns its handler stack: a
+/// resumption that may not leave the body runs [`run_generator_body`], whose
+/// suspension moves the body's handlers back into `handlers` (handed out in
+/// the outcome) instead of making a new vector.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resume_frame(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    regs: &mut [NanBox],
+    pc: usize,
+    handlers: &mut alloc::vec::Vec<(usize, Reg)>,
+    ic: &[crate::ic::PropertyCache],
+    resumes: u32,
+) -> Option<Result<FrameExit, VmError>> {
+    let jit = match funcs.get(id)?.tier.jit() {
+        Some(Some(j)) if j.is_generic() && !resume_may_recompile(resumes) => j,
+        _ => return resume_generator(ctx, funcs, id, regs, pc, handlers, ic, resumes),
+    };
+    match run_generator_body(ctx, funcs, &jit, regs, pc, handlers) {
+        GenRun::Yield { value, pc, dst } => Some(Ok(FrameExit::Yield {
+            value,
+            pc,
+            handlers: core::mem::take(handlers),
+            dst,
+        })),
+        GenRun::Exit(r) => Some(r),
+        GenRun::Refused => None,
+    }
 }
 
 /// How often a generator's resumption may leave its compiled body to be

@@ -1471,6 +1471,18 @@ pub trait VmHost {
     /// # Errors
     /// The abrupt completion of PromiseResolve (thrown at the `await`).
     fn await_resume(&mut self, v: NanBox, fns: (NanBox, NanBox)) -> Result<(), HostError>;
+    /// The next queued promise job's `(handler, value)`, when the running job
+    /// belongs to a plain microtask drain whose function table is `table` and
+    /// the next one is a plain reaction (no thenable, `finally` or foreign
+    /// capability): one the VM may run in the context it already holds,
+    /// exactly as the drain would run it next. The job stays queued (see
+    /// [`pop_job`](Self::pop_job)). Reads only the job queue: the realm may be
+    /// out.
+    fn peek_batch_job(&self, _table: &alloc::rc::Rc<[FnProto]>) -> Option<(NanBox, NanBox)> {
+        None
+    }
+    /// Dequeues the job [`peek_batch_job`](Self::peek_batch_job) named.
+    fn pop_job(&mut self) {}
     /// GetIterator(v, async) for `for await`: `(iterator, next, sync)` — a sync
     /// iterator (no callable `@@asyncIterator`) is stepped through
     /// [`VmHost::async_from_sync_next`].
@@ -1702,6 +1714,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         gen_ic: PropertyCache::new(),
+        agen_ic: PropertyCache::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -2934,8 +2947,82 @@ pub(crate) fn resume_vm_async(
 ) -> Result<(), VmError> {
     let entered = enter_frame_realm(host, controller);
     let mut ctx = hosted_ctx(host.take_realm(), host);
-    let result = (|| {
-        let ctx = &mut ctx;
+    let mut result = resume_async_frame(&mut ctx, table, controller, state, fulfilled, v);
+    // The jobs queued right behind this one that resume VM frames too run
+    // here, in this context, one after the other: the drain would run exactly
+    // these next, each building a context of its own. (A throw out of a
+    // resumption ends only its own job, as it does in the drain.)
+    while !entered && matches!(result, Ok(()) | Err(VmError::Thrown(_))) {
+        result = match next_batch_resume(&mut ctx, table) {
+            Some((target, false, fulfilled, v)) => {
+                let c = NanBox::handle(target.to_raw());
+                resume_async_frame(&mut ctx, table, c, Some(target), fulfilled, v)
+            }
+            Some((target, true, fulfilled, v)) => resume_agen_frame(
+                &mut ctx,
+                table,
+                NanBox::handle(target.to_raw()),
+                fulfilled,
+                v,
+            ),
+            None => break,
+        };
+    }
+    let realm = ctx.realm;
+    host.restore_realm(realm);
+    if entered {
+        host.leave_fn_realm();
+    }
+    result
+}
+
+/// The next queued job, when [`VmHost::peek_batch_job`] offers it and it is
+/// the resumption of a VM async function's frame cell (`false`) or of a VM
+/// async generator (`true`) of `table`, with its value and whether it
+/// fulfilled: dequeued, for the caller to run now. (Only while one realm
+/// exists: a frame of another realm resumes in its own.)
+fn next_batch_resume(
+    ctx: &mut Ctx,
+    table: &alloc::rc::Rc<[FnProto]>,
+) -> Option<(Handle, bool, bool, NanBox)> {
+    if ctx.realm.multi_realm || !ctx.microtasks.is_empty() {
+        return None;
+    }
+    let (handler, value) = ctx.host.as_deref()?.peek_batch_job(table)?;
+    let (id, target) = ctx
+        .realm
+        .bound_native_at(Handle::from_raw(handler.as_handle()?))?;
+    let fulfilled = match id {
+        crate::nbexec::N_ASYNC_RESUME_FULFILL => true,
+        crate::nbexec::N_ASYNC_RESUME_REJECT => false,
+        _ => return None,
+    };
+    let agen = match ctx.realm.vm_frame(target) {
+        Some(f) if (f.func as usize) < table.len() => false,
+        Some(_) => return None,
+        None => {
+            let st = agen_state(ctx, NanBox::handle(target.to_raw())).ok()?;
+            if st.id >= table.len() {
+                return None;
+            }
+            true
+        }
+    };
+    ctx.host.as_deref_mut()?.pop_job();
+    Some((target, agen, fulfilled, value))
+}
+
+/// One resumption of the hosted async frame parked in its frame cell
+/// `controller` ([`resume_vm_async`]'s), in the context `ctx`.
+fn resume_async_frame(
+    ctx: &mut Ctx,
+    table: &alloc::rc::Rc<[FnProto]>,
+    controller: NanBox,
+    state: Option<Handle>,
+    fulfilled: bool,
+    v: NanBox,
+) -> Result<(), VmError> {
+    {
         let fh = state.ok_or(VmError::NotAnObject)?;
         let (id, p, pc, dst, mut regs, handlers) = match ctx.realm.vm_frame_mut(fh) {
             Some(f) => (
@@ -2988,8 +3075,10 @@ pub(crate) fn resume_vm_async(
         // A hot body resumes in native code, on the same register file (a
         // rejection, thrown at the `await`, is the interpreter's).
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        let mut handlers = handlers;
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         let compiled = if hot {
-            jit_tier::resume_generator(ctx, table, id, &mut regs, pc, &handlers, &ic, resumes)
+            jit_tier::resume_frame(ctx, table, id, &mut regs, pc, &mut handlers, &ic, resumes)
         } else {
             None
         };
@@ -3012,13 +3101,7 @@ pub(crate) fn resume_vm_async(
         } else {
             r
         }
-    })();
-    let realm = ctx.realm;
-    host.restore_realm(realm);
-    if entered {
-        host.leave_fn_realm();
     }
-    result
 }
 
 /// The hidden slot of a VM async generator: its suspended frame's cell
@@ -3042,14 +3125,15 @@ struct AgenState {
     queue: Handle,
 }
 
-fn agen_state(ctx: &Ctx, generator: NanBox) -> Result<AgenState, VmError> {
+fn agen_state(ctx: &mut Ctx, generator: NanBox) -> Result<AgenState, VmError> {
     let gh = generator
         .as_handle()
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
     let sh = ctx
         .realm
-        .get_property(gh, VM_AGEN)
+        .object_get_cached(gh, VM_AGEN, &mut ctx.agen_ic)
+        .or_else(|| ctx.realm.get_property(gh, VM_AGEN))
         .and_then(|s| s.as_handle())
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
@@ -3116,16 +3200,13 @@ fn save_frame(
     ctx.realm.vm_frame_stored(sh);
 }
 
-/// Settles the front request's promise and dequeues it (the queue of frame
-/// cell `state` is replaced by the rest).
-fn agen_settle_front(ctx: &mut Ctx, state: Handle, queue: Handle, v: NanBox, fulfilled: bool) {
-    let items = ctx
+/// Settles the front request's promise and dequeues it (in place: the
+/// queue is engine-internal).
+fn agen_settle_front(ctx: &mut Ctx, _state: Handle, queue: Handle, v: NanBox, fulfilled: bool) {
+    let Some(front) = ctx
         .realm
         .array_elements(queue)
-        .map(<[_]>::to_vec)
-        .unwrap_or_default();
-    let Some(front) = items
-        .first()
+        .and_then(|items| items.first().copied())
         .and_then(|f| f.as_handle())
         .map(Handle::from_raw)
     else {
@@ -3136,11 +3217,7 @@ fn agen_settle_front(ctx: &mut Ctx, state: Handle, queue: Handle, v: NanBox, ful
         .array_elements(front)
         .and_then(|r| r.get(2).copied())
         .unwrap_or(NanBox::undefined());
-    let rest = ctx.realm.new_array(items[1..].to_vec());
-    if let Some(f) = ctx.realm.vm_frame_mut(state) {
-        f.aux = NanBox::handle(rest.to_raw());
-    }
-    ctx.realm.vm_frame_stored(state);
+    ctx.realm.internal_array_shift(queue);
     with_host(ctx, |h| h.settle_promise(p, v, fulfilled));
 }
 
@@ -3221,8 +3298,7 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
                     agen_set_status(ctx, st.state, GEN_EXECUTING);
                     let (mut regs, handlers) = load_frame(ctx, st.state);
                     let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
-                    let r =
-                        run_frame_at(ctx, funcs, &proto.ops, &mut regs, st.pc, handlers, Some(e));
+                    let r = run_suspended(ctx, funcs, proto, &mut regs, st.pc, handlers, Some(e));
                     if !agen_step(ctx, funcs, generator, st.id, regs, r)? {
                         return Ok(());
                     }
@@ -3278,7 +3354,7 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
         };
         agen_set_status(ctx, st.state, GEN_EXECUTING);
         let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
-        let r = run_frame_at(ctx, funcs, &proto.ops, &mut regs, st.pc, handlers, inject);
+        let r = run_suspended(ctx, funcs, proto, &mut regs, st.pc, handlers, inject);
         if !agen_step(ctx, funcs, generator, st.id, regs, r)? {
             return Ok(());
         }
@@ -3316,7 +3392,7 @@ fn agen_step(
                         Some(Ok(())) => return Ok(false),
                         Some(Err(HostError::Thrown(e))) => {
                             let (mut rg, hs) = load_frame(ctx, st.state);
-                            r = run_frame_at(ctx, funcs, &proto.ops, &mut rg, pc, hs, Some(e));
+                            r = run_suspended(ctx, funcs, proto, &mut rg, pc, hs, Some(e));
                             regs = rg;
                             continue;
                         }
@@ -3343,6 +3419,40 @@ fn agen_step(
             Err(other) => return Err(other),
         }
     }
+}
+
+/// `it.next()` for a `for await` step whose `next` is the intrinsic
+/// `%AsyncGeneratorPrototype%.next` and whose iterator is a VM async
+/// generator of a function in `funcs`: exactly the host's call of that
+/// intrinsic (its brand check passes; AsyncGeneratorEnqueue), in this
+/// context. `None` (nothing done) for anything else, or past the recursion
+/// limits, which the host's call handles.
+fn agen_direct_next(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    it: NanBox,
+    nx: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    if ctx.host.is_none()
+        || ctx.realm.multi_realm
+        || ctx.realm.native_at(Handle::from_raw(nx.as_handle()?))
+            != Some(crate::nbexec::N_ASYNC_GEN_NEXT)
+        || ctx.call_depth >= ctx.realm.limits.max_call_depth
+        || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        || crate::stack::exhausted()
+    {
+        return None;
+    }
+    let st = agen_state(ctx, it).ok()?;
+    if st.id >= funcs.len() {
+        return None;
+    }
+    ctx.call_depth += 1;
+    ctx.realm.vm_total_depth += 1;
+    let r = vm_agen_enqueue(ctx, funcs, it, 0, NanBox::undefined());
+    ctx.call_depth -= 1;
+    ctx.realm.vm_total_depth -= 1;
+    Some(r)
 }
 
 /// The host's `%AsyncGeneratorPrototype%` `next`/`throw`/`return` (`kind` 0/1/2)
@@ -3389,8 +3499,42 @@ pub(crate) fn resume_vm_agen(
 ) -> Result<(), VmError> {
     let entered = enter_frame_realm(host, generator);
     let mut ctx = hosted_ctx(host.take_realm(), host);
-    let result = (|| {
-        let ctx = &mut ctx;
+    let mut result = resume_agen_frame(&mut ctx, table, generator, fulfilled, v);
+    // As `resume_vm_async`: the resumption jobs right behind run here.
+    while !entered && matches!(result, Ok(()) | Err(VmError::Thrown(_))) {
+        result = match next_batch_resume(&mut ctx, table) {
+            Some((target, false, fulfilled, v)) => {
+                let c = NanBox::handle(target.to_raw());
+                resume_async_frame(&mut ctx, table, c, Some(target), fulfilled, v)
+            }
+            Some((target, true, fulfilled, v)) => resume_agen_frame(
+                &mut ctx,
+                table,
+                NanBox::handle(target.to_raw()),
+                fulfilled,
+                v,
+            ),
+            None => break,
+        };
+    }
+    let realm = ctx.realm;
+    host.restore_realm(realm);
+    if entered {
+        host.leave_fn_realm();
+    }
+    result
+}
+
+/// One await-reaction resumption of the VM async generator `generator`
+/// ([`resume_vm_agen`]'s), in the context `ctx`.
+fn resume_agen_frame(
+    ctx: &mut Ctx,
+    table: &alloc::rc::Rc<[FnProto]>,
+    generator: NanBox,
+    fulfilled: bool,
+    v: NanBox,
+) -> Result<(), VmError> {
+    {
         let st = agen_state(ctx, generator)?;
         if st.status == GEN_RETURN_AWAIT && fulfilled {
             agen_set_status(ctx, st.state, GEN_COMPLETED);
@@ -3416,7 +3560,7 @@ pub(crate) fn resume_vm_agen(
                 Some(v)
             };
             let proto = table.get(st.id).ok_or(VmError::Unsupported)?;
-            let r = run_frame_at(ctx, table, &proto.ops, &mut regs, st.pc, handlers, inject);
+            let r = run_suspended(ctx, table, proto, &mut regs, st.pc, handlers, inject);
             if !agen_step(ctx, table, generator, st.id, regs, r)? {
                 return Ok(());
             }
@@ -3427,13 +3571,33 @@ pub(crate) fn resume_vm_agen(
         } else {
             Err(VmError::Unsupported)
         }
-    })();
-    let realm = ctx.realm;
-    host.restore_realm(realm);
-    if entered {
-        host.leave_fn_realm();
     }
-    result
+}
+
+/// A suspended frame of function `proto` run from `pc` (with `handlers`,
+/// optionally throwing `inject` there first) on the function's persistent
+/// inline caches, as a generator's resumption runs (see `gen_fast`): taken
+/// out for the run and put back after it.
+fn run_suspended(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    proto: &FnProto,
+    regs: &mut [NanBox],
+    pc: usize,
+    handlers: Vec<(usize, Reg)>,
+    inject: Option<NanBox>,
+) -> Result<FrameExit, VmError> {
+    let body = proto.ops.as_ptr() as usize;
+    let mut ic = match proto.tier.0.try_borrow_mut() {
+        Ok(mut t) if t.ic_body == body => core::mem::take(&mut t.ic),
+        _ => Vec::new(),
+    };
+    let r = run_frame_at_ic(ctx, funcs, &proto.ops, regs, pc, handlers, inject, &mut ic);
+    if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
+        t.ic = ic;
+        t.ic_body = body;
+    }
+    r
 }
 
 /// CreateIterResultObject(value, done).
@@ -4263,6 +4427,8 @@ struct Ctx<'a> {
     /// serves every generator of a function, so the hidden slot is read
     /// without a name lookup.
     gen_ic: PropertyCache,
+    /// [`gen_ic`](Self::gen_ic) for an async generator's `VM_AGEN` slot.
+    agen_ic: PropertyCache,
     /// An in-flight thrown value stashed by a generic-JIT runtime helper (see
     /// [`jit_helper_add`]). The helper returns the reserved throw sentinel and
     /// leaves the value here; [`call_generic`] takes it back out as
@@ -4558,6 +4724,7 @@ pub fn run_program(
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -4607,6 +4774,7 @@ pub fn run_program_capturing(
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -4995,7 +5163,32 @@ fn call_with_inner(
             // safepoints.
             let mark = ctx.frame_shadow.len();
             ctx.frame_shadow.push(p);
-            let r = run_frame(ctx, funcs, body, &mut regs);
+            // A hot body runs in native code (to its first `await` or its
+            // end), else interpreted on the function's persistent caches.
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            let compiled = if jit_tier::call_is_hot(optimized.is_some()) {
+                jit_tier::enter_async_on_call(
+                    ctx,
+                    funcs,
+                    id,
+                    &mut regs,
+                    if ic.is_empty() { &stale_ic } else { &ic },
+                )
+            } else {
+                None
+            };
+            #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+            let compiled = None;
+            let (r, ic_for) = match compiled {
+                Some(r) => (r, ic_body),
+                None => (
+                    run_frame_at_ic(ctx, funcs, body, &mut regs, 0, Vec::new(), None, &mut ic),
+                    body.as_ptr() as usize,
+                ),
+            };
+            if let Ok(mut entry) = proto.tier.0.try_borrow_mut() {
+                entry.put_back_ic(ic, ic_for);
+            }
             let r = drive_async(ctx, funcs, id, None, p, regs, r);
             ctx.frame_shadow.truncate(mark);
             r?;
@@ -5299,6 +5492,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -7995,6 +8189,8 @@ fn run_frame_at_ic(
                     with_host(ctx, |h| h.async_from_sync_next(it, nx))
                         .unwrap_or(Err(HostError::Fault))
                         .map_err(VmError::from)
+                } else if let Some(r) = agen_direct_next(ctx, funcs, it, nx) {
+                    r
                 } else {
                     call_closure(ctx, funcs, nx, &[], it)
                 };
@@ -26936,6 +27132,7 @@ mod generic_jit_tests {
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            agen_ic: PropertyCache::new(),
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending_fault: None,
