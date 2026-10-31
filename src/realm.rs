@@ -7065,6 +7065,76 @@ impl Realm {
         self.heap.get_mut(g)?.as_object_mut()?.jit_data_ptr(key)
     }
 
+    /// The value of the ordinary object `h`'s own **data** property `key`
+    /// (no same-named accessor), which `[[Get]]` returns without running
+    /// anything: the global object record's read of a property it owns
+    /// (`nbvm::global_obj`). `None` for anything else.
+    #[must_use]
+    pub(crate) fn own_plain_data(&self, h: Handle, key: &str) -> Option<NanBox> {
+        let o = self.heap.get(h)?.as_object()?;
+        if is_private_key(key) || o.accessor(key).is_some() {
+            return None;
+        }
+        o.get(key)
+    }
+
+    /// `HasProperty(h, key)` decided without running anything, when every
+    /// object on `h`'s prototype chain up to the answer is an ordinary
+    /// `Cell::Object` (no proxy, no host-exotic object, no String wrapper):
+    /// `Some(true)` at the first that owns `key` (a data or accessor
+    /// property), `Some(false)` when none does. `None` when that cannot be
+    /// told (the caller takes the full `[[HasProperty]]`).
+    #[must_use]
+    pub(crate) fn plain_has_property(&self, h: Handle, key: &str) -> Option<bool> {
+        let mut cur = Some(h);
+        // (A cycle is impossible for ordinary objects; the bound is a guard.)
+        for _ in 0..64 {
+            let Some(h) = cur else {
+                return Some(false);
+            };
+            let o = self.heap.get(h).and_then(Cell::as_object)?;
+            if self.is_host_exotic(h)
+                || self.string_object_len(h).is_some()
+                || self.vm_fn_meta_value(h, key).is_some()
+            {
+                return None;
+            }
+            if o.has_own_key(key) {
+                return Some(true);
+            }
+            cur = o.proto();
+        }
+        None
+    }
+
+    /// Whether `HasProperty(h, key)` is certainly false
+    /// ([`plain_has_property`](Self::plain_has_property)).
+    #[must_use]
+    pub(crate) fn plain_chain_lacks(&self, h: Handle, key: &str) -> bool {
+        self.plain_has_property(h, key) == Some(false)
+    }
+
+    /// Stores `value` into the ordinary object `h`'s existing own writable
+    /// data property `key` (no same-named accessor, the object not frozen),
+    /// with the write barrier — exactly what `[[Set]]` with `h` as receiver
+    /// does there. Returns `false`, changing nothing, for anything else.
+    pub(crate) fn set_own_plain_data(&mut self, h: Handle, key: &str, value: NanBox) -> bool {
+        let Some(o) = self.heap.get_mut(h).and_then(Cell::as_object_mut) else {
+            return false;
+        };
+        if is_private_key(key)
+            || o.is_frozen()
+            || !o.contains(key)
+            || o.is_readonly(key)
+            || o.accessor(key).is_some()
+        {
+            return false;
+        }
+        o.set(key, value);
+        self.write_barrier(h, value);
+        true
+    }
+
     /// The write barrier of a store of `value` into `container` that
     /// compiled code made itself (`nbvm::global_mirror`).
     #[cfg_attr(

@@ -49,6 +49,7 @@ pub(crate) fn array_species_is_default(realm: &Realm, h: Handle) -> bool {
 }
 mod free_memo;
 mod global_mirror;
+mod global_obj;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use global_mirror::plan_body as plan_global_mirrors;
 mod gen_fast;
@@ -1106,6 +1107,13 @@ pub trait VmHost {
     /// scope binds resolves straight to that binding (no `with` object or
     /// inner frame in between). `None` otherwise. Needs no realm.
     fn global_scope_if_current(&self) -> Option<(&crate::env::Scope, NanBox)>;
+    /// [`global_scope_if_current`](VmHost::global_scope_if_current) when,
+    /// moreover, a name the global scope does not bind resolves to the global
+    /// object record (no module import aliases one): the global object
+    /// record fast paths (`global_obj`). Needs no realm.
+    fn global_object_record(&self) -> Option<(&crate::env::Scope, NanBox)> {
+        None
+    }
     /// A real `name` error instance (`TypeError`, …) with `message`, linked to
     /// the intrinsic prototype exactly as the interpreter's own errors are.
     fn make_error(&mut self, name: &str, message: &str) -> NanBox;
@@ -2081,6 +2089,12 @@ fn vm_set_prop_mode(
     }
     if ctx.host.is_none() {
         return vm_set_prop(ctx, funcs, recv, key, value, cache);
+    }
+    // A write to an existing plain data property of the running realm's
+    // global object (`global_obj`), mirrored into a like-named `var`
+    // binding as the host would.
+    if global_obj::set_prop(ctx, recv, key, value) {
+        return Ok(());
     }
     // A write to the global object also updates the global environment's
     // bindings (the host mirrors it), so it is the host's.
@@ -4186,13 +4200,16 @@ fn vm_load_global(ctx: &mut Ctx, name: &str, cache: &SlotCache) -> Result<NanBox
     {
         return Ok(v);
     }
-    if let Some(v) = ctx
-        .host
-        .as_deref()
-        .and_then(|h| h.global(name))
-        .filter(|v| !v.is_tdz())
-    {
-        return Ok(v);
+    match ctx.host.as_deref().and_then(|h| h.global(name)) {
+        Some(v) if !v.is_tdz() => return Ok(v),
+        Some(_) => {}
+        // Not a global-scope binding: a plain data property the global
+        // object owns is read in place (`global_obj`).
+        None => {
+            if let Some(v) = global_obj::load(ctx, name, cache) {
+                return Ok(v);
+            }
+        }
     }
     match with_host(ctx, |h| h.read_global(name)) {
         Some(r) => r.map_err(VmError::from),
@@ -4251,7 +4268,9 @@ fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: 
         return false;
     };
     if !scope.cached_set_plain_local(name, &cache.slot, v) {
-        return false;
+        // Not a plain global-scope binding: an existing writable data
+        // property of the global object is stored in place (`global_obj`).
+        return global_obj::store(ctx, name, cache, v);
     }
     let Some(g) = global.as_handle().map(Handle::from_raw) else {
         return true;
@@ -7994,7 +8013,10 @@ fn run_frame_at_ic(
                 Ok(v) => regs[*dst as usize] = v,
                 Err(e) => handle_throw!(e),
             },
-            Op::TypeofGlobal { dst, name } => match with_host(ctx, |h| h.typeof_global(name)) {
+            Op::TypeofGlobal { dst, name } => match global_obj::type_of(ctx, name)
+                .map(Ok)
+                .or_else(|| with_host(ctx, |h| h.typeof_global(name)))
+            {
                 Some(Ok(t)) => {
                     regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
                 }

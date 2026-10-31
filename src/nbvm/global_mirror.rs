@@ -49,6 +49,14 @@ pub(crate) struct MirrorCache {
     /// current global binding epoch whenever compiled code holds the binding
     /// address it was validated with).
     ptr: Cell<u64>,
+    /// The write-only "binding" a write of a name the global scope does not
+    /// bind stores into before its mirror store reaches the global object's
+    /// property (`super::global_obj`). Never read: it may hold a stale handle.
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    sink: Cell<u64>,
 }
 
 impl Clone for MirrorCache {
@@ -65,6 +73,12 @@ impl MirrorCache {
     /// Whether the op's compiled code mirrors the write.
     pub(crate) fn on(&self) -> bool {
         self.on.get() && self.canon.get() != 0
+    }
+
+    /// The address of the op's write-only sink (see `sink`).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn sink_ptr(&self) -> *mut crate::nanbox::NanBox {
+        self.sink.as_ptr().cast()
     }
 
     /// The address compiled code reads the mirror target from (its canonical

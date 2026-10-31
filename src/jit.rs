@@ -6902,6 +6902,7 @@ impl JitFunction {
                 exec_op: exec_op_helper,
                 backedge: backedge_helper,
                 global_ref: helpers.global_ref as usize as u64,
+                global_mirror: helpers.global_mirror as usize as u64,
                 math1: helpers.math1 as usize as u64,
                 persist,
                 no_spec: no_spec.to_vec(),

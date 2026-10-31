@@ -3874,3 +3874,65 @@ fn hole_writes_reach_inherited_index_setters() {
     "#;
     assert_eq!(run(src), "1,false 12,false,false 13,false,2 true,13");
 }
+
+/// The global object record's fast paths (`nbvm::global_obj`): reads and
+/// writes of names the global scope does not bind but the global object owns
+/// as plain data properties (implicit globals), in loops the JIT compiles,
+/// stay exact when the property becomes an accessor, is deleted and
+/// recreated, is shadowed by a global lexical an indirect `eval` declares, or
+/// is made non-writable mid-loop.
+#[test]
+fn global_object_record_fast_paths_track_redefinitions() {
+    let src = r#"
+        var r = [];
+        cnt = 0; acc = 0; var log = 0;
+        function rd() { return cnt; }
+        function wr(v) { cnt = v; }
+        for (var i = 0; i < 3000; i++) {
+            wr(rd() + 1);
+            acc = (acc + cnt) | 0;
+            if (i === 2000) {
+                var store = cnt;
+                Object.defineProperty(globalThis, "cnt", { get: function () { log++; return store; }, set: function (v) { store = v * 2; }, configurable: true });
+            }
+            if (i === 2500) { delete globalThis.cnt; cnt = -1; }
+        }
+        r.push(cnt, acc, log);
+        sh = 1; var tot = 0;
+        function rs() { return sh; }
+        function ws(v) { sh = v; }
+        for (var j = 0; j < 3000; j++) {
+            if (j === 1500) (0, eval)("let sh = 1000;");
+            if (j === 2200) Object.defineProperty(globalThis, "sh", { writable: false });
+            ws(rs() + 1);
+            tot = (tot + rs()) % 1000003;
+        }
+        r.push(sh, globalThis.sh, tot);
+        r.join()
+    "#;
+    assert_eq!(run(src), "498,124251,1000,2201,2201,184088");
+}
+
+/// Heap values stored into global `var`s, implicit globals and `globalThis`
+/// properties from compiled loops go through the write barrier (the global
+/// object is old; the stored objects young).
+#[test]
+fn global_object_heap_stores_keep_young_values_alive() {
+    let src = r#"
+        var r = [];
+        hv = null; var last = null, keep = [], s = 0;
+        function mk(i) { hv = { i: i, next: hv && hv.i }; }
+        for (var i = 0; i < 5000; i++) {
+            mk(i);
+            last = { i: i, h: hv };
+            globalThis.gp = [i];
+            if ((i & 511) === 0) keep.push(last, gp);
+            s = (s + hv.i + (hv.next | 0) + last.h.i + gp[0]) % 1000003;
+        }
+        var t = 0;
+        for (var k = 0; k < keep.length; k++) t += keep[k].i !== undefined ? keep[k].h.i : keep[k][0];
+        r.push(s, t, hv.i, last.i, gp[0]);
+        r.join()
+    "#;
+    assert_eq!(run(src), "984854,46080,4999,4999,4999");
+}

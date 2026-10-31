@@ -1100,7 +1100,8 @@ pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: 
         Op::LoadGlobal { name, cache, .. } => ctx
             .host
             .as_deref()
-            .and_then(|host| host.global_scope().jit_binding_ptr(name, cache, false)),
+            .and_then(|host| host.global_scope().jit_binding_ptr(name, cache, false))
+            .or_else(|| super::global_obj::jit_load_ref(ctx, name, cache)),
         Op::StoreGlobal {
             name,
             strict,
@@ -1121,14 +1122,19 @@ fn global_store_ref(
     name: &str,
     cache: &super::StoreGlobalCache,
 ) -> Option<*mut NanBox> {
-    let (p, g) = ctx
-        .host
-        .as_deref()?
-        .global_scope_if_current()
-        .and_then(|(scope, global)| {
-            let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
-            Some((p, Handle::from_raw(global.as_handle()?)))
-        })?;
+    let Some((p, g)) =
+        ctx.host
+            .as_deref()?
+            .global_scope_if_current()
+            .and_then(|(scope, global)| {
+                let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
+                Some((p, Handle::from_raw(global.as_handle()?)))
+            })
+    else {
+        // No plain global-scope binding: an existing writable data property
+        // of the global object, written as a binding-less mirror write.
+        return super::global_obj::jit_store_ref(ctx, name, cache);
+    };
     // Only a global object whose key changes bump the global binding epoch
     // (which the compiled cache holds the answer across calls under).
     let tracked = ctx

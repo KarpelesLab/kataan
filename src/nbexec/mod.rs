@@ -9396,6 +9396,14 @@ impl crate::nbvm::VmHost for Interp {
             .then_some((&self.global_scope, self.global_this))
     }
 
+    fn global_object_record(&self) -> Option<(&Scope, NanBox)> {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if !self.module_imports.is_empty() {
+            return None;
+        }
+        self.global_scope_if_current()
+    }
+
     fn global(&self, name: &str) -> Option<NanBox> {
         self.global_scope.get(name)
     }

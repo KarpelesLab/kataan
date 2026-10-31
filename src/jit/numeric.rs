@@ -839,6 +839,8 @@ pub(super) struct NumEnv {
     pub(super) exec_op: u64,
     pub(super) backedge: u64,
     pub(super) global_ref: u64,
+    /// `jit_helper_global_mirror` (`StubKind::Mirror`).
+    pub(super) global_mirror: u64,
     pub(super) math1: u64,
     /// The body's persistent global binding cache (`super::global_persist`).
     pub(super) persist: u64,
@@ -890,6 +892,12 @@ enum StubKind {
     },
     /// The interpreter runs bytecode op `pc`.
     Exec { pc: u32 },
+    /// The `StoreGlobal` at `pc` stored the heap handle in register `src`
+    /// into its binding; its global-object mirror store (which needs the
+    /// write barrier) goes through `jit_helper_global_mirror`, which runs no
+    /// code that could retire a validated global address. Should it refuse,
+    /// the interpreter runs the op (as [`StubKind::Exec`]).
+    Mirror { pc: u32, src: u16 },
     /// `ToBoolean([cond])` through the helper, then branch: falsy → bytecode
     /// pc `target`, truthy → `resume`.
     Truthy { cond: u16, target: usize },
@@ -2560,18 +2568,28 @@ impl NumGen {
                                     a.movq_gpr_x(RAX, x);
                                     let h = a.new_label();
                                     a.gm_store_gpr(cell, RCX, RAX, h);
-                                    self.stub(h, resume, reg, StubKind::Exec { pc: pc as u32 });
+                                    self.stub(
+                                        h,
+                                        resume,
+                                        reg,
+                                        StubKind::Mirror { pc: pc as u32, src },
+                                    );
                                 }
                             }
                             None => {
                                 self.load_gpr(a, reg, RAX, src);
                                 a.raw(&[0x48, 0x89, 0x01]); // mov [rcx], rax
                                 // A heap handle's mirror needs the write
-                                // barrier: the interpreter runs the op.
+                                // barrier: `jit_helper_global_mirror`.
                                 if let Some(cell) = mirror {
                                     let h = a.new_label();
                                     a.gm_store_gpr(cell, RCX, RAX, h);
-                                    self.stub(h, resume, reg, StubKind::Exec { pc: pc as u32 });
+                                    self.stub(
+                                        h,
+                                        resume,
+                                        reg,
+                                        StubKind::Mirror { pc: pc as u32, src },
+                                    );
                                 }
                             }
                         }
@@ -3163,7 +3181,10 @@ impl NumGen {
         // The integer version runs no slow path itself: it hands the op to the
         // double version.
         let kind = match kind {
-            StubKind::Helper { .. } | StubKind::Exec { .. } | StubKind::Truthy { .. }
+            StubKind::Helper { .. }
+            | StubKind::Exec { .. }
+            | StubKind::Mirror { .. }
+            | StubKind::Truthy { .. }
                 if self.imode.is_some() =>
             {
                 StubKind::Bail {
@@ -3174,7 +3195,10 @@ impl NumGen {
             // In a speculative region every slow path that would run Rust
             // code leaves for the plain copy (the fast version makes no call:
             // see `in_spec`).
-            StubKind::Helper { .. } | StubKind::Exec { .. } | StubKind::Truthy { .. }
+            StubKind::Helper { .. }
+            | StubKind::Exec { .. }
+            | StubKind::Mirror { .. }
+            | StubKind::Truthy { .. }
                 if region.is_some_and(|ri| self.regions[ri].spec.is_some()) =>
             {
                 StubKind::SpecBail {
@@ -4101,6 +4125,35 @@ impl NumGen {
                     self.reload(a, s.region);
                     self.zero_globals(a, s.region);
                     a.jmp(s.resume);
+                }
+                StubKind::Mirror { pc, src } => {
+                    // (Flushed, the register file holds `src`'s value, as
+                    // the interpreter would read it.)
+                    self.flush(a, s.region);
+                    let op_ptr = self.env.bytecode.wrapping_add(pc as usize);
+                    a.mov_rdi_r15();
+                    a.movabs_argreg(1, op_ptr as i64);
+                    a.load_argreg(2, disp(src));
+                    a.movabs_rax(self.env.global_mirror as i64);
+                    a.call_rax();
+                    let refused = a.new_label();
+                    a.test_rax_rax();
+                    a.jcc(CC_NE, refused);
+                    self.reload(a, s.region);
+                    self.after_slow(a, labels, s);
+                    a.bind(refused);
+                    a.mov_rdi_r15();
+                    a.mov_rsi_rbx();
+                    a.movabs_argreg(2, self.env.n_regs as i64);
+                    a.movabs_argreg(3, op_ptr as i64);
+                    a.movabs_rax(self.env.exec_op as i64);
+                    a.call_rax();
+                    a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                    a.cmp_rax_r11();
+                    a.je(throw_exit);
+                    self.reload(a, s.region);
+                    self.zero_globals(a, s.region);
+                    self.after_slow(a, labels, s);
                 }
                 StubKind::Exec { pc } => {
                     self.flush(a, s.region);
