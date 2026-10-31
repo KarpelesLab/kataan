@@ -45,6 +45,8 @@ use crate::nanbox::NanBox;
 use crate::nbvm::Op;
 use alloc::vec::Vec;
 
+mod elems;
+
 /// The general-purpose registers int registers live in: caller-saved, and
 /// never touched by the emitters' fast paths (`rax`/`rcx`/`rdx`/`r11` are
 /// their scratch, `rbx`/`r15` are pinned).
@@ -79,6 +81,11 @@ pub(super) struct IntPlan {
     slots: Vec<ISlot>,
     /// The pcs of the `+`/`-`/`*` ops that wrap instead of checking overflow.
     wraps: Vec<usize>,
+    /// The pcs of the element reads ([`elems`]) and `>>>` ops whose int
+    /// register holds the value's `ToInt32` bits rather than the value (a
+    /// Uint32 element or a `>>>` result past `i32::MAX`): like a wrapped
+    /// op's, read only by bitwise ops before anything can bail.
+    wrap_bits: Vec<usize>,
     /// The promoted global bindings.
     pub(super) globals: Vec<PGlobal>,
     /// The integer version's entry (region entry jumps here first).
@@ -130,6 +137,13 @@ fn const_i32(v: NanBox) -> Option<i32> {
 /// Plans the integer version of region `head..=end` (`info`: per register named
 /// in it, `(reg, first, last, mentions, written)`; `carried`: live into the
 /// header or out of the region). `None` when no integer arithmetic would run.
+///
+/// With `elems` (a region whose only generic ops are element and `.length`
+/// reads, [`elems`]), those reads' results may be int registers too (each
+/// checked when read), as may `>>>` results that only bitwise ops read
+/// ([`IntPlan::wrap_bits`]); the plan is then only made when every such
+/// read's result and index are int registers (else the region keeps its
+/// double versions).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
     bytecode: &[Op],
@@ -139,9 +153,41 @@ pub(super) fn plan(
     carried: &dyn Fn(u16) -> bool,
     n_regs: usize,
     dbl_xmm: &[u8],
+    elems: bool,
 ) -> Option<IntPlan> {
     use crate::nbvm::{VB_LOOSE_EQ, VB_LOOSE_NEQ, VB_SHR, VB_USHR};
     let body = &bytecode[head..=end];
+    // An element read's result is speculated an int32 only when bitwise
+    // ops read it (whose operands the double versions convert to int32 at
+    // every op: what the integer version saves), or another read as its
+    // index, or a move into a register read only that way. (A Float64
+    // element summed up would only ever bail; a loop that only compares
+    // elements keeps its speculative version, whose views are hoisted.)
+    let elem_reader_ok = |r: u16| {
+        let mut work = alloc::vec![r];
+        let mut seen: Vec<u16> = Vec::new();
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        while let Some(x) = work.pop() {
+            if seen.contains(&x) || seen.len() > 8 {
+                return false;
+            }
+            seen.push(x);
+            for op in body {
+                def_use(op, &mut d, &mut u);
+                if !u.contains(&x) {
+                    continue;
+                }
+                match op {
+                    Op::ValueBin { op, .. } if (1..=VB_USHR).contains(op) => {}
+                    Op::GetKey { key, obj, .. } if *key == x && *obj != x => {}
+                    Op::Move { dst, .. } => work.push(*dst),
+                    _ => return false,
+                }
+            }
+        }
+        true
+    };
+    let elem_def = |op: &Op| matches!(op, Op::GetKey { .. } | Op::ArrayLen { .. });
     // Promoted global bindings: each named global the loop reads or writes is
     // a pseudo-register `n_regs + k`, loop-carried, written back at exits and
     // before calls (see `PGlobal`).
@@ -211,6 +257,7 @@ pub(super) fn plan(
     for (i, op) in body.iter().enumerate() {
         let d = match op {
             Op::StoreGlobal { name, .. } => vreg_of(name),
+            Op::GetKey { dst, .. } | Op::ArrayLen { dst, .. } if elems => Some(*dst),
             _ => super::written_reg(op),
         };
         if let Some(d) = d
@@ -265,10 +312,12 @@ pub(super) fn plan(
                 | Op::Sub { a, b, .. }
                 | Op::Mul { a, b, .. }
                 | Op::Mod { a, b, .. } => inn(*a) && inn(*b),
-                Op::ValueBin { op, .. } => (1..=VB_SHR).contains(op),
+                Op::ValueBin { op, .. } => (1..=VB_SHR).contains(op) || (elems && *op == VB_USHR),
                 Op::ToNumeric { src, .. } | Op::Step { src, .. } | Op::Neg { a: src, .. } => {
                     inn(*src)
                 }
+                Op::GetKey { dst, .. } => elems && elem_reader_ok(*dst),
+                Op::ArrayLen { .. } => elems,
                 // A promoted global reads / writes its pseudo-register.
                 Op::LoadGlobal { name, .. } => vreg_of(name).is_none_or(inn),
                 Op::StoreGlobal { src, .. } => inn(*src),
@@ -297,6 +346,8 @@ pub(super) fn plan(
                         Op::ValueBin { op, .. } => (1..=VB_USHR).contains(op),
                         Op::Lt { a, b, .. } | Op::StrictEq { a, b, .. } => inn(*a) && inn(*b),
                         Op::Compare { op, a, b, .. } => *op <= 3 && inn(*a) && inn(*b),
+                        // An element read's index.
+                        Op::GetKey { key, obj, .. } => elems && *key == r && *obj != r,
                         _ => super::written_reg(op).is_some_and(inn),
                     }
                 })
@@ -312,6 +363,7 @@ pub(super) fn plan(
                     let speculative = carried(r)
                         || ds.iter().any(|&pc| {
                             matches!(bytecode[pc], Op::LoadGlobal { .. } | Op::LoadConst { .. })
+                                || elem_def(&bytecode[pc])
                         });
                     !speculative || useful(r, &mut du_d, &mut du_u)
                 })
@@ -450,10 +502,24 @@ pub(super) fn plan(
         // in between (nothing else can bail or flush while a wrapped value is
         // live: it is not the true Number).
         let cval = |r: u16| consts.iter().find(|c| c.0 == r).map(|c| c.1);
+        // (In `elems` mode an element read's or a `>>>`'s value may be held
+        // as its `ToInt32` bits the same way: `IntPlan::wrap_bits`.)
+        let bits_op = |op: &Op| {
+            elems
+                && match op {
+                    Op::GetKey { dst, .. } => Some(*dst),
+                    Op::ValueBin { op, dst, .. } if *op == VB_USHR => Some(*dst),
+                    _ => None,
+                }
+                .is_some_and(|d| inn(d) && !carried(d) && defs_of(d).len() == 1)
+        };
         let mut wraps: Vec<usize> = body
             .iter()
             .enumerate()
             .filter_map(|(i, op)| {
+                if bits_op(op) {
+                    return Some(head + i);
+                }
                 let (Op::Add { dst, a, b }
                 | Op::AddValue { dst, a, b }
                 | Op::Sub { dst, a, b }
@@ -482,12 +548,18 @@ pub(super) fn plan(
                     Op::Add { a, b, .. } | Op::AddValue { a, b, .. } | Op::Sub { a, b, .. } => {
                         bnd(a, &bound).max(bnd(b, &bound)) + 1
                     }
+                    // A 32-bit value (a uint32 at most).
+                    Op::GetKey { .. } | Op::ValueBin { .. } => 32,
                     _ => u32::MAX / 2,
                 };
                 // Too wide to be exact: not wrapped, so later ops see a checked
                 // int32 (bound 31) in its place.
+                let d = match bytecode[p] {
+                    Op::GetKey { dst, .. } => Some(dst),
+                    _ => super::written_reg(&bytecode[p]),
+                };
                 if b <= 53
-                    && let Some(d) = super::written_reg(&bytecode[p])
+                    && let Some(d) = d
                 {
                     bound.push((d, b));
                 }
@@ -496,7 +568,11 @@ pub(super) fn plan(
                 .iter()
                 .copied()
                 .filter(|&p| {
-                    let Some(d) = super::written_reg(&bytecode[p]) else {
+                    let d = match bytecode[p] {
+                        Op::GetKey { dst, .. } => Some(dst),
+                        _ => super::written_reg(&bytecode[p]),
+                    };
+                    let Some(d) = d else {
                         return false;
                     };
                     let Some(x) = info.iter().find(|x| x.0 == d) else {
@@ -509,7 +585,8 @@ pub(super) fn plan(
                             Op::ValueBin { op, a, b, .. } => {
                                 (1..=VB_USHR).contains(op) && inn(*a) && inn(*b)
                             }
-                            _ => wraps.contains(&pc),
+                            // (An element read can bail: not between.)
+                            _ => wraps.contains(&pc) && !matches!(bytecode[pc], Op::GetKey { .. }),
                         })
                 })
                 .collect();
@@ -518,11 +595,43 @@ pub(super) fn plan(
             }
             wraps = next;
         }
+        let (wrap_bits, wraps): (Vec<usize>, Vec<usize>) =
+            wraps.into_iter().partition(|&p| bits_op(&bytecode[p]));
+        if elems {
+            // A `>>>` result that is not held as bits is not an int32.
+            let lost: Vec<u16> = body
+                .iter()
+                .enumerate()
+                .filter_map(|(i, op)| match op {
+                    Op::ValueBin { op, dst, .. }
+                        if *op == VB_USHR && inn(*dst) && !wrap_bits.contains(&(head + i)) =>
+                    {
+                        Some(*dst)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !lost.is_empty() {
+                cset.retain(|r| !lost.contains(r));
+                continue;
+            }
+            // Every element / `.length` read's result, and every element
+            // read's index, an int register: else the double versions.
+            let all = body.iter().all(|op| match op {
+                Op::GetKey { dst, key, .. } => inn(*dst) && inn(*key),
+                Op::ArrayLen { dst, .. } => inn(*dst),
+                _ => true,
+            });
+            if !all {
+                return None;
+            }
+        }
         return Some(IntPlan {
             ints: cset,
             consts,
             slots,
             wraps,
+            wrap_bits,
             globals,
             entry: None,
             dbl_entry: None,
@@ -600,8 +709,14 @@ impl NumGen {
         let Some(p) = self.regions[ri].int.as_ref() else {
             return;
         };
-        for s in &self.regions[ri].slots {
-            if s.dirty && s.start <= pc && pc <= s.end && p.ints.binary_search(&s.reg).is_err() {
+        let rg = &self.regions[ri];
+        for s in &rg.slots {
+            if s.dirty
+                && s.start <= pc
+                && pc <= s.end
+                && p.ints.binary_search(&s.reg).is_err()
+                && rg.defined(s, pc, pc)
+            {
                 a.movsd_mem_x(disp(s.reg), s.xmm);
             }
         }
@@ -913,6 +1028,13 @@ impl NumGen {
         let bc = self.bc(pc)?;
         let ii = |s: &Self, r: u16| s.is_int(r);
         match ops[pc] {
+            // (`elems`: only planned with int results.)
+            GenericOp::GetElem { dst, obj, index } if ii(self, dst) => {
+                self.iget_elem(a, dst, obj, index)?;
+            }
+            GenericOp::ArrayLen { dst, arr } if ii(self, dst) => {
+                self.iarray_len(a, dst, arr)?;
+            }
             GenericOp::Const { dst, .. } if ii(self, dst) => {
                 if let IK::Gpr(g) = self.ik(dst)? {
                     let Op::LoadConst { value, .. } = *bc else {
@@ -1344,8 +1466,10 @@ impl NumGen {
             let IK::Gpr(d) = self.ik(dst)? else {
                 return None;
             };
-            if vop == VB_USHR {
-                return None; // planned never: a uint32
+            // A `>>>` result only where it is held as its bits
+            // (`IntPlan::wrap_bits`): else it is planned never (a uint32).
+            if vop == VB_USHR && !self.iplan()?.wrap_bits.contains(&pc) {
+                return None;
             }
             a.mov32_rr(d, RAX);
         } else {

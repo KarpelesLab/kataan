@@ -3642,3 +3642,40 @@ fn speculative_loops_with_branches_and_fractional_typed_stores() {
         )
     );
 }
+
+/// The integer version of loops over element reads (`numeric::int32::elems`):
+/// a table CRC, `>>>` results and Uint32 elements held as their bits, a
+/// bit-set loop indexing through element reads, over typed arrays of
+/// several kinds, plain arrays, one with a hole / a double / `-0` / a
+/// string, and indices past the end (checked against node).
+#[test]
+fn integer_loops_over_element_reads() {
+    let src = r#"
+        var out = [];
+        var T = new Uint32Array(256);
+        for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; T[n] = c >>> 0; }
+        function crc(b) { var c = -1; for (var i = 0; i < b.length; i++) c = T[(c ^ b[i]) & 0xff] ^ (c >>> 8); return (c ^ -1) >>> 0; }
+        var u8 = new Uint8Array(3000);
+        for (var i = 0; i < u8.length; i++) u8[i] = (i * 31 + 7) & 255;
+        var plain = Array.prototype.slice.call(u8, 0, 500), holey = plain.slice();
+        delete holey[100]; holey[200] = 2.5; holey[201] = -0; holey[202] = "7";
+        out.push(crc(u8), crc(plain), crc(holey), crc(new Int16Array(plain)), crc(new Float64Array(plain)));
+        function mix(t, o, n) { var h = 7; for (var i = 0; i < n; i++) h = ((t[i & 63] >>> (i & 7)) ^ o[i & 7]) ^ (h << 1); return h; }
+        var big = new Uint32Array(64);
+        for (var i = 0; i < 64; i++) big[i] = (0x9e3779b9 * (i + 1)) >>> 0;
+        out.push(mix(big, new Uint8Array(8).fill(3), 3000), mix(big, [1, 2, , 4, 5.5, 6, 7, 8], 3000), mix(Array.prototype.slice.call(big), [1, 2, 3, 4, 5, 6, 7, 8], 3000));
+        function bits(rows, cols, R, C, n) { var a = 0; for (var i = 0; i < n; i++) { var j = i % 81; a = (a + (~(rows[R[j]] | cols[C[j]]) & 0x3fe)) | 0; } return a; }
+        var R = new Uint8Array(81), C = new Uint8Array(81), rows = new Uint16Array(9), cols = new Uint16Array(9);
+        for (var i = 0; i < 81; i++) { R[i] = (i / 9) | 0; C[i] = i % 9; }
+        for (var i = 0; i < 9; i++) { rows[i] = (i * 37) & 0x3fe; cols[i] = (i * 91) & 0x3fe; }
+        out.push(bits(rows, cols, R, C, 3000), bits(rows, cols, R, new Uint8Array(81).fill(12), 3000));
+        out.join()
+    "#;
+    assert_eq!(
+        run(src),
+        concat!(
+            "2803193529,572011418,3660864733,572011418,572011418,",
+            "-56190379,-1966019550,-357528510,1706200,2623776"
+        )
+    );
+}

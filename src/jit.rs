@@ -6596,6 +6596,7 @@ impl JitFunction {
                 persist,
                 realm: helpers.call_layout.realm,
                 layout: helpers.call_layout,
+                heap: layout,
                 // A compiled-in read of a slot its layout had as Number-only
                 // (`numeric::Spec::fields`).
                 fields: ops
@@ -6637,6 +6638,13 @@ impl JitFunction {
                 sites.all(|pc| matches!(bytecode.get(pc), Some(crate::nbvm::Op::LoadGlobal { .. })))
             })
             .collect();
+        // (An integer version with element reads bails into its double
+        // version at any of its ops: entries too, `NumGen::int_bail_pcs`.)
+        let rc_entries: Vec<usize> = osr_entries
+            .iter()
+            .copied()
+            .chain(num.int_bail_pcs())
+            .collect();
         let mut rc = recv_cache::plan(
             ops,
             bytecode,
@@ -6654,7 +6662,7 @@ impl JitFunction {
                     && (!num.in_region(pc) || num.truthy_cacheable(pc, ops))
             },
             |pc| num.reuse_planned(pc),
-            osr_entries,
+            &rc_entries,
             &catch_targets,
         );
         // Once typed arrays have been indexed, an element site may well see

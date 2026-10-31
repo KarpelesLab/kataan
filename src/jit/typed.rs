@@ -186,6 +186,7 @@ const fn size_log2(kind: u8) -> u8 {
 const CC_O: u8 = 0x0;
 const CC_NP: u8 = 0xb;
 const CC_NS: u8 = 0x9;
+const CC_S: u8 = 0x8;
 const CC_LE: u8 = 0xe;
 
 impl X64Assembler {
@@ -322,6 +323,42 @@ impl X64Assembler {
                 _ => self.raw(&[0xf2, 0x0f, 0x2a, 0xc0]),
             }
             self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+            self.jmp(got);
+            self.bind(next);
+        }
+        self.jmp(miss);
+    }
+
+    /// The element read of the integer version (`numeric::int32`): with
+    /// `rax` an integer index (and, for [`Src::View`], `rcx` / `r9` from
+    /// [`t_view`](Self::t_view)), `eax` = the element of an integer kind,
+    /// an int32 (a Uint32 one past `i32::MAX` only when `wrap`: its low 32
+    /// bits, for a reader that takes `ToInt32` of it), and on to `got`;
+    /// else to `miss`. Clobbers `r8`, `r11`.
+    pub(crate) fn t_get_i32(
+        &mut self,
+        t: &TypedLayout,
+        src: Src,
+        wrap: bool,
+        miss: Label,
+        got: Label,
+    ) {
+        self.t_index(t, src, miss);
+        for kind in [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED] {
+            let next = self.new_label();
+            self.t_kind(t, src, kind, next, miss);
+            let s = size_log2(kind);
+            match kind {
+                INT8 => self.t_elem(None, false, &[0x0f, 0xbe], r::RAX, s), // movsx eax, byte
+                UINT8 | UINT8_CLAMPED => self.t_elem(None, false, &[0x0f, 0xb6], r::RAX, s),
+                INT16 => self.t_elem(None, false, &[0x0f, 0xbf], r::RAX, s), // movsx eax, word
+                UINT16 => self.t_elem(None, false, &[0x0f, 0xb7], r::RAX, s), // movzx eax, word
+                _ => self.t_elem(None, false, &[0x8b], r::RAX, s),           // mov eax, dword
+            }
+            if kind == UINT32 && !wrap {
+                self.raw(&[0x85, 0xc0]); // test eax, eax
+                self.g_jcc(CC_S, miss); // past i32::MAX
+            }
             self.jmp(got);
             self.bind(next);
         }

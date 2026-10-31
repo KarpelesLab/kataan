@@ -816,6 +816,8 @@ pub(super) struct NumEnv {
     pub(super) realm: i32,
     /// The call sequence's layout (the back-edge poll's inline test).
     pub(super) layout: super::CallLayout,
+    /// The heap layout (the integer version's element reads' walks).
+    pub(super) heap: super::JitLayout,
     /// Per pc: for a `GetProp` whose layout is compiled in, and which that
     /// layout had as a Number-only slot when compiled, the address of the
     /// layout's may-be-non-Number mask and the slot (see [`Spec::fields`]).
@@ -1688,6 +1690,17 @@ impl NumGen {
             }
         }
         Some(())
+    }
+
+    /// The pcs where the integer version of a region with generic ops
+    /// (`int32::elems`) may bail into its double version, which therefore
+    /// may be entered there: the receiver cache plans them as entries.
+    pub(super) fn int_bail_pcs(&self) -> Vec<usize> {
+        self.regions
+            .iter()
+            .filter(|r| r.generic && r.int.is_some())
+            .flat_map(|r| r.head..=r.end)
+            .collect()
     }
 
     /// Whether op `pc` lies in the fast version of a speculative region:
@@ -4169,107 +4182,131 @@ fn plan_regions(
         // left in memory puts a store and a reload on its dependency chain.
         let weights = spill_weights(bytecode, head, end, &loops, &reuse);
         let weight = |r: u16| weights.iter().find(|x| x.0 == r).map_or(0, |x| x.1);
-        let mut slots: Vec<Slot> = Vec::new();
-        let mut free: Vec<u8> = (FIRST_XMM..FIRST_XMM + MAX_PROMOTED as u8).rev().collect();
-        // (interval end, xmm, register, interval start, carried)
-        let mut active: Vec<(usize, u8, u16, usize, bool)> = Vec::new();
-        let ordered = carried
-            .iter()
-            .map(|x| (*x, true))
-            .chain(temps.iter().map(|x| (*x, false)));
-        for (x, is_carried) in ordered {
-            let (start, stop) = if is_carried { (head, end) } else { (x.1, x.2) };
-            active.retain(|&(e, xmm, ..)| {
-                if e < start {
-                    free.push(xmm);
-                    false
-                } else {
-                    true
-                }
+        // A loop whose only generic ops are element and `.length` reads may
+        // have an integer version (`int32::elems`), which shadows the slots
+        // (so no SSE register is handed on); when it has none, its double
+        // registers are allocated again with the hand-ons.
+        let elem_cand = generic
+            && loops.is_empty()
+            && (head..=end).all(|pc| match (&ops[pc], &bytecode[pc]) {
+                (GenericOp::GetElem { .. }, Op::GetKey { obj, key, .. }) => obj != key,
+                (GenericOp::ArrayLen { .. }, _) => true,
+                (op, bc) => !generic_region_op(op, bc),
             });
-            // A `Move` that ends its source's interval hands the source's
-            // SSE register to its destination (the move then emits nothing).
-            // Generic regions only (no integer version shadows the slots).
-            let mut reuse = None;
-            if generic
-                && !is_carried
-                && let Op::Move { dst, src } = bytecode[x.1]
-                && dst == x.0
-                && let Some(i) = active
-                    .iter()
-                    .position(|&(e, _, r, ..)| r == src && e == x.1)
-            {
-                reuse = Some(active.remove(i).1);
-            }
-            // Likewise an arithmetic op (`float_bin`'s) whose first operand
-            // (or, commuting, second) ends there: the result is computed in
-            // place, with no copy. Every slow path of the op leaves before
-            // the result is written (a stub that resumes reloads the result
-            // last, `NumGen::reload`), so the operand's value is intact
-            // wherever one stores it.
-            if generic
-                && !is_carried
-                && reuse.is_none()
-                && let Some((p, q, commutes)) = float_bin_operands(&ops[x.1], x.0)
-            {
-                let ends = |r: u16| {
-                    active
+        let mut no_reuse = elem_cand;
+        let (slots, int) = 'alloc: loop {
+            let mut slots: Vec<Slot> = Vec::new();
+            let mut free: Vec<u8> = (FIRST_XMM..FIRST_XMM + MAX_PROMOTED as u8).rev().collect();
+            // (interval end, xmm, register, interval start, carried)
+            let mut active: Vec<(usize, u8, u16, usize, bool)> = Vec::new();
+            let ordered = carried
+                .iter()
+                .map(|x| (*x, true))
+                .chain(temps.iter().map(|x| (*x, false)));
+            for (x, is_carried) in ordered {
+                let (start, stop) = if is_carried { (head, end) } else { (x.1, x.2) };
+                active.retain(|&(e, xmm, ..)| {
+                    if e < start {
+                        free.push(xmm);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                // A `Move` that ends its source's interval hands the source's
+                // SSE register to its destination (the move then emits nothing).
+                // Generic regions only (no integer version shadows the slots).
+                let mut reuse = None;
+                if generic
+                    && !no_reuse
+                    && !is_carried
+                    && let Op::Move { dst, src } = bytecode[x.1]
+                    && dst == x.0
+                    && let Some(i) = active
                         .iter()
-                        .position(|&(e, _, ar, ..)| ar == r && e == x.1 && r != x.0)
-                };
-                if let Some(i) = ends(p).or_else(|| if commutes { ends(q) } else { None }) {
+                        .position(|&(e, _, r, ..)| r == src && e == x.1)
+                {
                     reuse = Some(active.remove(i).1);
                 }
-            }
-            let xmm = match (reuse, free.pop()) {
-                (Some(m), f) => {
-                    free.extend(f);
-                    m
-                }
-                (None, Some(m)) => m,
-                // Out of registers: in a generic region the active interval
-                // whose register buys the least gives it up, unless that is
-                // this one (an interval only ever holds one register, from
-                // its start to its end, so the loser stays in memory).
-                (None, None) if generic => {
-                    let w = |r: u16, a: usize, b: usize| {
-                        weight(r).saturating_mul(1024) / (b.saturating_sub(a) as u64 + 1)
+                // Likewise an arithmetic op (`float_bin`'s) whose first operand
+                // (or, commuting, second) ends there: the result is computed in
+                // place, with no copy. Every slow path of the op leaves before
+                // the result is written (a stub that resumes reloads the result
+                // last, `NumGen::reload`), so the operand's value is intact
+                // wherever one stores it.
+                if generic
+                    && !no_reuse
+                    && !is_carried
+                    && reuse.is_none()
+                    && let Some((p, q, commutes)) = float_bin_operands(&ops[x.1], x.0)
+                {
+                    let ends = |r: u16| {
+                        active
+                            .iter()
+                            .position(|&(e, _, ar, ..)| ar == r && e == x.1 && r != x.0)
                     };
-                    let mine = w(x.0, start, stop);
-                    let victim = active
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &(e, _, r, s0, _))| (w(r, s0, e), core::cmp::Reverse(e), i))
-                        .min();
-                    match victim {
-                        Some((vw, core::cmp::Reverse(ve), i))
-                            if vw < mine || (vw == mine && ve > stop) =>
-                        {
-                            let (_, m, vr, vs, _) = active.remove(i);
-                            slots.retain(|s| !(s.reg == vr && s.start == vs));
-                            m
-                        }
-                        _ => continue,
+                    if let Some(i) = ends(p).or_else(|| if commutes { ends(q) } else { None }) {
+                        reuse = Some(active.remove(i).1);
                     }
                 }
-                (None, None) => continue,
+                let xmm = match (reuse, free.pop()) {
+                    (Some(m), f) => {
+                        free.extend(f);
+                        m
+                    }
+                    (None, Some(m)) => m,
+                    // Out of registers: in a generic region the active interval
+                    // whose register buys the least gives it up, unless that is
+                    // this one (an interval only ever holds one register, from
+                    // its start to its end, so the loser stays in memory).
+                    (None, None) if generic => {
+                        let w = |r: u16, a: usize, b: usize| {
+                            weight(r).saturating_mul(1024) / (b.saturating_sub(a) as u64 + 1)
+                        };
+                        let mine = w(x.0, start, stop);
+                        let victim = active
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &(e, _, r, s0, _))| (w(r, s0, e), core::cmp::Reverse(e), i))
+                            .min();
+                        match victim {
+                            Some((vw, core::cmp::Reverse(ve), i))
+                                if vw < mine || (vw == mine && ve > stop) =>
+                            {
+                                let (_, m, vr, vs, _) = active.remove(i);
+                                slots.retain(|s| !(s.reg == vr && s.start == vs));
+                                m
+                            }
+                            _ => continue,
+                        }
+                    }
+                    (None, None) => continue,
+                };
+                active.push((stop, xmm, x.0, start, is_carried));
+                slots.push(Slot {
+                    reg: x.0,
+                    xmm,
+                    start,
+                    end: stop,
+                    carried: is_carried,
+                    dirty: x.4,
+                });
+            }
+            let dbl_xmm: Vec<u8> = slots.iter().map(|s| s.xmm).collect();
+            // The integer version covers numeric ops, and element and `.length`
+            // reads.
+            let int = if generic && !elem_cand {
+                None
+            } else {
+                int32::plan(
+                    bytecode, head, end, &info, &carried_r, n_regs, &dbl_xmm, elem_cand,
+                )
             };
-            active.push((stop, xmm, x.0, start, is_carried));
-            slots.push(Slot {
-                reg: x.0,
-                xmm,
-                start,
-                end: stop,
-                carried: is_carried,
-                dirty: x.4,
-            });
-        }
-        let dbl_xmm: Vec<u8> = slots.iter().map(|s| s.xmm).collect();
-        // The integer version covers numeric ops only.
-        let int = if generic {
-            None
-        } else {
-            int32::plan(bytecode, head, end, &info, &carried_r, n_regs, &dbl_xmm)
+            if no_reuse && int.is_none() {
+                no_reuse = false;
+                continue 'alloc;
+            }
+            break (slots, int);
         };
         let live_head = if generic {
             (0..n_regs as u16).filter(|&r| is_live(head, r)).collect()
@@ -6028,6 +6065,30 @@ mod tests {
             unreachable!()
         };
         assert_ne!(ty(muls[1], x), T_NUM);
+    }
+
+    #[test]
+    fn element_read_loops_have_an_integer_version() {
+        // A table CRC: element reads whose values only bitwise ops read,
+        // the Uint32 table's element and `c >>> 8` held as their bits.
+        let p = proto_of(
+            "function f(t, b){ let c = -1; for (let i = 0; i < b.length; i = i + 1) { c = t[(c ^ b[i]) & 255] ^ (c >>> 8); } return c; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        assert!(r.generic && r.int.is_some(), "an integer version");
+        // A loop summing elements keeps its double versions.
+        let q = proto_of(
+            "function g(a){ let s = 0; for (let i = 0; i < a.length; i = i + 1) { s = s + a[i]; } return s; }",
+            "g",
+        );
+        let (qops, ..) = crate::jit::lower_nbvm_generic(&q).expect("generic");
+        let qr = plan_regions(&qops, &q.ops, &[], q.n_regs);
+        assert_eq!(qr.len(), 1);
+        assert!(qr[0].int.is_none());
     }
 
     #[test]
