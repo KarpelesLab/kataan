@@ -1067,13 +1067,14 @@ impl Interp {
                     // `Array.prototype[0] = set…` or `Object.setPrototypeOf(arr, proxy)`.
                     // An *own* accessor at the index shadows any inherited one, so it
                     // is left to `store_array_index` (which fires the own setter).
-                    let absent_own = self
-                        .realm
-                        .array_length(handle)
-                        .is_none_or(|len| i >= len || self.realm.get_element(handle, i).is_hole());
-                    if absent_own
-                        && (self.realm.object_proto(handle) != self.realm.array_proto_intrinsic()
-                            || self.realm.proto_index_accessor_dirty())
+                    // (An index past the dense store of a sparse array is absent
+                    // too, unless it is stored sparsely: hence `has_own`, not
+                    // a hole check.)
+                    if (self.realm.object_proto(handle) != self.realm.array_proto_intrinsic()
+                        || self.realm.proto_index_accessor_dirty())
+                        && self.realm.array_length(handle).is_none_or(|len| {
+                            i >= len || !self.realm.has_own(handle, &alloc::format!("{i}"))
+                        })
                         && self
                             .realm
                             .accessor(handle, &alloc::format!("{i}"))

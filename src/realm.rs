@@ -5420,7 +5420,7 @@ impl Realm {
     /// `%Array.prototype%`, whose own prototype is an ordinary object with
     /// none above it, and neither has an index key (data or accessor).
     /// Memoized on the two objects' key epochs, so a hit is two compares.
-    fn array_chain_index_free(&mut self, handle: Handle) -> bool {
+    pub(crate) fn array_chain_index_free(&mut self, handle: Handle) -> bool {
         let Some(Cell::Array(a)) = self.heap.get(handle) else {
             return false;
         };

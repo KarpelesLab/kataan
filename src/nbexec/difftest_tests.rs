@@ -3848,3 +3848,29 @@ fn set_interval_repeats_until_cleared() {
         "micro zero a1 a2 b t30 a3 a4 b stop-b ids=numbertrue\n"
     );
 }
+
+/// `[[Set]]` of an index the array does not own runs OrdinarySet's
+/// prototype-chain lookup, so an inherited index setter on
+/// `Array.prototype` fires (and no own property is made) for a hole that
+/// `fill` writes and for an index past a sparse array's dense store (a
+/// `new Array(n)` with `n` past the dense cap). Both stored the element
+/// directly.
+#[test]
+fn hole_writes_reach_inherited_index_setters() {
+    let src = r#"
+        var n = 0;
+        Object.defineProperty(Array.prototype, "5", { set: function () { n++; }, configurable: true });
+        var a = new Array(10).fill(9);
+        var r = [n, a.hasOwnProperty(5)].join();
+        Object.defineProperty(Array.prototype, "1099999", { set: function () { n += 10; }, configurable: true });
+        var b = new Array(1100000).fill(9);
+        r += " " + [n, b.hasOwnProperty(1099999), b.hasOwnProperty(5)];
+        var d = new Array(1100000); d[5] = 1; d[6] = 2;
+        r += " " + [n, d.hasOwnProperty(5), d[6]];
+        delete Array.prototype[5]; delete Array.prototype[1099999];
+        var e = new Array(10).fill(1);
+        r += " " + [e.hasOwnProperty(5), n];
+        r
+    "#;
+    assert_eq!(run(src), "1,false 12,false,false 13,false,2 true,13");
+}

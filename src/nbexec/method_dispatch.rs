@@ -5034,13 +5034,17 @@ impl Interp {
                             (n as usize).min(len)
                         }
                     };
+                    // A prototype chain with an index key (an inherited setter
+                    // or read-only element) answers the `[[Set]]` of a hole.
+                    let chain_owns_index = self.realm.typed_kind(handle).is_none()
+                        && !self.realm.array_chain_index_free(handle);
                     for i in start..end {
                         // `Set(O, k, value, true)`: an index carrying a non-default
                         // attribute (a frozen array's non-writable elements) or an
                         // accessor must be honoured, and a failed write is a
                         // TypeError. The plain dense store is the fast path.
                         if self.realm.typed_kind(handle).is_none()
-                            && self.realm.array_index_has_override(handle, i)
+                            && (chain_owns_index || self.realm.array_index_has_override(handle, i))
                         {
                             let key = alloc::format!("{i}");
                             let kb = self.new_str(&key);
