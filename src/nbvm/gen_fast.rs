@@ -40,9 +40,10 @@ pub(super) enum GenOut {
 }
 
 /// The generator object `gh`'s state array, when it is a sync VM generator.
-fn state_of(ctx: &Ctx, gh: Handle) -> Option<Handle> {
+fn state_of(ctx: &mut Ctx, gh: Handle) -> Option<Handle> {
     ctx.realm
-        .get_property(gh, VM_GEN)
+        .object_get_cached(gh, VM_GEN, &mut ctx.gen_ic)
+        .or_else(|| ctx.realm.get_property(gh, VM_GEN))
         .and_then(|s| s.as_handle())
         .map(Handle::from_raw)
 }
@@ -99,10 +100,22 @@ fn resume_state(
                 _ => None,
             }
         });
-    let n_handlers = hs_h.and_then(|h| ctx.realm.array_length(h)).unwrap_or(0);
+    let handlers: Vec<(usize, Reg)> = match hs_h.and_then(|h| ctx.realm.array_elements(h)) {
+        Some(hs) if !hs.is_empty() => hs
+            .chunks(2)
+            .map(|c| {
+                (
+                    c[0].as_number().unwrap_or(0.0) as usize,
+                    c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let had_handlers = handlers.len();
     // A `return(v)` at a `yield` inside a try / for-of / destructuring region
     // must run that region's cleanup (iterator closes) — the interpreter's.
-    if delegate.is_none() && mode == 2 && state == GEN_SUSPENDED_YIELD && n_handlers > 0 {
+    if delegate.is_none() && mode == 2 && state == GEN_SUSPENDED_YIELD && !handlers.is_empty() {
         return Err(VmError::Unsupported);
     }
     if delegate.is_none()
@@ -117,18 +130,6 @@ fn resume_state(
     }
     let Some(proto) = funcs.get(id) else {
         return Err(VmError::Unsupported);
-    };
-    let handlers: Vec<(usize, Reg)> = match hs_h.and_then(|h| ctx.realm.array_elements(h)) {
-        Some(hs) if !hs.is_empty() => hs
-            .chunks(2)
-            .map(|c| {
-                (
-                    c[0].as_number().unwrap_or(0.0) as usize,
-                    c.get(1).and_then(|x| x.as_number()).unwrap_or(0.0) as Reg,
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
     };
     // The register file moves out of its array for the run (and back in at
     // the next `yield`); a completed generator's stays empty.
@@ -153,13 +154,42 @@ fn resume_state(
     // calls (see `TierState`): taken out for the run (a nested resume of
     // the same function runs cold) and put back after it.
     let body = proto.ops.as_ptr() as usize;
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let (mut hot, mut resumes) = (false, 0);
     let mut ic = match proto.tier.0.try_borrow_mut() {
-        Ok(mut t) if t.ic_body == body => core::mem::take(&mut t.ic),
+        Ok(mut t) => {
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            {
+                t.resumes = t.resumes.saturating_add(1);
+                resumes = t.resumes;
+                hot = inject.is_none()
+                    && !matches!(t.jit, Some(None))
+                    && super::jit_tier::resume_is_hot(t.resumes);
+            }
+            if t.ic_body == body {
+                core::mem::take(&mut t.ic)
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     };
-    let r = run_frame_at_ic(
-        ctx, funcs, &proto.ops, &mut regs, pc, handlers, inject, &mut ic,
-    );
+    // A hot generator's body resumes in native code (see
+    // `jit_tier::resume_generator`), on the same register file.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let compiled = if hot {
+        super::jit_tier::resume_generator(ctx, funcs, id, &mut regs, pc, &handlers, &ic, resumes)
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    let compiled = None;
+    let r = match compiled {
+        Some(r) => r,
+        None => run_frame_at_ic(
+            ctx, funcs, &proto.ops, &mut regs, pc, handlers, inject, &mut ic,
+        ),
+    };
     if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
         t.ic = ic;
         t.ic_body = body;
@@ -174,7 +204,11 @@ fn resume_state(
             if let Some(rh) = regs_h {
                 ctx.realm.internal_array_put(rh, regs);
             }
-            if let Some(hh) = hs_h {
+            // (Most bodies suspend outside any handler region, as they
+            // resumed: then the handler array stays as it is, empty.)
+            if let Some(hh) = hs_h
+                && !(handlers.is_empty() && had_handlers == 0)
+            {
                 ctx.realm.internal_array_set_numbers(
                     hh,
                     handlers
@@ -182,10 +216,11 @@ fn resume_state(
                         .flat_map(|(t, reg)| [*t as f64, f64::from(*reg)]),
                 );
             }
-            ctx.realm.internal_array_set_number(sh, 2, pc as f64);
-            ctx.realm.internal_array_set_number(sh, 3, f64::from(dst));
-            ctx.realm
-                .internal_array_set_number(sh, 1, GEN_SUSPENDED_YIELD);
+            ctx.realm.internal_array_set_numbers_from(
+                sh,
+                1,
+                &[GEN_SUSPENDED_YIELD, pc as f64, f64::from(dst)],
+            );
             // A `yield*` step hands the inner result object through as is.
             if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
                 Ok(GenOut::Delegated(value))
@@ -241,7 +276,7 @@ fn nested<T>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx) -> Result<T, VmError>) -> R
 /// The state array of the generator object `g` when the direct path may
 /// resume it: a hosted, single-realm run, and `g` a sync VM generator of a
 /// function in `funcs`.
-fn direct_target(ctx: &Ctx, funcs: &[FnProto], g: NanBox) -> Option<Handle> {
+fn direct_target(ctx: &mut Ctx, funcs: &[FnProto], g: NanBox) -> Option<Handle> {
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }

@@ -56,6 +56,28 @@ impl Realm {
         }
     }
 
+    /// Overwrites elements `i..` of the engine-internal array at `h` with
+    /// the Numbers `ns` (those past its end are dropped). Numbers need no
+    /// write barrier.
+    pub(crate) fn internal_array_set_numbers_from(&mut self, h: Handle, i: usize, ns: &[f64]) {
+        if let Some(a) = self.heap.get_mut(h).and_then(Cell::as_array_mut) {
+            for (slot, &n) in a.as_mut_slice().iter_mut().skip(i).zip(ns) {
+                *slot = NanBox::number(n);
+            }
+        }
+    }
+
+    /// The own data property `key` of the ordinary object at `h` through the
+    /// inline cache `cache` (`None` for any other cell, or no such key).
+    pub(crate) fn object_get_cached(
+        &self,
+        h: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
+        self.heap.get(h)?.as_object()?.cached_get(key, cache)
+    }
+
     /// Replaces the elements of the engine-internal array at `h` with the
     /// Numbers `ns`.
     pub(crate) fn internal_array_set_numbers(&mut self, h: Handle, ns: impl Iterator<Item = f64>) {

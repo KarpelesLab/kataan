@@ -2400,7 +2400,6 @@ fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
         Op::Yield { .. }
         | Op::Await { .. }
         | Op::GeneratorStart
-        | Op::InitGenerator { .. }
         | Op::YieldDelegate { .. }
         | Op::YieldResume { .. }
         | Op::AsyncDelegateCall { .. }
@@ -2417,6 +2416,50 @@ fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
     }
 }
 
+/// The suspension ops a sync generator's body compiles with
+/// ([`GenericHelpers::suspend`]): each leaves the compiled code with the
+/// generator's frame entirely in the register file, which the resumption
+/// re-enters after it (`YieldDelegate` re-runs on resumption).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn sync_generator_suspension(op: &crate::nbvm::Op) -> bool {
+    use crate::nbvm::Op;
+    matches!(
+        op,
+        Op::YieldResume { .. } | Op::GeneratorStart | Op::YieldDelegate { .. }
+    )
+}
+
+/// Whether the generic tier compiles `proto` with op `op` (its suspensions
+/// only in a sync generator).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn generic_accepts(proto: &crate::nbvm::FnProto, op: &crate::nbvm::Op) -> bool {
+    generic_refuses(op).is_none()
+        || (proto.is_generator && !proto.is_async && sync_generator_suspension(op))
+}
+
+/// Where a sync generator's compiled body is re-entered on resumption, in the
+/// function's own numbering: after each `yield` and after the body's start,
+/// and at each `yield*` step (which runs again).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
+    use crate::nbvm::Op;
+    if !proto.is_generator || proto.is_async {
+        return Vec::new();
+    }
+    proto
+        .ops
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| match op {
+            Op::YieldResume { .. } | Op::GeneratorStart => Some(pc + 1),
+            Op::YieldDelegate { .. } => Some(pc),
+            _ => None,
+        })
+        .filter(|&pc| pc < proto.ops.len())
+        .collect()
+}
+
 /// Lowers a `nbvm::FnProto` to the generic-tier IR, one [`GenericOp`] per
 /// bytecode op. Ops with a dedicated lowering (constants, moves, `+`/`-`/`*`/`/`/
 /// `%`, the comparisons, `!`, branches, static property get/set, computed element
@@ -2429,7 +2472,7 @@ fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
 #[must_use]
 pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowering> {
     use crate::nbvm::Op;
-    if proto.is_generator || proto.ops.len() > u32::MAX as usize {
+    if (proto.is_generator && proto.is_async) || proto.ops.len() > u32::MAX as usize {
         return None;
     }
     let n_regs = proto.n_regs;
@@ -2443,7 +2486,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
     // Call caches (`CallValue`).
     let mut n_calls = 0usize;
     for (pc, op) in proto.ops.iter().enumerate() {
-        if generic_refuses(op).is_some() {
+        if !generic_accepts(proto, op) {
             return None;
         }
         let pc32 = u32::try_from(pc).ok()?;
@@ -2971,11 +3014,13 @@ fn drop_dead_stores(
 #[must_use]
 pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::String {
     use alloc::format;
-    if proto.is_generator {
-        return alloc::string::String::from("generator");
+    if proto.is_generator && proto.is_async {
+        return alloc::string::String::from("async generator");
     }
     for (pc, op) in proto.ops.iter().enumerate() {
-        if let Some(why) = generic_refuses(op) {
+        if let Some(why) = generic_refuses(op)
+            && !generic_accepts(proto, op)
+        {
             return format!("{why} at pc {pc}: {op:?}");
         }
     }
@@ -3109,6 +3154,11 @@ pub struct GenericHelpers {
     /// The loop back-edge poll (`jit_helper_backedge`) — host interrupt, agent
     /// scheduling and the GC safepoint; returns the next poll countdown.
     pub backedge: JitBackedgeHelper,
+    /// A sync generator's suspension point (`jit_helper_suspend`): a
+    /// `yield` (or the start of the body, or a `yield*` step) leaves the
+    /// compiled code for the generator's resumption, which re-enters it
+    /// after the op.
+    pub suspend: JitSuspendHelper,
     /// The native-builtin-call helper (`jit_helper_call_native`) — runs the
     /// interpreter's `Op::CallNative` dispatch for a builtin (Pass 4).
     pub call_native: JitCallNativeHelper,
@@ -3571,6 +3621,17 @@ pub type JitBackedgeHelper = extern "C" fn(
     usize,
 ) -> u64;
 
+/// The runtime-helper ABI for a sync generator's suspension op
+/// (`Op::YieldResume`, `Op::GeneratorStart`, `Op::YieldDelegate`): `(ctx,
+/// regs, n_regs, op, pc) -> 0` (a `yield*` step that finished: fall through),
+/// the throw sentinel (the fault pending in `ctx`), or
+/// `NanBox::jit_exit_bits` (the generator suspended there: the context holds
+/// what it yields and where it resumes; `pc` is the op's pc in the
+/// function's own numbering).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitSuspendHelper =
+    extern "C" fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op, usize) -> u64;
+
 /// The runtime-helper ABI for a **native builtin call** (`Op::CallNative`):
 /// `(ctx, native_id, argv_ptr, argc) -> NanBox bits` (or the throw sentinel, with
 /// the fault in `ctx.jit_pending_fault`). `native_id` is the builtin discriminant.
@@ -3766,6 +3827,8 @@ impl JitProto {
             _ => None,
         });
         let nt_ok = new_target.is_none_or(|nt| nt > proto.n_params + proto.n_captures);
+        // A sync generator's resumption points (its own pcs).
+        let resume_pcs = generator_resume_pcs(proto);
         let expanded = inline::expand(proto, warm, pick);
         let spliced;
         let (proto, warm, pc_map) = match expanded {
@@ -3980,6 +4043,11 @@ impl JitProto {
                 _ => None,
             })
             .collect();
+        // A sync generator is also entered where a resumption continues.
+        osr_entries.extend(resume_pcs.iter().filter_map(|&pc| match &pc_map {
+            Some(m) => m.0.get(pc).map(|&p| p as usize),
+            None => Some(pc),
+        }));
         osr_entries.sort_unstable();
         osr_entries.dedup();
         let persist = global_persist::Persist::new();
@@ -6440,6 +6508,7 @@ impl JitFunction {
         let call_native_helper = helpers.call_native as usize as u64;
         let exec_op_helper = helpers.exec_op as usize as u64;
         let backedge_helper = helpers.backedge as usize as u64;
+        let suspend_helper = helpers.suspend as usize as u64;
         let push_handler_helper = helpers.push_handler as usize as u64;
         let pop_handler_helper = helpers.pop_handler as usize as u64;
         let unwind_helper = helpers.unwind as usize as u64;
@@ -8182,6 +8251,32 @@ impl JitFunction {
                         .flatten()
                         .and_then(|(args, site)| Some((args, *call_sites.get(site as usize)?)));
                     match bytecode.get(pc as usize)? {
+                        // A sync generator's suspension (`lower_nbvm_generic`
+                        // accepts these only there): the helper records what
+                        // it yields and where the resumption re-enters (the
+                        // function's own pc), and the body leaves as at a
+                        // loop header — everything is in the register file.
+                        // A `yield*` step that finished falls through.
+                        op @ (crate::nbvm::Op::YieldResume { .. }
+                        | crate::nbvm::Op::GeneratorStart
+                        | crate::nbvm::Op::YieldDelegate { .. }) => {
+                            let own = match pc_orig.get(pc as usize) {
+                                Some(&o) if o != u32::MAX => o as usize,
+                                Some(_) => return None,
+                                None => pc as usize,
+                            };
+                            a.mov_rdi_r15();
+                            a.mov_rsi_rbx();
+                            a.movabs_argreg(2, n_regs as i64);
+                            a.movabs_argreg(3, core::ptr::from_ref(op) as i64);
+                            a.movabs_argreg(4, own as i64);
+                            a.movabs_rax(suspend_helper as i64);
+                            a.call_rax();
+                            throw_check!();
+                            a.movabs_r11(NanBox::jit_exit_bits() as i64);
+                            a.cmp_rax_r11();
+                            a.je(leave_exit);
+                        }
                         // `super(…)`: the native call sequence, `new.target`
                         // passed on and `this` bound from the result.
                         crate::nbvm::Op::SuperCallArgs {

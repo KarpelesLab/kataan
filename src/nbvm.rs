@@ -1690,6 +1690,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         host: Some(host),
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
+        gen_ic: PropertyCache::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -2676,6 +2677,44 @@ fn gen_state_array(
         NanBox::handle(h.to_raw()),
     ]);
     NanBox::handle(arr.to_raw())
+}
+
+/// One [`Op::YieldDelegate`] step on the register file `regs` (the
+/// interpreter's arm and the compiled tier's): `Some(result)` to yield the
+/// inner iterator's not-done result as is (the op runs again on
+/// resumption), `None` once it is done (its value in `dst`; a forwarded
+/// return also sets `mode` to 3, so the code after the op returns, running
+/// finally blocks and iterator closes).
+#[allow(clippy::too_many_arguments)]
+fn yield_delegate_op(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &mut [NanBox],
+    dst: Reg,
+    iter: Reg,
+    next: Reg,
+    mode: Reg,
+) -> Result<Option<NanBox>, VmError> {
+    // `yield*` drives the iterator object itself: make a by-index array
+    // iterator real first.
+    if regs[iter as usize].is_number() {
+        iter_fast::materialize(ctx, regs, iter)?;
+    }
+    let (it, nx) = (regs[iter as usize], regs[next as usize]);
+    let m = regs[mode as usize].as_number().unwrap_or(0.0) as u8;
+    let v = regs[dst as usize];
+    match yield_delegate_step(ctx, funcs, it, nx, m, v)? {
+        DelegateStep::Yield(res) => Ok(Some(res)),
+        DelegateStep::Done(value) => {
+            regs[dst as usize] = value;
+            Ok(None)
+        }
+        DelegateStep::Return(value) => {
+            regs[dst as usize] = value;
+            regs[mode as usize] = NanBox::number(3.0);
+            Ok(None)
+        }
+    }
 }
 
 /// The outcome of one [`Op::YieldDelegate`] step.
@@ -4191,6 +4230,10 @@ struct Ctx<'a> {
     host: Option<&'a mut dyn VmHost>,
     output: String,
     microtasks: alloc::collections::VecDeque<Microtask>,
+    /// The generator objects' state-slot lookup (`gen_fast`): one layout
+    /// serves every generator of a function, so the hidden slot is read
+    /// without a name lookup.
+    gen_ic: PropertyCache,
     /// An in-flight thrown value stashed by a generic-JIT runtime helper (see
     /// [`jit_helper_add`]). The helper returns the reserved throw sentinel and
     /// leaves the value here; [`call_generic`] takes it back out as
@@ -4335,6 +4378,10 @@ struct TierState {
     /// as `jit`: compiled call sites hold its address.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     twin: Option<Option<alloc::rc::Rc<crate::jit::JitProto>>>,
+    /// A generator function's resumptions so far (its generators' hotness:
+    /// see `jit_tier::resume_is_hot`).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    resumes: u32,
 }
 
 /// How many spare inline-cache vectors a function keeps for its recursive
@@ -4481,6 +4528,7 @@ pub fn run_program(
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
+            gen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -4529,6 +4577,7 @@ pub fn run_program_capturing(
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
+            gen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -5110,7 +5159,11 @@ fn ensure_jit(
     // Prefer the Int/Float tiers (unboxed, for pure numeric code); fall back to
     // the generic (NanBox) tier, which runs on the interpreter's register file and
     // accepts nearly any body (see `jit_tier`).
-    let compiled = crate::jit::JitProto::compile_with_registry(&funcs[id], &registry)
+    // (A generator's body is only ever resumed on the register file: the
+    // generic tier's.)
+    let compiled = (!funcs[id].is_generator)
+        .then(|| crate::jit::JitProto::compile_with_registry(&funcs[id], &registry))
+        .flatten()
         .or_else(|| {
             let (warm, hints) = match ic {
                 Some(ic) => (
@@ -5216,6 +5269,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
+            gen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -6511,6 +6565,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call_native: jit_helper_call_native,
         exec_op: jit_tier::jit_helper_exec_op,
         backedge: jit_tier::jit_helper_backedge,
+        suspend: jit_tier::jit_helper_suspend,
         arena: jit_arena,
         push_handler: jit_tier::jit_helper_push_handler,
         pop_handler: jit_tier::jit_helper_pop_handler,
@@ -7968,37 +8023,18 @@ fn run_frame_at_ic(
                 iter,
                 next,
                 mode,
-            } => {
-                // `yield*` drives the iterator object itself: make a by-index
-                // array iterator real first.
-                if regs[*iter as usize].is_number()
-                    && let Err(e) = iter_fast::materialize(ctx, regs, *iter)
-                {
-                    handle_throw!(e);
-                    continue;
+            } => match yield_delegate_op(ctx, funcs, regs, *dst, *iter, *next, *mode) {
+                Ok(Some(res)) => {
+                    return Ok(FrameExit::Yield {
+                        value: res,
+                        pc: pc - 1,
+                        handlers: core::mem::take(&mut handlers),
+                        dst: *dst,
+                    });
                 }
-                let (it, nx) = (regs[*iter as usize], regs[*next as usize]);
-                let m = regs[*mode as usize].as_number().unwrap_or(0.0) as u8;
-                let v = regs[*dst as usize];
-                match yield_delegate_step(ctx, funcs, it, nx, m, v) {
-                    Ok(DelegateStep::Yield(res)) => {
-                        return Ok(FrameExit::Yield {
-                            value: res,
-                            pc: pc - 1,
-                            handlers: core::mem::take(&mut handlers),
-                            dst: *dst,
-                        });
-                    }
-                    Ok(DelegateStep::Done(value)) => regs[*dst as usize] = value,
-                    // A forwarded return: the compiled code after this op
-                    // returns (running finally blocks / iterator closes).
-                    Ok(DelegateStep::Return(value)) => {
-                        regs[*dst as usize] = value;
-                        regs[*mode as usize] = NanBox::number(3.0);
-                    }
-                    Err(e) => handle_throw!(e),
-                }
-            }
+                Ok(None) => {}
+                Err(e) => handle_throw!(e),
+            },
             Op::YieldResume { dst, src, .. } => {
                 return Ok(FrameExit::Yield {
                     value: regs[*src as usize],
@@ -26860,6 +26896,7 @@ mod generic_jit_tests {
             host: None,
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
+            gen_ic: PropertyCache::new(),
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending_fault: None,

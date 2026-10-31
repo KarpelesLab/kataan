@@ -105,6 +105,11 @@ pub(super) struct TierRuntime {
     left: Option<(usize, alloc::vec::Vec<(usize, Reg)>)>,
     /// What a back-edge poll returns to its loop: polls until the next one.
     poll_interval: u64,
+    /// A sync generator's compiled body that just suspended
+    /// ([`jit_helper_suspend`]): the pc its resumption continues at (the
+    /// function's own), the value it yields and the register a `next(v)`
+    /// lands `v` in.
+    suspended: Option<(usize, NanBox, Reg)>,
 }
 
 impl Default for TierRuntime {
@@ -121,6 +126,7 @@ impl Default for TierRuntime {
             resume: None,
             left: None,
             poll_interval: if exit_stress() { 1 } else { POLL_INTERVAL },
+            suspended: None,
         }
     }
 }
@@ -421,6 +427,16 @@ fn left_at(
     let handlers = ctx.jit_rt.handlers.split_off(base);
     ctx.jit_rt.base = outer_base;
     ctx.jit_funcs = saved;
+    // A sync generator's body suspended (the register file is up to date):
+    // the interpreter's own suspension outcome.
+    if let Some((pc, value, dst)) = ctx.jit_rt.suspended.take() {
+        return Ok(FrameExit::Yield {
+            value,
+            pc,
+            handlers,
+            dst,
+        });
+    }
     match ctx.jit_rt.resume.take() {
         Some(pc) => {
             ctx.jit_rt.left = Some((pc, handlers));
@@ -519,7 +535,7 @@ pub(super) fn osr(
             })
         })?;
     let proto = funcs.get(id)?;
-    if proto.is_generator || proto.ops.len() != program.len() {
+    if (proto.is_generator && proto.is_async) || proto.ops.len() != program.len() {
         return None;
     }
     if proto.tier.jit().is_none() {
@@ -537,6 +553,129 @@ pub(super) fn osr(
         );
     }
     run_tiering(ctx, funcs, id, jit, regs, target, handlers, ic, true)
+}
+
+/// Resumes the suspended sync generator of function `id` in native code: its
+/// register file `regs` (with the resumption's value and kind already bound),
+/// from `pc` with its handler stack `handlers` — exactly what the
+/// interpreter's run of the frame from there does. `ic` is the body's
+/// inline caches; `resumes` the function's resumptions so far. `None`
+/// (nothing ran) when the body has no compiled code entered there: interpret
+/// it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resume_generator(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    regs: &mut [NanBox],
+    pc: usize,
+    handlers: &[(usize, Reg)],
+    ic: &[crate::ic::PropertyCache],
+    resumes: u32,
+) -> Option<Result<FrameExit, VmError>> {
+    let proto = funcs.get(id)?;
+    if proto.tier.jit().is_none() {
+        super::global_mirror::prefill(ctx, proto);
+    }
+    let jit = jit_for(funcs, id, ic)?;
+    if !jit.is_generic() || !jit.has_entry(pc) {
+        return None;
+    }
+    // A resumption typically runs a loop's single iteration, whose back-edge
+    // poll would be the slow one of an activation that may leave to be
+    // recompiled: only one resumption in `RECOMPILE_EVERY` may (each one
+    // under `KATAAN_JIT_EXIT_STRESS`), which still recompiles a body whose
+    // sites learned more.
+    if resumes.is_multiple_of(RECOMPILE_EVERY) || exit_stress() {
+        run_tiering(ctx, funcs, id, jit, regs, pc, handlers, ic, true)
+    } else {
+        run_compiled_at(ctx, funcs, &jit, regs, pc, handlers, false, true)
+    }
+}
+
+/// How often a generator's resumption may leave its compiled body to be
+/// recompiled (see [`resume_generator`]).
+const RECOMPILE_EVERY: u32 = 64;
+
+/// Whether a resumption of a generator whose function has been resumed
+/// `resumes` times should run compiled code.
+pub(super) fn resume_is_hot(resumes: u32) -> bool {
+    match mode() {
+        Mode::Off => false,
+        Mode::Normal => resumes >= RESUME_THRESHOLD,
+        Mode::Eager => true,
+    }
+}
+
+/// Resumptions of a generator function's generators before they run in
+/// native code.
+const RESUME_THRESHOLD: u32 = 32;
+
+/// A sync generator's suspension op in compiled code
+/// (`crate::jit::JitSuspendHelper`): `Op::YieldResume` and
+/// `Op::GeneratorStart` suspend (recording what is yielded and where the
+/// resumption continues, `pc + 1`), and an `Op::YieldDelegate` step runs as
+/// its interpreter arm does — a not-done inner result suspends at the op
+/// itself (it runs again on resumption), a done one falls through.
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]; `pc` is the op's pc in the function's own
+/// numbering.
+pub(crate) extern "C" fn jit_helper_suspend(
+    ctx: *mut core::ffi::c_void,
+    regs: *mut u64,
+    n_regs: usize,
+    op: *const Op,
+    pc: usize,
+) -> u64 {
+    // SAFETY: as `jit_helper_exec_op`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // SAFETY: the activation's register file, live and unaliased here.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs) };
+    // SAFETY: the calling `JitProto`'s owned bytecode.
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op };
+    match op {
+        Op::YieldResume { dst, src, .. } => {
+            ctx.jit_rt.suspended = Some((pc + 1, regs[*src as usize], *dst));
+            NanBox::jit_exit_bits()
+        }
+        Op::GeneratorStart => {
+            ctx.jit_rt.suspended = Some((pc + 1, NanBox::undefined(), 0));
+            NanBox::jit_exit_bits()
+        }
+        Op::YieldDelegate {
+            dst,
+            iter,
+            next,
+            mode,
+        } => {
+            // SAFETY: `jit_funcs` outlives this call.
+            #[allow(unsafe_code)]
+            let funcs = unsafe {
+                &*ctx
+                    .jit_funcs
+                    .expect("jit_funcs set before generic dispatch")
+            };
+            match super::yield_delegate_op(ctx, funcs, regs, *dst, *iter, *next, *mode) {
+                Ok(Some(res)) => {
+                    ctx.jit_rt.suspended = Some((pc, res, *dst));
+                    NanBox::jit_exit_bits()
+                }
+                Ok(None) => 0,
+                Err(e) => {
+                    ctx.jit_pending_fault = Some(e);
+                    NanBox::jit_throw_bits()
+                }
+            }
+        }
+        _ => {
+            ctx.jit_pending_fault = Some(VmError::Unsupported);
+            NanBox::jit_throw_bits()
+        }
+    }
 }
 
 /// Runs function `id`'s compiled body `jit` on `regs` from `entry` with
