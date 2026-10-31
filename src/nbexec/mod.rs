@@ -1238,7 +1238,7 @@ const N_AB_ACCESSOR: u16 = 301;
 /// to have a `[[DataView]]` internal slot (else a TypeError), then re-dispatches
 /// through `call_method` so `DataView.prototype.getInt8.call(dv, 0)` and a direct
 /// `dv.getInt8(0)` share one implementation.
-const N_DATA_VIEW_PROTO_FN: u16 = 302;
+pub(crate) const N_DATA_VIEW_PROTO_FN: u16 = 302;
 /// `$262_detachArrayBuffer(buffer)` — the Test262 host hook (`$262.detachArrayBuffer`).
 /// Detaches the given `ArrayBuffer`: zero-lengths its backing store, empties every
 /// typed-array view over it, and flags it detached so subsequent operations throw
@@ -2798,9 +2798,11 @@ mod intl_aliases;
 mod intl_fmt;
 mod iterator;
 pub(crate) use iterator::{realm_builtin_entry_step, realm_builtin_iter_step};
+mod dataview_fast;
 mod json;
 mod json_parse;
 mod method_dispatch;
+pub(crate) use dataview_fast::{DvAccess, dataview_fast, dv_access_for};
 #[cfg(all(feature = "module", feature = "std"))]
 pub mod module;
 mod native_dispatch;

@@ -40,9 +40,10 @@ use crate::heap::Handle;
 use crate::ic::PropertyCache;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
-    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN,
-    N_NUMBER_PROTO_FN, N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES,
-    N_OBJECT_KEYS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
+    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_JSON_PARSE, N_JSON_STRINGIFY,
+    N_MAP_PROTO_FN, N_NUMBER_PROTO_FN, N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE,
+    N_OBJECT_ENTRIES, N_OBJECT_KEYS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD,
+    N_STRING_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -144,6 +145,9 @@ enum FastOp {
     /// `math_fast::compute` on Number arguments.
     #[cfg(feature = "std")]
     Math(u16),
+    /// A `DataView.prototype` `get*` / `set*` accessor (not BigInt or
+    /// Float16), served by `nbexec::dataview_fast`.
+    DataView(crate::nbexec::DvAccess),
     /// A built-in whose implementation is the host's (`Object.assign`,
     /// `JSON.stringify`, `JSON.parse`, and every built-in not served
     /// otherwise): the resolved function is called through the host
@@ -228,6 +232,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         return FastOp::None;
     };
     match (id, name) {
+        (N_DATA_VIEW_PROTO_FN, n) => {
+            crate::nbexec::dv_access_for(n).map_or(FastOp::HostDirect, FastOp::DataView)
+        }
         (N_ARRAY_PROTO_FN, b"push") => FastOp::ArrayPush,
         (N_ARRAY_PROTO_FN, b"pop") => FastOp::ArrayPop,
         (N_ARRAY_PROTO_FN, b"shift") => FastOp::ArrayShift,
@@ -870,6 +877,9 @@ fn run_op(
                 }
                 _ => crate::nbexec::index_of_units(bytes, pat, pos, rope.is_ascii()) >= 0.0,
             })
+        }
+        FastOp::DataView(acc) => {
+            crate::nbexec::dataview_fast(realm, recv, acc, arg(0), [arg(1), arg(2)])?
         }
         FastOp::StrFromCharCode => {
             // ToNumber of a Number runs no code; ToUint16 as the host does.

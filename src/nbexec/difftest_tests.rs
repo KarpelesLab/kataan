@@ -3050,3 +3050,69 @@ fn typed_array_element_writes_every_kind() {
     let exp = "-56 -1 44 -5 1 2 0 -1 0 0 0 0 0 0 0 1|200 255 44 251 1 2 0 255 0 0 0 0 0 0 0 1|200 0 255 0 2 2 255 0 255 0 255 0 0 255 0 255|200 -1 300 -5 1 2 0 -1 -7168 7168 0 0 0 0 0 1|200 65535 300 65531 1 2 0 65535 58368 7168 0 0 0 0 0 1|200 -1 300 -5 1 2 -2147483648 2147483647 1410065408 -1410065408 0 0 0 0 0 65537|200 4294967295 300 4294967291 1 2 2147483648 2147483647 1410065408 2884901888 0 0 0 0 0 65537|200 -1 300 -5 1.5 2.5 2147483648 -2147483648 10000000000 -10000000000 1152921504606847000 NaN -0 Infinity 0.10000000149011612 65537.75|200 -1 300 -5 1.5 2.5 2147483648 -2147483649 10000000000 -10000000000 1152921504606847000 NaN -0 Infinity 0.1 65537.75|,0,11,1,11,0|0,0,7,0";
     assert_eq!(run(src), exp);
 }
+
+/// DataView `get*`/`set*` from a method-call site: both byte orders, every
+/// non-BigInt type, modular / NaN / Infinity stores, a fractional or string
+/// offset, out-of-range offsets (RangeError), a non-DataView `this`
+/// (TypeError), offsets and values whose `valueOf` runs, and an own property
+/// shadowing the method.
+#[test]
+fn dataview_accessors_from_call_sites() {
+    let src = r#"
+        var buf = new ArrayBuffer(16), dv = new DataView(buf, 2, 12), u8 = new Uint8Array(buf);
+        var out = [];
+        for (var rep = 0; rep < 3; rep++) {
+            dv.setInt32(0, -2, true); dv.setUint16(4, 0x1234); dv.setInt8(6, 200); dv.setFloat32(8, 0.1, true);
+            dv.setUint32(0, 1e10); dv.setInt16(4, -1.9, true); dv.setUint8(7, NaN); dv.setUint8(6, Infinity);
+        }
+        out.push(Array.from(u8).join(","));
+        out.push([dv.getInt32(0), dv.getInt32(0, true), dv.getUint16(4), dv.getInt16(4, 1), dv.getInt8(6), dv.getUint8(7),
+            dv.getFloat32(8, true), dv.getFloat32(8), dv.getFloat64(4, "yes"), dv.getUint32(1.7), dv.getInt8("3")].join(","));
+        var errs = [];
+        [function () { dv.getInt32(9); }, function () { dv.setFloat64(5, 1); }, function () { dv.getUint8(-1); },
+         function () { dv.getUint8(12); }, function () { DataView.prototype.getInt8.call({}, 0); }].forEach(function (f) {
+            try { f(); errs.push("none"); } catch (e) { errs.push(e.constructor.name); }
+        });
+        out.push(errs.join(","));
+        var calls = 0;
+        dv.setUint8(0, { valueOf: function () { calls++; return 7; } });
+        out.push(dv.getUint8({ valueOf: function () { calls++; return 0; } }) + ":" + calls);
+        dv.getInt32 = function () { return "own"; };
+        out.push(dv.getInt32(0));
+        out.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "0,0,84,11,228,0,255,255,0,0,205,204,204,61,0,0|1410065408,14945108,65535,-1,0,0,0.10000000149011612,-429492128,5.23869003736593e-11,199491839,0|RangeError,RangeError,RangeError,RangeError,TypeError|7:2|own"
+    );
+}
+
+/// DataView accesses on a view over a resizable buffer that shrinks under it
+/// (TypeError while out of bounds, back in bounds after it grows), on an
+/// immutable buffer (a set is a TypeError) and on a detached buffer.
+#[test]
+fn dataview_accessors_on_resized_immutable_detached() {
+    let src = r#"
+        var r = [];
+        var rab = new ArrayBuffer(8, { maxByteLength: 16 });
+        var fixed = new DataView(rab, 0, 8), track = new DataView(rab, 4);
+        function w(dv, o, v) { try { dv.setUint8(o, v); return "ok"; } catch (e) { return e.constructor.name; } }
+        function g(dv, o) { try { return dv.getUint8(o); } catch (e) { return e.constructor.name; } }
+        for (var i = 0; i < 3; i++) { r.push(w(fixed, 7, 1), w(track, 3, 2)); }
+        rab.resize(6);
+        r.push(w(fixed, 0, 3), g(fixed, 0), w(track, 1, 4), g(track, 1), w(track, 2, 4));
+        rab.resize(16);
+        r.push(g(fixed, 7), g(track, 11), w(track, 11, 9), g(track, 11));
+        var im = new ArrayBuffer(4);
+        var imm = im.transferToImmutable ? im.transferToImmutable() : null;
+        if (imm) { var idv = new DataView(imm); r.push(w(idv, 0, 1), g(idv, 0)); }
+        var ab = new ArrayBuffer(4), ddv = new DataView(ab);
+        r.push(w(ddv, 0, 5));
+        if (ab.transfer) { ab.transfer(); r.push(w(ddv, 0, 5), g(ddv, 0)); }
+        r.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "ok,ok,ok,ok,ok,ok,TypeError,TypeError,ok,4,RangeError,0,0,ok,9,TypeError,0,ok,TypeError,TypeError"
+    );
+}
