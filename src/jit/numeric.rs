@@ -2756,9 +2756,12 @@ impl NumGen {
                     return Some(true);
                 }
                 // Only `undefined` / `null` throw (the interpreter's op).
+                // (The usual receiver, a heap handle, passes at once.)
                 let stub = a.new_label();
                 let resume = a.new_label();
                 self.load_gpr(a, reg, RAX, src);
+                a.p_cmp_handle_floor(super::call_seq::r::RAX);
+                a.g_jcc(super::call_seq::cc::AE, resume);
                 a.movabs_r11(NanBox::undefined().to_bits() as i64);
                 a.cmp_rax_r11();
                 a.jcc(CC_E, stub);

@@ -2612,7 +2612,7 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     let Some(jit) = direct_jit(ctx, proto, id) else {
         return;
     };
-    let Some(code) = jit.native_entry() else {
+    let Some(code) = jit.native_entry_for(site) else {
         return;
     };
     // (An inlining body's window is larger than the function's own.)
@@ -2624,7 +2624,7 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     site.fill(crate::jit::CallTarget {
         key: u64::from(fid) | ((n_caps as u64) << 32),
         code,
-        frame_bytes: (jit.n_regs() * 8) as u64,
+        frame_bytes: jit.native_frame_bytes(),
     });
 }
 
@@ -2801,13 +2801,13 @@ fn fill_construct_site(ctx: &mut Ctx, ctor: NanBox, site: &mut CallSite) {
     if let Some(proto) = funcs.get(fid as usize)
         && n_caps >= proto.n_captures
         && let Some(jit) = construct_target(proto)
-        && let Some(code) = jit.native_entry()
+        && let Some(code) = jit.native_entry_for(site)
         && jit.n_regs() >= proto.n_regs
     {
         site.fill(crate::jit::CallTarget {
             key: u64::from(fid) | ((n_caps as u64) << 32),
             code,
-            frame_bytes: (jit.n_regs() * 8) as u64,
+            frame_bytes: jit.native_frame_bytes(),
         });
     }
 }

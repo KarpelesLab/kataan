@@ -3192,7 +3192,25 @@ pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::Str
 /// offsets, and its speculative loops' `(header, region)`
 /// (`tierup::TierUp::spec_regions`).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-type GenericCompiled = (JitFunction, (usize, usize), Vec<(usize, usize)>);
+type GenericCompiled = (JitFunction, NativeEntries, Vec<(usize, usize)>);
+
+/// A generic body's native-call entries (`call_seq::emit_native_entry`), as
+/// byte offsets into its code.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeEntries {
+    /// The call sequence's.
+    general: usize,
+    /// A Rust caller's.
+    rust: usize,
+    /// For a site passing exactly the parameter count.
+    exact: usize,
+    /// For such a site in a pinned body, when this body pins too.
+    exact_pinned: Option<usize>,
+    /// The bytes the call sequence reserves above the register window for
+    /// the inlined calls' headers (see `emit_native_entry`'s `inline_ok`).
+    room: usize,
+}
 
 /// A bytecode-VM function compiled to native code, callable from the VM with
 /// `NanBox` values. This is the end-to-end fast path: it owns the compiled
@@ -3210,7 +3228,7 @@ pub struct JitProto {
     /// whose handler stack needs the activation set-up the ordinary entry
     /// (`jit_tier::run_compiled`) does, or one whose `new.target` register the
     /// entry cannot fill.
-    native_entry: Option<(usize, usize)>,
+    native_entry: Option<NativeEntries>,
     /// Generic tier: the register-file size the body addresses (the bytecode's
     /// `n_regs`); a caller's register file must be at least this long.
     n_regs: usize,
@@ -4544,7 +4562,7 @@ impl JitProto {
         caps: *const u64,
         this: u64,
     ) -> Option<u64> {
-        let (_, off) = self.native_entry?;
+        let off = self.native_entry?.rust;
         let code = self.func.code_ptr() + off;
         // SAFETY: `code` is this body's native-call entry, emitted to the
         // System V signature below (see `call_seq::emit_native_entry`); the
@@ -4577,7 +4595,32 @@ impl JitProto {
     #[must_use]
     pub fn native_entry(&self) -> Option<u64> {
         self.native_entry
-            .map(|(off, _)| (self.func.code_ptr() + off) as u64)
+            .map(|e| (self.func.code_ptr() + e.general) as u64)
+    }
+
+    /// The native-call entry a call sequence of `site` enters this body at
+    /// (see `CallSite::entry_argc`), if it has one.
+    #[must_use]
+    pub fn native_entry_for(&self, site: &CallSite) -> Option<u64> {
+        let e = self.native_entry?;
+        let off = if usize::try_from(site.entry_argc).ok() == Some(self.n_params) {
+            match e.exact_pinned {
+                Some(p) if site.entry_pinned => p,
+                _ => e.exact,
+            }
+        } else {
+            e.general
+        };
+        Some((self.func.code_ptr() + off) as u64)
+    }
+
+    /// The bytes a call sequence entering [`Self::native_entry`] lays out
+    /// above the arguments: the register window and the room the body's
+    /// inlined calls' headers need (which that entry then takes as checked).
+    #[must_use]
+    pub fn native_frame_bytes(&self) -> u64 {
+        let room = self.native_entry.map_or(0, |e| e.room);
+        (self.n_regs * 8 + room) as u64
     }
 }
 
@@ -6943,9 +6986,15 @@ impl JitFunction {
             // Number or boolean, which `numeric` makes), or a promoted
             // loop's that `numeric` makes through the way
             // (`NumGen::truthy_cacheable`).
+            // (An inlined call's guard result is a boolean: the test right
+            // after the guard is fused into it, `recv_cache::fused_guard_tests`.)
             |pc, r| {
                 !num.is_number_at(pc, r)
                     && !num.is_bool_at(pc, r)
+                    && !matches!(
+                        pc.checked_sub(1).and_then(|p| ops.get(p)),
+                        Some(&GenericOp::InlineGuard { dst, .. }) if dst == r
+                    )
                     && (!num.in_region(pc) || num.truthy_cacheable(pc, ops))
             },
             |pc| num.reuse_planned(pc),
@@ -7607,6 +7656,8 @@ impl JitFunction {
         a.jmp(labels[0]);
         let native = a.new_label();
         let native_rust = a.new_label();
+        let native_exact = a.new_label();
+        let native_exact_pinned = a.pinned().then(|| a.new_label());
         let fill = prologue::entry_fill(
             bytecode,
             &|pc| matches!(ops.get(pc), Some(GenericOp::Nop)),
@@ -7618,6 +7669,20 @@ impl JitFunction {
             GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => target <= i,
             _ => false,
         });
+        // The room the inlined calls' headers need above the window (as
+        // their guards' checks ask for it, `call_seq::emit_inline_guard`):
+        // a call sequence entering the native entry reserves and checks it
+        // with the window, so that entry starts with the guards' limits
+        // checked. (A body with `try` regions is entered through its Rust
+        // caller's entry instead, which checks nothing.)
+        let has_handlers = ops
+            .iter()
+            .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
+        let native_room = if has_inline && !has_handlers {
+            inl_slots.levels() * (call_seq::FRAME_HEADER + inl_slots.max_argc) * 8
+        } else {
+            0
+        };
         call_seq::emit_native_entry(
             &mut a,
             frame,
@@ -7627,7 +7692,16 @@ impl JitFunction {
             n_caps,
             new_target,
             (native, native_rust),
+            (native_exact, native_exact_pinned),
             labels[0],
+            (native_room > 0).then_some((
+                call_seq::InlineOk {
+                    ok: inl_slots.ok,
+                    room: native_room,
+                    levels: inl_slots.levels(),
+                },
+                &helpers.call_layout,
+            )),
         )?;
         // A speculative region's plain copy is emitted right after it
         // (`numeric::NumGen::schedule`).
@@ -7684,6 +7758,11 @@ impl JitFunction {
             }
             // The test of an `if (!x)` whose not branched itself.
             if not_tested[op_idx] && not_fused[op_idx - 1] {
+                continue;
+            }
+            // The test an inlined call's guard took over (outside promoted
+            // loops: `numeric` would test the proven boolean again).
+            if fused_test[op_idx] && !num.in_region(op_idx) {
                 continue;
             }
             if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
@@ -10869,6 +10948,11 @@ impl JitFunction {
         let uses_handlers = ops
             .iter()
             .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
+        let (exact, exact_pinned) = if uses_handlers {
+            (None, None)
+        } else {
+            (Some(native_exact), native_exact_pinned)
+        };
         let entries = if uses_handlers {
             // The handler entry is the Rust caller's, and behind a stub that
             // passes it the context, the call sequence's.
@@ -10900,6 +10984,8 @@ impl JitFunction {
             want.extend((0..ops.len()).filter_map(|i| num.copy_label(i)));
             want.extend(a.dbg_marks.iter().map(|m| m.0));
         }
+        want.push(exact.unwrap_or(entries.0));
+        want.push(exact_pinned.or(exact).unwrap_or(entries.0));
         let marks: Vec<(&'static str, Option<usize>)> =
             a.dbg_marks.iter().map(|m| (m.1, m.2)).collect();
         let (code, at) = a.finish_at(&want);
@@ -10939,7 +11025,15 @@ impl JitFunction {
             }
         }
         let spec_heads = num.spec_heads();
-        f.map(|f| (f, (at[0], at[1]), spec_heads))
+        let n = at.len();
+        let entries = NativeEntries {
+            general: at[0],
+            rust: at[1],
+            exact: at[n - 2],
+            exact_pinned: exact_pinned.map(|_| at[n - 1]),
+            room: native_room,
+        };
+        f.map(|f| (f, entries, spec_heads))
     }
 
     /// Wraps already-emitted machine `code` into a callable region (the entry

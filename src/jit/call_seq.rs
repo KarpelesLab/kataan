@@ -198,6 +198,17 @@ pub struct CallSite {
     /// is no longer entered (the copy makes the call without leaving
     /// anything first), and the body asks to be recompiled.
     pub spec_misses: u64,
+    /// The argument count every native call sequence emitted for this site
+    /// passes ([`CallSite::ENTRY_UNSET`] before the first is emitted,
+    /// [`CallSite::ENTRY_MIXED`] once two differ, as a `f.call(…)` site's
+    /// two do): a target with exactly that many parameters is entered at
+    /// its `exact` entry (see `emit_native_entry`). Written while the body
+    /// is emitted, before it can run.
+    pub entry_argc: u32,
+    /// Whether the body that emitted this site's call sequences pins the
+    /// heap arena (`pin`): a pinned target is then entered at its
+    /// `exact_pinned` entry.
+    pub entry_pinned: bool,
 }
 
 /// The guard misses after which a speculative loop's fast version is no
@@ -496,8 +507,16 @@ impl CallSite {
                 stamp: 0,
             },
             spec_misses: 0,
+            entry_argc: Self::ENTRY_UNSET,
+            entry_pinned: false,
         }
     }
+
+    /// [`CallSite::entry_argc`] before any call sequence is emitted.
+    pub const ENTRY_UNSET: u32 = u32::MAX;
+    /// [`CallSite::entry_argc`] once two call sequences pass different
+    /// counts.
+    pub const ENTRY_MIXED: u32 = u32::MAX - 1;
 
     /// Whether the site already holds `key`.
     #[must_use]
@@ -974,6 +993,15 @@ impl X64Assembler {
 /// pc 0 (`body`), which it falls through to when that is bound next. A body
 /// that polls at a back-edge has its poll `countdown` slot set to poll at the
 /// first one; any other has none.
+///
+/// Two more entries skip what a call site that always passes exactly
+/// `n_params` arguments does not need (the site picks one when its cache is
+/// filled, see [`CallSite::entry_argc`]): `exact` the argument-count test,
+/// and `exact_pinned` (a pinned body's only; `None` otherwise) also the
+/// save and load of the heap arena (`pin`), for a caller that pins it too —
+/// whose `r12`/`r13` already hold the arena at its call, and which loads
+/// them afresh after every call, so needs nothing back (the epilogue's
+/// restore of the never-saved slots hands it garbage it overwrites).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_native_entry(
     a: &mut X64Assembler,
@@ -984,7 +1012,9 @@ pub(crate) fn emit_native_entry(
     n_caps: usize,
     new_target: Option<usize>,
     (native, rust): (Label, Label),
+    (exact, exact_pinned): (Label, Option<Label>),
     body: Label,
+    inline_ok: Option<(InlineOk, &CallLayout)>,
 ) -> Option<()> {
     let undefined = crate::nanbox::NanBox::undefined().to_bits();
     let slot = |i: usize| i32::try_from(i * 8).ok();
@@ -996,24 +1026,64 @@ pub(crate) fn emit_native_entry(
     a.mov_r15_rdi(); // pin ctx
     a.jmp(pinned);
     a.cold_end(cold);
+    // `inline_ok`: on entry from a call sequence, the inlined calls'
+    // guards' limits (the `InlineSlots::ok` slot) hold but for the depth:
+    // the sequence checked the rest with its own (the window on the
+    // register stack, one realm), and room for the guards' headers above
+    // the window, which it laid out as part of the callee's
+    // (`JitProto::native_frame_bytes`) and the entry gives back — the stack
+    // top is then the window's end, the room under the limit. (The call
+    // sequence leaves the register stack in `r10`.) So the entry checks the
+    // depth for the inlined activations only. A Rust caller's entry leaves
+    // it all to the first guard.
+    let native_prologue = |a: &mut X64Assembler| -> Option<()> {
+        match inline_ok {
+            Some((io, l)) => {
+                let keys = core::mem::take(&mut a.recv_cache_keys);
+                a.recv_cache_keys = keys.iter().copied().filter(|&k| k != io.ok).collect();
+                a.frame_prologue(frame);
+                a.recv_cache_keys = keys;
+                // sub qword [r10 + STACK_TOP], room
+                a.g_mem(true, &[0x81], 5, r::R10, STACK_TOP);
+                a.code
+                    .extend_from_slice(&i32::try_from(io.room).ok()?.to_le_bytes());
+                // As `emit_limit_checks_deep`'s depth check, `levels - 1`
+                // activations above this one.
+                // ok = depth < max ? 0 : RECV_CACHE_EMPTY, without a branch.
+                const _: () = assert!(super::RECV_CACHE_EMPTY == -1);
+                a.g_load(r::R11, r::R15, l.realm);
+                a.g_load(r::RAX, r::R11, l.total_depth);
+                if io.levels > 1 {
+                    a.g_lea(r::RAX, r::RAX, i32::try_from(io.levels - 1).ok()?);
+                }
+                a.g_cmp_mem(r::RAX, r::R11, l.max_depth);
+                a.code.push(0xf5); // cmc: CF = depth >= max
+                a.code.extend_from_slice(&[0x4d, 0x19, 0xdb]); // sbb r11, r11
+                a.g_store(RBP, io.ok, r::R11);
+            }
+            None => a.frame_prologue(frame),
+        }
+        Some(())
+    };
+    let n_params = n_params.min(n_regs);
+    let copy = a.new_label();
+    let args_done = a.new_label();
     a.bind(native);
-    a.frame_prologue(frame);
+    native_prologue(a)?;
     a.bind(pinned);
     a.mov_rbx_rsi(); // pin the window
     a.pin_enter(); // the caller's `r12`/`r13` (see `pin`)
-    let n_params = n_params.min(n_regs);
     if n_params > 0 {
         // rdx = argc, rcx = argv. Fewer arguments than parameters: out of
         // line.
         let short = a.new_label();
-        let done = a.new_label();
         a.g_cmp_imm(r::RDX, i32::try_from(n_params).ok()?);
         a.g_jcc(cc::B, short);
         for i in 0..n_params {
             a.g_load(r::RAX, r::RCX, slot(i)?);
             a.g_store(r::RBX, slot(i)?, r::RAX);
         }
-        a.jmp(done);
+        a.jmp(args_done);
         let cold = a.cold_begin();
         a.bind(short);
         a.g_movabs(r::R11, undefined);
@@ -1029,10 +1099,28 @@ pub(crate) fn emit_native_entry(
             a.bind(store);
             a.g_store(r::RBX, slot(i)?, r::RAX);
         }
-        a.jmp(done);
+        a.jmp(args_done);
         a.cold_end(cold);
-        a.bind(done);
+    } else {
+        a.jmp(args_done);
     }
+    // The exact-count entries.
+    a.bind(exact);
+    native_prologue(a)?;
+    a.mov_rbx_rsi();
+    a.pin_enter();
+    if let Some(exact_pinned) = exact_pinned {
+        a.jmp(copy);
+        a.bind(exact_pinned);
+        native_prologue(a)?;
+        a.mov_rbx_rsi();
+    }
+    a.bind(copy);
+    for i in 0..n_params {
+        a.g_load(r::RAX, r::RCX, slot(i)?);
+        a.g_store(r::RBX, slot(i)?, r::RAX);
+    }
+    a.bind(args_done);
     let caps_end = (n_params + n_caps).min(n_regs);
     for (j, i) in (n_params..caps_end).enumerate() {
         a.g_load(r::RAX, r::R8, slot(j)?);
@@ -1138,6 +1226,18 @@ pub(crate) fn emit_handler_entry(a: &mut X64Assembler, helper: u64, inner: Label
 
 /// `rbp`'s register number.
 const RBP: u8 = 5;
+
+/// What a body with inlined calls' native entry needs to start with their
+/// guards' limits checked (see `emit_native_entry`).
+#[derive(Clone, Copy)]
+pub(crate) struct InlineOk {
+    /// The `InlineSlots::ok` slot.
+    pub ok: i32,
+    /// The bytes the guards ask for above the window.
+    pub room: usize,
+    /// `InlineSlots::levels`.
+    pub levels: usize,
+}
 
 /// One call site's emission inputs (see `emit_call`).
 pub(crate) struct CallEmit<'a> {
@@ -1683,6 +1783,24 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     emit_outcome(a, e)
 }
 
+/// Records how a call sequence being emitted for `site` enters its targets
+/// (see [`CallSite::entry_argc`]).
+fn note_entry(site: *const CallSite, argc: usize, pinned: bool) {
+    // SAFETY: `site` is one of the call caches of the body being compiled
+    // (an `UnsafeCell` the compiled body will own), which nothing else
+    // references until that body exists: its emission is the only access.
+    #[allow(unsafe_code)]
+    let site = unsafe { &mut *site.cast_mut() };
+    let argc = u32::try_from(argc).unwrap_or(CallSite::ENTRY_MIXED);
+    let first = site.entry_argc == CallSite::ENTRY_UNSET;
+    site.entry_argc = match site.entry_argc {
+        CallSite::ENTRY_UNSET => argc,
+        n if n == argc => n,
+        _ => CallSite::ENTRY_MIXED,
+    };
+    site.entry_pinned = pinned && (first || site.entry_pinned);
+}
+
 /// An inlined activation enclosing a call site, as that site's sequence
 /// pushes it when it is still pending ([`InlineCtx`]): what its stub
 /// ([`emit_inline_stub`]) would push.
@@ -1741,6 +1859,7 @@ fn emit_enter(
     }
     let below_b = hdr(below)?;
     let levels = i32::try_from(acts.len()).ok()?;
+    note_entry(e.site, argc, a.pinned());
     a.dbg_mark("c-limits");
     // 2. The activation may make native calls (`ACT_OK`), one realm, and
     //    room under the depth limit (for the pending activations too).
@@ -1959,7 +2078,7 @@ pub(crate) struct NestedSlots {
 
 impl InlineSlots {
     /// How many inlined activations can be active at once.
-    fn levels(&self) -> usize {
+    pub(crate) fn levels(&self) -> usize {
         1 + usize::from(self.nested.is_some())
     }
 
@@ -2409,7 +2528,11 @@ fn emit_guard_fast(
         a.g_jcc(cc::NE, slow);
         a.g_store(RBP, e.slots.callee, r::RAX);
         if w == own {
-            a.g_load(r::R8, r::R11, g(w, offset_of!(GuardMemo, caps)));
+            // (The captures' pointer, for an inlined body that has some.)
+            let n_caps = e.n_caps - u16::from(e.new_target.is_some());
+            if n_caps > 0 || e.proved.is_some() {
+                a.g_load(r::R8, r::R11, g(w, offset_of!(GuardMemo, caps)));
+            }
             a.jmp(identified);
         } else {
             a.jmp(miss);
@@ -2650,11 +2773,17 @@ pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &Inline
 /// no call: the activation its guard made pending is still pending (only a
 /// call materializes one), so it is dropped — `pend` emptied, or for an
 /// inner level's given back what it held when the guard hit (the outer
-/// activation's stub: that one is pending too), its `save` emptied.
+/// activation's stub, or `0` when that one was materialized before the loop
+/// was entered, which leaves none pending), its `save` emptied.
 pub(crate) fn emit_inline_leave_pending(a: &mut X64Assembler, s: &InlineSlots) {
     a.dbg_mark("leave-p");
     if let Some(save) = s.save {
+        let restore = a.new_label();
         a.g_load(r::RCX, RBP, save);
+        a.g_test(r::RCX);
+        a.g_jcc(cc::NE, restore);
+        a.g_movabs(r::RCX, super::RECV_CACHE_EMPTY as u64);
+        a.bind(restore);
         a.g_store(RBP, s.pend, r::RCX);
         a.g_store_imm32(RBP, save, super::RECV_CACHE_EMPTY);
     } else {
