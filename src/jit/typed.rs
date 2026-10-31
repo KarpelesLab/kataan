@@ -23,9 +23,10 @@
 //! A write takes a Number only (any other value's `ToNumber` may run code,
 //! which the helper does before anything else); the float kinds store any
 //! Number (Float32 rounding as the interpreter's `as f32` does, with the
-//! same instruction), the integer kinds an exact integer (`ToInt8` ..
-//! `ToUint32` of one is its low bits; Uint8Clamped clamps it to `0..=255`):
-//! a fraction or NaN, which needs real rounding, goes to the helper.
+//! same instruction), the integer kinds one below 2^63 in magnitude
+//! (`ToInt8` .. `ToUint32` of one is its truncation's low bits;
+//! Uint8Clamped rounds it half to even, then clamps it to `0..=255`): a
+//! NaN, an infinity or a larger Number goes to the helper.
 //!
 //! A read of a Float32 / Float64 element that holds a NaN gives the
 //! canonical NaN, as `NanBox::number` does (any NaN pattern can be written
@@ -182,7 +183,7 @@ const fn size_log2(kind: u8) -> u8 {
 }
 
 /// x86 condition codes beyond [`cc`]'s.
-const CC_P: u8 = 0xa;
+const CC_O: u8 = 0x0;
 const CC_NP: u8 = 0xb;
 const CC_NS: u8 = 0x9;
 const CC_LE: u8 = 0xe;
@@ -491,18 +492,32 @@ impl X64Assembler {
         self.t_elem(Some(0xf3), false, &[0x0f, 0x11], 1, 2); // movss [..], xmm1
         self.jmp(done);
         self.bind(not32);
-        // The integer kinds (0..=6) store an exact integer's low bits.
+        // The integer kinds (0..=6): `ToInt8` .. `ToUint32` of a Number is
+        // its truncation's low bits, which `cvttsd2si` makes for any one
+        // below 2^63 in magnitude; Uint8Clamped's rounds half to even
+        // (`ToUint8Clamp`), as `cvtsd2si` does in the default rounding
+        // mode, before the clamp. A NaN, an infinity or a larger Number
+        // gives the "integer indefinite" `i64::MIN` (as does -2^63 itself),
+        // the only value `cmp rdx, 1` overflows on.
         match src {
             Src::View => self.g_cmp_byte_imm(r::RCX, t.off_kind, UINT32),
             Src::Hoisted(v) => self.g_cmp_byte_imm(r::RBP, v.kind, UINT32),
         }
         self.g_jcc(cc::A, miss);
+        let trunc = self.new_label();
+        let conv = self.new_label();
+        match src {
+            Src::View => self.g_cmp_byte_imm(r::RCX, t.off_kind, UINT8_CLAMPED),
+            Src::Hoisted(v) => self.g_cmp_byte_imm(r::RBP, v.kind, UINT8_CLAMPED),
+        }
+        self.g_jcc(cc::NE, trunc);
+        self.raw(&[0xf2, 0x48, 0x0f, 0x2d, 0xd0]); // cvtsd2si rdx, xmm0
+        self.jmp(conv);
+        self.bind(trunc);
         self.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd0]); // cvttsd2si rdx, xmm0
-        self.raw(&[0x0f, 0x57, 0xc9]); // xorps xmm1, xmm1 (no false dependency)
-        self.raw(&[0xf2, 0x48, 0x0f, 0x2a, 0xca]); // cvtsi2sd xmm1, rdx
-        self.raw(&[0x66, 0x0f, 0x2e, 0xc1]); // ucomisd xmm0, xmm1
-        self.g_jcc(cc::NE, miss); // a fraction (or past i64)
-        self.g_jcc(CC_P, miss); // NaN
+        self.bind(conv);
+        self.raw(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx, 1
+        self.g_jcc(CC_O, miss);
         for kind in [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED] {
             let next = self.new_label();
             self.t_kind(t, src, kind, next, miss);

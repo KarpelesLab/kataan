@@ -602,12 +602,46 @@ struct Region {
     /// guard's test (`test`, a `JumpIfFalse`) emits nothing and the
     /// fallback arm `fallback..join` is not there at all.
     cold: Vec<(usize, usize, usize)>,
+    /// For a body that branches inside itself: the registers live on entry
+    /// to each of its ops (`live_words` words per pc from `head`), which
+    /// [`Region::defined`] reads; empty otherwise.
+    live: Vec<u64>,
+    live_words: usize,
 }
 
 impl Region {
     /// Whether `pc` lies in a guard diamond's fallback arm ([`Region::cold`]).
     fn is_cold(&self, pc: usize) -> bool {
         self.cold.iter().any(|&(_, f, e)| f <= pc && pc < e)
+    }
+
+    /// Whether register `r` is live on entry to region op `pc` (`true`
+    /// when not recorded).
+    fn live_at(&self, pc: usize, r: u16) -> bool {
+        if self.live_words == 0 || pc < self.head {
+            return true;
+        }
+        let w = (pc - self.head) * self.live_words + r as usize / 64;
+        self.live.get(w).is_none_or(|w| w & (1u64 << (r % 64)) != 0)
+    }
+
+    /// Whether slot `s`'s SSE register holds register `s.reg`'s value at op
+    /// `pc` (whose own write is still to come) on every path there, so that
+    /// storing it writes the register file a true value. A loop-carried
+    /// slot is loaded at the region's entry. A temporary's interval runs
+    /// from its first mention (a write, else the register would be live
+    /// at the header) to its last, in pc order, which in a body that only
+    /// branches forward (the back-edge aside) every path takes; but past a
+    /// join a temporary one arm wrote and the other has not yet (`t = c ?
+    /// x : y`, left in the second arm before its write) holds whatever
+    /// that SSE register last held, maybe a heap handle since freed. Such a
+    /// register is dead there (each path writes it before reading it), so
+    /// it is stored only where it is live: on entry to `pc`, or to `to`,
+    /// where a leave at `pc` resumes (a merged-check stretch's start,
+    /// whose live registers no op of the stretch writes).
+    fn defined(&self, s: &Slot, pc: usize, to: usize) -> bool {
+        s.carried
+            || (s.start < pc && (self.live_at(pc, s.reg) || (to != pc && self.live_at(to, s.reg))))
     }
 }
 
@@ -1525,9 +1559,8 @@ impl NumGen {
     /// For the `LoadGlobal` at `pc` of speculative region `ri`: the register
     /// still holding its binding's value, when an earlier global op of the
     /// iteration on the same name read it into one, or wrote it from one,
-    /// that no op since has written. (The fast version runs straight from
-    /// the header, or from a loop nest's last join: its other branches
-    /// leave it.)
+    /// that no op since has written. (Only back to the last join before
+    /// `pc`: past it the value may come from another edge.)
     fn global_known(&self, ri: usize, pc: usize) -> Option<u16> {
         let Op::LoadGlobal { name, .. } = self.bc(pc)? else {
             return None;
@@ -1535,7 +1568,8 @@ impl NumGen {
         let head = self.regions[ri].head;
         let (mut d, mut u) = (Vec::new(), Vec::new());
         for q in (head..pc).rev() {
-            // (Not across a join: a loop nest's inner header or exit.)
+            // (Not across a join: an arm's end, a loop nest's inner header
+            // or exit.)
             if self.is_target.get(q + 1).copied().unwrap_or(true) {
                 return None;
             }
@@ -2351,11 +2385,11 @@ impl NumGen {
         let Some(ri) = self.region_at(pc) else {
             return Vec::new();
         };
-        self.regions[ri]
-            .slots
+        let rg = &self.regions[ri];
+        rg.slots
             .iter()
             .filter(|s| s.start <= pc && pc <= s.end)
-            .map(|s| (s.xmm, disp(s.reg), s.dirty && (s.carried || s.start < pc)))
+            .map(|s| (s.xmm, disp(s.reg), s.dirty && rg.defined(s, pc, pc)))
             .collect()
     }
 
@@ -2695,10 +2729,12 @@ impl NumGen {
             return;
         }
         let pc = self.cur_pc;
-        for s in &self.regions[ri].slots {
+        let to = self.bail_pc(pc);
+        let rg = &self.regions[ri];
+        for s in &rg.slots {
             // A temporary op `pc` first defines holds no value yet (its first
             // mention is a write: a read would make it live at the header).
-            if s.dirty && s.start <= pc && pc <= s.end && (s.carried || s.start < pc) {
+            if s.dirty && s.start <= pc && pc <= s.end && rg.defined(s, pc, to) {
                 a.movsd_mem_x(disp(s.reg), s.xmm);
             }
         }
@@ -4248,7 +4284,18 @@ fn plan_regions(
         } else {
             Vec::new()
         };
+        // A body that branches inside itself records its liveness
+        // (`Region::defined`).
+        let branchy =
+            (head..end).any(|pc| branch_target(&ops[pc]).is_some_and(|t| t > head && t <= end));
+        let live_rows = if branchy && generic {
+            live[head * words..(end + 1) * words].to_vec()
+        } else {
+            Vec::new()
+        };
         out.push(Region {
+            live: live_rows,
+            live_words: if branchy && generic { words } else { 0 },
             head,
             end,
             slots,
@@ -4887,8 +4934,8 @@ fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Ve
     let mut checked: Vec<u16> = Vec::new();
     let mut out = Vec::new();
     let (mut d, mut u) = (Vec::new(), Vec::new());
-    // A loop nest's in-body branch targets (its inner loops' headers and
-    // exits) are joins: nothing is known there.
+    // The body's in-body branch targets (an arm's end, a loop nest's inner
+    // headers and exits) are joins: nothing is known there.
     let mut joins: Vec<usize> = Vec::new();
     for op in ops.get(head..=end).unwrap_or(&[]) {
         if let GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } = *op
@@ -5117,8 +5164,13 @@ fn spec_step(
 }
 
 /// Plans region `r`'s speculative double version ([`Spec`]): for a region of
-/// generic ops (and no integer version) whose in-body branches all leave it
-/// (the back-edge aside), so the plain copy needs no other in-body entry.
+/// generic ops (and no integer version) whose body makes no call. Its body
+/// may branch inside itself (an `if`, `&&` / `||`, `?:`, a `continue` or an
+/// early exit, a loop nest's inner loops): the facts then come from a
+/// dataflow over the body's branches, a register's at a join being what
+/// every edge into it agrees on ([`spec_nest_rows`]), and a leave for the
+/// plain copy from inside an arm resumes at its op there, the copy's own
+/// branches staying in the copy (`NumGen::branch_label`).
 /// A loop-carried register an arithmetic op reads is assumed (and checked at
 /// entry) to be a Number when the static types do not prove it, unless the
 /// loop itself may leave a non-Number in it.
@@ -5138,6 +5190,9 @@ fn plan_spec(
     if len.saturating_mul(n_regs) > MAX_STATE {
         return None;
     }
+    // Whether the body branches inside itself (an `if`, `&&`, `?:`, a
+    // `continue`, a loop nest's inner loops).
+    let mut branches = false;
     for (pc, op) in ops.iter().enumerate().take(end + 1).skip(head) {
         // (A guard diamond's fallback arm is not in the fast version.)
         if r.is_cold(pc) {
@@ -5157,10 +5212,10 @@ fn plan_spec(
         }) {
             continue;
         }
-        // (A loop nest's in-body branches are its inner loops': the plain
-        // copy keeps them to itself, `NumGen::branch_label`.)
-        if pc != end && (head..=end).contains(&t) && r.loops.is_empty() {
-            return None;
+        // (An in-body branch of the fast version stays in it, the plain
+        // copy's in the copy, `NumGen::branch_label`.)
+        if pc != end && (head..=end).contains(&t) {
+            branches = true;
         }
     }
     let (mut d, mut u) = (Vec::new(), Vec::new());
@@ -5193,7 +5248,7 @@ fn plan_spec(
             cur[x as usize] = T_NUM;
         }
         let mut rows = Vec::with_capacity(len * n_regs);
-        if r.loops.is_empty() {
+        if !branches {
             for (i, op) in bytecode[head..=end].iter().enumerate() {
                 rows.extend_from_slice(&cur);
                 // (The fast arm's jump skips the fallback arm: its join
@@ -5338,10 +5393,12 @@ fn plan_views(
     out
 }
 
-/// [`plan_spec`]'s in-state rows for loop nest `r` (into `rows`), its entry
-/// state `entry`: a forward dataflow over the nest's body to a fixpoint (its
-/// inner loops' back-edges and exits are joins). Returns the state the
-/// outer back-edge carries to the header.
+/// [`plan_spec`]'s in-state rows for region `r`, whose body branches inside
+/// itself (into `rows`), its entry state `entry`: a forward dataflow over
+/// the body to a fixpoint, each join (an `if`'s end, a loop nest's inner
+/// header or exit) taking the [`join`] of its incoming edges' states, so a
+/// fact holds there only if it holds on every edge. Returns the state the
+/// back-edges carry to the header.
 fn spec_nest_rows(
     r: &Region,
     ops: &[GenericOp],
@@ -5736,7 +5793,8 @@ mod tests {
             unreachable!()
         };
         assert!(sp.checks.contains(&sum), "checks {:?}", sp.checks);
-        // A branch inside the body: no speculative version.
+        // A branch inside the body: a speculative version too (its facts
+        // from the dataflow over the body's branches).
         let b = proto_of(
             "function h(o){ let s = 0; for (let i = 0; i < 100; i = i + 1) { if (o.x > 1) s = s + o.x; } return s; }",
             "h",
@@ -5745,7 +5803,7 @@ mod tests {
         let regions = plan_regions(&bops, &b.ops, &[], b.n_regs);
         assert_eq!(regions.len(), 1);
         let t = infer(&b.ops, b.n_regs);
-        assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs, &[]).is_none());
+        assert!(plan_spec(&regions[0], &bops, &b.ops, &t, b.n_regs, &[]).is_some());
     }
 
     #[test]
@@ -5935,6 +5993,41 @@ mod tests {
         let (qops, ..) = crate::jit::lower_nbvm_generic(&q).expect("generic");
         let qr = plan_regions(&qops, &q.ops, &[], q.n_regs);
         assert!(qr.iter().all(|r| r.loops.is_empty()));
+    }
+
+    #[test]
+    fn branchy_loops_have_a_speculative_version() {
+        // An `if` / `else` in the body: a speculative version, its liveness
+        // recorded, and at the join only what both arms agree on: `x` is a
+        // Number on one arm (`i * 0.5`) and an element on the other.
+        let p = proto_of(
+            "function f(a, strs){ let s = 0; for (let i = 0; i < a.length; i = i + 1) { let x; if (i & 1) x = i * 0.5; else x = strs[i]; s = s + x * 2; } return s; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let mut regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1);
+        let types = infer(&p.ops, p.n_regs);
+        let r = &mut regions[0];
+        assert!(r.loops.is_empty() && r.live_words > 0);
+        r.spec = plan_spec(r, &ops, &p.ops, &types, p.n_regs, &[]);
+        let sp = r.spec.as_ref().expect("a speculative version");
+        let n = p.n_regs;
+        let muls: Vec<usize> = (r.head..=r.end)
+            .filter(|&pc| matches!(p.ops[pc], Op::Mul { .. }))
+            .collect();
+        assert_eq!(muls.len(), 2);
+        let ty = |pc: usize, x: u16| sp.types[(pc - r.head) * n + x as usize];
+        // `i * 0.5`, on the first arm: `i` is a Number there.
+        let Op::Mul { a: i, .. } = p.ops[muls[0]] else {
+            unreachable!()
+        };
+        assert_eq!(ty(muls[0], i), T_NUM);
+        // `x * 2`, past the join: `x` is not.
+        let Op::Mul { a: x, .. } = p.ops[muls[1]] else {
+            unreachable!()
+        };
+        assert_ne!(ty(muls[1], x), T_NUM);
     }
 
     #[test]

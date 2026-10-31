@@ -3560,3 +3560,85 @@ fn typed_array_length_in_compiled_code_honours_redefinitions() {
         "270 390 90 630 150 undefined3"
     );
 }
+
+/// Speculative loops whose bodies branch inside themselves: a Number on one
+/// arm and a string on the other (the join keeps only what both agree on),
+/// a merged NaN check after a join one arm reaches without the merged op, a
+/// property read after a write on one arm, an early `break`, a clamping
+/// filter; and fractional Numbers stored into every integer typed-array kind
+/// (truncation, Uint8Clamped's round half to even), checked against node.
+#[test]
+fn speculative_loops_with_branches_and_fractional_typed_stores() {
+    let src = r#"
+        var out = [];
+        var strs = ["k0", "k1", "k22", "5"];
+        function numFirst(n, strs) {
+            var acc = 0, s = 0;
+            for (var i = 0; i < n; i++) {
+                var x;
+                if (i % 97 !== 3) x = i * 0.5; else x = strs[i & 3];
+                acc = acc + x;
+                if (acc.length !== undefined) { s += acc.length; acc = i & 15; }
+            }
+            return acc + ":" + s;
+        }
+        out.push(numFirst(3000, strs));
+        function cover(xs, ys, n) {
+            var s = 0, k = 0;
+            for (var i = 0; i < n; i++) {
+                var a = xs[i % 7], b = ys[i % 5], p;
+                if (i & 1) p = 1.5; else p = a * 2;
+                var q = p * b;
+                if (q === q) s += q; else { k++; s += (p === p ? p : 7); }
+            }
+            return s + ":" + k;
+        }
+        out.push(cover([1, "2", null, undefined, 2.5, {}, -3], [1, undefined, "x", 0.5, 2], 3000));
+        function reuse(o, n) {
+            var s = 0;
+            for (var i = 0; i < n; i++) {
+                var a = o.p;
+                if (i & 1) o.p = a + 1;
+                else if ((i & 7) === 2) o.p = strs[i & 3];
+                var b = o.p;
+                if (b.length !== undefined) { s += b.length; o.p = i & 3; } else s += b - a;
+            }
+            return s;
+        }
+        out.push(reuse({ p: 0 }, 3000));
+        function find(a, x) { var i = 0; for (; i < a.length; i++) { if (a[i] === x) break; } return i; }
+        var ia = new Int32Array(1000);
+        for (var i = 0; i < 1000; i++) ia[i] = i * 3;
+        var f = 0;
+        for (var k = 0; k < 30; k++) f += find(ia, ((k * 79) % 1100) * 3);
+        out.push(f);
+        function clamp(src, dst, k) {
+            for (var i = 0; i < src.length; i++) {
+                var v = src[i] * k - 7;
+                if (v > 255) v = 255; else if (v < 0) v = 0;
+                dst[i] = v;
+            }
+            var h = 0;
+            for (var i = 0; i < dst.length; i++) h = (h * 31 + dst[i]) % 1000003;
+            return h;
+        }
+        var src = new Float64Array(600);
+        for (var i = 0; i < 600; i++) src[i] = (i * 37) % 300 - 20 + (i & 3) * 0.25;
+        out.push(clamp(src, new Uint8Array(600), 1.25), clamp(src, new Uint8ClampedArray(600), 1.25), clamp(src, new Int8Array(600), 0.75));
+        var vals = [0.5, 1.5, 2.5, -0.5, -1.5, 254.5, 255.5, 2147483648.5, -2147483649.5, 4294967297.25, 1e19, NaN, -Infinity];
+        var kinds = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array];
+        function fill(d, v) { for (var r = 0; r < 50; r++) for (var i = 0; i < v.length; i++) d[i] = v[i] * 1; }
+        for (var j = 0; j < kinds.length; j++) { var d = new kinds[j](vals.length); fill(d, vals); out.push(Array.prototype.join.call(d, " ")); }
+        out.join()
+    "#;
+    assert_eq!(
+        run(src),
+        concat!(
+            "127130.5:221,6646.5:1457,2625,14505,563960,178256,777861,0 1 2 0 -1 -2 -1 0 -1 1 0 0 0,",
+            "0 1 2 0 255 254 255 0 255 1 0 0 0,0 2 2 0 0 254 255 255 0 255 255 0 0,",
+            "0 1 2 0 -1 254 255 0 -1 1 0 0 0,0 1 2 0 65535 254 255 0 65535 1 0 0 0,",
+            "0 1 2 0 -1 254 255 -2147483648 2147483647 1 -1981284352 0 0,",
+            "0 1 2 0 4294967295 254 255 2147483648 2147483647 1 2313682944 0 0"
+        )
+    );
+}
