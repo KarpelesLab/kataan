@@ -1163,25 +1163,6 @@ impl Interp {
                         "Array.prototype.{name} called on null or undefined"
                     )));
                 }
-                // A *generic* `Array.prototype.<m>` whose `this` is a typed array views
-                // it as an array-like and builds a plain `Array` — unlike
-                // `%TypedArray%.prototype.<m>` (a direct `ta.<m>()`), which returns a
-                // same-kind typed array. For the collection-returning methods we
-                // materialize the view's elements into a plain array first, so e.g.
-                // `Array.prototype.slice.call(u8)` returns a real, concat-spreadable
-                // `Array`. We do NOT convert for typed-array-specific/mutating methods
-                // (`set`, `subarray`, `sort`, `fill`, …) — those must see the live view.
-                const PLAIN_ARRAY_RESULT: &[&str] = &[
-                    "slice",
-                    "map",
-                    "filter",
-                    "flat",
-                    "flatMap",
-                    "concat",
-                    "toReversed",
-                    "toSorted",
-                    "with",
-                ];
                 // ToObject(this): a primitive `this` (a boolean/number/string/
                 // symbol/bigint, e.g. `Array.prototype.reduce.call("abc", …)`) is
                 // boxed to its wrapper object so its array-like indexed properties
@@ -1203,21 +1184,10 @@ impl Interp {
                 } else {
                     this_val
                 };
-                let this_eff = match this_obj.as_handle().map(Handle::from_raw) {
-                    // `map`/`filter` are excluded: they reach a generic per-index
-                    // path that already builds a plain array via ArraySpeciesCreate,
-                    // and copying the elements up front would freeze a view whose
-                    // buffer the callback is allowed to resize.
-                    Some(h)
-                        if PLAIN_ARRAY_RESULT.contains(&name.as_str())
-                            && !matches!(name.as_str(), "map" | "filter" | "slice")
-                            && self.realm.typed_kind(h).is_some() =>
-                    {
-                        let elems = self.realm.typed_elements(h).unwrap_or_default();
-                        NanBox::handle(self.realm.new_array(elems).to_raw())
-                    }
-                    _ => this_obj,
-                };
+                // A typed-array `this` stays the view itself: the generic
+                // algorithms read it through `Get(O, "length")` and per-index
+                // `[[Get]]` and build a plain `Array` (see `call_method_inner`).
+                let this_eff = this_obj;
                 // Mark this as a generic `Array.prototype.<m>` application so a
                 // primitive-wrapper `this` is treated as an array-like object
                 // rather than unwrapped to its boxed primitive.

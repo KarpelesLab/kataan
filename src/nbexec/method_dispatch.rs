@@ -230,7 +230,7 @@ impl Interp {
         // own branded `toReversed` (a same-kind view) below.
         if method == "toReversed"
             && let Some(h) = recv.as_handle().map(Handle::from_raw)
-            && self.realm.typed_kind(h).is_none()
+            && (self.realm.typed_kind(h).is_none() || array_proto_generic)
             && (self.realm.is_array(h) || array_proto_generic || self.inherits_array_proto(h))
         {
             let len = self.array_like_length(h)?;
@@ -2833,7 +2833,24 @@ impl Interp {
             "splice",
             "sort",
         ];
-        if self.realm.is_generic_array_like_target(handle)
+        // `Array.prototype.<m>.call(ta)` is the generic algorithm over a typed
+        // array: `LengthOfArrayLike` is `Get(O, "length")` (an own or inherited
+        // `length` property is honored), then `HasProperty`/`Get`/`Set` per index.
+        let generic_over_typed = array_proto_generic && self.realm.typed_kind(handle).is_some();
+        // `slice`/`join`/`toLocaleString` read the elements only after their
+        // argument coercions (which may resize the view's buffer), so they run
+        // by index rather than over a snapshot.
+        if generic_over_typed {
+            match method {
+                "slice" => return Ok(Some(self.array_slice_generic(handle, args)?)),
+                "join" | "toLocaleString" => {
+                    let locale = method == "toLocaleString";
+                    return Ok(Some(self.array_join_generic(handle, args, locale)?));
+                }
+                _ => {}
+            }
+        }
+        if (self.realm.is_generic_array_like_target(handle) || generic_over_typed)
             && MUTATING_GENERIC.contains(&method)
             && (array_proto_generic || self.inherits_array_proto(handle))
             && !self.inherits_iterator_proto(handle)
@@ -2869,7 +2886,7 @@ impl Interp {
                 .and_then(|p| p.as_handle())
                 .map(Handle::from_raw)
                 .is_some_and(|p| self.realm.is_string_handle(p));
-        if self.realm.is_generic_array_like_target(handle)
+        if (self.realm.is_generic_array_like_target(handle) || generic_over_typed)
             && LAZY_SCAN_GENERIC.contains(&method)
             && (array_proto_generic || self.inherits_array_proto(handle))
             && !self.inherits_iterator_proto(handle)
@@ -2909,7 +2926,7 @@ impl Interp {
         // spec MOP order/count a proxy observes — the materialize path would instead
         // pre-read every element (wrong access count) and read `constructor` late. A
         // real dense array keeps its fast `elems` path below.
-        if self.realm.is_generic_array_like_target(handle)
+        if (self.realm.is_generic_array_like_target(handle) || generic_over_typed)
             && matches!(method, "flat" | "flatMap")
             && (array_proto_generic || self.inherits_array_proto(handle))
             && !self.inherits_iterator_proto(handle)
@@ -2925,7 +2942,6 @@ impl Interp {
         // exotic element methods — but `Array.prototype.map.call(ta)` *is* the
         // generic algorithm, and must read live: the callback can `resize()` the
         // backing buffer and take later indices out of bounds.
-        let generic_over_typed = array_proto_generic && self.realm.typed_kind(handle).is_some();
         if (self.realm.is_generic_array_like_target(handle) || generic_over_typed)
             && matches!(method, "map" | "filter")
             && (array_proto_generic || self.inherits_array_proto(handle))
@@ -2957,7 +2973,7 @@ impl Interp {
         // indices their algorithm names: `at` the one element, `with` every index
         // but the replaced one. Materializing the receiver would `[[Get]]` (and
         // `HasProperty`) every index, which a Proxy or getter observes.
-        if self.realm.is_generic_array_like_target(handle)
+        if (self.realm.is_generic_array_like_target(handle) || generic_over_typed)
             && matches!(method, "at" | "with")
             && (array_proto_generic || self.inherits_array_proto(handle))
             && !self.inherits_iterator_proto(handle)
@@ -2966,7 +2982,14 @@ impl Interp {
             return Ok(Some(self.array_at_with_generic(method, handle, args)?));
         }
         let mut array_like = None;
-        if self.realm.is_generic_array_like_target(handle)
+        // `Array.prototype.<m>.call(ta)` is the generic algorithm too: its
+        // `LengthOfArrayLike` is `Get(O, "length")`, which an own or inherited
+        // `length` property can make differ from the typed array's own length.
+        // (The array iterators are the exception: `%ArrayIteratorPrototype%.next`
+        // reads a typed array's internal length.)
+        let typed_as_array_like =
+            generic_over_typed && !matches!(method, "values" | "keys" | "entries");
+        if (self.realm.is_generic_array_like_target(handle) || typed_as_array_like)
             && ARRAY_LIKE_METHODS.contains(&method)
             // Only treat the receiver as a generic array-like when the call was
             // an explicit `Array.prototype.<m>.call(o)` (the flag) OR `o` actually

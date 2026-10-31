@@ -3778,3 +3778,40 @@ fn string_builders_enforce_the_length_cap() {
         "R ok90 R R R R R R R ok90 R R R R R R R R ok60 R ok60 R R"
     );
 }
+
+/// `Array.prototype.<m>.call(typedArray)` is the generic algorithm: its
+/// `LengthOfArrayLike` is `Get(O, "length")`, so an own (or inherited)
+/// `length` property shadowing `%TypedArray%.prototype.length` is honored,
+/// read once, and indices past the view are absent (`HasProperty` false).
+/// The engine used the view's internal length for join/slice/indexOf/
+/// reduce/forEach/at/flat/toReversed/toSorted and friends, and
+/// `Array.prototype.concat.call(ta)` spread the view instead of wrapping it.
+/// The array iterators keep the internal length, as specified.
+#[test]
+fn generic_array_methods_read_a_typed_arrays_length_property() {
+    let src = r#"
+        function mk(len) {
+            var ta = new Uint8Array([1, 2, 3, 4, 5, 6]);
+            Object.defineProperty(ta, "length", { value: len });
+            return ta;
+        }
+        var A = Array.prototype, r = [];
+        r.push(A.join.call(mk(3), "-"), A.join.call(mk(8), "-"), String(A.slice.call(mk(8))));
+        r.push(A.slice.call(mk(2.7)).length, A.indexOf.call(mk(3), 4), A.includes.call(mk(8), undefined));
+        r.push(A.reduce.call(mk(8), function (a, x) { return a + x; }, 0), A.at.call(mk(3), -1));
+        r.push(String(A.flat.call(mk(2))), String(A.toReversed.call(mk(8))), String(A.toSorted.call(mk(3))));
+        r.push(A.toLocaleString.call(mk(2)), A.findLast.call(mk(3), function (x) { return x < 9; }));
+        r.push(Array.from(A.keys.call(mk(2))).length);
+        var c = A.concat.call(new Uint8Array([1, 2]), [3]);
+        r.push(c.length, c[0] instanceof Uint8Array);
+        var reads = 0, t = new Int16Array([5, 6, 7, 8]);
+        Object.defineProperty(t, "length", { get: function () { reads++; return 2; } });
+        r.push(A.join.call(t), A.slice.call(t).length, reads, t.join("+"));
+        r.join(" | ")
+    "#;
+    assert_eq!(
+        run(src),
+        "1-2-3 | 1-2-3-4-5-6-- | 1,2,3,4,5,6,, | 2 | -1 | true | 21 | 3 | 1,2 | ,,6,5,4,3,2,1 | 1,2,3 \
+         | 1,2 | 3 | 6 | 2 | true | 5,6 | 2 | 2 | 5+6+7+8"
+    );
+}
