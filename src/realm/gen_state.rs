@@ -106,6 +106,62 @@ impl Realm {
         self.object_get_cached(proto, "constructor", cache)
     }
 
+    /// Whether `Get(h, "then")` is `undefined` without running any code,
+    /// for an iterator-result object: `h` is an ordinary object whose own
+    /// properties are exactly the data properties `value` and `done` (the
+    /// layout [`new_iter_result`](Self::new_iter_result) makes) and whose
+    /// `[[Prototype]]` is the default object prototype, and no object on
+    /// that prototype's chain has a `then` property. The chain is proved
+    /// once per prototype epoch: each object on it is watched
+    /// ([`JIT_FLAG_WATCHED`](crate::object::JIT_FLAG_WATCHED)), so a `then`
+    /// defined anywhere on it, or a `[[Prototype]]` changed, retires the
+    /// proof. `false` means "do the full `[[Get]]`".
+    pub(crate) fn iter_result_thenless(&mut self, h: Handle) -> bool {
+        let Some(shape) = self.iter_result_shape.as_ref() else {
+            return false;
+        };
+        let Some(o) = self.heap.get(h).and_then(Cell::as_object) else {
+            return false;
+        };
+        if !o
+            .shaped_shape()
+            .is_some_and(|s| alloc::rc::Rc::ptr_eq(s, shape))
+            || !o.has_no_accessors()
+            || o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0
+            || o.proto().is_none()
+            || o.proto() != self.default_object_proto
+        {
+            return false;
+        }
+        if self.no_then_stamp == crate::object::proto_epoch() {
+            return true;
+        }
+        let mut cur = self.default_object_proto;
+        while let Some(c) = cur {
+            match self.heap.get(c).and_then(Cell::as_object) {
+                Some(p)
+                    if p.jit_flags() & crate::object::JIT_FLAG_EXOTIC == 0
+                        && !p.has_own_key("then") =>
+                {
+                    cur = p.proto();
+                }
+                _ => {
+                    self.no_then_stamp = 0;
+                    return false;
+                }
+            }
+        }
+        let mut cur = self.default_object_proto;
+        while let Some(c) = cur
+            && let Some(p) = self.heap.get_mut(c).and_then(Cell::as_object_mut)
+        {
+            p.watch();
+            cur = p.proto();
+        }
+        self.no_then_stamp = crate::object::proto_epoch();
+        true
+    }
+
     /// CreateIterResultObject(`value`, `done`): a fresh ordinary object with
     /// the data properties `value` and `done`, in that order — built in its
     /// final layout at once.

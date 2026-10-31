@@ -560,7 +560,7 @@ pub(super) fn osr(
             })
         })?;
     let proto = funcs.get(id)?;
-    if (proto.is_generator && proto.is_async) || proto.ops.len() != program.len() {
+    if proto.ops.len() != program.len() {
         return None;
     }
     if proto.tier.jit().is_none() {
@@ -716,6 +716,7 @@ pub(super) fn run_generator_body(
 /// suspension moves the body's handlers back into `handlers` (handed out in
 /// the outcome) instead of making a new vector.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(super) fn resume_frame(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -1555,6 +1556,19 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             super::vm_iter_step(ctx, funcs, regs, *done, *iter, *next)
                 .map(|v| regs[*dst as usize] = v.unwrap_or(NanBox::undefined())),
         ),
+        // A `for await` step's `next()` call, and the check of what it
+        // resolved to: exactly their interpreter arms.
+        Op::AsyncIterStep {
+            dst,
+            iter,
+            next,
+            sync,
+        } => Some(super::async_iter_step(
+            ctx, funcs, regs, *dst, *iter, *next, *sync,
+        )),
+        Op::CheckObject { src } if super::is_object_value(&ctx.realm, regs[*src as usize]) => {
+            Some(Ok(()))
+        }
         // `for (const [k, v] of map)`: exactly its interpreter arm.
         Op::IterNextEntry {
             dst,

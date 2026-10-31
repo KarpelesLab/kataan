@@ -2558,9 +2558,6 @@ fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
         | Op::YieldDelegate { .. }
         | Op::YieldResume { .. }
         | Op::AsyncDelegateCall { .. }
-        | Op::AsyncIterOpen { .. }
-        | Op::AsyncIterStep { .. }
-        | Op::AsyncIterClose { .. }
         | Op::AddAsyncDisposable { .. }
         | Op::AsyncDisposeStep { .. } => Some("suspension"),
         Op::TailCall { .. } | Op::TailCallValue { .. } | Op::TailCallThis { .. } => {
@@ -2585,23 +2582,32 @@ fn sync_generator_suspension(op: &crate::nbvm::Op) -> bool {
 }
 
 /// Whether the generic tier compiles `proto` with op `op` (its suspensions
-/// only in a sync generator, and `await` only in an async function).
+/// only in a sync generator, `await` only in an async function, and in an
+/// async generator its start, its `yield`s and its `await`s — not an async
+/// `yield*`, whose steps are not these ops).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn generic_accepts(proto: &crate::nbvm::FnProto, op: &crate::nbvm::Op) -> bool {
+    use crate::nbvm::Op;
     generic_refuses(op).is_none()
         || (proto.is_generator && !proto.is_async && sync_generator_suspension(op))
-        || (proto.is_async && !proto.is_generator && matches!(op, crate::nbvm::Op::Await { .. }))
+        || (proto.is_async && !proto.is_generator && matches!(op, Op::Await { .. }))
+        || (proto.is_async
+            && proto.is_generator
+            && matches!(
+                op,
+                Op::GeneratorStart | Op::YieldResume { .. } | Op::Await { .. }
+            ))
 }
 
-/// Where a sync generator's or an async function's compiled body is
-/// re-entered on resumption, in the function's own numbering: after each
-/// `yield` and after the body's start, and at each `yield*` step (which runs
+/// Where a generator's or an async function's compiled body is re-entered
+/// on resumption, in the function's own numbering: after each `yield` and
+/// after the body's start, and at each (sync) `yield*` step (which runs
 /// again); after each `await`.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 #[must_use]
 pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
     use crate::nbvm::Op;
-    if proto.is_generator == proto.is_async {
+    if !proto.is_generator && !proto.is_async {
         return Vec::new();
     }
     proto
@@ -2610,7 +2616,7 @@ pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
         .enumerate()
         .filter_map(|(pc, op)| match op {
             Op::YieldResume { .. } | Op::GeneratorStart if proto.is_generator => Some(pc + 1),
-            Op::YieldDelegate { .. } if proto.is_generator => Some(pc),
+            Op::YieldDelegate { .. } if proto.is_generator && !proto.is_async => Some(pc),
             Op::Await { .. } if proto.is_async => Some(pc + 1),
             _ => None,
         })
@@ -2630,7 +2636,7 @@ pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
 #[must_use]
 pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowering> {
     use crate::nbvm::Op;
-    if (proto.is_generator && proto.is_async) || proto.ops.len() > u32::MAX as usize {
+    if proto.ops.len() > u32::MAX as usize {
         return None;
     }
     let n_regs = proto.n_regs;
@@ -3172,9 +3178,6 @@ fn drop_dead_stores(
 #[must_use]
 pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::String {
     use alloc::format;
-    if proto.is_generator && proto.is_async {
-        return alloc::string::String::from("async generator");
-    }
     for (pc, op) in proto.ops.iter().enumerate() {
         if let Some(why) = generic_refuses(op)
             && !generic_accepts(proto, op)

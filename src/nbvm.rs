@@ -2954,14 +2954,15 @@ pub(crate) fn resume_vm_async(
     // resumption ends only its own job, as it does in the drain.)
     while !entered && matches!(result, Ok(()) | Err(VmError::Thrown(_))) {
         result = match next_batch_resume(&mut ctx, table) {
-            Some((target, false, fulfilled, v)) => {
+            Some((target, None, fulfilled, v)) => {
                 let c = NanBox::handle(target.to_raw());
                 resume_async_frame(&mut ctx, table, c, Some(target), fulfilled, v)
             }
-            Some((target, true, fulfilled, v)) => resume_agen_frame(
+            Some((target, Some(sh), fulfilled, v)) => resume_agen_frame(
                 &mut ctx,
                 table,
                 NanBox::handle(target.to_raw()),
+                Some(sh),
                 fulfilled,
                 v,
             ),
@@ -2977,14 +2978,14 @@ pub(crate) fn resume_vm_async(
 }
 
 /// The next queued job, when [`VmHost::peek_batch_job`] offers it and it is
-/// the resumption of a VM async function's frame cell (`false`) or of a VM
-/// async generator (`true`) of `table`, with its value and whether it
-/// fulfilled: dequeued, for the caller to run now. (Only while one realm
+/// the resumption of a VM async function's frame cell (`None`) or of a VM
+/// async generator (its frame cell) of `table`, with its value and whether
+/// it fulfilled: dequeued, for the caller to run now. (Only while one realm
 /// exists: a frame of another realm resumes in its own.)
 fn next_batch_resume(
     ctx: &mut Ctx,
     table: &alloc::rc::Rc<[FnProto]>,
-) -> Option<(Handle, bool, bool, NanBox)> {
+) -> Option<(Handle, Option<Handle>, bool, NanBox)> {
     if ctx.realm.multi_realm || !ctx.microtasks.is_empty() {
         return None;
     }
@@ -2998,14 +2999,14 @@ fn next_batch_resume(
         _ => return None,
     };
     let agen = match ctx.realm.vm_frame(target) {
-        Some(f) if (f.func as usize) < table.len() => false,
+        Some(f) if (f.func as usize) < table.len() => None,
         Some(_) => return None,
         None => {
             let st = agen_state(ctx, NanBox::handle(target.to_raw())).ok()?;
             if st.id >= table.len() {
                 return None;
             }
-            true
+            Some(st.state)
         }
     };
     ctx.host.as_deref_mut()?.pop_job();
@@ -3137,6 +3138,11 @@ fn agen_state(ctx: &mut Ctx, generator: NanBox) -> Result<AgenState, VmError> {
         .and_then(|s| s.as_handle())
         .map(Handle::from_raw)
         .ok_or(VmError::NotAnObject)?;
+    agen_state_at(ctx, sh)
+}
+
+/// [`agen_state`] of the async generator whose frame cell is `sh`.
+fn agen_state_at(ctx: &Ctx, sh: Handle) -> Result<AgenState, VmError> {
     let f = ctx.realm.vm_frame(sh).ok_or(VmError::NotAnObject)?;
     let queue = f
         .aux
@@ -3151,6 +3157,27 @@ fn agen_state(ctx: &mut Ctx, generator: NanBox) -> Result<AgenState, VmError> {
         dst: f.dst,
         queue,
     })
+}
+
+/// `Await(v)` in the async generator `generator` (frame cell `sh`): its
+/// resume reactions are made at its first `await` and kept in its frame
+/// cell, reused by every later one (they are never observable, as an async
+/// function's are not).
+fn agen_await(
+    ctx: &mut Ctx,
+    generator: NanBox,
+    sh: Handle,
+    v: NanBox,
+) -> Option<Result<(), HostError>> {
+    let mut fns = ctx.realm.vm_frame(sh)?.resume_fns;
+    if fns.0.is_undefined() {
+        fns = with_host(ctx, |h| h.async_resume_fns(generator))?;
+        if let Some(f) = ctx.realm.vm_frame_mut(sh) {
+            f.resume_fns = fns;
+        }
+        ctx.realm.vm_frame_stored(sh);
+    }
+    with_host(ctx, |h| h.await_resume(v, fns))
 }
 
 /// Sets the status of the async generator frame `sh`.
@@ -3242,6 +3269,18 @@ fn vm_agen_enqueue(
     v: NanBox,
 ) -> Result<NanBox, VmError> {
     let st = agen_state(ctx, generator)?;
+    vm_agen_enqueue_at(ctx, funcs, generator, st, kind, v)
+}
+
+/// [`vm_agen_enqueue`] with the generator's state `st` already read.
+fn vm_agen_enqueue_at(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    generator: NanBox,
+    st: AgenState,
+    kind: u8,
+    v: NanBox,
+) -> Result<NanBox, VmError> {
     let p = with_host(ctx, |h| h.new_promise()).ok_or(VmError::Unsupported)?;
     let req = ctx
         .realm
@@ -3251,16 +3290,21 @@ fn vm_agen_enqueue(
         && st.status != GEN_AWAITING_RETURN
         && st.status != GEN_RETURN_AWAIT
     {
-        agen_drain(ctx, funcs, generator)?;
+        agen_drain(ctx, funcs, generator, st.state)?;
     }
     Ok(p)
 }
 
 /// Services queued requests until the queue empties or the generator parks
 /// on an `await` (AsyncGeneratorResume / AsyncGeneratorDrainQueue).
-fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(), VmError> {
+fn agen_drain(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    generator: NanBox,
+    sh: Handle,
+) -> Result<(), VmError> {
     loop {
-        let st = agen_state(ctx, generator)?;
+        let st = agen_state_at(ctx, sh)?;
         let Some((kind, v)) = agen_front(ctx, st.queue) else {
             return Ok(());
         };
@@ -3292,14 +3336,13 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
                 return Err(VmError::Unsupported);
             }
             agen_set_status(ctx, st.state, GEN_RETURN_AWAIT);
-            match with_host(ctx, |h| h.await_value(v, generator)) {
+            match agen_await(ctx, generator, sh, v) {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(HostError::Thrown(e))) => {
                     agen_set_status(ctx, st.state, GEN_EXECUTING);
                     let (mut regs, handlers) = load_frame(ctx, st.state);
-                    let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
-                    let r = run_suspended(ctx, funcs, proto, &mut regs, st.pc, handlers, Some(e));
-                    if !agen_step(ctx, funcs, generator, st.id, regs, r)? {
+                    let r = run_suspended(ctx, funcs, st.id, &mut regs, st.pc, handlers, Some(e));
+                    if !agen_step(ctx, funcs, generator, sh, st.id, regs, r)? {
                         return Ok(());
                     }
                     continue;
@@ -3321,7 +3364,7 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
                 }
                 _ => {
                     agen_set_status(ctx, st.state, GEN_AWAITING_RETURN);
-                    match with_host(ctx, |h| h.await_value(v, generator)) {
+                    match agen_await(ctx, generator, sh, v) {
                         Some(Ok(())) => return Ok(()),
                         Some(Err(HostError::Thrown(e))) => {
                             agen_set_status(ctx, st.state, GEN_COMPLETED);
@@ -3353,9 +3396,8 @@ fn agen_drain(ctx: &mut Ctx, funcs: &[FnProto], generator: NanBox) -> Result<(),
             }
         };
         agen_set_status(ctx, st.state, GEN_EXECUTING);
-        let proto = funcs.get(st.id).ok_or(VmError::Unsupported)?;
-        let r = run_suspended(ctx, funcs, proto, &mut regs, st.pc, handlers, inject);
-        if !agen_step(ctx, funcs, generator, st.id, regs, r)? {
+        let r = run_suspended(ctx, funcs, st.id, &mut regs, st.pc, handlers, inject);
+        if !agen_step(ctx, funcs, generator, sh, st.id, regs, r)? {
             return Ok(());
         }
     }
@@ -3368,11 +3410,12 @@ fn agen_step(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     generator: NanBox,
+    sh: Handle,
     id: usize,
     mut regs: Vec<NanBox>,
     mut r: Result<FrameExit, VmError>,
 ) -> Result<bool, VmError> {
-    let st = agen_state(ctx, generator)?;
+    let st = agen_state_at(ctx, sh)?;
     let proto = funcs.get(id).ok_or(VmError::Unsupported)?;
     loop {
         match r {
@@ -3388,11 +3431,11 @@ fn agen_step(
                     .is_some_and(|op| matches!(op, Op::Await { .. }));
                 if is_await {
                     save_frame(ctx, st.state, GEN_EXECUTING, pc, dst, regs, handlers);
-                    match with_host(ctx, |h| h.await_value(value, generator)) {
+                    match agen_await(ctx, generator, sh, value) {
                         Some(Ok(())) => return Ok(false),
                         Some(Err(HostError::Thrown(e))) => {
                             let (mut rg, hs) = load_frame(ctx, st.state);
-                            r = run_suspended(ctx, funcs, proto, &mut rg, pc, hs, Some(e));
+                            r = run_suspended(ctx, funcs, id, &mut rg, pc, hs, Some(e));
                             regs = rg;
                             continue;
                         }
@@ -3449,10 +3492,36 @@ fn agen_direct_next(
     }
     ctx.call_depth += 1;
     ctx.realm.vm_total_depth += 1;
-    let r = vm_agen_enqueue(ctx, funcs, it, 0, NanBox::undefined());
+    let r = vm_agen_enqueue_at(ctx, funcs, it, st, 0, NanBox::undefined());
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
     Some(r)
+}
+
+/// [`Op::AsyncIterStep`] on the register file `regs` (the interpreter's arm
+/// and the compiled tier's): a `for await` step's `next()` call, its
+/// promise in `dst`.
+fn async_iter_step(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &mut [NanBox],
+    dst: Reg,
+    iter: Reg,
+    next: Reg,
+    sync: Reg,
+) -> Result<(), VmError> {
+    let (it, nx) = (regs[iter as usize], regs[next as usize]);
+    let v = if regs[sync as usize].as_boolean() == Some(true) {
+        with_host(ctx, |h| h.async_from_sync_next(it, nx))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from)?
+    } else if let Some(r) = agen_direct_next(ctx, funcs, it, nx) {
+        r?
+    } else {
+        call_closure(ctx, funcs, nx, &[], it)?
+    };
+    regs[dst as usize] = v;
+    Ok(())
 }
 
 /// The host's `%AsyncGeneratorPrototype%` `next`/`throw`/`return` (`kind` 0/1/2)
@@ -3499,18 +3568,19 @@ pub(crate) fn resume_vm_agen(
 ) -> Result<(), VmError> {
     let entered = enter_frame_realm(host, generator);
     let mut ctx = hosted_ctx(host.take_realm(), host);
-    let mut result = resume_agen_frame(&mut ctx, table, generator, fulfilled, v);
+    let mut result = resume_agen_frame(&mut ctx, table, generator, None, fulfilled, v);
     // As `resume_vm_async`: the resumption jobs right behind run here.
     while !entered && matches!(result, Ok(()) | Err(VmError::Thrown(_))) {
         result = match next_batch_resume(&mut ctx, table) {
-            Some((target, false, fulfilled, v)) => {
+            Some((target, None, fulfilled, v)) => {
                 let c = NanBox::handle(target.to_raw());
                 resume_async_frame(&mut ctx, table, c, Some(target), fulfilled, v)
             }
-            Some((target, true, fulfilled, v)) => resume_agen_frame(
+            Some((target, Some(sh), fulfilled, v)) => resume_agen_frame(
                 &mut ctx,
                 table,
                 NanBox::handle(target.to_raw()),
+                Some(sh),
                 fulfilled,
                 v,
             ),
@@ -3526,16 +3596,21 @@ pub(crate) fn resume_vm_agen(
 }
 
 /// One await-reaction resumption of the VM async generator `generator`
-/// ([`resume_vm_agen`]'s), in the context `ctx`.
+/// ([`resume_vm_agen`]'s), in the context `ctx`; `sh` its frame cell, if
+/// the caller has it.
 fn resume_agen_frame(
     ctx: &mut Ctx,
     table: &alloc::rc::Rc<[FnProto]>,
     generator: NanBox,
+    sh: Option<Handle>,
     fulfilled: bool,
     v: NanBox,
 ) -> Result<(), VmError> {
     {
-        let st = agen_state(ctx, generator)?;
+        let st = match sh {
+            Some(sh) => agen_state_at(ctx, sh)?,
+            None => agen_state(ctx, generator)?,
+        };
         if st.status == GEN_RETURN_AWAIT && fulfilled {
             agen_set_status(ctx, st.state, GEN_COMPLETED);
             let res = iter_result(ctx, v, true);
@@ -3559,13 +3634,12 @@ fn resume_agen_frame(
             } else {
                 Some(v)
             };
-            let proto = table.get(st.id).ok_or(VmError::Unsupported)?;
-            let r = run_suspended(ctx, table, proto, &mut regs, st.pc, handlers, inject);
-            if !agen_step(ctx, table, generator, st.id, regs, r)? {
+            let r = run_suspended(ctx, table, st.id, &mut regs, st.pc, handlers, inject);
+            if !agen_step(ctx, table, generator, st.state, st.id, regs, r)? {
                 return Ok(());
             }
         }
-        agen_drain(ctx, table, generator)?;
+        agen_drain(ctx, table, generator, st.state)?;
         if ctx.microtasks.is_empty() {
             Ok(())
         } else {
@@ -3574,25 +3648,57 @@ fn resume_agen_frame(
     }
 }
 
-/// A suspended frame of function `proto` run from `pc` (with `handlers`,
+/// A suspended frame of function `id` run from `pc` (with `handlers`,
 /// optionally throwing `inject` there first) on the function's persistent
 /// inline caches, as a generator's resumption runs (see `gen_fast`): taken
-/// out for the run and put back after it.
+/// out for the run and put back after it. A hot body resumes in native code
+/// on the same register file (a throw injected at the suspension is the
+/// interpreter's).
 fn run_suspended(
     ctx: &mut Ctx,
     funcs: &[FnProto],
-    proto: &FnProto,
+    id: usize,
     regs: &mut [NanBox],
     pc: usize,
     handlers: Vec<(usize, Reg)>,
     inject: Option<NanBox>,
 ) -> Result<FrameExit, VmError> {
+    let proto = funcs.get(id).ok_or(VmError::Unsupported)?;
     let body = proto.ops.as_ptr() as usize;
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let (mut hot, mut resumes) = (false, 0);
     let mut ic = match proto.tier.0.try_borrow_mut() {
-        Ok(mut t) if t.ic_body == body => core::mem::take(&mut t.ic),
+        Ok(mut t) => {
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            {
+                t.resumes = t.resumes.saturating_add(1);
+                resumes = t.resumes;
+                hot = inject.is_none()
+                    && !matches!(t.jit, Some(None))
+                    && jit_tier::resume_is_hot(t.resumes);
+            }
+            if t.ic_body == body {
+                core::mem::take(&mut t.ic)
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     };
-    let r = run_frame_at_ic(ctx, funcs, &proto.ops, regs, pc, handlers, inject, &mut ic);
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let mut handlers = handlers;
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let compiled = if hot {
+        jit_tier::resume_frame(ctx, funcs, id, regs, pc, &mut handlers, &ic, resumes)
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    let compiled = None;
+    let r = match compiled {
+        Some(r) => r,
+        None => run_frame_at_ic(ctx, funcs, &proto.ops, regs, pc, handlers, inject, &mut ic),
+    };
     if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
         t.ic = ic;
         t.ic_body = body;
@@ -4656,6 +4762,7 @@ impl TierSlot {
 
     /// The cached native-code compilation outcome, if one was attempted.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[inline(always)]
     fn jit(&self) -> Option<Option<alloc::rc::Rc<crate::jit::JitProto>>> {
         self.0.try_borrow().ok().and_then(|t| t.jit.clone())
     }
@@ -8184,19 +8291,8 @@ fn run_frame_at_ic(
                 next,
                 sync,
             } => {
-                let (it, nx) = (regs[*iter as usize], regs[*next as usize]);
-                let r = if regs[*sync as usize].as_boolean() == Some(true) {
-                    with_host(ctx, |h| h.async_from_sync_next(it, nx))
-                        .unwrap_or(Err(HostError::Fault))
-                        .map_err(VmError::from)
-                } else if let Some(r) = agen_direct_next(ctx, funcs, it, nx) {
-                    r
-                } else {
-                    call_closure(ctx, funcs, nx, &[], it)
-                };
-                match r {
-                    Ok(v) => regs[*dst as usize] = v,
-                    Err(e) => handle_throw!(e),
+                if let Err(e) = async_iter_step(ctx, funcs, regs, *dst, *iter, *next, *sync) {
+                    handle_throw!(e);
                 }
             }
             Op::AsyncIterClose {

@@ -274,6 +274,11 @@ pub struct Realm {
         allow(dead_code)
     )]
     jit_typed_len_stamp: u64,
+    /// The prototype epoch at which [`iter_result_thenless`]
+    /// (Realm::iter_result_thenless) last proved that no object on the
+    /// chain from the default object prototype has a `then` property (each
+    /// of them watched from then on); `0` = not proved.
+    no_then_stamp: u64,
     /// One-slot memo of the most recent regex subject widened to UTF-16, kept
     /// because the matcher takes `&[u16]` and every `test`/`exec`/`split`/…
     /// otherwise re-transcodes the whole subject — making a match cost O(subject)
@@ -868,6 +873,7 @@ impl Realm {
             typed_len_protos: Vec::new(),
             typed_len_tainted: false,
             jit_typed_len_stamp: 0,
+            no_then_stamp: 0,
             regex_subject_units: None,
             unit_strings: alloc::vec::Vec::new(),
             unit_cursor: None,

@@ -246,6 +246,13 @@ impl Interp {
             self.settle(handle, value, true);
             return;
         };
+        // An iterator result (an async generator's settled request) with no
+        // `then` anywhere on its chain, proved without running code: the
+        // `Get` below would answer `undefined`.
+        if self.realm.iter_result_thenless(vh) {
+            self.settle(handle, value, true);
+            return;
+        }
         // `Let then = Get(resolution, "then")` — through `read_member` so a `then`
         // *accessor* getter runs (and a throwing getter rejects the promise).
         let then = match self.read_member(vh, "then") {
