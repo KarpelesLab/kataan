@@ -1900,6 +1900,56 @@ fn plain_write_ok(realm: &Realm, h: Handle, key: &str) -> bool {
     true
 }
 
+/// `Op::DefineData`: `DefinePropertyOrThrow(o, k, {value: v, ...attrs})`. A
+/// writable, enumerable, configurable data property (`attrs` 7: a class
+/// field, a computed literal key) named by a string on an ordinary object —
+/// not a primitive wrapper, an arguments object, the global object (whose
+/// bindings mirror it), a built-in prototype whose overwrites are tracked or
+/// a host-exotic one — that is absent or already such a property, is the
+/// plain add or store `init_data_property_cached` makes; anything else (an
+/// index-like or `__proto__` key, one with a lone surrogate (whose storage
+/// key is encoded), an existing accessor, read-only or
+/// non-configurable property, a non-extensible object, a proxy) is the host's
+/// `[[DefineOwnProperty]]`, with its errors.
+fn vm_define_data(
+    ctx: &mut Ctx,
+    o: NanBox,
+    k: NanBox,
+    v: NanBox,
+    attrs: u8,
+) -> Result<(), VmError> {
+    if attrs == 7
+        && let Some(h) = o.as_handle().map(Handle::from_raw)
+        && let Some(kh) = k.as_handle().map(Handle::from_raw)
+        && ctx.realm.string_leaf_bytes(kh).is_some_and(|b| {
+            b.first().is_some_and(|c| !c.is_ascii_digit() && *c != b'-')
+                && core::str::from_utf8(b).is_ok()
+        })
+        && ctx.realm.is_plain_object(h)
+        && !ctx.realm.is_host_exotic(h)
+        && !ctx.realm.has_argument_map_marker(h)
+        && !ctx.realm.is_dispatch_tracked_proto(h)
+        && !ctx.host.as_deref().is_some_and(|x| x.is_global_object(o))
+    {
+        let key = private_ops::KeyText::of(&ctx.realm, k);
+        if key.as_str() != "__proto__"
+            && ctx.realm.init_data_property_cached(
+                h,
+                key.as_str(),
+                v,
+                &mut PropertyCache::default(),
+            )
+        {
+            return Ok(());
+        }
+    }
+    match with_host(ctx, |h| h.define_data(o, k, v, attrs)) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) => Err(VmError::from(e)),
+        None => Err(VmError::Unsupported),
+    }
+}
+
 /// `Op::InitProp`: defines the own data property `key` of a fresh literal
 /// object `o` (through the site's inline cache when it is a plain append),
 /// else the host's `[[DefineOwnProperty]]`.
@@ -8379,10 +8429,8 @@ fn run_frame_at_ic(
                     regs[*key as usize],
                     regs[*src as usize],
                 );
-                match with_host(ctx, |h| h.define_data(o, k, v, *attrs)) {
-                    Some(Ok(())) => {}
-                    Some(Err(e)) => handle_throw!(VmError::from(e)),
-                    None => return Err(VmError::Unsupported),
+                if let Err(e) = vm_define_data(ctx, o, k, v, *attrs) {
+                    handle_throw!(e);
                 }
             }
             Op::NewObjectLit { dst, lit } => match objlit::vm_new_object_lit(ctx, lit, regs) {

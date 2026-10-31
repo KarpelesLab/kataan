@@ -1089,6 +1089,19 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
             Some(Ok(()))
         }
+        // A class field's define: its interpreter arm.
+        Op::DefineData {
+            obj,
+            key,
+            src,
+            attrs,
+        } => Some(super::vm_define_data(
+            ctx,
+            regs[*obj as usize],
+            regs[*key as usize],
+            regs[*src as usize],
+            *attrs,
+        )),
         // `this.#x`, `this.#x = v`, `#x in o`, a private field's add: exactly
         // their interpreter arm.
         Op::PrivateGet { .. }

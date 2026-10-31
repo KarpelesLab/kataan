@@ -1051,6 +1051,14 @@ impl Realm {
         )
     }
 
+    /// Whether `handle` is an ordinary object cell (a [`Cell::Object`]) that
+    /// is not a primitive wrapper (whose String-exotic own properties no slot
+    /// records).
+    #[must_use]
+    pub fn is_plain_object(&self, handle: Handle) -> bool {
+        matches!(self.heap.get(handle), Some(Cell::Object(o)) if !o.is_prim_wrapper())
+    }
+
     /// Records the realm's `%Promise.prototype%` intrinsic.
     pub fn set_promise_proto_intrinsic(&mut self, handle: Handle) {
         self.promise_proto_intrinsic = Some(handle);
