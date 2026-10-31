@@ -3025,6 +3025,22 @@ impl Interp {
         source: crate::heap::Handle,
         excluded: &[String],
     ) -> Result<(), ExecError> {
+        // A plain data-only object (not a module namespace, whose reads are
+        // live bindings): no step below can run code, so copy its enumerable
+        // own data properties straight from the slots.
+        #[cfg(all(feature = "module", feature = "std"))]
+        let namespace = self.module_namespaces.contains_key(&source.to_raw())
+            || self.deferred_namespaces.contains_key(&source.to_raw());
+        #[cfg(not(all(feature = "module", feature = "std")))]
+        let namespace = false;
+        if !namespace && let Some(entries) = self.realm.plain_data_entries(source) {
+            for (name, v) in entries {
+                if !excluded.contains(&name) {
+                    self.realm.set_property(target, &name, v);
+                }
+            }
+            return Ok(());
+        }
         for key in self.own_property_keys_values(source)? {
             let name = self.member_key(key);
             if excluded.contains(&name) {

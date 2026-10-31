@@ -32,6 +32,7 @@ mod concat_fast;
 pub(crate) mod hidden_layout;
 mod msg_text;
 mod shortest;
+mod spread_fast;
 mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;

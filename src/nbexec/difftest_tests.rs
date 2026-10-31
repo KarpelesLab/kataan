@@ -3116,3 +3116,54 @@ fn dataview_accessors_on_resized_immutable_detached() {
         "ok,ok,ok,ok,ok,ok,TypeError,TypeError,ok,4,RangeError,0,0,ok,9,TypeError,0,ok,TypeError,TypeError"
     );
 }
+
+/// Object spread and object rest from plain objects copy exactly the own
+/// enumerable properties in `[[OwnPropertyKeys]]` order (integer keys first,
+/// symbols included, non-enumerable and inherited ones skipped, a getter run
+/// once), and from arrays, strings, wrappers, `arguments`, proxies, frozen
+/// objects and objects re-keyed by delete; the copy defines (never sets) its
+/// properties.
+#[test]
+fn object_spread_and_rest_copy_own_enumerable() {
+    let src = r#"
+        var r = [];
+        var s = Symbol("s");
+        var base = { b: 1, a: 2, 10: "ten", 2: "two", [s]: "sym" };
+        Object.defineProperty(base, "hid", { value: 3, enumerable: false });
+        var o = { z: 0 };
+        for (var i = 0; i < 4; i++) o = { ...o, ...base, n: i };
+        r.push(JSON.stringify(o), Object.keys(o).join(), o[s], "hid" in o);
+        var getterRuns = 0;
+        var acc = { x: 1, get y() { getterRuns++; return "Y"; } };
+        var c = { ...acc };
+        r.push(JSON.stringify(c), getterRuns, Object.getOwnPropertyDescriptor(c, "y").value);
+        var { a, ...rest } = base;
+        r.push(a, JSON.stringify(rest), rest[s]);
+        var arr = { ...[5, 6], ..."hi", ...null, ...undefined, ...7 };
+        r.push(JSON.stringify(arr));
+        var proto = Object.create({ inherited: 1 });
+        proto.own = 2;
+        r.push(JSON.stringify({ ...proto }));
+        var wrap = { ...new String("ab"), ...new Number(3), ...Object(Symbol.iterator) };
+        r.push(JSON.stringify(wrap));
+        function f() { return { ...arguments }; }
+        r.push(JSON.stringify(f(7, 8)));
+        var px = new Proxy({ p: 1, q: 2 }, { ownKeys: function () { return ["q", "p"]; } });
+        r.push(JSON.stringify({ ...px }));
+        var frozen = Object.freeze({ k: 1 });
+        var cp = { ...frozen };
+        cp.k = 9;
+        r.push(cp.k, Object.isFrozen(cp));
+        var target = Object.defineProperty({}, "w", { set: function () { r.push("setter!"); }, configurable: true });
+        r.push(JSON.stringify({ ...target, w: 1 }));
+        var del = { a: 1, b: 2, c: 3 };
+        delete del.b;
+        del.b = 4;
+        r.push(Object.keys({ ...del }).join());
+        r.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "{\"2\":\"two\",\"10\":\"ten\",\"z\":0,\"b\":1,\"a\":2,\"n\":3}|2,10,z,b,a,n|sym|false|{\"x\":1,\"y\":\"Y\"}|1|Y|2|{\"2\":\"two\",\"10\":\"ten\",\"b\":1}|sym|{\"0\":\"h\",\"1\":\"i\"}|{\"own\":2}|{\"0\":\"a\",\"1\":\"b\"}|{\"0\":7,\"1\":8}|{\"q\":2,\"p\":1}|9|false|{\"w\":1}|a,c,b"
+    );
+}
