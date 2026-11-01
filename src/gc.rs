@@ -56,6 +56,29 @@ pub trait Trace {
         false
     }
 
+    /// Visits the outgoing handles a container keeps from position `from` on
+    /// (its elements or entries in order; the handles of everything else it
+    /// holds too): what may have changed when it was only appended to since
+    /// the last collection (`Heap::get_mut_append`). The default visits them
+    /// all.
+    fn trace_tail<F: FnMut(Handle)>(&self, from: usize, visit: F)
+    where
+        Self: Sized,
+    {
+        let _ = from;
+        self.trace_each(visit);
+    }
+
+    /// Visits the outgoing handles a container keeps before position `to`
+    /// (the counterpart of [`trace_tail`](Self::trace_tail), for the
+    /// verification that they hold no young object). The default visits none.
+    fn trace_head<F: FnMut(Handle)>(&self, to: usize, visit: F)
+    where
+        Self: Sized,
+    {
+        let _ = (to, visit);
+    }
+
     /// Drops a swept object. The default is plain `drop`; an implementation
     /// may special-case its common shapes so the sweep's per-object cost is not
     /// the full drop glue, and hand reusable parts to the heap's `pool`.
@@ -424,8 +447,14 @@ pub fn mark_minor<T: Trace>(
     // The remembered old objects are scanned like roots' referents.
     let rescanned = heap.take_remembered();
     for &index in &rescanned {
+        let from = heap.remembered_from(index);
         if let Some(obj) = heap.live_handle_at(index).and_then(|h| heap.peek(h)) {
-            obj.trace_each(|e| edges.push(e));
+            if from == 0 {
+                obj.trace_each(|e| edges.push(e));
+            } else {
+                // Only appended to since the last collection.
+                obj.trace_tail(from, |e| edges.push(e));
+            }
             scan(obj, &mut edges);
         }
         for e in edges.drain(..) {
@@ -489,6 +518,7 @@ pub fn remembered_violation<T: Trace>(
             obj.trace_each(|e| out.push(e));
             scan(obj, out);
         },
+        |obj, to, out| obj.trace_head(to, |e| out.push(e)),
         T::interior_mutable,
     )
 }
@@ -782,6 +812,59 @@ mod tests {
         let stats = collect_minor(&mut heap, &[old]);
         assert_eq!(stats.swept, 0);
         assert!(heap.is_live(young));
+    }
+
+    #[test]
+    fn an_appending_borrow_rescans_only_the_tail() {
+        use crate::cell::{ArrayElems, Cell};
+        use crate::nanbox::NanBox;
+        let h = |x: Handle| NanBox::handle(x.to_raw());
+        let mut heap: Heap<Cell> = Heap::new();
+        let first = heap.alloc(Cell::Box(NanBox::number(1.0)));
+        let arr = heap.alloc(Cell::Array(ArrayElems::from(alloc::vec![h(first)])));
+        collect(&mut heap, &[arr]); // both old now
+        // Appends of young objects: remembered from the old length on.
+        let young: Vec<Handle> = (0..3)
+            .map(|i| heap.alloc(Cell::Box(NanBox::number(f64::from(i)))))
+            .collect();
+        for &y in &young {
+            heap.get_mut_append(arr, Cell::ref_len)
+                .and_then(Cell::as_array_mut)
+                .unwrap()
+                .push_back(h(y));
+        }
+        assert_eq!(heap.remembered_from(arr.index()), 1);
+        assert_eq!(remembered_violation(&heap, |_, _| {}), None);
+        let stats = collect_minor(&mut heap, &[]);
+        assert_eq!(stats.swept, 0);
+        assert!(young.iter().all(|&y| heap.age(y) == Some(OLD_AGE)));
+        // A store below the tail lowers the scan position; an ordinary
+        // mutable borrow makes it a whole rescan.
+        let y0 = heap.alloc(Cell::Box(NanBox::number(7.0)));
+        heap.get_mut_append(arr, |c| 2.min(c.ref_len()))
+            .and_then(Cell::as_array_mut)
+            .unwrap()[2] = h(y0);
+        assert_eq!(heap.remembered_from(arr.index()), 2);
+        let y1 = heap.alloc(Cell::Box(NanBox::number(8.0)));
+        heap.get_mut_append(arr, |c| 1.min(c.ref_len()))
+            .and_then(Cell::as_array_mut)
+            .unwrap()[1] = h(y1);
+        assert_eq!(heap.remembered_from(arr.index()), 1);
+        let y2 = heap.alloc(Cell::Box(NanBox::number(9.0)));
+        heap.get_mut(arr).and_then(Cell::as_array_mut).unwrap()[0] = h(y2);
+        assert_eq!(heap.remembered_from(arr.index()), 0);
+        assert_eq!(remembered_violation(&heap, |_, _| {}), None);
+        let stats = collect_minor(&mut heap, &[]);
+        assert_eq!(stats.swept, 0); // (`first`, overwritten, is old)
+        assert!([y0, y1, y2].iter().all(|&y| heap.age(y) == Some(OLD_AGE)));
+        // An appended-to object whose prefix gained a young reference without
+        // the ordinary barrier is what the verification reports.
+        let y3 = heap.alloc(Cell::Box(NanBox::number(10.0)));
+        assert!(heap.get_mut_append(arr, Cell::ref_len).is_some());
+        let mut a = heap.peek(arr).and_then(Cell::as_array).unwrap().to_vec();
+        a[0] = h(y3);
+        heap.swap_value_for_test(arr, Cell::Array(ArrayElems::from(a)));
+        assert_eq!(remembered_violation(&heap, |_, _| {}), Some((arr, y3)));
     }
 
     #[test]

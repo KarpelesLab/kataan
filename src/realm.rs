@@ -1625,7 +1625,6 @@ impl Realm {
             crate::heap::HeapAllocOffsets {
                 free_ptr: heap + h.free_ptr,
                 free_len: heap + h.free_len,
-                live: heap + h.live,
                 allocs_since_gc: heap + h.allocs_since_gc,
                 pool_ptr: heap + h.pool_ptr,
                 pool_len: heap + h.pool_len,
@@ -3460,29 +3459,39 @@ impl Realm {
         // Look the key up through the hash index (built on demand), then write.
         let hash = self.collection_key_hash(key);
         let pos = self.collection_find_hashed(handle, key, hash);
+        if let Some(i) = pos {
+            // `Set.prototype.add` of a key already there changes nothing.
+            if is_set {
+                return true;
+            }
+            let Some(Cell::Collection { entries, .. }) = self.heap.get_mut(handle) else {
+                return false;
+            };
+            entries[i].1 = value;
+            self.write_barrier(handle, value);
+            return true;
+        }
+        // A new entry, appended: the write barrier's tail form (so a minor
+        // collection rescans only the entries added since the last one).
         let Some(Cell::Collection {
             entries,
             live,
             index,
             ..
-        }) = self.heap.get_mut(handle)
+        }) = self.heap.get_mut_append(handle, Cell::ref_len)
         else {
             return false;
         };
-        match pos {
-            Some(i) => entries[i].1 = value,
-            None => {
-                let i = entries.len();
-                entries.push((key, value));
-                *live += 1;
-                // (`collection_find_hashed` just built the index if it was missing.)
-                if let Some(map) = index {
-                    map.insert(hash, i);
-                }
-            }
+        let i = entries.len();
+        entries.push((key, value));
+        *live += 1;
+        // (`collection_find_hashed` just built the index if it was missing.)
+        if let Some(map) = index {
+            map.insert(hash, i);
         }
-        self.write_barrier(handle, key);
-        self.write_barrier(handle, value);
+        // (The generational barrier was the borrow.)
+        self.shade_stored(key);
+        self.shade_stored(value);
         true
     }
 
@@ -5247,7 +5256,12 @@ impl Realm {
             self.array_store_sparse(handle, dense, index, value);
             return true;
         }
-        match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
+        // Nothing below `index` changes: the write barrier's tail form.
+        match self
+            .heap
+            .get_mut_append(handle, |c| index.min(c.ref_len()))
+            .and_then(Cell::as_array_mut)
+        {
             Some(a) => {
                 if index >= a.len() {
                     if non_ext {
@@ -5278,7 +5292,7 @@ impl Realm {
                 } else {
                     a[index] = value;
                 }
-                self.write_barrier(handle, value);
+                self.shade_stored(value);
                 true
             }
             None => false,
@@ -5340,7 +5354,11 @@ impl Realm {
             return None;
         }
         let max = self.limits.max_array_len;
-        let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
+        // (Only appends: the write barrier's tail form.)
+        let a = self
+            .heap
+            .get_mut_append(handle, Cell::ref_len)
+            .and_then(Cell::as_array_mut)?;
         // C1: refuse to grow past the configured cap rather than risk an unbounded
         // allocation (a single push only adds one element, but an array already at
         // the cap must not exceed it).
@@ -5361,9 +5379,10 @@ impl Realm {
             return None;
         }
         let max = self.limits.max_array_len;
+        // (Only appends: the write barrier's tail form.)
         let a = self
             .heap
-            .get_mut(handle)
+            .get_mut_append(handle, Cell::ref_len)
             .and_then(Cell::as_array_mut_plain)?;
         if a.len().saturating_add(values.len()) > max {
             return None;
@@ -7143,6 +7162,17 @@ impl Realm {
     )]
     pub(crate) fn jit_write_barrier(&mut self, container: Handle, value: NanBox) {
         self.write_barrier(container, value);
+    }
+
+    /// The incremental-marking half of [`write_barrier`](Self::write_barrier),
+    /// for a store whose generational barrier was its borrow's tail form
+    /// (`Heap::get_mut_append`), which the full barrier would undo.
+    fn shade_stored(&mut self, value: NanBox) {
+        if let Some(marker) = self.incremental.as_mut()
+            && let Some(raw) = value.as_handle()
+        {
+            marker.mark_grey(Handle::from_raw(raw));
+        }
     }
 
     fn write_barrier(&mut self, container: Handle, value: NanBox) {

@@ -1258,6 +1258,18 @@ impl Cell {
     }
 
     /// The array elements mutably, if this cell is one.
+    /// Where an append to this cell's references starts (for
+    /// `Heap::get_mut_append`): an array's element count, a collection's
+    /// entry count; `0` (everything) for any other kind.
+    #[must_use]
+    pub fn ref_len(&self) -> usize {
+        match self {
+            Cell::Array(a) => a.len(),
+            Cell::Collection { entries, .. } => entries.len(),
+            _ => 0,
+        }
+    }
+
     pub fn as_array_mut(&mut self) -> Option<&mut ArrayElems> {
         match self {
             Cell::Array(a) => Some(a),
@@ -1569,6 +1581,11 @@ impl Trace for Cell {
     fn release_in(place: &mut Option<Self>, pool: &mut crate::object::ExtraPool) {
         if let Some(Cell::Array(elems)) = place {
             // `ArrayElems` owns nothing else (and has no `Drop` of its own).
+            if elems.elems.capacity() == 0 {
+                // Elements inline (or none): nothing owned at all.
+                core::mem::forget(place.take());
+                return;
+            }
             let elems = core::mem::take(&mut elems.elems);
             core::mem::forget(place.take());
             drop(elems);
@@ -1583,6 +1600,54 @@ impl Trace for Cell {
 
     fn trace(&self, visit: &mut dyn FnMut(Handle)) {
         self.trace_each(visit);
+    }
+
+    /// An array's elements and a collection's entries from `from` on (each
+    /// owns no other handle); anything else whole.
+    fn trace_tail<F: FnMut(Handle)>(&self, from: usize, mut visit: F) {
+        match self {
+            Cell::Array(elems) => {
+                for e in elems.get(from..).unwrap_or(&[]) {
+                    if let Some(raw) = e.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
+            Cell::Collection { entries, .. } => {
+                for (k, v) in entries.get(from..).unwrap_or(&[]) {
+                    if let Some(raw) = k.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                    if let Some(raw) = v.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
+            _ => self.trace_each(visit),
+        }
+    }
+
+    fn trace_head<F: FnMut(Handle)>(&self, to: usize, mut visit: F) {
+        match self {
+            Cell::Array(elems) => {
+                for e in &elems[..to.min(elems.len())] {
+                    if let Some(raw) = e.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
+            Cell::Collection { entries, .. } => {
+                for (k, v) in &entries[..to.min(entries.len())] {
+                    if let Some(raw) = k.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                    if let Some(raw) = v.as_handle() {
+                        visit(Handle::from_raw(raw));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn trace_each<F: FnMut(Handle)>(&self, mut visit: F) {

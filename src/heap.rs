@@ -93,13 +93,23 @@ struct Slot<T> {
     occupied: u8,
     /// The slot's **remembered-set** state (see [`Heap::remembered`]):
     /// [`CLEAN`], [`DIRTY`] (an old object mutably borrowed since the last
-    /// collection) or [`STICKY`] (an old object whose value hides interior
-    /// mutability, rescanned by every minor collection). Non-zero exactly
+    /// collection), [`APPENDED`] (one only appended to since, so far) or
+    /// [`STICKY`] (an old object whose value hides interior mutability,
+    /// rescanned by every minor collection). Non-zero exactly
     /// while the slot's index is in the list. A free slot is always `CLEAN`,
     /// so an allocation — compiled code's inline one included — never has to
     /// write it.
     dirty: u8,
+    /// While `dirty` is [`APPENDED`]: the low 16 bits of the position from
+    /// which the object's references may have changed since the last
+    /// collection (see [`Heap::get_mut_append`]); `scan_hi` holds bits 16-23.
+    scan_lo: u16,
+    /// See `scan_lo`.
+    scan_hi: u8,
 }
+
+/// The largest [`Slot::scan_lo`]/[`Slot::scan_hi`] position (24 bits).
+const SCAN_MAX: usize = (1 << 24) - 1;
 
 /// [`Slot::dirty`]: not in the remembered set.
 const CLEAN: u8 = 0;
@@ -108,6 +118,13 @@ const DIRTY: u8 = 1;
 /// [`Slot::dirty`]: in the remembered set for as long as it lives (its value's
 /// [`Trace::interior_mutable`](crate::gc::Trace::interior_mutable) holds).
 const STICKY: u8 = 2;
+/// [`Slot::dirty`]: in the remembered set until the next collection, having
+/// only been **appended** to since it entered it: its references before the
+/// slot's scan position are unchanged (so hold no young object), and a minor
+/// collection traces it from there ([`Trace::trace_tail`](crate::gc::Trace::trace_tail)).
+/// Any other mutable borrow turns it [`DIRTY`]. (`CLEAN` and `APPENDED` are
+/// the two states `x | APPENDED == APPENDED` picks out.)
+const APPENDED: u8 = 4;
 
 /// [`Slot::occupied`] of a live slot.
 const SLOT_OCCUPIED: u8 = 1;
@@ -122,7 +139,15 @@ impl<T> Slot<T> {
             age,
             occupied: SLOT_OCCUPIED,
             dirty: CLEAN,
+            scan_lo: 0,
+            scan_hi: 0,
         }
+    }
+
+    /// The [`APPENDED`] scan position.
+    #[inline]
+    const fn scan_from(&self) -> usize {
+        self.scan_lo as usize | (self.scan_hi as usize) << 16
     }
 
     /// The value, if the slot is live in `generation`.
@@ -305,8 +330,6 @@ pub(crate) struct HeapAllocOffsets {
     /// The free list's allocation cursor (`Heap::free_top`): the number of
     /// still-free entries.
     pub free_len: usize,
-    /// `live`.
-    pub live: usize,
     /// `allocs_since_gc`.
     pub allocs_since_gc: usize,
     /// The `extra`-part pool's (`Heap::extra_pool`) data pointer.
@@ -348,7 +371,6 @@ pub(crate) fn jit_heap_alloc_offsets() -> HeapAllocOffsets {
         free_ptr: field + ptr_off,
         // The allocation cursor, not the `Vec`'s length (see `Heap::free_top`).
         free_len: core::mem::offset_of!(Heap<Cell>, free_top),
-        live: core::mem::offset_of!(Heap<Cell>, live),
         allocs_since_gc: core::mem::offset_of!(Heap<Cell>, allocs_since_gc),
         pool_ptr: pool + pool_ptr,
         pool_len: pool + pool_len,
@@ -360,8 +382,13 @@ pub struct Heap<T> {
     slots: Vec<Slot<T>>,
     /// Indices of free slots, reused before growing.
     free: Vec<u32>,
-    /// The number of live (occupied) slots.
+    /// The number of live (occupied) slots, less the allocations since the
+    /// last collection not folded in yet (see [`len`](Heap::len)): so an
+    /// allocation bumps one counter, `allocs_since_gc`, not two.
     live: usize,
+    /// How many of `allocs_since_gc` are already counted in `live` (see
+    /// [`fold_allocs`](Heap::fold_allocs)).
+    counted: usize,
     /// The generation stamped on slots produced by the next compaction. Drawn
     /// from a high range (`>= COMPACT_GEN_BASE`) disjoint from the low
     /// generations free/reuse produces, so a *new* (forwarded) handle can never
@@ -432,6 +459,7 @@ impl<T> Heap<T> {
             slots: Vec::new(),
             free: Vec::new(),
             live: 0,
+            counted: 0,
             compact_gen: COMPACT_GEN_BASE,
             free_top: 0,
             young_floor: 0,
@@ -458,7 +486,16 @@ impl<T> Heap<T> {
 
     /// Clears the allocation-pressure counter (called when a collection runs).
     pub const fn reset_alloc_pressure(&mut self) {
+        self.fold_allocs();
         self.allocs_since_gc = 0;
+        self.counted = 0;
+    }
+
+    /// Folds the allocations not counted in `live` yet into it: what every
+    /// path that subtracts from `live` does first.
+    const fn fold_allocs(&mut self) {
+        self.live += self.allocs_since_gc - self.counted;
+        self.counted = self.allocs_since_gc;
     }
 
     /// Turns on **GC-verification mode**: swept slots are recorded but not freed,
@@ -517,7 +554,7 @@ impl<T> Heap<T> {
     /// The number of live objects.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.live
+        self.live + (self.allocs_since_gc - self.counted)
     }
 
     /// The raw base pointer and length of the backing slot array, for the
@@ -541,7 +578,7 @@ impl<T> Heap<T> {
     /// Whether the heap holds no live objects.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.live == 0
+        self.len() == 0
     }
 
     /// Allocates `value`, reusing a freed slot when one is available, and
@@ -557,7 +594,7 @@ impl<T> Heap<T> {
     }
 
     pub fn alloc(&mut self, value: T) -> Handle {
-        self.live += 1;
+        // (Counted in `len` through `allocs_since_gc`.)
         self.allocs_since_gc += 1;
         if self.free_top > 0 {
             self.free_top -= 1;
@@ -646,11 +683,81 @@ impl<T> Heap<T> {
             return None;
         }
         let value = slot.value.as_mut()?;
-        if slot.dirty == CLEAN && slot.age >= crate::gc::OLD_AGE {
+        if slot.dirty | APPENDED == APPENDED && slot.age >= crate::gc::OLD_AGE {
+            if slot.dirty == CLEAN {
+                remembered.push(handle.index);
+            }
             slot.dirty = DIRTY;
-            remembered.push(handle.index);
         }
         Some(value)
+    }
+
+    /// [`get_mut`](Heap::get_mut) for a borrow that changes the object's
+    /// references only from a position on — appends (a push onto an array, a
+    /// new collection entry) and stores past it: `from(value)` is that
+    /// position (the current length, for an append). An old object entering
+    /// the remembered set this way is traced only from the lowest such
+    /// position by the next minor collection ([`APPENDED`]), unless something
+    /// borrows it mutably the ordinary way first. The caller must change no
+    /// reference before the position, and must not apply the write barrier
+    /// again (`Realm::write_barrier`), which would undo this.
+    #[inline]
+    pub fn get_mut_append(
+        &mut self,
+        handle: Handle,
+        from: impl FnOnce(&T) -> usize,
+    ) -> Option<&mut T> {
+        if self.poison.is_some() {
+            self.note_poison_use(handle);
+        }
+        let Self {
+            slots, remembered, ..
+        } = self;
+        let slot = slots.get_mut(handle.index as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        let value = slot.value.as_mut()?;
+        if slot.dirty | APPENDED == APPENDED && slot.age >= crate::gc::OLD_AGE {
+            let at = from(value);
+            if slot.dirty == CLEAN {
+                remembered.push(handle.index);
+            } else if at > (slot.scan_lo as usize | (slot.scan_hi as usize) << 16) {
+                // Already appended to, from lower down.
+                return Some(value);
+            }
+            if at <= SCAN_MAX {
+                slot.dirty = APPENDED;
+                slot.scan_lo = at as u16;
+                slot.scan_hi = (at >> 16) as u8;
+            } else {
+                slot.dirty = DIRTY;
+            }
+        }
+        Some(value)
+    }
+
+    /// Test-only: replaces the value behind `handle` with no write barrier
+    /// at all (a store the barrier missed, for the verification's tests).
+    #[cfg(test)]
+    pub(crate) fn swap_value_for_test(&mut self, handle: Handle, value: T) {
+        if let Some(v) = self
+            .slots
+            .get_mut(handle.index as usize)
+            .and_then(|s| s.get_mut(handle.generation))
+        {
+            *v = value;
+        }
+    }
+
+    /// Where a minor collection traces the remembered object in slot
+    /// `index` from: its [`APPENDED`] scan position, else `0` (all of it).
+    #[must_use]
+    pub fn remembered_from(&self, index: u32) -> usize {
+        match self.slots.get(index as usize) {
+            Some(slot) if slot.dirty == APPENDED => slot.scan_from(),
+            _ => 0,
+        }
     }
 
     /// Enters slot `index` into the remembered set if it holds an old object
@@ -658,11 +765,13 @@ impl<T> Heap<T> {
     fn remember(&mut self, index: usize) {
         if let Some(slot) = self.slots.get_mut(index)
             && slot.is_live()
-            && slot.dirty == CLEAN
+            && slot.dirty | APPENDED == APPENDED
             && slot.age >= crate::gc::OLD_AGE
         {
+            if slot.dirty == CLEAN {
+                self.remembered.push(index as u32);
+            }
             slot.dirty = DIRTY;
-            self.remembered.push(index as u32);
         }
     }
 
@@ -759,6 +868,7 @@ impl<T> Heap<T> {
     where
         T: crate::gc::Trace,
     {
+        self.fold_allocs();
         let Self {
             slots,
             free,
@@ -876,6 +986,7 @@ impl<T> Heap<T> {
     where
         T: crate::gc::Trace,
     {
+        self.fold_allocs();
         let Self {
             slots,
             free,
@@ -973,6 +1084,7 @@ impl<T> Heap<T> {
     pub fn remembered_violation(
         &self,
         mut edges: impl FnMut(&T, &mut Vec<Handle>),
+        mut head_edges: impl FnMut(&T, usize, &mut Vec<Handle>),
         sticky: impl Fn(&T) -> bool,
     ) -> Option<(Handle, Handle)> {
         let mut tracked = alloc::vec![false; self.slots.len()];
@@ -994,6 +1106,16 @@ impl<T> Heap<T> {
             if slot.age < crate::gc::OLD_AGE {
                 if !tracked[i] {
                     return Some((h, h));
+                }
+                continue;
+            }
+            if slot.dirty == APPENDED {
+                // Remembered for what was appended: nothing before its scan
+                // position may point at a young object.
+                out.clear();
+                head_edges(value, slot.scan_from(), &mut out);
+                if let Some(&t) = out.iter().find(|&&t| self.is_young(t)) {
+                    return Some((h, t));
                 }
                 continue;
             }
@@ -1101,6 +1223,7 @@ impl<T> Heap<T> {
         }
         self.slots = new_slots;
         self.live = self.slots.len();
+        self.counted = self.allocs_since_gc;
         // Ages are kept, so a young survivor stays young: every slot is a
         // candidate for the next minor collection's sweep (which skips the old
         // ones), and every old one is remembered, which also settles the
@@ -1127,6 +1250,7 @@ impl<T> Heap<T> {
             p.freed.insert(handle);
             return None;
         }
+        self.fold_allocs();
         let slot = self.slots.get_mut(handle.index as usize)?;
         match slot.generation {
             generation if slot.is_live() && generation == handle.generation => {

@@ -97,13 +97,11 @@ pub(crate) struct PropsLayout {
     /// `Realm`-relative offset of `max_array_len`.
     pub max_array_len: i32,
     /// `Realm`-relative offsets of the heap's free-list data pointer and
-    /// length, its live count and its allocations-since-collection count
-    /// (inline object allocation, `p_alloc_object`).
+    /// length and its allocations-since-collection count, which also counts
+    /// the allocation as live (inline object allocation, `p_alloc_object`).
     pub free_ptr: i32,
     /// See `free_ptr`.
     pub free_len: i32,
-    /// See `free_ptr`.
-    pub heap_live: i32,
     /// See `free_ptr`.
     pub heap_allocs: i32,
     /// `Realm`-relative offsets of the heap's `extra`-part pool's data
@@ -143,7 +141,6 @@ impl PropsLayout {
             default_proto: i(default_proto),
             free_ptr: i(alloc.free_ptr),
             free_len: i(alloc.free_len),
-            heap_live: i(alloc.live),
             heap_allocs: i(alloc.allocs_since_gc),
             pool_ptr: i(alloc.pool_ptr),
             pool_len: i(alloc.pool_len),
@@ -2234,7 +2231,6 @@ impl X64Assembler {
         self.g_load(r::R11, r::R9, p.free_ptr);
         self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
         self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_live);
         self.g_inc_mem(r::R9, p.heap_allocs);
         // rcx = the slot.
         self.g_mov(r::RAX, r::RDX);
@@ -2311,7 +2307,6 @@ impl X64Assembler {
         self.g_load(r::R11, r::R9, p.free_ptr);
         self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
         self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_live);
         self.g_inc_mem(r::R9, p.heap_allocs);
         // rcx = the slot.
         self.g_mov(r::RAX, r::RDX);
@@ -2376,7 +2371,6 @@ impl X64Assembler {
         self.g_load(r::R11, r::R9, p.free_ptr);
         self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
         self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_live);
         self.g_inc_mem(r::R9, p.heap_allocs);
         // rcx = the slot.
         self.g_mov(r::RAX, r::RDX);
@@ -2431,7 +2425,6 @@ impl X64Assembler {
         self.g_load(r::R11, r::R9, p.free_ptr);
         self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
         self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_live);
         self.g_inc_mem(r::R9, p.heap_allocs);
         // rcx = the slot.
         self.g_mov(r::RAX, r::RDX);
@@ -2484,7 +2477,6 @@ impl X64Assembler {
         self.g_load(r::R11, r::R9, p.free_ptr);
         self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
         self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_live);
         self.g_inc_mem(r::R9, p.heap_allocs);
         // rcx = the slot.
         self.g_mov(r::RAX, r::RDX);
