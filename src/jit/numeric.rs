@@ -605,6 +605,10 @@ struct Region {
     /// ([`plan_views`]): `(register, first of its frame slots, where its
     /// entry check finds the value)`.
     views: Vec<(u16, u32, ViewSrc)>,
+    /// The speculative version's **hoisted arrays** ([`plain_views_ok`]):
+    /// `(register, first of its four frame slots, where its entry check
+    /// finds the value)`, see [`ArraySlots`].
+    aviews: Vec<(u16, u32, ViewSrc)>,
     /// The region's **guard diamonds** ([`guard_diamonds`]), as `(test,
     /// fallback, join)`: in the speculative version's fast version the
     /// guard's test (`test`, a `JumpIfFalse`) emits nothing and the
@@ -1421,6 +1425,36 @@ impl NumGen {
                 }
             }
         }
+        // The hoisted arrays' slots (four each), after the views'.
+        let first = n_gslots as usize + regions.len();
+        for r in &mut regions {
+            if r.spec.is_some() && plain_views_ok(r, ops, bytecode) {
+                let binding = |src: ViewSrc| match src {
+                    ViewSrc::Global(pc) => match &bytecode[pc] {
+                        Op::LoadGlobal { name, .. } => Some(name.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                for (v, src) in plan_views(r, ops, bytecode, env.n_regs) {
+                    // Registers that all read one global binding share
+                    // its array's slots (one entry check).
+                    let shared = binding(src).and_then(|n| {
+                        r.aviews
+                            .iter()
+                            .find(|&&(_, _, s)| binding(s) == Some(n))
+                            .map(|&(_, k, _)| k)
+                    });
+                    match shared {
+                        Some(k) => r.aviews.push((v, k, src)),
+                        None => {
+                            r.aviews.push((v, (first + n_view_slots) as u32, src));
+                            n_view_slots += 4;
+                        }
+                    }
+                }
+            }
+        }
         Self {
             types,
             ints,
@@ -1606,10 +1640,33 @@ impl NumGen {
     /// live and the register file is up to date. Clobbers `rax`, `rcx`,
     /// `rdx`, `r8`..`r11`.
     fn hoist_views(&self, a: &mut X64Assembler, ri: usize) {
+        let l = super::compute_jit_layout();
+        let av = &self.regions[ri].aviews;
+        for (i, &(r, k, src)) in av.iter().enumerate() {
+            // (Slots shared by an earlier register are filled already.)
+            if av[..i].iter().any(|&(_, k2, _)| k2 == k) {
+                continue;
+            }
+            let from = match src {
+                ViewSrc::Global(pc) => match self.gslot.get(pc) {
+                    Some(&g) if g != u32::MAX => {
+                        super::typed::HoistFrom::Binding(self.gslot_disp(g))
+                    }
+                    _ => super::typed::HoistFrom::Reg(disp(r)),
+                },
+                _ => super::typed::HoistFrom::Reg(disp(r)),
+            };
+            let s = ArraySlots {
+                held: self.gslot_disp(k),
+                len: self.gslot_disp(k + 1),
+                base: self.gslot_disp(k + 2),
+                lend: self.gslot_disp(k + 3),
+            };
+            a.p_hoist_array(l, self.env.realm, from, s);
+        }
         if self.regions[ri].views.is_empty() {
             return;
         }
-        let l = super::compute_jit_layout();
         let t = super::typed::typed_layout();
         for &(r, _, src) in &self.regions[ri].views {
             let Some(v) = self.hoisted_view_slots(ri, r) else {
@@ -1627,6 +1684,62 @@ impl NumGen {
                 _ => super::typed::HoistFrom::Reg(disp(r)),
             };
             a.t_hoist(l, t, self.env.realm, from, v);
+        }
+    }
+
+    /// For an element read or `.length` op `pc` in a speculative region's
+    /// fast version, on receiver register `r`: its hoisted array's slots,
+    /// when the region hoists `r` ([`plain_views_ok`]).
+    pub(super) fn hoisted_array(&self, pc: usize, r: u16) -> Option<ArraySlots> {
+        let ri = self.region_at(pc)?;
+        self.regions[ri].spec.as_ref()?;
+        let &(_, k, _) = self.regions[ri].aviews.iter().find(|v| v.0 == r)?;
+        Some(ArraySlots {
+            held: self.gslot_disp(k),
+            len: self.gslot_disp(k + 1),
+            base: self.gslot_disp(k + 2),
+            lend: self.gslot_disp(k + 3),
+        })
+    }
+
+    /// Takes the element and `.length` sites on a hoisted array
+    /// ([`hoisted_array`](Self::hoisted_array)) out of the receiver cache
+    /// (their fast path walks nothing, so fills nothing), and with them
+    /// every site that takes a way as filled by one of them.
+    pub(super) fn drop_hoisted_array_sites(
+        &self,
+        ops: &[GenericOp],
+        rc: &mut super::recv_cache::RecvPlan,
+    ) {
+        let mut dropped = alloc::vec![false; rc.sites.len()];
+        for (pc, op) in ops.iter().enumerate() {
+            let recv = match *op {
+                GenericOp::GetElem { obj, .. } => obj,
+                GenericOp::ArrayLen { arr, .. } => arr,
+                _ => continue,
+            };
+            if self.hoisted_array(pc, recv).is_some()
+                && let Some(s) = rc.sites.get_mut(pc)
+                && s.is_some()
+            {
+                *s = None;
+                dropped[pc] = true;
+            }
+        }
+        let mut changed = dropped.iter().any(|&d| d);
+        while changed {
+            changed = false;
+            for pc in 0..rc.sites.len() {
+                if let Some(p) = rc.sites[pc]
+                    && p.known
+                    && p.pred
+                        .is_some_and(|q| dropped.get(q).copied().unwrap_or(false))
+                {
+                    rc.sites[pc] = None;
+                    dropped[pc] = true;
+                    changed = true;
+                }
+            }
         }
     }
 
@@ -5187,6 +5300,7 @@ fn plan_regions(
             live_inner,
             defer: DeferPlan::default(),
             views: Vec::new(),
+            aviews: Vec::new(),
             cold: Vec::new(),
         });
     }
@@ -6188,6 +6302,101 @@ fn plan_spec(
     }
 }
 
+/// A **hoisted array**: the frame slots (`rbp`-relative) where a
+/// speculative loop's fast version keeps what its entry check found about
+/// an array a register holds ([`plain_views_ok`]): the register's value
+/// (`held`; the throw sentinel, which no register holds, when it is not an
+/// array without side-table state), the array's element count (`len`, and
+/// as a Number `lend`) and the address of its first element (`base`). An element read or `.length`
+/// on a register holding exactly `held` then needs no walk.
+///
+/// They stay right from that check to the back-edge: the fast version of a
+/// region [`plain_views_ok`] admits changes no array's elements' count or
+/// place (its element writes are inline in-bounds stores over no hole, it
+/// has no `length` store and no call, every slow path leaves for the plain
+/// copy), and nothing else runs there; every
+/// way back into it (the loop's entry, a back-edge poll's return, an inner
+/// header's entry from the copy) checks afresh, as for a hoisted typed-array
+/// view (`super::typed::ViewSlots`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArraySlots {
+    pub(crate) held: i32,
+    pub(crate) len: i32,
+    pub(crate) base: i32,
+    /// The element count as a Number (`f64` bits): `.length`'s value.
+    pub(crate) lend: i32,
+}
+
+/// Whether speculative region `r`'s fast version may keep hoisted arrays
+/// ([`ArraySlots`]): every op in it is one that cannot change an array's
+/// element count or storage — reads, arithmetic, branches, element writes
+/// (inline only in bounds over no hole), property writes of keys that are
+/// neither `length` nor an array index (an array's named property lives
+/// apart from its elements; an inline write is to an ordinary object
+/// anyway), cell and binding reads and writes, and inline `Math` calls —
+/// and it reads elements or `.length` at all.
+fn plain_views_ok(r: &Region, ops: &[GenericOp], bytecode: &[Op]) -> bool {
+    let index_like = |k: &str| k == "length" || k.parse::<u32>().is_ok();
+    let mut reads = false;
+    for pc in r.head..=r.end {
+        let ok = match (ops[pc], &bytecode[pc]) {
+            (GenericOp::GetElem { .. } | GenericOp::ArrayLen { .. }, _) => {
+                reads = true;
+                true
+            }
+            // (Its inline store is in bounds and to no hole: a value
+            // changes, never the count or the storage.)
+            (GenericOp::SetElem { .. }, _) => true,
+            (
+                GenericOp::SetProp { .. },
+                Op::SetProp { key, .. } | Op::SetPropStrict { key, .. },
+            ) => !index_like(key.as_str()),
+            (GenericOp::SetProp { .. }, _) => false,
+            (GenericOp::CallMethod { .. }, bc) => super::inline_math(bc).is_some(),
+            (
+                GenericOp::Interp { .. },
+                Op::LoadGlobal { .. }
+                | Op::StoreGlobal { .. }
+                | Op::Neg { .. }
+                | Op::BitNot { .. }
+                | Op::RequireObjectCoercible { .. },
+            ) => true,
+            (
+                GenericOp::Const { .. }
+                | GenericOp::Add { .. }
+                | GenericOp::Move { .. }
+                | GenericOp::GetProp { .. }
+                | GenericOp::GetMethod { .. }
+                | GenericOp::Arith { .. }
+                | GenericOp::Lt { .. }
+                | GenericOp::Compare { .. }
+                | GenericOp::NumAdd { .. }
+                | GenericOp::StrictEq { .. }
+                | GenericOp::ValueBin { .. }
+                | GenericOp::Not { .. }
+                | GenericOp::Jump { .. }
+                | GenericOp::JumpIfFalse { .. }
+                | GenericOp::CheckTdz { .. }
+                | GenericOp::ToNumeric { .. }
+                | GenericOp::Step { .. }
+                | GenericOp::ArrGet { .. }
+                | GenericOp::CellGet { .. }
+                | GenericOp::CellSet { .. }
+                | GenericOp::PlainPrims { .. }
+                | GenericOp::Nop
+                | GenericOp::InlineGuard { .. }
+                | GenericOp::InlineLeave,
+                _,
+            ) => true,
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    reads
+}
+
 /// The most typed-array views a speculative region hoists (three or four
 /// frame slots and an entry check each).
 const MAX_VIEWS: usize = 4;
@@ -6468,18 +6677,75 @@ impl X64Assembler {
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
-    /// `[pfx] [REX.R] 0F opc xmm(x), [rip + c]`, `c` a constant word with the
-    /// value `value` (placed after the code, each once, as
-    /// `handle::p_rip_const`'s).
-    fn sse_rip_const(&mut self, pfx: u8, opc: u8, x: u8, value: u64) {
-        let c = match self.consts.iter().find(|c| c.0 == value) {
+    /// A hoisted array's entry check ([`ArraySlots`]): when the value (a
+    /// register at a frame displacement, or a global binding through its
+    /// validated address) is an array without side-table state, it, its
+    /// element count and its first element's address go to `s`'s slots;
+    /// else `held` gets the throw sentinel, which no register holds.
+    /// Clobbers `rax`, `rcx`, `r8`, `r9`, `r11`, `xmm0` (and, unpinned,
+    /// `rdx` / `r10`).
+    pub(super) fn p_hoist_array(
+        &mut self,
+        l: &super::JitLayout,
+        realm: i32,
+        from: super::typed::HoistFrom,
+        s: ArraySlots,
+    ) {
+        use super::call_seq::r;
+        let none = self.new_label();
+        let done = self.new_label();
+        self.p_arena(realm, &l.props);
+        match from {
+            super::typed::HoistFrom::Reg(d) => self.load_rax(d),
+            super::typed::HoistFrom::Binding(slot) => {
+                self.g_load(r::RAX, r::RBP, slot);
+                self.g_load(r::RAX, r::RAX, 0);
+            }
+        }
+        self.p_is_handle(r::RCX, none);
+        self.p_slot_rooted(l, r::RCX, none);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
+        self.jne(none);
+        self.p_array_plain(l, realm, false, none);
+        self.g_store(r::RBP, s.held, r::RAX);
+        self.p_arr_len_ptr(l); // r8 = the count, r11 = the first element
+        self.g_store(r::RBP, s.len, r::R8);
+        self.g_store(r::RBP, s.base, r::R11);
+        self.cvtsi2sd_x_gpr(0, r::R8);
+        self.movq_gpr_x(r::RAX, 0);
+        self.g_store(r::RBP, s.lend, r::RAX);
+        self.jmp(done);
+        self.bind(none);
+        self.g_movabs(r::RAX, NanBox::jit_throw_bits());
+        self.g_store(r::RBP, s.held, r::RAX);
+        self.bind(done);
+    }
+
+    /// The label of the code's constant word `value` (each once).
+    fn const_word(&mut self, value: u64) -> Label {
+        match self.consts.iter().find(|c| c.0 == value) {
             Some(&(_, l)) => l,
             None => {
                 let l = self.new_label();
                 self.consts.push((value, l));
                 l
             }
-        };
+        }
+    }
+
+    /// `cmp rax, [rip + c]`, `c` the constant word `value` (no scratch
+    /// register, a `movabs` fewer).
+    pub(super) fn cmp_rax_const(&mut self, value: u64) {
+        let c = self.const_word(value);
+        self.code.extend_from_slice(&[0x48, 0x3b, 0x05]);
+        self.emit_rel32(c);
+    }
+
+    /// `[pfx] [REX.R] 0F opc xmm(x), [rip + c]`, `c` a constant word with the
+    /// value `value` (placed after the code, each once, as
+    /// `handle::p_rip_const`'s).
+    fn sse_rip_const(&mut self, pfx: u8, opc: u8, x: u8, value: u64) {
+        let c = self.const_word(value);
         self.code.push(pfx);
         if x >= 8 {
             self.code.push(0x44);

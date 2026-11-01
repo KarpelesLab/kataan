@@ -7037,6 +7037,8 @@ impl JitFunction {
         if crate::realm::typed_elems_seen() {
             typed::drop_array_sites(&mut rc);
         }
+        // A hoisted array's sites walk nothing (`NumGen::hoisted_array`).
+        num.drop_hoisted_array_sites(ops, &mut rc);
         // The ways whose every site compiles in one layout `S` (see
         // `recv_cache::shape_ways`): a hit there proves the receiver has `S`.
         let way_shape = recv_cache::shape_ways(&rc, ops, |op| match *op {
@@ -9924,6 +9926,24 @@ impl JitFunction {
                             }
                         };
                     }
+                    // A speculative loop's hoisted array
+                    // (`numeric::ArraySlots`): the receiver the very array
+                    // its entry check found, its element with no walk (any
+                    // miss: the ordinary path, below).
+                    if let Some(s) = num.hoisted_array(op_idx, obj) {
+                        let other = a.new_label();
+                        a.load_rax(disp(obj));
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.held);
+                        a.jne(other);
+                        elem_index!(other);
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.len);
+                        a.jae(other); // OOB / negative
+                        a.g_load(call_seq::r::R11, call_seq::r::RBP, s.base);
+                        a.mov_rax_at_r11_rax8(); // rax = elems[idx]
+                        a.cmp_rax_const(NanBox::hole().to_bits());
+                        a.jne(got);
+                        a.bind(other);
+                    }
                     // A speculative loop's hoisted view of the receiver
                     // (`typed::ViewSlots`): its element with no walk.
                     if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
@@ -10155,6 +10175,29 @@ impl JitFunction {
                     let slow = a.new_label();
                     let walked = a.new_label();
                     let got = a.new_label();
+                    // A speculative loop's hoisted array
+                    // (`numeric::ArraySlots`): its length with no walk.
+                    // (The result's location: the same as the walk's, below.)
+                    let res_x = num.result_xmm(op_idx, dst);
+                    let res_past = res_x.map(|_| a.new_label());
+                    if let Some(s) = num.hoisted_array(op_idx, arr) {
+                        let other = a.new_label();
+                        a.load_rax(disp(arr));
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.held);
+                        a.jne(other);
+                        a.g_load(call_seq::r::RAX, call_seq::r::RBP, s.lend);
+                        match (res_x, res_past) {
+                            (Some(x), Some(past)) => {
+                                numeric::NumGen::set_xmm_from_rax(&mut a, x);
+                                a.jmp(past);
+                            }
+                            _ => {
+                                a.store_rax(disp(dst));
+                                a.jmp(done);
+                            }
+                        }
+                        a.bind(other);
+                    }
                     // A speculative loop's hoisted view of the receiver
                     // (`typed::ViewSlots`): its length with no walk.
                     if let Some(v) = num.hoisted_view(op_idx, arr).filter(|_| typed) {
@@ -10176,8 +10219,7 @@ impl JitFunction {
                     }
                     a.p_arr_len(&layout, call_seq::r::RAX);
                     a.bind(got);
-                    if let Some(x) = num.result_xmm(op_idx, dst) {
-                        let past = a.new_label();
+                    if let (Some(x), Some(past)) = (res_x, res_past) {
                         numeric::NumGen::set_xmm_from_int_rax(&mut a, x);
                         a.jmp(past);
                         past_reload = Some(past);
