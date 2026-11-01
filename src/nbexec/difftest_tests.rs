@@ -4096,3 +4096,27 @@ fn exotic_own_keys_order_and_shadow() {
          a,lastIndex,z a,length,name,z 0,1,a,name,lastIndex,z"
     );
 }
+
+/// A raw lone surrogate survives `JSON.parse` on the paths that go through a
+/// reviver or a non-string `text`, as it did with a plain string and no reviver:
+/// keys, values and `context.source` all became U+FFFD. `JSON.rawJSON` as well.
+#[test]
+fn json_parse_keeps_raw_lone_surrogates_with_a_reviver() {
+    let src = r#"
+        var esc = (s) => s.replace(/[^ -~]/g, (c) => "\\u" + c.charCodeAt(0).toString(16));
+        var keep = (k, v) => v, r = [];
+        r.push(esc(Object.keys(JSON.parse('{"a\ud800":"\udc00"}', keep))[0]));
+        r.push(esc(JSON.parse('{"a":"\udc00"}', keep).a));
+        JSON.parse('"\ud800"', (k, v, c) => { r.push(esc(c.source)); return v; });
+        r.push(esc(JSON.parse(new String('"\ud800"'))));
+        r.push(esc(JSON.parse({ toString() { return '"\ud800"'; } }, keep)));
+        // A real private-use character keeps its identity beside a stand-in.
+        r.push(esc(JSON.parse('"\u{F0000}\ud800"', keep)));
+        r.push(esc(JSON.stringify({ a: JSON.rawJSON('"\ud800"') })));
+        [r.join(" "), (() => { try { JSON.parse('[\ud800]', keep); } catch (e) { return e.name; } })()].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "a\\ud800 \\udc00 \"\\ud800\" \\ud800 \\ud800 \\udb80\\udc00\\ud800 {\"a\":\"\\ud800\"}|SyntaxError"
+    );
+}

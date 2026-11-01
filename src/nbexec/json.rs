@@ -127,7 +127,7 @@ impl Interp {
             && let Some(JsonSrc::Prim { value: pv, source }) = snapshot
             && self.realm.same_value(*pv, value)
         {
-            let src_box = self.new_str(source);
+            let src_box = self.new_str_bytes(source.clone());
             self.realm.set_property(context, "source", src_box);
         }
         let kb = self.new_key_str(key);
@@ -429,8 +429,15 @@ impl Interp {
             if self.realm.get_property(h, RAW_JSON_BRAND).is_some()
                 && let Some(raw) = self.realm.get_property(h, "rawJSON")
             {
-                cx.out
-                    .extend_from_slice(self.realm.to_display_string(raw).as_bytes());
+                match raw
+                    .as_handle()
+                    .and_then(|r| self.realm.string_bytes(Handle::from_raw(r)))
+                {
+                    Some(bytes) => cx.out.extend_from_slice(&bytes),
+                    None => cx
+                        .out
+                        .extend_from_slice(self.realm.to_display_string(raw).as_bytes()),
+                }
                 return Ok(true);
             }
             if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
@@ -1239,7 +1246,7 @@ impl Interp {
             'n' | 't' | 'f' | '"' | '-' | '0'..='9' => {
                 let start = *pos;
                 let value = self.json_parse(c, pos, depth)?;
-                let source: String = c[start..*pos].iter().collect();
+                let source = json_source_bytes(&c[start..*pos], self.json_lone_base);
                 Ok((value, JsonSrc::Prim { value, source }))
             }
             '[' => {
@@ -1398,13 +1405,72 @@ impl Interp {
                             self.json_error("Bad control character in string literal in JSON")
                         );
                     }
-                    let mut buf = [0u8; 4];
-                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    push_json_source_char(ch, self.json_lone_base, &mut out);
                     *pos += 1;
                 }
             }
         }
     }
+}
+
+/// The text of a reviver-aware `JSON.parse` as `char`s, which cannot hold a lone
+/// surrogate: each one becomes a code point of a private-use block the text does
+/// not otherwise use. Returns the chars and that block's base (0: no lone
+/// surrogate). [`push_json_source_char`] turns the stand-ins back.
+pub(crate) fn json_text_chars(text: &[u8]) -> (Vec<char>, u32) {
+    if let Ok(s) = core::str::from_utf8(text) {
+        return (s.chars().collect(), 0);
+    }
+    let mut cps: Vec<u32> = Vec::with_capacity(text.len());
+    let mut it = crate::wtf8::code_points(text).peekable();
+    while let Some(cp) = it.next() {
+        if (0xD800..0xDC00).contains(&cp)
+            && let Some(&lo) = it.peek()
+            && (0xDC00..0xE000).contains(&lo)
+        {
+            it.next();
+            cps.push(0x1_0000 + ((cp - 0xD800) << 10) + (lo - 0xDC00));
+        } else {
+            cps.push(cp);
+        }
+    }
+    // Planes 15 and 16 hold 64 blocks of the surrogates' size; a text that uses
+    // every one of them keeps U+FFFD for its lone surrogates.
+    let base = (0..64u32)
+        .map(|k| 0xF_0000 + k * 0x1000 / 2)
+        .find(|b| !cps.iter().any(|cp| cp.wrapping_sub(*b) < 0x800))
+        .unwrap_or(0);
+    let chars = cps
+        .into_iter()
+        .map(|cp| {
+            if (0xD800..0xE000).contains(&cp) && base != 0 {
+                char::from_u32(base + cp - 0xD800).unwrap_or('\u{FFFD}')
+            } else {
+                char::from_u32(cp).unwrap_or('\u{FFFD}')
+            }
+        })
+        .collect();
+    (chars, base)
+}
+
+/// Appends one char of a [`json_text_chars`] text as WTF-8.
+fn push_json_source_char(ch: char, lone_base: u32, out: &mut Vec<u8>) {
+    let cp = ch as u32;
+    if lone_base != 0 && cp.wrapping_sub(lone_base) < 0x800 {
+        crate::wtf8::encode_utf16_unit((0xD800 + cp - lone_base) as u16, out);
+    } else {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    }
+}
+
+/// A slice of a [`json_text_chars`] text as WTF-8.
+fn json_source_bytes(c: &[char], lone_base: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(c.len());
+    for &ch in c {
+        push_json_source_char(ch, lone_base, &mut out);
+    }
+    out
 }
 
 /// A parse-time source-text snapshot mirroring a parsed JSON value's structure,
@@ -1413,7 +1479,7 @@ impl Interp {
 /// reviver can be handed the original text (unless a reviver has since replaced
 /// the value at that position — checked by SameValue).
 pub(crate) enum JsonSrc {
-    Prim { value: NanBox, source: String },
+    Prim { value: NanBox, source: Vec<u8> },
     Array(Vec<JsonSrc>),
     Object(Vec<(String, JsonSrc)>),
 }

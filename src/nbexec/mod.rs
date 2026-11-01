@@ -162,6 +162,10 @@ pub struct Interp {
     ///
     /// [`VmHost::take_realm`]: crate::nbvm::VmHost::take_realm
     realm: alloc::boxed::Box<Realm>,
+    /// While the reviver-aware `JSON.parse` runs: the first code point of the
+    /// private-use block standing in for the text's lone surrogates (see
+    /// `json::json_text_chars`), 0 when it has none.
+    json_lone_base: u32,
     /// Empty stand-in realms parked in `realm` while a hosted VM run holds the
     /// real one — reused, so entering the VM from a host call (a callback) does
     /// not build a fresh `Realm` each time. Boxed: a spare is swapped into
@@ -3003,6 +3007,7 @@ impl Interp {
     #[must_use]
     pub fn new_with_limits(limits: crate::limits::Limits) -> Self {
         let mut interp = Self {
+            json_lone_base: 0,
             realm: alloc::boxed::Box::new(Realm::with_limits(limits)),
             realm_spares: Vec::new(),
             subject_units_cache: None,

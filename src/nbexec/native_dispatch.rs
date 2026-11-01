@@ -886,7 +886,7 @@ impl Interp {
                 // `JSON.parse(text)` does `ToString(text)` first — a user
                 // `toString`/`valueOf` runs (propagating), unlike the raw
                 // `to_display_string` which stringifies an object as "[object …]".
-                let text = self.coerce_to_string(arg(0))?;
+                let text = self.coerce_to_string_bytes(arg(0))?;
                 // An optional `reviver` transforms each value bottom-up. When one is
                 // present, parse with source spans so the reviver's `context.source`
                 // (the json-parse-with-source proposal) can surface original text.
@@ -895,12 +895,15 @@ impl Interp {
                     .as_handle()
                     .is_some_and(|r| self.is_callable(Handle::from_raw(r)));
                 if !has_reviver {
-                    return self.json_parse_text(&text);
+                    return self.json_parse_wtf8(&text);
                 }
-                let chars: Vec<char> = text.chars().collect();
+                let (chars, lone_base) = json::json_text_chars(&text);
                 let mut pos = 0;
                 {
-                    let (value, src) = self.json_parse_src(&chars, &mut pos, 0)?;
+                    self.json_lone_base = lone_base;
+                    let parsed = self.json_parse_src(&chars, &mut pos, 0);
+                    self.json_lone_base = 0;
+                    let (value, src) = parsed?;
                     skip_ws(&chars, &mut pos);
                     if pos != chars.len() {
                         return Err(self.json_error("Unexpected token in JSON"));
@@ -919,19 +922,23 @@ impl Interp {
             N_JSON_RAW => {
                 // ToString(value); a Symbol throws (ToString of a Symbol is a
                 // TypeError), handled by `coerce_to_string`.
-                let text = self.coerce_to_string(arg(0))?;
+                let text = self.coerce_to_string_bytes(arg(0))?;
                 // Reject empty text or any leading/trailing JSON whitespace.
-                let is_ws = |c: char| matches!(c, '\u{20}' | '\u{09}' | '\u{0A}' | '\u{0D}');
-                let first = text.chars().next();
-                let last = text.chars().next_back();
-                if text.is_empty() || first.is_some_and(is_ws) || last.is_some_and(is_ws) {
+                let is_ws = |c: &u8| matches!(*c, 0x20 | 0x09 | 0x0A | 0x0D);
+                if text.is_empty()
+                    || text.first().is_some_and(is_ws)
+                    || text.last().is_some_and(is_ws)
+                {
                     return Err(self.json_error("Invalid raw JSON text"));
                 }
                 // Must parse as exactly one JSON value, and that value must be a
                 // primitive (not an object/array).
-                let chars: Vec<char> = text.chars().collect();
+                let (chars, lone_base) = json::json_text_chars(&text);
                 let mut pos = 0;
-                let parsed = self.json_parse(&chars, &mut pos, 0)?;
+                self.json_lone_base = lone_base;
+                let parsed = self.json_parse(&chars, &mut pos, 0);
+                self.json_lone_base = 0;
+                let parsed = parsed?;
                 skip_ws(&chars, &mut pos);
                 if pos != chars.len() {
                     return Err(self.json_error("Invalid raw JSON text"));
@@ -947,7 +954,7 @@ impl Interp {
                 // = the text, plus the internal brand; then frozen.
                 let obj = self.realm.new_object();
                 self.realm.set_object_proto(obj, None);
-                let text_box = self.new_str(&text);
+                let text_box = self.new_str_bytes(text);
                 self.realm.set_property(obj, "rawJSON", text_box);
                 self.realm
                     .set_hidden_property(obj, RAW_JSON_BRAND, NanBox::boolean(true));
