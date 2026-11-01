@@ -36,7 +36,11 @@ mod gen_state;
 mod private_fast;
 pub use private_fast::PrivCache;
 pub(crate) mod hidden_layout;
+pub(crate) mod json_fast;
 mod msg_text;
+mod pow5_tables;
+pub(crate) mod ryu;
+#[cfg(test)]
 mod shortest;
 mod spread_fast;
 mod str_key_fast;
@@ -9222,47 +9226,10 @@ pub(crate) fn js_number_string(n: f64) -> alloc::string::String {
 
 /// Appends [`js_number_string`]`(n)` to `out`, without an intermediate string.
 pub(crate) fn push_js_number(out: &mut alloc::string::String, n: f64) {
-    if n.is_nan() {
-        return out.push_str("NaN");
-    }
-    if n.is_infinite() {
-        return out.push_str(if n > 0.0 { "Infinity" } else { "-Infinity" });
-    }
-    // Both `+0` and `-0` stringify to "0".
-    if n == 0.0 {
-        return out.push('0');
-    }
-    if builtins_fast::push_small_integer(out, n) {
-        return;
-    }
-    // `abs = 0.digits × 10^e` (the spec's `s`, `k` and `n`).
-    let (digits, e) = shortest_digits(n.abs());
-    // Digits are ASCII.
-    let digits = core::str::from_utf8(digits.as_bytes()).unwrap_or_default();
-    let k = digits.len() as i32;
-    if n < 0.0 {
-        out.push('-');
-    }
-    if k <= e && e <= 21 {
-        out.push_str(digits);
-        out.extend(core::iter::repeat_n('0', (e - k) as usize));
-    } else if 0 < e && e <= 21 {
-        out.push_str(&digits[..e as usize]);
-        out.push('.');
-        out.push_str(&digits[e as usize..]);
-    } else if -6 < e && e <= 0 {
-        out.push_str("0.");
-        out.extend(core::iter::repeat_n('0', (-e) as usize));
-        out.push_str(digits);
-    } else {
-        out.push_str(&digits[..1]);
-        if k > 1 {
-            out.push('.');
-            out.push_str(&digits[1..]);
-        }
-        out.push_str(if e > 0 { "e+" } else { "e-" });
-        builtins_fast::push_small_integer(out, f64::from((e - 1).abs()));
-    }
+    let mut buf = [0u8; ryu::NUMBER_TEXT_MAX];
+    let len = ryu::write_js_number(n, &mut buf);
+    // The text is ASCII.
+    out.push_str(core::str::from_utf8(&buf[..len]).unwrap_or_default());
 }
 
 /// The ECMAScript `Number::toString` digits of a finite `abs > 0`: the
@@ -9304,11 +9271,13 @@ impl Digits {
 
 /// A fixed-capacity `fmt::Write` sink, so a float can be rendered without an
 /// allocation (overflow is a formatting error).
+#[cfg(test)]
 struct StackText {
     buf: [u8; 48],
     len: usize,
 }
 
+#[cfg(test)]
 impl core::fmt::Write for StackText {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let end = self.len + s.len();
@@ -9325,6 +9294,7 @@ impl core::fmt::Write for StackText {
 /// correctly rounded to `p` fraction digits) as `(digits, exponent)`, see
 /// [`sci_digits`]. `None` only if the text overflowed the sink (it cannot for
 /// an `f64` at the precisions used here).
+#[cfg(test)]
 fn sci_render(abs: f64, prec: Option<usize>) -> Option<(Digits, i32)> {
     use core::fmt::Write;
     let mut t = StackText {
@@ -9343,6 +9313,20 @@ fn sci_render(abs: f64, prec: Option<usize>) -> Option<(Digits, i32)> {
 /// exponent `n` with `abs = 0.digits × 10^n`.
 #[must_use]
 pub(crate) fn shortest_digits(abs: f64) -> (Digits, i32) {
+    let (d, k, n) = ryu::digits_of(abs);
+    let mut out = Digits {
+        buf: [0; 24],
+        len: k,
+    };
+    ryu::write_digits(d, &mut out.buf[..k]);
+    (out, n)
+}
+
+/// The pre-[`ryu`] [`shortest_digits`] (exact 128-bit arithmetic where it
+/// reaches, else Rust's formatter with a tie re-check): the oracle the
+/// [`ryu`] tests compare against.
+#[cfg(test)]
+pub(crate) fn shortest_digits_reference(abs: f64) -> (Digits, i32) {
     if let Some(r) = shortest::shortest_digits_exact(abs) {
         return r;
     }
@@ -9351,6 +9335,7 @@ pub(crate) fn shortest_digits(abs: f64) -> (Digits, i32) {
 
 /// [`shortest_digits`] through Rust's float formatter (the general path, for
 /// the magnitudes [`shortest::shortest_digits_exact`] does not cover).
+#[cfg(test)]
 fn shortest_digits_fmt(abs: f64) -> (Digits, i32) {
     let Some((mut digits, mut exp)) = sci_render(abs, None) else {
         let (d, e) = sci_digits(alloc::format!("{abs:e}").as_bytes());
@@ -9383,6 +9368,7 @@ fn shortest_digits_fmt(abs: f64) -> (Digits, i32) {
 
 /// The significant digits (trailing zeros dropped) and the decimal exponent of
 /// a Rust `{:e}` rendering such as `"2.5e-3"`.
+#[cfg(test)]
 fn sci_digits(s: &[u8]) -> (Digits, i32) {
     let split = s.iter().position(|&c| c == b'e').unwrap_or(s.len());
     let (mant, exp) = (&s[..split], s.get(split + 1..).unwrap_or(&[]));

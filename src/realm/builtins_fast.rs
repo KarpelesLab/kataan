@@ -408,7 +408,7 @@ impl Realm {
     /// may come and go), and the next link. `None` for anything other than an
     /// ordinary object, an array, a RegExp or a collection, and for a
     /// host-exotic one.
-    fn key_link(&self, h: Handle) -> Option<(Option<u64>, u32, Option<Handle>)> {
+    pub(super) fn key_link(&self, h: Handle) -> Option<(Option<u64>, u32, Option<Handle>)> {
         if self.is_host_exotic(h) {
             return None;
         }
@@ -1293,74 +1293,23 @@ impl Realm {
     }
 }
 
-/// The decimal digits of `Number::toString(n)` when `n` is an integer of
-/// magnitude below 2^53 (`-0` reads as `0`): a buffer and the start of the
-/// text in it. `None` for any other number.
-fn small_integer_digits(n: f64) -> Option<([u8; 21], usize)> {
-    const LIMIT: f64 = 9_007_199_254_740_992.0;
-    if !(n > -LIMIT && n < LIMIT) {
-        return None;
-    }
-    let i = n as i64;
-    if i as f64 != n {
-        return None;
-    }
-    let mut buf = [0u8; 21];
-    let mut pos = buf.len();
-    let mut u = i.unsigned_abs();
-    loop {
-        pos -= 1;
-        buf[pos] = b'0' + (u % 10) as u8;
-        u /= 10;
-        if u == 0 {
-            break;
-        }
-    }
-    if i < 0 {
-        pos -= 1;
-        buf[pos] = b'-';
-    }
-    Some((buf, pos))
-}
-
-/// Appends `Number::toString(n)` to `out` when `n` is an integer of magnitude
-/// below 2^53 (written as plain decimal digits, `-0` as `0`) and returns
-/// `true`; returns `false`, having written nothing, for any other number.
-pub(crate) fn push_small_integer(out: &mut alloc::string::String, n: f64) -> bool {
-    // A non-negative integer below 10^4 (array indices, counters, small
-    // ids): its digits pushed one by one, no buffer.
-    if (0.0..10_000.0).contains(&n) {
-        let u = n as u32;
-        if f64::from(u) == n {
-            if u >= 1000 {
-                out.push(char::from(b'0' + (u / 1000) as u8));
-            }
-            if u >= 100 {
-                out.push(char::from(b'0' + (u / 100 % 10) as u8));
-            }
-            if u >= 10 {
-                out.push(char::from(b'0' + (u / 10 % 10) as u8));
-            }
-            out.push(char::from(b'0' + (u % 10) as u8));
-            return true;
-        }
-    }
-    let Some((buf, pos)) = small_integer_digits(n) else {
-        return false;
-    };
-    // Digits (and the sign) are ASCII: each byte is its own `char`.
-    out.extend(buf[pos..].iter().map(|&b| char::from(b)));
-    true
-}
-
-/// Appends `Number::toString(n)` to the WTF-8 buffer `out` — the digits
-/// directly for a small integer, else the general rendering.
+/// Appends `Number::toString(n)` to the WTF-8 buffer `out`.
 pub(crate) fn push_number_bytes(out: &mut alloc::vec::Vec<u8>, n: f64) {
-    if let Some((buf, pos)) = small_integer_digits(n) {
-        out.extend_from_slice(&buf[pos..]);
-    } else {
-        out.extend_from_slice(super::js_number_string(n).as_bytes());
-    }
+    let mut buf = [0u8; super::ryu::NUMBER_TEXT_MAX];
+    let len = super::ryu::write_js_number(n, &mut buf);
+    // The whole buffer, then the excess dropped: a copy of a known size
+    // (a few moves) rather than a call to copy `len` bytes.
+    let start = out.len();
+    out.extend_from_slice(&buf);
+    out.truncate(start + len);
+}
+
+/// `ToString(n)` as a fresh rope, built from the text without an
+/// intermediate `String`.
+fn number_rope_uncached(n: f64) -> crate::rope::Rope {
+    let mut buf = [0u8; super::ryu::NUMBER_TEXT_MAX];
+    let len = super::ryu::write_js_number(n, &mut buf);
+    crate::rope::Rope::from_bytes(&buf[..len])
 }
 
 /// How many small non-negative integers keep a shared string rope.
@@ -1378,10 +1327,10 @@ impl Realm {
                 cache.resize(NUMBER_ROPES, None);
             }
             return cache[i]
-                .get_or_insert_with(|| crate::rope::Rope::from(super::js_number_string(n).as_str()))
+                .get_or_insert_with(|| number_rope_uncached(n))
                 .clone();
         }
-        crate::rope::Rope::from(super::js_number_string(n).as_str())
+        number_rope_uncached(n)
     }
 
     /// A new string cell holding `ToString(v)` for a primitive `v` (a number
@@ -1498,10 +1447,7 @@ impl Realm {
             let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(bound);
             for &p in parts {
                 match p.unpack() {
-                    crate::nanbox::Unpacked::Number(n) => match small_integer_digits(n) {
-                        Some((d, pos)) => buf.extend_from_slice(&d[pos..]),
-                        None => buf.extend_from_slice(super::js_number_string(n).as_bytes()),
-                    },
+                    crate::nanbox::Unpacked::Number(n) => push_number_bytes(&mut buf, n),
                     crate::nanbox::Unpacked::Handle(raw) => {
                         let piece = self
                             .heap
@@ -1553,9 +1499,10 @@ impl Realm {
         if bytes.len() > 40 || bytes.is_empty() {
             return None;
         }
-        let (buf, pos) = small_integer_digits(n)?;
-        let digits = &buf[pos..];
-        // At most 40 + 21 bytes: joined on the stack, then copied once into the
+        let mut buf = [0u8; super::ryu::NUMBER_TEXT_MAX];
+        let len = super::ryu::write_js_number(n, &mut buf);
+        let digits = &buf[..len];
+        // At most 40 + 25 bytes: joined on the stack, then copied once into the
         // new rope (inline when short).
         let mut out = [0u8; 64];
         let (first, second) = if number_first {

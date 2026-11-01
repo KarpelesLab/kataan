@@ -7900,46 +7900,7 @@ fn format_precision(n: f64, p: usize) -> String {
     out
 }
 
-/// Quotes and escapes WTF-8 bytes as a JSON string literal onto `out`,
-/// iterating code points so a **lone surrogate** is escaped as `\uXXXX`
-/// (well-formed JSON per the spec) and astral scalars emit their characters
-/// directly. Printable ASCII with no `"` or `\` (the usual key or value) needs
-/// no escaping and is copied in one go.
-fn json_quote_wtf8_into(out: &mut String, bytes: &[u8]) {
-    out.push('"');
-    // Printable ASCII with no quote or backslash is copied as is, in the
-    // same pass that checks it (each such byte is its own `char`); anything
-    // else rewinds and takes the escaping walk.
-    if bytes
-        .iter()
-        .all(|&b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
-        && let Ok(s) = core::str::from_utf8(bytes)
-    {
-        out.push_str(s);
-        out.push('"');
-        return;
-    }
-    for cp in crate::wtf8::code_points(bytes) {
-        match cp {
-            0x22 => out.push_str("\\\""),
-            0x5C => out.push_str("\\\\"),
-            0x08 => out.push_str("\\b"),
-            0x0C => out.push_str("\\f"),
-            0x0A => out.push_str("\\n"),
-            0x0D => out.push_str("\\r"),
-            0x09 => out.push_str("\\t"),
-            cp if cp < 0x20 || crate::wtf8::is_surrogate(cp) => {
-                out.push_str(&alloc::format!("\\u{cp:04x}"));
-            }
-            cp => {
-                if let Some(c) = char::from_u32(cp) {
-                    out.push(c);
-                }
-            }
-        }
-    }
-    out.push('"');
-}
+use crate::realm::json_fast::json_quote_wtf8_into;
 
 /// Reads exactly four hex digits from the char slice `c` starting at `at`,
 /// returning the `u16` code unit. `None` if fewer than four hex digits are

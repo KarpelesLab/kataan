@@ -1,4 +1,5 @@
 use super::*;
+use crate::realm::json_fast::{SHORT_TEXT, push_padded};
 use alloc::rc::Rc;
 
 impl Interp {
@@ -147,7 +148,7 @@ impl Interp {
         value: NanBox,
         replacer: NanBox,
         space: NanBox,
-    ) -> Result<Option<String>, ExecError> {
+    ) -> Result<Option<Vec<u8>>, ExecError> {
         // ReplacerFunction / PropertyList from `replacer`.
         let mut replacer_fn = NanBox::undefined();
         let mut property_list: Option<Vec<String>> = None;
@@ -236,10 +237,15 @@ impl Interp {
             gap: &gap,
             stack: Vec::new(),
             deep: alloc::collections::BTreeSet::new(),
-            out: String::new(),
+            out: Vec::new(),
             shape_keys: core::mem::take(&mut self.json_shape_memo),
             tojson_obj: crate::ic::PropertyCache::new(),
             tojson_arr: Default::default(),
+            fast: replacer_fn.as_handle().is_none() && property_list.is_none() && gap.is_empty(),
+            max_len: self.realm.limits.max_string_len,
+            slow: 0,
+            proofs: [(0, 0); 4],
+            last_plan: None,
         };
         let wrote = match self.read_member(holder, "") {
             Ok(value) => self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, ""),
@@ -287,23 +293,33 @@ impl Interp {
         // `json_ser_value` writes it, and a String primitive (no `toJSON`
         // lookup, no wrapper or RawJSON probes) is quoted: here, ahead of
         // the general steps (out of line, so these cheap cases do not pay
-        // for their frame).
-        if cx.replacer_fn.as_handle().is_none() {
+        // for their frame). In the fast mode (no property list or gap
+        // either), plain objects and arrays are written here too.
+        if cx.fast {
+            if self.realm.json_write_prim(&mut cx.out, value, cx.max_len) {
+                return Ok(true);
+            }
+            if let Some(raw) = value.as_handle()
+                && let Some(done) = self.json_fast_container(cx, Handle::from_raw(raw))
+            {
+                return done.map(|()| true);
+            }
+        } else if cx.replacer_fn.as_handle().is_none() {
             match value.unpack() {
                 Unpacked::Number(n) => {
                     if n.is_finite() {
-                        crate::realm::push_js_number(&mut cx.out, n);
+                        crate::realm::builtins_fast::push_number_bytes(&mut cx.out, n);
                     } else {
-                        cx.out.push_str("null");
+                        cx.out.extend_from_slice(b"null");
                     }
                     return Ok(true);
                 }
                 Unpacked::Bool(b) => {
-                    cx.out.push_str(if b { "true" } else { "false" });
+                    cx.out.extend_from_slice(if b { b"true" } else { b"false" });
                     return Ok(true);
                 }
                 Unpacked::Null => {
-                    cx.out.push_str("null");
+                    cx.out.extend_from_slice(b"null");
                     return Ok(true);
                 }
                 Unpacked::Handle(raw) if self.realm.typeof_is_string(Handle::from_raw(raw)) => {
@@ -326,6 +342,7 @@ impl Interp {
         mut value: NanBox,
         indent: &str,
     ) -> Result<bool, ExecError> {
+        cx.slow += 1;
         // With no replacer function, an ordinary dense array with no named
         // own properties (so no own `toJSON`) whose prototype chain is known
         // to lack `toJSON` is serialized as an array — exactly what the
@@ -412,7 +429,8 @@ impl Interp {
             if self.realm.get_property(h, RAW_JSON_BRAND).is_some()
                 && let Some(raw) = self.realm.get_property(h, "rawJSON")
             {
-                cx.out.push_str(&self.realm.to_display_string(raw));
+                cx.out
+                    .extend_from_slice(self.realm.to_display_string(raw).as_bytes());
                 return Ok(true);
             }
             if let Some(prim) = self.realm.get_property(h, PRIM_WRAP) {
@@ -440,13 +458,13 @@ impl Interp {
             value
         };
         match value.unpack() {
-            Unpacked::Null => cx.out.push_str("null"),
-            Unpacked::Bool(b) => cx.out.push_str(if b { "true" } else { "false" }),
+            Unpacked::Null => cx.out.extend_from_slice(b"null"),
+            Unpacked::Bool(b) => cx.out.extend_from_slice(if b { b"true" } else { b"false" }),
             Unpacked::Number(n) => {
                 if n.is_finite() {
-                    crate::realm::push_js_number(&mut cx.out, n);
+                    crate::realm::builtins_fast::push_number_bytes(&mut cx.out, n);
                 } else {
-                    cx.out.push_str("null");
+                    cx.out.extend_from_slice(b"null");
                 }
             }
             Unpacked::Undefined => return Ok(false),
@@ -537,6 +555,191 @@ impl Interp {
         }
     }
 
+    /// The fast path of [`json_ser_got`](Self::json_ser_got) (no replacer,
+    /// no property list, no gap) for an object or array whose own steps run
+    /// no user code: a plain shaped data object owning no `toJSON`, or an
+    /// array with no named or exotic own properties, either with a
+    /// prototype chain shown to lack `toJSON`. `Get(value, "toJSON")` is
+    /// then `undefined` with no side effect, and the value is no wrapper,
+    /// RawJSON object, callable or proxy, so SerializeJSONProperty goes
+    /// straight to SerializeJSONObject / SerializeJSONArray. `Some` once
+    /// written, `None` (nothing written) for anything else.
+    fn json_fast_container(
+        &mut self,
+        cx: &mut JsonOut<'_>,
+        h: Handle,
+    ) -> Option<Result<(), ExecError>> {
+        if let Some((shape, proto)) = self.realm.json_plain_object(h) {
+            let hit = cx
+                .last_plan
+                .as_ref()
+                .filter(|p| Rc::ptr_eq(&p.shape, shape))
+                .map(Rc::clone);
+            let plan = match hit {
+                Some(p) => p,
+                None => {
+                    let p = self.json_shape_keys(cx, h)?;
+                    cx.last_plan = Some(Rc::clone(&p));
+                    p
+                }
+            };
+            if plan.own_tojson
+                || self.is_mapped_arguments(h)
+                || self.realm.is_function_proto_intrinsic(h)
+                || !self.json_chain_lacks_tojson(cx, proto)
+            {
+                return None;
+            }
+            return Some(self.json_fast_object(cx, h, &plan));
+        }
+        let proto = self.realm.json_plain_array(h)?;
+        if !self.json_chain_lacks_tojson(cx, proto) {
+            return None;
+        }
+        Some(self.json_fast_array(cx, h))
+    }
+
+    /// Whether the `[[Get]]` of `toJSON` from the prototype `proto` finds
+    /// nothing, remembered per prototype for as long as the prototype epoch
+    /// it was shown at is current (every link of the chain is watched, so
+    /// any change to one moves the epoch).
+    fn json_chain_lacks_tojson(&mut self, cx: &mut JsonOut<'_>, proto: Option<Handle>) -> bool {
+        let Some(p) = proto else {
+            return true;
+        };
+        let raw = p.to_raw();
+        let epoch = crate::object::proto_epoch();
+        if cx.proofs.iter().any(|&(r, e)| r == raw && e == epoch) {
+            return true;
+        }
+        if !self.realm.prove_chain_lacks(Some(p), "toJSON") {
+            return false;
+        }
+        let epoch = crate::object::proto_epoch();
+        let slot = cx.proofs.iter().position(|&(_, e)| e != epoch).unwrap_or(0);
+        cx.proofs[slot] = (raw, epoch);
+        true
+    }
+
+    /// SerializeJSONObject (compact, no property list) for an object of
+    /// `plan`'s shape (see [`json_fast_container`](Self::json_fast_container)).
+    /// Its values are copied out of the slots a chunk at a time and stay
+    /// valid while no general step has run since (`cx.slow`): only those can
+    /// run user code that changes the object. After one has, the next value
+    /// is re-read the way [`json_ser_planned`](Self::json_ser_planned) does.
+    fn json_fast_object(
+        &mut self,
+        cx: &mut JsonOut<'_>,
+        h: Handle,
+        plan: &JsonShapeKeys,
+    ) -> Result<(), ExecError> {
+        const CHUNK: usize = 16;
+        self.json_enter(cx, h)?;
+        cx.out.push(b'{');
+        let mut any = false;
+        let n = plan.keys.len();
+        let mut buf = [NanBox::undefined(); CHUNK];
+        // `buf[..cnt]` holds the values of keys `base..base + cnt`, read
+        // when the general-step count was `at`.
+        let (mut base, mut cnt, mut at) = (0, 0, cx.slow);
+        for i in 0..n {
+            let (k, quoted, _) = &plan.keys[i];
+            let value = if i < base + cnt && cx.slow == at {
+                buf[i - base]
+            } else {
+                let c = CHUNK.min(n - i);
+                if self
+                    .realm
+                    .json_slots_under(h, &plan.shape, &plan.slots[i..i + c], &mut buf[..c])
+                {
+                    (base, cnt, at) = (i, c, cx.slow);
+                    buf[0]
+                } else {
+                    // Reshaped by user code: the full `[[Get]]` (which may
+                    // itself run a getter).
+                    cnt = 0;
+                    cx.slow += 1;
+                    self.get_own_fast(h, k)?
+                }
+            };
+            let mark = cx.out.len();
+            match plan.texts[i] {
+                (ref first, ref next, len) if len > 0 => {
+                    if any {
+                        push_padded(&mut cx.out, next, len + 1);
+                    } else {
+                        push_padded(&mut cx.out, first, len);
+                    }
+                }
+                _ => {
+                    if any {
+                        cx.out.push(b',');
+                    }
+                    cx.out.extend_from_slice(quoted);
+                }
+            }
+            if cx.out.len() > cx.max_len {
+                return Err(self.string_length_error());
+            }
+            if self.realm.json_write_prim(&mut cx.out, value, cx.max_len)
+                || self.json_ser_got(cx, h, JsonKey::Str(k), value, "")?
+            {
+                any = true;
+            } else {
+                cx.out.truncate(mark);
+            }
+        }
+        Self::json_leave(cx);
+        cx.out.push(b'}');
+        Ok(())
+    }
+
+    /// SerializeJSONArray (compact) for a plain array (see
+    /// [`json_fast_container`](Self::json_fast_container)): runs of
+    /// elements that need nothing but their text are written straight from
+    /// the element store ([`Realm::json_write_array_run`]); any other
+    /// element takes the steps of [`json_ser_array`](Self::json_ser_array).
+    fn json_fast_array(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<(), ExecError> {
+        self.json_enter(cx, h)?;
+        let len = self.realm.array_length(h).unwrap_or(0);
+        cx.out.push(b'[');
+        let mut i = 0;
+        while i < len {
+            i = self
+                .realm
+                .json_write_array_run(h, i, len, &mut cx.out, cx.max_len);
+            if i >= len {
+                break;
+            }
+            if i > 0 {
+                cx.out.push(b',');
+                self.check_str_len(cx.out.len())?;
+            }
+            let direct = if self.realm.array_has_index_side_table(h) {
+                None
+            } else {
+                self.realm
+                    .array_elements(h)
+                    .and_then(|a| a.get(i).copied())
+                    .filter(|v| !v.is_hole())
+            };
+            let value = match direct {
+                Some(v) => v,
+                None => {
+                    cx.slow += 1;
+                    self.read_member(h, &alloc::format!("{i}"))?
+                }
+            };
+            if !self.json_ser_got(cx, h, JsonKey::Index(i), value, "")? {
+                cx.out.extend_from_slice(b"null");
+            }
+            i += 1;
+        }
+        Self::json_leave(cx);
+        cx.out.push(b']');
+        self.check_str_len(cx.out.len())
+    }
+
     /// The memoized key plan for the object at `h` (see [`JsonShapeKeys`]),
     /// built on the first object of each shape; `None` when `h` is not a plain
     /// keyed object or its shape holds an engine-internal key.
@@ -567,11 +770,34 @@ impl Interp {
         let mut keys = Vec::with_capacity(names.len());
         for k in names {
             let slot = shape.lookup(&k)?;
-            let mut quoted = String::with_capacity(k.len() + 2);
+            let mut quoted = Vec::with_capacity(k.len() + 3);
             json_quote_wtf8_into(&mut quoted, &crate::realm::key_wtf8(&k));
+            quoted.push(b':');
             keys.push((k, quoted, slot));
         }
-        let m = Rc::new(JsonShapeKeys { shape, keys });
+        let slots = keys.iter().map(|k| k.2).collect();
+        let own_tojson = keys.iter().any(|k| k.0 == "toJSON");
+        let texts = keys
+            .iter()
+            .map(|(_, q, _)| {
+                let (mut first, mut next) = ([0; SHORT_TEXT], [0; SHORT_TEXT]);
+                if q.len() < SHORT_TEXT {
+                    first[..q.len()].copy_from_slice(q);
+                    next[0] = b',';
+                    next[1..=q.len()].copy_from_slice(q);
+                    (first, next, q.len())
+                } else {
+                    (first, next, 0)
+                }
+            })
+            .collect();
+        let m = Rc::new(JsonShapeKeys {
+            shape,
+            keys,
+            slots,
+            texts,
+            own_tojson,
+        });
         if cx.shape_keys.len() >= JSON_SHAPE_MEMO {
             cx.shape_keys.remove(0);
         }
@@ -680,20 +906,20 @@ impl Interp {
             }
         };
         let pretty = !cx.gap.is_empty();
-        cx.out.push('{');
+        cx.out.push(b'{');
         let mut any = false;
         for k in keys {
             let mark = cx.out.len();
             if any {
-                cx.out.push(',');
+                cx.out.push(b',');
                 self.check_str_len(cx.out.len())?;
             }
             if pretty {
-                cx.out.push('\n');
-                cx.out.push_str(&new_indent);
+                cx.out.push(b'\n');
+                cx.out.extend_from_slice(new_indent.as_bytes());
             }
             json_quote_wtf8_into(&mut cx.out, &crate::realm::key_wtf8(&k));
-            cx.out.push_str(if pretty { ": " } else { ":" });
+            cx.out.extend_from_slice(if pretty { b": " } else { b":" });
             // `Get(h, k)`: an own data property of an ordinary object is its
             // slot; everything else takes the full `[[Get]]`.
             let value = match self.ordinary_own_data(h, &k) {
@@ -708,10 +934,10 @@ impl Interp {
         }
         Self::json_leave(cx);
         if any && pretty {
-            cx.out.push('\n');
-            cx.out.push_str(indent);
+            cx.out.push(b'\n');
+            cx.out.extend_from_slice(indent.as_bytes());
         }
-        cx.out.push('}');
+        cx.out.push(b'}');
         Ok(())
     }
 
@@ -734,20 +960,24 @@ impl Interp {
         } else {
             String::new()
         };
-        cx.out.push('{');
+        cx.out.push(b'{');
         let mut any = false;
         for (k, quoted, slot) in &plan.keys {
             let mark = cx.out.len();
             if any {
-                cx.out.push(',');
+                cx.out.push(b',');
                 self.check_str_len(cx.out.len())?;
             }
             if pretty {
-                cx.out.push('\n');
-                cx.out.push_str(&new_indent);
+                cx.out.push(b'\n');
+                cx.out.extend_from_slice(new_indent.as_bytes());
             }
-            cx.out.push_str(quoted);
-            cx.out.push_str(if pretty { ": " } else { ":" });
+            if pretty {
+                cx.out.extend_from_slice(&quoted[..quoted.len() - 1]);
+                cx.out.extend_from_slice(b": ");
+            } else {
+                cx.out.extend_from_slice(quoted);
+            }
             let value = match self.realm.plain_slot_under(h, &plan.shape, *slot) {
                 Some(v) => v,
                 None => self.get_own_fast(h, k)?,
@@ -760,10 +990,10 @@ impl Interp {
         }
         Self::json_leave(cx);
         if any && pretty {
-            cx.out.push('\n');
-            cx.out.push_str(indent);
+            cx.out.push(b'\n');
+            cx.out.extend_from_slice(indent.as_bytes());
         }
-        cx.out.push('}');
+        cx.out.push(b'}');
         Ok(())
     }
 
@@ -798,15 +1028,15 @@ impl Interp {
             self.realm.array_length(h).unwrap_or(0)
         };
         let pretty = !cx.gap.is_empty();
-        cx.out.push('[');
+        cx.out.push(b'[');
         for i in 0..len {
             if i > 0 {
-                cx.out.push(',');
+                cx.out.push(b',');
                 self.check_str_len(cx.out.len())?;
             }
             if pretty {
-                cx.out.push('\n');
-                cx.out.push_str(&new_indent);
+                cx.out.push(b'\n');
+                cx.out.extend_from_slice(new_indent.as_bytes());
             }
             // `Get(h, i)`: a present slot of a plain array with no per-index side
             // table is the element itself; anything else (a hole, an accessor, a
@@ -827,15 +1057,15 @@ impl Interp {
             // their own elements), but it MUST propagate to any nested objects,
             // which it does through `cx`.
             if !self.json_ser_got(cx, h, JsonKey::Index(i), value, &new_indent)? {
-                cx.out.push_str("null");
+                cx.out.extend_from_slice(b"null");
             }
         }
         Self::json_leave(cx);
         if len > 0 && pretty {
-            cx.out.push('\n');
-            cx.out.push_str(indent);
+            cx.out.push(b'\n');
+            cx.out.extend_from_slice(indent.as_bytes());
         }
-        cx.out.push(']');
+        cx.out.push(b']');
         Ok(())
     }
 
@@ -1198,7 +1428,7 @@ struct JsonOut<'a> {
     /// The raw handles of `stack[JSON_STACK_SCAN..]`, for the cycle check of
     /// a deep structure.
     deep: alloc::collections::BTreeSet<u64>,
-    out: String,
+    out: Vec<u8>,
     /// Key lists memoized per shape (see [`JsonShapeKeys`]); a few entries,
     /// most recently added last.
     shape_keys: Vec<Rc<JsonShapeKeys>>,
@@ -1206,6 +1436,20 @@ struct JsonOut<'a> {
     /// (an ordinary object, an array's prototype).
     tojson_obj: crate::ic::PropertyCache,
     tojson_arr: crate::realm::builtins_fast::ChainKeyCache,
+    /// No replacer, no property list and no gap: plain objects and arrays
+    /// take [`Interp::json_fast_object`] / [`Interp::json_fast_array`].
+    fast: bool,
+    /// The string length cap, in bytes of `out`.
+    max_len: usize,
+    /// How many times the general steps ([`Interp::json_ser_got_full`]),
+    /// the only ones that can run user code, were entered: values read
+    /// from the heap before the count last moved are still current.
+    slow: u64,
+    /// Prototypes shown (by [`Realm::prove_chain_lacks`]) to have no
+    /// `toJSON` on their chain, each with the prototype epoch it holds at.
+    proofs: [(u64, u64); 4],
+    /// The plan [`Interp::json_fast_object`] used last.
+    last_plan: Option<Rc<JsonShapeKeys>>,
 }
 
 /// How many enclosing objects the `JSON.stringify` cycle check scans before
@@ -1223,8 +1467,16 @@ const JSON_SHAPE_MEMO: usize = 8;
 /// object that still has `shape` when a key is read.
 pub(super) struct JsonShapeKeys {
     shape: Rc<crate::shape::Shape>,
-    /// `(key, "key" quoted, slot)`.
-    keys: Vec<(String, String, u32)>,
+    /// `(key, "key": quoted with its colon, slot)`.
+    keys: Vec<(String, Vec<u8>, u32)>,
+    /// The slots of `keys`, in order.
+    slots: Vec<u32>,
+    /// For each key whose `"key":` text fits a short buffer: that text
+    /// staged for [`push_padded`](crate::realm::json_fast::push_padded),
+    /// alone and after a `,`, and its length (`0` when it does not fit).
+    texts: Vec<([u8; SHORT_TEXT], [u8; SHORT_TEXT], usize)>,
+    /// Whether one of the keys is `toJSON`.
+    own_tojson: bool,
 }
 
 /// The key of a property being serialized: a named key, or an array index whose
