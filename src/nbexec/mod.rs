@@ -10149,13 +10149,11 @@ impl crate::nbvm::VmHost for Interp {
             None => None,
         };
         let (keys, live) = match trap_keys {
-            Some(ks) => {
-                let is_proxy = obj
-                    .as_handle()
-                    .is_some_and(|raw| self.realm.proxy_at(Handle::from_raw(raw)).is_some());
-                let live = if is_proxy { NanBox::undefined() } else { obj };
-                (ks, live)
-            }
+            // No per-key liveness check: `key in obj` would fire the `has` trap
+            // of a proxy on the chain, which EnumerateObjectProperties never
+            // asks. (A key deleted mid-loop from an object whose chain holds a
+            // proxy is therefore still visited.)
+            Some(ks) => (ks, NanBox::undefined()),
             None => {
                 let live = if self.is_object_value(obj) {
                     obj

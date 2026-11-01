@@ -4120,3 +4120,19 @@ fn json_parse_keeps_raw_lone_surrogates_with_a_reviver() {
         "a\\ud800 \\udc00 \"\\ud800\" \\ud800 \\ud800 \\udb80\\udc00\\ud800 {\"a\":\"\\ud800\"}|SyntaxError"
     );
 }
+
+/// `for-in` over an ordinary object whose chain holds a proxy never fires the
+/// proxy's `has` trap (the per-key liveness check was a real `key in obj`).
+#[test]
+fn for_in_through_a_proxy_on_the_chain_does_not_ask_has() {
+    let src = r#"
+        var has = 0;
+        var p = new Proxy({ c: 1 }, { has(t, k) { has++; return Reflect.has(t, k); } });
+        var o = Object.create(p); o.own = 1;
+        var r = [];
+        for (var k in o) r.push(k);
+        for (var k in Object.create(o)) r.push(k);
+        [r.join(), has].join("|")
+    "#;
+    assert_eq!(run(src), "own,c,own,c|0");
+}
