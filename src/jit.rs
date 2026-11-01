@@ -2626,6 +2626,14 @@ pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
         .collect()
 }
 
+/// The largest body the generic tier compiles. Several of its analyses are
+/// worse than linear in the body (`recv_cache::plan` keeps per-register state
+/// through every branch), so past this a compile takes longer (hundreds of ms,
+/// seconds at a few times this) than it is likely to win back; such a body
+/// stays in the interpreter.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+const MAX_GENERIC_OPS: usize = 8192;
+
 /// Lowers a `nbvm::FnProto` to the generic-tier IR, one [`GenericOp`] per
 /// bytecode op. Ops with a dedicated lowering (constants, moves, `+`/`-`/`*`/`/`/
 /// `%`, the comparisons, `!`, branches, static property get/set, computed element
@@ -2638,7 +2646,7 @@ pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
 #[must_use]
 pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowering> {
     use crate::nbvm::Op;
-    if proto.ops.len() > u32::MAX as usize {
+    if proto.ops.len() > MAX_GENERIC_OPS {
         return None;
     }
     let n_regs = proto.n_regs;
@@ -3180,6 +3188,9 @@ fn drop_dead_stores(
 #[must_use]
 pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::String {
     use alloc::format;
+    if proto.ops.len() > MAX_GENERIC_OPS {
+        return format!("{} ops: over the size limit", proto.ops.len());
+    }
     for (pc, op) in proto.ops.iter().enumerate() {
         if let Some(why) = generic_refuses(op)
             && !generic_accepts(proto, op)
@@ -13154,5 +13165,23 @@ mod tests {
         if let Some(f) = JitFunction::compile_arith(&ops) {
             assert_eq!(f.call1(3), interp);
         }
+    }
+
+    /// A body past the size limit stays in the interpreter: the tier's
+    /// analyses are not linear in the body.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn generic_tier_refuses_a_huge_body() {
+        let lowers = |n: usize| {
+            let src = alloc::format!("function f(a, b) {{ {} }}", "a = b;".repeat(n));
+            let program = crate::parser::Parser::parse_program(&src).expect("parse");
+            let mut table = alloc::vec::Vec::new();
+            crate::nbvm::compile_program_into(&program, true, &mut table).expect("compile");
+            let body = table.iter().max_by_key(|p| p.ops.len()).expect("a body");
+            assert!(body.ops.len() >= n, "{} ops", body.ops.len());
+            lower_nbvm_generic(body).is_some()
+        };
+        assert!(lowers(MAX_GENERIC_OPS / 2));
+        assert!(!lowers(MAX_GENERIC_OPS + 1));
     }
 }
