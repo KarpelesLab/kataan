@@ -923,7 +923,7 @@ impl X64Assembler {
         self.spill_before_call();
         self.g_mem(false, &[0xff], 2, base, disp);
         self.clear_recv_cache();
-        self.pin_reload();
+        self.survive_reload();
         self.reload_after_call();
     }
 

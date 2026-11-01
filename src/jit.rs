@@ -26,6 +26,8 @@ mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fieldrep;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod fused;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_mirror;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_persist;
@@ -4675,6 +4677,20 @@ pub struct X64Assembler {
     /// (which alone can move, free or retype a heap cell) runs only behind a
     /// call.
     recv_cache_keys: Vec<i32>,
+    /// The receiver-cache ways a `call` emitted now keeps rather than
+    /// empties: re-validated after it returns (`recv_cache::SurviveWay`).
+    /// Set per op by the generic tier; empty elsewhere.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    recv_survive: Vec<recv_cache::SurviveWay>,
+    /// The heap layout the [`recv_survive`](Self::recv_survive) checks read.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    recv_survive_layout: Option<JitLayout>,
+    /// In a body some of whose calls keep ways: the frame slot (`[rbp+disp]`)
+    /// holding the arena base as of the latest call (or
+    /// [`RECV_CACHE_EMPTY`] from the prologue on), which every call
+    /// updates (`recv_cache::survive_reload`).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    recv_seen: Option<i32>,
     /// Frame slots (`[rbp+disp]`) the frame prologue alone sets to
     /// [`RECV_CACHE_EMPTY`]: the generic tier's global binding cache, which
     /// a call does not empty (it is guarded by the global binding epoch).
@@ -4959,6 +4975,12 @@ impl X64Assembler {
     fn clear_recv_cache(&mut self) {
         for i in 0..self.recv_cache_keys.len() {
             let d = self.recv_cache_keys[i];
+            // (A way the call keeps is re-validated after it instead:
+            // `survive_reload`.)
+            #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+            if self.recv_survive.iter().any(|w| w.key == d) {
+                continue;
+            }
             self.store_empty(d);
         }
     }
@@ -5660,7 +5682,7 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0xff, 0xd0]);
         self.clear_recv_cache();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-        self.pin_reload();
+        self.survive_reload();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.reload_after_call();
     }
@@ -5741,6 +5763,14 @@ impl X64Assembler {
         self.code.push(0x53); // push rbx
         self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
         self.code.extend_from_slice(&frame.to_le_bytes());
+        // (The entry empties every way.)
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.recv_survive.clear();
+            if let Some(d) = self.recv_seen {
+                self.store_empty(d);
+            }
+        }
         self.clear_recv_cache();
         self.clear_entry_slots();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -7090,7 +7120,10 @@ impl JitFunction {
         // across calls, guarded by the global binding epoch it was validated
         // under (`gc_epoch`, one for all slots: a changed epoch empties them
         // all, as does a `catch` entry). The prologue empties both.
-        let gc_base = rc_base - 24 * rc.ways as i32;
+        // (Under the ways, the arena base as of the latest call: see
+        // `recv_cache::survive_reload`.)
+        let rc_seen = rc_base - 24 * rc.ways as i32 - 8;
+        let gc_base = rc_seen;
         let gc_slot = |k: usize| gc_base - 8 * (k as i32 + 1);
         let gc_epoch = gc_base - 8 * (gc_plan.slots as i32 + 1);
         let gc_frame_slots = if gc_plan.slots > 0 {
@@ -7258,6 +7291,7 @@ impl JitFunction {
             + max_argc as u32 * 8
             + (num.frame_slots()
                 + 3 * rc.ways
+                + 1
                 + gc_frame_slots
                 + 3 * math_sites.len()
                 + 4 * usize::from(has_inline)
@@ -7277,6 +7311,55 @@ impl JitFunction {
                 heap_len: layout.props.heap_len,
                 save: -16 - i32::try_from(frame).ok()?,
             }));
+        }
+        // Per `GetProp`, the `o.k++` it begins (`fused`): both sites in one
+        // compiled-in layout and slot, outside promoted loops.
+        let fused_step: Vec<Option<fused::FusedStep>> = (0..ops.len())
+            .map(|i| {
+                if (i..i + 4).any(|k| num.in_region(k)) {
+                    return None;
+                }
+                fused::fused_step_at(ops, i, |gs, ss| {
+                    let g = sites.get(gs as usize).and_then(|s| s.baked);
+                    let st = sites.get(ss as usize).and_then(|s| s.baked);
+                    matches!((g, st), (Some(g), Some(st)) if g.shape == st.shape && g.slot == st.slot)
+                })
+            })
+            .collect();
+        // Per op, the ways a call there keeps, re-validated after it
+        // (`recv_cache::survivors`); never an inlined `new`'s.
+        let survive: Vec<Vec<recv_cache::SurviveWay>> = {
+            let excluded: Vec<usize> = fresh_add
+                .iter()
+                .flatten()
+                .filter_map(|f| rc.sites.get(f.guard).copied().flatten().map(|p| p.way))
+                .collect();
+            let family = |w: usize| {
+                rc.sites
+                    .iter()
+                    .flatten()
+                    .find(|p| p.way == w)
+                    .map(|p| p.family)
+            };
+            recv_cache::survivors(&rc, ops, &excluded)
+                .into_iter()
+                .map(|ws| {
+                    ws.into_iter()
+                        .filter_map(|w| {
+                            Some(recv_cache::SurviveWay {
+                                key: rc_key(w),
+                                cell: rc_cell(w),
+                                family: family(w)?,
+                                shape: way_shape.get(w).copied().flatten(),
+                            })
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        // (Before the prologue, which empties it.)
+        if survive.iter().any(|w| !w.is_empty()) {
+            a.set_recv_seen(rc_seen);
         }
         a.set_recv_cache_keys(
             (0..rc.ways)
@@ -7540,7 +7623,7 @@ impl JitFunction {
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(p.way));
                         a.jne(walk);
                         if plain {
-                            a.jmp(yes);
+                            a.jmp($yes.unwrap_or(yes));
                         } else {
                             a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(p.way));
                             a.jmp(proven);
@@ -7553,15 +7636,19 @@ impl JitFunction {
                     let skip_fill = a.new_label();
                     if p.fill {
                         if let Some(shape) = way_shape[p.way] {
-                            a.g_load(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
-                            a.g_movabs(call_seq::r::RDX, shape);
-                            a.g_cmp(call_seq::r::R11, call_seq::r::RDX);
+                            a.p_cmp_shape(
+                                call_seq::r::RCX,
+                                layout.off_shape,
+                                shape,
+                                call_seq::r::RDX,
+                            );
                             a.jne(skip_fill);
                         }
                         a.g_store(call_seq::r::RBP, rc_key(p.way), call_seq::r::RAX);
                         a.g_store(call_seq::r::RBP, rc_cell(p.way), call_seq::r::RCX);
                         if plain {
-                            a.jmp(yes);
+                            // (Straight to the branch's target, if any.)
+                            a.jmp($yes.unwrap_or(yes));
                         }
                     }
                     a.bind(skip_fill);
@@ -7711,6 +7798,7 @@ impl JitFunction {
             let op = &ops[op_idx];
             a.dbg_op = Some(op_idx);
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
+            a.set_recv_survive(survive.get(op_idx).cloned().unwrap_or_default(), layout);
             // (The body, a speculative region's plain copy, or its integer
             // version: `numeric::NumGen::schedule`.)
             a.bind(num.begin_op(&labels, op_idx, pass)?);
@@ -9192,8 +9280,12 @@ impl JitFunction {
                             a.bind(resume);
                             cold_verifies.push((verify, None, b.shape, cached, resume));
                         } else {
-                            a.g_movabs(call_seq::r::R11, b.shape);
-                            a.g_cmp_mem(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
+                            a.p_cmp_shape(
+                                call_seq::r::RCX,
+                                layout.off_shape,
+                                b.shape,
+                                call_seq::r::R11,
+                            );
                             a.jne(cached);
                         }
                         extra_in_frame[op_idx] = a.p_obj_fixed_slot_ex_xmm(
@@ -9227,8 +9319,12 @@ impl JitFunction {
                             a.bind(resume);
                             cold_verifies.push((verify, None, b.shape, cached, resume));
                         } else {
-                            a.g_movabs(call_seq::r::R11, b.shape);
-                            a.g_cmp_mem(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
+                            a.p_cmp_shape(
+                                call_seq::r::RCX,
+                                layout.off_shape,
+                                b.shape,
+                                call_seq::r::R11,
+                            );
                             a.jne(cached);
                         }
                         match rc.sites[op_idx].filter(|_| num.in_spec(op_idx)) {
@@ -9245,6 +9341,21 @@ impl JitFunction {
                             None => a.p_obj_fixed_slot_load(&layout, b.slot),
                         }
                         let x = num.result_xmm(op_idx, dst);
+                        // `o.k++`: the hit goes on through the store
+                        // (`fused`).
+                        if x.is_none()
+                            && let Some(f) = fused_step.get(op_idx).copied().flatten()
+                        {
+                            a.p_fused_step(
+                                &layout,
+                                b.slot,
+                                f.dst.map(disp),
+                                f.dec,
+                                *labels.get(op_idx + 1)?,
+                                *labels.get(op_idx + 3)?,
+                                *labels.get(op_idx + 4)?,
+                            );
+                        }
                         let spill = x.map(|_| a.new_label());
                         // (In a speculative loop's fast version another
                         // layout leaves for the copy: the way must keep
@@ -9541,8 +9652,12 @@ impl JitFunction {
                             a.bind(resume);
                             cold_verifies.push((verify, Some(helper), b.shape, cached, resume));
                         } else {
-                            a.g_movabs(call_seq::r::R11, b.shape);
-                            a.g_cmp_mem(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
+                            a.p_cmp_shape(
+                                call_seq::r::RCX,
+                                layout.off_shape,
+                                b.shape,
+                                call_seq::r::R11,
+                            );
                             a.jne(cached);
                         }
                         if !num.is_number_at(op_idx, val) {
@@ -10693,6 +10808,8 @@ impl JitFunction {
             // back, `numeric::NumGen::int_save`.)
             num.after_generic_op(&mut a);
         }
+        // (The out-of-line code below keeps no way across its calls.)
+        a.set_recv_survive(Vec::new(), layout);
         num.set_copy(false);
         a.dbg_op = None;
         // (Out of line, a call sequence runs the stub of whatever inlined

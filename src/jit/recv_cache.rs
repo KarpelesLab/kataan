@@ -349,7 +349,7 @@ pub(super) enum Family {
 
 /// The most ways a body uses per family (each way costs a store after every
 /// call): `Obj` ways first, then `Arr`, then `Cell` ways.
-const MAX_OBJ_WAYS: usize = 3;
+const MAX_OBJ_WAYS: usize = 6;
 const MAX_ARR_WAYS: usize = 1;
 const MAX_CELL_WAYS: usize = 1;
 
@@ -915,6 +915,42 @@ pub(super) fn plan(
             });
         }
     }
+    // A value read afresh each iteration from the same object and key
+    // (`this.items.length` in a loop's condition: the receiver register no
+    // op of the loop writes, the key no op of it stores) is usually the
+    // object it was last iteration: its first site is no fresh one.
+    let loops = innermost_loops(ops);
+    for i in 0..n {
+        if !fresh_first[i] {
+            continue;
+        }
+        let (Some((head, end)), Some((r, _))) = (loops[i], site_recv(&ops[i], i)) else {
+            continue;
+        };
+        // The op that defined the site's receiver (the nearest write before
+        // it in the stream).
+        let Some(def) = (head..i)
+            .rev()
+            .find(|&j| writes(&ops[j], bytecode.get(j), r))
+        else {
+            continue;
+        };
+        let (GenericOp::GetProp { obj, .. }, Some(Op::GetProp { key, .. })) =
+            (&ops[def], bytecode.get(def))
+        else {
+            continue;
+        };
+        let stable = (head..=end).all(|j| {
+            !writes(&ops[j], bytecode.get(j), *obj)
+                && !matches!(
+                    bytecode.get(j),
+                    Some(Op::SetProp { key: k, .. } | Op::SetPropStrict { key: k, .. }) if k == key
+                )
+        });
+        if stable {
+            fresh_first[i] = false;
+        }
+    }
     // In a promoted loop, a receiver is usually the one the same site saw
     // last iteration (a loop-invariant object, or one read afresh from the
     // same binding): every site there checks its way first and refills it —
@@ -1139,4 +1175,244 @@ fn carried_aliases(
         }
     }
     alias
+}
+
+/// The innermost loop of each op, as `(header, back-edge)`: the shortest
+/// span of a backward `Jump` that covers it.
+fn innermost_loops(ops: &[GenericOp]) -> Vec<Option<(usize, usize)>> {
+    let mut inner: Vec<Option<(usize, usize)>> = vec![None; ops.len()];
+    for (end, op) in ops.iter().enumerate() {
+        if let GenericOp::Jump { target: head } = *op
+            && head <= end
+        {
+            for x in &mut inner[head..=end] {
+                if x.is_none_or(|(h, e)| h <= head && e >= end) {
+                    *x = Some((head, end));
+                }
+            }
+        }
+    }
+    inner
+}
+
+/// Whether `op` (bytecode `bc`) may write register `r`.
+fn writes(op: &GenericOp, bc: Option<&Op>, r: u16) -> bool {
+    match *op {
+        GenericOp::InlineGuard {
+            dst, caps, n_caps, ..
+        } => r == dst || (r >= caps && r - caps < n_caps),
+        GenericOp::Interp { .. } | GenericOp::PushHandler { .. } => bc.is_none_or(|b| {
+            let hit = core::cell::Cell::new(false);
+            crate::bytecode::op_for_each_reg(b, &|x| hit.set(hit.get() || x == r));
+            hit.get()
+        }),
+        _ => op_dst(op) == Some(r),
+    }
+}
+
+/// A way that a `call` keeps instead of emptying it: its frame slots, the
+/// family its fills prove and, for a layout-proving way (`shape_ways`), the
+/// layout. See [`survivors`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SurviveWay {
+    /// The key slot (`[rbp + key]`).
+    pub(super) key: i32,
+    /// The heap slot address slot (`[rbp + cell]`).
+    pub(super) cell: i32,
+    /// What the way's fills prove.
+    pub(super) family: Family,
+    /// The layout a hit on the way proves (its sites skip their shape
+    /// compare), if any.
+    pub(super) shape: Option<u64>,
+}
+
+/// The most ops [`survivors`] follows from a call to the next sites.
+const SURVIVE_SCAN: usize = 256;
+
+/// Per op, the ways a call made there (on its fast or slow path) keeps
+/// rather than empties: those a site likely uses again before the next call
+/// (following the op stream from the op, around its innermost loop's
+/// back-edge and along forward jumps). Outside loops, none.
+///
+/// What a way proves (that its key's object lives at the address in its
+/// `cell` slot, of the way's family, and of its layout for a layout-proving
+/// way) holds after a call only if the call neither moved the arena (the
+/// address is the arena base plus the handle's index, and a key equal to a
+/// register's value is a live handle to that very slot) nor retyped or
+/// reshaped that cell (Rust code may: an add, a delete, a dictionary switch,
+/// a host-exotic mark, a heap swap). So after the call the kept ways are
+/// re-validated, never assumed (`X64Assembler::survive_reload`): a moved
+/// arena empties them all, and each way's family checks (and layout compare)
+/// run again on its cell, a failure emptying it. That is all a fill proved,
+/// so a later hit may skip exactly what it skipped before.
+///
+/// `excluded` ways never survive: an inlined `new`'s way, whose fresh adds
+/// take a hit as "no call since the allocation" (`fresh_adds`).
+pub(super) fn survivors(plan: &RecvPlan, ops: &[GenericOp], excluded: &[usize]) -> Vec<Vec<usize>> {
+    let n = ops.len();
+    let mut out = vec![Vec::new(); n];
+    if plan.ways == 0 {
+        return out;
+    }
+    let inner = innermost_loops(ops);
+    // Ops whose fast path makes a call: the scan stops there.
+    let calls = |op: &GenericOp| {
+        matches!(
+            op,
+            GenericOp::CallNative { .. }
+                | GenericOp::CallMethod { .. }
+                | GenericOp::CallValue { .. }
+                | GenericOp::CallWithMethod { .. }
+                | GenericOp::CallKey { .. }
+                | GenericOp::Construct { .. }
+                | GenericOp::Ret { .. }
+        )
+    };
+    let mut seen = vec![false; n];
+    let mut visited: Vec<usize> = Vec::new();
+    for c in 0..n {
+        let Some((head, end)) = inner[c] else {
+            continue;
+        };
+        let mut ways: Vec<usize> = Vec::new();
+        let mut j = c + 1;
+        for _ in 0..SURVIVE_SCAN {
+            if j > end || j < head || seen[j] {
+                break;
+            }
+            seen[j] = true;
+            visited.push(j);
+            if let Some(p) = plan.sites[j]
+                && p.check
+                && !ways.contains(&p.way)
+                && !excluded.contains(&p.way)
+            {
+                ways.push(p.way);
+            }
+            if calls(&ops[j]) {
+                break;
+            }
+            j = match ops[j] {
+                GenericOp::Jump { target } => target,
+                _ => j + 1,
+            };
+        }
+        for v in visited.drain(..) {
+            seen[v] = false;
+        }
+        out[c] = ways;
+    }
+    out
+}
+
+impl super::X64Assembler {
+    /// Sets the ways the `call`s emitted next keep (see [`survivors`]).
+    pub(super) fn set_recv_survive(&mut self, ways: Vec<SurviveWay>, layout: super::JitLayout) {
+        self.recv_survive = ways;
+        self.recv_survive_layout = Some(layout);
+    }
+
+    /// `cmp qword [base + disp], shape` for an equality jump: one compare
+    /// with a sign-extended immediate when the layout's address fits one,
+    /// else through `scratch`.
+    pub(super) fn p_cmp_shape(&mut self, base: u8, disp: i32, shape: u64, scratch: u8) {
+        match i32::try_from(shape as i64) {
+            Ok(imm) => {
+                self.g_mem(true, &[0x81], 7, base, disp);
+                self.code.extend_from_slice(&imm.to_le_bytes());
+            }
+            Err(_) => {
+                self.g_movabs(scratch, shape);
+                self.g_cmp_mem(scratch, base, disp);
+            }
+        }
+    }
+
+    /// Sets the frame slot of the arena base as of the latest call (see the
+    /// `recv_seen` field): a body with a way to keep needs it.
+    pub(super) fn set_recv_seen(&mut self, slot: i32) {
+        self.recv_seen = Some(slot);
+    }
+
+    /// Right after a `call` returns (its result in `rax`/`rdx`, which this
+    /// keeps): reloads the pinned arena and re-validates the ways the call
+    /// kept ([`survivors`]), emptying those that no longer hold; then notes
+    /// the arena base. Clobbers `rcx`, `r11` and the flags.
+    ///
+    /// The noted base is what every key's cell was filled under: a cell is
+    /// filled with the arena as it is (it moves only in Rust code, behind a
+    /// call), and every call either empties a way or keeps it only when the
+    /// base it reloads is the noted one. (`r12` itself does not survive the
+    /// call: a pinned callee entered at its `exact_pinned` entry hands back
+    /// garbage, see `call_seq::emit_native_entry`.)
+    pub(super) fn survive_reload(&mut self) {
+        use super::call_seq::r;
+        let ways = core::mem::take(&mut self.recv_survive);
+        match (self.recv_seen, self.recv_survive_layout) {
+            (Some(seen), Some(l)) if self.pinned() => {
+                self.pin_reload();
+                if !ways.is_empty() {
+                    let moved = self.new_label();
+                    let done = self.new_label();
+                    self.g_cmp_mem(super::pin::R12, r::RBP, seen);
+                    self.jne(moved);
+                    for w in &ways {
+                        let next = self.new_label();
+                        let bad = self.new_label();
+                        // cmp qword [rbp + key], RECV_CACHE_EMPTY
+                        self.code.extend_from_slice(&[0x48, 0x81, 0xbd]);
+                        self.code.extend_from_slice(&w.key.to_le_bytes());
+                        self.code
+                            .extend_from_slice(&super::RECV_CACHE_EMPTY.to_le_bytes());
+                        self.je(next);
+                        self.g_load(r::RCX, r::RBP, w.cell);
+                        // The family checks of a fill (`family_checks!`), the
+                        // last one's flags left for the jump below.
+                        match w.family {
+                            // (Passing leaves ZF set.)
+                            Family::Obj => self.p_object_not_exotic(&l, bad),
+                            Family::Arr => {
+                                self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
+                                self.jne(bad);
+                            }
+                            Family::Cell => {
+                                self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.box_disc);
+                            }
+                        }
+                        // (The last check jumps on success, past the empty.)
+                        match w.family {
+                            Family::Obj => {
+                                if let Some(s) = w.shape {
+                                    self.p_cmp_shape(r::RCX, l.off_shape, s, r::R11);
+                                }
+                                self.je(next);
+                            }
+                            Family::Arr => {
+                                self.cmp_byte_at_rcx_imm(l.off_arr_side, 0);
+                                self.je(next);
+                            }
+                            Family::Cell => self.je(next),
+                        }
+                        self.bind(bad);
+                        self.store_empty(w.key);
+                        self.bind(next);
+                    }
+                    self.jmp(done);
+                    self.bind(moved);
+                    for w in &ways {
+                        self.store_empty(w.key);
+                    }
+                    self.bind(done);
+                }
+                self.g_store(r::RBP, seen, super::pin::R12);
+            }
+            _ => {
+                for w in &ways {
+                    self.store_empty(w.key);
+                }
+                self.pin_reload();
+            }
+        }
+        self.recv_survive = ways;
+    }
 }
