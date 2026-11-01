@@ -4799,6 +4799,24 @@ const LABEL_COLD: usize = usize::MAX - 1;
 /// so no register ever holds them.
 const RECV_CACHE_EMPTY: i32 = -1;
 
+/// Whether some op of `bytecode` can store property `key` without a call
+/// (an inline store or definition of it): an inline `Math.f(x)` site's
+/// proved method is then re-checked on every call.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn math_stores_key(bytecode: &[crate::nbvm::Op], key: &str) -> bool {
+    bytecode.iter().any(|o| {
+        matches!(o,
+            crate::nbvm::Op::SetProp { key: k, .. }
+            | crate::nbvm::Op::SetPropStrict { key: k, .. }
+            | crate::nbvm::Op::InitProp { key: k, .. } if k.as_str() == key)
+            || matches!(o, crate::nbvm::Op::NewObjectLit { lit, .. }
+                if lit.keys.iter().any(|k| k.as_str() == key))
+    })
+}
+
 /// Whether the later-way guard of a polymorphic inlined site at `pc`
 /// (`Op::InlineGuard::poly`) is reached only by the miss branch of the
 /// previous way's guard of the same call (the `JumpIfFalse` right after it),
@@ -7146,6 +7164,43 @@ impl JitFunction {
             .collect();
         let m_base = gc_base - 8 * gc_frame_slots as i32;
         let m_slot = |site: usize, k: i32| m_base - 8 * (3 * site as i32 + k + 1);
+        // The sites a speculative loop's entry check may prove: the cached
+        // path's (a built-in method found, registers in range), whose key
+        // no op of the body stores (else its proof is re-checked per call).
+        let provable: Vec<numeric::MathProof> = math_sites
+            .iter()
+            .enumerate()
+            .filter_map(|(mi, &pc)| {
+                let GenericOp::CallMethod {
+                    site, dst, recv, ..
+                } = ops[pc]
+                else {
+                    return None;
+                };
+                let op = bytecode.get(pc)?;
+                let (native, _) = inline_math(op)?;
+                let crate::nbvm::Op::CallMethod { key, args, .. } = op else {
+                    return None;
+                };
+                let in_range = |r: u16| (r as usize) < n_regs;
+                let method = sites.get(site as usize)?.method_ptr;
+                if method.is_null()
+                    || !in_range(dst)
+                    || !in_range(recv)
+                    || !args.iter().all(|&m| in_range(m))
+                    || math_stores_key(bytecode, key.as_str())
+                {
+                    return None;
+                }
+                Some(numeric::MathProof::new(
+                    pc,
+                    [m_slot(mi, 0), m_slot(mi, 1), m_slot(mi, 2)],
+                    helpers.call_layout.hosted,
+                    method as u64,
+                    native,
+                ))
+            })
+            .collect();
         // An inlined call's active header (`inline`), under the `Math` sites'
         // slots: emptied on entry, set by a guard, popped by its leave — or
         // by the throw exit, for a throw out of the inlined body.
@@ -7811,6 +7866,8 @@ impl JitFunction {
         // A speculative region's plain copy is emitted right after it
         // (`numeric::NumGen::schedule`).
         num.alloc_copy_labels(&mut a);
+        // (After the copy's labels: `NumGen::roc_folded` needs them.)
+        num.plan_math_proofs(&provable);
         for (op_idx, pass) in num.schedule(ops.len()) {
             let op = &ops[op_idx];
             a.dbg_op = Some(op_idx);
@@ -8198,55 +8255,53 @@ impl JitFunction {
                         let walk = a.new_label();
                         let have = a.new_label();
                         let proven = a.new_label();
-                        a.g_cmp_byte_imm(call_seq::r::R15, helpers.call_layout.hosted, 0);
-                        a.g_jcc(call_seq::cc::E, general); // not hosted: no chain cache
-                        // The receiver's heap slot through the site's own
-                        // one-entry cache (else walked, out of line).
-                        a.load_rax(disp(recv));
-                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 0));
-                        a.jne(walk);
-                        // The same receiver, and a method proved the
-                        // built-in since the last call: when nothing in this
-                        // body can store the method's key without a call
-                        // (no inline store or definition of it), the lookup
-                        // would find that very value — only Rust code
-                        // (behind a call, which empties both keys) can
-                        // otherwise change, shadow or remove it. (The key is
-                        // stored only once the lookup on this receiver found
-                        // it; a walk to another receiver looks it up again.)
-                        let crate::nbvm::Op::CallMethod { key, .. } = bytecode.get(op_idx)? else {
-                            return None;
-                        };
-                        let key = key.as_str();
-                        let stores_key = bytecode.iter().any(|o| {
-                            matches!(o,
-                                crate::nbvm::Op::SetProp { key: k, .. }
-                                | crate::nbvm::Op::SetPropStrict { key: k, .. }
-                                | crate::nbvm::Op::InitProp { key: k, .. } if k.as_str() == key)
-                                || matches!(o, crate::nbvm::Op::NewObjectLit { lit, .. }
-                                    if lit.keys.iter().any(|k| k.as_str() == key))
-                        });
-                        if !stores_key {
-                            a.g_load(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 2));
-                            a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
-                            a.jne(proven);
+                        // (A fast version's call its entry check proved:
+                        // `NumGen::plan_math_proofs`.)
+                        let proved = num.math_proved(op_idx);
+                        if !proved {
+                            a.g_cmp_byte_imm(call_seq::r::R15, helpers.call_layout.hosted, 0);
+                            a.g_jcc(call_seq::cc::E, general); // not hosted: no chain cache
+                            // The receiver's heap slot through the site's own
+                            // one-entry cache (else walked, out of line).
+                            a.load_rax(disp(recv));
+                            a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 0));
+                            a.jne(walk);
+                            // The same receiver, and a method proved the
+                            // built-in since the last call: when nothing in this
+                            // body can store the method's key without a call
+                            // (no inline store or definition of it), the lookup
+                            // would find that very value — only Rust code
+                            // (behind a call, which empties both keys) can
+                            // otherwise change, shadow or remove it. (The key is
+                            // stored only once the lookup on this receiver found
+                            // it; a walk to another receiver looks it up again.)
+                            let crate::nbvm::Op::CallMethod { key, .. } = bytecode.get(op_idx)?
+                            else {
+                                return None;
+                            };
+                            let stores_key = math_stores_key(bytecode, key.as_str());
+                            if !stores_key {
+                                a.g_load(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 2));
+                                a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
+                                a.jne(proven);
+                            }
+                            a.g_load(call_seq::r::RCX, call_seq::r::RBP, m_slot(mi, 1));
+                            a.bind(have);
+                            a.p_method_lookup_walked(
+                                &layout,
+                                helpers.call_layout.realm,
+                                si.method_ptr,
+                                fill,
+                                None,
+                            );
+                            // The method: the very value proved the built-in since
+                            // the last call, else proved now.
+                            a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 2));
+                            a.je(proven);
+                            a.g_mov(call_seq::r::R9, call_seq::r::RAX);
+                            a.p_is_native(&layout, helpers.call_layout.realm, native_id, general);
+                            a.g_store(call_seq::r::RBP, m_slot(mi, 2), call_seq::r::R9);
                         }
-                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, m_slot(mi, 1));
-                        a.bind(have);
-                        a.p_method_lookup_walked(
-                            &layout,
-                            helpers.call_layout.realm,
-                            si.method_ptr,
-                            fill,
-                            None,
-                        );
-                        // The method: the very value proved the built-in since
-                        // the last call, else proved now.
-                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, m_slot(mi, 2));
-                        a.je(proven);
-                        a.g_mov(call_seq::r::R9, call_seq::r::RAX);
-                        a.p_is_native(&layout, helpers.call_layout.realm, native_id, general);
-                        a.g_store(call_seq::r::RBP, m_slot(mi, 2), call_seq::r::R9);
                         a.bind(proven);
                         // In a speculative region's integer version, over
                         // its int registers.
@@ -8415,12 +8470,14 @@ impl JitFunction {
                             }
                         }
                         // The receiver walk, recorded in the site's cache.
-                        a.bind(walk);
-                        walk_to_slot!(recv, general);
-                        family_checks!(recv_cache::Family::Obj, general);
-                        a.g_store(call_seq::r::RBP, m_slot(mi, 0), call_seq::r::RAX);
-                        a.g_store(call_seq::r::RBP, m_slot(mi, 1), call_seq::r::RCX);
-                        a.jmp(have);
+                        if !proved {
+                            a.bind(walk);
+                            walk_to_slot!(recv, general);
+                            family_checks!(recv_cache::Family::Obj, general);
+                            a.g_store(call_seq::r::RBP, m_slot(mi, 0), call_seq::r::RAX);
+                            a.g_store(call_seq::r::RBP, m_slot(mi, 1), call_seq::r::RCX);
+                            a.jmp(have);
+                        }
                         // A chain-cache miss: refill it from the receiver
                         // (in a speculative loop's fast version, the copy
                         // does, as it makes every call — from the
@@ -8955,71 +9012,113 @@ impl JitFunction {
                             let (dst, done, iter, next) = (*dst, *done, *iter, *next);
                             let slow = a.new_label();
                             let fin = a.new_label();
-                            a.movabs_r11(QNAN as i64);
-                            a.load_rax(disp(iter));
-                            a.and_rax_r11();
-                            a.cmp_rax_r11();
-                            a.je(slow); // an iterator object: the protocol
-                            a.load_rax(disp(done));
-                            a.movabs_r11(tag_true as i64);
-                            a.cmp_rax_r11();
-                            a.je(slow);
-                            recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
-                            // The cursor's truncation, as `iter_fast::step`
-                            // takes it (it is always an exact index there; a
-                            // NaN's "indefinite" is negative: the end path's
-                            // sign test sends it to the interpreter).
-                            a.movsd_xmm0_mem(disp(iter));
-                            a.cvttsd2si_rax_xmm0();
-                            a.p_arr_len_ptr(&layout);
-                            a.cmp_rax_r8();
-                            let end = a.new_label();
-                            a.jae(end);
-                            a.mov_r8_rax();
-                            a.mov_rax_at_r11_rax8();
-                            a.movabs_r11(NanBox::hole().to_bits() as i64);
-                            a.cmp_rax_r11();
-                            a.je(slow);
-                            a.store_rax(disp(dst));
-                            // cursor = index + 1 (an exact Number: below the
-                            // array's length).
-                            numeric::NumGen::inc_r8_to_xmm0(&mut a);
-                            a.movsd_mem_xmm0(disp(iter));
-                            // Straight into the loop body when the `!done`
-                            // test after the step is known to pass.
-                            a.jmp(num.iter_step_body(&labels, op_idx).unwrap_or(fin));
-                            // The end (`index >= length`, the length the
-                            // plain array's element count): latch `done`, and
-                            // the step's value is `undefined`, as
-                            // `iter_fast::step` does.
-                            a.bind(end);
-                            a.test_rax_rax();
-                            a.g_jcc(0x8, slow); // js: a negative cursor is the interpreter's
-                            a.movabs_rax(tag_true as i64);
-                            a.store_rax(disp(done));
-                            a.movabs_rax(NanBox::undefined().to_bits() as i64);
-                            a.store_rax(disp(dst));
-                            a.jmp(fin);
-                            a.bind(slow);
-                            // (A speculative loop's fast version leaves for
-                            // its plain copy instead.) The general step is
-                            // `jit_helper_iter_next`'s, which resumes a hot
-                            // generator directly.
-                            match num.spec_bail(&mut a, op_idx) {
-                                Some(bail) => a.jmp(bail),
-                                None => {
-                                    let op_ptr: *const crate::nbvm::Op =
-                                        bytecode.get(pc as usize)?;
-                                    a.mov_rdi_r15();
-                                    a.mov_rsi_rbx();
-                                    a.movabs_argreg(2, n_regs as i64);
-                                    a.movabs_argreg(3, op_ptr as i64);
-                                    a.movabs_rax(helpers.iter_next as usize as i64);
-                                    a.call_rax();
-                                    throw_check!();
+                            // A speculative loop's hoisted step
+                            // (`NumGen::iter_hoisted`): its entry proved
+                            // `done` not `true`, and the array is the
+                            // hoisted one whenever there is one (else its
+                            // count is `0`: the end path then checks).
+                            if let (Some(s), Some(body)) = (
+                                num.iter_hoisted(op_idx),
+                                num.iter_step_body(&labels, op_idx),
+                            ) {
+                                let end = a.new_label();
+                                // (A cursor not a Number truncates to the
+                                // "indefinite" integer: past any count, and
+                                // negative.)
+                                a.movsd_xmm0_mem(disp(iter));
+                                a.cvttsd2si_rax_xmm0();
+                                a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.len);
+                                a.jae(end);
+                                a.g_load(call_seq::r::R11, call_seq::r::RBP, s.base);
+                                a.mov_r8_rax();
+                                a.mov_rax_at_r11_rax8();
+                                a.cmp_rax_const(NanBox::hole().to_bits());
+                                a.je(slow);
+                                a.store_rax(disp(dst));
+                                numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                a.movsd_mem_xmm0(disp(iter));
+                                a.jmp(body);
+                                a.bind(end);
+                                a.cmp_frame_imm8(s.held, RECV_CACHE_EMPTY as i8);
+                                a.je(slow); // no hoisted array: the general step
+                                a.test_rax_rax();
+                                a.g_jcc(0x8, slow); // js
+                                a.movabs_rax(tag_true as i64);
+                                a.store_rax(disp(done));
+                                a.movabs_rax(NanBox::undefined().to_bits() as i64);
+                                a.store_rax(disp(dst));
+                                a.jmp(fin);
+                                a.bind(slow);
+                                let bail = num.spec_bail(&mut a, op_idx)?;
+                                a.jmp(bail);
+                                a.bind(fin);
+                            } else {
+                                a.movabs_r11(QNAN as i64);
+                                a.load_rax(disp(iter));
+                                a.and_rax_r11();
+                                a.cmp_rax_r11();
+                                a.je(slow); // an iterator object: the protocol
+                                a.load_rax(disp(done));
+                                a.movabs_r11(tag_true as i64);
+                                a.cmp_rax_r11();
+                                a.je(slow);
+                                recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
+                                // The cursor's truncation, as `iter_fast::step`
+                                // takes it (it is always an exact index there; a
+                                // NaN's "indefinite" is negative: the end path's
+                                // sign test sends it to the interpreter).
+                                a.movsd_xmm0_mem(disp(iter));
+                                a.cvttsd2si_rax_xmm0();
+                                a.p_arr_len_ptr(&layout);
+                                a.cmp_rax_r8();
+                                let end = a.new_label();
+                                a.jae(end);
+                                a.mov_r8_rax();
+                                a.mov_rax_at_r11_rax8();
+                                a.movabs_r11(NanBox::hole().to_bits() as i64);
+                                a.cmp_rax_r11();
+                                a.je(slow);
+                                a.store_rax(disp(dst));
+                                // cursor = index + 1 (an exact Number: below the
+                                // array's length).
+                                numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                a.movsd_mem_xmm0(disp(iter));
+                                // Straight into the loop body when the `!done`
+                                // test after the step is known to pass.
+                                a.jmp(num.iter_step_body(&labels, op_idx).unwrap_or(fin));
+                                // The end (`index >= length`, the length the
+                                // plain array's element count): latch `done`, and
+                                // the step's value is `undefined`, as
+                                // `iter_fast::step` does.
+                                a.bind(end);
+                                a.test_rax_rax();
+                                a.g_jcc(0x8, slow); // js: a negative cursor is the interpreter's
+                                a.movabs_rax(tag_true as i64);
+                                a.store_rax(disp(done));
+                                a.movabs_rax(NanBox::undefined().to_bits() as i64);
+                                a.store_rax(disp(dst));
+                                a.jmp(fin);
+                                a.bind(slow);
+                                // (A speculative loop's fast version leaves for
+                                // its plain copy instead.) The general step is
+                                // `jit_helper_iter_next`'s, which resumes a hot
+                                // generator directly.
+                                match num.spec_bail(&mut a, op_idx) {
+                                    Some(bail) => a.jmp(bail),
+                                    None => {
+                                        let op_ptr: *const crate::nbvm::Op =
+                                            bytecode.get(pc as usize)?;
+                                        a.mov_rdi_r15();
+                                        a.mov_rsi_rbx();
+                                        a.movabs_argreg(2, n_regs as i64);
+                                        a.movabs_argreg(3, op_ptr as i64);
+                                        a.movabs_rax(helpers.iter_next as usize as i64);
+                                        a.call_rax();
+                                        throw_check!();
+                                    }
                                 }
+                                a.bind(fin);
                             }
-                            a.bind(fin);
                         }
                         // The open of an iteration over a plain array (no
                         // named property, no prototype ever set: its
@@ -9932,9 +10031,14 @@ impl JitFunction {
                     // miss: the ordinary path, below).
                     if let Some(s) = num.hoisted_array(op_idx, obj) {
                         let other = a.new_label();
-                        a.load_rax(disp(obj));
-                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.held);
-                        a.jne(other);
+                        // (A receiver known to be the held array whenever
+                        // there is one: the bounds check alone, the count
+                        // `0` when the entry found none.)
+                        if !num.hoisted_array_known(op_idx, obj) {
+                            a.load_rax(disp(obj));
+                            a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.held);
+                            a.jne(other);
+                        }
                         elem_index!(other);
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.len);
                         a.jae(other); // OOB / negative
@@ -9943,6 +10047,8 @@ impl JitFunction {
                         a.cmp_rax_const(NanBox::hole().to_bits());
                         a.jne(got);
                         a.bind(other);
+                        // (A sunk load's register, for the other paths.)
+                        num.materialize_sunk(&mut a, op_idx);
                     }
                     // A speculative loop's hoisted view of the receiver
                     // (`typed::ViewSlots`): its element with no walk.
@@ -10182,21 +10288,30 @@ impl JitFunction {
                     let res_past = res_x.map(|_| a.new_label());
                     if let Some(s) = num.hoisted_array(op_idx, arr) {
                         let other = a.new_label();
-                        a.load_rax(disp(arr));
-                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.held);
-                        a.jne(other);
-                        a.g_load(call_seq::r::RAX, call_seq::r::RBP, s.lend);
+                        if num.hoisted_array_known(op_idx, arr) {
+                            // (Known to be the held array whenever there
+                            // is one.)
+                            a.cmp_frame_imm8(s.held, RECV_CACHE_EMPTY as i8);
+                            a.je(other);
+                        } else {
+                            a.load_rax(disp(arr));
+                            a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.held);
+                            a.jne(other);
+                        }
                         match (res_x, res_past) {
                             (Some(x), Some(past)) => {
-                                numeric::NumGen::set_xmm_from_rax(&mut a, x);
+                                a.movsd_x_frame(x, s.lend);
                                 a.jmp(past);
                             }
                             _ => {
+                                a.g_load(call_seq::r::RAX, call_seq::r::RBP, s.lend);
                                 a.store_rax(disp(dst));
                                 a.jmp(done);
                             }
                         }
                         a.bind(other);
+                        // (A sunk load's register, for the other paths.)
+                        num.materialize_sunk(&mut a, op_idx);
                     }
                     // A speculative loop's hoisted view of the receiver
                     // (`typed::ViewSlots`): its length with no walk.

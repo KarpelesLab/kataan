@@ -1040,6 +1040,64 @@ pub(super) struct NumGen {
     /// Per pc: a later site of the iteration takes the receiver-cache way
     /// this op fills as filled (`typed::relied_on`).
     rc_relied: Vec<bool>,
+    /// The inline `Math.f(x)` calls whose receiver and method the fast
+    /// version's entry checks prove ([`Self::plan_math_proofs`]).
+    math_proofs: Vec<MathProof>,
+}
+
+/// An inline `Math.f(x)` call of a speculative region's fast version that
+/// its **entry check proves** ([`NumGen::plan_math_proofs`]): its receiver
+/// is a global binding's value (`LoadGlobal`, its validated address in frame
+/// slot `gslot`) that no op of the region writes, so from the entry to the
+/// back-edge (no Rust code runs in a fast version) it is the value the entry
+/// reads. The entry check does what the call's own cached path would (the
+/// receiver walked and kept in the site's cache, the method looked up
+/// through the site's chain cache and proved the built-in `native`, kept
+/// too); only a call (never made there) empties those slots. Proved once
+/// at every entry, it holds for every iteration, and the call itself is the
+/// bare computation. A miss leaves for the plain copy, whose call refills
+/// what it can.
+#[derive(Clone, Copy)]
+pub(super) struct MathProof {
+    pc: usize,
+    region: usize,
+    gslot: u32,
+    /// The site's cache slots: the receiver's bits, its heap slot address,
+    /// the method last proved the built-in (`rbp`-relative).
+    key: i32,
+    cell: i32,
+    proof: i32,
+    /// The `Ctx` byte the cached path requires nonzero.
+    hosted: i32,
+    /// The site's chain cache (`props::MethodSite`).
+    site: u64,
+    native: u16,
+    /// The receiver's `LoadGlobal`, when the fast version need not run it:
+    /// right before the call's folded `RequireObjectCoercible`, its
+    /// register named by those three ops alone and not promoted, and every
+    /// argument a Number there (so the call never leaves for the copy,
+    /// which would read the register).
+    load: Option<usize>,
+}
+
+impl MathProof {
+    /// A candidate site (its region and binding filled by
+    /// [`NumGen::plan_math_proofs`]): the call at `pc`, its cache slots
+    /// `[key, cell, proof]`, the `hosted` byte, its chain cache and method.
+    pub(super) fn new(pc: usize, slots: [i32; 3], hosted: i32, site: u64, native: u16) -> Self {
+        Self {
+            pc,
+            region: usize::MAX,
+            gslot: u32::MAX,
+            key: slots[0],
+            cell: slots[1],
+            proof: slots[2],
+            hosted,
+            site,
+            native,
+            load: None,
+        }
+    }
 }
 
 /// [`NumGen::schedule`]'s passes: the body itself, a speculative region's
@@ -1416,7 +1474,7 @@ impl NumGen {
             let first = n_gslots as usize + regions.len();
             for r in &mut regions {
                 if r.spec.is_some() {
-                    for (v, src) in plan_views(r, ops, bytecode, env.n_regs) {
+                    for (v, src) in plan_views(r, ops, bytecode, env.n_regs, false) {
                         r.views.push((v, (first + n_view_slots) as u32, src));
                         // (A register the region may write: and the value
                         // the facts are about, `ViewSlots::held`.)
@@ -1436,7 +1494,7 @@ impl NumGen {
                     },
                     _ => None,
                 };
-                for (v, src) in plan_views(r, ops, bytecode, env.n_regs) {
+                for (v, src) in plan_views(r, ops, bytecode, env.n_regs, true) {
                     // Registers that all read one global binding share
                     // its array's slots (one entry check).
                     let shared = binding(src).and_then(|n| {
@@ -1488,6 +1546,7 @@ impl NumGen {
             int_math: None,
             int_post: None,
             rc_relied: Vec::new(),
+            math_proofs: Vec::new(),
         }
     }
 
@@ -1702,6 +1761,175 @@ impl NumGen {
         })
     }
 
+    /// For an element read or `.length` op `pc` on a hoisted array
+    /// ([`hoisted_array`](Self::hoisted_array)) in the fast version, whose
+    /// receiver register `r` is known to hold the value the entry check
+    /// found: a register no op of the region writes ([`ViewSrc::Fixed`]),
+    /// or one of a global binding's reads ([`ViewSrc::Global`]) that the
+    /// op right before (no join between) wrote. `r` then is the held array
+    /// exactly when the entry found an array at all: the op tests that
+    /// slot (or, for an element read, only the bounds, the count `0` when
+    /// none) instead of comparing the register.
+    pub(super) fn hoisted_array_known(&self, pc: usize, r: u16) -> bool {
+        !self.copy && self.imode.is_none() && self.array_known_fast(pc, r)
+    }
+
+    /// [`hoisted_array_known`](Self::hoisted_array_known) for the fast
+    /// version, whichever version is being emitted.
+    fn array_known_fast(&self, pc: usize, r: u16) -> bool {
+        if self.hoisted_array(pc, r).is_none() {
+            return false;
+        }
+        let Some(ri) = self.region_at(pc) else {
+            return false;
+        };
+        let Some(&(_, _, src)) = self.regions[ri].aviews.iter().find(|v| v.0 == r) else {
+            return false;
+        };
+        match src {
+            ViewSrc::Fixed => true,
+            ViewSrc::Global(g) => {
+                pc > self.regions[ri].head
+                    && !self.is_target.get(pc).copied().unwrap_or(true)
+                    && match (self.bc(g), self.bc(pc - 1)) {
+                        (
+                            Some(Op::LoadGlobal { name: n, .. }),
+                            Some(Op::LoadGlobal { name, dst, .. }),
+                        ) => *dst == r && name == n,
+                        _ => false,
+                    }
+            }
+            ViewSrc::Held => false,
+        }
+    }
+
+    /// For an array iteration's step `pc` (`IterNext`) in a speculative
+    /// region's fast version: its array's hoisted slots, when the step can
+    /// run there by index with no receiver walk and no `done` test — its
+    /// array register (`next`) one no op of the region writes, hoisted
+    /// ([`array_known_fast`](Self::array_known_fast)); the loop test right
+    /// after it ([`iter_step_body`](Self::iter_step_body)'s shape) leaving
+    /// the region on `done`; no other op of the region writing `done`, and
+    /// none of the step's registers promoted. Every entry into the fast
+    /// version then checks `done` is not `true` ([`Self::iter_entry_checks`]),
+    /// and inside it only the step's end path latches it, which leaves.
+    pub(super) fn iter_hoisted(&self, pc: usize) -> Option<ArraySlots> {
+        if self.copy || self.imode.is_some() {
+            return None;
+        }
+        self.iter_fast(pc)?;
+        let Some(&Op::IterNext { next, .. }) = self.bc(pc) else {
+            return None;
+        };
+        self.hoisted_array(pc, next)
+    }
+
+    /// [`iter_hoisted`](Self::iter_hoisted)'s conditions, whichever version
+    /// is being emitted: the step's `done` register.
+    fn iter_fast(&self, pc: usize) -> Option<u16> {
+        let &Op::IterNext {
+            dst,
+            done,
+            iter,
+            next,
+        } = self.bc(pc)?
+        else {
+            return None;
+        };
+        let n = self.env.n_regs;
+        let ri = self.region_at(pc)?;
+        let r = &self.regions[ri];
+        r.spec.as_ref()?;
+        let (Some(&Op::Not { dst: t, a: na }), Some(&Op::JumpIfFalse { cond, target })) =
+            (self.bc(pc + 1), self.bc(pc + 2))
+        else {
+            return None;
+        };
+        let regs_ok = [dst, done, iter, next].iter().all(|&x| (x as usize) < n)
+            && usize::from(next) == usize::from(iter) + 1
+            && dst != done
+            && dst != iter
+            && done != iter
+            && ![dst, done, iter].contains(&next)
+            && !r.slots.iter().any(|s| [dst, done, iter].contains(&s.reg));
+        let test_ok = na == done
+            && cond == t
+            && t != done
+            && self.mentions.get(t as usize).copied() == Some(2)
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && !self.is_target.get(pc + 2).copied().unwrap_or(true)
+            && self.ty(pc, done) == T_BOOL
+            && pc + 3 <= r.end
+            && (target < r.head || target > r.end);
+        if !regs_ok || !test_ok || !self.array_known_fast(pc, next) {
+            return None;
+        }
+        // No other op of the region writes `done`.
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        let others = (r.head..=r.end).filter(|&q| q != pc).any(|q| {
+            self.bc(q).is_none_or(|o| {
+                def_use(o, &mut d, &mut u);
+                d.contains(&done) || written_reg(o) == Some(done)
+            })
+        });
+        (!others).then_some(done)
+    }
+
+    /// Region `ri`'s hoisted steps' entry checks ([`Self::iter_hoisted`]):
+    /// `done` not `true`, else to `copy`. Clobbers `rax`.
+    fn iter_entry_checks(&self, a: &mut X64Assembler, ri: usize, copy: Label) {
+        let r = &self.regions[ri];
+        for pc in r.head..=r.end {
+            if let Some(done) = self.iter_fast(pc) {
+                a.load_rax(disp(done));
+                a.cmp_rax_const(self.tag_true);
+                a.jcc(CC_E, copy);
+            }
+        }
+    }
+
+    /// Whether the fast version's `LoadGlobal` at `pc` is
+    /// **sunk** into the next op: an element read or `.length` on its
+    /// register, a hoisted array known held there
+    /// ([`hoisted_array_known`](Self::hoisted_array_known)), is the only
+    /// other op naming that register (not promoted), so the fast path needs
+    /// no value in it — only the op's other paths, which load it first
+    /// ([`materialize_sunk`](Self::materialize_sunk)).
+    pub(super) fn sunk_load(&self, pc: usize) -> bool {
+        let Some(&Op::LoadGlobal { dst, .. }) = self.bc(pc) else {
+            return false;
+        };
+        let Some(ri) = self.region_at(pc) else {
+            return false;
+        };
+        let used = match self.bc(pc + 1) {
+            Some(&Op::GetKey { obj, .. }) => obj == dst,
+            Some(&Op::ArrayLen { arr, .. }) => arr == dst,
+            _ => false,
+        };
+        used && self.region_at(pc + 1) == Some(ri)
+            && self.mentions.get(dst as usize) == Some(&2)
+            && !self.regions[ri].slots.iter().any(|s| s.reg == dst)
+            && self.array_known_fast(pc + 1, dst)
+    }
+
+    /// At the start of the non-hoisted paths of op `pc` (see
+    /// [`sunk_load`](Self::sunk_load)): the sunk `LoadGlobal` before it,
+    /// its binding's value into its register. Clobbers `rax`.
+    pub(super) fn materialize_sunk(&self, a: &mut X64Assembler, pc: usize) {
+        if pc == 0 || !self.sunk_load(pc - 1) {
+            return;
+        }
+        let (Some(&Op::LoadGlobal { dst, .. }), Some(&k)) =
+            (self.bc(pc - 1), self.gslot.get(pc - 1))
+        else {
+            return;
+        };
+        a.load_rax(self.gslot_disp(k));
+        a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+        a.store_rax(disp(dst));
+    }
+
     /// Takes the element and `.length` sites on a hoisted array
     /// ([`hoisted_array`](Self::hoisted_array)) out of the receiver cache
     /// (their fast path walks nothing, so fills nothing), and with them
@@ -1713,9 +1941,14 @@ impl NumGen {
     ) {
         let mut dropped = alloc::vec![false; rc.sites.len()];
         for (pc, op) in ops.iter().enumerate() {
-            let recv = match *op {
-                GenericOp::GetElem { obj, .. } => obj,
-                GenericOp::ArrayLen { arr, .. } => arr,
+            let recv = match (*op, self.bc(pc)) {
+                (GenericOp::GetElem { obj, .. }, _) => obj,
+                (GenericOp::ArrayLen { arr, .. }, _) => arr,
+                (GenericOp::Interp { .. }, Some(&Op::IterNext { next, .. }))
+                    if self.iter_fast(pc).is_some() =>
+                {
+                    next
+                }
                 _ => continue,
             };
             if self.hoisted_array(pc, recv).is_some()
@@ -1920,6 +2153,11 @@ impl NumGen {
                 if (dst as usize) >= self.env.n_regs {
                     return None;
                 }
+                if self.math_load_dead(pc)
+                    || (!self.copy && self.imode.is_none() && self.sunk_load(pc))
+                {
+                    return Some(true);
+                }
                 if let Some(src) = self.global_known(ri, pc) {
                     self.copy_reg(a, reg, dst, src);
                     return Some(true);
@@ -2008,8 +2246,15 @@ impl NumGen {
                     || slots
                         .iter()
                         .any(|s| s.reg == r && s.start <= q && pc <= s.end);
-                return (clean && held && self.gslot.get(q).is_some_and(|&k| k != u32::MAX))
-                    .then_some(r);
+                // (Not a load the fast version leaves out: `MathProof::load`,
+                // `sunk_load`.)
+                let loaded =
+                    !self.math_proofs.iter().any(|m| m.load == Some(q)) && !self.sunk_load(q);
+                return (clean
+                    && held
+                    && loaded
+                    && self.gslot.get(q).is_some_and(|&k| k != u32::MAX))
+                .then_some(r);
             }
         }
         None
@@ -2024,6 +2269,130 @@ impl NumGen {
             return None;
         }
         self.global_known(ri, pc)
+    }
+
+    /// Plans the entry-proved inline `Math.f(x)` calls ([`MathProof`]) among
+    /// `sites`: the cached path's calls whose method key no op of the body
+    /// stores. A call qualifies in a speculative region (with no integer
+    /// version) whose receiver register the same iteration read, past the
+    /// last join, from a global binding the region never writes.
+    pub(super) fn plan_math_proofs(&mut self, sites: &[MathProof]) {
+        for &m in sites {
+            let pc = m.pc;
+            let Some(ri) = self.region_at(pc) else {
+                continue;
+            };
+            let r = &self.regions[ri];
+            if r.spec.is_none() || r.spec_int || r.int.is_some() {
+                continue;
+            }
+            let Some(Op::CallMethod { recv, args, .. }) = self.bc(pc) else {
+                continue;
+            };
+            let recv = *recv;
+            // The op writing `recv` last before `pc`, with no join between.
+            let mut def = None;
+            let (mut d, mut u) = (Vec::new(), Vec::new());
+            for q in (r.head..pc).rev() {
+                if self.is_target.get(q + 1).copied().unwrap_or(true) {
+                    break;
+                }
+                let Some(o) = self.bc(q) else { break };
+                def_use(o, &mut d, &mut u);
+                if d.contains(&recv) || written_reg(o) == Some(recv) {
+                    def = Some(q);
+                    break;
+                }
+            }
+            let Some(q) = def else { continue };
+            let Some(Op::LoadGlobal { name, dst, .. }) = self.bc(q) else {
+                continue;
+            };
+            if *dst != recv {
+                continue;
+            }
+            let Some(&k) = self.gslot.get(q) else {
+                continue;
+            };
+            if k == u32::MAX {
+                continue;
+            }
+            let writes = (r.head..=r.end)
+                .any(|x| matches!(self.bc(x), Some(Op::StoreGlobal { name: n, .. }) if n == name));
+            if writes {
+                continue;
+            }
+            let dead = q + 2 == pc
+                && self.roc_folded(q + 1)
+                && self.mentions.get(recv as usize) == Some(&3)
+                && !self.regions[ri].slots.iter().any(|s| s.reg == recv)
+                && args.iter().all(|&x| self.is_number_at(pc, x));
+            self.math_proofs.push(MathProof {
+                region: ri,
+                gslot: k,
+                load: dead.then_some(q),
+                ..m
+            });
+        }
+    }
+
+    /// Whether the inline `Math.f(x)` call at `pc`, emitted now, is the
+    /// fast version's and its entry check proves it ([`MathProof`]): its
+    /// receiver and method checks are left out.
+    pub(super) fn math_proved(&self, pc: usize) -> bool {
+        !self.copy && self.imode.is_none() && self.math_proofs.iter().any(|m| m.pc == pc)
+    }
+
+    /// Whether the `LoadGlobal` at `pc`, emitted now in a fast version, only
+    /// fed an entry-proved call that does not read it ([`MathProof::load`]).
+    fn math_load_dead(&self, pc: usize) -> bool {
+        !self.copy && self.imode.is_none() && self.math_proofs.iter().any(|m| m.load == Some(pc))
+    }
+
+    /// Region `ri`'s [`MathProof`]s, at an entry into its fast version
+    /// (after [`spec_globals_ready`](Self::spec_globals_ready)'s checks,
+    /// which proved the binding addresses filled), to `copy` on a miss: the
+    /// call's cached path for the binding's value, which fills the site's
+    /// cache. Clobbers `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`..`r11`.
+    fn math_entry_checks(&self, a: &mut X64Assembler, ri: usize, copy: Label) {
+        use super::call_seq::r;
+        let l = super::compute_jit_layout();
+        let realm = self.env.realm;
+        for m in self.math_proofs.iter().filter(|m| m.region == ri) {
+            let walk = a.new_label();
+            let have = a.new_label();
+            let ok = a.new_label();
+            let binding = |a: &mut X64Assembler| {
+                a.load_rax(self.gslot_disp(m.gslot));
+                a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+            };
+            a.g_cmp_byte_imm(r::R15, m.hosted, 0);
+            a.jcc(CC_E, copy);
+            binding(a);
+            a.g_cmp_mem(RAX, r::RBP, m.key);
+            a.jcc(CC_NE, walk);
+            a.cmp_frame_imm8(m.proof, super::RECV_CACHE_EMPTY as i8);
+            a.jcc(CC_NE, ok);
+            a.g_load(r::RCX, r::RBP, m.cell);
+            a.jmp(have);
+            // The receiver walked (a global binding's value is rooted).
+            a.bind(walk);
+            a.p_arena(realm, &l.props);
+            binding(a);
+            a.p_is_handle(r::RCX, copy);
+            a.p_slot_rooted(l, r::RCX, copy);
+            a.p_object_not_exotic(l, copy);
+            a.g_store(r::RBP, m.key, RAX);
+            a.g_store(r::RBP, m.cell, r::RCX);
+            a.bind(have);
+            a.p_method_lookup_walked(l, realm, m.site as *const _, copy, None);
+            a.g_cmp_mem(RAX, r::RBP, m.proof);
+            a.jcc(CC_E, ok);
+            a.g_mov(r::R9, RAX);
+            a.p_is_native(l, realm, m.native, copy);
+            a.g_store(r::RBP, m.proof, r::R9);
+            a.bind(ok);
+        }
     }
 
     /// `x++` / `x--` on a promoted Number `x` — the compiler's `ToNumeric t1
@@ -2073,9 +2442,7 @@ impl NumGen {
         let Some(xx) = self.xmm_of(reg, x) else {
             return false;
         };
-        a.movabs_rax(1.0f64.to_bits() as i64);
-        a.movq_x_gpr(1, RAX);
-        a.sse_rr(0xf2, if dec { 0x5c } else { 0x58 }, xx, 1);
+        a.sse_rip_const(0xf2, if dec { 0x5c } else { 0x58 }, xx, 1.0f64.to_bits());
         self.skip[pc + 1] = true;
         self.skip[pc + 2] = true;
         true
@@ -2084,8 +2451,9 @@ impl NumGen {
     /// The entry check of speculative region `ri`'s fast version: every one
     /// of its global ops has a validated binding address (else, with
     /// nothing promoted yet, the plain copy runs the iteration) and its
-    /// field facts ([`Spec::fields`]) still hold. Clobbers `r11` when it has
-    /// any, else nothing.
+    /// field facts ([`Spec::fields`]) still hold, and its entry-proved
+    /// `Math` calls are proved ([`Self::math_entry_checks`], which clobbers
+    /// more). Clobbers `r11` when it has any, else nothing.
     fn spec_globals_ready(&self, a: &mut X64Assembler, ri: usize, pc: usize) -> Option<()> {
         let copy = self.copy_label(pc)?;
         for &k in &self.region_gslots[ri] {
@@ -2115,6 +2483,8 @@ impl NumGen {
                 a.jcc(CC_AE, copy);
             }
         }
+        self.math_entry_checks(a, ri, copy);
+        self.iter_entry_checks(a, ri, copy);
         Some(())
     }
 
@@ -2426,10 +2796,15 @@ impl NumGen {
         let op = ops[pc];
         let bc = self.bc(pc)?;
         match op {
-            GenericOp::Const { dst, imm } if reg.is_some() => {
-                a.movabs_rax(imm as i64);
-                self.store_gpr(a, reg, RAX, dst);
-            }
+            GenericOp::Const { dst, imm } if reg.is_some() => match self.xmm_of(reg, dst) {
+                // (A promoted register: from the code's constant words, no
+                // general-purpose detour.)
+                Some(x) => a.sse_rip_const(0xf2, 0x10, x, imm),
+                None => {
+                    a.movabs_rax(imm as i64);
+                    self.store_gpr(a, reg, RAX, dst);
+                }
+            },
             GenericOp::Move { dst, src } if reg.is_some() => {
                 match (self.xmm_of(reg, src), self.xmm_of(reg, dst)) {
                     (Some(xs), Some(xd)) if xs == xd => {}
@@ -2819,7 +3194,18 @@ impl NumGen {
                     if nested && !self.regions[ri].loops.contains(&(target, pc)) {
                         return None;
                     }
-                    let skip = a.new_label();
+                    // (With nothing to do before the header, the quiet path
+                    // goes straight there.)
+                    let skip = if self.regions[ri].int.is_none() && self.imode.is_none() {
+                        if nested {
+                            *labels.get(target)?
+                        } else {
+                            self.regions[ri].inner?
+                        }
+                    } else {
+                        a.new_label()
+                    };
+                    let direct = self.regions[ri].int.is_none() && self.imode.is_none();
                     a.dec_frame8(COUNTDOWN);
                     a.jne(skip);
                     super::call_seq::emit_quiet_poll(
@@ -2857,7 +3243,9 @@ impl NumGen {
                     if !validate {
                         self.refresh_globals(a, ri, false);
                     }
-                    a.bind(skip);
+                    if !direct {
+                        a.bind(skip);
+                    }
                     if nested {
                         a.jmp(*labels.get(target)?);
                     } else {
@@ -6353,6 +6741,14 @@ fn plain_views_ok(r: &Region, ops: &[GenericOp], bytecode: &[Op]) -> bool {
             ) => !index_like(key.as_str()),
             (GenericOp::SetProp { .. }, _) => false,
             (GenericOp::CallMethod { .. }, bc) => super::inline_math(bc).is_some(),
+            // An array iteration's step (by index, it reads the element;
+            // anything else leaves for the plain copy).
+            (GenericOp::Interp { .. }, Op::IterNext { iter, next, .. })
+                if usize::from(*next) == usize::from(*iter) + 1 =>
+            {
+                reads = true;
+                true
+            }
             (
                 GenericOp::Interp { .. },
                 Op::LoadGlobal { .. }
@@ -6430,12 +6826,19 @@ fn plan_views(
     ops: &[GenericOp],
     bytecode: &[Op],
     n_regs: usize,
+    iters: bool,
 ) -> Vec<(u16, ViewSrc)> {
     let mut regs: Vec<u16> = Vec::new();
-    for op in &ops[r.head..=r.end] {
-        let recv = match *op {
-            GenericOp::GetElem { obj, .. } | GenericOp::SetElem { obj, .. } => obj,
-            GenericOp::ArrayLen { arr, .. } => arr,
+    for (pc, op) in ops.iter().enumerate().take(r.end + 1).skip(r.head) {
+        let recv = match (*op, &bytecode[pc]) {
+            (GenericOp::GetElem { obj, .. } | GenericOp::SetElem { obj, .. }, _) => obj,
+            (GenericOp::ArrayLen { arr, .. }, _) => arr,
+            // (With `iters`: the array a step by index reads.)
+            (GenericOp::Interp { .. }, &Op::IterNext { iter, next, .. })
+                if iters && usize::from(next) == usize::from(iter) + 1 =>
+            {
+                next
+            }
             _ => continue,
         };
         if (recv as usize) < n_regs && !regs.contains(&recv) {
@@ -6457,6 +6860,10 @@ fn plan_views(
                     true
                 }
                 Op::SetKey { .. } | Op::SetKeyStrict { .. } | Op::JumpIfFalse { .. } => true,
+                // (A step writes its value, `done` and cursor registers.)
+                Op::IterNext {
+                    dst, done, iter, ..
+                } => *dst != v && *done != v && *iter != v,
                 _ => written_reg(op).is_some_and(|d| d != v),
             };
             if leaves || !op_regs(op).contains(&v) {
@@ -6681,7 +7088,9 @@ impl X64Assembler {
     /// register at a frame displacement, or a global binding through its
     /// validated address) is an array without side-table state, it, its
     /// element count and its first element's address go to `s`'s slots;
-    /// else `held` gets the throw sentinel, which no register holds.
+    /// else `held` gets the receiver cache's empty key, which no register
+    /// holds, and the count `0` (so a bounds check alone rejects every
+    /// index: [`NumGen::hoisted_array_known`]).
     /// Clobbers `rax`, `rcx`, `r8`, `r9`, `r11`, `xmm0` (and, unpinned,
     /// `rdx` / `r10`).
     pub(super) fn p_hoist_array(
@@ -6716,9 +7125,22 @@ impl X64Assembler {
         self.g_store(r::RBP, s.lend, r::RAX);
         self.jmp(done);
         self.bind(none);
-        self.g_movabs(r::RAX, NanBox::jit_throw_bits());
+        self.g_movabs(r::RAX, super::RECV_CACHE_EMPTY as i64 as u64);
         self.g_store(r::RBP, s.held, r::RAX);
+        self.g_movabs(r::RAX, 0);
+        self.g_store(r::RBP, s.len, r::RAX);
         self.bind(done);
+    }
+
+    /// `movsd xmm(x), [rbp + disp32]` (a native frame slot).
+    pub(super) fn movsd_x_frame(&mut self, x: u8, disp: i32) {
+        self.code.push(0xf2);
+        if x >= 8 {
+            self.code.push(0x44);
+        }
+        self.code
+            .extend_from_slice(&[0x0f, 0x10, 0x85 | ((x & 7) << 3)]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
     /// The label of the code's constant word `value` (each once).
@@ -6835,7 +7257,7 @@ impl X64Assembler {
     }
 
     /// `cmp qword [rbp + disp32], imm8` (a native frame slot).
-    fn cmp_frame_imm8(&mut self, disp: i32, imm: i8) {
+    pub(super) fn cmp_frame_imm8(&mut self, disp: i32, imm: i8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xbd]);
         self.code.extend_from_slice(&disp.to_le_bytes());
         self.code.push(imm as u8);
