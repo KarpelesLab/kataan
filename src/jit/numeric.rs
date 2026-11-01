@@ -4763,6 +4763,23 @@ fn plan_regions(
             }
         }
         info.retain(|x| !pinned.contains(&x.0));
+        // In a generic region, only the registers some numeric op names
+        // ([`numeric_op`]) are worth an SSE register. Any other is an
+        // object, a key or a flag that only the generic emitter's GPR code
+        // reads; an SSE register would put a GPR <-> SSE transfer (several
+        // cycles each way, and a register-file store of one domain that
+        // a load of the other cannot take forwarded) on its every use,
+        // while the register file in memory costs a store and a load the
+        // processor forwards for free.
+        if generic {
+            let mut numeric: Vec<u16> = Vec::new();
+            for pc in head..=end {
+                if numeric_op(&ops[pc], &bytecode[pc]) {
+                    numeric.extend(op_regs(&bytecode[pc]));
+                }
+            }
+            info.retain(|x| numeric.contains(&x.0));
+        }
         // In a nest, a register live into an inner loop's header holds its
         // value around that loop's back-edge too: its interval covers the
         // whole inner loop (to a fixpoint, for loops nested deeper).
@@ -5567,6 +5584,27 @@ fn plan_nests(
 
 /// The operands of a region op the numeric emitter computes with
 /// `float_bin` into `dst`: `(a, b, commutes)`.
+/// Whether region op `op` (bytecode `bc`) computes over Numbers in SSE
+/// registers: its registers are worth promoting ([`plan_regions`]).
+fn numeric_op(op: &GenericOp, bc: &Op) -> bool {
+    match op {
+        GenericOp::Add { .. }
+        | GenericOp::NumAdd { .. }
+        | GenericOp::Lt { .. }
+        | GenericOp::Compare { .. }
+        | GenericOp::StrictEq { .. }
+        | GenericOp::ToNumeric { .. }
+        | GenericOp::Step { .. }
+        | GenericOp::Arith { .. }
+        | GenericOp::ValueBin { .. } => true,
+        GenericOp::Interp { .. } => matches!(bc, Op::Neg { .. } | Op::BitNot { .. }),
+        GenericOp::CallMethod { .. } | GenericOp::CallWithMethod { .. } => {
+            super::inline_math(bc).is_some() || int_math_op(bc).is_some()
+        }
+        _ => false,
+    }
+}
+
 fn float_bin_operands(op: &GenericOp, dst: u16) -> Option<(u16, u16, bool)> {
     match *op {
         GenericOp::Add { dst: d, a, b } | GenericOp::NumAdd { dst: d, a, b, .. } if d == dst => {
