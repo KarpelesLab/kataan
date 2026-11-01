@@ -6910,8 +6910,10 @@ impl Interp {
     ) -> ExecError {
         match e {
             crate::nbvm::CompileError::TooDeep => self.stack_exhausted(),
-            crate::nbvm::CompileError::Unsupported(crate::nbvm::TOO_MANY_REGISTERS) => {
-                let m = self.new_str(crate::nbvm::TOO_MANY_REGISTERS);
+            crate::nbvm::CompileError::Unsupported(
+                message @ (crate::nbvm::TOO_MANY_REGISTERS | crate::nbvm::FUNCTION_TOO_LARGE),
+            ) => {
+                let m = self.new_str(message);
                 ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m)))
             }
             _ => ExecError::Unsupported(refused),
