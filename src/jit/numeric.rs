@@ -3587,9 +3587,19 @@ impl NumGen {
     ) {
         let resume = a.new_label();
         let stub = a.new_label();
-        match self.const_int_at(pc, y).filter(|&k| k != 0 && k != -1) {
+        let k = self.const_int_at(pc, y).filter(|&k| k != 0 && k != -1);
+        // A compiled-in divisor `|k| >= 2` that fits an `imm32` takes no
+        // `idiv` (whose ~12-cycle latency is most of the op's): a power of
+        // two by a mask, any other by a multiply with its reciprocal
+        // (`signed_magic`). (The remainder's sign follows the dividend's, so
+        // `x % k == x % |k|`.)
+        let by = k
+            .map(i64::unsigned_abs)
+            .filter(|&d| (2..=1 << 31).contains(&d));
+        match k {
             // rcx = the divisor, compiled in.
-            Some(k) => a.g_movabs(RCX, k as u64),
+            Some(k) if by.is_none() => a.g_movabs(RCX, k as u64),
+            Some(_) => {}
             None => {
                 // rcx = int(y), exact (an out-of-range y converts to
                 // i64::MIN, which only -2^63 itself converts back to), neither
@@ -3613,22 +3623,56 @@ impl NumGen {
         a.sse_rr(0x66, 0x2e, 0, xx); // ucomisd xmm0, x
         a.jcc(CC_NE, stub);
         a.jcc(CC_P, stub);
-        // `y` is not -1, so the 64-bit `idiv` cannot overflow.
-        a.cqo();
-        a.idiv_rcx();
-        // A zero remainder takes the dividend's sign (x's raw sign bit: -0 too).
-        let nonzero = a.new_label();
-        let have = a.new_label();
-        a.raw(&[0x48, 0x85, 0xd2]); // test rdx, rdx
-        a.jcc(CC_NE, nonzero);
-        self.load_gpr(a, reg, RAX, x);
-        a.movabs_r11(SIGN as i64);
-        a.raw(&[0x4c, 0x21, 0xd8]); // and rax, r11 → ±0.0 bits
-        a.movq_x_gpr(0, RAX);
-        a.jmp(have);
-        a.bind(nonzero);
+        // rdx = the truncated remainder of rax.
+        match by {
+            Some(d) if d.is_power_of_two() => {
+                // r = n - ((n + (n < 0 ? d - 1 : 0)) & -d)
+                let m = d.trailing_zeros() as u8;
+                a.raw(&[0x48, 0x89, 0xc2]); // mov rdx, rax
+                a.raw(&[0x48, 0xc1, 0xfa, 63]); // sar rdx, 63
+                a.raw(&[0x48, 0xc1, 0xea, 64 - m]); // shr rdx, 64 - m
+                a.raw(&[0x48, 0x01, 0xc2]); // add rdx, rax
+                a.raw(&[0x48, 0x81, 0xe2]); // and rdx, imm32 (-d)
+                a.raw(&(d.wrapping_neg() as u32).to_le_bytes());
+                a.raw(&[0x48, 0x29, 0xd0]); // sub rax, rdx
+                a.raw(&[0x48, 0x89, 0xc2]); // mov rdx, rax
+            }
+            Some(d) => {
+                // q = trunc(n / d) by the reciprocal; r = n - q * d.
+                let (magic, shift) = signed_magic(d);
+                a.raw(&[0x49, 0x89, 0xc3]); // mov r11, rax (n)
+                a.g_movabs(RCX, magic);
+                a.raw(&[0x48, 0xf7, 0xe9]); // imul rcx: rdx = hi(n * M)
+                if (magic as i64) < 0 {
+                    a.raw(&[0x4c, 0x01, 0xda]); // add rdx, r11
+                }
+                if shift > 0 {
+                    a.raw(&[0x48, 0xc1, 0xfa, shift]); // sar rdx, shift
+                }
+                a.raw(&[0x4c, 0x89, 0xd8]); // mov rax, r11
+                a.raw(&[0x48, 0xc1, 0xe8, 63]); // shr rax, 63
+                a.raw(&[0x48, 0x01, 0xc2]); // add rdx, rax (round toward 0)
+                a.raw(&[0x48, 0x69, 0xd2]); // imul rdx, rdx, imm32 (d)
+                a.raw(&(d as u32).to_le_bytes());
+                a.raw(&[0x49, 0x29, 0xd3]); // sub r11, rdx
+                a.raw(&[0x4c, 0x89, 0xda]); // mov rdx, r11
+            }
+            None => {
+                // `y` is not -1, so the 64-bit `idiv` cannot overflow.
+                a.cqo();
+                a.idiv_rcx();
+            }
+        }
+        // The result has the dividend's sign: a nonzero remainder has it
+        // already, a zero one takes x's raw sign bit (`-0` included). So
+        // the remainder's double with x's sign bit or'ed in, branch-free.
         a.cvtsi2sd_x_gpr(0, RDX);
-        a.bind(have);
+        if xx != 1 {
+            a.movapd_xx(1, xx);
+        }
+        a.raw(&[0x66, 0x0f, 0x73, 0xd1, 63]); // psrlq xmm1, 63
+        a.raw(&[0x66, 0x0f, 0x73, 0xf1, 63]); // psllq xmm1, 63
+        a.sse_rr(0x66, 0x56, 0, 1); // orpd xmm0, xmm1
         self.store_xmm0(a, reg, dst);
         a.bind(resume);
         let k = slow(self);
@@ -4325,6 +4369,43 @@ enum CmpKind {
 }
 
 /// Register `r`'s displacement in the register file.
+/// The multiplier `M` and shift `s` of signed 64-bit division by the
+/// constant `d` (`2 <= d < 2^63`, not a power of two): for every `i64` `n`,
+/// `trunc(n / d) == ((hi64(n * M) [+ n when M < 0]) >> s) + (n < 0)`, the
+/// arithmetic of `int_mod`'s compiled-in divisors. `M` is the smallest
+/// `ceil(2^(64+s) / d)` exact over the whole `i64` range: `s` grows until the
+/// error of the rounded-up reciprocal stays below one quotient step for the
+/// largest dividend whose remainder is `d - 1`.
+fn signed_magic(d: u64) -> (u64, u8) {
+    const TWO63: u64 = 1 << 63;
+    // The largest |n| (as 2^63 - 1 - (2^63 mod d)) whose remainder is d - 1.
+    let anc = TWO63 - 1 - TWO63 % d;
+    let mut p: u32 = 63;
+    // q1 / r1: 2^p / anc; q2 / r2: 2^p / d (quotient and remainder).
+    let (mut q1, mut r1) = (TWO63 / anc, TWO63 - (TWO63 / anc) * anc);
+    let (mut q2, mut r2) = (TWO63 / d, TWO63 - (TWO63 / d) * d);
+    loop {
+        p += 1;
+        q1 = q1.wrapping_mul(2);
+        r1 = r1.wrapping_mul(2);
+        if r1 >= anc {
+            q1 = q1.wrapping_add(1);
+            r1 -= anc;
+        }
+        q2 = q2.wrapping_mul(2);
+        r2 = r2.wrapping_mul(2);
+        if r2 >= d {
+            q2 = q2.wrapping_add(1);
+            r2 -= d;
+        }
+        let delta = d - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    (q2.wrapping_add(1), (p - 64) as u8)
+}
+
 fn disp(r: u16) -> i32 {
     i32::from(r) * 8
 }
@@ -6900,6 +6981,59 @@ mod tests {
         assert_eq!(at(&ops, 0), None);
         let ops = [c(f64::NAN), Op::Jump { target: 0 }];
         assert_eq!(at(&ops, 1), None);
+    }
+
+    #[test]
+    fn reciprocal_remainders_are_exact() {
+        // `int_mod`'s compiled-in divisor sequences, run here on the same
+        // integer semantics, against `%` (truncated) over the whole range.
+        let rem = |n: i64, d: u64| -> i64 {
+            if d.is_power_of_two() {
+                let m = d.trailing_zeros();
+                let bias = ((n >> 63) as u64 >> (64 - m)) as i64;
+                return n.wrapping_sub(n.wrapping_add(bias) & (d.wrapping_neg() as i64));
+            }
+            let (magic, shift) = signed_magic(d);
+            let mut hi = ((i128::from(n) * i128::from(magic as i64)) >> 64) as i64;
+            if (magic as i64) < 0 {
+                hi = hi.wrapping_add(n);
+            }
+            let q = (hi >> shift).wrapping_add((n as u64 >> 63) as i64);
+            n.wrapping_sub(q.wrapping_mul(d as i64))
+        };
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut ds: Vec<u64> = (2..=300).collect();
+        ds.extend([
+            1013,
+            1000,
+            1 << 31,
+            (1 << 31) - 1,
+            (1 << 30) + 3,
+            1_000_000_007,
+            641,
+        ]);
+        for _ in 0..200 {
+            ds.push(2 + next() % ((1 << 31) - 1));
+        }
+        for &d in &ds {
+            let di = d as i64;
+            let mut ns = alloc::vec![0, 1, -1, di, -di, di - 1, 1 - di, di + 1, -di - 1];
+            ns.extend([i64::MAX, i64::MIN, i64::MIN + 1, 1 << 53, -(1 << 53)]);
+            for _ in 0..500 {
+                let r = next();
+                ns.push(r as i64);
+                ns.push((r >> 20) as i64 - (1 << 43));
+            }
+            for n in ns {
+                assert_eq!(rem(n, d), n.wrapping_rem(di), "{n} % {d}");
+            }
+        }
     }
 
     #[test]
