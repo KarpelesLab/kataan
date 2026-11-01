@@ -387,6 +387,37 @@ impl Loop<'_> {
         self.element_slow(ctx, k, probe)
     }
 
+    /// How many of the indices from `k` on (descending when `backwards`, at
+    /// most `max`) are holes of the dense store that `HasProperty` reports
+    /// absent with no effect: the array has no per-index side table and its
+    /// prototype chain (the default one) owns no index at all. A run of them
+    /// is skipped at once — nothing runs between its steps.
+    fn absent_run(&self, ctx: &mut Ctx, k: usize, max: usize, backwards: bool) -> usize {
+        let hole_at = |ctx: &Ctx, i: usize| {
+            ctx.realm
+                .array_elements(self.h)
+                .and_then(|e| e.get(i))
+                .is_some_and(|v| v.is_hole())
+        };
+        if max == 0
+            || !hole_at(ctx, k)
+            || ctx.realm.array_has_index_side_table(self.h)
+            || !ctx.realm.array_chain_index_free(self.h)
+        {
+            return 0;
+        }
+        let Some(e) = ctx.realm.array_elements(self.h) else {
+            return 0;
+        };
+        if backwards {
+            let lo = (k + 1).saturating_sub(max);
+            e[lo..=k].iter().rev().take_while(|v| v.is_hole()).count()
+        } else {
+            let hi = e.len().min(k.saturating_add(max));
+            e[k..hi].iter().take_while(|v| v.is_hole()).count()
+        }
+    }
+
     /// [`Self::element`] for an index that is not a present dense slot: the
     /// host's full `[[HasProperty]]` / `[[Get]]`.
     #[cold]
@@ -454,6 +485,17 @@ impl Loop<'_> {
                 }
             }
             let k = if backwards { len - 1 - n } else { n };
+            if probe {
+                let run = self.absent_run(ctx, k, len - n, backwards);
+                if run > 0 {
+                    if op == Hof::Map {
+                        ctx.frame_shadow
+                            .extend(core::iter::repeat_n(NanBox::hole(), run));
+                    }
+                    n += run;
+                    continue;
+                }
+            }
             n += 1;
             let v = match self.element(ctx, k, probe)? {
                 Some(v) => v,
@@ -606,6 +648,11 @@ impl Loop<'_> {
                     return Err(VmError::Thrown(e));
                 }
                 let k = at(n);
+                let run = self.absent_run(ctx, k, len - n, right);
+                if run > 0 {
+                    n += run;
+                    continue;
+                }
                 n += 1;
                 if let Some(v) = self.element(ctx, k, true)? {
                     break v;
@@ -641,6 +688,11 @@ impl Loop<'_> {
                 }
             }
             let k = at(n);
+            let run = self.absent_run(ctx, k, len - n, right);
+            if run > 0 {
+                n += run;
+                continue;
+            }
             n += 1;
             let Some(v) = self.element(ctx, k, true)? else {
                 continue;

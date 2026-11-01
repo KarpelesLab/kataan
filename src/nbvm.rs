@@ -2140,6 +2140,17 @@ fn vm_set_elem_mode(
     value: NanBox,
     strict: bool,
 ) -> Result<(), VmError> {
+    // A store into a hole of a plain array (`new Array(n)` filled in): the
+    // element store itself, when nothing on the chain can intercept it.
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && n >= 0.0
+        && n == (n as usize) as f64
+        && ctx
+            .realm
+            .array_fill_hole_plain(Handle::from_raw(h), n as usize, value)
+    {
+        return Ok(());
+    }
     if typed_array_index_set(ctx, recv, key, value) {
         return Ok(());
     }
@@ -2364,6 +2375,13 @@ fn vm_get_method(
         return Ok(v);
     }
     vm_get_prop(ctx, funcs, recv, key, cache)
+}
+
+/// Whether `GetIterator(v)` would yield the built-in `%ArrayIterator%` over
+/// the array `v` with the intrinsic `next`, decided without running code (see
+/// `iter_fast`): then no consumer can observe the iterator object itself.
+pub(crate) fn array_iteration_is_plain(realm: &mut Realm, v: NanBox) -> bool {
+    iter_fast::can_open(realm, v)
 }
 
 /// [`Op::PlainPrims`] of one value: a primitive whose conversions run no
@@ -8117,6 +8135,17 @@ fn run_frame_at_ic(
             } => {
                 let mut out = Vec::new();
                 let mut failed = None;
+                if regs[*iter as usize].is_number() {
+                    // A spread's rest feeds the next op's literal / argument
+                    // list: its plain run goes there directly.
+                    let into = match program.get(pc) {
+                        Some(Op::ArrayExtend { arr, src }) if src == dst => {
+                            regs[*arr as usize].as_handle().map(Handle::from_raw)
+                        }
+                        _ => None,
+                    };
+                    iter_fast::drain_plain_prefix(ctx, regs, *done, *iter, into, &mut out);
+                }
                 while regs[*done as usize].as_boolean() != Some(true) {
                     match vm_iter_step(ctx, funcs, regs, *done, *iter, *next) {
                         Ok(Some(v)) => out.push(v),
@@ -9626,11 +9655,27 @@ fn run_frame_at_ic(
                 // A spread of any built-in iterable (array / typed array / string
                 // / Map / Set); a user iterable faults to the interpreter, which
                 // drives the full iterator protocol.
+                // A plain array source without holes: one copy, store to store.
+                if let Some(sh) = regs[*src as usize].as_handle().map(Handle::from_raw)
+                    && !ctx.realm.array_has_index_overrides(sh)
+                    && let Some(n) = ctx.realm.array_elements(sh).map(<[_]>::len)
+                    && ctx.realm.array_length(sh) == Some(n)
+                    && ctx
+                        .realm
+                        .array_append_run_plain(handle, sh, 0, n, true)
+                        .is_some()
+                {
+                    continue;
+                }
                 let elems =
                     vm_iterable_values(ctx, regs[*src as usize]).ok_or(VmError::NotAnObject)?;
-                let start = ctx.realm.array_length(handle).unwrap_or(0);
-                for (i, e) in elems.into_iter().enumerate() {
-                    ctx.realm.set_element(handle, start + i, e);
+                // A literal's array is plain until something (a spread
+                // past the length cap) makes it otherwise: one bulk append.
+                if ctx.realm.array_push_plain(handle, &elems).is_none() {
+                    let start = ctx.realm.array_length(handle).unwrap_or(0);
+                    for (i, e) in elems.into_iter().enumerate() {
+                        ctx.realm.set_element(handle, start + i, e);
+                    }
                 }
             }
             Op::IterValues { dst, src } => {

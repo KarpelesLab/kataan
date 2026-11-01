@@ -180,6 +180,14 @@ impl Interp {
         it: Handle,
         next: NanBox,
     ) -> Result<Option<NanBox>, ExecError> {
+        // A built-in Set/Map/string/snapshot iterator with the built-in
+        // `next`: the step needs only the realm, and no result object (as
+        // the VM's `IteratorStep` takes it).
+        if let Some(step) =
+            realm_builtin_iter_step(&mut self.realm, next, NanBox::handle(it.to_raw()))
+        {
+            return Ok(step);
+        }
         let Some(rh) = self.iter_step_result(it, next)? else {
             return Ok(None);
         };

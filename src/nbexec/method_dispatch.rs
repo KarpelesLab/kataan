@@ -3246,7 +3246,7 @@ impl Interp {
                 Unpacked::Undefined | Unpacked::Null | Unpacked::Bool(_) | Unpacked::Number(_)
             )
         };
-        if matches!(method, "at" | "indexOf" | "lastIndexOf")
+        if matches!(method, "at" | "indexOf" | "lastIndexOf" | "includes")
             && array_like.is_none()
             && self.realm.typed_kind(handle).is_none()
             && !self.realm.array_has_index_overrides(handle)
@@ -3291,13 +3291,19 @@ impl Interp {
                         return Ok(Some(NanBox::number(-1.0)));
                     }
                     let from = self.array_from_index_checked(arg(1), len)?;
-                    for i in from..len {
-                        let Some(e) = read(self, i)? else { continue };
-                        if self.realm.strict_equals(e, target) {
-                            return Ok(Some(NanBox::number(i as f64)));
-                        }
+                    let found =
+                        self.array_dense_search(handle, from, len, ArraySearch::IndexOf, target)?;
+                    return Ok(Some(NanBox::number(found.map_or(-1.0, |i| i as f64))));
+                }
+                "includes" => {
+                    // Length is checked before the fromIndex coercion.
+                    if len == 0 {
+                        return Ok(Some(NanBox::boolean(false)));
                     }
-                    return Ok(Some(NanBox::number(-1.0)));
+                    let from = self.array_from_index_checked(arg(1), len)?;
+                    let found =
+                        self.array_dense_search(handle, from, len, ArraySearch::Includes, arg(0))?;
+                    return Ok(Some(NanBox::boolean(found.is_some())));
                 }
                 _ => {
                     let target = arg(0);
@@ -3314,13 +3320,14 @@ impl Interp {
                     } else {
                         len - 1
                     };
-                    for i in (0..=from).rev() {
-                        let Some(e) = read(self, i)? else { continue };
-                        if self.realm.strict_equals(e, target) {
-                            return Ok(Some(NanBox::number(i as f64)));
-                        }
-                    }
-                    return Ok(Some(NanBox::number(-1.0)));
+                    let found = self.array_dense_search(
+                        handle,
+                        0,
+                        from + 1,
+                        ArraySearch::LastIndexOf,
+                        target,
+                    )?;
+                    return Ok(Some(NanBox::number(found.map_or(-1.0, |i| i as f64))));
                 }
             }
         }

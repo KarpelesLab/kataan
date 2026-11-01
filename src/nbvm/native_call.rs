@@ -1095,7 +1095,17 @@ fn run_op(
             NanBox::handle(realm.new_string(&out).to_raw())
         }
         FastOp::ArrIndexOf | FastOp::ArrIncludes => {
-            let elems = dense_elements(realm, h)?;
+            // Holes are not scanned for up front (that would cost a pass over
+            // the whole array when the match is early): the search stops at
+            // the first hole before a match and leaves it to the host (whose
+            // answer may come from the prototype chain).
+            let elems = realm.array_elements(h)?;
+            if realm.array_has_index_overrides(h)
+                || realm.proto_index_accessor_dirty()
+                || realm.array_length(h) != Some(elems.len())
+            {
+                return None;
+            }
             let len = elems.len();
             let target = arg(0);
             // `fromIndex` converts before the search; a zero length skips it.
@@ -1109,11 +1119,27 @@ fn run_op(
                 }
             };
             let tail = elems.get(from..).unwrap_or(&[]);
-            if op == FastOp::ArrIndexOf {
-                let i = tail.iter().position(|e| realm.strict_equals(*e, target));
-                NanBox::number(i.map_or(-1.0, |i| (from + i) as f64))
+            // A primitive target is decided by the boxed values alone (no
+            // string or BigInt content to compare): the tight loop.
+            let prim = target.as_handle().is_none();
+            let nan = op == FastOp::ArrIncludes && target.as_number().is_some_and(f64::is_nan);
+            let pos = if prim && !nan {
+                tail.iter()
+                    .position(|e| e.is_hole() || e.strict_equals(target))
+            } else if prim {
+                tail.iter()
+                    .position(|e| e.is_hole() || e.as_number().is_some_and(f64::is_nan))
             } else {
-                NanBox::boolean(tail.iter().any(|e| realm.same_value_zero(*e, target)))
+                tail.iter()
+                    .position(|e| e.is_hole() || realm.strict_equals(*e, target))
+            };
+            if pos.is_some_and(|i| tail[i].is_hole()) {
+                return None;
+            }
+            if op == FastOp::ArrIndexOf {
+                NanBox::number(pos.map_or(-1.0, |i| (from + i) as f64))
+            } else {
+                NanBox::boolean(pos.is_some())
             }
         }
         FastOp::ArrJoin => {

@@ -5352,6 +5352,39 @@ impl Realm {
         }
     }
 
+    /// `arr[index] = value` into a hole of the dense store, when that `[[Set]]`
+    /// is exactly the store: the array has never had side-table state (see
+    /// [`crate::cell::ArrayElems`]: no index attributes or accessors, sparse
+    /// length, frozen/sealed/non-extensible mark), keeps its default
+    /// prototype, and no object on that chain owns an index (the memoized
+    /// [`array_chain_index_free`](Self::array_chain_index_free)), so no
+    /// inherited setter or read-only element can intercept the write. Whether
+    /// it was done (nothing changes otherwise).
+    pub fn array_fill_hole_plain(&mut self, handle: Handle, index: usize, value: NanBox) -> bool {
+        let Some(Cell::Array(a)) = self.heap.get(handle) else {
+            return false;
+        };
+        if a.has_side_state() || a.has_proto_set() || !a.get(index).is_some_and(|v| v.is_hole()) {
+            return false;
+        }
+        if (!self.host_exotic.is_empty() && self.host_exotic.contains(&handle.to_raw()))
+            || !self.array_chain_index_free(handle)
+        {
+            return false;
+        }
+        // Nothing below `index` changes: the write barrier's tail form.
+        let Some(a) = self
+            .heap
+            .get_mut_append(handle, |c| index.min(c.ref_len()))
+            .and_then(Cell::as_array_mut)
+        else {
+            return false;
+        };
+        a[index] = value;
+        self.shade_stored(value);
+        true
+    }
+
     /// Whether growing the dense store of the array `raw` from `dense` to
     /// `new_len` elements is refused (see [`SparseLen`]): past
     /// [`DENSE_GROW_FREE`], a growth by more than the store's own size (which
@@ -5443,6 +5476,62 @@ impl Realm {
         // (A plain array is never a queue: queue mode marks side state.)
         a.vec_mut().extend_from_slice(values);
         Some(a.len())
+    }
+
+    /// Appends the elements `src[from..from + n]` of the array `src` to the
+    /// array `dst` (as [`Self::array_push_plain`] requires it) with a single
+    /// copy, where `n` is the longest run from `from` (up to `to` and the end
+    /// of `src`'s dense store) that holds no hole: the number appended.
+    /// `None`, with nothing done, when `dst` is not such an array, is `src`,
+    /// or would pass the length cap, or (`whole`) the run is not all of
+    /// `from..to`. The elements are copied straight from
+    /// one store into the other (`dst`'s is taken out for the copy, which runs
+    /// no code and allocates no cell).
+    pub fn array_append_run_plain(
+        &mut self,
+        dst: Handle,
+        src: Handle,
+        from: usize,
+        to: usize,
+        whole: bool,
+    ) -> Option<usize> {
+        if self.proto_index_accessor_dirty || dst == src {
+            return None;
+        }
+        let max = self.limits.max_array_len;
+        let run = {
+            let e = self.heap.get(src)?.as_array()?;
+            let tail = e.get(from..to.min(e.len()))?;
+            let run = tail.iter().position(|v| v.is_hole()).unwrap_or(tail.len());
+            if whole && run < tail.len() {
+                return None;
+            }
+            run
+        };
+        // (Only appends: the write barrier's tail form.)
+        let a = self
+            .heap
+            .get_mut_append(dst, Cell::ref_len)
+            .and_then(Cell::as_array_mut_plain)?;
+        let old_len = a.len();
+        if old_len.saturating_add(run) > max {
+            return None;
+        }
+        let mut v = core::mem::take(a.vec_mut());
+        // A little room past the run: a literal often goes on (`[...a, x]`).
+        v.reserve(run + 4);
+        if let Some(e) = self.heap.get(src).and_then(Cell::as_array) {
+            v.extend_from_slice(&e[from..from + run]);
+        }
+        // The barrier above already covers everything from `old_len` on.
+        if let Some(a) = self
+            .heap
+            .get_mut_append(dst, |_| old_len)
+            .and_then(Cell::as_array_mut)
+        {
+            *a.vec_mut() = v;
+        }
+        Some(run)
     }
 
     /// `arr.pop()` on an array as [`Self::array_push_plain`] requires whose

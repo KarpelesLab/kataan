@@ -410,14 +410,18 @@ impl Interp {
                 }
             }
             N_MATH_MAX => {
-                // ToNumber every argument first (in order, propagating any abrupt
-                // completion), then reduce — so each element's `valueOf` runs even
-                // when an earlier element is `NaN`.
-                let mut coerced = Vec::with_capacity(args.len());
-                for a in args {
-                    let num = self.coerce_to_number(*a)?;
-                    coerced.push(self.realm.to_number(num));
-                }
+                // ToNumber every argument first (all in order, any of them
+                // may run code) — unless they are all Numbers already.
+                let coerced: Vec<f64> = if args.iter().all(|a| a.is_number()) {
+                    args.iter().filter_map(|a| a.as_number()).collect()
+                } else {
+                    let mut coerced = Vec::with_capacity(args.len());
+                    for a in args {
+                        let num = self.coerce_to_number(*a)?;
+                        coerced.push(self.realm.to_number(num));
+                    }
+                    coerced
+                };
                 let mut m = f64::NEG_INFINITY;
                 for n in coerced {
                     if n.is_nan() {
@@ -432,11 +436,18 @@ impl Interp {
                 NanBox::number(m)
             }
             N_MATH_MIN => {
-                let mut coerced = Vec::with_capacity(args.len());
-                for a in args {
-                    let num = self.coerce_to_number(*a)?;
-                    coerced.push(self.realm.to_number(num));
-                }
+                // ToNumber every argument first (all in order, any of them
+                // may run code) — unless they are all Numbers already.
+                let coerced: Vec<f64> = if args.iter().all(|a| a.is_number()) {
+                    args.iter().filter_map(|a| a.as_number()).collect()
+                } else {
+                    let mut coerced = Vec::with_capacity(args.len());
+                    for a in args {
+                        let num = self.coerce_to_number(*a)?;
+                        coerced.push(self.realm.to_number(num));
+                    }
+                    coerced
+                };
                 let mut m = f64::INFINITY;
                 for n in coerced {
                     if n.is_nan() {
@@ -2297,29 +2308,77 @@ impl Interp {
                     } else {
                         None
                     };
+                    // A plain array into a plain result: by index, with no
+                    // iterator (see `iter_plain`), until a step needs the
+                    // protocol path. Each element is re-read live (`mapFn` may
+                    // change the array); a throwing `mapFn` closes the iterator
+                    // the elided one would be by then.
+                    let mut out = Vec::new();
+                    let mut k = 0usize;
+                    let plain = if target_h.is_none() && using_iterator.is_some() {
+                        self.plain_iterable_array(arg(0))
+                    } else {
+                        None
+                    };
+                    let resume = match plain {
+                        Some(arr) => loop {
+                            match self.plain_array_step(arr, k) {
+                                Some(None) => break None,
+                                None => break Some(self.plain_array_iterator_at(arr, k)?),
+                                Some(Some(val)) => {
+                                    let mapped = if has_map {
+                                        match self.call_with_this(
+                                            map_fn,
+                                            this_arg,
+                                            &[val, NanBox::number(k as f64)],
+                                        ) {
+                                            Ok(m) => m,
+                                            Err(e) => {
+                                                let (it, _) =
+                                                    self.plain_array_iterator_at(arr, k + 1)?;
+                                                let _ = self.iterator_close(it);
+                                                return Err(e);
+                                            }
+                                        }
+                                    } else {
+                                        val
+                                    };
+                                    out.push(mapped);
+                                    k += 1;
+                                }
+                            }
+                        },
+                        None => None,
+                    };
+                    if plain.is_some() && resume.is_none() {
+                        return Ok(NanBox::handle(self.realm.new_array(out).to_raw()));
+                    }
                     // Iterate LAZILY, applying mapFn per element interleaved with
                     // IteratorStep, so an abrupt mapFn completion IteratorCloses the
                     // still-open iterator (a `next`/getter throw propagates directly).
-                    let it = match using_iterator {
-                        // GetIteratorFromMethod(items, usingIterator): the method is
-                        // called with the **original** `items` value as its `this`
-                        // (a primitive stays a primitive for a strict method).
-                        Some(f) => {
-                            let iterator = self.call_with_this(f, arg(0), &[])?;
-                            match iterator.as_handle().map(Handle::from_raw) {
-                                Some(ih) => ih,
-                                None => {
-                                    return Err(self
-                                        .type_error("[Symbol.iterator] did not return an object"));
+                    let (it, next) = if let Some(r) = resume {
+                        r
+                    } else {
+                        let it = match using_iterator {
+                            // GetIteratorFromMethod(items, usingIterator): the method is
+                            // called with the **original** `items` value as its `this`
+                            // (a primitive stays a primitive for a strict method).
+                            Some(f) => {
+                                let iterator = self.call_with_this(f, arg(0), &[])?;
+                                match iterator.as_handle().map(Handle::from_raw) {
+                                    Some(ih) => ih,
+                                    None => {
+                                        return Err(self.type_error(
+                                            "[Symbol.iterator] did not return an object",
+                                        ));
+                                    }
                                 }
                             }
-                        }
-                        // A built-in iterable with no readable `@@iterator`.
-                        None => self.get_iter_object(items_box)?,
+                            // A built-in iterable with no readable `@@iterator`.
+                            None => self.get_iter_object(items_box)?,
+                        };
+                        (it, self.read_member(it, "next")?)
                     };
-                    let next = self.read_member(it, "next")?;
-                    let mut out = Vec::new();
-                    let mut k = 0usize;
                     while let Some(val) = self.iter_step(it, next)? {
                         let mapped = if has_map {
                             match self.call_with_this(

@@ -3518,8 +3518,36 @@ impl Interp {
                     "{ctor_name}.prototype.{adder_name} is not callable"
                 )));
             }
-            let it = self.get_iter_object(first)?;
-            let next = self.read_member(it, "next")?;
+            // The intrinsic adder over a plain array: its entries go in by
+            // index, with no iterator (see `iter_plain`), until one needs the
+            // protocol path.
+            let intrinsic_adder = matches!(id, N_MAP | N_SET)
+                && adder
+                    .as_handle()
+                    .and_then(|a| self.realm.bound_native_at(Handle::from_raw(a)))
+                    .is_some_and(|(nid, name)| {
+                        let want: (u16, &[u8]) = if is_set {
+                            (N_SET_PROTO_FN, b"add")
+                        } else {
+                            (N_MAP_PROTO_FN, b"set")
+                        };
+                        nid == want.0 && self.realm.string_leaf_bytes(name) == Some(want.1)
+                    });
+            let plain = if intrinsic_adder {
+                self.plain_iterable_array(first)
+            } else {
+                None
+            };
+            let (it, next) = match plain {
+                Some(arr) => match self.collection_fill_plain(handle, arr, is_set) {
+                    None => return Ok(NanBox::handle(handle.to_raw())),
+                    Some(k) => self.plain_array_iterator_at(arr, k)?,
+                },
+                None => {
+                    let it = self.get_iter_object(first)?;
+                    (it, self.read_member(it, "next")?)
+                }
+            };
             while let Some(entry) = self.iter_step(it, next)? {
                 let call_res = if is_set {
                     self.call_with_this(adder, map_val, &[entry])

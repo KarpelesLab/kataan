@@ -145,6 +145,9 @@ impl Interp {
     /// later infallible `Realm::to_number` would silently swallow these errors —
     /// e.g. coercing an array-like object's elements during typed-array construction.
     pub(crate) fn coerce_to_number(&mut self, value: NanBox) -> Result<NanBox, ExecError> {
+        if let Some(n) = value.as_number() {
+            return Ok(NanBox::number(n));
+        }
         let prim = self.coerce_primitive(value, "number")?;
         if let Some(h) = prim.as_handle().map(Handle::from_raw) {
             if self.realm.symbol_at(h).is_some() {

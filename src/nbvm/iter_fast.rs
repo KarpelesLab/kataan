@@ -367,6 +367,54 @@ pub(super) fn step(
     }
 }
 
+/// The run of [`step`]s a rest/spread drain would take from a fast-mode
+/// iterator (`regs[iter]` is a Number) that each read a present element of a
+/// plain dense array directly: those elements are appended at once, to the
+/// plain array `into` when given (the array literal or argument list the
+/// spread feeds, which nothing can observe until it is complete) or else to
+/// `out`, and the cursor moves past them. Nothing between such steps can
+/// observe or change the array (they run no code), so the run is the slice
+/// up to the first index that a step would hand to the host (a hole, an
+/// index override, the end of the dense store); the caller's ordinary steps
+/// take over from there, and latch `done` at the end.
+pub(super) fn drain_plain_prefix(
+    ctx: &mut Ctx,
+    regs: &mut [NanBox],
+    done: Reg,
+    iter: Reg,
+    into: Option<Handle>,
+    out: &mut alloc::vec::Vec<NanBox>,
+) {
+    if regs[done as usize].as_boolean() == Some(true) {
+        return;
+    }
+    let Ok(arr_v) = array_of(regs, iter) else {
+        return;
+    };
+    let arr = Handle::from_raw(arr_v.as_handle().unwrap_or_default());
+    if ctx.realm.array_has_index_overrides(arr) {
+        return;
+    }
+    let idx = regs[iter as usize].as_number().unwrap_or(0.0) as usize;
+    let len = ctx.realm.array_length(arr).unwrap_or(0);
+    if let Some(dst) = into
+        && let Some(run) = ctx.realm.array_append_run_plain(dst, arr, idx, len, false)
+    {
+        regs[iter as usize] = NanBox::number((idx + run) as f64);
+        return;
+    }
+    let Some(elems) = ctx.realm.array_elements(arr) else {
+        return;
+    };
+    let end = len.min(elems.len());
+    let Some(tail) = elems.get(idx..end) else {
+        return;
+    };
+    let run = tail.iter().position(|e| e.is_hole()).unwrap_or(tail.len());
+    out.extend_from_slice(&tail[..run]);
+    regs[iter as usize] = NanBox::number((idx + run) as f64);
+}
+
 /// Replaces a fast-mode iterator in `regs[iter]`/`regs[iter + 1]` with the
 /// real `%ArrayIterator%` it stood in for (and the intrinsic `next`), returning
 /// the iterator.

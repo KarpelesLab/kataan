@@ -2922,7 +2922,9 @@ const PCOMB_CALLED: &str = "\u{0}pc_called";
 mod agent;
 #[cfg(feature = "std")]
 mod agent_pool;
+mod array_search;
 mod array_sparse;
+use array_search::ArraySearch;
 mod base64;
 mod call;
 mod convert;
@@ -2933,6 +2935,7 @@ mod gc_tests;
 mod generator;
 mod intl_aliases;
 mod intl_fmt;
+mod iter_plain;
 mod iterator;
 pub(crate) use iterator::{realm_builtin_entry_step, realm_builtin_iter_step};
 mod dataview_fast;
