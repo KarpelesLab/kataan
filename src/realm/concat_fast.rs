@@ -25,6 +25,22 @@ const DIGIT_PAIRS: [u8; 200] = {
 };
 
 impl Realm {
+    /// `a + b` for two plain string cells (no auxiliary object, which may
+    /// carry a function marker): their concatenation, in one step. `None`,
+    /// having done nothing, for any other operands or a result past the
+    /// maximum string length (the general `+` then runs, and throws).
+    #[inline]
+    pub(crate) fn add_str_str(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
+        let (x, y) = (a.as_handle()?, b.as_handle()?);
+        let ra = self.heap.get(Handle::from_raw(x))?.as_str()?;
+        let rb = self.heap.get(Handle::from_raw(y))?.as_str()?;
+        if self.aux_props.contains_key(&x) || self.aux_props.contains_key(&y) {
+            return None;
+        }
+        let joined = ra.try_concat(rb)?;
+        Some(NanBox::handle(self.heap.alloc(Cell::Str(joined)).to_raw()))
+    }
+
     /// `a + b` when one operand is a flat string cell whose `typeof` is
     /// `"string"` and the other an integer Number of magnitude below 2^53, and
     /// the joined text fits a small rope: that new string. `None`, having done

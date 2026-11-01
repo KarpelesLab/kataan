@@ -313,6 +313,9 @@ pub struct Realm {
     /// roots ([`gc_roots`](Realm::gc_roots), and the minor path's side-table
     /// roots) and the table is dropped by a moving [`compact`](Realm::compact).
     unit_strings: alloc::vec::Vec<Option<Handle>>,
+    /// The interned `typeof` result strings, by `TYPE_NAMES` index (see
+    /// [`type_name_string`](Realm::type_name_string)), filled on first use.
+    type_name_strings: alloc::vec::Vec<Option<Handle>>,
     /// Where the last indexed read of a non-ASCII flat string stopped: the
     /// string and the (byte, UTF-16 unit) boundary of the character read. UTF-8
     /// cannot be indexed by unit in O(1), so `for (i…) s[i]` over such a string
@@ -889,6 +892,7 @@ impl Realm {
             no_then_stamp: 0,
             regex_subject_units: None,
             unit_strings: alloc::vec::Vec::new(),
+            type_name_strings: alloc::vec::Vec::new(),
             unit_cursor: None,
             slice_cursor: None,
             tree_slice: None,
@@ -1908,6 +1912,43 @@ impl Realm {
         let rope = rope.clone();
         self.unit_cursor = Some((rope, b, u));
         Some(unit)
+    }
+
+    /// The String of a `typeof` result `name` (one of
+    /// [`type_of_value`](Self::type_of_value)'s): interned, so `typeof x`
+    /// allocates nothing after the first time each name is produced. A
+    /// String's identity is not observable. Any other text gets a fresh cell.
+    pub fn type_name_string(&mut self, name: &str) -> Handle {
+        const TYPE_NAMES: [&str; 8] = [
+            "undefined",
+            "object",
+            "boolean",
+            "number",
+            "string",
+            "symbol",
+            "function",
+            "bigint",
+        ];
+        let Some(i) = TYPE_NAMES.iter().position(|n| *n == name) else {
+            return self.new_string(name);
+        };
+        // Revalidated on every hit, as `unit_string` does.
+        if let Some(Some(h)) = self.type_name_strings.get(i)
+            && self
+                .heap
+                .get(*h)
+                .and_then(Cell::as_str)
+                .and_then(Rope::as_leaf_bytes)
+                == Some(name.as_bytes())
+        {
+            return *h;
+        }
+        let h = self.new_string(name);
+        if self.type_name_strings.is_empty() {
+            self.type_name_strings.resize(TYPE_NAMES.len(), None);
+        }
+        self.type_name_strings[i] = Some(h);
+        h
     }
 
     /// The string holding the single UTF-16 code unit `unit`. Units below 256
@@ -7312,42 +7353,6 @@ impl Realm {
         o.get(key)
     }
 
-    /// `HasProperty(h, key)` decided without running anything, when every
-    /// object on `h`'s prototype chain up to the answer is an ordinary
-    /// `Cell::Object` (no proxy, no host-exotic object, no String wrapper):
-    /// `Some(true)` at the first that owns `key` (a data or accessor
-    /// property), `Some(false)` when none does. `None` when that cannot be
-    /// told (the caller takes the full `[[HasProperty]]`).
-    #[must_use]
-    pub(crate) fn plain_has_property(&self, h: Handle, key: &str) -> Option<bool> {
-        let mut cur = Some(h);
-        // (A cycle is impossible for ordinary objects; the bound is a guard.)
-        for _ in 0..64 {
-            let Some(h) = cur else {
-                return Some(false);
-            };
-            let o = self.heap.get(h).and_then(Cell::as_object)?;
-            if self.is_host_exotic(h)
-                || self.string_object_len(h).is_some()
-                || self.vm_fn_meta_value(h, key).is_some()
-            {
-                return None;
-            }
-            if o.has_own_key(key) {
-                return Some(true);
-            }
-            cur = o.proto();
-        }
-        None
-    }
-
-    /// Whether `HasProperty(h, key)` is certainly false
-    /// ([`plain_has_property`](Self::plain_has_property)).
-    #[must_use]
-    pub(crate) fn plain_chain_lacks(&self, h: Handle, key: &str) -> bool {
-        self.plain_has_property(h, key) == Some(false)
-    }
-
     /// Stores `value` into the ordinary object `h`'s existing own writable
     /// data property `key` (no same-named accessor, the object not frozen),
     /// with the write barrier — exactly what `[[Set]]` with `h` as receiver
@@ -7485,6 +7490,7 @@ impl Realm {
         out.extend(self.vm_array_iter.values_fns.iter().copied());
         self.for_in_cache_roots(out);
         out.extend(self.unit_strings.iter().flatten().copied());
+        out.extend(self.type_name_strings.iter().flatten().copied());
         out.extend(self.literal_ropes.iter().flatten().map(|(_, _, h)| *h));
         // Explicit prototype links for cells with no inline object part, and the
         // class prototypes: both are keyed by an identity the heap graph does not
@@ -8097,6 +8103,7 @@ impl Realm {
         // The interned one-unit strings are a cache too: drop them rather than
         // forward them.
         self.unit_strings.clear();
+        self.type_name_strings.clear();
         self.literal_ropes.clear();
         self.for_in_cache = None;
         self.vm_array_iter = VmArrayIterIntrinsics {
@@ -8883,6 +8890,15 @@ impl Realm {
         match v.as_handle() {
             Some(raw) => {
                 let h = Handle::from_raw(raw);
+                // The two commonest cells, which every probe below would
+                // answer the same way: a VM closure is a function whatever
+                // its auxiliary properties hold, and a string with none (so
+                // no function marker) is a string.
+                match self.heap.get(h) {
+                    Some(Cell::VmFunction { .. }) => return "function",
+                    Some(Cell::Str(_)) if !self.aux_props.contains_key(&raw) => return "string",
+                    _ => {}
+                }
                 // An [[IsHTMLDDA]] exotic object (`document.all`) reports
                 // `typeof` as `"undefined"` despite being an object.
                 if self.is_html_dda(h) {

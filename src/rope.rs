@@ -385,6 +385,13 @@ impl Rope {
             bytes.extend_from_slice(&other_bytes[3..]); // drop the lone low surrogate
             return Some(Rope::from_wtf8(bytes));
         }
+        // No surrogate pair forms at the boundary, so the result's UTF-16
+        // length is the sum of the sides': carried over when both are known
+        // already (or, for a short flat side, counted now), so a `s += c`
+        // loop that reads `s.length` never rescans what it built.
+        let u16_len = self
+            .utf16_len_if_cheap()
+            .and_then(|x| Some(x + other.utf16_len_if_cheap()?));
         // Two short leaves (`'item' + i`, a template's pieces) join into one
         // leaf: copying a few bytes costs less than a `Concat` node that every
         // later read has to walk and that eventually has to be flattened anyway.
@@ -397,21 +404,35 @@ impl Rope {
                 buf[a.len()..len].copy_from_slice(b);
                 return Some(Rope(Rc::new(Node::Small {
                     len: len as u8,
-                    u16: core::cell::Cell::new(SMALL_U16_UNKNOWN),
+                    u16: core::cell::Cell::new(u16_len.map_or(SMALL_U16_UNKNOWN, |n| n as u8)),
                     buf,
                 })));
             }
             let mut bytes = Vec::with_capacity(len);
             bytes.extend_from_slice(a);
             bytes.extend_from_slice(b);
-            return Some(Rope::from_wtf8(bytes));
+            return Some(Rope(Rc::new(Node::Leaf(
+                bytes.into_boxed_slice(),
+                core::cell::Cell::new(u16_len.unwrap_or(U16_LEN_UNKNOWN)),
+            ))));
         }
         Some(Rope(Rc::new(Node::Concat {
             left: self.clone(),
             right: other.clone(),
             len,
-            u16_len: core::cell::Cell::new(U16_LEN_UNKNOWN),
+            u16_len: core::cell::Cell::new(u16_len.unwrap_or(U16_LEN_UNKNOWN)),
         })))
+    }
+
+    /// The UTF-16 length when it costs (nearly) nothing: memoized already, or
+    /// an inline run counted now (at most [`SMALL_CAP`] bytes). `None`
+    /// otherwise.
+    fn utf16_len_if_cheap(&self) -> Option<usize> {
+        if let Node::Small { .. } = &*self.0 {
+            return Some(self.utf16_len());
+        }
+        let n = self.u16_len_cell()?.get();
+        (n != U16_LEN_UNKNOWN).then_some(n)
     }
 
     /// Concatenates `self` and `other` in O(1), sharing both sides. A result

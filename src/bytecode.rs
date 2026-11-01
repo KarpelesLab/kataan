@@ -1440,7 +1440,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_str(name, out);
         }
-        Op::TypeofGlobal { dst, name } => {
+        Op::TypeofGlobal { dst, name, .. } => {
             w_u8(61, out);
             w_reg(*dst, out);
             w_str(name, out);
@@ -2382,6 +2382,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         61 => Op::TypeofGlobal {
             dst: r.reg()?,
             name: r.string()?,
+            cache: crate::nbvm::TypeofGlobalCache::default(),
         },
         62 => Op::StoreGlobal {
             name: r.string()?,

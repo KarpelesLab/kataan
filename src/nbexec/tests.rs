@@ -13345,3 +13345,27 @@ fn for_in_key_cache_follows_chain_and_enumerability_changes() {
         "xypq,xypq,xypqs,xyqs,xys,xyqs,z,-,xyw,xq,12ba,12ba,uv,true,false,true"
     );
 }
+
+#[test]
+fn typeof_global_site_cache_follows_bindings_and_chain() {
+    // `typeof name` at a global site is answered by the VM through a per-site
+    // cache (`nbvm::typeof_fast`); each change between evaluations must show.
+    let src = r#"
+        function t() { return typeof tgA + typeof tgB; }
+        var r = [];
+        for (var i = 0; i < 5; i++) r.push(t());
+        globalThis.tgA = 1; r.push(t());
+        Object.prototype.tgB = "s"; r.push(t());
+        delete Object.prototype.tgB; r.push(t());
+        Object.defineProperty(globalThis, "tgB", { get: function () { return 1n; }, configurable: true });
+        r.push(t());
+        delete globalThis.tgB; delete globalThis.tgA; r.push(t());
+        r.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "undefinedundefined,undefinedundefined,undefinedundefined,undefinedundefined,\
+         undefinedundefined,numberundefined,numberstring,numberundefined,numberbigint,\
+         undefinedundefined"
+    );
+}

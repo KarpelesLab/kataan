@@ -38,15 +38,44 @@ impl Realm {
 
     /// The object at `h` when its own properties are exactly its slots and
     /// accessors (see the module docs).
+    /// (A mapped `arguments` object owns its index keys like any other, so
+    /// only a value read, `args_too`, has to leave it to the general path.)
     #[inline]
-    fn ordinary_props(&self, h: Handle) -> Option<&Object> {
+    fn ordinary_props(&self, h: Handle, args_too: bool) -> Option<&Object> {
         let Some(Cell::Object(o)) = self.heap.get(h) else {
             return None;
         };
-        if o.is_prim_wrapper() || self.is_host_exotic(h) || self.has_argument_map_marker(h) {
+        if o.is_prim_wrapper()
+            || self.is_host_exotic(h)
+            || (args_too && self.has_argument_map_marker(h))
+        {
             return None;
         }
         Some(o)
+    }
+
+    /// An ordinary object's key epoch and `[[Prototype]]`, without the
+    /// checks of [`ordinary_link`](Self::ordinary_link) (for revalidating a
+    /// link that passed them, whose key epoch fixes its keys).
+    #[must_use]
+    #[inline]
+    pub(crate) fn link_epoch(&self, h: Handle) -> Option<(u32, Option<Handle>)> {
+        let Some(Cell::Object(o)) = self.heap.get(h) else {
+            return None;
+        };
+        if self.is_host_exotic(h) {
+            return None;
+        }
+        Some((o.key_epoch(), o.proto()))
+    }
+
+    /// A prototype-chain link [`has_property_named`](Self::has_property_named)
+    /// walks: its key epoch and `[[Prototype]]`, or `None` when it is not
+    /// one it decides for.
+    #[must_use]
+    pub(crate) fn ordinary_link(&self, h: Handle) -> Option<(u32, Option<Handle>)> {
+        let o = self.ordinary_props(h, false)?;
+        Some((o.key_epoch(), o.proto()))
     }
 
     /// `obj[key]` for a String `key` naming an own **data** property of the
@@ -55,11 +84,25 @@ impl Realm {
     #[must_use]
     pub(crate) fn own_data_by_string(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
         let k = self.string_key_in_place(key)?;
-        let o = self.ordinary_props(Handle::from_raw(obj.as_handle()?))?;
+        let o = self.ordinary_props(Handle::from_raw(obj.as_handle()?), true)?;
         if o.accessor(k).is_some() {
             return None;
         }
         o.get(k)
+    }
+
+    /// The ordinary object `h`'s own **data** property `key` (no like-named
+    /// accessor): what `[[Get]]` returns there without running anything.
+    /// `None` for anything else.
+    #[must_use]
+    pub(crate) fn own_data_named(&self, h: Handle, key: &str) -> Option<NanBox> {
+        let Some(Cell::Object(o)) = self.heap.get(h) else {
+            return None;
+        };
+        if self.is_host_exotic(h) || o.accessor(key).is_some() {
+            return None;
+        }
+        o.get(key)
     }
 
     /// `key in obj` (`[[HasProperty]]`) for a String `key`, when every object
@@ -68,13 +111,21 @@ impl Realm {
     #[must_use]
     pub(crate) fn has_property_by_string(&self, key: NanBox, obj: NanBox) -> Option<bool> {
         let k = self.string_key_in_place(key)?;
-        let mut cur = Some(Handle::from_raw(obj.as_handle()?));
+        self.has_property_named(Handle::from_raw(obj.as_handle()?), k)
+    }
+
+    /// `HasProperty(h, key)` for a storage key `key`, when every object on
+    /// `h`'s prototype chain up to the answer is an ordinary one (see the
+    /// module docs). `None` when that cannot be told here.
+    #[must_use]
+    pub(crate) fn has_property_named(&self, h: Handle, k: &str) -> Option<bool> {
+        let mut cur = Some(h);
         // (An ordinary chain has no cycle; the bound is a guard.)
         for _ in 0..64 {
             let Some(h) = cur else {
                 return Some(false);
             };
-            let o = self.ordinary_props(h)?;
+            let o = self.ordinary_props(h, false)?;
             if o.has_own_key(k) {
                 return Some(true);
             }

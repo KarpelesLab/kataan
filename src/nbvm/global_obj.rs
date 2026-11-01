@@ -62,27 +62,6 @@ pub(super) fn store(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: NanB
     ctx.realm.set_own_plain_data(g, name, v)
 }
 
-/// `typeof name` of a global reference, decided without running anything:
-/// the type of an initialized global-scope binding's value or (the global
-/// scope not binding `name`) of the global object's own data property, or
-/// `"undefined"` for a name nothing on the global object's (ordinary)
-/// prototype chain has — an unresolvable reference. `None` for anything
-/// else (the TDZ, an accessor, a proxy), which is the host's.
-pub(super) fn type_of(ctx: &Ctx, name: &str) -> Option<&'static str> {
-    if name.starts_with('\u{1}') {
-        return None;
-    }
-    let (scope, global) = ctx.host.as_deref()?.global_object_record()?;
-    if let Some(v) = scope.get(name) {
-        return (!v.is_tdz()).then(|| ctx.realm.type_of_value(v));
-    }
-    let g = Handle::from_raw(global.as_handle()?);
-    if let Some(v) = ctx.realm.own_plain_data(g, name) {
-        return Some(ctx.realm.type_of_value(v));
-    }
-    ctx.realm.plain_chain_lacks(g, name).then_some("undefined")
-}
-
 /// `[[Set]]` of `recv[key] = v` when `recv` is the running realm's global
 /// object and owns `key` as a writable data property: stores it there (with
 /// the write barrier) and, as the host's `sync_global_object_write` does,

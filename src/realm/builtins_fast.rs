@@ -1351,6 +1351,19 @@ impl Realm {
         const SLOTS: usize = 256;
         let b = s.as_bytes();
         match *b {
+            // (An ASCII unit's interned cell, checked against the literal's
+            // own byte: `unit_string`'s hit without re-encoding the unit.)
+            [c] if c < 0x80
+                && let Some(Some(h)) = self.unit_strings.get(usize::from(c))
+                && self
+                    .heap
+                    .get(*h)
+                    .and_then(Cell::as_str)
+                    .and_then(crate::rope::Rope::as_leaf_bytes)
+                    == Some(b) =>
+            {
+                return *h;
+            }
             [c] => return self.unit_string(u16::from(c)),
             [c0 @ 0xC2..=0xC3, c1] => {
                 return self.unit_string(u16::from(c0 & 0x1F) << 6 | u16::from(c1 & 0x3F));

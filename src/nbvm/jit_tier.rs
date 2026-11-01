@@ -1494,6 +1494,42 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::boolean(r);
             Ok(())
         }),
+        // `key in obj` over an ordinary chain (the interpreter arm's first
+        // step, also a `for-in`'s per-key liveness check).
+        Op::Relational {
+            dst,
+            instanceof: false,
+            a,
+            b,
+        } => ctx
+            .realm
+            .has_property_by_string(regs[*a as usize], regs[*b as usize])
+            .map(|r| {
+                regs[*dst as usize] = NanBox::boolean(r);
+                Ok(())
+            }),
+        // A `for-in`'s memoized key list (the hosted interpreter arm's first
+        // step).
+        Op::EnumKeys { dst, obj } if ctx.host.is_some() => regs[*obj as usize]
+            .as_handle()
+            .and_then(|h| ctx.realm.for_in_cached_array(Handle::from_raw(h)))
+            .map(|keys| {
+                regs[*dst as usize] = keys;
+                Ok(())
+            }),
+        // `typeof v` (its interpreter arm, which cannot fail).
+        Op::TypeOf { dst, a } => {
+            let t = ctx.realm.type_of_value(regs[*a as usize]);
+            regs[*dst as usize] = NanBox::handle(ctx.realm.type_name_string(t).to_raw());
+            Some(Ok(()))
+        }
+        // `typeof name` for a plain global (the interpreter arm's first step).
+        Op::TypeofGlobal { dst, name, cache } => {
+            super::typeof_fast::type_of(ctx, name, cache).map(|t| {
+                regs[*dst as usize] = NanBox::handle(ctx.realm.type_name_string(t).to_raw());
+                Ok(())
+            })
+        }
         // A sloppy function's `this`: the interpreter arm's fast path (one
         // realm: `undefined`/`null` binds the global `this`; an object is
         // its own ToObject).

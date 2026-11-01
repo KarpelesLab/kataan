@@ -57,6 +57,13 @@ static NEXT_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// tier's "nothing validated" mark).
 static GLOBAL_BINDING_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
+/// The current global binding epoch (see [`bump_global_binding_epoch`]).
+#[inline]
+#[must_use]
+pub(crate) fn global_binding_epoch() -> u64 {
+    GLOBAL_BINDING_EPOCH.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Retires every global binding address the compiled tier validated (see
 /// [`global_binding_epoch_addr`]).
 #[inline]

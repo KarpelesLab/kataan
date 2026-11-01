@@ -62,7 +62,9 @@ pub(crate) mod native_call;
 pub mod objlit;
 mod private_ops;
 mod str_replace;
+mod typeof_fast;
 pub use str_replace::{ReplacePlan, ReplaceStep};
+pub use typeof_fast::TypeofGlobalCache;
 mod vm_eval;
 #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 use jit_tier::call_generic;
@@ -136,7 +138,11 @@ pub enum Op {
     },
     /// `dst = typeof name` for a global-environment name: `"undefined"` rather
     /// than a `ReferenceError` when it is unresolvable.
-    TypeofGlobal { dst: Reg, name: String },
+    TypeofGlobal {
+        dst: Reg,
+        name: String,
+        cache: typeof_fast::TypeofGlobalCache,
+    },
     /// `name = src` for a global-environment name (`PutValue`): a sloppy write
     /// to an unresolvable name creates a global, a strict one throws.
     StoreGlobal {
@@ -5898,6 +5904,10 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     if let Some(v) = ctx.realm.add_str_int(a, b) {
         return Ok(v);
     }
+    // Two strings: one rope concatenation (`Realm::add_str_str`).
+    if let Some(v) = ctx.realm.add_str_str(a, b) {
+        return Ok(v);
+    }
     // A string with a string or a number: no host operand, ToPrimitive is the
     // identity and no Symbol is involved.
     let prim_str = |v: NanBox| {
@@ -8025,18 +8035,18 @@ fn run_frame_at_ic(
             }
             Op::TypeOf { dst, a } => {
                 let t = ctx.realm.type_of_value(regs[*a as usize]);
-                regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
+                regs[*dst as usize] = NanBox::handle(ctx.realm.type_name_string(t).to_raw());
             }
             Op::LoadGlobal { dst, name, cache } => match vm_load_global(ctx, name, cache) {
                 Ok(v) => regs[*dst as usize] = v,
                 Err(e) => handle_throw!(e),
             },
-            Op::TypeofGlobal { dst, name } => match global_obj::type_of(ctx, name)
+            Op::TypeofGlobal { dst, name, cache } => match typeof_fast::type_of(ctx, name, cache)
                 .map(Ok)
                 .or_else(|| with_host(ctx, |h| h.typeof_global(name)))
             {
                 Some(Ok(t)) => {
-                    regs[*dst as usize] = NanBox::handle(ctx.realm.new_string(t).to_raw());
+                    regs[*dst as usize] = NanBox::handle(ctx.realm.type_name_string(t).to_raw());
                 }
                 Some(Err(e)) => handle_throw!(VmError::from(e)),
                 None => return Err(VmError::Unsupported),
@@ -9524,6 +9534,16 @@ fn run_frame_at_ic(
             // whose properties keep a key live (or `undefined`).
             Op::EnumKeys { dst, obj } if ctx.host.is_some() => {
                 let o = regs[*obj as usize];
+                // A memoized key list (`realm::forin_cache`; never a proxy,
+                // namespace or other exotic object): `obj` stays the
+                // liveness object.
+                if let Some(keys) = o
+                    .as_handle()
+                    .and_then(|h| ctx.realm.for_in_cached_array(Handle::from_raw(h)))
+                {
+                    regs[*dst as usize] = keys;
+                    continue;
+                }
                 match with_host(ctx, |h| h.for_in_enumerate(o)) {
                     Some(Ok((keys, live))) => {
                         regs[*dst as usize] = keys;
@@ -19318,6 +19338,7 @@ impl Compiler {
                     self.ops.push(Op::TypeofGlobal {
                         dst,
                         name: String::from(&*id.name),
+                        cache: typeof_fast::TypeofGlobalCache::default(),
                     });
                     return Ok(dst);
                 }
