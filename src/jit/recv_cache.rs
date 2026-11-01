@@ -528,7 +528,10 @@ pub(super) fn shape_ways(
         // (`call_seq::emit_inline_guard`): they prove none.
         if matches!(
             op,
-            GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. } | GenericOp::InlineGuard { .. }
+            GenericOp::Not { .. }
+                | GenericOp::JumpIfFalse { .. }
+                | GenericOp::InlineGuard { .. }
+                | GenericOp::GetMethod { .. }
         ) {
             continue;
         }
@@ -587,6 +590,8 @@ pub(super) fn plan(
         // A read a promoted loop's fast version replaces by a register copy
         // makes no way access there (`numeric::plan_reuse`).
         GenericOp::GetProp { .. } if reused(i).is_some() => None,
+        // A method read through the call site's memo (`GetMethodWay`).
+        GenericOp::GetMethod { obj, .. } if !in_spec(i) => Some((obj, Family::Obj)),
         // An inlined method call's guard looks the method up on its
         // receiver (`call_seq::emit_inline_guard`) — but not in a
         // speculative loop, where a later site may take the way as filled
@@ -728,6 +733,12 @@ pub(super) fn plan(
                 }
                 Some(st) if !back[i] && !entry.contains(&i) => {
                     let here = (core::mem::take(&mut live), core::mem::take(&mut fresh));
+                    // One branch in, and a fall-in that knows no walked
+                    // value (an inlined call's fallback `call` just before:
+                    // `x = o.m(); if (!x)`): the registers name what they
+                    // named on the branch's path, the only one with a way
+                    // to reuse (none of it certain, see `merge`).
+                    let branch_ids = falls_in && into[i] == 1 && here.0.is_empty();
                     let (l, f) = if falls_in {
                         merge(&mut fill, st, here)
                     } else {
@@ -736,6 +747,10 @@ pub(super) fn plan(
                     };
                     live = l;
                     fresh = f;
+                    if branch_ids && let Some(Some((v, r))) = snap_ids[i].take() {
+                        ids = v;
+                        joined_reads = Some(r);
+                    }
                 }
                 // A loop's header, entered by falling in: a value walked
                 // before the loop may still be in its way on the first
@@ -897,8 +912,29 @@ pub(super) fn plan(
                 | GenericOp::Arith { .. }
                 | GenericOp::Add { .. }
                 | GenericOp::NumAdd { .. }
+                | GenericOp::ToNumeric { .. }
+                | GenericOp::Step { .. }
+                | GenericOp::SetProp { .. }
+                | GenericOp::InlineGuard { .. }
+                | GenericOp::InlineLeave
+        ) && !matches!(
+            (op, bytecode.get(i)),
+            (
+                GenericOp::Interp { .. },
+                Some(Op::RequireObjectCoercible { .. })
+            )
         ) {
             reads.clear();
+        }
+        // A property store most likely changes only its own key's value (an
+        // accessor's or a `valueOf`'s code may do more: the reads are only
+        // guesses, which a key compare decides).
+        if let (
+            GenericOp::SetProp { .. },
+            Some(Op::SetProp { key, .. } | Op::SetPropStrict { key, .. }),
+        ) = (op, bytecode.get(i))
+        {
+            reads.retain(|r| r.1 != key.as_str());
         }
         if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
             && t > i
@@ -1208,6 +1244,20 @@ fn writes(op: &GenericOp, bc: Option<&Op>, r: u16) -> bool {
         }),
         _ => op_dst(op) == Some(r),
     }
+}
+
+/// A `GetMethod`'s receiver-cache way (`call_seq::emit_get_method`): its
+/// frame slots, whether to compare the key first and whether a walk fills
+/// it (only with an object of the way's layout, if it proves one). A
+/// `GetMethod` site proves no layout itself and is never a speculative
+/// loop's (its inline lookup may go on without filling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct GetMethodWay {
+    pub(super) key: i32,
+    pub(super) cell: i32,
+    pub(super) check: bool,
+    pub(super) fill: bool,
+    pub(super) layout: Option<u64>,
 }
 
 /// A way that a `call` keeps instead of emptying it: its frame slots, the

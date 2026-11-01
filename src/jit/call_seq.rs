@@ -1385,6 +1385,7 @@ pub(crate) fn emit_get_method(
     method: *const super::props::MethodSite,
     site: *const CallSite,
     miss: Label,
+    way: Option<super::recv_cache::GetMethodWay>,
 ) {
     use core::mem::offset_of;
     let jl = super::compute_jit_layout();
@@ -1392,7 +1393,32 @@ pub(crate) fn emit_get_method(
     let lk = |f: usize| m(offset_of!(GetMethodMemo, lookup) + f);
     let lookup = a.new_label();
     let have = a.new_label();
+    // The receiver through its receiver-cache way (see `GetMethodWay`): a
+    // hit takes the walked slot from it; a walk fills it.
+    let walked = a.new_label();
+    if let Some(w) = way
+        && w.check
+    {
+        let walk = a.new_label();
+        a.g_load(r::RAX, recv.0, recv.1);
+        a.g_cmp_mem(r::RAX, RBP, w.key);
+        a.g_jcc(cc::NE, walk);
+        a.g_load(r::RCX, RBP, w.cell);
+        a.jmp(walked);
+        a.bind(walk);
+    }
     a.p_walk_plain(jl, realm_off, recv, miss);
+    if let Some(w) = way
+        && w.fill
+    {
+        if let Some(s) = w.layout {
+            a.p_cmp_shape(r::RCX, jl.off_shape, s, r::R11);
+            a.g_jcc(cc::NE, walked);
+        }
+        a.g_store(RBP, w.key, r::RAX);
+        a.g_store(RBP, w.cell, r::RCX);
+    }
+    a.bind(walked);
     a.g_movabs(r::R11, site as u64);
     a.g_load(r::RAX, r::RCX, jl.off_shape);
     a.g_cmp_mem(r::RAX, r::R11, lk(offset_of!(LookupMemo, shape)));
@@ -2302,7 +2328,18 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
                         }
                         a.bind(walk);
                         a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), lookup_miss);
-                        if w.fill {
+                        if w.fill && a.pinned() {
+                            // (A pinned walk leaves the value in `rax`, which
+                            // the layout compare keeps.)
+                            let skip = a.new_label();
+                            if let Some(shape) = w.shape {
+                                a.p_cmp_shape(r::RCX, jl.off_shape, shape, r::R11);
+                                a.g_jcc(cc::NE, skip);
+                            }
+                            a.g_store(RBP, w.key, r::RAX);
+                            a.g_store(RBP, w.cell, r::RCX);
+                            a.bind(skip);
+                        } else if w.fill {
                             let skip = a.new_label();
                             if let Some(shape) = w.shape {
                                 a.g_load(r::RAX, r::RCX, jl.off_shape);

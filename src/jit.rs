@@ -9460,6 +9460,17 @@ impl JitFunction {
                             s.method_ptr,
                             call_site,
                             helper,
+                            rc.sites[op_idx]
+                                .filter(|p| {
+                                    p.family == recv_cache::Family::Obj && !num.in_spec(op_idx)
+                                })
+                                .map(|p| recv_cache::GetMethodWay {
+                                    key: rc_key(p.way),
+                                    cell: rc_cell(p.way),
+                                    check: p.check,
+                                    fill: p.fill,
+                                    layout: way_shape[p.way],
+                                }),
                         );
                     }
                     a.store_rax(disp(dst));

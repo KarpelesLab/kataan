@@ -2133,9 +2133,7 @@ impl X64Assembler {
         self.p_plain_shaped(l, other);
         let skip_fill = self.new_label();
         if let Some(s) = shape {
-            self.g_load(r::R11, r::RCX, l.off_shape);
-            self.g_movabs(r::RDX, s);
-            self.g_cmp(r::R11, r::RDX);
+            self.p_cmp_shape(r::RCX, l.off_shape, s, r::RDX);
             self.jne(skip_fill);
         }
         self.g_store(r::RBP, key, bits);
