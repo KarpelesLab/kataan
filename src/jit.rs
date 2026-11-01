@@ -7188,24 +7188,36 @@ impl JitFunction {
         // The guards in a speculative loop that prove their callee for
         // the next times (`call_seq::InlineEmit::proved`), each two slots
         // under the inline slots: by op, its index.
-        let mut n_proved = 0usize;
+        //
+        // Every such guard of one callee key at one inlining level shares
+        // one pair: what any of them proved (that value is the key's
+        // function, the level's limits are checked) holds for all of them
+        // until the next call empties it, so `f(); f(); f()` of a fresh
+        // closure identifies it once, not three times. (Not only in
+        // speculative loops: the slots are emptied by the prologue and
+        // after every call wherever they are read.)
+        let mut proof_keys: Vec<(u64, u8)> = Vec::new();
         let proved_slot: Vec<Option<usize>> = ops
             .iter()
             .enumerate()
             .map(|(i, o)| match *o {
-                GenericOp::InlineGuard { poly: 0, call, .. }
-                    if num.in_spec(i)
-                        && matches!(
-                            ops.get(call as usize),
-                            Some(GenericOp::CallValue { .. } | GenericOp::CallWithMethod { .. })
-                        ) =>
+                GenericOp::InlineGuard {
+                    poly: 0, call, key, ..
+                } if matches!(
+                    ops.get(call as usize),
+                    Some(GenericOp::CallValue { .. } | GenericOp::CallWithMethod { .. })
+                ) =>
                 {
-                    n_proved += 1;
-                    Some(n_proved - 1)
+                    let k = (key, inl_level[i]);
+                    Some(proof_keys.iter().position(|&p| p == k).unwrap_or_else(|| {
+                        proof_keys.push(k);
+                        proof_keys.len() - 1
+                    }))
                 }
                 _ => None,
             })
             .collect();
+        let n_proved = proof_keys.len();
         let proved_base = inl_base - 8 * (4 + 3 * i32::from(has_nested));
         let inl_proved = |k: usize| {
             let k = k as i32;
