@@ -1005,22 +1005,27 @@ neverSettles }}` parks forever.
 original (clean-room) programs, takes best-of-3 wall clock, and checks each
 program's output against node's. Ratios are kataan/node; lower is better.
 
-| benchmark | start of campaign (42796a5) | 8ca64fb | c616086 | 9dc93cb | 1d39450 | ed4765fe | b3f37ff9 | fd93e0a4 | 34d0fff7 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| fib | 19x | 4.5x | 1.6x | 1.4x | 1.3x | 1.3x | 1.2x | 1.4x | 0.8x |
-| sort | 20x | 5.0x | 1.8x | 1.7x | 1.5x | 1.0x | 1.0x | 0.9x | 0.9x |
-| json | 11x | 3.5x | 2.0x | 1.9x | 1.4x | 1.4x | 1.4x | 1.4x | 1.0x |
-| array_ops | 44x | 7.6x | 2.6x | 2.6x | 2.5x | 1.6x | 1.6x | 1.6x | 0.9x |
-| loop_arith | 372x | 25.6x | 3.2x | 0.9x | 0.9x | 0.9x | 0.8x | 0.9x | 0.8x |
-| richards_like | (quadratic, fixed) | 9.4x | 4.0x | 3.2x | 2.7x | 2.5x | 2.2x | 2.0x | 1.5x |
-| string_build | 14x | 7.4x | 4.1x | 3.1x | 2.7x | 2.0x | 1.1x | 1.1x | 1.0x |
-| map_set | 400x | 6.6x | 4.6x | 3.2x | 1.4x | 1.4x | 1.5x | 1.2x | 0.9x |
-| regex | 18x | 11.5x | 5.1x | 5.1x | 3.4x | 2.6x | 1.4x | 1.4x | 1.0x |
-| prop_access | 101x | 9.4x | 7.0x | 5.3x | 2.3x | 1.7x | 1.0x | 1.1x | 1.0x |
-| method_calls | 80x | 21.6x | 8.9x | 4.7x | 3.6x | 2.7x | 2.0x | 1.6x | 1.3x |
-| closures | 69x | 16.9x | 12.4x | 3.9x | 2.0x | 1.8x | 1.6x | 1.3x | 0.8x |
-| objects_alloc | 265x | 16.2x | 13.8x | 7.9x | 6.0x | 3.6x | 1.9x | 1.5x | 1.4x |
-| nbody_like | 205x | 28.9x | 21.7x | 15.2x | 9.2x | 5.1x | 2.8x | 3.0x | 1.9x |
+| benchmark | start of campaign (42796a5) | 8ca64fb | c616086 | 9dc93cb | 1d39450 | ed4765fe | b3f37ff9 | fd93e0a4 | 34d0fff7 | 2e4a59e5 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fib | 19x | 4.5x | 1.6x | 1.4x | 1.3x | 1.3x | 1.2x | 1.4x | 0.8x | 0.8x |
+| sort | 20x | 5.0x | 1.8x | 1.7x | 1.5x | 1.0x | 1.0x | 0.9x | 0.9x | 1.0x |
+| json | 11x | 3.5x | 2.0x | 1.9x | 1.4x | 1.4x | 1.4x | 1.4x | 1.0x | 0.8x |
+| array_ops | 44x | 7.6x | 2.6x | 2.6x | 2.5x | 1.6x | 1.6x | 1.6x | 0.9x | 0.9x |
+| loop_arith | 372x | 25.6x | 3.2x | 0.9x | 0.9x | 0.9x | 0.8x | 0.9x | 0.8x | 0.8x |
+| richards_like | (quadratic, fixed) | 9.4x | 4.0x | 3.2x | 2.7x | 2.5x | 2.2x | 2.0x | 1.5x | 1.2x |
+| string_build | 14x | 7.4x | 4.1x | 3.1x | 2.7x | 2.0x | 1.1x | 1.1x | 1.0x | 0.8x |
+| map_set | 400x | 6.6x | 4.6x | 3.2x | 1.4x | 1.4x | 1.5x | 1.2x | 0.9x | 0.8x |
+| regex | 18x | 11.5x | 5.1x | 5.1x | 3.4x | 2.6x | 1.4x | 1.4x | 1.0x | 0.9x |
+| prop_access | 101x | 9.4x | 7.0x | 5.3x | 2.3x | 1.7x | 1.0x | 1.1x | 1.0x | 0.7x |
+| method_calls | 80x | 21.6x | 8.9x | 4.7x | 3.6x | 2.7x | 2.0x | 1.6x | 1.3x | 0.9x |
+| closures | 69x | 16.9x | 12.4x | 3.9x | 2.0x | 1.8x | 1.6x | 1.3x | 0.8x | 0.9x |
+| objects_alloc | 265x | 16.2x | 13.8x | 7.9x | 6.0x | 3.6x | 1.9x | 1.5x | 1.4x | 1.0x |
+| nbody_like | 205x | 28.9x | 21.7x | 15.2x | 9.2x | 5.1x | 2.8x | 3.0x | 1.9x | 1.1x |
+
+These runs are short and whole-process, so they include node's slower startup and warm-up. Steady state is
+further behind: with the main loop scaled 4x (2e4a59e5, best of 5, kataan/node), map_set 0.68x, regex 0.84x,
+loop_arith 0.87x, json 0.97x, array_ops 1.0x, method_calls 1.2x, closures 1.2x, prop_access 1.4x,
+string_build 1.4x, objects_alloc 1.6x, nbody_like 1.8x, richards_like 2.3x.
 
 The main contributors, by landing order:
 - number fast paths;
