@@ -50,7 +50,7 @@ pub(super) fn type_of(ctx: &Ctx, name: &str, cache: &TypeofGlobalCache) -> Optio
     if name.starts_with('\u{1}') {
         return None;
     }
-    let (scope, global) = ctx.host.as_deref()?.global_scope_if_current()?;
+    let (scope, global) = ctx.host.as_deref()?.global_object_record()?;
     let g = Handle::from_raw(global.as_handle()?);
     let epoch = crate::env::global_binding_epoch();
     let proven = cache.unbound_at.get() == epoch && cache.global.get() == g.to_raw();
