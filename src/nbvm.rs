@@ -1933,7 +1933,8 @@ fn plain_write_ok(realm: &Realm, h: Handle, key: &str) -> bool {
     }
     let mut cur = realm.object_proto(h);
     while let Some(p) = cur {
-        if realm.proxy_at(p).is_some() {
+        // A proxy or a module namespace has a `[[Set]]` of its own.
+        if realm.proxy_at(p).is_some() || realm.is_host_exotic(p) {
             return false;
         }
         if let Some((_, setter)) = realm.accessor(p, key) {

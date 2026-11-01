@@ -147,3 +147,50 @@ fn import_bindings_on_the_eval_environment_paths() {
          number,number,1|TypeError|7"
     );
 }
+
+/// A module namespace on a prototype chain fails `[[Set]]` (the write created an
+/// own property), and a namespace's integrity operations read its bindings, so a
+/// binding in its temporal dead zone throws.
+#[test]
+fn namespace_objects_on_the_chain_and_in_the_dead_zone() {
+    let lib = r#"
+        import * as ns from "./lib";
+        export const a = 1;
+        const r = [];
+        const T = (f) => { try { r.push(f()); } catch (e) { r.push(e.name); } };
+        const c = Object.create(ns);
+        T(() => { c.a = 2; });
+        T(() => { c.fresh = 2; });
+        T(() => Reflect.set(c, "fresh", 2));
+        T(() => Reflect.set(Object.create(c), "a", 2));
+        T(() => new Function("c", "c.fresh = 3; return Object.keys(c).length")(c));
+        T(() => Object.defineProperty(c, "own", { value: 9 }).own);
+        T(() => { c.own2 = 0; });
+        T(() => Object.isFrozen(ns));
+        T(() => Object.isSealed(ns));
+        export const b = 1;
+        console.log(r.join("|"));
+        const s = Object.keys(ns).join();
+        const q = [];
+        const U = (f) => { try { q.push(f()); } catch (e) { q.push(e.name); } };
+        globalThis.__late = () => {
+            U(() => Object.isFrozen(ns));
+            U(() => Object.isSealed(ns));
+            U(() => Object.freeze(ns) === ns);
+            U(() => Object.seal(ns) === ns);
+            U(() => Object.keys(Object.getOwnPropertyDescriptors(ns)).join());
+            console.log(s, q.join("|"));
+        };
+    "#;
+    let main = r#"
+        import "./lib";
+        __late();
+    "#;
+    // `a` is initialized and `b` is not at the first probes: a frozen test answers
+    // false at `a`, a sealed test reads on to `b`.
+    assert_eq!(
+        run_with_lib(main, lib),
+        "TypeError|TypeError|false|false|0|9|TypeError|false|ReferenceError\n\
+         a,b false|true|TypeError|true|a,b"
+    );
+}

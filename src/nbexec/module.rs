@@ -1746,6 +1746,47 @@ impl Interp {
         Ok(())
     }
 
+    /// Whether OrdinarySet of `key` from `start` reaches a module namespace on the
+    /// prototype chain (its `[[Set]]` always fails): nothing closer owns `key`.
+    #[cfg(all(feature = "module", feature = "std"))]
+    pub(crate) fn namespace_answers_set(&self, start: crate::heap::Handle, key: &str) -> bool {
+        if self.module_namespaces.is_empty() {
+            return false;
+        }
+        let mut cur = Some(start);
+        while let Some(c) = cur {
+            if self.module_namespaces.contains_key(&c.to_raw()) {
+                return true;
+            }
+            if self.realm.proxy_at(c).is_some()
+                || self.realm.typed_kind(c).is_some()
+                || self.realm.accessor(c, key).is_some()
+                || self.realm.has_own(c, key)
+            {
+                return false;
+            }
+            cur = self.realm.object_proto(c);
+        }
+        false
+    }
+
+    /// The `[[GetOwnProperty]]` of `handle`'s first export when it is a module
+    /// namespace: a `ReferenceError` when that binding is in its Temporal Dead Zone.
+    #[cfg(all(feature = "module", feature = "std"))]
+    pub(crate) fn namespace_first_key_tdz(
+        &mut self,
+        handle: crate::heap::Handle,
+    ) -> Result<(), ExecError> {
+        let first = self
+            .module_namespaces
+            .get(&handle.to_raw())
+            .and_then(|m| m.keys().next().cloned());
+        match first {
+            Some(name) => self.namespace_binding_tdz(handle, &name),
+            None => Ok(()),
+        }
+    }
+
     /// The module namespace exotic `[[DefineOwnProperty]]` (§10.4.6.11). Returns
     /// `Ok(None)` when `handle` is not a namespace or `key` is a Symbol (both
     /// fall through to `OrdinaryDefineOwnProperty` — so `@@toStringTag` and new

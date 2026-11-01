@@ -653,6 +653,18 @@ impl Interp {
     ) -> Result<Option<()>, ExecError> {
         let mut cur = self.realm.object_proto(receiver);
         while let Some(c) = cur {
+            // A module namespace on the chain: its `[[Set]]` always returns false.
+            #[cfg(all(feature = "module", feature = "std"))]
+            if self.module_namespaces.contains_key(&c.to_raw()) {
+                if self.strict {
+                    let m = self.new_str(&alloc::format!(
+                        "Cannot assign to read only property '{}' of a module namespace object",
+                        crate::realm::key_display(key)
+                    ));
+                    return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
+                }
+                return Ok(Some(()));
+            }
             // A proxy above the receiver handles the write through its own
             // `[[Set]]` (trap, or trapless forward to an inherited setter, else the
             // own-property creation on the receiver).
@@ -783,6 +795,11 @@ impl Interp {
                 // takes the trap path below), so this only triggers for an ancestor.
                 if self.realm.proxy_at(c).is_some() {
                     return self.proxy_set_bool(c, key, value, receiver);
+                }
+                // A module namespace's `[[Set]]` always returns false.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if self.module_namespaces.contains_key(&c.to_raw()) {
+                    return Ok(false);
                 }
                 // Integer-indexed exotic `[[Set]]` (10.4.5.5): a canonical numeric
                 // index on a **TypedArray** reached in the chain is governed by that

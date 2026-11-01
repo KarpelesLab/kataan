@@ -1148,6 +1148,12 @@ impl Interp {
                 NanBox::handle(self.realm.new_array(boxed).to_raw())
             }
             N_OBJECT_FREEZE => {
+                // SetIntegrityLevel asks `[[GetOwnProperty]]` first; the first
+                // initialized export of a namespace then fails the define.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(raw) = arg(0).as_handle() {
+                    self.namespace_first_key_tdz(Handle::from_raw(raw))?;
+                }
                 // A proxy routes SetIntegrityLevel through its traps (ownKeys +
                 // getOwnPropertyDescriptor + defineProperty, per key).
                 // A mapped `arguments` object too: its `[[DefineOwnProperty]]`
@@ -1201,6 +1207,11 @@ impl Interp {
                 arg(0) // returns the (now frozen) object
             }
             N_OBJECT_SEAL => {
+                // A namespace's `[[DefineOwnProperty]]` reads each binding.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(raw) = arg(0).as_handle() {
+                    self.namespace_enumeration_tdz(Handle::from_raw(raw))?;
+                }
                 if let Some(raw) = arg(0).as_handle()
                     && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
                 {
@@ -1249,6 +1260,12 @@ impl Interp {
             N_OBJECT_IS_SEALED => {
                 // A non-object argument (a primitive) is reported as sealed.
                 let v = arg(0);
+                // TestIntegrityLevel's `[[GetOwnProperty]]` per key: every export
+                // of a namespace is non-configurable, so all of them are read.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(raw) = v.as_handle() {
+                    self.namespace_enumeration_tdz(Handle::from_raw(raw))?;
+                }
                 if let Some(raw) = v.as_handle()
                     && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
                 {
@@ -1469,6 +1486,10 @@ impl Interp {
                     } else {
                         NanBox::handle(h.to_raw())
                     };
+                    #[cfg(all(feature = "module", feature = "std"))]
+                    if self.namespace_answers_set(h, &key) {
+                        return Ok(NanBox::boolean(false));
+                    }
                     // Integer-indexed exotic `[[Set]]`: a canonical numeric index on a
                     // typed-array target never consults the prototype chain.
                     //   - SameValue(O, Receiver): IntegerIndexedElementSet, return true
@@ -1882,6 +1903,8 @@ impl Interp {
                     arg(0),
                     "Object.getOwnPropertyDescriptors",
                 )?;
+                #[cfg(all(feature = "module", feature = "std"))]
+                self.namespace_enumeration_tdz(obj)?;
                 let out = self.realm.new_object();
                 {
                     if self.realm.proxy_at(obj).is_some() {
@@ -1920,6 +1943,12 @@ impl Interp {
             N_OBJECT_IS_FROZEN => {
                 // A non-object argument (a primitive) is reported as frozen.
                 let v = arg(0);
+                // TestIntegrityLevel's `[[GetOwnProperty]]` per key: the first
+                // initialized export of a namespace (writable) already answers.
+                #[cfg(all(feature = "module", feature = "std"))]
+                if let Some(raw) = v.as_handle() {
+                    self.namespace_first_key_tdz(Handle::from_raw(raw))?;
+                }
                 if let Some(raw) = v.as_handle()
                     && self.realm.proxy_at(Handle::from_raw(raw)).is_some()
                 {
