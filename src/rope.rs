@@ -225,6 +225,27 @@ impl Rope {
         Rope(Rc::new(Node::flat(bytes)))
     }
 
+    /// [`from_bytes`](Self::from_bytes) of bytes the caller knows are all
+    /// ASCII: the UTF-16 length (the byte length) is recorded up front, so a
+    /// later `.length` or indexed read needs no scan.
+    #[must_use]
+    pub fn from_ascii_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.is_ascii());
+        let node = Node::flat(bytes);
+        Self::with_known_utf16(node, bytes.len())
+    }
+
+    /// A flat `node` with its UTF-16 length memo set to `units`.
+    #[inline]
+    fn with_known_utf16(node: Node, units: usize) -> Self {
+        match &node {
+            Node::Small { u16, .. } => u16.set(units as u8),
+            Node::Leaf(_, cell) => cell.set(units),
+            _ => {}
+        }
+        Rope(Rc::new(node))
+    }
+
     /// The total length in bytes (O(1) — cached).
     #[must_use]
     pub fn len(&self) -> usize {

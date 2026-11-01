@@ -367,6 +367,22 @@ impl Realm {
         true
     }
 
+    /// The shape of the object at `handle` when it is a plain shaped data
+    /// object with the default `[[Prototype]]` holding exactly `n` keys,
+    /// every one added once and none removed: then that shape's keys, in slot
+    /// order, are the keys in the order they were added, and
+    /// [`new_object_in_shape`](Self::new_object_in_shape) of the same keys'
+    /// values remakes the same object (`JSON.parse`'s record templates).
+    #[must_use]
+    pub fn plain_fresh_shape(&self, handle: Handle, n: usize) -> Option<Rc<Shape>> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        let shape = o.shaped_shape()?;
+        (o.is_plain_fresh_data() && o.len() as usize == n && o.proto() == self.default_object_proto)
+            .then(|| Rc::clone(shape))
+    }
+
     /// This realm's root shape (the one every ordinary object grows from).
     #[must_use]
     pub fn root_shape_rc(&self) -> Rc<Shape> {

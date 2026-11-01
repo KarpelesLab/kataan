@@ -868,6 +868,21 @@ impl Interp {
                 }
             }
             N_JSON_PARSE => {
+                // A string `text` with no reviver: parse its own bytes (an
+                // `Rc` bump of a flat string, not a copy; lone surrogates
+                // kept). `ToString` of a string is itself.
+                let reviver = arg(1);
+                if let Some(raw) = arg(0).as_handle()
+                    && let Some(rope) = self.realm.string_rope(Handle::from_raw(raw))
+                    && !reviver
+                        .as_handle()
+                        .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
+                {
+                    return match rope.as_leaf_bytes() {
+                        Some(bytes) => self.json_parse_wtf8(bytes),
+                        None => self.json_parse_wtf8(&rope.materialize_bytes()),
+                    };
+                }
                 // `JSON.parse(text)` does `ToString(text)` first — a user
                 // `toString`/`valueOf` runs (propagating), unlike the raw
                 // `to_display_string` which stringifies an object as "[object …]".
