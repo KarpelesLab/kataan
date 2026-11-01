@@ -279,33 +279,69 @@ impl Interp {
         cx: &mut JsonOut<'_>,
         holder: Handle,
         key: JsonKey<'_>,
+        value: NanBox,
+        indent: &str,
+    ) -> Result<bool, ExecError> {
+        // With no replacer function, a primitive that is no handle (no
+        // `toJSON`, nothing to unwrap) is its text at once, as
+        // `json_ser_value` writes it, and a String primitive (no `toJSON`
+        // lookup, no wrapper or RawJSON probes) is quoted: here, ahead of
+        // the general steps (out of line, so these cheap cases do not pay
+        // for their frame).
+        if cx.replacer_fn.as_handle().is_none() {
+            match value.unpack() {
+                Unpacked::Number(n) => {
+                    if n.is_finite() {
+                        crate::realm::push_js_number(&mut cx.out, n);
+                    } else {
+                        cx.out.push_str("null");
+                    }
+                    return Ok(true);
+                }
+                Unpacked::Bool(b) => {
+                    cx.out.push_str(if b { "true" } else { "false" });
+                    return Ok(true);
+                }
+                Unpacked::Null => {
+                    cx.out.push_str("null");
+                    return Ok(true);
+                }
+                Unpacked::Handle(raw) if self.realm.typeof_is_string(Handle::from_raw(raw)) => {
+                    self.json_quote_string(cx, Handle::from_raw(raw))?;
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        self.json_ser_got_full(cx, holder, key, value, indent)
+    }
+
+    /// [`json_ser_got`](Self::json_ser_got)'s general steps.
+    #[inline(never)]
+    fn json_ser_got_full(
+        &mut self,
+        cx: &mut JsonOut<'_>,
+        holder: Handle,
+        key: JsonKey<'_>,
         mut value: NanBox,
         indent: &str,
     ) -> Result<bool, ExecError> {
-        // With no replacer function, the two commonest heap values skip the
-        // general dispatch: a String primitive (no `toJSON` lookup, no wrapper
-        // or RawJSON probes) is quoted, and an ordinary dense array with no
-        // named own properties (so no own `toJSON`) whose prototype chain is
-        // known to lack `toJSON` is serialized as an array — exactly what
-        // the steps below conclude for them.
+        // With no replacer function, an ordinary dense array with no named
+        // own properties (so no own `toJSON`) whose prototype chain is known
+        // to lack `toJSON` is serialized as an array — exactly what the
+        // steps below conclude for it.
         if cx.replacer_fn.as_handle().is_none()
             && let Some(h) = value.as_handle().map(Handle::from_raw)
+            && self.realm.is_plain_array_cell(h)
+            && !self.realm.is_host_exotic(h)
+            && !self.realm.may_own_named(h)
+            && self
+                .realm
+                .object_proto(h)
+                .is_some_and(|proto| self.realm.chain_absent_cached(proto, &cx.tojson_arr))
         {
-            if self.realm.typeof_is_string(h) {
-                self.json_quote_string(cx, h)?;
-                return Ok(true);
-            }
-            if self.realm.is_plain_array_cell(h)
-                && !self.realm.is_host_exotic(h)
-                && !self.realm.may_own_named(h)
-                && self
-                    .realm
-                    .object_proto(h)
-                    .is_some_and(|proto| self.realm.chain_absent_cached(proto, &cx.tojson_arr))
-            {
-                self.json_ser_array(cx, h, indent)?;
-                return Ok(true);
-            }
+            self.json_ser_array(cx, h, indent)?;
+            return Ok(true);
         }
         // If value is an Object (or BigInt) with a callable `toJSON`, call it.
         if let Some(h) = value.as_handle().map(Handle::from_raw) {
@@ -333,6 +369,11 @@ impl Interp {
     fn json_quote_string(&mut self, cx: &mut JsonOut<'_>, h: Handle) -> Result<(), ExecError> {
         let n = self.realm.string_byte_len(h).unwrap_or(0);
         self.check_str_len(cx.out.len() + n + 2)?;
+        // A flat string is quoted from its leaf at once.
+        if let Some(bytes) = self.realm.string_leaf_bytes(h) {
+            json_quote_wtf8_into(&mut cx.out, bytes);
+            return self.check_str_len(cx.out.len());
+        }
         // Collapse a rope once so the quoting borrows one leaf.
         self.realm.flatten_string(h);
         if let Some(bytes) = self.realm.string_leaf_bytes(h) {

@@ -1558,6 +1558,45 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
             Some(Ok(()))
         }
+        // `${v}` / `String(v)`'s ToString of a primitive (the interpreter
+        // arm's non-object cases: a string is itself, anything else its
+        // digits or name, a small integer's interned); an object runs code
+        // and takes the one-op frame.
+        Op::ToStr { dst, src } | Op::ToStrLazy { dst, src } => {
+            let v = regs[*src as usize];
+            match v.as_handle() {
+                Some(h) if ctx.realm.is_string_handle(Handle::from_raw(h)) => {
+                    regs[*dst as usize] = v;
+                    Some(Ok(()))
+                }
+                Some(_) => None,
+                None if matches!(op, Op::ToStrLazy { .. }) => {
+                    regs[*dst as usize] = v;
+                    Some(Ok(()))
+                }
+                None => {
+                    regs[*dst as usize] =
+                        NanBox::handle(ctx.realm.new_primitive_string(v).to_raw());
+                    Some(Ok(()))
+                }
+            }
+        }
+        // A template literal's concatenation when every part is a string or a
+        // primitive (its interpreter arm's first step, which runs no code);
+        // anything else takes the one-op frame.
+        Op::Concat { dst, parts } if parts.len() <= 16 => {
+            let mut vals = [NanBox::undefined(); 16];
+            for (slot, r) in vals.iter_mut().zip(parts.iter()) {
+                *slot = regs[*r as usize];
+            }
+            match ctx.realm.concat_parts(&vals[..parts.len()]) {
+                Some(Some(h)) => {
+                    regs[*dst as usize] = NanBox::handle(h.to_raw());
+                    Some(Ok(()))
+                }
+                _ => None,
+            }
+        }
         // A string literal (`'k' + i` evaluates its `'k'` every iteration).
         Op::NewString { dst, value } => {
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_literal_string(value).to_raw());

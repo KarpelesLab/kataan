@@ -500,6 +500,51 @@ impl Realm {
         }
     }
 
+    /// For a string cell holding one flat all-ASCII leaf, the code unit at
+    /// ToIntegerOrInfinity(`n`) (`n` a Number: NaN is 0, truncated toward
+    /// zero), `Some(None)` when that is out of range; `None` for any other
+    /// cell, which the general read handles.
+    #[inline]
+    pub(crate) fn ascii_unit_at(&self, h: Handle, n: f64) -> Option<Option<u16>> {
+        let rope = self.heap.get(h)?.as_str()?;
+        let bytes = rope.as_leaf_bytes()?;
+        if !rope.is_ascii() {
+            return None;
+        }
+        let n = if n.is_nan() { 0.0 } else { n };
+        // `n` truncates to a non-negative index exactly when it exceeds -1.
+        Some(if n > -1.0 {
+            bytes.get(n as usize).map(|b| u16::from(*b))
+        } else {
+            None
+        })
+    }
+
+    /// `%String.prototype%` when `h` is a plain string cell (no auxiliary
+    /// object, which would make it a function-like marker, and not
+    /// host-exotic): where `[[Get]]` of any named key other than `length`
+    /// continues, as [`method_lookup_start`](Self::method_lookup_start)
+    /// answers for it. `None` for anything else.
+    ///
+    /// Likewise the realm's first `%Array.prototype%` for an array that never
+    /// had side-table state nor a `[[Prototype]]` set: it owns no named
+    /// property, so its lookup continues there (`method_lookup_start`'s
+    /// answer for it too).
+    #[inline]
+    pub(crate) fn plain_recv_lookup_start(&self, h: Handle) -> Option<Handle> {
+        let start = match self.heap.get(h)? {
+            Cell::Str(_) => {
+                if self.aux_props.contains_key(&h.to_raw()) {
+                    return None;
+                }
+                self.string_proto_intrinsic?
+            }
+            Cell::Array(a) if !a.has_side_state() && !a.has_proto_set() => self.root_array_proto?,
+            _ => return None,
+        };
+        (!self.is_host_exotic(h)).then_some(start)
+    }
+
     /// The object holding the named properties of the chain link `h`: `h`
     /// itself for an ordinary object, else its auxiliary object.
     fn named_props(&self, h: Handle) -> Option<&crate::object::Object> {
@@ -1282,11 +1327,29 @@ fn small_integer_digits(n: f64) -> Option<([u8; 21], usize)> {
 /// below 2^53 (written as plain decimal digits, `-0` as `0`) and returns
 /// `true`; returns `false`, having written nothing, for any other number.
 pub(crate) fn push_small_integer(out: &mut alloc::string::String, n: f64) -> bool {
+    // A non-negative integer below 10^4 (array indices, counters, small
+    // ids): its digits pushed one by one, no buffer.
+    if (0.0..10_000.0).contains(&n) {
+        let u = n as u32;
+        if f64::from(u) == n {
+            if u >= 1000 {
+                out.push(char::from(b'0' + (u / 1000) as u8));
+            }
+            if u >= 100 {
+                out.push(char::from(b'0' + (u / 100 % 10) as u8));
+            }
+            if u >= 10 {
+                out.push(char::from(b'0' + (u / 10 % 10) as u8));
+            }
+            out.push(char::from(b'0' + (u % 10) as u8));
+            return true;
+        }
+    }
     let Some((buf, pos)) = small_integer_digits(n) else {
         return false;
     };
-    // Digits are ASCII, so the slice is valid UTF-8; one reserve-and-copy.
-    out.push_str(core::str::from_utf8(&buf[pos..]).unwrap_or_default());
+    // Digits (and the sign) are ASCII: each byte is its own `char`.
+    out.extend(buf[pos..].iter().map(|&b| char::from(b)));
     true
 }
 

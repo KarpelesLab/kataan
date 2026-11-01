@@ -7574,14 +7574,45 @@ pub(crate) fn index_of_units(hay: &[u8], needle: &[u8], from: usize, ascii: bool
         unit_to_byte(hay, from)
     };
     let to_unit = |b: usize| -> usize { if ascii { b } else { byte_to_unit(hay, b) } };
-    let mut i = start_byte;
-    while i + needle.len() <= hay.len() {
-        if &hay[i..i + needle.len()] == needle {
-            return to_unit(i) as f64;
-        }
-        i += 1;
+    find_bytes(hay, needle, start_byte).map_or(-1.0, |i| to_unit(i) as f64)
+}
+
+/// The first byte offset at or after `from` where `needle` (non-empty)
+/// occurs in `hay`. A long haystack is scanned with a bad-character skip
+/// table (Horspool): at each alignment the haystack byte under the needle's
+/// last position decides how far the needle can slide without passing a
+/// match, so most bytes are never looked at.
+pub(crate) fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    let n = needle.len();
+    let end = hay.len().checked_sub(n)?;
+    if from > end {
+        return None;
     }
-    -1.0
+    let first = needle[0];
+    if n == 1 {
+        return hay[from..]
+            .iter()
+            .position(|&b| b == first)
+            .map(|i| from + i);
+    }
+    if end - from < 64 || n < 3 {
+        return (from..=end).find(|&i| hay[i] == first && &hay[i..i + n] == needle);
+    }
+    let mut skip = [n; 256];
+    for (k, &b) in needle[..n - 1].iter().enumerate() {
+        skip[usize::from(b)] = n - 1 - k;
+    }
+    let last = needle[n - 1];
+    let head = &needle[..n - 1];
+    let mut i = from;
+    while i <= end {
+        let c = hay[i + n - 1];
+        if c == last && &hay[i..i + n - 1] == head {
+            return Some(i);
+        }
+        i += skip[usize::from(c)];
+    }
+    None
 }
 
 /// `String.prototype.lastIndexOf` over UTF-16 units: the last match of `needle`
@@ -7876,6 +7907,9 @@ fn format_precision(n: f64, p: usize) -> String {
 /// no escaping and is copied in one go.
 fn json_quote_wtf8_into(out: &mut String, bytes: &[u8]) {
     out.push('"');
+    // Printable ASCII with no quote or backslash is copied as is, in the
+    // same pass that checks it (each such byte is its own `char`); anything
+    // else rewinds and takes the escaping walk.
     if bytes
         .iter()
         .all(|&b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')

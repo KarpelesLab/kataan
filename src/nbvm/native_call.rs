@@ -472,11 +472,25 @@ pub(super) fn try_call(
     {
         return Some(Ok(v));
     }
+    if let Some(v) = try_str_unit(ctx, recv, key, regs, args, cache) {
+        return Some(Ok(v));
+    }
     // A Number receiver owns no property: its lookup starts at
     // `%Number.prototype%`, which then stands in for it in the site's chain.
-    let (h, prim) = match recv.as_handle() {
-        Some(r) => (Handle::from_raw(r), false),
-        None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true),
+    // So does `%String.prototype%` for a plain string cell, and
+    // `%Array.prototype%` for an array without side-table state, which own
+    // only their indices and `length` (keys `cacheable_key` turns away):
+    // their lookup is then the same few checks, with the receiver itself the
+    // method's `this` (`this_h`).
+    let (h, prim, this_h) = match recv.as_handle() {
+        Some(r) => {
+            let r = Handle::from_raw(r);
+            match ctx.realm.plain_recv_lookup_start(r) {
+                Some(start) if cacheable_key(key) => (start, true, Some(r)),
+                _ => (r, false, None),
+            }
+        }
+        None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true, None),
         None => return None,
     };
     let site = cache.native.get_or_insert_with(|| {
@@ -503,7 +517,51 @@ pub(super) fn try_call(
         ctx.realm.method_site_note_recv(h, &mut site.chain, objects);
     }
     let (op, method) = (site.op, site.method);
-    run_op(ctx, funcs, op, method, recv, h, prim, regs, args)
+    match this_h {
+        Some(s) => run_op(ctx, funcs, op, method, recv, s, false, regs, args),
+        None => run_op(ctx, funcs, op, method, recv, h, prim, regs, args),
+    }
+}
+
+/// `s.charCodeAt(i)` / `s.charAt(i)` with `s` a flat all-ASCII string and `i`
+/// a Number or absent, at a site already resolved to that intrinsic for a
+/// string receiver (see [`try_call`]): [`run_op`]'s answer read straight off
+/// the string's bytes. `None`, having done nothing, otherwise.
+#[inline]
+fn try_str_unit(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    key: &str,
+    regs: &[NanBox],
+    args: &[Reg],
+    cache: &mut PropertyCache,
+) -> Option<NanBox> {
+    let site = cache.native.as_deref_mut()?;
+    let op = site.op;
+    if !matches!(op, FastOp::StrCharCodeAt | FastOp::StrCharAt) {
+        return None;
+    }
+    let h = Handle::from_raw(recv.as_handle()?);
+    let n = match args.first().map(|r| regs[*r as usize]) {
+        Some(a) => a.as_number()?,
+        None => 0.0,
+    };
+    let unit = ctx.realm.ascii_unit_at(h, n)?;
+    let start = ctx.realm.plain_recv_lookup_start(h)?;
+    if ctx
+        .realm
+        .method_site_get_prim(start, key, &mut site.chain)?
+        .to_bits()
+        != site.method
+    {
+        return None;
+    }
+    Some(match (op, unit) {
+        (FastOp::StrCharCodeAt, Some(u)) => NanBox::number(f64::from(u)),
+        (FastOp::StrCharCodeAt, None) => NanBox::number(f64::NAN),
+        (_, Some(u)) => NanBox::handle(ctx.realm.unit_string(u).to_raw()),
+        (_, None) => NanBox::handle(ctx.realm.new_string("").to_raw()),
+    })
 }
 
 /// `recv.key(args…)` when the site last called a `Map.prototype` /

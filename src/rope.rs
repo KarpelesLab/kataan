@@ -784,20 +784,45 @@ impl Rope {
         if let Some(b) = self.0.flat_bytes() {
             return b.to_vec();
         }
-        let mut out = Vec::with_capacity(self.len());
-        // Depth-first, left-to-right, using an explicit stack of pending nodes.
-        let mut stack: Vec<&Rope> = alloc::vec![self];
-        while let Some(node) = stack.pop() {
-            match &*node.0 {
-                Node::Concat { left, right, .. } => {
-                    // Push right first so left is processed first (LIFO).
-                    stack.push(right);
-                    stack.push(left);
+        let mut out = alloc::vec![0u8; self.len()];
+        self.fill_bytes(&mut out);
+        out
+    }
+
+    /// Writes the rope's bytes into `out`, which is exactly [`len`](Self::len)
+    /// bytes long. Every node's length is known, so each piece goes straight
+    /// to its offset and the tree can be visited in any order: of a
+    /// concatenation's two sides the shorter is done first and the longer
+    /// waits on the stack, which so never holds more than about log2(len)
+    /// entries however lopsided the tree (a `s += c` loop builds a left
+    /// spine as long as the string).
+    fn fill_bytes(&self, out: &mut [u8]) {
+        let mut stack: Vec<(&Rope, usize)> = alloc::vec![(self, 0)];
+        while let Some((mut node, mut at)) = stack.pop() {
+            loop {
+                match &*node.0 {
+                    Node::Concat { left, right, .. } => {
+                        let mid = at + left.len();
+                        let (small, big) = if left.len() <= right.len() {
+                            ((left, at), (right, mid))
+                        } else {
+                            ((right, mid), (left, at))
+                        };
+                        stack.push(big);
+                        (node, at) = small;
+                    }
+                    flat => {
+                        let b = flat.flat_bytes().unwrap_or_default();
+                        if let [one] = *b {
+                            out[at] = one;
+                        } else {
+                            out[at..at + b.len()].copy_from_slice(b);
+                        }
+                        break;
+                    }
                 }
-                flat => out.extend_from_slice(flat.flat_bytes().unwrap_or_default()),
             }
         }
-        out
     }
 
     /// Appends the rope's WTF-8 bytes (lossless) to `out`, iteratively — the
@@ -808,17 +833,9 @@ impl Rope {
             out.extend_from_slice(b);
             return;
         }
-        out.reserve(self.len());
-        let mut stack: Vec<&Rope> = alloc::vec![self];
-        while let Some(node) = stack.pop() {
-            match &*node.0 {
-                Node::Concat { left, right, .. } => {
-                    stack.push(right);
-                    stack.push(left);
-                }
-                flat => out.extend_from_slice(flat.flat_bytes().unwrap_or_default()),
-            }
-        }
+        let start = out.len();
+        out.resize(start + self.len(), 0);
+        self.fill_bytes(&mut out[start..]);
     }
 
     /// Materializes the rope into a flat `String` in O(n). **Lossy**: any stored
