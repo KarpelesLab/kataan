@@ -4028,3 +4028,39 @@ fn console_has_error_warn_info_debug() {
     interp.run(&program).expect("exec");
     assert_eq!(interp.output(), "a\ni 2\nd\ninfo,error,function\n");
 }
+
+/// An unlabeled `break` leaves the innermost enclosing loop or `switch`, past
+/// any labeled block or labeled `if` in between (ECMA-262 14.13 / 14.15: only
+/// `break L` leaves the labeled statement `L`). The compiler gave a labeled
+/// non-loop its own break target and an unlabeled `break` took the innermost
+/// one, so `for (...) { L: { if (c) break; } }` kept looping.
+#[test]
+fn unlabeled_break_skips_labeled_blocks() {
+    let src = r#"
+        var t = [];
+        for (var v of [1, 2, 3]) { L: { if (v === 2) break; t.push("in" + v); } t.push("after" + v); }
+        t.push("|");
+        for (var i = 0; i < 3; i++) { L: { if (i === 1) break; t.push("in" + i); } t.push("after" + i); }
+        t.push("|");
+        var k = 0; while (k < 3) { k++; M: { N: { if (k === 2) break; } t.push("w" + k); } }
+        t.push("|");
+        for (var i = 0; i < 3; i++) { L: if (i === 1) break; else t.push("e" + i); }
+        t.push("|");
+        for (var i = 0; i < 3; i++) { L: { if (i === 1) break L; t.push("bl" + i); } t.push("a" + i); }
+        t.push("|");
+        switch (1) { case 1: L: { break; } t.push("nope"); }
+        function f() {
+            var r = [];
+            for (var i = 0; i < 3; i++) {
+                L: { try { if (i === 1) break; r.push("try" + i); } finally { r.push("fin" + i); } }
+            }
+            return r.join(" ");
+        }
+        t.push(f());
+        t.join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "in1 after1 | in0 after0 | w1 | e0 | bl0 a0 a1 bl2 a2 | try0 fin0 fin1"
+    );
+}

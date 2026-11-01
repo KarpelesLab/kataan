@@ -14836,6 +14836,9 @@ struct LoopFrame {
     async_iter: bool,
     /// A loop (a `continue` target), not a `switch` or labeled block.
     is_loop: bool,
+    /// A loop or `switch` (an unlabeled `break` target), not a labeled
+    /// non-loop statement, which only `break label` leaves.
+    breakable: bool,
 }
 
 /// The inputs of [`Compiler::make_closure_ext`].
@@ -18001,6 +18004,7 @@ impl Compiler {
                         iter: None,
                         async_iter: false,
                         is_loop: false,
+                        breakable: true,
                     });
                     // Dispatch: jump to the first matching `case` body (else default,
                     // else the end). Bodies (compiled next) fall through.
@@ -18405,15 +18409,17 @@ impl Compiler {
                 Ok(None)
             }
             Stmt::Break { label: None, .. } => {
+                // The innermost enclosing loop or `switch`: a labeled block in
+                // between is left only by `break label`.
                 let t = self
-                    .break_sites
-                    .len()
-                    .checked_sub(1)
+                    .loop_frames
+                    .iter()
+                    .rposition(|f| f.breakable)
                     .ok_or(CompileError::Unsupported("break outside loop/switch"))?;
                 self.emit_unwind(t, true, t + 1)?;
                 let j = self.emit_jump();
                 self.break_sites
-                    .last_mut()
+                    .get_mut(t)
                     .ok_or(CompileError::Unsupported("break outside loop/switch"))?
                     .push(j);
                 Ok(None)
@@ -18505,6 +18511,7 @@ impl Compiler {
                         iter: None,
                         async_iter: false,
                         is_loop: false,
+                        breakable: false,
                     });
                     let r = self.stmt(body);
                     self.loop_frames.pop();
@@ -24054,6 +24061,7 @@ impl Compiler {
             iter: None,
             async_iter: false,
             is_loop: true,
+            breakable: true,
         });
     }
 
