@@ -22,7 +22,43 @@ use std::process::ExitCode;
 #[global_allocator]
 static GLOBAL: kataan::pool_alloc::PoolAlloc = kataan::pool_alloc::PoolAlloc;
 
+/// A hard address-space limit for the whole process, so a runaway script (or a
+/// compiler blowup) fails its own allocation instead of exhausting the machine.
+/// `KATAAN_MAX_MEMORY_MB` overrides the default of 8 GiB. It can never exceed a
+/// limit already inherited, and child processes cannot raise it.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[allow(unsafe_code)]
+fn limit_address_space() {
+    const DEFAULT_MB: u64 = 8 * 1024;
+    const RLIMIT_AS: i32 = 9;
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
+    unsafe extern "C" {
+        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+    }
+    let mb = std::env::var("KATAAN_MAX_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MB);
+    let bytes = mb.saturating_mul(1024 * 1024);
+    let mut lim = RLimit { cur: 0, max: 0 };
+    // SAFETY: both calls only read or write the `RLimit` passed by pointer,
+    // whose layout matches the C `struct rlimit` on 64-bit Linux.
+    unsafe {
+        if getrlimit(RLIMIT_AS, &mut lim) == 0 {
+            let cap = bytes.min(lim.max);
+            setrlimit(RLIMIT_AS, &RLimit { cur: cap, max: cap });
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    limit_address_space();
     // Run on a large stack so deep JS recursion is bounded by the engine's
     // call-depth guard (a thrown RangeError), not a host stack overflow.
     std::thread::Builder::new()

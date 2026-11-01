@@ -1,0 +1,4 @@
+# Every binary cargo runs on Linux (tests, `cargo run`) goes through a hard
+# address-space limit, so a runaway test fails instead of taking the machine.
+[target.x86_64-unknown-linux-gnu]
+runner = "tools/memcap.sh"
