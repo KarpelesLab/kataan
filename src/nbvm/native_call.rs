@@ -63,6 +63,10 @@ enum FastOp {
     /// `Array.prototype.pop`.
     ArrayPop,
     ArrayShift,
+    /// `Array.prototype.unshift`.
+    ArrayUnshift,
+    /// `Array.prototype.splice`.
+    ArraySplice,
     /// `String.prototype.indexOf`.
     StrIndexOf,
     /// `String.prototype.charCodeAt`.
@@ -244,6 +248,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"push") => FastOp::ArrayPush,
         (N_ARRAY_PROTO_FN, b"pop") => FastOp::ArrayPop,
         (N_ARRAY_PROTO_FN, b"shift") => FastOp::ArrayShift,
+        (N_ARRAY_PROTO_FN, b"unshift") => FastOp::ArrayUnshift,
+        (N_ARRAY_PROTO_FN, b"splice") => FastOp::ArraySplice,
         (N_STRING_PROTO_FN, b"indexOf") => FastOp::StrIndexOf,
         (N_STRING_PROTO_FN, b"charCodeAt") => FastOp::StrCharCodeAt,
         (N_STRING_PROTO_FN, b"charAt") => FastOp::StrCharAt,
@@ -730,6 +736,28 @@ fn run_op(
             realm.array_pop(h)
         }
         FastOp::ArrayShift => realm.array_shift_fast(h)?,
+        FastOp::ArrayUnshift => {
+            let items = super::ArgBuf::from_regs(regs, args);
+            NanBox::number(realm.array_unshift_fast(h, &items)? as f64)
+        }
+        FastOp::ArraySplice => {
+            // Number (or absent) positions, whose conversions run no code, and
+            // a plain `ArraySpeciesCreate`.
+            let len = realm.array_elements(h)?.len();
+            let start = rel_index(arg(0), len, 0)?;
+            let delete = match args.len() {
+                0 => 0,
+                1 => len - start,
+                _ => length_arg(arg(1))?.min(len - start),
+            };
+            if !super::array_hof::default_species(realm, h) {
+                return None;
+            }
+            let items = args.get(2..).unwrap_or(&[]);
+            let items: alloc::vec::Vec<NanBox> = items.iter().map(|r| regs[*r as usize]).collect();
+            let removed = realm.array_splice_fast(h, start, delete, &items)?;
+            NanBox::handle(realm.new_array(removed).to_raw())
+        }
         FastOp::StrIndexOf => {
             // A string needle (ToString is the identity) and a Number or absent
             // position (ToIntegerOrInfinity runs no code).
@@ -773,7 +801,7 @@ fn run_op(
             let n = if n.is_nan() { 0.0 } else { n };
             // `n` truncates to a non-negative index exactly when it exceeds -1.
             let idx = (n > -1.0).then_some(n as usize);
-            realm.flatten_string(h);
+            // (A `Concat` is read by a short tree walk, or flattened once.)
             let unit = realm.string_unit_at_index(h, idx)?;
             match (op, unit) {
                 (FastOp::StrCharCodeAt, Some(u)) => NanBox::number(f64::from(u)),
@@ -894,9 +922,36 @@ fn run_op(
         FastOp::StrStartsWith | FastOp::StrEndsWith | FastOp::StrIncludes => {
             // A string search argument is not a RegExp, and converts as itself.
             let needle = str_arg(realm, arg(0))?;
+            let pat = needle.as_leaf_bytes()?;
+            // An affix test on a `Concat` compares just the window it names
+            // (`str_rope::window_is`), without flattening the receiver.
+            if op != FastOp::StrIncludes
+                && let Some(r) = realm
+                    .typeof_is_string(h)
+                    .then(|| realm.string_rope(h))
+                    .flatten()
+                    .filter(crate::rope::Rope::is_concat)
+                && realm.rope_walk_ok(&r)
+            {
+                let units = r.utf16_len();
+                let default = if op == FastOp::StrEndsWith { units } else { 0 };
+                let pos = int_arg(arg(1))?.map_or(default, |n| (n.max(0.0) as usize).min(units));
+                let pat_units = needle.utf16_len();
+                let at = if op == FastOp::StrEndsWith {
+                    pos.checked_sub(pat_units)
+                } else {
+                    Some(pos)
+                };
+                let hit = match at {
+                    None => Some(false),
+                    Some(at) => crate::nbexec::str_rope::window_is(&r, at, pat, pat_units),
+                };
+                if let Some(hit) = hit {
+                    return Some(Ok(NanBox::boolean(hit)));
+                }
+            }
             let rope = str_parts(realm, h)?;
             let (bytes, units) = (rope.as_leaf_bytes()?, rope.utf16_len());
-            let pat = needle.as_leaf_bytes()?;
             let default = if op == FastOp::StrEndsWith { units } else { 0 };
             let pos = int_arg(arg(1))?.map_or(default, |n| (n.max(0.0) as usize).min(units));
             NanBox::boolean(match op {
@@ -1118,14 +1173,27 @@ fn run_op(
             NanBox::handle(realm.new_string_wtf8(out).to_raw())
         }
         FastOp::StrTrim(start, end) => {
-            let rope = str_parts(realm, h)?;
-            let bytes = rope.as_leaf_bytes()?;
-            let out = crate::nbexec::trim_wtf8(bytes, start, end);
-            if out.len() == bytes.len() {
+            // The kept part shares the receiver's bytes or subtrees; a
+            // `Concat` too deep to walk is flattened first.
+            if !realm.typeof_is_string(h) {
+                return None;
+            }
+            let rope = realm.string_rope(h)?;
+            let walk = !rope.is_concat() || realm.rope_walk_ok(&rope);
+            let out = match walk
+                .then(|| crate::nbexec::str_rope::trim_rope(&rope, start, end))
+                .flatten()
+            {
+                Some(out) => out,
+                None => {
+                    let rope = str_parts(realm, h)?;
+                    crate::nbexec::str_rope::trim_rope(&rope, start, end)?
+                }
+            };
+            if out.ptr_eq(&rope) {
                 recv
             } else {
-                let out = out.to_vec();
-                NanBox::handle(realm.new_string_wtf8(out).to_raw())
+                NanBox::handle(realm.new_string_from_rope(out).to_raw())
             }
         }
         FastOp::StrPad(at_start) => {
@@ -1136,7 +1204,12 @@ fn run_op(
             } else {
                 Some(str_arg(realm, fill_v)?)
             };
-            let rope = str_parts(realm, h)?;
+            // The receiver as it is (a `Concat` is not flattened): the result
+            // joins it to the filler.
+            if !realm.typeof_is_string(h) {
+                return None;
+            }
+            let rope = realm.string_rope(h)?;
             // A huge target is the host's (its length check throws).
             if target > rope.utf16_len() + (1 << 20) {
                 return None;
@@ -1145,8 +1218,12 @@ fn run_op(
                 None => b" ",
                 Some(f) => f.as_leaf_bytes()?,
             };
-            let out = crate::nbexec::pad_units(rope.as_leaf_bytes()?, target, pad, at_start);
-            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+            let out = crate::nbexec::str_rope::pad_rope(&rope, target, pad, at_start)?;
+            if out.ptr_eq(&rope) {
+                recv
+            } else {
+                NanBox::handle(realm.new_string_from_rope(out).to_raw())
+            }
         }
         FastOp::StrSplit => {
             // A non-empty string separator that cannot split a surrogate pair,

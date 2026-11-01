@@ -800,11 +800,69 @@ impl ArrayElems {
         let h = self.head as usize;
         let v = core::mem::replace(&mut self.elems[h], NanBox::undefined());
         self.head += 1;
-        if 2 * self.head as usize >= self.elems.len() {
-            self.elems.drain(..self.head as usize);
+        // Reclaimed once the dead prefix is twice the live part: not as soon
+        // as it matches it, so the head room an `unshift` leaves (as long as
+        // the live part, see `unshift_front`) survives an interleaved `shift`.
+        let dead = self.head as usize;
+        if dead >= 2 * (self.elems.len() - dead) + Self::QUEUE_MIN {
+            self.elems.drain(..dead);
             self.head = 0;
         }
         Some(v)
+    }
+
+    /// Inserts `vs` before the first element — the element move of
+    /// `Array.prototype.unshift` on an array whose indices are all plain
+    /// data properties (a hole moves as a hole). A long array enters queue
+    /// mode with head room before its elements, as long as the elements
+    /// themselves, so a run of `unshift`s costs O(1) each, amortized,
+    /// rather than moving every element per call. Marks the side-state flag
+    /// as [`shift_front`](Self::shift_front) does.
+    pub fn unshift_front(&mut self, vs: &[NanBox]) {
+        let n = vs.len();
+        if n == 0 {
+            return;
+        }
+        if self.is_queue() && self.head as usize >= n {
+            let at = self.head as usize - n;
+            self.elems[at..at + n].copy_from_slice(vs);
+            self.head = at as u32;
+            return;
+        }
+        let live = self.len();
+        let total = live + n;
+        if total < Self::QUEUE_MIN {
+            self.vec_mut().splice(0..0, vs.iter().copied());
+            return;
+        }
+        // Rebuild as a queue: `room` dead slots (`undefined`), then `vs`, then
+        // the elements.
+        let room = total;
+        if u32::try_from(room + total).is_err() {
+            self.vec_mut().splice(0..0, vs.iter().copied());
+            return;
+        }
+        let mut next = Vec::with_capacity(room + total);
+        next.resize(room, NanBox::undefined());
+        next.extend_from_slice(vs);
+        next.extend_from_slice(self.as_slice());
+        self.elems = next;
+        self.inline = INLINE_FILL;
+        self.inline_len = 0;
+        self.head = room as u32;
+        self.side = true;
+    }
+
+    /// Replaces the `delete` elements at `start` with `vs` (both clamped by
+    /// the caller to the elements), returning the removed ones in order —
+    /// the element moves of `Array.prototype.splice` on an array whose
+    /// indices are all plain data properties (holes move as holes): one
+    /// memmove of the tail.
+    pub fn splice_at(&mut self, start: usize, delete: usize, vs: &[NanBox]) -> Vec<NanBox> {
+        let v = self.vec_mut();
+        let end = (start + delete).min(v.len());
+        let start = start.min(end);
+        v.splice(start..end, vs.iter().copied()).collect()
     }
 
     /// Appends `v`, keeping a queue in queue mode.

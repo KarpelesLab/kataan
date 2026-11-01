@@ -157,6 +157,14 @@ const SLICE_SHARE_RATIO: usize = 16;
 /// the slice to a flatten.
 const TREE_SLICE_STEPS: usize = 64;
 
+/// The most `Concat` nodes [`Rope::unit_at_tree`] descends through before
+/// leaving the read to a flatten: a string read in a loop after a few
+/// appends stays a short walk per read.
+const UNIT_WALK_STEPS: usize = 32;
+
+/// The longest non-ASCII leaf [`Rope::unit_at_tree`] scans for a unit.
+const UNIT_WALK_SCAN: usize = 256;
+
 /// Sentinel for "the UTF-16 length has not been computed yet". A real length is
 /// bounded by [`MAX_STRING_LEN`], so it can never collide.
 const U16_LEN_UNKNOWN: usize = usize::MAX;
@@ -529,6 +537,97 @@ impl Rope {
             out = out.try_concat(&piece)?;
         }
         Some(out)
+    }
+
+    /// The UTF-16 code unit at `i` of a `Concat` rope, read by walking down
+    /// its tree rather than flattening it: `Some(None)` past the end. `None`
+    /// (flatten and read the flat string instead) for a flat rope, when the
+    /// walk passes [`UNIT_WALK_STEPS`] nodes, or when the leaf reached is
+    /// long and not ASCII (a unit index into it is a scan, which the flat
+    /// string's memoized cursor makes O(1) for a loop).
+    #[must_use]
+    pub fn unit_at_tree(&self, i: usize) -> Option<Option<u16>> {
+        if !matches!(&*self.0, Node::Concat { .. }) {
+            return None;
+        }
+        let total = self.utf16_len();
+        if i >= total {
+            return Some(None);
+        }
+        let (mut node, mut units, mut i) = (self, total, i);
+        for _ in 0..=UNIT_WALK_STEPS {
+            let Node::Concat { left, right, .. } = &*node.0 else {
+                let bytes = node.0.flat_bytes()?;
+                if units == bytes.len() {
+                    return Some(bytes.get(i).map(|b| u16::from(*b)));
+                }
+                if bytes.len() > UNIT_WALK_SCAN {
+                    return None;
+                }
+                return Some(wtf8::utf16_index(bytes, i));
+            };
+            let (lu, ru) = Self::child_units(left, right, units);
+            if i < lu {
+                (node, units) = (left, lu);
+            } else {
+                (node, units) = (right, ru);
+                i -= lu;
+            }
+        }
+        None
+    }
+
+    /// Visits the leaves' WTF-8 bytes in order from one end (the right end
+    /// when `from_right`) while `visit` returns `true`, walking at most
+    /// [`TREE_SLICE_STEPS`] `Concat` nodes: `false` when the walk was cut
+    /// short by that bound (the caller then flattens instead).
+    pub fn walk_edge_leaves(&self, from_right: bool, mut visit: impl FnMut(&[u8]) -> bool) -> bool {
+        let mut stack: Vec<&Rope> = alloc::vec![self];
+        let mut steps = 0usize;
+        while let Some(node) = stack.pop() {
+            match &*node.0 {
+                Node::Concat { left, right, .. } => {
+                    steps += 1;
+                    if steps > TREE_SLICE_STEPS {
+                        return false;
+                    }
+                    if from_right {
+                        stack.push(left);
+                        stack.push(right);
+                    } else {
+                        stack.push(right);
+                        stack.push(left);
+                    }
+                }
+                flat => {
+                    if !visit(flat.flat_bytes().unwrap_or_default()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether this is a `Concat` (not a flat string).
+    #[must_use]
+    pub fn is_concat(&self) -> bool {
+        matches!(&*self.0, Node::Concat { .. })
+    }
+
+    /// The bytes `[b0, b1)` of this flat rope (both on character
+    /// boundaries) as a string, sharing its buffer as
+    /// [`Rope::slice_units`] does; `None` for a `Concat`.
+    #[must_use]
+    pub fn share_byte_range(&self, b0: usize, b1: usize) -> Option<Rope> {
+        let bytes = self.0.flat_bytes()?;
+        let sub = bytes.get(b0..b1)?;
+        let units = if self.is_ascii() {
+            sub.len()
+        } else {
+            wtf8::utf16_len(sub)
+        };
+        Some(self.share_bytes(b0, b1, units))
     }
 
     /// A non-owning identity for this rope (see [`RopeId`]).

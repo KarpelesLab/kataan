@@ -1877,7 +1877,16 @@ impl Realm {
     /// flat string resumes from the last read's position (see `unit_cursor`),
     /// and a `Concat` rope is flattened in place first.
     pub fn string_unit_at_seq(&mut self, handle: Handle, i: usize) -> Option<u16> {
-        if self.heap.get(handle)?.as_str()?.as_leaf_bytes().is_none() {
+        let rope = self.heap.get(handle)?.as_str()?;
+        if rope.as_leaf_bytes().is_none() {
+            // A short walk down the tree reads a string still being appended
+            // to without flattening it per read.
+            let rope = rope.clone();
+            if self.rope_walk_ok(&rope)
+                && let Some(unit) = rope.unit_at_tree(i)
+            {
+                return unit;
+            }
             self.flatten_string(handle);
         }
         let rope = self.heap.get(handle)?.as_str()?;
@@ -2002,6 +2011,32 @@ impl Realm {
         }
         let out = rope.slice_units_tree(start, end)?;
         Some(self.heap.alloc(Cell::Str(out)))
+    }
+
+    /// Whether a read of the `Concat` rope `rope` (a unit, a trim, an affix
+    /// test) should walk its tree rather than flatten it: not for a short
+    /// rope (flattening it costs about as much and makes every later read
+    /// O(1)), nor for one already walked [`TREE_SLICE_REPEAT`] times in a row
+    /// (a string read in a loop pays one flatten rather than a walk per
+    /// read). Counts this walk. Shares the memo of
+    /// [`new_string_slice_tree`](Realm::new_string_slice_tree).
+    pub fn rope_walk_ok(&mut self, rope: &Rope) -> bool {
+        /// Below this many bytes a flatten is cheap.
+        const ROPE_WALK_MIN_LEN: usize = 1 << 10;
+        if rope.len() < ROPE_WALK_MIN_LEN {
+            return false;
+        }
+        match self.tree_slice.as_deref_mut() {
+            Some((id, n)) if id.is(rope) => {
+                if *n >= TREE_SLICE_REPEAT {
+                    return false;
+                }
+                *n += 1;
+            }
+            Some(memo) => *memo = (rope.id(), 1),
+            None => self.tree_slice = Some(alloc::boxed::Box::new((rope.id(), 1))),
+        }
+        true
     }
 
     /// Allocates a string value sharing `rope` (an `Rc` bump, no copy).
@@ -3555,6 +3590,11 @@ impl Realm {
         *live -= 1;
         if let Some(map) = index {
             map.remove(hash, i);
+            // The oldest entry went: step the dead-prefix mark over it (and
+            // any tombstones right behind it, each passed over once).
+            if i == map.head as usize {
+                map.head = dead_prefix_end(entries, i);
+            }
         }
         self.collection_maybe_compact(handle);
         true
@@ -3668,16 +3708,28 @@ impl Realm {
         // Entries are deleted in place (tombstones), so the cursor only needs
         // rebasing after a compaction renumbered them: with none since it was
         // saved (the common case), the next live entry is read in one look.
-        let (next, now) = match self.heap.get(coll) {
+        let (next, now) = match self.heap.get_mut(coll) {
             Some(Cell::Collection {
-                epoch: e, entries, ..
-            }) if *e == epoch => (
-                entries
-                    .get(idx..)
+                epoch: e,
+                entries,
+                index,
+                ..
+            }) if *e == epoch => {
+                // No live entry lies before the dead prefix's end; a scan from
+                // there extends it to the entry found.
+                let head = index.as_deref_mut().map_or(0, |m| m.head as usize);
+                let from = idx.max(head);
+                let found = entries
+                    .get(from..)
                     .and_then(|rest| rest.iter().position(|e| !e.0.is_hole()))
-                    .map(|i| (idx + i, entries[idx + i].0, entries[idx + i].1)),
-                epoch,
-            ),
+                    .map(|i| from + i);
+                if from == head
+                    && let Some(m) = index.as_deref_mut()
+                {
+                    m.head = u32::try_from(found.unwrap_or(entries.len())).unwrap_or(0);
+                }
+                (found.map(|i| (i, entries[i].0, entries[i].1)), epoch)
+            }
             _ => {
                 let (idx, now) = self.collection_iter_rebase(coll, idx, epoch, last);
                 (self.collection_next_live(coll, idx), now)
@@ -3762,13 +3814,14 @@ impl Realm {
         handle: Handle,
         from: usize,
     ) -> Option<(usize, NanBox, NanBox)> {
-        let Some(Cell::Collection { entries, .. }) = self.heap.get(handle) else {
+        let Some(Cell::Collection { entries, index, .. }) = self.heap.get(handle) else {
             return None;
         };
+        let head = index.as_deref().map_or(0, |m| m.head as usize);
         entries
             .iter()
             .enumerate()
-            .skip(from)
+            .skip(from.max(head))
             .find(|(_, e)| !e.0.is_hole())
             .map(|(i, &(k, v))| (i, k, v))
     }
@@ -5432,6 +5485,73 @@ impl Realm {
         let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
         let v = a.shift_front().unwrap_or(NanBox::undefined());
         Some(if v.is_hole() { NanBox::undefined() } else { v })
+    }
+
+    /// Whether `arr.unshift(…)` / `arr.splice(…)` on the array at `handle`
+    /// is exactly a move of its dense elements, as for
+    /// [`Self::array_shift_fast`]: plain writable data indices, extensible,
+    /// a writable `length` equal to the element count, and an index-free
+    /// prototype chain (so a hole moves as a hole, and no step runs user
+    /// code or can fail). `Some(element count)` then.
+    fn array_moves_plain(&mut self, handle: Handle) -> Option<usize> {
+        let dense = self.heap.get(handle)?.as_array()?.len();
+        if self.proto_index_accessor_dirty
+            || self.array_has_index_overrides(handle)
+            || self.array_is_non_extensible(handle)
+            || self.array_length_is_readonly(handle)
+            || self.array_length(handle) != Some(dense)
+            || !self.array_chain_index_free(handle)
+        {
+            return None;
+        }
+        Some(dense)
+    }
+
+    /// `arr.unshift(...items)` as a bulk move when that is exactly the
+    /// spec's algorithm (see [`Self::array_moves_plain`]), and the new length
+    /// is a valid array length: the new length. O(1) amortized for a long
+    /// array (see [`crate::cell::ArrayElems::unshift_front`]). `None`, with
+    /// nothing done, otherwise.
+    pub fn array_unshift_fast(&mut self, handle: Handle, items: &[NanBox]) -> Option<usize> {
+        let len = self.array_moves_plain(handle)?;
+        let new_len = len.checked_add(items.len())?;
+        if new_len > self.limits.max_array_len {
+            return None;
+        }
+        let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
+        a.unshift_front(items);
+        for v in items {
+            self.write_barrier(handle, *v);
+        }
+        Some(new_len)
+    }
+
+    /// The element moves of `arr.splice(start, delete, ...items)` (`start`
+    /// and `delete` already clamped to the length) as one memmove when that
+    /// is exactly the spec's algorithm (see [`Self::array_moves_plain`]) and
+    /// the new length is a valid array length: the removed elements, holes
+    /// kept. `None`, with nothing done, otherwise. The caller makes the
+    /// removed array (its `ArraySpeciesCreate` must be the plain one).
+    pub fn array_splice_fast(
+        &mut self,
+        handle: Handle,
+        start: usize,
+        delete: usize,
+        items: &[NanBox],
+    ) -> Option<Vec<NanBox>> {
+        let len = self.array_moves_plain(handle)?;
+        if start > len || delete > len - start {
+            return None;
+        }
+        if len - delete + items.len() > self.limits.max_array_len {
+            return None;
+        }
+        let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
+        let removed = a.splice_at(start, delete, items);
+        for v in items {
+            self.write_barrier(handle, *v);
+        }
+        Some(removed)
     }
 
     /// Whether no object on the array at `handle`'s prototype chain has an
@@ -10974,4 +11094,15 @@ pub(crate) fn canonical_array_index(k: &str) -> Option<usize> {
         .ok()
         .filter(|&i| i != u32::MAX && is_canonical_decimal(k))
         .map(|i| i as usize)
+}
+
+/// The end of the run of tombstones in `entries` starting at `from`: the
+/// position of the first live entry at or after it (or the length), as a
+/// collection's dead-prefix mark (see `CollIndex::head`).
+fn dead_prefix_end(entries: &[(NanBox, NanBox)], from: usize) -> u32 {
+    let mut h = from;
+    while entries.get(h).is_some_and(|e| e.0.is_hole()) {
+        h += 1;
+    }
+    u32::try_from(h).unwrap_or(0)
 }

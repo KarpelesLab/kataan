@@ -157,6 +157,16 @@ impl Interp {
         // unwrapped) — consume the one-shot flag so it applies only to this call.
         let array_proto_generic = core::mem::take(&mut self.array_proto_generic);
 
+        // `unshift` on a plain array whose element moves are exactly the
+        // spec's: one bulk move (O(1) amortized), before the cascade below
+        // snapshots the elements and their holes (several O(n) passes).
+        if method == "unshift"
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.is_plain_array_cell(h)
+            && let Some(n) = self.realm.array_unshift_fast(h, args)
+        {
+            return Ok(Some(NanBox::number(n as f64)));
+        }
         // `push` on a plain dense array — the hottest built-in call there is —
         // served before the long by-name cascade below, every step of which is a
         // probe for some other receiver kind (wrappers, iterators, DataViews,
@@ -190,13 +200,57 @@ impl Interp {
             && self.realm.typeof_is_string(h)
         {
             let idx = self.coerce_to_integer_or_infinity(arg(0))?;
-            self.realm.flatten_string(h);
+            // (A `Concat` is read by a short tree walk, or flattened once.)
             if let Some(unit) = self.realm.string_unit_at_index(h, str_char_index(idx)) {
                 return Ok(Some(match (method, unit) {
                     ("charCodeAt", Some(u)) => NanBox::number(f64::from(u)),
                     ("charCodeAt", None) => NanBox::number(f64::NAN),
                     (_, Some(u)) => NanBox::handle(self.realm.unit_string(u).to_raw()),
                     (_, None) => self.new_str(""),
+                }));
+            }
+        }
+        // `codePointAt` likewise (a surrogate pair combines).
+        if method == "codePointAt"
+            && !array_proto_generic
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.typeof_is_string(h)
+        {
+            let idx = self.coerce_to_integer_or_infinity(arg(0))?;
+            let Some(i) = str_char_index(idx) else {
+                return Ok(Some(NanBox::undefined()));
+            };
+            if let Some(unit) = self.realm.string_unit_at_index(h, Some(i)) {
+                let cp = match unit {
+                    None => return Ok(Some(NanBox::undefined())),
+                    Some(u) if (0xD800..0xDC00).contains(&u) => {
+                        match self.realm.string_unit_at_index(h, i.checked_add(1)) {
+                            Some(Some(low)) if (0xDC00..0xE000).contains(&low) => {
+                                0x1_0000
+                                    + ((u32::from(u) - 0xD800) << 10)
+                                    + (u32::from(low) - 0xDC00)
+                            }
+                            _ => u32::from(u),
+                        }
+                    }
+                    Some(u) => u32::from(u),
+                };
+                return Ok(Some(NanBox::number(f64::from(cp))));
+            }
+        }
+        // `at` likewise (a negative index counts from the end).
+        if method == "at"
+            && !array_proto_generic
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.realm.typeof_is_string(h)
+            && let Some(units) = self.realm.string_utf16_len(h)
+        {
+            let i = self.coerce_to_integer_or_infinity(arg(0))?;
+            let idx = if i < 0.0 { units as f64 + i } else { i };
+            if let Some(unit) = self.realm.string_unit_at_index(h, as_index(idx)) {
+                return Ok(Some(match unit {
+                    Some(u) => NanBox::handle(self.realm.unit_string(u).to_raw()),
+                    None => NanBox::undefined(),
                 }));
             }
         }
@@ -2254,6 +2308,51 @@ impl Interp {
             }
             return Ok(Some(acc));
         }
+        // `padStart`/`padEnd`/`repeat` never read the receiver's characters, so
+        // they run on the rope as it is: flattening (or copying) it here made
+        // `s = s.padEnd(s.length + 1)` in a loop quadratic.
+        if !force_array_like
+            && self.realm.is_string_handle(handle)
+            && let Some(rope) = self.realm.string_rope(handle)
+            && matches!(method, "padStart" | "padEnd" | "repeat")
+        {
+            let out = if method == "repeat" {
+                // ToIntegerOrInfinity(count) (a Symbol / abrupt valueOf throws).
+                // A negative or `+Infinity` count is a `RangeError`, and so is a
+                // result past the string length cap.
+                let nf = self.coerce_to_integer_or_infinity(arg(0))?;
+                let n = nf as usize;
+                let total = n.checked_mul(rope.len());
+                let max_string_len = self.realm.limits.max_string_len;
+                if nf < 0.0 || nf.is_infinite() || total.is_none_or(|t| t > max_string_len) {
+                    return Err(self.string_length_error());
+                }
+                super::str_rope::repeat_rope(&rope, n)
+            } else {
+                // Spec order: ToLength(maxLength) then ToString(fillString).
+                let tn = self.coerce_to_integer_or_infinity(arg(0))?;
+                let target = self.pad_target(tn)?;
+                // Already long enough: the fill string is never read (its
+                // ToString does not run).
+                if target <= rope.utf16_len() {
+                    return Ok(Some(NanBox::handle(handle.to_raw())));
+                }
+                let pad = if matches!(arg(1).unpack(), Unpacked::Undefined) {
+                    alloc::vec![b' ']
+                } else {
+                    self.arg_string_bytes_fallible(arg(1))?
+                };
+                super::str_rope::pad_rope(&rope, target, &pad, method == "padStart")
+            };
+            let Some(out) = out else {
+                return Err(self.string_length_error());
+            };
+            return Ok(Some(if out.ptr_eq(&rope) {
+                NanBox::handle(handle.to_raw())
+            } else {
+                NanBox::handle(self.realm.new_string_from_rope(out).to_raw())
+            }));
+        }
         if !force_array_like {
             // Collapse a `Concat` to a leaf once, so this and every later string
             // method reads it without walking and copying the tree.
@@ -2337,7 +2436,7 @@ impl Interp {
                         Some(self.new_str_bytes(case_map_wtf8(&bytes, upper)))
                     }
                 }
-                "trim" => Some(self.new_str_bytes(trim_wtf8(bytes, true, true).to_vec())),
+                "trim" => Some(self.trimmed_str(&rope, bytes, true, true)),
                 "charAt" => {
                     // UTF-16-indexed: the unit at `i` as a one-unit string,
                     // preserving a lone surrogate (stored via WTF-8). A negative
@@ -2551,12 +2650,8 @@ impl Interp {
                 }
                 // Annex B.2.3: `trimLeft`/`trimRight` are legacy aliases of
                 // `trimStart`/`trimEnd`.
-                "trimStart" | "trimLeft" => {
-                    Some(self.new_str_bytes(trim_wtf8(bytes, true, false).to_vec()))
-                }
-                "trimEnd" | "trimRight" => {
-                    Some(self.new_str_bytes(trim_wtf8(bytes, false, true).to_vec()))
-                }
+                "trimStart" | "trimLeft" => Some(self.trimmed_str(&rope, bytes, true, false)),
+                "trimEnd" | "trimRight" => Some(self.trimmed_str(&rope, bytes, false, true)),
                 // Annex B.2.3 legacy HTML wrapper methods. `CreateHTML(S, tag,
                 // attribute, value)`: wraps the receiver string `S` in
                 // `<tag …>S</tag>`, optionally emitting `attribute="value"` with

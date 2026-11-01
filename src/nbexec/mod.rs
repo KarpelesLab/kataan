@@ -2947,6 +2947,7 @@ mod object;
 mod promise;
 mod regexp;
 mod resource;
+pub(crate) mod str_rope;
 mod structured_clone;
 mod temporal;
 mod temporal_astro;
@@ -7040,6 +7041,21 @@ impl Interp {
     /// The UTF-16 units `[a, b)` of the string `rope` (whose bytes, flat or
     /// materialized, are `bytes`) as a new string value, sharing a flat
     /// rope's buffer when the result is long (see [`Rope::slice_units`](crate::rope::Rope::slice_units)).
+    /// `TrimString` of the flat string `rope` (its bytes `bytes`), the kept
+    /// part sharing its buffer rather than copied.
+    fn trimmed_str(
+        &mut self,
+        rope: &crate::rope::Rope,
+        bytes: &[u8],
+        start: bool,
+        end: bool,
+    ) -> NanBox {
+        match str_rope::trim_rope(rope, start, end) {
+            Some(out) => NanBox::handle(self.realm.new_string_from_rope(out).to_raw()),
+            None => self.new_str_bytes(trim_wtf8(bytes, start, end).to_vec()),
+        }
+    }
+
     fn new_str_slice(
         &mut self,
         rope: &crate::rope::Rope,

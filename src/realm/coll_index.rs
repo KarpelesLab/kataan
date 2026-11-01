@@ -30,6 +30,14 @@ pub struct CollIndex {
     used: usize,
     /// [`GONE`] slots.
     gone: usize,
+    /// How many entries at the front of the collection's entry list are all
+    /// tombstones (each of `entries[..head]` is one; 0 is always true): where
+    /// a search for the first live entry may start, so a queue that deletes
+    /// its oldest entry each time (`s.delete(s.values().next().value)`)
+    /// finds the next one in O(1) amortized rather than rescanning the dead
+    /// prefix. Kept here, with the index, because it goes stale exactly when
+    /// the index does (a compaction renumbers the entries).
+    pub head: u32,
 }
 
 /// Folds a 64-bit key hash into the 32 stored bits (never all-ones together
@@ -58,6 +66,7 @@ impl CollIndex {
             slots: alloc::vec![0; slots],
             used: 0,
             gone: 0,
+            head: 0,
         }
     }
 
