@@ -4064,3 +4064,35 @@ fn unlabeled_break_skips_labeled_blocks() {
         "in1 after1 | in0 after0 | w1 | e0 | bl0 a0 a1 bl2 a2 | try0 fin0 fin1"
     );
 }
+
+/// An array index kept outside the dense elements (an accessor, a sparse
+/// element) takes its ascending place among the integer keys of
+/// `Object.keys` / `values` / `entries` / `for-in` (OrdinaryOwnPropertyKeys);
+/// it came after the dense indices. `values`/`entries` re-check each index
+/// (an earlier getter may delete a later one). And an exotic object's
+/// synthesized own keys (an array's or String's `length`, a function's
+/// `length`/`name`, a RegExp's `lastIndex`) shadow an enumerable inherited
+/// property of the same name in `for-in` (EnumerateObjectProperties).
+#[test]
+fn exotic_own_keys_order_and_shadow() {
+    let src = r#"
+        var fin = function (o) { var r = []; for (var k in o) r.push(k); return r.join(); };
+        var a = [1, 2, 3];
+        Object.defineProperty(a, "0", { get: function () { return 9; }, enumerable: true, configurable: true });
+        var c = [10]; c.name = "n"; c[50] = "far"; c[7] = "mid";
+        var e = [0, 1, 2];
+        Object.defineProperty(e, "0", { get: function () { delete e[2]; return "f"; }, enumerable: true, configurable: true });
+        var p = { a: 1, length: 5, name: "p", lastIndex: 3, z: 6 };
+        var arr = [1, 2]; Object.setPrototypeOf(arr, p);
+        var fn = function g(x) {}; Object.setPrototypeOf(fn, p);
+        var re = /x/; Object.setPrototypeOf(re, p);
+        var str = new String("ab"); Object.setPrototypeOf(str, p);
+        [Object.keys(a).join(), Object.values(a).join(), fin(a), Object.keys(c).join(),
+         JSON.stringify(Object.entries(e)), fin(arr), fin(fn), fin(re), fin(str)].join(" ")
+    "#;
+    assert_eq!(
+        run(src),
+        "0,1,2 9,2,3 0,1,2 0,7,50,name [[\"0\",\"f\"],[\"1\",1]] 0,1,a,name,lastIndex,z \
+         a,lastIndex,z a,length,name,z 0,1,a,name,lastIndex,z"
+    );
+}

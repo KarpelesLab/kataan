@@ -2816,7 +2816,7 @@ impl Interp {
         let enumerable = self
             .realm
             .object_keys(c)
-            .unwrap_or_else(|| self.realm.aux_named_keys(c));
+            .unwrap_or_else(|| self.realm.aux_named_keys_after_indices(c));
         for k in enumerable {
             if seen.insert(k.clone()) {
                 out.push(self.new_key_str(&k));
@@ -2837,6 +2837,18 @@ impl Interp {
             if !crate::realm::is_internal_key(&k) {
                 seen.insert(k);
             }
+        }
+        // An exotic object's synthesized own keys shadow too: an array's or a
+        // String object's `length`, a function's `length`/`name`, a RegExp's
+        // `lastIndex` (none is stored as a cell key). A typed array has only
+        // its indices, already seen.
+        if self.realm.array_elements(c).is_some() || self.string_index_count(c).is_some() {
+            seen.insert(String::from("length"));
+        } else if self.realm.object_keys(c).is_none()
+            && self.realm.typed_len(c).is_none()
+            && let Some(names) = self.realm.own_property_names(c)
+        {
+            seen.extend(names);
         }
     }
 

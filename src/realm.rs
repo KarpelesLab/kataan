@@ -5155,11 +5155,38 @@ impl Realm {
         let Some(o) = hidden_owner else {
             return Some((0..a.len()).filter(|&i| !a[i].is_hole()).collect());
         };
-        Some(
-            (0..a.len())
-                .filter(|&i| !a[i].is_hole() && !o.is_hidden(&alloc::format!("{i}")))
-                .collect(),
-        )
+        let mut indices: Vec<usize> = (0..a.len())
+            .filter(|&i| !a[i].is_hole() && !o.is_hidden(&alloc::format!("{i}")))
+            .collect();
+        // An index stored in the aux object (an accessor, or a sparse element
+        // past the dense part) is an integer key too: it takes its ascending
+        // place among the element indices, not after them (OrdinaryOwnPropertyKeys).
+        if matches!(self.heap.get(handle), Some(Cell::Array(_))) {
+            let before = indices.len();
+            indices.extend(
+                o.enumerable_keys()
+                    .iter()
+                    .filter_map(|k| canonical_array_index(k))
+                    .filter(|&i| i >= a.len() || a[i].is_hole()),
+            );
+            if indices.len() != before {
+                indices.sort_unstable();
+                indices.dedup();
+            }
+        }
+        Some(indices)
+    }
+
+    /// [`aux_named_keys`](Realm::aux_named_keys) without an array's integer
+    /// keys, which [`array_enumerable_indices`](Realm::array_enumerable_indices)
+    /// already lists in their ascending place.
+    #[must_use]
+    pub fn aux_named_keys_after_indices(&self, handle: Handle) -> Vec<alloc::string::String> {
+        let mut keys = self.aux_named_keys(handle);
+        if matches!(self.heap.get(handle), Some(Cell::Array(_))) {
+            keys.retain(|k| canonical_array_index(k).is_none());
+        }
+        keys
     }
 
     /// The length of an array's *dense* backing `Vec` (not its logical `length`,

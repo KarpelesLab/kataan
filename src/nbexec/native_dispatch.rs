@@ -1134,7 +1134,7 @@ impl Interp {
                         // its auxiliary object (e.g. `arr.custom`, a match result's
                         // `index`/`input`, a class's enumerable static fields —
                         // static methods/accessors are non-enumerable and excluded).
-                        keys.extend(self.realm.aux_named_keys(h));
+                        keys.extend(self.realm.aux_named_keys_after_indices(h));
                     }
                 }
                 let boxed: Vec<NanBox> = keys.iter().map(|k| self.new_key_str(k)).collect();
@@ -2064,14 +2064,25 @@ impl Interp {
                     if !self.realm.is_vm_function(h)
                         && let Some(indices) = self.realm.array_enumerable_indices(h)
                     {
+                        // Re-checked per key, as for named keys below: an earlier
+                        // index getter (only an aux-stored index can have one)
+                        // may have deleted this index or made it non-enumerable.
+                        let recheck = self.realm.has_aux_object(h);
                         for i in indices {
-                            vals.push(self.read_member(h, &alloc::format!("{i}"))?);
+                            let k = alloc::format!("{i}");
+                            if recheck
+                                && (!self.realm.has_own(h, &k)
+                                    || !self.realm.property_is_enumerable(h, &k))
+                            {
+                                continue;
+                            }
+                            vals.push(self.read_member(h, &k)?);
                         }
                     }
                     let named = self
                         .realm
                         .object_keys(h)
-                        .unwrap_or_else(|| self.realm.aux_named_keys(h));
+                        .unwrap_or_else(|| self.realm.aux_named_keys_after_indices(h));
                     for k in named {
                         // EnumerableOwnProperties re-runs `[[GetOwnProperty]]` per
                         // key: an earlier key's getter may have deleted this key or
@@ -2187,15 +2198,23 @@ impl Interp {
                     if !self.realm.is_vm_function(h)
                         && let Some(indices) = self.realm.array_enumerable_indices(h)
                     {
+                        let recheck = self.realm.has_aux_object(h);
                         for i in indices {
-                            let v = self.read_member(h, &alloc::format!("{i}"))?;
-                            entries.push((alloc::format!("{i}"), v));
+                            let k = alloc::format!("{i}");
+                            if recheck
+                                && (!self.realm.has_own(h, &k)
+                                    || !self.realm.property_is_enumerable(h, &k))
+                            {
+                                continue;
+                            }
+                            let v = self.read_member(h, &k)?;
+                            entries.push((k, v));
                         }
                     }
                     let named = self
                         .realm
                         .object_keys(h)
-                        .unwrap_or_else(|| self.realm.aux_named_keys(h));
+                        .unwrap_or_else(|| self.realm.aux_named_keys_after_indices(h));
                     for k in named {
                         // EnumerableOwnProperties re-runs `[[GetOwnProperty]]` per
                         // key (an earlier getter may have deleted it or turned off
