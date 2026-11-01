@@ -12760,7 +12760,7 @@ pub fn execute_capturing(
     source: &str,
     limits: crate::limits::Limits,
 ) -> (String, Result<String, String>) {
-    crate::nbexec::eval_source_capturing_on(source, limits, false)
+    crate::nbexec::eval_source_capturing_on(source, limits, false, None)
 }
 
 /// [`execute_capturing`] for a process that exits right after it returns
@@ -12773,7 +12773,19 @@ pub fn execute_capturing_then_exit(
     source: &str,
     limits: crate::limits::Limits,
 ) -> (String, Result<String, String>) {
-    crate::nbexec::eval_source_capturing_on(source, limits, true)
+    crate::nbexec::eval_source_capturing_on(source, limits, true, None)
+}
+
+/// [`execute_capturing_then_exit`] for a script read from `script_path`: its
+/// dynamic `import()` specifiers resolve relative to that file (as the
+/// `kataan run <FILE>` command line does), not to the working directory.
+#[cfg(feature = "std")]
+pub fn execute_file_capturing_then_exit(
+    source: &str,
+    script_path: &str,
+    limits: crate::limits::Limits,
+) -> (String, Result<String, String>) {
+    crate::nbexec::eval_source_capturing_on(source, limits, true, Some(script_path))
 }
 
 /// Like [`execute_with_limits`], but on failure returns a structured
@@ -13013,6 +13025,35 @@ pub fn execute_module(
             alloc::format!("{}: {}", t.name, t.message)
         }
     })
+}
+
+/// Runs the ES-module graph rooted at the resolved `entry_key` (the `kataan
+/// run file.mjs` command line), returning the console output together with the
+/// completion or a flattened error message. Unlike [`execute_module`], the
+/// output printed before an uncaught throw is kept.
+#[cfg(all(feature = "std", feature = "module"))]
+pub fn execute_module_capturing(
+    entry_key: &str,
+    host: &dyn crate::nbexec::module::ModuleHost,
+    limits: crate::limits::Limits,
+) -> (String, Result<String, String>) {
+    vm_module::execute_module_capturing(entry_key, host, limits)
+}
+
+/// Loads, links and evaluates the ES-module graph rooted at `entry_key` on an
+/// existing interpreter (one a host has already set up, e.g. with timers
+/// installed for `kataan hostrun file.mjs`). The console output stays in
+/// `interp` whether or not evaluation throws.
+///
+/// # Errors
+/// Returns [`Thrown`](crate::nbexec::Thrown) for any parse/link/runtime failure.
+#[cfg(all(feature = "std", feature = "module"))]
+pub fn evaluate_module_on(
+    interp: &mut crate::nbexec::Interp,
+    entry_key: &str,
+    host: &dyn crate::nbexec::module::ModuleHost,
+) -> Result<String, crate::nbexec::Thrown> {
+    vm_module::evaluate_module_graph(interp, entry_key, host).map(|(_, completion)| completion)
 }
 
 /// Evaluates `prelude` (script) into the realm global, then runs the module

@@ -104,6 +104,10 @@ fn run_main() -> ExitCode {
         // by its `KTBC` magic).
         ["eval" | "run", path] => match std::fs::read(path) {
             Ok(bytes) if bytes.starts_with(b"KTBC") => run_bytecode(&bytes, path),
+            // An ES module (a `.mjs` file, or module syntax in another file,
+            // as Node detects it) runs as the entry of a module graph whose
+            // imports resolve relative to it.
+            Ok(bytes) if runs_as_module(path, &String::from_utf8_lossy(&bytes)) => run_module(path),
             Ok(bytes) => run_eval_nb(&String::from_utf8_lossy(&bytes), path),
             Err(e) => {
                 eprintln!("kataan: cannot read {path}: {e}");
@@ -115,6 +119,7 @@ fn run_main() -> ExitCode {
         // `nbrun` is a legacy alias of `run` (there is one engine).
         ["nbrun", "-e", source] => run_eval_nb(source, "<argv>"),
         ["nbrun", path] => match std::fs::read_to_string(path) {
+            Ok(source) if runs_as_module(path, &source) => run_module(path),
             Ok(source) => run_eval_nb(&source, path),
             Err(e) => {
                 eprintln!("kataan: cannot read {path}: {e}");
@@ -127,6 +132,7 @@ fn run_main() -> ExitCode {
         // process exits.
         ["hostrun", "-e", source] => run_host(source, "<argv>"),
         ["hostrun", path] => match std::fs::read_to_string(path) {
+            Ok(source) if runs_as_module(path, &source) => run_host_module(path),
             Ok(source) => run_host(&source, path),
             Err(e) => {
                 eprintln!("kataan: cannot read {path}: {e}");
@@ -193,8 +199,12 @@ fn run_parse(source: &str, origin: &str) -> ExitCode {
 fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
     // The script's `console` output is printed on the error path too: an
     // uncaught throw does not un-print what ran before it.
-    let (output, outcome) =
-        kataan::nbvm::execute_capturing_then_exit(source, kataan::limits::Limits::default());
+    let limits = kataan::limits::Limits::default();
+    let (output, outcome) = if origin == "<argv>" {
+        kataan::nbvm::execute_capturing_then_exit(source, limits)
+    } else {
+        kataan::nbvm::execute_file_capturing_then_exit(source, &script_key(origin), limits)
+    };
     print!("{output}");
     match outcome {
         Ok(completion) => {
@@ -208,6 +218,97 @@ fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The canonical path of the script or module file at `path` (the referrer its
+/// imports resolve against), or `path` itself when it cannot be canonicalised.
+fn script_key(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Whether the file at `path` runs as an ES module: a `.mjs` file always, a
+/// `.cjs` file never, and any other file when its text is module code (Node's
+/// syntax detection): it has a top-level `import`/`export` declaration, or it
+/// does not parse as a script but does as a module (top-level `await`,
+/// `import.meta`).
+fn runs_as_module(path: &str, source: &str) -> bool {
+    if path.ends_with(".mjs") {
+        return true;
+    }
+    if path.ends_with(".cjs")
+        || !["import", "export", "await"]
+            .iter()
+            .any(|k| source.contains(k))
+    {
+        return false;
+    }
+    match kataan::parser::Parser::parse_program(source) {
+        Ok(program) => program.source_type == kataan::ast::SourceType::Module,
+        Err(_) => kataan::parser::Parser::parse_module(source).is_ok(),
+    }
+}
+
+/// `name: message` for an uncaught error (just the name when there is no
+/// message).
+fn thrown_text(t: &kataan::nbexec::Thrown) -> String {
+    if t.message.is_empty() {
+        t.name.clone()
+    } else {
+        format!("{}: {}", t.name, t.message)
+    }
+}
+
+/// Prints what the program logged, then reports the uncaught error `e` of a
+/// `hostrun` program by its name and message (not the raw thrown handle).
+fn host_uncaught(
+    interp: &kataan::nbexec::Interp,
+    origin: &str,
+    e: kataan::nbexec::ExecError,
+) -> ExitCode {
+    print!("{}", interp.output());
+    let t = interp.exec_error_to_thrown(e, kataan::nbexec::ErrorPhase::Runtime);
+    eprintln!("kataan: {origin}: uncaught {}", thrown_text(&t));
+    ExitCode::FAILURE
+}
+
+/// Runs the `.mjs` file at `path` as the entry module of an ES-module graph.
+fn run_module(path: &str) -> ExitCode {
+    let key = script_key(path);
+    let (output, outcome) = kataan::nbvm::execute_module_capturing(
+        &key,
+        &kataan::nbexec::module::FileModuleHost,
+        kataan::limits::Limits::default(),
+    );
+    print!("{output}");
+    match outcome {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kataan: {path}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `hostrun` for a `.mjs` entry: the module graph runs with the host timers
+/// installed, then the event loop drains to quiescence.
+fn run_host_module(path: &str) -> ExitCode {
+    let key = script_key(path);
+    let mut interp: kataan::nbexec::Interp = kataan::nbexec::Interp::new();
+    kataan::host::timers::install(&mut interp);
+    if let Err(t) =
+        kataan::nbvm::evaluate_module_on(&mut interp, &key, &kataan::nbexec::module::FileModuleHost)
+    {
+        print!("{}", interp.output());
+        eprintln!("kataan: {path}: {}", thrown_text(&t));
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = kataan::host::timers::run_event_loop(&mut interp) {
+        return host_uncaught(&interp, path, e);
+    }
+    print!("{}", interp.output());
+    ExitCode::SUCCESS
 }
 
 /// Compiles `path`'s JavaScript to a portable `.ktbc` bytecode artifact written
@@ -300,20 +401,17 @@ fn run_host(source: &str, origin: &str) -> ExitCode {
     let program: &'static kataan::ast::Program = Box::leak(Box::new(program));
     let mut interp: kataan::nbexec::Interp = kataan::nbexec::Interp::new();
     kataan::host::timers::install(&mut interp);
+    if origin != "<argv>" {
+        interp.set_script_import_base(Some(script_key(origin)));
+    }
 
     let completion = match interp.run(program) {
         Ok(value) => value,
-        Err(e) => {
-            print!("{}", interp.output());
-            eprintln!("kataan: {origin}: uncaught {e:?}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return host_uncaught(&interp, origin, e),
     };
     // Drain timers / microtasks / nextTick queue to quiescence.
     if let Err(e) = kataan::host::timers::run_event_loop(&mut interp) {
-        print!("{}", interp.output());
-        eprintln!("kataan: {origin}: uncaught {e:?}");
-        return ExitCode::FAILURE;
+        return host_uncaught(&interp, origin, e);
     }
     print!("{}", interp.output());
     let disp = interp.display(completion);
@@ -392,7 +490,7 @@ fn print_usage() {
          kataan lex -e <SOURCE>    tokenize a source string\n    \
          kataan parse <FILE>       parse a program and dump its AST\n    \
          kataan parse -e <SOURCE>  parse a source string and dump its AST\n    \
-         kataan run <FILE>         run a script or a compiled .ktbc artifact\n    \
+         kataan run <FILE>         run a script, a .mjs module or a .ktbc artifact\n    \
          kataan run -e <SOURCE>    run a source string\n    \
          kataan eval <FILE>        alias for `run`\n    \
          kataan eval -e <SOURCE>   alias for `run -e`\n    \

@@ -368,7 +368,6 @@ pub(super) fn execute_module_entry(
     prelude: Option<&str>,
     limits: crate::limits::Limits,
 ) -> Result<(String, String), crate::nbexec::Thrown> {
-    use crate::nbexec::ErrorPhase;
     let program = match prelude.filter(|p| !p.is_empty()).map(parse_script) {
         Some(Ok(p)) if p.source_type == crate::ast::SourceType::Module => {
             return Err(super::import_export_in_script());
@@ -381,6 +380,39 @@ pub(super) fn execute_module_entry(
     if let Some(program) = &program {
         run_hosted_script(&mut interp, program)?;
     }
+    evaluate_module_graph(&mut interp, entry_key, host)
+}
+
+/// [`super::execute_module_capturing`]: runs the graph rooted at `entry_key`
+/// and returns the console output even when evaluation throws.
+pub(super) fn execute_module_capturing(
+    entry_key: &str,
+    host: &dyn crate::nbexec::module::ModuleHost,
+    limits: crate::limits::Limits,
+) -> (String, Result<String, String>) {
+    let mut interp = crate::nbexec::Interp::new_with_limits(limits);
+    let result = evaluate_module_graph(&mut interp, entry_key, host);
+    let output = String::from(interp.output());
+    let result = result.map(|(_, completion)| completion).map_err(|t| {
+        if t.message.is_empty() {
+            t.name
+        } else {
+            alloc::format!("{}: {}", t.name, t.message)
+        }
+    });
+    (output, result)
+}
+
+/// Loads, links and evaluates the module graph rooted at `entry_key` on
+/// `interp`, returning `(console_output, completion_string)` or the thrown
+/// error. The interpreter keeps the console output either way, so a caller
+/// can print what ran before an uncaught throw.
+pub(super) fn evaluate_module_graph(
+    interp: &mut crate::nbexec::Interp,
+    entry_key: &str,
+    host: &dyn crate::nbexec::module::ModuleHost,
+) -> Result<(String, String), crate::nbexec::Thrown> {
+    use crate::nbexec::ErrorPhase;
     let linked = interp
         .load_module_pub(entry_key, host)
         .and_then(|()| interp.link_module_pub(entry_key));
@@ -393,7 +425,7 @@ pub(super) fn execute_module_entry(
             Err(e) => Err(interp.exec_error_to_thrown(e, ErrorPhase::Runtime)),
         },
     };
-    finish(&interp, result)
+    finish(interp, result)
 }
 
 /// The end of an entry's run: a module the VM refused to compile, or a VM

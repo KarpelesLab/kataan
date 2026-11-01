@@ -50,3 +50,178 @@ fn no_test262_host_hooks_in_cli() {
     );
     assert!(ok);
 }
+
+/// Writes `files` (name, source) into a fresh directory for one test and
+/// returns its path.
+fn fixture_dir(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("kataan-cli-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    for (name, src) in files {
+        std::fs::write(dir.join(name), src).expect("write fixture");
+    }
+    dir
+}
+
+/// Runs `kataan <mode> <path>` from an unrelated working directory and returns
+/// (stdout, stderr, success).
+fn run_file(mode: &str, path: &std::path::Path) -> (String, String, bool) {
+    let out = Command::new(env!("CARGO_BIN_EXE_kataan"))
+        .args([mode, path.to_str().expect("utf-8 path")])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("spawn kataan");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// A `.mjs` file runs as an ES module under both `run` and `hostrun`: static
+/// imports resolve next to it, bindings are live, and top-level await works.
+#[test]
+fn mjs_runs_as_module_graph() {
+    let dir = fixture_dir(
+        "mjs",
+        &[
+            (
+                "main.mjs",
+                "import { n, bump } from './dep.mjs';\nbump();\nconst m = await import('./dep.mjs');\nconsole.log(n, m.n, typeof this, await Promise.resolve('tla'));\n",
+            ),
+            (
+                "dep.mjs",
+                "export let n = 1;\nexport function bump() { n++; }\n",
+            ),
+        ],
+    );
+    for mode in ["run", "hostrun"] {
+        let (stdout, stderr, ok) = run_file(mode, &dir.join("main.mjs"));
+        assert_eq!(stdout, "2 2 undefined tla\n", "{mode} stderr: {stderr}");
+        assert!(ok, "{mode}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A script's dynamic `import()` resolves relative to the script file, not to
+/// the process working directory.
+#[test]
+fn script_dynamic_import_resolves_next_to_script() {
+    let dir = fixture_dir(
+        "dynimport",
+        &[
+            (
+                "main.js",
+                "import('./dep.mjs').then(m => console.log('got', m.v), e => console.log('failed', String(e)));\nvoid 0;\n",
+            ),
+            ("dep.mjs", "export const v = 'dep';\n"),
+        ],
+    );
+    for mode in ["run", "hostrun"] {
+        let (stdout, _, ok) = run_file(mode, &dir.join("main.js"));
+        assert_eq!(stdout, "got dep\n", "{mode}");
+        assert!(ok, "{mode}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `hostrun` reports an uncaught error by name and message (not as a raw
+/// thrown handle), and a failing module keeps the output printed before it.
+#[test]
+fn hostrun_uncaught_error_is_readable() {
+    let dir = fixture_dir(
+        "hostthrow",
+        &[
+            ("a.js", "console.log('before'); null.x;\n"),
+            (
+                "b.js",
+                "setTimeout(() => { throw new RangeError('late'); }, 0);\n",
+            ),
+            ("c.mjs", "console.log('m'); throw new TypeError('mod');\n"),
+        ],
+    );
+    let (stdout, stderr, ok) = run_file("hostrun", &dir.join("a.js"));
+    assert_eq!(stdout, "before\n");
+    assert!(stderr.contains("uncaught TypeError: "), "stderr: {stderr}");
+    assert!(!ok);
+    let (_, stderr, ok) = run_file("hostrun", &dir.join("b.js"));
+    assert!(
+        stderr.contains("uncaught RangeError: late"),
+        "stderr: {stderr}"
+    );
+    assert!(!ok);
+    for mode in ["run", "hostrun"] {
+        let (stdout, stderr, ok) = run_file(mode, &dir.join("c.mjs"));
+        assert_eq!(stdout, "m\n", "{mode}");
+        assert!(stderr.contains("TypeError: mod"), "{mode} stderr: {stderr}");
+        assert!(!ok, "{mode}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `.js` file with module syntax (a top-level `import`/`export`, or a
+/// top-level `await` / `import.meta` that only parses as a module) runs as a
+/// module, as Node's syntax detection does; a `.cjs` file never does.
+#[test]
+fn module_syntax_in_js_file_runs_as_module() {
+    let dir = fixture_dir(
+        "detect",
+        &[
+            (
+                "static.js",
+                "import { v } from './dep.mjs';\nconsole.log(v, this);\n",
+            ),
+            (
+                "tla.js",
+                "const m = await import('./dep.mjs');\nconsole.log(m.v, typeof import.meta.url);\n",
+            ),
+            ("plain.js", "console.log(typeof this, 'import'.length);\n"),
+            ("c.cjs", "import { v } from './dep.mjs';\n"),
+            ("dep.mjs", "export const v = 'dep';\n"),
+        ],
+    );
+    for mode in ["run", "hostrun"] {
+        let (stdout, stderr, ok) = run_file(mode, &dir.join("static.js"));
+        assert_eq!(stdout, "dep undefined\n", "{mode} stderr: {stderr}");
+        assert!(ok, "{mode}");
+        let (stdout, stderr, ok) = run_file(mode, &dir.join("tla.js"));
+        assert_eq!(stdout, "dep string\n", "{mode} stderr: {stderr}");
+        assert!(ok, "{mode}");
+        let (stdout, _, ok) = run_file(mode, &dir.join("plain.js"));
+        assert_eq!(stdout, "object 6\n", "{mode}");
+        assert!(ok, "{mode}");
+        let (_, stderr, ok) = run_file(mode, &dir.join("c.cjs"));
+        assert!(stderr.contains("SyntaxError"), "{mode} stderr: {stderr}");
+        assert!(!ok, "{mode}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing import fails the run with a readable error, and a `file:` URL
+/// specifier (built from the percent-encoded `import.meta.url`) loads the
+/// same module instance as the relative path.
+#[test]
+fn module_file_urls_and_missing_imports() {
+    let dir = fixture_dir(
+        "furl",
+        &[
+            (
+                "main.mjs",
+                "import * as a from './d e#.mjs';\nconst u = import.meta.url.replace(/main\\.mjs$/, 'd%20e%23.mjs');\nconst b = await import(u);\nconsole.log(a === b, b.v, import.meta.url.includes(' '));\n",
+            ),
+            ("d e#.mjs", "export const v = 1;\n"),
+            (
+                "miss.mjs",
+                "import { y } from './nope.mjs';\nconsole.log(y);\n",
+            ),
+        ],
+    );
+    let (stdout, stderr, ok) = run_file("run", &dir.join("main.mjs"));
+    assert_eq!(stdout, "true 1 false\n", "stderr: {stderr}");
+    assert!(ok);
+    let (stdout, stderr, ok) = run_file("run", &dir.join("miss.mjs"));
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("nope.mjs"), "stderr: {stderr}");
+    assert!(!ok);
+    let _ = std::fs::remove_dir_all(&dir);
+}

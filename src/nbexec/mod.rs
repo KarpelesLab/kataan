@@ -9270,12 +9270,19 @@ pub(crate) fn eval_source_capturing_on(
     source: &str,
     limits: crate::limits::Limits,
     at_exit: bool,
+    import_base: Option<&str>,
 ) -> (String, Result<String, String>) {
     let program = match crate::parser::Parser::parse_program(source) {
         Ok(program) => program,
         Err(e) => return (String::new(), Err(alloc::format!("{e}"))),
     };
     let mut interp = Interp::new_with_limits(limits);
+    // A script run from a file resolves its dynamic `import()` specifiers
+    // relative to that file, not to the process working directory.
+    #[cfg(feature = "module")]
+    interp.set_script_import_base(import_base.map(String::from));
+    #[cfg(not(feature = "module"))]
+    let _ = import_base;
     let outcome = match interp.run(&program) {
         Ok(value) => Ok(interp.display(value)),
         Err(ExecError::Throw(thrown)) => Err(format_thrown(&interp, thrown)),

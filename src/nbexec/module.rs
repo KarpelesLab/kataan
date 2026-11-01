@@ -97,6 +97,15 @@ impl ModuleHost for FileModuleHost {
                 .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
             None => PathBuf::from("."),
         };
+        // A `file:` URL (e.g. built from `import.meta.url`) names its path.
+        let decoded;
+        let specifier = match specifier.strip_prefix("file://") {
+            Some(rest) => {
+                decoded = path_of_file_url(rest);
+                decoded.as_str()
+            }
+            None => specifier,
+        };
         let joined = base.join(specifier);
         // Canonicalise so `./a.js` and `a.js` and `../dir/a.js` dedupe to one
         // key. Fall back to the lexical join if the file does not exist yet (the
@@ -114,6 +123,46 @@ impl ModuleHost for FileModuleHost {
     fn load_bytes(&self, key: &str) -> Result<Vec<u8>, String> {
         std::fs::read(key).map_err(|e| alloc::format!("cannot load module {key}: {e}"))
     }
+}
+
+/// The `file:` URL of the absolute path `path` (`import.meta.url`): the
+/// bytes of the URL path percent-encode set (controls, space, `"#<>?` and
+/// backtick, braces, non-ASCII), plus `%` itself, are written as `%XX`.
+fn file_url_of_path(path: &str) -> String {
+    let mut url = String::from("file://");
+    for &b in path.as_bytes() {
+        if b <= b' ' || b >= 0x7f || b"\"#%<>?`{}".contains(&b) {
+            url.push_str(&alloc::format!("%{b:02X}"));
+        } else {
+            url.push(char::from(b));
+        }
+    }
+    url
+}
+
+/// The path a `file:` URL names (`rest` follows `file://`): an optional
+/// `localhost` host is dropped, the query and fragment too, and `%XX` escapes
+/// decode (a malformed escape is kept as written).
+fn path_of_file_url(rest: &str) -> String {
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |c: u8| char::from(c).to_digit(16);
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Where a module is in the link/evaluate lifecycle (a coarse subset of the
@@ -1947,7 +1996,7 @@ impl Interp {
         let url = if key.starts_with("file://") || key.contains("://") {
             key.to_string()
         } else {
-            alloc::format!("file://{key}")
+            file_url_of_path(key)
         };
         let url_val = self.new_str(&url);
         self.realm.set_property(obj, "url", url_val);
