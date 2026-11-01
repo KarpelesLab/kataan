@@ -517,6 +517,24 @@ impl Scope {
         self.parent().and_then(|p| p.owner_frame(name))
     }
 
+    /// Whether `name`, looked up from this scope, reaches the enclosing module's
+    /// import binding: no frame between here and the module environment binds it.
+    /// (Below the module environment a local shadows the import; the import in
+    /// turn shadows the global environment outside it.)
+    #[must_use]
+    pub fn reaches_module_import(&self, name: &str) -> bool {
+        let data = self.0.borrow();
+        if data.module_imports.is_some() {
+            return true;
+        }
+        if data.slot_of(name).is_some() {
+            return false;
+        }
+        data.parent
+            .as_ref()
+            .is_some_and(|p| p.reaches_module_import(name))
+    }
+
     /// Looks up `name`, walking outward through enclosing scopes.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<NanBox> {

@@ -37,6 +37,16 @@ impl Interp {
         ExecError::Throw(self.make_error(N_REFERENCE_ERROR, Some(m)))
     }
 
+    /// The live binding `name` resolves to from the current scope when it is an
+    /// import of the enclosing module (a local of a function or block shadows it).
+    #[cfg(all(feature = "module", feature = "std"))]
+    pub(crate) fn visible_import(&self, name: &str) -> Option<(Scope, String)> {
+        let found = self.module_imports.get(name)?;
+        self.current
+            .reaches_module_import(name)
+            .then(|| found.clone())
+    }
+
     fn const_assign(&mut self) -> ExecError {
         let m = self.new_str("Assignment to constant variable.");
         ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m)))
@@ -153,6 +163,11 @@ impl Interp {
                         let v = this.with_binding_value(h, name)?;
                         return this.unary(UnaryOp::Typeof, v);
                     }
+                    #[cfg(all(feature = "module", feature = "std"))]
+                    if this.visible_import(name).is_some() {
+                        let v = this.read_ident_lexical(name)?;
+                        return this.unary(UnaryOp::Typeof, v);
+                    }
                     if this.current.get(name).is_none()
                         && !matches!(name, "undefined" | "NaN" | "Infinity")
                         && !this.global_object_provides(name)
@@ -192,6 +207,12 @@ impl Interp {
                         && let Some(h) = this.with_binding_result(name)?
                     {
                         return Ok((NanBox::handle(h.to_raw()), NanBox::undefined()));
+                    }
+                    // An import is immutable and outlives this reference: not
+                    // a frame to write to (`ref_put` throws, `ref_get` reads it).
+                    #[cfg(all(feature = "module", feature = "std"))]
+                    if this.visible_import(name).is_some() {
+                        return Ok((NanBox::number(0.0), NanBox::undefined()));
                     }
                     if let Some(fr) = this.current.owner_frame(name) {
                         return Ok((this.env_value(fr), NanBox::undefined()));
@@ -664,6 +685,10 @@ impl Interp {
 
     /// `PutValue` of a reference resolved by [`EnvReq::Ref`].
     fn ref_put(&mut self, reference: NanBox, name: &str, value: NanBox) -> Result<(), ExecError> {
+        #[cfg(all(feature = "module", feature = "std"))]
+        if reference.as_handle().is_none() && self.visible_import(name).is_some() {
+            return Err(self.const_assign());
+        }
         if let Some(h) = reference.as_handle().map(Handle::from_raw) {
             if let Some(fr) = self.realm.env_at(h) {
                 if !fr.has_local(name) {
@@ -824,6 +849,11 @@ impl Interp {
     /// shadowing, the `const` reassignment check, and the strict/sloppy rules for
     /// an unresolvable reference. Shared by `assign_to` and `set_assign_ref`.
     pub(crate) fn assign_to_name(&mut self, name: &str, value: NanBox) -> Result<(), ExecError> {
+        // An import binding is immutable.
+        #[cfg(all(feature = "module", feature = "std"))]
+        if self.visible_import(name).is_some() {
+            return Err(self.const_assign());
+        }
         // A bare identifier inside `with (obj)` assigns to the with-object's
         // property (via `[[Set]]`, so setters fire) when it provides the name.
         if let Some(h) = self.with_binding_result(name)? {

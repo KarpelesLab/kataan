@@ -14,7 +14,7 @@ impl Interp {
         // observed here. A reference before the source module has run leaves the
         // slot absent (TDZ) and throws a ReferenceError.
         #[cfg(all(feature = "module", feature = "std"))]
-        if let Some((src_scope, src_name)) = self.module_imports.get(name).cloned() {
+        if let Some((src_scope, src_name)) = self.visible_import(name) {
             return match src_scope.get(&src_name) {
                 // The slot is either absent (source module not yet run) or holds
                 // the TDZ sentinel (the source `let`/`const`/`class` is hoisted but
@@ -75,7 +75,7 @@ impl Interp {
         // callers using this non-`with` path (e.g. a bare-identifier call) still
         // resolve imported functions.
         #[cfg(all(feature = "module", feature = "std"))]
-        if let Some((src_scope, src_name)) = self.module_imports.get(name).cloned() {
+        if let Some((src_scope, src_name)) = self.visible_import(name) {
             return match src_scope.get(&src_name) {
                 Some(v) if !v.is_tdz() => Ok(v),
                 _ => {

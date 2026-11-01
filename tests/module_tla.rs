@@ -106,3 +106,44 @@ fn tla_rejection_propagates() {
         err.message
     );
 }
+
+/// Runs the module `main` (which imports `./lib`) and returns what it logged.
+fn run_with_lib(main: &str, lib: &str) -> String {
+    let (out, _) = run("main", &[("main", main), ("./lib", lib)]);
+    out.trim().to_string()
+}
+
+/// Module code with a direct `eval` resolves names through its environments: an
+/// import binding there is immutable (a write was a ReferenceError, or landed on
+/// a global of the same name), `typeof` sees it (it said "undefined") and a local
+/// shadows it (a read saw the import through the local).
+#[test]
+fn import_bindings_on_the_eval_environment_paths() {
+    let lib = "export let x = 1; export default 5; export function setX(v) { x = v; }";
+    let main = r#"
+        import d, { x, setX, x as Map } from "./lib";
+        import * as ns from "./lib";
+        const r = [];
+        const T = (f) => { try { r.push(f()); } catch (e) { r.push(e.name); } };
+        T(() => { x = 2; });
+        T(() => eval("x = 2"));
+        T(() => eval("x++"));
+        T(() => { [x] = [3]; });
+        T(() => eval("d = 1"));
+        T(() => eval("typeof x + typeof d + typeof ns"));
+        T(() => { let x = "L"; return eval("x"); });
+        T(() => { let x = "L"; eval("x = 'M'"); return x; });
+        T(() => ((x) => eval("typeof x"))("P"));
+        T(() => { try { throw "C"; } catch (x) { return eval("x"); } });
+        T(() => { let setX = () => "own"; return eval("setX()"); });
+        T(() => [typeof Map, eval("typeof Map"), eval("Map")].join());
+        T(() => eval("Map = 1"));
+        T(() => { setX(7); return eval("x"); });
+        console.log(r.join("|"));
+    "#;
+    assert_eq!(
+        run_with_lib(main, lib),
+        "TypeError|TypeError|TypeError|TypeError|TypeError|numbernumberobject|L|M|string|C|own|\
+         number,number,1|TypeError|7"
+    );
+}
