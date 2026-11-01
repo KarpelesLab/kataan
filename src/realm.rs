@@ -30,6 +30,7 @@ pub(crate) mod coll_fast;
 mod coll_index;
 mod concat_fast;
 mod fn_chain;
+mod forin_cache;
 pub use fn_chain::FnChain;
 mod gen_state;
 mod private_fast;
@@ -38,6 +39,7 @@ pub(crate) mod hidden_layout;
 mod msg_text;
 mod shortest;
 mod spread_fast;
+mod str_key_fast;
 mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;
@@ -334,6 +336,9 @@ pub struct Realm {
     /// handle and key epoch (`builtins_fast::ChainKeyCache`) is only valid
     /// while this is unchanged.
     cell_swaps: u32,
+    /// The `for-in` key lists by receiver shape (`forin_cache`), made on
+    /// first use. Boxed: the realm is moved by value on every host call.
+    for_in_cache: Option<alloc::boxed::Box<forin_cache::ForInCache>>,
     /// Compiled programs by `(source, flags)`, most recently used last: every
     /// evaluation of a regex literal creates a new RegExp object (so a literal
     /// in a loop is a fresh object per iteration), but they share one compiled
@@ -888,6 +893,7 @@ impl Realm {
             slice_cursor: None,
             tree_slice: None,
             cell_swaps: 0,
+            for_in_cache: None,
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -7477,6 +7483,7 @@ impl Realm {
             .flatten(),
         );
         out.extend(self.vm_array_iter.values_fns.iter().copied());
+        self.for_in_cache_roots(out);
         out.extend(self.unit_strings.iter().flatten().copied());
         out.extend(self.literal_ropes.iter().flatten().map(|(_, _, h)| *h));
         // Explicit prototype links for cells with no inline object part, and the
@@ -8091,6 +8098,7 @@ impl Realm {
         // forward them.
         self.unit_strings.clear();
         self.literal_ropes.clear();
+        self.for_in_cache = None;
         self.vm_array_iter = VmArrayIterIntrinsics {
             species_key,
             ..VmArrayIterIntrinsics::default()

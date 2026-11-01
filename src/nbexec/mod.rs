@@ -10123,6 +10123,14 @@ impl crate::nbvm::VmHost for Interp {
             self.namespace_enumeration_tdz(Handle::from_raw(raw))
                 .map_err(exec_to_host)?;
         }
+        // The key list memoized for this receiver's shape and chain
+        // (`realm::forin_cache`): no proxy, no exotic object on the chain.
+        if let Some(raw) = obj.as_handle()
+            && let Some(keys) = self.realm.for_in_cached(Handle::from_raw(raw))
+        {
+            let keys = keys.to_vec();
+            return Ok((NanBox::handle(self.realm.new_array(keys).to_raw()), obj));
+        }
         // A Proxy anywhere on the chain is walked through its traps (including
         // `getPrototypeOf`, so the keys it inherits are enumerated too).
         let trap_keys = match obj.as_handle() {
@@ -10145,7 +10153,11 @@ impl crate::nbvm::VmHost for Interp {
                 } else {
                     NanBox::undefined()
                 };
-                (self.iterate_keys(obj), live)
+                let keys = self.iterate_keys(obj);
+                if let Some(raw) = obj.as_handle() {
+                    self.realm.for_in_remember(Handle::from_raw(raw), &keys);
+                }
+                (keys, live)
             }
         };
         Ok((NanBox::handle(self.realm.new_array(keys).to_raw()), live))

@@ -976,8 +976,8 @@ impl Object {
     }
 
     /// A counter that changes whenever this object's set of own keys (data or
-    /// accessor) may have changed: equal values at two moments mean the same
-    /// own keys. (A `u32` that would need 2³² key changes between two reads to
+    /// accessor), or which of them are enumerable, may have changed: equal
+    /// values at two moments mean the same own keys. (A `u32` that would need 2³² key changes between two reads to
     /// alias.)
     #[must_use]
     pub fn key_epoch(&self) -> u32 {
@@ -1879,11 +1879,13 @@ impl Object {
         {
             if !self.ex().has_mark(Mark::Hidden, key) {
                 self.extra_mut().hidden_prefix = prefix + 1;
+                self.bump_key_epoch();
             }
             return;
         }
         if !self.is_hidden(key) {
             self.extra_mut().add_mark(Mark::Hidden, key);
+            self.bump_key_epoch();
         }
     }
 
@@ -1937,6 +1939,11 @@ impl Object {
     /// Clears the non-enumerable mark for `key` (a `defineProperty` redefining a
     /// configurable property to `enumerable: true`).
     pub fn clear_hidden(&mut self, key: &str) {
+        // An enumerability change moves the key epoch (the `for-in` key-list
+        // cache, `realm::forin_cache`, keys on it).
+        if self.is_hidden(key) {
+            self.bump_key_epoch();
+        }
         self.materialize_implied_attrs();
         if self.prefix_hidden(key) {
             self.write_out_hidden_prefix();

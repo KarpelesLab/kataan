@@ -9174,7 +9174,13 @@ fn run_frame_at_ic(
                 b,
             } => {
                 let (x, y) = (regs[*a as usize], regs[*b as usize]);
-                if *instanceof && let Some(r) = instance_of_fast(&ctx.realm, x, y) {
+                if let Some(r) = if *instanceof {
+                    instance_of_fast(&ctx.realm, x, y)
+                } else {
+                    // `key in obj` over an ordinary chain (a `for-in`'s
+                    // per-key liveness check among others).
+                    ctx.realm.has_property_by_string(x, y)
+                } {
                     regs[*dst as usize] = NanBox::boolean(r);
                     continue;
                 }
@@ -10748,6 +10754,10 @@ fn vm_get_elem(
         return Ok(NanBox::handle(s.to_raw()));
     }
     if let Some(v) = typed_array_index_get(ctx, recv, key) {
+        return Ok(v);
+    }
+    // A String key naming an ordinary object's own data property.
+    if let Some(v) = ctx.realm.own_data_by_string(recv, key) {
         return Ok(v);
     }
     if read_needs_host(ctx, recv)

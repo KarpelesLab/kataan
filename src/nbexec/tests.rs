@@ -13314,3 +13314,34 @@ fn first_array_for_of_takes_the_by_index_path_and_honors_patches() {
     "#;
     assert_eq!(run(src), "10,4,Array Iterator");
 }
+
+#[test]
+fn for_in_key_cache_follows_chain_and_enumerability_changes() {
+    // The `for-in` key list is memoized per receiver shape and chain
+    // (`realm::forin_cache`); every change between loops must show, as must
+    // the per-key liveness check and string-keyed `in`.
+    let src = r#"
+        function keys(o) { var r = []; for (var k in o) r.push(k); return r.join(""); }
+        var p = { p: 1, q: 2 }, a = Object.create(p); a.x = 1; a.y = 2;
+        var b = Object.create(p); b.x = 3; b.y = 4;
+        var r = [keys(a), keys(b)];
+        p.s = 1; r.push(keys(a));
+        delete p.p; r.push(keys(b));
+        Object.defineProperty(p, "q", { enumerable: false }); r.push(keys(a));
+        Object.defineProperty(p, "q", { enumerable: true }); r.push(keys(a));
+        var e = {}; e.z = 1; r.push(keys(e));
+        Object.defineProperty(e, "z", { enumerable: false }); r.push(keys(e) || "-");
+        Object.setPrototypeOf(a, { w: 1 }); r.push(keys(a));
+        var d = Object.create(p); d.x = 1;
+        Object.defineProperty(d, "s", { value: 0, enumerable: false }); r.push(keys(d));
+        var n = { b: 1, 2: 1, a: 1, 1: 1 }; r.push(keys(n), keys(n));
+        var m = { u: 1, v: 2, w: 3 }, seen = "";
+        for (var k in m) { seen += k; delete m.w; }
+        r.push(seen, "u" in m, "zz" in m, "toString" in m);
+        r.join(",")
+    "#;
+    assert_eq!(
+        run(src),
+        "xypq,xypq,xypqs,xyqs,xys,xyqs,z,-,xyw,xq,12ba,12ba,uv,true,false,true"
+    );
+}
