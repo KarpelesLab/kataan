@@ -7702,7 +7702,10 @@ impl JitFunction {
             ($reg:expr, $miss:expr) => {{ int_index!($reg, $miss, false) }};
             ($reg:expr, $miss:expr, $num:expr) => {{
                 let _: bool = $num;
-                a.movsd_xmm0_mem(disp($reg)); // xmm0 = index f64
+                // xmm0 = index f64, through `rax` (a general-purpose store
+                // wrote it, most likely: see `NumGen::xmm_from_slot`).
+                a.load_rax(disp($reg));
+                numeric::NumGen::set_xmm_from_rax(&mut a, 0);
                 a.cvttsd2si_rax_xmm0(); // rax = trunc(index)
                 a.cvtsi2sd_xmm1_rax(); // xmm1 = (f64)rax
                 a.ucomisd_xmm0_xmm1();
@@ -8290,7 +8293,8 @@ impl JitFunction {
                                 a.jmp(past);
                                 past_reload = Some(past);
                             } else {
-                                a.movsd_mem_xmm0(disp(dst));
+                                numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                                a.store_rax(disp(dst));
                                 a.jmp(done);
                             }
                             a.bind(nan);
@@ -8305,7 +8309,10 @@ impl JitFunction {
                             // or -2^63 itself), which the call computes.
                             match arg_x {
                                 Some(ax) => numeric::NumGen::xmm0_from_xmm(&mut a, ax),
-                                None => a.movsd_xmm0_mem(disp(x)),
+                                None => {
+                                    a.load_rax(disp(x));
+                                    numeric::NumGen::set_xmm_from_rax(&mut a, 0);
+                                }
                             }
                             a.cvttsd2si_rax_xmm0();
                             a.movabs_r11(i64::MIN);
@@ -8339,7 +8346,8 @@ impl JitFunction {
                                 a.jmp(past);
                                 past_reload = Some(past);
                             } else {
-                                a.movsd_mem_xmm0(disp(dst));
+                                numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                                a.store_rax(disp(dst));
                                 a.jmp(done);
                             }
                         } else if let MathInline::Abs = f {
@@ -8377,7 +8385,10 @@ impl JitFunction {
                         } else {
                             match arg_x {
                                 Some(ax) => numeric::NumGen::xmm0_from_xmm(&mut a, ax),
-                                None => a.movsd_xmm0_mem(disp(x)),
+                                None => {
+                                    a.load_rax(disp(x));
+                                    numeric::NumGen::set_xmm_from_rax(&mut a, 0);
+                                }
                             }
                             match f {
                                 MathInline::Round(mode) => a.roundsd_xmm0(mode),
@@ -8396,7 +8407,8 @@ impl JitFunction {
                                 a.jmp(past);
                                 past_reload = Some(past);
                             } else {
-                                a.movsd_mem_xmm0(disp(dst));
+                                numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                                a.store_rax(disp(dst));
                                 a.jmp(done);
                             }
                         }
@@ -9903,7 +9915,9 @@ impl JitFunction {
                                     $miss,
                                 ),
                                 None if integral => {
-                                    a.movsd_xmm0_mem(disp(index));
+                                    // (Through `rax`, see `int_index!`.)
+                                    a.load_rax(disp(index));
+                                    numeric::NumGen::set_xmm_from_rax(&mut a, 0);
                                     a.cvttsd2si_rax_xmm0();
                                 }
                                 None => int_index!(index, $miss, num.is_number_at(op_idx, index)),
@@ -10168,8 +10182,10 @@ impl JitFunction {
                         a.jmp(past);
                         past_reload = Some(past);
                     } else {
+                        // (Stored through `rax`: `NumGen::xmm_from_slot`.)
                         a.cvtsi2sd_xmm0_rax();
-                        a.movsd_mem_xmm0(disp(dst));
+                        numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                        a.store_rax(disp(dst));
                         a.jmp(done);
                     }
                     a.bind(helper);

@@ -2321,8 +2321,8 @@ impl NumGen {
                 match (self.xmm_of(reg, src), self.xmm_of(reg, dst)) {
                     (Some(xs), Some(xd)) if xs == xd => {}
                     (Some(xs), Some(xd)) => a.movapd_xx(xd, xs),
-                    (Some(xs), None) => a.movsd_mem_x(disp(dst), xs),
-                    (None, Some(xd)) => a.movsd_x_mem(xd, disp(src)),
+                    (Some(xs), None) => Self::slot_from_xmm(a, dst, xs, RAX),
+                    (None, Some(xd)) => Self::xmm_from_slot(a, xd, src, RAX),
                     (None, None) => {
                         a.load_rax(disp(src));
                         a.store_rax(disp(dst));
@@ -2470,18 +2470,14 @@ impl NumGen {
                     throws: false,
                 };
                 let fused = self.fusable(pc, ops, dst);
-                self.compare(
-                    a,
-                    labels,
-                    pc,
-                    reg,
-                    CmpKind::Eq(false),
-                    dst,
-                    x,
-                    y,
-                    slow,
-                    fused,
-                )?;
+                // Against a constant: the bits alone (in a general-purpose
+                // register, no type test, no slow path).
+                let kind = match (self.const_num_bits_at(pc, y), self.const_num_bits_at(pc, x)) {
+                    (Some(k), _) if x != y => CmpKind::Bits(x, k),
+                    (_, Some(k)) if x != y => CmpKind::Bits(y, k),
+                    _ => CmpKind::Eq(false),
+                };
+                self.compare(a, labels, pc, reg, kind, dst, x, y, slow, fused)?;
             }
             GenericOp::ToNumeric { dst, src, pc: opc } => {
                 if self.fused_step(a, reg, pc, ops) {
@@ -2510,9 +2506,8 @@ impl NumGen {
                 }
                 // `x ± 1` of a canonical NaN is that NaN, so no fix-up is needed.
                 self.load_xmm0(a, reg, src);
-                a.movabs_rax(1.0f64.to_bits() as i64);
-                a.movq_x_gpr(1, RAX);
-                a.sse_rr(0xf2, if dec { 0x5c } else { 0x58 }, 0, 1);
+                // addsd / subsd xmm0, [rip + 1.0]
+                a.sse_rip_const(0xf2, if dec { 0x5c } else { 0x58 }, 0, 1.0f64.to_bits());
                 self.store_xmm0(a, reg, dst);
                 a.bind(resume);
             }
@@ -3276,32 +3271,69 @@ impl NumGen {
         }
     }
 
-    /// `xmm0 = register r`.
+    /// `xmm0 = register r`. (A register-file slot moves through `rax`, see
+    /// [`xmm_from_slot`](Self::xmm_from_slot).)
     fn load_xmm0(&self, a: &mut X64Assembler, reg: Option<usize>, r: u16) {
         match self.xmm_of(reg, r) {
             Some(x) => a.movapd_xx(0, x),
-            None => a.movsd_x_mem(0, disp(r)),
+            None => self.xmm_from_reg(a, 0, r),
         }
     }
 
     /// The SSE register holding register `r` (promoted), or `scratch` loaded
-    /// with it.
+    /// with it (through `rax`).
     fn xmm_src(&self, a: &mut X64Assembler, reg: Option<usize>, r: u16, scratch: u8) -> u8 {
         match self.xmm_of(reg, r) {
             Some(x) => x,
             None => {
-                a.movsd_x_mem(scratch, disp(r));
+                self.xmm_from_reg(a, scratch, r);
                 scratch
             }
         }
     }
 
-    /// `register r = xmm0`.
+    /// `xmm x = register r` (not promoted) for the op being emitted: the
+    /// constant the `LoadConst` just before wrote, straight from the code's
+    /// constant words (no dependency on that store), else the slot through
+    /// `rax`.
+    fn xmm_from_reg(&self, a: &mut X64Assembler, x: u8, r: u16) {
+        match self.const_num_bits_at(self.cur_pc, r) {
+            Some(k) => a.sse_rip_const(0xf2, 0x10, x, k), // movsd x, [rip + k]
+            None => Self::xmm_from_slot(a, x, r, RAX),
+        }
+    }
+
+    /// `register r = xmm0` (a register-file slot through `rax`).
     fn store_xmm0(&self, a: &mut X64Assembler, reg: Option<usize>, r: u16) {
         match self.xmm_of(reg, r) {
             Some(x) => a.movapd_xx(x, 0),
-            None => a.movsd_mem_x(disp(r), 0),
+            None => {
+                a.movq_gpr_x(RAX, 0);
+                a.mov_mem_gpr(disp(r), RAX);
+            }
         }
+    }
+
+    /// `xmm x = register-file slot r`, loaded through general-purpose
+    /// register `via`. Almost everything else reads and writes the register
+    /// file with general-purpose loads and stores (moves, calls, property
+    /// reads and writes, type tests), and a value an SSE load takes from
+    /// such a store, or a general-purpose load from an SSE store, is
+    /// forwarded across domains: measured on this tier's targets, ~8-9
+    /// cycles, against ~0 for a general-purpose store and load of the same
+    /// slot (memory renaming) plus ~4 for each `movq`. Between two SSE ops
+    /// both ways cost the same, so a value goes through a general-purpose
+    /// register on its way in and out of every numeric op here.
+    fn xmm_from_slot(a: &mut X64Assembler, x: u8, r: u16, via: u8) {
+        a.mov_gpr_mem(via, disp(r));
+        a.movq_x_gpr(x, via);
+    }
+
+    /// `register-file slot r = xmm x`, through general-purpose register
+    /// `via` (see [`xmm_from_slot`](Self::xmm_from_slot)).
+    fn slot_from_xmm(a: &mut X64Assembler, r: u16, x: u8, via: u8) {
+        a.movq_gpr_x(via, x);
+        a.mov_mem_gpr(disp(r), via);
     }
 
     /// `register dst = register src`.
@@ -3311,8 +3343,8 @@ impl NumGen {
         }
         match (self.xmm_of(reg, src), self.xmm_of(reg, dst)) {
             (Some(xs), Some(xd)) => a.movapd_xx(xd, xs),
-            (Some(xs), None) => a.movsd_mem_x(disp(dst), xs),
-            (None, Some(xd)) => a.movsd_x_mem(xd, disp(src)),
+            (Some(xs), None) => Self::slot_from_xmm(a, dst, xs, RAX),
+            (None, Some(xd)) => Self::xmm_from_slot(a, xd, src, RAX),
             (None, None) => {
                 a.load_rax(disp(src));
                 a.store_rax(disp(dst));
@@ -3384,7 +3416,14 @@ impl NumGen {
     /// jump to `stub` for NaN / ±∞ / |x| ≥ 2^63 (the helper's case). Clobbers
     /// `r11` and `xmm1`.
     fn to_int32(&self, a: &mut X64Assembler, reg: Option<usize>, gpr: u8, r: u16, stub: Label) {
-        let x = self.xmm_src(a, reg, r, 1);
+        // (Through `gpr` itself: the other operand's may be live in `rax`.)
+        let x = match self.xmm_of(reg, r) {
+            Some(x) => x,
+            None => {
+                Self::xmm_from_slot(a, 1, r, gpr);
+                1
+            }
+        };
         a.cvttsd2si_gpr_x(gpr, x);
         a.movabs_r11(INDEFINITE as i64);
         a.cmp_gpr_r11(gpr);
@@ -3462,7 +3501,7 @@ impl NumGen {
                     match xx {
                         Some(s) if s == st => {}
                         Some(s) => a.movapd_xx(st, s),
-                        None => a.movsd_x_mem(st, disp(x)),
+                        None => Self::xmm_from_slot(a, st, x, RAX),
                     }
                     let ys = self.xmm_src(a, reg, y, 1);
                     a.sse_rr(0xf2, opc, st, ys);
@@ -3507,7 +3546,7 @@ impl NumGen {
                     match xx {
                         Some(s) if s == xd => {}
                         Some(s) => a.movapd_xx(xd, s),
-                        None => a.movsd_x_mem(xd, disp(x)),
+                        None => Self::xmm_from_slot(a, xd, x, RAX),
                     }
                     let ys = self.xmm_src(a, reg, y, 1);
                     a.sse_rr(0xf2, opc, xd, ys);
@@ -3516,8 +3555,14 @@ impl NumGen {
             }
             _ => {
                 self.load_xmm0(a, reg, x);
-                let xy = self.xmm_src(a, reg, y, 1);
-                a.sse_rr(0xf2, opc, 0, xy);
+                match (self.xmm_of(reg, y), self.const_num_bits_at(pc, y)) {
+                    // `x <op> k`: the constant as the memory operand.
+                    (None, Some(k)) if y != x => a.sse_rip_const(0xf2, opc, 0, k),
+                    _ => {
+                        let xy = self.xmm_src(a, reg, y, 1);
+                        a.sse_rr(0xf2, opc, 0, xy);
+                    }
+                }
                 if dk == DEFER_SKIP {
                     // (Checked later, [`DeferPlan`].)
                 } else if defer {
@@ -3563,6 +3608,19 @@ impl NumGen {
         // (`-0.0` is not an integer constant here: `x % -0` is NaN.)
         (v == v.trunc() && v.abs() < 9.0e15 && !(v == 0.0 && v.is_sign_negative()))
             .then_some(v as i64)
+    }
+
+    /// The bits of the Number other than NaN that register `r` surely holds
+    /// on entry to op `pc` (as [`const_int_at`](Self::const_int_at)).
+    fn const_num_bits_at(&self, pc: usize, r: u16) -> Option<u64> {
+        if pc == 0 || self.is_target.get(pc).copied().unwrap_or(true) {
+            return None;
+        }
+        let Some(Op::LoadConst { dst, value }) = self.bc(pc - 1) else {
+            return None;
+        };
+        let v = value.as_number().filter(|v| *dst == r && !v.is_nan())?;
+        Some(v.to_bits())
     }
 
     /// `dst = x % y`: inline when both are integral Numbers that convert
@@ -3695,13 +3753,28 @@ impl NumGen {
         use crate::nbvm::{VB_BIT_AND, VB_BIT_OR, VB_BIT_XOR, VB_SHL, VB_SHR, VB_USHR};
         let resume = a.new_label();
         let stub = a.new_label();
-        for r in [x, y] {
-            if self.ty(pc, r) != T_NUM {
-                self.num_guard(a, reg, r, stub);
+        // (No type test: anything but a Number reads as a NaN, whose
+        // truncation is the "indefinite" integer `to_int32` sends to `stub`.)
+        // A constant operand (`x | 0`, `h & 0xff`, `n >> 3`) is its
+        // `ToInt32`, compiled in.
+        let k32 = |r: u16| {
+            let v = f64::from_bits(self.const_num_bits_at(pc, r)?);
+            (v.abs() < 9.0e18).then_some(v as i64 as i32)
+        };
+        match k32(x) {
+            Some(k) if x != y => {
+                a.raw(&[0xb8]); // mov eax, imm32
+                a.raw(&k.to_le_bytes());
             }
+            _ => self.to_int32(a, reg, RAX, x, stub),
         }
-        self.to_int32(a, reg, RAX, x, stub);
-        self.to_int32(a, reg, RCX, y, stub);
+        match k32(y) {
+            Some(k) if x != y => {
+                a.raw(&[0xb9]); // mov ecx, imm32
+                a.raw(&k.to_le_bytes());
+            }
+            _ => self.to_int32(a, reg, RCX, y, stub),
+        }
         match vop {
             VB_BIT_AND => a.raw(&[0x21, 0xc8]), // and eax, ecx
             VB_BIT_OR => a.raw(&[0x09, 0xc8]),  // or eax, ecx
@@ -3741,8 +3814,14 @@ impl NumGen {
         fused: Option<(usize, bool)>,
     ) -> Option<()> {
         let stub = a.new_label();
-        let guarded = self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM;
-        if guarded {
+        let bits = matches!(kind, CmpKind::Bits(..));
+        let guarded = !bits && (self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM);
+        // An operand not proven a Number is told apart by the compare
+        // itself: anything but a Number reads as a NaN, so `ucomisd` comes
+        // out unordered, and only then does the slow path run (which also
+        // takes a Number's NaN, the rare case: its result is the same).
+        let defer = guarded && self.imode.is_none();
+        if guarded && !defer {
             self.guard_numbers(a, pc, reg, x, y, stub);
         }
         // `ucomisd p, q` then `a`/`ae` = p > q / p >= q (false when unordered).
@@ -3751,15 +3830,33 @@ impl NumGen {
             CmpKind::Rel(1) => (x, y, CC_A),
             CmpKind::Rel(2) => (y, x, CC_AE),
             CmpKind::Rel(_) => (x, y, CC_AE),
-            CmpKind::Eq(_) => (x, y, CC_E),
+            CmpKind::Eq(_) | CmpKind::Bits(..) => (x, y, CC_E),
         };
-        let xp = self.xmm_src(a, reg, p, 0);
-        let xq = self.xmm_src(a, reg, q, 1);
-        a.sse_rr(0x66, 0x2e, xp, xq); // ucomisd p, q
+        if let CmpKind::Bits(v, k) = kind {
+            // ZF = the register's bits are k's (either zero, for a zero k).
+            self.load_gpr(a, reg, RAX, v);
+            if k << 1 == 0 {
+                a.raw(&[0x48, 0x01, 0xc0]); // add rax, rax (the sign bit out)
+            } else {
+                a.movabs_r11(k as i64);
+                a.cmp_rax_r11();
+            }
+        } else {
+            let xp = self.xmm_src(a, reg, p, 0);
+            let xq = self.xmm_src(a, reg, q, 1);
+            a.sse_rr(0x66, 0x2e, xp, xq); // ucomisd p, q
+        }
+        if defer {
+            a.jcc(CC_P, stub); // (leaves the flags for the branch below)
+        }
         let store = fused.is_none_or(|(_, s)| s);
         if store {
             // rax = the 0/1 result (ordered equality needs ZF && !PF).
             match kind {
+                CmpKind::Bits(..) => {
+                    a.setcc_al(CC_E);
+                    a.raw(&[0x0f, 0xb6, 0xc0]); // movzx eax, al
+                }
                 CmpKind::Eq(neg) => {
                     a.setcc_al(CC_E);
                     a.raw(&[0x0f, 0x9b, 0xc1]); // setnp cl
@@ -3795,6 +3892,7 @@ impl NumGen {
                     self.jcc_to(a, labels, reg, CC_E, target);
                 } else {
                     match kind {
+                        CmpKind::Bits(..) => self.jcc_to(a, labels, reg, CC_NE, target),
                         CmpKind::Eq(false) => {
                             self.jcc_to(a, labels, reg, CC_NE, target);
                             self.jcc_to(a, labels, reg, CC_P, target);
@@ -4366,6 +4464,11 @@ enum CmpKind {
     Rel(u8),
     /// Equality over Numbers; `true` for the negated form.
     Eq(bool),
+    /// `register === k` (either way round) for a Number constant `k` other
+    /// than NaN: exactly a compare of the register's bits with `k`'s (with
+    /// the sign bit left out for a zero `k`, so `-0 === 0`), whatever the
+    /// register holds, since no other value's bits are a non-NaN Number's.
+    Bits(u16, u64),
 }
 
 /// Register `r`'s displacement in the register file.
@@ -6363,6 +6466,29 @@ impl X64Assembler {
         self.code
             .extend_from_slice(&[0x0f, opc, 0x80 | ((reg & 7) << 3) | 3]);
         self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `[pfx] [REX.R] 0F opc xmm(x), [rip + c]`, `c` a constant word with the
+    /// value `value` (placed after the code, each once, as
+    /// `handle::p_rip_const`'s).
+    fn sse_rip_const(&mut self, pfx: u8, opc: u8, x: u8, value: u64) {
+        let c = match self.consts.iter().find(|c| c.0 == value) {
+            Some(&(_, l)) => l,
+            None => {
+                let l = self.new_label();
+                self.consts.push((value, l));
+                l
+            }
+        };
+        self.code.push(pfx);
+        if x >= 8 {
+            self.code.push(0x44);
+        }
+        // ModRM mod=00 rm=101: [rip + disp32], the disp32 ending the
+        // instruction (so it resolves as a jump's `rel32` does).
+        self.code
+            .extend_from_slice(&[0x0f, opc, ((x & 7) << 3) | 5]);
+        self.emit_rel32(c);
     }
 
     /// `F2 [REX.R] 0F opc` with `xmm(x)` and `[rax]` (`10` load, `11` store).
