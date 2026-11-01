@@ -144,6 +144,16 @@ pub fn compile_module_into(
         }
     }
 
+    // A module's evaluation promise fulfills with undefined: an async body must
+    // not return its last expression's value, whose being a promise would hold
+    // back the modules waiting on this one.
+    if is_async {
+        body.push(Stmt::Return {
+            argument: None,
+            span: crate::common::Span::point(0),
+        });
+    }
+
     let base = table.len() as u32;
     let n = fns.len() as u32;
     let init_id = base + n + 1;

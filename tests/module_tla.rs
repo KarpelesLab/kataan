@@ -194,3 +194,23 @@ fn namespace_objects_on_the_chain_and_in_the_dead_zone() {
          a,b false|true|TypeError|true|a,b"
     );
 }
+
+/// An async module body's completion does not wait on its last expression: when
+/// that value was a promise, the importers' bodies ran only after it settled (and
+/// after every tick of its chain) rather than one tick after the body ended.
+#[test]
+fn importer_runs_one_tick_after_a_tla_body_ends() {
+    let lib = r#"
+        globalThis.log = [];
+        await null;
+        log.push("end");
+        Promise.resolve().then(() => log.push("t1")).then(() => log.push("t2")).then(() => log.push("t3"));
+    "#;
+    let main = r#"
+        import "./lib";
+        log.push("main");
+        await new Promise((r) => setTimeout(r, 0));
+        console.log(log.join());
+    "#;
+    assert_eq!(run_with_lib(main, lib), "end,t1,main,t2,t3");
+}
