@@ -528,6 +528,20 @@ pub enum Op {
         this: Reg,
         args: Reg,
     },
+    /// `f(items…, ...src)` when spreading `src` runs no code: `src` is a plain
+    /// array iterated by the built-in `%ArrayIterator%` (see `iter_fast`)
+    /// whose elements `0..length` are all present own data properties. Then
+    /// `dst = callee.call(this, items…, ...elements)` and `ok = true`;
+    /// otherwise nothing happens and `ok = false`, and the general spread
+    /// call that follows runs.
+    CallSpreadPlain {
+        dst: Reg,
+        callee: Reg,
+        this: Reg,
+        items: Vec<Reg>,
+        src: Reg,
+        ok: Reg,
+    },
     /// `dst = new ctor(...args)` where `args` is a compiler-built array.
     ConstructSpread { dst: Reg, ctor: Reg, args: Reg },
     /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
@@ -9154,6 +9168,31 @@ fn run_frame_at_ic(
                     Err(e) => handle_throw!(e),
                 }
             }
+            Op::CallSpreadPlain {
+                dst,
+                callee,
+                this,
+                items,
+                src,
+                ok,
+            } => {
+                let Some(argv) = plain_spread_argv(ctx, regs, items, regs[*src as usize]) else {
+                    regs[*ok as usize] = NanBox::boolean(false);
+                    continue;
+                };
+                regs[*ok as usize] = NanBox::boolean(true);
+                let (f, t) = (regs[*callee as usize], regs[*this as usize]);
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let r = call_closure(ctx, funcs, f, &argv, t);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match r {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
+            }
             Op::ConstructSpread { dst, ctor, args } => {
                 let argv = spread_argv(ctx, regs[*args as usize])?;
                 let c = regs[*ctor as usize];
@@ -11078,6 +11117,31 @@ fn spread_argv(ctx: &Ctx, args: NanBox) -> Result<Vec<NanBox>, VmError> {
         .to_vec())
 }
 
+/// [`Op::CallSpreadPlain`]'s argument list: the `items` registers' values
+/// followed by the elements of the array `src`, when `GetIterator(src)` is
+/// the built-in array iteration (`iter_fast::can_open`) and every index below
+/// its length is a present own data element, so iterating it reads exactly
+/// those values and runs no code. `None` otherwise (nothing observable has
+/// happened).
+fn plain_spread_argv(ctx: &mut Ctx, regs: &[NanBox], items: &[Reg], src: NanBox) -> Option<ArgBuf> {
+    if !iter_fast::can_open(&mut ctx.realm, src) {
+        return None;
+    }
+    let arr = Handle::from_raw(src.as_handle()?);
+    if ctx.realm.array_has_index_overrides(arr) {
+        return None;
+    }
+    let len = ctx.realm.array_length(arr)?;
+    let elems = ctx.realm.array_elements(arr)?;
+    let elems = elems.get(..len)?;
+    if elems.iter().any(|e| e.is_hole()) {
+        return None;
+    }
+    let mut argv = ArgBuf::from_regs(regs, items);
+    argv.extend_from_slice(elems);
+    Some(argv)
+}
+
 /// A call's argument (or capture) values, inline up to eight so an ordinary
 /// call does not heap-allocate a vector for them. Derefs to the slice.
 struct ArgBuf {
@@ -11121,6 +11185,22 @@ impl ArgBuf {
             b.heap = vals.to_vec();
         }
         b
+    }
+
+    /// Appends `vals` after the values held.
+    #[inline]
+    fn extend_from_slice(&mut self, vals: &[NanBox]) {
+        let n = self.len + vals.len();
+        if n <= ARGBUF_INLINE {
+            self.inline[self.len..n].copy_from_slice(vals);
+        } else {
+            if self.len <= ARGBUF_INLINE {
+                self.heap = Vec::with_capacity(n);
+                self.heap.extend_from_slice(&self.inline[..self.len]);
+            }
+            self.heap.extend_from_slice(vals);
+        }
+        self.len = n;
     }
 }
 
@@ -19958,15 +20038,7 @@ impl Compiler {
                     let jf = self.emit_jump_if_false(go);
                     self.optchain_ends.last_mut().expect("a chain").push(jf);
                 }
-                let args = self.spread_args(arguments)?;
-                let dst = self.alloc();
-                self.ops.push(Op::CallSpread {
-                    dst,
-                    callee: f,
-                    this,
-                    args,
-                });
-                Ok(dst)
+                self.call_spread(f, this, arguments)
             }
             // `f?.(args)` / `o.m?.(args)`: a nullish callee short-circuits the
             // whole chain (to its `OptChain` end) before the arguments run.
@@ -20014,15 +20086,7 @@ impl Compiler {
                 let go = self.emit_not_nullish(f)?;
                 let jf = self.emit_jump_if_false(go);
                 self.optchain_ends.last_mut().expect("a chain").push(jf);
-                let args = self.spread_args(arguments)?;
-                let dst = self.alloc();
-                self.ops.push(Op::CallSpread {
-                    dst,
-                    callee: f,
-                    this,
-                    args,
-                });
-                Ok(dst)
+                self.call_spread(f, this, arguments)
             }
             // A bare-identifier callee resolved through the environment: the
             // reference supplies `this` (a `with` object), and `eval(…)` is a
@@ -20092,15 +20156,7 @@ impl Compiler {
                         (f, self.constant(NanBox::undefined())?)
                     }
                 };
-                let args = self.spread_args(arguments)?;
-                let dst = self.alloc();
-                self.ops.push(Op::CallSpread {
-                    dst,
-                    callee: f,
-                    this,
-                    args,
-                });
-                Ok(dst)
+                self.call_spread(f, this, arguments)
             }
             Expr::Call {
                 callee,
@@ -21413,6 +21469,73 @@ impl Compiler {
     /// compiled).
     /// A hosted call's argument list with spreads, as a fresh array: each
     /// `...x` runs the full iterator protocol through the host.
+    /// `f(arguments…)` with `this` for an argument list holding a spread:
+    /// the general [`Op::CallSpread`] over [`spread_args`](Self::spread_args)'
+    /// array, led, when the list is plain items then one trailing spread, by
+    /// an [`Op::CallSpreadPlain`] that makes the call directly (skipping the
+    /// rest) whenever spreading runs no code.
+    fn call_spread(
+        &mut self,
+        f: Reg,
+        this: Reg,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<Reg, CompileError> {
+        let dst = self.alloc();
+        if let Some((crate::ast::Argument::Spread(last), init)) = arguments.split_last()
+            && init.len() < ARGBUF_INLINE
+            && init
+                .iter()
+                .all(|a| matches!(a, crate::ast::Argument::Item(_)))
+        {
+            let mut items = Vec::with_capacity(init.len());
+            for (i, a) in init.iter().enumerate() {
+                let crate::ast::Argument::Item(e) = a else {
+                    return Err(CompileError::Unsupported("spread argument"));
+                };
+                let r = self.expr(e)?;
+                // Read now, even when a later argument assigns its variable.
+                let r = self.pin_operand(r, args_may_assign(&arguments[i + 1..]));
+                items.push(r);
+            }
+            let src = self.expr(last)?;
+            let ok = self.alloc();
+            self.ops.push(Op::CallSpreadPlain {
+                dst,
+                callee: f,
+                this,
+                items: items.clone(),
+                src,
+                ok,
+            });
+            let slow = self.emit_jump_if_false(ok);
+            let done = self.emit_jump();
+            self.patch(slow);
+            let arr = self.alloc();
+            self.ops.push(Op::NewArray { dst: arr, len: 0 });
+            for v in items {
+                self.ops.push(Op::ArrayPush { arr, src: v });
+            }
+            let rest = self.iterate_to_array(src)?;
+            self.ops.push(Op::ArrayExtend { arr, src: rest });
+            self.ops.push(Op::CallSpread {
+                dst,
+                callee: f,
+                this,
+                args: arr,
+            });
+            self.patch(done);
+            return Ok(dst);
+        }
+        let args = self.spread_args(arguments)?;
+        self.ops.push(Op::CallSpread {
+            dst,
+            callee: f,
+            this,
+            args,
+        });
+        Ok(dst)
+    }
+
     fn spread_args(&mut self, arguments: &[crate::ast::Argument]) -> Result<Reg, CompileError> {
         let arr = self.alloc();
         self.ops.push(Op::NewArray { dst: arr, len: 0 });

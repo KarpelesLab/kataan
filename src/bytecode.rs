@@ -827,6 +827,19 @@ fn verify_op_with(
             reg(*this)?;
             reg(*args)
         }
+        Op::CallSpreadPlain {
+            dst,
+            callee,
+            this,
+            items,
+            src,
+            ok,
+        } => {
+            for x in [dst, callee, this, src, ok] {
+                reg(*x)?;
+            }
+            regs(items)
+        }
         Op::ConstructSpread { dst, ctor, args } => {
             reg(*dst)?;
             reg(*ctor)?;
@@ -1910,6 +1923,20 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_reg(*r, out);
             }
         }
+        Op::CallSpreadPlain {
+            dst,
+            callee,
+            this,
+            items,
+            src,
+            ok,
+        } => {
+            w_u8(225, out);
+            for x in [dst, callee, this, src, ok] {
+                w_reg(*x, out);
+            }
+            w_regs(items, out);
+        }
         Op::ConstructSpread { dst, ctor, args } => {
             w_u8(88, out);
             w_reg(*dst, out);
@@ -2714,6 +2741,17 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             src: r.reg()?,
             this: r.reg()?,
         },
+        225 => {
+            let (dst, callee, this, src, ok) = (r.reg()?, r.reg()?, r.reg()?, r.reg()?, r.reg()?);
+            Op::CallSpreadPlain {
+                dst,
+                callee,
+                this,
+                items: r.regs()?,
+                src,
+                ok,
+            }
+        }
         88 => Op::ConstructSpread {
             dst: r.reg()?,
             ctor: r.reg()?,
