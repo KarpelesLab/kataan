@@ -10832,8 +10832,8 @@ pub(crate) fn parse_int(s: &str, radix: u32) -> f64 {
 /// at least one) name, as `parseInt` returns it (19.2.5): correctly rounded
 /// for radix 10 and the powers of two, which the spec requires exactly (a
 /// digit-by-digit `value * radix + d` rounds at every step once past 2^53,
-/// so `parseInt("68826266662840068")` came out one unit off). Other radixes
-/// keep that accumulation, the approximation the spec permits for them.
+/// so `parseInt("68826266662840068")` came out one unit off). The spec lets the
+/// other radixes approximate, but they round once too.
 pub(crate) fn int_digits_value(digits: &str, radix: u32) -> f64 {
     let mut value: f64 = 0.0;
     for c in digits.chars() {
@@ -10846,13 +10846,11 @@ pub(crate) fn int_digits_value(digits: &str, radix: u32) -> f64 {
     if radix == 10 {
         return digits.parse::<f64>().unwrap_or(value);
     }
-    if !matches!(radix, 2 | 4 | 8 | 16 | 32) {
-        return value;
-    }
-    // A power of two: past 1100 significant bits the value is `Infinity`;
-    // below, the exact integer rounds once.
+    // Past 1100 significant bits the value is `Infinity` (each digit but the
+    // first is worth at least the radix's whole bits); below, the exact integer
+    // rounds once.
     let sig = digits.trim_start_matches('0');
-    if sig.len() as u64 * u64::from(radix.trailing_zeros()) > 1100 {
+    if (sig.len() as u64 - 1) * u64::from(radix.ilog2()) > 1100 {
         return f64::INFINITY;
     }
     crate::bignum::BigInt::from_str_radix(sig, radix).map_or(value, |b| b.to_f64())

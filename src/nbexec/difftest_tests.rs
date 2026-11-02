@@ -4179,3 +4179,26 @@ fn global_let_write_leaves_like_named_property_alone() {
         "5,prop,2,prop,2,2,19999,prop,19999,19999,39999,prop,1,propc,39999,again"
     );
 }
+
+/// `parseInt` in a radix the spec lets approximate still names the nearest
+/// Number: the digit-by-digit accumulation rounded at every step past 2^53.
+#[test]
+fn parse_int_rounds_once_in_every_radix() {
+    let src = r#"
+        function exact(s, r) {
+            var v = 0n;
+            for (var c of s) v = v * BigInt(r) + BigInt(parseInt(c, 36));
+            return Number(v);
+        }
+        var cases = [["661433031661466022443", 7], ["c27813677c7592817723cb37c", 13],
+            ["ro7c27losu90fm9q86oqimfdccb", 31], ["bf15hfh7310c9354f", 21], ["zzzzzzzzzzzzzzzzzzzz", 36],
+            ["2".repeat(700), 3], ["z".repeat(198), 36], ["0".repeat(50) + "5enioo9i603mo759o6f9h6m0d", 25]];
+        var r = cases.map(function (c) { return parseInt(c[0], c[1]) === exact(c[0], c[1]); });
+        r.push(parseInt("z".repeat(199), 36), parseInt("2".repeat(1200), 3), parseInt("-" + "6".repeat(30), 7) === -exact("6".repeat(30), 7));
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "true,true,true,true,true,true,true,true,Infinity,Infinity,true"
+    );
+}
