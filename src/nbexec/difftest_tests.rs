@@ -4227,3 +4227,37 @@ fn compact_mantissa_past_the_largest_suffix_is_rounded() {
          integer:1 group:, integer:000 group:, integer:000 compact:T"
     );
 }
+
+/// `Intl.DateTimeFormat` renders every field it was asked for, also when no CLDR
+/// skeleton has the combination: `{weekday, era}` formatted as the empty string,
+/// `{weekday, year}` lost the weekday, `{hour, fractionalSecondDigits}` the
+/// fraction. Every subset of the fields, in a few locales.
+#[cfg(feature = "intl")]
+#[test]
+fn date_time_format_keeps_every_requested_field() {
+    let src = r#"
+        var d = new Date(Date.UTC(2024, 0, 5, 13, 4, 5, 678));
+        var f = { weekday: "long", era: "short", year: "numeric", month: "short", day: "numeric",
+            hour: "numeric", minute: "numeric", second: "numeric", fractionalSecondDigits: 2, timeZoneName: "short" };
+        var names = Object.keys(f), bad = [];
+        ["en-US", "de", "ja"].forEach(function (loc) {
+            for (var m = 1; m < 1 << names.length; m++) {
+                var o = { timeZone: "UTC" };
+                names.forEach(function (n, i) { if (m & (1 << i)) o[n] = f[n]; });
+                var have = {};
+                new Intl.DateTimeFormat(loc, o).formatToParts(d).forEach(function (p) { have[p.type] = 1; });
+                names.forEach(function (n, i) {
+                    if (m & (1 << i) && !have[n === "fractionalSecondDigits" ? "fractionalSecond" : n]) bad.push(loc + m + n);
+                });
+            }
+        });
+        function en(o) { o.timeZone = "UTC"; return new Intl.DateTimeFormat("en-US", o).format(d); }
+        [bad.length, en({ weekday: "long", era: "short" }), en({ weekday: "long", year: "numeric" }),
+         en({ era: "long", day: "numeric" }), en({ dayPeriod: "long", fractionalSecondDigits: 1 }),
+         en({ weekday: "long", month: "long", day: "numeric" }), en({ era: "short", year: "numeric" })].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "0|Friday AD|2024 Friday|5 Anno Domini|in the afternoon 6|Friday, January 5|2024 AD"
+    );
+}

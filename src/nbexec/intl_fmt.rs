@@ -6858,7 +6858,82 @@ impl Interp {
             }
         }
         Self::fix_bce_era_year(dt, &mut parts);
+        Self::restore_dropped_fields(locale, dt, o, &mut parts);
         parts
+    }
+
+    /// The crate matches component options to the nearest CLDR skeleton, whose
+    /// pattern can lack a requested field: `{weekday: "long", year: "numeric"}`
+    /// rendered `2024`, and `{weekday: "long", era: "short"}` nothing at all. A
+    /// missing field follows the rest, as CLDR's root `appendItems` pattern
+    /// (`{0} {1}`) has it. (`resolvedOptions` reports these fields regardless.)
+    #[cfg(feature = "intl")]
+    fn restore_dropped_fields(
+        locale: &str,
+        dt: &intl::datetime::DateTime,
+        o: &intl::datetime::DateTimeFormatOptions,
+        parts: &mut Vec<(&'static str, String)>,
+    ) {
+        use intl::datetime::DateTimeFormatOptions as Opts;
+        if o.date_style.is_some() || o.time_style.is_some() {
+            return;
+        }
+        type SetField = fn(&mut Opts, &Opts);
+        // Each option, the part it renders, and how to set just that one.
+        let fields: [(bool, &str, SetField); 10] = [
+            (o.weekday.is_some(), "weekday", |p, o| p.weekday = o.weekday),
+            (o.era.is_some(), "era", |p, o| p.era = o.era),
+            (o.year.is_some(), "year", |p, o| p.year = o.year),
+            (o.month.is_some(), "month", |p, o| p.month = o.month),
+            (o.day.is_some(), "day", |p, o| p.day = o.day),
+            (o.hour.is_some(), "hour", |p, o| p.hour = o.hour),
+            (o.minute.is_some(), "minute", |p, o| p.minute = o.minute),
+            (o.second.is_some(), "second", |p, o| p.second = o.second),
+            (
+                o.fractional_second_digits.is_some(),
+                "fractionalSecond",
+                |p, o| p.fractional_second_digits = o.fractional_second_digits,
+            ),
+            (o.time_zone_name.is_some(), "timeZoneName", |p, o| {
+                p.time_zone_name = o.time_zone_name
+            }),
+        ];
+        // A lone field is what the skeleton match cannot drop.
+        if fields.iter().filter(|f| f.0).count() + usize::from(o.day_period.is_some()) < 2 {
+            return;
+        }
+        for (wanted, kind, set) in fields {
+            if !wanted || parts.iter().any(|(k, _)| *k == kind) {
+                continue;
+            }
+            let mut probe = *o;
+            probe.weekday = None;
+            probe.era = None;
+            probe.year = None;
+            probe.month = None;
+            probe.day = None;
+            probe.day_period = None;
+            probe.hour = None;
+            probe.minute = None;
+            probe.second = None;
+            probe.fractional_second_digits = None;
+            probe.time_zone_name = None;
+            set(&mut probe, o);
+            // The crate renders an era only beside a year.
+            if kind == "era" {
+                probe.year = o.year.or(Some(intl::datetime::Numeric2Digit::Numeric));
+            }
+            let Some(field) = Self::dtf_crate_parts(locale, dt, &probe)
+                .into_iter()
+                .find(|(k, _)| *k == kind)
+            else {
+                continue;
+            };
+            if !parts.is_empty() {
+                parts.push(("literal", String::from(" ")));
+            }
+            parts.push(field);
+        }
     }
 
     /// The crate honours `hour_cycle`/`hour12` only on the skeleton path, so a
