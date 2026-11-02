@@ -4301,7 +4301,8 @@ fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: 
     let Some(g) = global.as_handle().map(Handle::from_raw) else {
         return true;
     };
-    if global_owns_cached(&ctx.realm, g, name, cache) {
+    // A global `let`/`const`/`class` is not the like-named property's binding.
+    if global_owns_cached(&ctx.realm, g, name, cache) && !scope.has_lexical(name) {
         ctx.realm.set_property(g, name, v);
     }
     true

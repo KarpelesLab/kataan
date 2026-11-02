@@ -4144,3 +4144,38 @@ fn for_in_through_a_proxy_on_the_chain_does_not_ask_has() {
     "#;
     assert_eq!(run(src), "own,c,own,c|0|a,e,p|a");
 }
+
+/// A write to a global `let` is not a write to a like-named property of the
+/// global object, which `globalThis.s = "prop"` can make before the binding is
+/// initialized: `s = 5` also stored into the property (the `var` mirror asked
+/// only whether the object owns the name), on the host's path, the VM's fast path
+/// and compiled code's. A `var` still has the one location.
+#[test]
+fn global_let_write_leaves_like_named_property_alone() {
+    let src = r#"
+        globalThis.s = "prop";
+        globalThis.c = "propc";
+        let s = 0;
+        class c {}
+        var v = 1;
+        var r = [];
+        s = 5;
+        r.push(s, globalThis.s);
+        function w(n) { for (var i = 0; i < n; i++) { s = i; v = i; } }
+        w(3);
+        r.push(s, globalThis.s, v, globalThis.v);
+        w(20000);
+        r.push(s, globalThis.s, v, globalThis.v);
+        for (let i = 0; i < 20000; i++) { s = s + 1; }
+        r.push(s, globalThis.s);
+        c = 1;
+        r.push(c, globalThis.c);
+        globalThis.s = "again";
+        r.push(s, globalThis.s);
+        r.join()
+    "#;
+    assert_eq!(
+        run(src),
+        "5,prop,2,prop,2,2,19999,prop,19999,19999,39999,prop,1,propc,39999,again"
+    );
+}

@@ -5762,7 +5762,9 @@ impl Interp {
     /// Restricted to names the global scope itself binds *and* the global object
     /// already carries, so a local/`let`/`const` write never touches the object.
     pub(crate) fn sync_global_var(&mut self, name: &str, value: NanBox) {
-        if !self.global_scope.has_local(name) {
+        // A global `let`/`const`/`class` lives apart from the global object: a
+        // like-named property is not its binding.
+        if !self.global_scope.has_local(name) || self.global_scope.has_lexical(name) {
             return;
         }
         let Some(g) = self.global_this.as_handle().map(Handle::from_raw) else {

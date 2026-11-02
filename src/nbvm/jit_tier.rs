@@ -1122,13 +1122,17 @@ fn global_store_ref(
     name: &str,
     cache: &super::StoreGlobalCache,
 ) -> Option<*mut NanBox> {
-    let Some((p, g)) =
+    let Some((p, g, lexical)) =
         ctx.host
             .as_deref()?
             .global_scope_if_current()
             .and_then(|(scope, global)| {
                 let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
-                Some((p, Handle::from_raw(global.as_handle()?)))
+                Some((
+                    p,
+                    Handle::from_raw(global.as_handle()?),
+                    scope.has_lexical(name),
+                ))
             })
     else {
         // No plain global-scope binding: an existing writable data property
@@ -1144,7 +1148,8 @@ fn global_store_ref(
     if !tracked {
         return None;
     }
-    if !super::global_owns_cached(&ctx.realm, g, name, cache) {
+    // A global `let`/`const`/`class` is not the like-named property's binding.
+    if lexical || !super::global_owns_cached(&ctx.realm, g, name, cache) {
         cache.jit.set(0);
         return Some(p);
     }
