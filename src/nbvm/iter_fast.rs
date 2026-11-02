@@ -253,6 +253,14 @@ fn fresh_pair_is_plain(realm: &mut Realm) -> bool {
     true
 }
 
+/// Whether destructuring a fresh array literal (all elements present) with
+/// `[t1, …, tn]` runs no code: what [`fresh_pair_is_plain`] decides, which
+/// depends on neither length (the steps read present own elements, and a
+/// close finds no `return`).
+pub(super) fn fresh_array_is_plain(realm: &mut Realm) -> bool {
+    fresh_pair_is_plain(realm)
+}
+
 /// [`fresh_pair_is_plain`] by the lookups themselves.
 fn fresh_pair_walk(realm: &Realm) -> bool {
     let ai = realm.vm_array_iter();

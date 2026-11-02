@@ -1475,6 +1475,13 @@ pub(crate) extern "C" fn jit_helper_exec_op(
                 None => None,
             }
         }
+        // Whether a fresh array destructures without running code (its
+        // interpreter arm, which cannot fail).
+        Op::FreshArrayIterPlain { dst } => {
+            regs[*dst as usize] =
+                NanBox::boolean(super::iter_fast::fresh_array_is_plain(&mut ctx.realm));
+            Some(Ok(()))
+        }
         // Literal allocations (an object or array literal per loop iteration):
         // exactly their interpreter arms, which cannot fail.
         Op::NewObject { dst } => {

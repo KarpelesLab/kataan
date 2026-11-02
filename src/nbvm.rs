@@ -542,6 +542,11 @@ pub enum Op {
         src: Reg,
         ok: Reg,
     },
+    /// `dst = true` when destructuring a fresh array literal runs no code:
+    /// its `@@iterator` (from `%Array.prototype%`) is the built-in one, the
+    /// iterator's `next` the intrinsic one, and no `return` is reachable for
+    /// the close (see `iter_fast`); `false` otherwise.
+    FreshArrayIterPlain { dst: Reg },
     /// `dst = new ctor(...args)` where `args` is a compiler-built array.
     ConstructSpread { dst: Reg, ctor: Reg, args: Reg },
     /// `dst = ToPropertyKey(src)` for an object key (its `toString` /
@@ -9168,6 +9173,10 @@ fn run_frame_at_ic(
                     Err(e) => handle_throw!(e),
                 }
             }
+            Op::FreshArrayIterPlain { dst } => {
+                regs[*dst as usize] =
+                    NanBox::boolean(iter_fast::fresh_array_is_plain(&mut ctx.realm));
+            }
             Op::CallSpreadPlain {
                 dst,
                 callee,
@@ -17621,6 +17630,105 @@ impl Compiler {
     /// the iterator closed afterwards unless exhausted, and closed quietly
     /// before an exception from a default, a nested pattern or a target
     /// propagates (a throwing `next` itself leaves it unclosed).
+    /// `[a, b, …] = [x, y, …];` as a statement, every target a bare name and
+    /// every source element a plain item: the elements are evaluated, in
+    /// order, into fresh registers, then — when destructuring a fresh array
+    /// runs no code ([`Op::FreshArrayIterPlain`]: the built-in `@@iterator`
+    /// and `next`, no reachable `return`) — each target is assigned its
+    /// element (or `undefined`) directly, skipping the iterator (and, when
+    /// the statement's value is not `wanted` as a completion value, the
+    /// array); otherwise the array is destructured as usual. `Some` with the
+    /// statement's value register (when `wanted`) once emitted; `None`,
+    /// having emitted nothing, for any other statement.
+    fn plain_swap_stmt(
+        &mut self,
+        e: &Expr,
+        wanted: bool,
+    ) -> Result<Option<Option<Reg>>, CompileError> {
+        const MAX: usize = 8;
+        let Expr::Assign {
+            op: crate::ast::AssignOp::Assign,
+            target,
+            value,
+            ..
+        } = e
+        else {
+            return Ok(None);
+        };
+        let (Expr::Array { elements: lhs, .. }, Expr::Array { elements: rhs, .. }) =
+            (&**target, &**value)
+        else {
+            return Ok(None);
+        };
+        if !self.hosted
+            || lhs.is_empty()
+            || lhs.len() > MAX
+            || rhs.len() > MAX
+            || !lhs
+                .iter()
+                .all(|el| matches!(el, ArrayElement::Item(Expr::Ident(_))))
+            || !rhs.iter().all(|el| matches!(el, ArrayElement::Item(_)))
+        {
+            return Ok(None);
+        }
+        let mut vals = Vec::with_capacity(rhs.len());
+        for el in rhs {
+            let ArrayElement::Item(x) = el else {
+                return Err(CompileError::Unsupported("array element"));
+            };
+            let mark = self.next_reg;
+            let v = self.expr(x)?;
+            // A binding's own register is read only when a target is
+            // assigned, after later elements and earlier targets ran.
+            let v = if v < mark {
+                let t = self.alloc();
+                self.ops.push(Op::Move { dst: t, src: v });
+                t
+            } else {
+                v
+            };
+            vals.push(v);
+        }
+        // The statement's value is the array: built first when wanted.
+        let built = if wanted {
+            let arr = self.alloc();
+            self.ops.push(Op::NewArrayFrom {
+                dst: arr,
+                elems: vals.clone(),
+            });
+            Some(arr)
+        } else {
+            None
+        };
+        let ok = self.alloc();
+        self.ops.push(Op::FreshArrayIterPlain { dst: ok });
+        let slow = self.emit_jump_if_false(ok);
+        let undef = self.constant(NanBox::undefined())?;
+        for (i, el) in lhs.iter().enumerate() {
+            let ArrayElement::Item(t) = el else {
+                return Err(CompileError::Unsupported("array element"));
+            };
+            let v = vals.get(i).copied().unwrap_or(undef);
+            self.assign_target_with_default(t, v)?;
+        }
+        let done = self.emit_jump();
+        self.patch(slow);
+        let arr = match built {
+            Some(arr) => arr,
+            None => {
+                let arr = self.alloc();
+                self.ops.push(Op::NewArrayFrom {
+                    dst: arr,
+                    elems: vals,
+                });
+                arr
+            }
+        };
+        self.assign_pattern(target, arr)?;
+        self.patch(done);
+        Ok(Some(built))
+    }
+
     fn array_destructure_hosted(
         &mut self,
         value_reg: Reg,
@@ -18442,7 +18550,12 @@ impl Compiler {
                 self.finally_depth -= u32::from(has_finally);
                 Ok(None)
             }
-            Stmt::Expr { expression, .. } => Ok(Some(self.expr(expression)?)),
+            Stmt::Expr { expression, .. } => {
+                if let Some(r) = self.plain_swap_stmt(expression, self.completion.is_some())? {
+                    return Ok(r);
+                }
+                Ok(Some(self.expr(expression)?))
+            }
             Stmt::Var(decl) => {
                 // `using` / `await using` declarations need scope-exit disposal
                 // semantics the bytecode VM does not model; bail to the
