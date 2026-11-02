@@ -169,6 +169,8 @@ pub struct CallSite {
     pub targets: [CallTarget; CallSite::WAYS],
     /// The way the next new callee replaces.
     pub next: usize,
+    /// How many callees the site has taken in (see [`CallSite::fill`]).
+    pub fills: u32,
     /// Per way, the last callee value the sequence identified as it (see
     /// [`CallMemo`]): a polymorphic site's values each keep theirs.
     pub memo: [CallMemo; CallSite::WAYS],
@@ -495,6 +497,7 @@ impl CallSite {
                 frame_bytes: 0,
             }; Self::WAYS],
             next: 0,
+            fills: 0,
             memo: [CallMemo::empty(); Self::WAYS],
             fast: ConstructFast::empty(),
             ident: IdentMemo::empty(),
@@ -533,9 +536,26 @@ impl CallSite {
             .map(core::ptr::from_ref)
     }
 
+    /// The fills after which a site whose ways are all taken replaces one
+    /// only every [`CallSite::MEGA_REFILL`]th time it is asked: a site
+    /// cycling through more callees than it has ways (five classes behind
+    /// one `x.run()`) would otherwise replace a way on almost every call
+    /// and hit almost never; this way it keeps a stable set (and still
+    /// follows a lasting change of callees, slowly).
+    pub const FILL_LIMIT: u32 = 16;
+    /// See [`CallSite::FILL_LIMIT`].
+    pub const MEGA_REFILL: u32 = 64;
+
     /// Remembers `target` (a no-op when its key is already held).
     pub fn fill(&mut self, target: CallTarget) {
         if self.holds(target.key) {
+            return;
+        }
+        self.fills = self.fills.saturating_add(1);
+        if self.fills > Self::FILL_LIMIT
+            && self.targets.iter().all(|t| t.key != Self::EMPTY)
+            && self.fills % Self::MEGA_REFILL != 0
+        {
             return;
         }
         let way = self.next % Self::WAYS;
