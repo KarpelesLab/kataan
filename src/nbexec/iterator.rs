@@ -2779,6 +2779,45 @@ impl Interp {
         Ok(Some(out))
     }
 
+    /// The object a `for-in` over `obj` (whose chain holds a proxy) tests each key
+    /// against with the compiled `key in live`: an internal proxy, never visible
+    /// to the program, whose `has` is [`Self::for_in_key_live`] over `obj`. Its
+    /// target is an empty object, so the `has` invariants have nothing to check.
+    pub(crate) fn for_in_liveness(&mut self, obj: Handle) -> NanBox {
+        let target = self.realm.new_object_with_proto(None);
+        let handler = self.realm.new_object_with_proto(None);
+        let has = self.realm.new_bound_native(N_FOR_IN_LIVE, obj);
+        self.realm
+            .set_property(handler, "has", NanBox::handle(has.to_raw()));
+        NanBox::handle(self.realm.new_proxy(target, handler).to_raw())
+    }
+
+    /// Whether the `for-in` key `key` still names a property of `start` or its
+    /// chain ("a property that is deleted before it has been processed is
+    /// ignored", 14.7.5.9), asked by `[[GetOwnProperty]]` and `[[GetPrototypeOf]]`,
+    /// the operations enumeration is defined over, and never by a `has` trap.
+    pub(crate) fn for_in_key_live(
+        &mut self,
+        start: Handle,
+        key: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let name = self.member_key(key);
+        let mut cur = Some(start);
+        // Bounded as the key walk is: a proxy may hand back an endless chain.
+        let mut steps = 0usize;
+        while let Some(c) = cur {
+            steps += 1;
+            if steps > 100_000 {
+                break;
+            }
+            if !matches!(self.descriptor_of(c, &name)?.unpack(), Unpacked::Undefined) {
+                return Ok(NanBox::boolean(true));
+            }
+            cur = self.get_proto_of(c)?.as_handle().map(Handle::from_raw);
+        }
+        Ok(NanBox::boolean(false))
+    }
+
     /// One ordinary object's share of a `for-in` walk: its enumerable own String
     /// keys not yet `seen` go to `out`, and every own key (enumerable or not)
     /// joins `seen`, shadowing a same-named property further down the chain.

@@ -4122,7 +4122,8 @@ fn json_parse_keeps_raw_lone_surrogates_with_a_reviver() {
 }
 
 /// `for-in` over an ordinary object whose chain holds a proxy never fires the
-/// proxy's `has` trap (the per-key liveness check was a real `key in obj`).
+/// proxy's `has` trap (the per-key liveness check was a real `key in obj`), and a
+/// key deleted before its turn is skipped wherever it lived, also through a proxy.
 #[test]
 fn for_in_through_a_proxy_on_the_chain_does_not_ask_has() {
     let src = r#"
@@ -4132,7 +4133,14 @@ fn for_in_through_a_proxy_on_the_chain_does_not_ask_has() {
         var r = [];
         for (var k in o) r.push(k);
         for (var k in Object.create(o)) r.push(k);
-        [r.join(), has].join("|")
+        var del = [];
+        var t = { p: 1, q: 2 };
+        var d = Object.create(new Proxy(t, {}));
+        d.a = 1; d.b = 2; d.e = 3;
+        for (var k in d) { del.push(k); if (k === "a") { delete d.b; delete t.q; } }
+        var viaProxy = [], pt = { a: 1, b: 2 };
+        for (var k in new Proxy(pt, {})) { viaProxy.push(k); delete pt.b; }
+        [r.join(), has, del.join(), viaProxy.join()].join("|")
     "#;
-    assert_eq!(run(src), "own,c,own,c|0");
+    assert_eq!(run(src), "own,c,own,c|0|a,e,p|a");
 }

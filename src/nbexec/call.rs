@@ -458,6 +458,10 @@ impl Interp {
         }
         // A bound native (promise resolve/reject) carries its target.
         if let Some((id, target)) = self.realm.bound_native_at(handle) {
+            if id == N_FOR_IN_LIVE {
+                let key = args.get(1).copied().unwrap_or_else(NanBox::undefined);
+                return self.for_in_key_live(target, key);
+            }
             // `Array.fromAsync`'s two continuations: the target is the loop state,
             // and the argument is the settled value of the `Await` it suspended at.
             if id == N_FROM_ASYNC_STEP || id == N_FROM_ASYNC_THROW {

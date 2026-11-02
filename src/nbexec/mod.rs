@@ -1256,6 +1256,9 @@ const N_INTL_NUMBER_FORMAT: u16 = 166;
 const N_INTL_DATETIME_FORMAT: u16 = 167;
 const N_SET_TIMEOUT: u16 = 211;
 const N_CLEAR_TIMEOUT: u16 = 212;
+/// The `has` handler of a `for-in` liveness stand-in (see
+/// `Interp::for_in_liveness`), bound to the enumerated object.
+const N_FOR_IN_LIVE: u16 = 1293;
 const N_SET_INTERVAL: u16 = 1290;
 const N_CLEAR_INTERVAL: u16 = 1291;
 /// `console.error` / `console.warn` (the diagnostic stream).
@@ -10149,11 +10152,15 @@ impl crate::nbvm::VmHost for Interp {
             None => None,
         };
         let (keys, live) = match trap_keys {
-            // No per-key liveness check: `key in obj` would fire the `has` trap
-            // of a proxy on the chain, which EnumerateObjectProperties never
-            // asks. (A key deleted mid-loop from an object whose chain holds a
-            // proxy is therefore still visited.)
-            Some(ks) => (ks, NanBox::undefined()),
+            // The per-key liveness check must not be a real `key in obj`, which
+            // would fire the `has` trap of a proxy on the chain.
+            Some(ks) => {
+                let live = match obj.as_handle().filter(|_| self.is_object_value(obj)) {
+                    Some(raw) => self.for_in_liveness(Handle::from_raw(raw)),
+                    None => NanBox::undefined(),
+                };
+                (ks, live)
+            }
             None => {
                 let live = if self.is_object_value(obj) {
                     obj
