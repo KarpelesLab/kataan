@@ -2461,6 +2461,10 @@ pub(crate) const VM_CTOR: &str = "\u{0}vmctor";
 /// non-enumerable, non-configurable property (ordinary function objects,
 /// ECMA-262 `MakeConstructor`), and marks `f` constructible.
 fn init_fn_prototype(realm: &mut Realm, f: Handle) {
+    // A fresh closure (the usual case): built in one step from cached layouts.
+    if realm.init_vm_fn_prototype(f, VM_CTOR) {
+        return;
+    }
     let proto = realm.new_object();
     realm.set_hidden_property(proto, "constructor", NanBox::handle(f.to_raw()));
     realm.set_hidden_property(f, "prototype", NanBox::handle(proto.to_raw()));

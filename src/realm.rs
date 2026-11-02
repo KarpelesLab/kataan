@@ -129,6 +129,11 @@ pub struct Realm {
     /// object starts with (see [`Realm::init_builtin_fn_props`]), made on
     /// first use.
     builtin_fn_shape: Option<Rc<Shape>>,
+    /// The `{constructor}` layout of a VM function's fresh `prototype` object
+    /// and the `{prototype, marker}` layout of its own-property object, with
+    /// the marker key they were grown for (see
+    /// [`Realm::init_vm_fn_prototype`]), made on first use.
+    vm_fn_proto_shapes: Option<(Rc<Shape>, Rc<Shape>, Rc<str>)>,
     /// The `{value, done}` layout of an iterator result object (see
     /// `Realm::new_iter_result`), grown from `root_shape` once.
     iter_result_shape: Option<Rc<Shape>>,
@@ -867,6 +872,7 @@ impl Realm {
             heap,
             root_shape: Shape::root(),
             builtin_fn_shape: None,
+            vm_fn_proto_shapes: None,
             iter_result_shape: None,
             args_shapes: alloc::vec::Vec::new(),
             args_cells_attached: false,
@@ -1810,6 +1816,57 @@ impl Realm {
     /// Reassigns a constructor function's `.prototype` (`Fn.prototype = obj`).
     pub fn set_function_prototype(&mut self, func_id: u32, proto: Handle) {
         self.fn_protos.insert(func_id, proto);
+    }
+
+    /// Gives the freshly made VM function `f`, which owns no named property
+    /// yet, what `MakeConstructor` leaves: a new ordinary object (inheriting
+    /// the default `Object.prototype`) whose own non-enumerable `constructor`
+    /// is `f`, as `f`'s own writable, non-enumerable, non-configurable
+    /// `prototype`, followed by the hidden `marker` key set to `true`. Exactly
+    /// the objects, layouts and marks that setting each property, then marking
+    /// it, leaves (see `nbvm::init_fn_prototype`), built directly from two
+    /// cached layouts. `false`, having changed nothing, when `f` already has
+    /// named properties or is not a VM function; the caller then takes the
+    /// general path.
+    pub(crate) fn init_vm_fn_prototype(&mut self, f: Handle, marker: &str) -> bool {
+        if !matches!(self.heap.get(f), Some(Cell::VmFunction { .. }))
+            || self.aux_props.contains_key(&f.to_raw())
+        {
+            return false;
+        }
+        let (ctor_shape, aux_shape) = match &self.vm_fn_proto_shapes {
+            Some((c, a, m)) if m.as_ref() == marker => (Rc::clone(c), Rc::clone(a)),
+            _ => {
+                let c = self.root_shape.transition("constructor");
+                let a = self.root_shape.transition("prototype").transition(marker);
+                self.vm_fn_proto_shapes = Some((Rc::clone(&c), Rc::clone(&a), Rc::from(marker)));
+                (c, a)
+            }
+        };
+        let default_proto = self.default_object_proto;
+        let fv = NanBox::handle(f.to_raw());
+        let Some(mut proto_obj) = Object::with_data_hidden_prefix(ctor_shape, &[fv], 1) else {
+            return false;
+        };
+        proto_obj.set_proto(default_proto);
+        let proto = self.heap.alloc(Cell::Object(proto_obj));
+        let pv = NanBox::handle(proto.to_raw());
+        let Some(mut aux_obj) =
+            Object::with_data_hidden_prefix(aux_shape, &[pv, NanBox::boolean(true)], 2)
+        else {
+            return false;
+        };
+        aux_obj.set_non_configurable("prototype");
+        aux_obj.set_proto(default_proto);
+        let aux = self.heap.alloc(Cell::Object(aux_obj));
+        if let (Some(p), Some(marker)) = (default_proto, self.incremental.as_mut()) {
+            marker.mark_grey(p);
+        }
+        self.write_barrier(proto, fv);
+        self.cell_link_changed(f);
+        self.aux_props.insert(f.to_raw(), aux);
+        self.write_barrier(aux, pv);
+        true
     }
 
     /// Gives the function `f`, which owns no named property yet, its own
