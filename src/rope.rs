@@ -100,6 +100,73 @@ enum Node {
     },
 }
 
+/// Byte offsets within a rope's node, from the pointer a [`Rope`] holds, for
+/// compiled code reading a flat string (`jit::props`). Probed on live nodes.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RopeLayout {
+    /// The node's tag byte.
+    pub(crate) tag: i32,
+    /// That byte in a [`Node::Leaf`].
+    pub(crate) leaf_tag: u8,
+    /// A leaf's memoized UTF-16 length ([`U16_LEN_UNKNOWN`] until first asked).
+    pub(crate) leaf_u16: i32,
+    /// A leaf's byte pointer and byte length.
+    pub(crate) leaf_ptr: i32,
+    pub(crate) leaf_len: i32,
+}
+
+/// Derives [`RopeLayout`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn jit_rope_layout() -> RopeLayout {
+    let long = [b'x'; SMALL_CAP + 9];
+    let leaf = Rope::from_bytes(&long);
+    let other = Rope::from_bytes(&[b'y'; SMALL_CAP + 40]);
+    let small = Rope::from_bytes(b"s");
+    let concat = leaf.concat(&other);
+    let value = Rc::as_ptr(&leaf.0) as usize;
+    // SAFETY: a `Rope` is exactly the `Rc`'s one word, in bounds of the local.
+    #[allow(unsafe_code)]
+    let raw = unsafe { *core::ptr::addr_of!(leaf).cast::<usize>() };
+    let base = i32::try_from(value - raw).expect("an Rc's value offset");
+    // SAFETY: the first byte of each live node; `Node`'s tag lives there (the
+    // assertions below reject any other layout).
+    #[allow(unsafe_code)]
+    let tag_of = |r: &Rope| unsafe { *Rc::as_ptr(&r.0).cast::<u8>() };
+    let leaf_tag = tag_of(&leaf);
+    assert!(
+        tag_of(&other) == leaf_tag && tag_of(&small) != leaf_tag && tag_of(&concat) != leaf_tag,
+        "a rope node's tag must be its first byte"
+    );
+    let Node::Leaf(bytes, memo) = &*leaf.0 else {
+        unreachable!("longer than SMALL_CAP")
+    };
+    let boxed = core::ptr::addr_of!(*bytes) as usize;
+    // SAFETY: the two words of the live `Box<[u8]>`, in bounds.
+    #[allow(unsafe_code)]
+    let (w0, w1) = unsafe {
+        (
+            *(boxed as *const usize),
+            *((boxed + core::mem::size_of::<usize>()) as *const usize),
+        )
+    };
+    let off = |a: usize| base + i32::try_from(a - value).expect("a node field's offset");
+    let (ptr_at, len_at) = if w0 == bytes.as_ptr() as usize && w1 == bytes.len() {
+        (boxed, boxed + core::mem::size_of::<usize>())
+    } else {
+        assert!(w1 == bytes.as_ptr() as usize && w0 == bytes.len());
+        (boxed + core::mem::size_of::<usize>(), boxed)
+    };
+    RopeLayout {
+        tag: base,
+        leaf_tag,
+        leaf_u16: off(core::ptr::addr_of!(*memo) as usize),
+        leaf_ptr: off(ptr_at),
+        leaf_len: off(len_at),
+    }
+}
+
 /// The longest flat string stored inline in its node (see the module docs).
 /// Chosen so that `Node::Small` (a tag, a length byte and the buffer) is no
 /// larger than `Node::Concat`, keeping every node the same size.
@@ -395,8 +462,9 @@ impl Rope {
         // as one code point, and are "well-formed". This only materializes in the
         // rare case that a boundary pair actually exists; the common concat stays
         // O(1). The peek walks to the rightmost leaf of `self` / leftmost of `other`.
-        if let Some(hi) = wtf8::trailing_high_surrogate(self.last_leaf_bytes())
-            && let Some(lo) = wtf8::leading_low_surrogate(other.first_leaf_bytes())
+        // (The appended side first: usually a short leaf, and rarely a match.)
+        if let Some(lo) = wtf8::leading_low_surrogate(other.first_leaf_bytes())
+            && let Some(hi) = wtf8::trailing_high_surrogate(self.last_leaf_bytes())
         {
             let mut bytes = self.materialize_bytes();
             bytes.truncate(bytes.len() - 3); // drop the lone high surrogate

@@ -614,6 +614,9 @@ struct Region {
     /// guard's test (`test`, a `JumpIfFalse`) emits nothing and the
     /// fallback arm `fallback..join` is not there at all.
     cold: Vec<(usize, usize, usize)>,
+    /// The **carried bindings** ([`plan_carried_globals`]): `(name, the
+    /// register its one `StoreGlobal` stores, a `LoadGlobal` of it)`.
+    gcarry: Vec<(alloc::string::String, u16, usize)>,
     /// For a body that branches inside itself: the registers live on entry
     /// to each of its ops (`live_words` words per pc from `head`), which
     /// [`Region::defined`] reads; empty otherwise.
@@ -2158,6 +2161,10 @@ impl NumGen {
                 {
                     return Some(true);
                 }
+                if let Some(src) = self.carried_global(ri, pc) {
+                    self.copy_reg(a, reg, dst, src);
+                    return Some(true);
+                }
                 if let Some(src) = self.global_known(ri, pc) {
                     self.copy_reg(a, reg, dst, src);
                     return Some(true);
@@ -2258,6 +2265,43 @@ impl NumGen {
             }
         }
         None
+    }
+
+    /// For the `LoadGlobal` at `pc` of speculative region `ri`'s fast version:
+    /// the register carrying its binding around the back-edge
+    /// ([`plan_carried_globals`]), which kept its SSE register.
+    fn carried_global(&self, ri: usize, pc: usize) -> Option<u16> {
+        let Op::LoadGlobal { name, .. } = self.bc(pc)? else {
+            return None;
+        };
+        if self.copy || self.imode.is_some() {
+            return None;
+        }
+        let g = self.regions[ri].gcarry.iter().find(|g| &g.0 == name)?;
+        if self.gslot.get(g.2).is_none_or(|&k| k == u32::MAX) {
+            return None;
+        }
+        self.regions[ri]
+            .slots
+            .iter()
+            .any(|s| s.reg == g.1 && s.carried)
+            .then_some(g.1)
+    }
+
+    /// On entering speculative region `ri`'s fast version, before its carried
+    /// registers load: the carried bindings' current values, as a read finds
+    /// them (a store's address may be a binding the read's address mirrors),
+    /// into their registers' frame slots, those registers being dead there.
+    /// (The addresses are validated: `spec_globals_ready`.) Clobbers `rax`.
+    fn load_carried_globals(&self, a: &mut X64Assembler, ri: usize) {
+        for g in &self.regions[ri].gcarry {
+            let slot = self.gslot.get(g.2).copied().unwrap_or(u32::MAX);
+            if slot != u32::MAX {
+                a.load_rax(self.gslot_disp(slot));
+                a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+                a.store_rax(disp(g.1));
+            }
+        }
     }
 
     /// For a `LoadGlobal` at `pc` in a speculative region's fast version that
@@ -2749,6 +2793,7 @@ impl NumGen {
                 self.refresh_globals(a, ri, true);
                 self.spec_globals_ready(a, ri, pc)?;
                 self.hoist_views(a, ri);
+                self.load_carried_globals(a, ri);
             }
             for s in &self.regions[ri].slots {
                 if s.carried {
@@ -4921,6 +4966,7 @@ impl NumGen {
                 continue;
             }
             self.hoist_views(a, ri);
+            self.load_carried_globals(a, ri);
             for s in &self.regions[ri].slots {
                 if s.start <= h && h <= s.end {
                     a.movsd_x_mem(s.xmm, disp(s.reg));
@@ -5490,9 +5536,35 @@ fn plan_regions(
         let mut carried: Vec<&(u16, usize, usize, u32, bool)> =
             info.iter().filter(|x| carried_r(x.0)).collect();
         carried.sort_by(|p, q| q.3.cmp(&p.3).then(p.0.cmp(&q.0)));
+        // The carried bindings' registers (a loop that may get a speculative
+        // version and has no integer version to keep in step).
+        let gcarry = if generic
+            && !elem_cand
+            && !spec_int_cand
+            && !(head..=end).any(|pc| region_call(&ops[pc], &bytecode[pc]))
+        {
+            let target = |q: usize| {
+                ops.iter()
+                    .any(|o| matches!(branch_target(o), Some(t) if t == q))
+            };
+            plan_carried_globals(
+                bytecode,
+                (head, end),
+                &|r| info.iter().any(|x| x.0 == r),
+                &carried_r,
+                &target,
+            )
+        } else {
+            Vec::new()
+        };
+        let in_gcarry = |r: u16| gcarry.iter().any(|g| g.1 == r);
+        carried.extend(info.iter().filter(|x| in_gcarry(x.0)));
+        carried.sort_by(|p, q| q.3.cmp(&p.3).then(p.0.cmp(&q.0)));
         // Body temporaries, by the start of their live intervals.
-        let mut temps: Vec<&(u16, usize, usize, u32, bool)> =
-            info.iter().filter(|x| !carried_r(x.0)).collect();
+        let mut temps: Vec<&(u16, usize, usize, u32, bool)> = info
+            .iter()
+            .filter(|x| !carried_r(x.0) && !in_gcarry(x.0))
+            .collect();
         temps.sort_by(|p, q| p.1.cmp(&q.1).then(p.0.cmp(&q.0)));
         // One linear scan: the loop-carried registers first (their interval
         // the whole region), then the temporaries. When the registers run
@@ -5690,7 +5762,76 @@ fn plan_regions(
             views: Vec::new(),
             aviews: Vec::new(),
             cold: Vec::new(),
+            gcarry,
         });
+    }
+    out
+}
+
+/// A loop's **carried bindings**. A top-level `s += x` loads the binding and
+/// stores it back every iteration, and a store-to-load forward of an SSE value
+/// (about 9 cycles on a current core) puts a memory round trip on the value's
+/// dependency chain each time, which is what bounds such a loop. In a
+/// speculative version's fast version only the region's own stores can change
+/// a binding (no Rust code runs there, `NumGen::spec_global`), so a read of the
+/// binding is the value its one store last stored, or what the entry read: the
+/// stored register stays in its SSE register around the back-edge, and the
+/// read is a copy of it. The store still happens, so every way out finds the
+/// binding right; every way in loads the register from the binding first.
+///
+/// A candidate: one `StoreGlobal` of the name in the region, and a read of it,
+/// whose source register holds nothing else there. It is dead at the header and
+/// at the exits (the register's frame slot is free for the entry's value), is
+/// written by one op, a modelled one, and between that write and the store
+/// control runs straight with no read of the binding, so that everywhere a read
+/// can be, the register equals the binding.
+fn plan_carried_globals(
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    in_info: &dyn Fn(u16) -> bool,
+    carried_r: &dyn Fn(u16) -> bool,
+    is_target: &dyn Fn(usize) -> bool,
+) -> Vec<(alloc::string::String, u16, usize)> {
+    let mut out: Vec<(alloc::string::String, u16, usize)> = Vec::new();
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    for pc in head..=end {
+        let Op::StoreGlobal { name, src, .. } = &bytecode[pc] else {
+            continue;
+        };
+        let named = |o: &Op| match o {
+            Op::LoadGlobal { name: n, .. } | Op::StoreGlobal { name: n, .. } => n == name,
+            _ => false,
+        };
+        let stores = bytecode[head..=end]
+            .iter()
+            .filter(|o| matches!(o, Op::StoreGlobal { .. }) && named(o))
+            .count();
+        let read = (head..=end)
+            .find(|&q| matches!(bytecode[q], Op::LoadGlobal { .. }) && named(&bytecode[q]));
+        let Some(read) = read else { continue };
+        if stores != 1 || !in_info(*src) || carried_r(*src) {
+            continue;
+        }
+        // Its one write.
+        let mut writes = Vec::new();
+        let mut modelled = true;
+        for (q, o) in bytecode.iter().enumerate().take(end + 1).skip(head) {
+            def_use(o, &mut d, &mut u);
+            let names = op_regs(o).contains(src);
+            if d.contains(src) {
+                writes.push(q);
+            } else if names && !u.contains(src) {
+                modelled = false;
+            }
+        }
+        let &[w] = writes.as_slice() else { continue };
+        if !modelled
+            || w >= pc
+            || (w + 1..=pc).any(|q| is_target(q) || (q < pc && named(&bytecode[q])))
+        {
+            continue;
+        }
+        out.push((name.clone(), *src, read));
     }
     out
 }

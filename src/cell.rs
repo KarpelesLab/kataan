@@ -1213,6 +1213,21 @@ pub(crate) fn jit_typed_layout() -> TypedCellLayout {
     }
 }
 
+/// `Cell::Str`'s tag byte and the offset of its rope in the cell.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_str_layout() -> (u8, usize) {
+    let cell = Cell::Str(crate::rope::Rope::from("s"));
+    let base = core::ptr::addr_of!(cell) as usize;
+    // SAFETY: as `jit_cell_layout`'s: the live cell's tag byte.
+    #[allow(unsafe_code)]
+    let disc = unsafe { *(base as *const u8) };
+    let off = match &cell {
+        Cell::Str(r) => core::ptr::addr_of!(*r) as usize - base,
+        _ => unreachable!("just built a Cell::Str"),
+    };
+    (disc, off)
+}
+
 /// Derives [`CellLayout`] from real `Cell::Object` and `Cell::Array` instances.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn jit_cell_layout() -> CellLayout {

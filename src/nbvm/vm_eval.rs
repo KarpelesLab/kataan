@@ -64,14 +64,16 @@ pub(crate) fn compile_eval_code(
     let base = table.len();
     let _free_memo = super::free_memo_session(&program.body);
     let protos = alloc::rc::Rc::new(core::cell::RefCell::new(core::mem::take(table)));
-    let r = compile_eval_body(program, &protos, strict, flags, privates);
+    let mut r = compile_eval_body(program, &protos, strict, flags, privates);
     *table = alloc::rc::Rc::try_unwrap(protos)
         .expect("unique proto table")
         .into_inner();
-    if r.is_err() {
-        table.truncate(base);
-    } else {
+    if let Ok(body) = &mut r {
         super::resolve_source_text(&mut table[base..], &program.source);
+        super::fresh_lit::optimize(&mut table[base..]);
+        super::fresh_lit::optimize(core::slice::from_mut(body));
+    } else {
+        table.truncate(base);
     }
     r
 }

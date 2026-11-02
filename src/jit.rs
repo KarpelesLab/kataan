@@ -3448,6 +3448,12 @@ pub struct GenericHelpers {
     /// method site's key is found on `recv` (`MethodSite::fill`), for the
     /// inline `Math.f(x)` lookup.
     pub site_fill: JitBinHelper,
+    /// `jit_helper_str_proof(ctx, recv, site, _) -> 0`: proves
+    /// `String.prototype`'s method for a `s.charCodeAt(i)` site.
+    pub str_proof: JitBinHelper,
+    /// `jit_helper_to_str(ctx, value, lazy, _) -> bits`: `Op::ToStr` /
+    /// `Op::ToStrLazy` without user code, else `0` (the op itself runs).
+    pub to_str: JitBinHelper,
     /// `jit_helper_new_object(ctx, _) -> bits`: `Op::NewObject`'s fresh
     /// ordinary object (never throws).
     pub new_object: JitTruthyHelper,
@@ -3580,6 +3586,11 @@ pub(crate) struct JitLayout {
     /// `Cell::Array` discriminant byte — the inline array-element fast paths guard
     /// the receiver cell tag against this.
     pub cell_array_disc: u8,
+    /// `Cell::Str`'s tag byte, and the offset of its rope in the slot.
+    pub cell_str_disc: u8,
+    pub off_str_rope: i32,
+    /// A flat string's layout behind that rope.
+    pub rope: crate::rope::RopeLayout,
     /// Slot-relative offset of a `Cell::Array`'s element `Vec` data pointer.
     pub off_arr_ptr: i32,
     /// Slot-relative offset of a `Cell::Array`'s element `Vec` length (the dense
@@ -3644,6 +3655,9 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             cache_slot_off: to_i32(cache.slot_off),
             cache_hits_off: to_i32(cache.hits_off),
             cell_array_disc: cell.array_disc,
+            cell_str_disc: crate::cell::jit_str_layout().0,
+            off_str_rope: to_i32(cell_base + crate::cell::jit_str_layout().1),
+            rope: crate::rope::jit_rope_layout(),
             // An array's element Vec sits at `cell_base + array_vec_off`; its data
             // ptr / len are the generic `Vec<NanBox>` offsets within that Vec.
             off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
@@ -8571,6 +8585,64 @@ impl JitFunction {
                         )?;
                         a.bind(general);
                     }
+                    // `s.charCodeAt(i)` on a flat all-ASCII string.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && key == "charCodeAt"
+                        && margs.len() == 1
+                        && ok(dst)
+                        && ok(recv)
+                        && ok(margs[0])
+                        && !si.method_ptr.is_null()
+                    {
+                        let x = margs[0];
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.str_special, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.p_str_proof(si.method_ptr, prove, general);
+                        walk_to_slot!(recv, general);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_str_disc);
+                        a.jne(general);
+                        a.p_flat_ascii(&layout, general);
+                        // The index: a Number, truncated; a NaN or anything
+                        // out of range (negative: above any length) is the
+                        // general path's.
+                        a.load_rax(disp(x));
+                        if !num.is_number_at(op_idx, x) {
+                            a.movabs_r11(QNAN as i64);
+                            a.g_mov(call_seq::r::R8, call_seq::r::RAX);
+                            a.g_and(call_seq::r::R8, call_seq::r::R11);
+                            a.g_cmp(call_seq::r::R8, call_seq::r::R11);
+                            a.g_jcc(call_seq::cc::E, general);
+                        }
+                        numeric::NumGen::set_xmm_from_rax(&mut a, 0);
+                        a.cvttsd2si_rax_xmm0();
+                        a.g_cmp(call_seq::r::RAX, call_seq::r::RDX);
+                        a.g_jcc(call_seq::cc::AE, general);
+                        a.p_byte_at(&layout);
+                        a.cvtsi2sd_xmm0_rax();
+                        numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
                     // The native call sequence, when the site has one.
                     let native = call_args
                         .get(args as usize)
@@ -9209,9 +9281,11 @@ impl JitFunction {
                             let caps: Vec<i32> = captures.iter().map(|r| disp(*r)).collect();
                             a.p_alloc_closure(&layout, cl.realm, *func, &caps, slow);
                             a.store_rax(disp(*dst));
-                            a.jmp(done);
+                            let cold = a.cold_begin();
                             a.bind(slow);
                             exec_op!(pc);
+                            a.jmp(done);
+                            a.cold_end(cold);
                             a.bind(done);
                         }
                         // A sloppy function's `this` binding
@@ -9244,9 +9318,11 @@ impl JitFunction {
                             let done = a.new_label();
                             a.p_alloc_box(&layout, helpers.call_layout.realm, slow);
                             a.store_rax(disp(*dst));
-                            a.jmp(done);
+                            let cold = a.cold_begin();
                             a.bind(slow);
                             exec_op!(pc);
+                            a.jmp(done);
+                            a.cold_end(cold);
                             a.bind(done);
                         }
                         // An object literal with a constant key set: inline
@@ -9274,9 +9350,39 @@ impl JitFunction {
                                 slow,
                             );
                             a.store_rax(disp(*dst));
-                            a.jmp(done);
+                            let cold = a.cold_begin();
                             a.bind(slow);
                             exec_op!(pc);
+                            a.jmp(done);
+                            a.cold_end(cold);
+                            a.bind(done);
+                        }
+                        // A template's substitution: a string as it is, a
+                        // primitive's text from its own helper, not the one-op
+                        // interpreter; anything else is the op's.
+                        crate::nbvm::Op::ToStr { dst, src }
+                        | crate::nbvm::Op::ToStrLazy { dst, src }
+                            if ok(*dst) && ok(*src) =>
+                        {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            let lazy = matches!(
+                                bytecode.get(pc as usize),
+                                Some(crate::nbvm::Op::ToStrLazy { .. })
+                            );
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(*src));
+                            a.movabs_argreg(2, i64::from(lazy));
+                            a.movabs_rax(helpers.to_str as usize as i64);
+                            a.call_rax();
+                            a.test_rax_rax();
+                            a.je(slow);
+                            a.store_rax(disp(*dst));
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.jmp(done);
+                            a.cold_end(cold);
                             a.bind(done);
                         }
                         array_op @ (crate::nbvm::Op::NewArrayFrom { .. }
@@ -9295,11 +9401,12 @@ impl JitFunction {
                                 _ => None,
                             };
                             let done = a.new_label();
+                            let mut cold = None;
                             if let Some((dst, elems)) = &small {
                                 let slow = a.new_label();
                                 a.p_alloc_array(&layout, helpers.call_layout.realm, elems, slow);
                                 a.store_rax(disp(*dst));
-                                a.jmp(done);
+                                cold = Some(a.cold_begin());
                                 a.bind(slow);
                             }
                             a.mov_rdi_r15();
@@ -9309,6 +9416,10 @@ impl JitFunction {
                             a.movabs_rax(helpers.new_array as usize as i64);
                             a.call_rax();
                             throw_check!();
+                            if let Some(cold) = cold {
+                                a.jmp(done);
+                                a.cold_end(cold);
+                            }
                             a.bind(done);
                         }
                         op @ crate::nbvm::Op::IterNext { .. } => {
@@ -10363,6 +10474,7 @@ impl JitFunction {
                             walk_to_slot!(arr, slow);
                         }
                         a.bind(walked);
+                        a.p_str_len(&layout, slow, got);
                         a.t_view(&layout, tl, slow);
                         a.t_len(tl, helpers.call_layout.realm, slow, got);
                     }

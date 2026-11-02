@@ -493,7 +493,7 @@ pub struct Realm {
     /// exposes, so an inherited property added to `String.prototype` is visible
     /// through `"str".foo` (GetV boxes the primitive, but the engine reads the
     /// primitive cell directly).
-    string_proto_intrinsic: Option<Handle>,
+    pub(crate) string_proto_intrinsic: Option<Handle>,
     /// The realm's `%BigInt.prototype%` intrinsic — the `[[Prototype]]` of
     /// every `Cell::BigInt` primitive (BigInt primitives are immutable).
     bigint_proto_intrinsic: Option<Handle>,
@@ -556,6 +556,10 @@ pub struct Realm {
     /// realm other than the host's current one, so only then does a host call
     /// from VM code check whose realm it runs in.
     pub multi_realm: bool,
+    /// Some string cell has an auxiliary object or is host-exotic, so a
+    /// string's method lookup may not simply start at `%String.prototype%`
+    /// (`plain_recv_lookup_start`). Never cleared.
+    pub str_special: bool,
     /// The callee of each active bytecode-VM activation (`undefined` when the
     /// call site did not know it), innermost last — across nested VM runs, so
     /// eval code and host callbacks see the enclosing activations (the legacy
@@ -855,6 +859,7 @@ impl Realm {
             interrupt: None,
             agents_active: false,
             multi_realm: false,
+            str_special: false,
             vm_callee_stack: Vec::new(),
             vm_args_buf: Vec::new(),
             vm_callee_args: Vec::new(),
@@ -1476,6 +1481,9 @@ impl Realm {
     /// [`Realm::is_host_exotic`]).
     pub fn mark_host_exotic(&mut self, handle: Handle) {
         crate::object::bump_proto_epoch();
+        if matches!(self.heap.get(handle), Some(Cell::Str(_))) {
+            self.str_special = true;
+        }
         self.host_exotic.insert(handle.to_raw());
         self.add_jit_flags(
             handle,
@@ -1718,6 +1726,9 @@ impl Realm {
         }
         let obj = self.new_object();
         self.cell_link_changed(handle);
+        if matches!(self.heap.get(handle), Some(Cell::Str(_))) {
+            self.str_special = true;
+        }
         // An own property on a typed array (maybe a `length`).
         if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
             self.taint_typed_len();
@@ -1962,8 +1973,12 @@ impl Realm {
     pub fn unit_string(&mut self, unit: u16) -> Handle {
         let i = usize::from(unit);
         if i < 256 {
-            let mut buf = [0u8; 2];
-            let n = char::from(unit as u8).encode_utf8(&mut buf).len();
+            let mut buf = [unit as u8, 0];
+            let n = if i < 0x80 {
+                1
+            } else {
+                char::from(unit as u8).encode_utf8(&mut buf).len()
+            };
             // Revalidated on every hit (a load and a short compare): the entry is
             // rooted by every production collection, but a bare `collect` with a
             // caller-chosen root set could free it and reuse the slot.

@@ -34,7 +34,8 @@ impl Realm {
         let (x, y) = (a.as_handle()?, b.as_handle()?);
         let ra = self.heap.get(Handle::from_raw(x))?.as_str()?;
         let rb = self.heap.get(Handle::from_raw(y))?.as_str()?;
-        if self.aux_props.contains_key(&x) || self.aux_props.contains_key(&y) {
+        if self.str_special && (self.aux_props.contains_key(&x) || self.aux_props.contains_key(&y))
+        {
             return None;
         }
         let joined = ra.try_concat(rb)?;
@@ -67,7 +68,7 @@ impl Realm {
         let len = bytes.len() + digits;
         // A string cell carrying a function marker (or any other auxiliary
         // object) is left to the general path, which decides its `typeof`.
-        if len > SMALL_CAP || self.aux_props.contains_key(&sh.to_raw()) {
+        if len > SMALL_CAP || (self.str_special && self.aux_props.contains_key(&sh.to_raw())) {
             return None;
         }
         let rope = Rope::small_with(len, |out| {

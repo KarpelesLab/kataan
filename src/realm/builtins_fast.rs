@@ -550,7 +550,7 @@ impl Realm {
     pub(crate) fn plain_recv_lookup_start(&self, h: Handle) -> Option<Handle> {
         let start = match self.heap.get(h)? {
             Cell::Str(_) => {
-                if self.aux_props.contains_key(&h.to_raw()) {
+                if self.str_special && self.aux_props.contains_key(&h.to_raw()) {
                     return None;
                 }
                 self.string_proto_intrinsic?

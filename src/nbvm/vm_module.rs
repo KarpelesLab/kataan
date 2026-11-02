@@ -307,6 +307,9 @@ pub fn compile_module_into(
         .expect("unique proto table")
         .into_inner();
     super::resolve_source_text(&mut table[base as usize..], &program.source);
+    if compiled.is_ok() {
+        super::fresh_lit::optimize(&mut table[base as usize..]);
+    }
     match compiled {
         Ok(()) => Ok({
             ModuleProtos {

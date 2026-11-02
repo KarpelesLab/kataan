@@ -48,6 +48,7 @@ pub(crate) fn array_species_is_default(realm: &Realm, h: Handle) -> bool {
     array_hof::default_species(realm, h)
 }
 mod free_memo;
+mod fresh_lit;
 mod global_mirror;
 mod global_obj;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -6997,6 +6998,8 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         global_mirror: global_mirror::jit_helper_global_mirror,
         math1: jit_tier::jit_helper_math1,
         site_fill: jit_tier::jit_helper_site_fill,
+        str_proof: jit_tier::jit_helper_str_proof,
+        to_str: jit_tier::jit_helper_to_str,
         new_object: jit_tier::jit_helper_new_object,
         new_array: jit_tier::jit_helper_new_array,
         iter_next: jit_tier::jit_helper_iter_next,
@@ -13393,6 +13396,9 @@ pub fn compile_program_into(
         .expect("unique proto table")
         .into_inner();
     resolve_source_text(&mut table[base as usize..], &program.source);
+    if compiled.is_ok() {
+        fresh_lit::optimize(&mut table[base as usize..]);
+    }
     match compiled {
         Ok(()) => Ok(base),
         Err(e) => {

@@ -772,6 +772,8 @@ pub struct CallLayout {
     pub max_depth: i32,
     /// realm: `multi_realm: bool`.
     pub multi_realm: i32,
+    /// realm: `str_special: bool`.
+    pub str_special: i32,
     /// realm: `vm_callee_stack`'s length word.
     pub callee_len: i32,
     /// `ctx`: whether the run is hosted (`bool`).

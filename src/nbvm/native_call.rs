@@ -523,6 +523,33 @@ pub(super) fn try_call(
     }
 }
 
+/// What compiled code's inline `s.charCodeAt(i)` relies on, for `site`: the
+/// method a plain string's lookup finds, an own data property of
+/// `%String.prototype%`, is the built-in (`MethodSite::set_str_proof`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prove_char_code_at(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
+    let found = realm.string_proto_intrinsic.and_then(|start| {
+        // (`%String.prototype%` is a String wrapper, whose string only owns
+        // indices and `length`.)
+        let o = realm.jit_object(start)?;
+        let shape = o.shaped_shape()?;
+        if o.accessor_index("charCodeAt").is_some() {
+            return None;
+        }
+        let slot = shape.lookup("charCodeAt")?;
+        let ptr = o.jit_slot_ptr(slot)?;
+        let value = o.slot(slot)?;
+        Some((start, ptr as u64, value))
+    });
+    match found {
+        Some((start, ptr, value)) if classify(realm, value) == FastOp::StrCharCodeAt => {
+            realm.jit_watch(start);
+            site.set_str_proof(Some((ptr, value.to_bits())));
+        }
+        _ => site.set_str_proof(None),
+    }
+}
+
 /// `s.charCodeAt(i)` / `s.charAt(i)` with `s` a flat all-ASCII string and `i`
 /// a Number or absent, at a site already resolved to that intrinsic for a
 /// string receiver (see [`try_call`]): [`run_op`]'s answer read straight off

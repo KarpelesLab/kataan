@@ -441,9 +441,43 @@ pub struct MethodSite {
     fills: u32,
     /// The site's add cache, when it is a property write.
     add: AddEntry,
+    /// The proof of an inline `s.charCodeAt(i)`, kept beside the cache of the
+    /// site's ordinary receivers.
+    str_proof: StrProof,
+}
+
+/// See [`MethodSite::set_str_proof`].
+#[repr(C)]
+struct StrProof {
+    /// The prototype epoch it was made under (`u64::MAX`: never).
+    stamp: u64,
+    /// The address holding the method, and the method's bits.
+    ptr: u64,
+    method: u64,
 }
 
 impl MethodSite {
+    /// Records that while the prototype epoch stands, the method of a plain
+    /// string's lookup is at `ptr` and was `method`'s bits the built-in when
+    /// proved, for compiled code's inline call: an epoch's change retires
+    /// the address (`%String.prototype%` is watched, and the slot array moving
+    /// bumps it), and the value is read live, as `MethodEntry::value`'s is.
+    /// `None`: not the built-in; the proof is one no value satisfies.
+    pub(crate) fn set_str_proof(&mut self, found: Option<(u64, u64)>) {
+        let stamp = crate::object::proto_epoch();
+        self.str_proof.stamp = stamp;
+        match found {
+            Some((ptr, method)) => {
+                self.str_proof.ptr = ptr;
+                self.str_proof.method = method;
+            }
+            None => {
+                self.str_proof.ptr = core::ptr::addr_of!(self.str_proof.stamp) as u64;
+                self.str_proof.method = !stamp;
+            }
+        }
+    }
+
     /// An empty site for `key` with the property cache `cache`.
     pub(crate) fn new(key: &str, cache: *mut core::ffi::c_void) -> Self {
         Self {
@@ -454,6 +488,11 @@ impl MethodSite {
             next: 0,
             fills: 0,
             add: AddEntry::default(),
+            str_proof: StrProof {
+                stamp: u64::MAX,
+                ptr: 0,
+                method: 0,
+            },
         }
     }
 
@@ -2179,6 +2218,103 @@ impl X64Assembler {
         self.p_store_rcx_imm(4, p.off_epoch, n);
     }
 
+    /// `Heap::alloc`'s free-list pop, inline, the realm in `r9`: `edx` = the
+    /// slot's index and `rcx` = its address, the allocation counted; else to
+    /// `miss`, having changed nothing in memory. Clobbers `rax`, `rdx`, `r11`.
+    fn p_pop_free_slot(&mut self, l: &JitLayout, miss: Label) {
+        let p = &l.props;
+        self.g_load(r::RAX, r::R9, p.free_len);
+        self.code.extend_from_slice(&[0x48, 0x83, 0xe8, 0x01]); // sub rax, 1
+        self.g_jcc(cc::B, miss);
+        self.g_load(r::R11, r::R9, p.free_ptr);
+        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
+        self.g_store(r::R9, p.free_len, r::RAX);
+        self.g_inc_mem(r::R9, p.heap_allocs);
+        if l.slot_stride == 72 {
+            self.code.extend_from_slice(&[0x48, 0x8d, 0x0c, 0xd2]); // lea rcx, [rdx + rdx*8]
+            if self.pinned() {
+                self.code.extend_from_slice(&[0x49, 0x8d, 0x0c, 0xcc]); // lea rcx, [r12 + rcx*8]
+            } else {
+                self.g_load(r::RAX, r::R9, p.heap_ptr);
+                self.code.extend_from_slice(&[0x48, 0x8d, 0x0c, 0xc8]); // lea rcx, [rax + rcx*8]
+            }
+        } else {
+            self.g_mov(r::RAX, r::RDX);
+            self.imul_rax_imm(l.slot_stride);
+            self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
+            self.g_mov(r::RCX, r::RAX);
+        }
+    }
+
+    /// The empty element `Vec` of a new array (or captures) at `base`.
+    fn p_store_empty_vec(&mut self, l: &JitLayout, base: i32) {
+        for (k, &w) in l.arr_empty_vec.iter().enumerate() {
+            let d = base + 8 * k as i32;
+            if let Ok(imm) = i32::try_from(w as i64) {
+                self.g_store_imm32(r::RCX, d, imm);
+            } else {
+                self.g_movabs(r::R11, w);
+                self.g_store(r::RCX, d, r::R11);
+            }
+        }
+    }
+
+    /// The string `.length` of the slot in `rcx`, when it is a string: a leaf
+    /// with its UTF-16 length known has `rax` = that and goes to `got`, any other
+    /// string to `slow`; anything else falls through with `rcx` intact.
+    /// Clobbers `rax`, `r11`.
+    pub(crate) fn p_str_len(&mut self, l: &JitLayout, slow: Label, got: Label) {
+        let other = self.new_label();
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_str_disc);
+        self.jne(other);
+        self.g_load(r::R11, r::RCX, l.off_str_rope);
+        self.g_cmp_byte_imm(r::R11, l.rope.tag, l.rope.leaf_tag);
+        self.g_jcc(cc::NE, slow);
+        self.g_load(r::RAX, r::R11, l.rope.leaf_u16);
+        // cmp rax, -1 (unknown)
+        self.code.extend_from_slice(&[0x48, 0x83, 0xf8, 0xff]);
+        self.g_jcc(cc::E, slow);
+        self.jmp(got);
+        self.bind(other);
+    }
+
+    /// From a string's slot in `rcx`: `rcx` = its rope's node, `rdx` = its byte
+    /// length, when it is a leaf whose UTF-16 length is known and equal to that
+    /// (so every byte is one ASCII unit); else to `miss`.
+    pub(crate) fn p_flat_ascii(&mut self, l: &JitLayout, miss: Label) {
+        self.g_load(r::RCX, r::RCX, l.off_str_rope);
+        self.g_cmp_byte_imm(r::RCX, l.rope.tag, l.rope.leaf_tag);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RDX, r::RCX, l.rope.leaf_len);
+        self.g_cmp_mem(r::RDX, r::RCX, l.rope.leaf_u16);
+        self.g_jcc(cc::NE, miss);
+    }
+
+    /// `eax` = the byte at index `rax` of the leaf node in `rcx`.
+    pub(crate) fn p_byte_at(&mut self, l: &JitLayout) {
+        self.g_load(r::RCX, r::RCX, l.rope.leaf_ptr);
+        self.code.extend_from_slice(&[0x0f, 0xb6, 0x04, 0x01]); // movzx eax, byte [rcx + rax]
+    }
+
+    /// The site's string-method proof (see [`MethodSite::set_str_proof`]): falls
+    /// through when the epoch is the proof's and the value is the proved one; a
+    /// stale epoch goes to `stale`, another value to `other`. Clobbers `rax`,
+    /// `r8`, `r11`.
+    pub(crate) fn p_str_proof(&mut self, site: *const MethodSite, stale: Label, other: Label) {
+        use core::mem::offset_of;
+        let at = |f: usize| {
+            i32::try_from(offset_of!(MethodSite, str_proof) + f).expect("site offset fits in i32")
+        };
+        self.g_movabs(r::R11, site as u64);
+        self.p_load_proto_epoch(r::RAX);
+        self.g_cmp_mem(r::RAX, r::R11, at(offset_of!(StrProof, stamp)));
+        self.g_jcc(cc::NE, stale);
+        self.g_load(r::RAX, r::R11, at(offset_of!(StrProof, ptr)));
+        self.g_load(r::RAX, r::RAX, 0);
+        self.g_cmp_mem(r::RAX, r::R11, at(offset_of!(StrProof, method)));
+        self.g_jcc(cc::NE, other);
+    }
+
     /// A freshly filled slot at `rcx`: age 0, occupied (one 2-byte store
     /// when the occupancy byte follows the age byte).
     fn p_store_slot_young(&mut self, l: &JitLayout) {
@@ -2222,19 +2358,7 @@ impl X64Assembler {
         self.g_load(r::R9, r::R15, realm_off);
         self.g_cmp_byte_imm(r::R9, p.marking, 0);
         self.g_jcc(cc::NE, miss);
-        self.g_load(r::RAX, r::R9, p.free_len);
-        self.g_test(r::RAX);
-        self.g_jcc(cc::E, miss);
-        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
-        self.g_load(r::R11, r::R9, p.free_ptr);
-        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
-        self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_allocs);
-        // rcx = the slot.
-        self.g_mov(r::RAX, r::RDX);
-        self.imul_rax_imm(l.slot_stride);
-        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
-        self.g_mov(r::RCX, r::RAX);
+        self.p_pop_free_slot(l, miss);
         // `Cell::Object(Object::new(root))`, field by field.
         self.p_store_obj_header(l, 0);
         self.g_load(r::R11, r::R9, p.root_shape);
@@ -2291,35 +2415,23 @@ impl X64Assembler {
         self.g_load(r::RAX, r::R11, LitShapeCache::ROOT_OFF);
         self.g_cmp_mem(r::RAX, r::R9, p.root_shape);
         self.g_jcc(cc::NE, miss);
+        // The memo's shape stays in `rsi`.
+        self.g_load(r::RSI, r::R11, LitShapeCache::SHAPE_OFF);
         // Promoted registers' current values reach the frame first.
         self.spill_before_call();
         // The layout's record of its Number-only slots (`fieldrep`).
-        self.p_field_rep_lit(l, (cache, LitShapeCache::SHAPE_OFF), vals, proven, miss);
+        self.p_field_rep_lit(l, vals, proven, miss);
         self.g_load(r::RAX, r::R9, p.dict_threshold);
         self.g_cmp_imm(r::RAX, n as i32);
         self.g_jcc(cc::BE, miss);
-        self.g_load(r::RAX, r::R9, p.free_len);
-        self.g_test(r::RAX);
-        self.g_jcc(cc::E, miss);
-        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
-        self.g_load(r::R11, r::R9, p.free_ptr);
-        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
-        self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_allocs);
-        // rcx = the slot.
-        self.g_mov(r::RAX, r::RDX);
-        self.imul_rax_imm(l.slot_stride);
-        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
-        self.g_mov(r::RCX, r::RAX);
+        self.p_pop_free_slot(l, miss);
         // `Cell::Object(Object::with_data(shape, vals))` with the
         // default prototype, field by field.
         self.p_store_obj_header(l, n);
-        self.g_movabs(r::R11, cache);
-        self.g_load(r::R11, r::R11, LitShapeCache::SHAPE_OFF);
-        self.g_inc_mem(r::R11, p.rc_strong);
-        self.g_store(r::RCX, l.off_shape, r::R11);
-        self.g_load(r::RSI, r::R9, p.default_proto);
-        self.g_store(r::RCX, p.off_proto, r::RSI);
+        self.g_inc_mem(r::RSI, p.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::RSI);
+        self.g_load(r::R11, r::R9, p.default_proto);
+        self.g_store(r::RCX, p.off_proto, r::R11);
         self.g_store_imm32(r::RCX, p.off_extra, 0);
         for (i, &d) in vals.iter().enumerate() {
             self.load_rax(d);
@@ -2358,31 +2470,29 @@ impl X64Assembler {
         assert!(elems.len() <= ARRAY_INLINE_CAP, "an inline array literal");
         let p = &l.props;
         self.g_load(r::R9, r::R15, realm_off);
-        self.g_cmp_byte_imm(r::R9, p.marking, 0);
-        self.g_jcc(cc::NE, miss);
-        self.g_cmp_byte_imm(r::R9, p.array_proto_default, 0);
-        self.g_jcc(cc::E, miss);
-        self.g_load(r::RAX, r::R9, p.free_len);
-        self.g_test(r::RAX);
-        self.g_jcc(cc::E, miss);
-        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
-        self.g_load(r::R11, r::R9, p.free_ptr);
-        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
-        self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_allocs);
-        // rcx = the slot.
-        self.g_mov(r::RAX, r::RDX);
-        self.imul_rax_imm(l.slot_stride);
-        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
-        self.g_mov(r::RCX, r::RAX);
+        if p.array_proto_default == p.marking + 1 {
+            // Both flags in one compare: not marking, the default prototype.
+            // cmp word [r9 + marking], 0x0100
+            self.code.extend_from_slice(&[0x66, 0x41, 0x81, 0xb9]);
+            self.code.extend_from_slice(&p.marking.to_le_bytes());
+            self.code.extend_from_slice(&0x0100u16.to_le_bytes());
+            self.g_jcc(cc::NE, miss);
+        } else {
+            self.g_cmp_byte_imm(r::R9, p.marking, 0);
+            self.g_jcc(cc::NE, miss);
+            self.g_cmp_byte_imm(r::R9, p.array_proto_default, 0);
+            self.g_jcc(cc::E, miss);
+        }
+        self.p_pop_free_slot(l, miss);
         // `Cell::Array(ArrayElems::from_slice(elems))`, field by field.
         self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(l.cell_array_disc));
-        for (k, &w) in l.arr_empty_vec.iter().enumerate() {
-            self.g_movabs(r::R11, w);
-            self.g_store(r::RCX, l.off_arr_vec + 8 * k as i32, r::R11);
+        self.p_store_empty_vec(l, l.off_arr_vec);
+        if l.off_arr_proto_set == l.off_arr_side + 1 {
+            self.p_store_rcx_imm(2, l.off_arr_side, 0);
+        } else {
+            self.p_store_rcx_imm(1, l.off_arr_side, 0);
+            self.p_store_rcx_imm(1, l.off_arr_proto_set, 0);
         }
-        self.p_store_rcx_imm(1, l.off_arr_side, 0);
-        self.p_store_rcx_imm(1, l.off_arr_proto_set, 0);
         self.p_store_rcx_imm(1, l.off_arr_inline_len, elems.len() as u32);
         // Promoted registers' current values reach the frame first.
         self.spill_before_call();
@@ -2416,19 +2526,7 @@ impl X64Assembler {
         self.g_load(r::R9, r::R15, realm_off);
         self.g_cmp_byte_imm(r::R9, p.marking, 0);
         self.g_jcc(cc::NE, miss);
-        self.g_load(r::RAX, r::R9, p.free_len);
-        self.g_test(r::RAX);
-        self.g_jcc(cc::E, miss);
-        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
-        self.g_load(r::R11, r::R9, p.free_ptr);
-        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
-        self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_allocs);
-        // rcx = the slot.
-        self.g_mov(r::RAX, r::RDX);
-        self.imul_rax_imm(l.slot_stride);
-        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
-        self.g_mov(r::RCX, r::RAX);
+        self.p_pop_free_slot(l, miss);
         // `Cell::Box(undefined)`.
         self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(p.box_disc));
         self.g_movabs(r::R11, crate::nanbox::NanBox::undefined().to_bits());
@@ -2468,26 +2566,11 @@ impl X64Assembler {
         self.g_load(r::R9, r::R15, realm_off);
         self.g_cmp_byte_imm(r::R9, p.marking, 0);
         self.g_jcc(cc::NE, miss);
-        self.g_load(r::RAX, r::R9, p.free_len);
-        self.g_test(r::RAX);
-        self.g_jcc(cc::E, miss);
-        self.code.extend_from_slice(&[0x48, 0xff, 0xc8]); // dec rax
-        self.g_load(r::R11, r::R9, p.free_ptr);
-        self.code.extend_from_slice(&[0x41, 0x8b, 0x14, 0x83]); // mov edx, [r11 + rax*4]
-        self.g_store(r::R9, p.free_len, r::RAX);
-        self.g_inc_mem(r::R9, p.heap_allocs);
-        // rcx = the slot.
-        self.g_mov(r::RAX, r::RDX);
-        self.imul_rax_imm(l.slot_stride);
-        self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
-        self.g_mov(r::RCX, r::RAX);
+        self.p_pop_free_slot(l, miss);
         // `Cell::VmFunction`, field by field.
         self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(p.vmfn_disc));
         self.p_store_rcx_imm(4, p.off_vmfn_func, func);
-        for (k, &w) in l.arr_empty_vec.iter().enumerate() {
-            self.g_movabs(r::R11, w);
-            self.g_store(r::RCX, p.off_vmfn_caps_vec + 8 * k as i32, r::R11);
-        }
+        self.p_store_empty_vec(l, p.off_vmfn_caps_vec);
         self.p_store_rcx_imm(1, p.off_vmfn_caps_inline_len, caps.len() as u32);
         // Promoted registers' current values reach the frame first.
         self.spill_before_call();

@@ -1226,6 +1226,48 @@ pub(crate) extern "C" fn jit_helper_site_fill(
     0
 }
 
+/// `Op::ToStr` (`lazy` zero) or `Op::ToStrLazy` of `v` when that runs no code:
+/// a string is itself, and a primitive is its text (`ToStr`) or itself
+/// (`ToStrLazy`, whose `Concat` makes the text). `0`, having done nothing, for
+/// any other value (and for a `+0` a lazy op keeps: its op does that too).
+pub(crate) extern "C" fn jit_helper_to_str(
+    ctx: *mut core::ffi::c_void,
+    v: u64,
+    lazy: u64,
+    _unused: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_site_fill`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let value = NanBox::from_bits(v);
+    match value.as_handle() {
+        Some(h) if ctx.realm.is_string_handle(Handle::from_raw(h)) => v,
+        Some(_) => 0,
+        None if lazy != 0 => v,
+        None => NanBox::handle(ctx.realm.new_primitive_string(value).to_raw()).to_bits(),
+    }
+}
+
+/// Proves (or finds it cannot) what an inline `s.charCodeAt(i)` relies on:
+/// see [`MethodSite::set_str_proof`](crate::jit::MethodSite::set_str_proof).
+pub(crate) extern "C" fn jit_helper_str_proof(
+    ctx: *mut core::ffi::c_void,
+    _recv: u64,
+    site: u64,
+    _unused: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_site_fill`.
+    #[allow(unsafe_code)]
+    let (ctx, site) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            &mut *(site as usize as *mut crate::jit::MethodSite),
+        )
+    };
+    super::native_call::prove_char_code_at(&mut ctx.realm, site);
+    0
+}
+
 /// `Op::NewObject` from compiled code: a fresh ordinary object's handle bits
 /// (exactly the interpreter arm, which cannot fail). It allocates and runs no
 /// JavaScript.
@@ -3464,6 +3506,7 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
         max_depth: i(offset_of!(crate::realm::Realm, limits)
             + offset_of!(crate::limits::Limits, max_call_depth)),
         multi_realm: i(offset_of!(crate::realm::Realm, multi_realm)),
+        str_special: i(offset_of!(crate::realm::Realm, str_special)),
         callee_len: i(offset_of!(crate::realm::Realm, vm_callee_stack) + len_off),
         hosted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, hosted)),
         main_realm: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, main_realm)),

@@ -144,7 +144,6 @@ impl X64Assembler {
     pub(crate) fn p_field_rep_lit(
         &mut self,
         l: &JitLayout,
-        (cache, shape_off): (u64, i32),
         vals: &[i32],
         proven: &[bool],
         miss: Label,
@@ -163,9 +162,7 @@ impl X64Assembler {
         // non-Number is marked from its first one on), else each one.
         let all: u32 = check.iter().map(|&(i, _)| 1u32 << i).sum();
         let done = self.new_label();
-        self.g_movabs(r::R11, cache);
-        self.g_load(r::R11, r::R11, shape_off);
-        self.g_load(r::R11, r::R11, l.props.shape_any);
+        self.g_load(r::R11, r::RSI, l.props.shape_any);
         self.code.extend_from_slice(&[0x49, 0xf7, 0xd3]); // not r11
         // test r11, all
         self.code.extend_from_slice(&[0x49, 0xf7, 0xc3]);
