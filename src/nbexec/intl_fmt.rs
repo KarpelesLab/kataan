@@ -1017,9 +1017,7 @@ fn compact_rollover_value(n: f64) -> f64 {
 /// (`987.65…M` → `988M`, `9.87…K` → `9.9K`, `0.159` → `0.16`). Operates on the
 /// crate's tagged `(kind, value)` parts (ASCII or a locale's native digits):
 /// rewrites the leading `integer`/`decimal`/`fraction` run in
-/// place, leaving the sign and compact-suffix parts untouched. Grouped mantissae
-/// (a `group` part right after the integer) are left alone — compact mantissae are
-/// always < 1000 there, so no re-rounding is needed. Returns whether the
+/// place, leaving the sign and compact-suffix parts untouched. Returns whether the
 /// mantissa rounded up to a new power of ten (`999.96K` → `1000K`), which the
 /// caller must re-render at the next magnitude (see [`compact_rollover_value`]).
 #[cfg(feature = "intl")]
@@ -1030,10 +1028,10 @@ fn compact_reround_parts(
     let Some(int_idx) = parts.iter().position(|(k, _)| *k == "integer") else {
         return false;
     };
-    // Skip a grouped integer core (a `group` immediately after the integer): the
-    // digits span several parts, but such a mantissa is >= 1000 with no fraction,
-    // so `max(0, 1 - e)` is already 0 and nothing needs re-rounding.
+    // A grouped integer core (a `group` immediately after the integer): past the
+    // largest suffix, so at the top magnitude already, and `max(0, 1 - e)` is 0.
     if parts.get(int_idx + 1).map(|(k, _)| *k) == Some("group") {
+        compact_reround_grouped(parts, int_idx, mode);
         return false;
     }
     let neg = parts.iter().any(|(k, _)| *k == "minusSign");
@@ -1121,6 +1119,80 @@ fn compact_reround_parts(
         parts.insert(int_idx + 2, ("fraction", new_frac));
     }
     rolled
+}
+
+/// [`compact_reround_parts`] of a mantissa past the largest compact suffix, whose
+/// integer digits span `integer`/`group` parts from `int_idx`: it keeps no fraction
+/// digit (`123,456.789012T` is `123,457T`).
+#[cfg(feature = "intl")]
+fn compact_reround_grouped(
+    parts: &mut alloc::vec::Vec<(&'static str, String)>,
+    int_idx: usize,
+    mode: intl::number::RoundingMode,
+) {
+    let kind = |parts: &[(&'static str, String)], i: usize| parts.get(i).map(|(k, _)| *k);
+    let mut last = int_idx;
+    while kind(parts, last + 1) == Some("group") && kind(parts, last + 2) == Some("integer") {
+        last += 2;
+    }
+    if kind(parts, last + 1) != Some("decimal") {
+        return;
+    }
+    let has_frac = kind(parts, last + 2) == Some("fraction");
+    let Some(zero) = parts[int_idx].1.chars().next().and_then(native_digit_zero) else {
+        return;
+    };
+    let digit = |c: char| (c as u32).checked_sub(zero).filter(|d| *d < 10);
+    let decode = |s: &str| -> Option<alloc::vec::Vec<u8>> {
+        s.chars().map(|c| digit(c).map(|d| d as u8)).collect()
+    };
+    let frac = if has_frac {
+        decode(&parts[last + 2].1)
+    } else {
+        Some(alloc::vec::Vec::new())
+    };
+    let int: Option<alloc::vec::Vec<u8>> = (int_idx..=last)
+        .step_by(2)
+        .map(|i| decode(&parts[i].1))
+        .collect::<Option<alloc::vec::Vec<_>>>()
+        .map(|runs| runs.concat());
+    let (Some(frac), Some(mut int)) = (frac, int) else {
+        return;
+    };
+    let neg = parts.iter().any(|(k, _)| *k == "minusSign");
+    let up = exact_round_up(&frac, mode, neg);
+    parts.drain(last + 1..=if has_frac { last + 2 } else { last + 1 });
+    if !up {
+        return;
+    }
+    let old_len = int.len();
+    exact_increment(&mut int, &mut []);
+    let encode = |ds: &[u8]| -> String {
+        ds.iter()
+            .filter_map(|d| char::from_u32(zero + u32::from(*d)))
+            .collect()
+    };
+    // Every run keeps its length, but for a new leading digit (`999,999.9T`).
+    let mut rest = int.as_slice();
+    let lead = int.len() - old_len;
+    let (head, tail) = rest.split_at(lead);
+    rest = tail;
+    for i in (int_idx..=last).step_by(2) {
+        let n = parts[i].1.chars().count();
+        let (run, more) = rest.split_at(n);
+        parts[i].1 = encode(run);
+        rest = more;
+    }
+    if !head.is_empty() {
+        let group_len = parts[int_idx + 2].1.chars().count();
+        if parts[int_idx].1.chars().count() < group_len {
+            parts[int_idx].1.insert_str(0, &encode(head));
+        } else {
+            let sep = parts[int_idx + 1].1.clone();
+            parts.insert(int_idx, ("integer", encode(head)));
+            parts.insert(int_idx + 1, ("group", sep));
+        }
+    }
 }
 
 /// Split the separator whitespace off each `compact` part into its own `literal`

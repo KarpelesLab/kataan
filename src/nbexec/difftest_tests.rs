@@ -4202,3 +4202,28 @@ fn parse_int_rounds_once_in_every_radix() {
         "true,true,true,true,true,true,true,true,Infinity,Infinity,true"
     );
 }
+
+/// A default-rounded compact number past the largest suffix keeps no fraction
+/// digit: its mantissa's integer digits span several parts, and the re-round
+/// took that to mean the fraction it had itself asked the crate for was absent
+/// (`123,456.789012T`, and `99,999,999,999.999985T` for `1e23`).
+#[cfg(feature = "intl")]
+#[test]
+fn compact_mantissa_past_the_largest_suffix_is_rounded() {
+    let src = r#"
+        var nf = new Intl.NumberFormat("en", { notation: "compact" });
+        var pct = new Intl.NumberFormat("en", { notation: "compact", style: "percent" });
+        var neg = new Intl.NumberFormat("en", { notation: "compact", roundingMode: "ceil" });
+        [nf.format(1e23), nf.format(123456789012345680), nf.format(1e15), nf.format(999999999999999900),
+         pct.format(1e21), neg.format(-123456789012345680), neg.format(123456789012345680),
+         new Intl.NumberFormat("en", { notation: "compact", compactDisplay: "long" }).format(1e23),
+         new Intl.NumberFormat("ar-EG", { notation: "compact" }).format(123456789012345680).length > 0,
+         nf.formatToParts(999999999999999900).map(function (p) { return p.type + ":" + p.value; }).join(" ")].join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "100,000,000,000T|123,457T|1000T|1,000,000T|100,000,000,000T%|-123,456T|123,457T|\
+         100,000,000,000 trillion|true|\
+         integer:1 group:, integer:000 group:, integer:000 compact:T"
+    );
+}
