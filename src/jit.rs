@@ -24,6 +24,8 @@ use alloc::vec::Vec;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod chase;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fieldrep;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fused;
@@ -7097,6 +7099,7 @@ impl JitFunction {
         let shape_ways: Vec<usize> = (0..rc.ways).filter(|&w| way_shape[w].is_some()).collect();
         // The ways whose layout lacks the `[[IsHTMLDDA]]` brand: an object
         // a hit or a fill there proves is truthy.
+        let chase_at = chase::plan(bytecode);
         let way_plain: Vec<bool> = way_shape
             .iter()
             .map(|s| {
@@ -9498,6 +9501,50 @@ impl JitFunction {
                     // line (`cold_verifies`).
                     let known = s.baked.filter(|b| shape_known(op_idx, b.shape));
                     let verify = known.map(|_| a.new_label());
+                    // `while (q.link) q = q.link`: while the next object has
+                    // the way's layout, hop straight to it (`chase`).
+                    if chase_at[op_idx]
+                        && !num.int_version()
+                        && num.result_xmm(op_idx, dst).is_none()
+                        && num.result_xmm(op_idx, obj).is_none()
+                        && a.pinned()
+                        && let (Some(b), Some(p)) = (s.baked, rc.sites[op_idx])
+                        && p.check
+                        && !b.dda
+                    {
+                        use call_seq::r;
+                        let normal = a.new_label();
+                        let leave = a.new_label();
+                        let hop = a.new_label();
+                        a.dbg_mark("chase");
+                        a.load_rax(disp(obj));
+                        a.g_cmp_mem(r::RAX, r::RBP, rc_key(p.way));
+                        a.jne(normal);
+                        a.g_load(r::RCX, r::RBP, rc_cell(p.way));
+                        if known.is_none() {
+                            a.p_cmp_shape(r::RCX, layout.off_shape, b.shape, r::R11);
+                            a.jne(normal);
+                        }
+                        a.g_mov(r::RSI, r::RAX);
+                        a.g_movabs(r::RDX, chase::MAX_HOPS);
+                        a.bind(hop);
+                        a.g_mov(r::RDI, r::RCX);
+                        a.p_obj_fixed_slot_load(&layout, b.slot);
+                        a.p_is_handle(r::RCX, leave);
+                        a.p_slot_rooted(&layout, r::RCX, leave);
+                        a.p_object_not_exotic(&layout, leave);
+                        a.p_cmp_shape(r::RCX, layout.off_shape, b.shape, r::R11);
+                        a.jne(leave);
+                        a.g_mov(r::RSI, r::RAX);
+                        a.raw(&[0xff, 0xca]); // dec edx
+                        a.jne(hop);
+                        a.g_mov(r::RDI, r::RCX);
+                        a.bind(leave);
+                        a.g_store(r::RBX, disp(obj), r::RSI);
+                        a.g_store(r::RBP, rc_key(p.way), r::RSI);
+                        a.g_store(r::RBP, rc_cell(p.way), r::RDI);
+                        a.bind(normal);
+                    }
                     // In a speculative loop's fast version, a promoted
                     // result of a compiled-in layout is loaded straight into
                     // its SSE register: every other path leaves for the
@@ -10332,11 +10379,19 @@ impl JitFunction {
                         recv_slot!(op_idx, obj, not_arr, recv_cache::Family::Arr);
                     }
                     a.p_array_plain(&layout, helpers.call_layout.realm, true, helper);
+                    let appended = a.new_label();
+                    let checked = a.new_label();
                     if val_x.is_none() {
                         // (A promoted value is a Number: nothing to check.)
                         a.load_rax(disp(val));
-                        a.p_barrier_check(&layout, helpers.call_layout.realm, helper);
+                        a.p_barrier_check_appended(
+                            &layout,
+                            helpers.call_layout.realm,
+                            helper,
+                            appended,
+                        );
                     }
+                    a.bind(checked);
                     store_index!(helper);
                     a.p_arr_len_ptr(&layout);
                     a.cmp_rax_r8();
@@ -10352,6 +10407,14 @@ impl JitFunction {
                     }
                     a.mov_at_r11_rax8_rdx(); // elems[idx] = val
                     a.jmp(done);
+                    if val_x.is_none() {
+                        let cold = a.cold_begin();
+                        a.bind(appended);
+                        store_index!(helper);
+                        a.p_scan_covers(&layout, helper);
+                        a.jmp(checked);
+                        a.cold_end(cold);
+                    }
                     if typed {
                         // A typed-array view's element: a Number value (any
                         // other's `ToNumber` is the helper's, before anything

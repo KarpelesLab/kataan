@@ -2608,6 +2608,12 @@ impl NumGen {
             .collect()
     }
 
+    /// Whether the op being emitted is in a region's integer version, whose
+    /// numbers live in general-purpose registers.
+    pub(super) fn int_version(&self) -> bool {
+        self.imode.is_some()
+    }
+
     /// Whether op `pc` lies in the fast version of a speculative region:
     /// none of its paths runs Rust code and then rejoins it (every one
     /// leaves for the region's plain copy instead), so from the region's

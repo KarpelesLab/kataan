@@ -126,6 +126,14 @@ const STICKY: u8 = 2;
 /// the two states `x | APPENDED == APPENDED` picks out.)
 const APPENDED: u8 = 4;
 
+/// [`Slot::dirty`]'s bits that say a store into the object has nothing to
+/// record: a whole-object rescan is already due ([`DIRTY`], [`STICKY`]).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) const JIT_DIRTY_WHOLE: u8 = DIRTY | STICKY;
+/// [`APPENDED`], for compiled code.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) const JIT_DIRTY_APPENDED: u8 = APPENDED;
+
 /// [`Slot::occupied`] of a live slot.
 const SLOT_OCCUPIED: u8 = 1;
 
@@ -212,6 +220,11 @@ pub(crate) struct SlotLayout {
     pub value_off: usize,
     /// Byte offset of the `age: u8` field (collections survived) within the slot.
     pub age_off: usize,
+    /// Byte offset of the remembered-set state within the slot.
+    pub dirty_off: usize,
+    /// Byte offsets of the state's scan position (see `Slot::scan_lo`).
+    pub scan_lo_off: usize,
+    pub scan_hi_off: usize,
     /// The byte at [`value_off`](Self::value_off) of a **vacant** slot (one
     /// whose value was taken): `Option<T>`'s `None`, which lives in the
     /// niche of `T`'s own tag byte — no `Some` value's tag. Compiled code
@@ -247,6 +260,9 @@ pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
         // keeps no separate tag for a niche-carrying `T`).
         value_off: core::ptr::addr_of!(*value) as usize - base,
         age_off: core::ptr::addr_of!(slot.age) as usize - base,
+        dirty_off: core::ptr::addr_of!(slot.dirty) as usize - base,
+        scan_lo_off: core::ptr::addr_of!(slot.scan_lo) as usize - base,
+        scan_hi_off: core::ptr::addr_of!(slot.scan_hi) as usize - base,
         vacant_tag: vacant_tag_byte(slot),
     }
 }

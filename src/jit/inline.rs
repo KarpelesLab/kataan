@@ -21,7 +21,9 @@
 //!                                               -- pending, captures loaded
 //! G+1   JumpIfFalse t → F
 //!       parameters, `this` and every other callee register initialized
-//!       exactly as a call's register window is
+//!       exactly as a call's register window is (a parameter or `this` the
+//!       body never writes is not copied: the body reads the caller's
+//!       register, which nothing writes while it runs: see `copied_param`)
 //!       the callee's body, registers moved up into a sub-window above the
 //!       caller's (`return r` becomes `dst = r` and a jump to L)
 //!       dst = undefined                          -- falling off its end
@@ -664,7 +666,13 @@ pub fn expand<'a>(
             next += sites[si]
                 .1
                 .iter()
-                .map(|c| block_len(&c.proto, matches!(proto.ops[pc], Op::Construct { .. })))
+                .map(|c| {
+                    block_len(
+                        &c.proto,
+                        matches!(proto.ops[pc], Op::Construct { .. }),
+                        site_shape(&proto.ops[pc]),
+                    )
+                })
                 .sum::<usize>()
                 + 1;
             if matches!(proto.ops[pc], Op::CallKey { .. }) {
@@ -707,10 +715,11 @@ pub fn expand<'a>(
             let op = &*op;
             let (dst, callee, args, this) = call_parts(op)?;
             // The ways' blocks in a row, then the call op itself.
+            let shape = (args.len(), this.is_some());
             let fallback = ops.len()
                 + site_ways
                     .iter()
-                    .map(|c| block_len(&c.proto, construct))
+                    .map(|c| block_len(&c.proto, construct, shape))
                     .sum::<usize>();
             let end = fallback + 1;
             let n_ways = site_ways.len();
@@ -718,7 +727,7 @@ pub fn expand<'a>(
                 let p: &FnProto = &c.proto;
                 let g = ops.len();
                 let tmp = rb(p.n_regs as Reg);
-                let next_way = g + block_len(p, construct);
+                let next_way = g + block_len(p, construct, shape);
                 let leave = next_way - 2;
                 macro_rules! emit {
                     ($o:expr, $w:expr, $ops:expr $(,)?) => {{
@@ -762,8 +771,28 @@ pub fn expand<'a>(
                 // registers the body may read before writing them (the others'
                 // values are never seen).
                 let this_slot = p.n_params + p.n_captures;
+                // The body's view of its registers: above the caller's, but
+                // for those it shares with the caller.
+                let shared: Vec<Option<Reg>> = (0..p.n_regs)
+                    .map(|r| {
+                        if !copied_param(p, r, construct, shape) {
+                            None
+                        } else if r < p.n_params {
+                            args.get(r).copied()
+                        } else {
+                            this
+                        }
+                    })
+                    .collect();
+                let view = |r: Reg| -> Reg {
+                    shared
+                        .get(r as usize)
+                        .copied()
+                        .flatten()
+                        .unwrap_or_else(|| rb(r))
+                };
                 for r in window_regs(p, construct) {
-                    if construct && r == this_slot {
+                    if (construct && r == this_slot) || shared[r].is_some() {
                         continue;
                     }
                     let o = if r < p.n_params {
@@ -803,7 +832,14 @@ pub fn expand<'a>(
                             };
                             // `return r`: the call's result, then (but from the
                             // last op) to the end.
-                            emit!(Op::Move { dst, src: rb(*src) }, None, ops,);
+                            emit!(
+                                Op::Move {
+                                    dst,
+                                    src: view(*src)
+                                },
+                                None,
+                                ops,
+                            );
                             if w == 2 {
                                 emit!(Op::Jump { target: leave }, None, ops);
                             }
@@ -821,7 +857,7 @@ pub fn expand<'a>(
                         }
                         _ => {
                             let mut o = bop.clone();
-                            if !remap(&mut o, &rb, &tgt) {
+                            if !remap(&mut o, &view, &tgt) {
                                 return None;
                             }
                             emit!(o, bw, ops);
@@ -931,14 +967,116 @@ fn body_pc(p: &FnProto, t: usize, construct: bool) -> usize {
 
 /// The ops one inlined site takes before its call op: guard, branch, window,
 /// body, fall-off, leave, jump.
-/// (`construct`: a `new` site, whose `this` the guard writes.)
-fn block_len(p: &FnProto, construct: bool) -> usize {
+/// (`construct`: a `new` site, whose `this` the guard writes. `shape`: see
+/// [`copied_param`].)
+fn block_len(p: &FnProto, construct: bool, shape: (usize, bool)) -> usize {
     let this_slot = p.n_params + p.n_captures;
     let window = window_regs(p, construct)
         .into_iter()
-        .filter(|&r| !(construct && r == this_slot))
+        .filter(|&r| !(construct && r == this_slot) && !copied_param(p, r, construct, shape))
         .count();
     2 + window + body_pc(p, p.ops.len(), construct) + usize::from(falls_off(p)) + 2
+}
+
+/// A call op's `(arguments, has a receiver)`, as [`copied_param`] asks them.
+fn site_shape(op: &Op) -> (usize, bool) {
+    // (A computed-key call inlines its call half, with the same parts.)
+    if let Op::CallKey { args, .. } = op {
+        return (args.len(), true);
+    }
+    call_parts(op).map_or((0, false), |(_, _, args, this)| {
+        (args.len(), this.is_some())
+    })
+}
+
+/// Whether callee register `r` is a parameter with an argument, or `this` with
+/// a receiver (`shape`: the site's argument count, and whether it has one), that
+/// the body never writes: it then needs no copy, and the body reads the
+/// caller's register directly. Nothing can change that register while the
+/// body runs: the caller is suspended at the call, the body writes only its
+/// own registers and (at its returns, just before leaving) the call's
+/// destination, and a captured variable lives in a box, not a register.
+fn copied_param(p: &FnProto, r: usize, construct: bool, (argc, this): (usize, bool)) -> bool {
+    let is_arg = r < p.n_params && r < argc;
+    let is_this = this && !construct && r == p.n_params + p.n_captures;
+    (is_arg || is_this) && !p.ops.iter().any(|o| writes_reg(o, r as Reg))
+}
+
+/// Whether `op`, one the splice takes ([`remap`]), may write register `r`.
+fn writes_reg(op: &Op, r: Reg) -> bool {
+    match op {
+        Op::SetProp { .. }
+        | Op::SetPropStrict { .. }
+        | Op::CellSet { .. }
+        | Op::SetElem { .. }
+        | Op::SetKey { .. }
+        | Op::SetKeyStrict { .. }
+        | Op::InitProp { .. }
+        | Op::StoreGlobal { .. }
+        | Op::RequireObjectCoercible { .. }
+        | Op::CheckTdz { .. }
+        | Op::Throw { .. }
+        | Op::Return { .. }
+        | Op::ThrowTypeError { .. }
+        | Op::ThrowReferenceError { .. }
+        | Op::Jump { .. }
+        | Op::JumpIfFalse { .. }
+        | Op::InlineLeave => false,
+        Op::BindThis { this } => *this == r,
+        Op::InlineGuard {
+            dst, caps, n_caps, ..
+        } => *dst == r || (*caps..caps.saturating_add(*n_caps)).contains(&r),
+        Op::LoadConst { dst, .. }
+        | Op::LoadGlobal { dst, .. }
+        | Op::TypeofGlobal { dst, .. }
+        | Op::NewObject { dst }
+        | Op::NewBox { dst }
+        | Op::NewString { dst, .. }
+        | Op::NewArray { dst, .. }
+        | Op::Add { dst, .. }
+        | Op::Sub { dst, .. }
+        | Op::Mul { dst, .. }
+        | Op::Div { dst, .. }
+        | Op::Mod { dst, .. }
+        | Op::ValueBin { dst, .. }
+        | Op::Compare { dst, .. }
+        | Op::Lt { dst, .. }
+        | Op::AddValue { dst, .. }
+        | Op::StrictEq { dst, .. }
+        | Op::Relational { dst, .. }
+        | Op::TypeOf { dst, .. }
+        | Op::BitNot { dst, .. }
+        | Op::Neg { dst, .. }
+        | Op::Not { dst, .. }
+        | Op::Move { dst, .. }
+        | Op::ToStr { dst, .. }
+        | Op::ToStrLazy { dst, .. }
+        | Op::ToNumeric { dst, .. }
+        | Op::Step { dst, .. }
+        | Op::ToKey { dst, .. }
+        | Op::CellGet { dst, .. }
+        | Op::ArrayLen { dst, .. }
+        | Op::GetProp { dst, .. }
+        | Op::GetElem { dst, .. }
+        | Op::GetKey { dst, .. }
+        | Op::Concat { dst, .. }
+        | Op::NewArrayFrom { dst, .. }
+        | Op::PlainPrims { dst, .. }
+        | Op::MakeClosure { dst, .. }
+        | Op::LoadFunc { dst, .. }
+        | Op::NewObjectLit { dst, .. }
+        | Op::HasProp { dst, .. }
+        | Op::InstanceOf { dst, .. }
+        | Op::GetMethod { dst, .. }
+        | Op::CallMethod { dst, .. }
+        | Op::CallValue { dst, .. }
+        | Op::Construct { dst, .. }
+        | Op::CallWithMethod { dst, .. }
+        | Op::CallKey { dst, .. }
+        | Op::LoadNewTarget { dst } => *dst == r,
+        // (Not one the splice takes: assume the worst.)
+        _ => true,
+    }
 }
 
 /// The callee registers an inlined site initializes as a call's register

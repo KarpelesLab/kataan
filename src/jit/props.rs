@@ -64,6 +64,11 @@ pub(crate) struct PropsLayout {
     pub marking: i32,
     /// Slot-relative offset of the slot's `age` (collections survived).
     pub off_slot_age: i32,
+    /// The slot's remembered-set state (`heap::Slot::dirty`) and its scan
+    /// position.
+    pub off_slot_dirty: i32,
+    pub off_slot_scan_lo: i32,
+    pub off_slot_scan_hi: i32,
     /// The `Cell::VmFunction` discriminant byte.
     pub vmfn_disc: u8,
     /// The `Cell::Box` discriminant byte.
@@ -154,6 +159,9 @@ impl PropsLayout {
                 + core::mem::offset_of!(crate::limits::Limits, max_array_len)),
             marking: i(crate::realm::Realm::jit_marking_offset()),
             off_slot_age: i(slot.age_off),
+            off_slot_dirty: i(slot.dirty_off),
+            off_slot_scan_lo: i(slot.scan_lo_off),
+            off_slot_scan_hi: i(slot.scan_hi_off),
             vmfn_disc,
             native_disc,
             off_native_id: i(cell_base + native_id_off),
@@ -1981,11 +1989,26 @@ impl X64Assembler {
     /// Whether storing the value in `rax` into the object or array whose slot
     /// is `rcx` needs nothing from the write barrier (`Realm::write_barrier`):
     /// a non-handle value, or no incremental marking running and either a
-    /// young container or a live old target (so no old-to-young edge to
-    /// record). Otherwise to `miss`, whose helper store runs the barrier.
+    /// young container, a live old target (so no old-to-young edge to record)
+    /// or a container whose next minor collection already rescans it whole.
+    /// Otherwise to `miss`, whose helper store runs the barrier.
     /// Loads the arena itself when it needs it; preserves `rcx`, clobbers
     /// `rax`, `rdx`, `r8`–`r11`.
     pub(crate) fn p_barrier_check(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        self.p_barrier_check_appended(l, realm_off, miss, miss);
+    }
+
+    /// [`p_barrier_check`](Self::p_barrier_check), going to `appended` instead
+    /// of `miss` when the container's next minor collection rescans only its
+    /// tail (`heap::Slot::scan_lo`): an element store at or past that position
+    /// needs nothing from the barrier either ([`p_scan_covers`](Self::p_scan_covers)).
+    pub(crate) fn p_barrier_check_appended(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        miss: Label,
+        appended: Label,
+    ) {
         let done = self.new_label();
         let old = crate::gc::OLD_AGE;
         self.p_is_handle(r::R9, done);
@@ -2003,8 +2026,33 @@ impl X64Assembler {
         // only its slot header's `age` is read.
         self.p_slot_rooted(l, r::R9, miss);
         self.g_cmp_byte_imm(r::R9, l.props.off_slot_age, old);
-        self.g_jcc(cc::B, miss);
+        self.g_jcc(cc::AE, done);
+        // A young target in an old container. (Compared with the slot's
+        // state byte: only compiled-in constants, no field of the cell.)
+        self.p_test_byte_imm(r::RCX, l.props.off_slot_dirty, crate::heap::JIT_DIRTY_WHOLE);
+        self.g_jcc(cc::NE, done);
+        self.p_test_byte_imm(
+            r::RCX,
+            l.props.off_slot_dirty,
+            crate::heap::JIT_DIRTY_APPENDED,
+        );
+        self.g_jcc(cc::NE, appended);
+        self.jmp(miss);
         self.bind(done);
+    }
+
+    /// To `miss` unless the element index in `rax` is at or past the scan
+    /// position of the array whose slot is `rcx`, whose state is `APPENDED`.
+    /// Clobbers `r8`, `r9`.
+    pub(crate) fn p_scan_covers(&mut self, l: &JitLayout, miss: Label) {
+        self.p_load8(r::R8, r::RCX, l.props.off_slot_scan_hi);
+        self.raw(&[0x49, 0xc1, 0xe0, 0x10]); // shl r8, 16
+        // movzx r9d, word [rcx + disp32]
+        self.raw(&[0x44, 0x0f, 0xb7, 0x89]);
+        self.raw(&l.props.off_slot_scan_lo.to_le_bytes());
+        self.raw(&[0x4d, 0x09, 0xc8]); // or r8, r9
+        self.g_cmp(r::RAX, r::R8);
+        self.g_jcc(cc::B, miss);
     }
 
     /// The truthiness of the value in `rax`, inline where it is not the
