@@ -6800,15 +6800,27 @@ fn jit_set_prop_impl(
         unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(key_ptr, key_len)) };
     #[allow(unsafe_code)]
     let cache = unsafe { &mut *(cache as *mut PropertyCache) };
-    match vm_set_prop_mode(
+    // A VM setter with a compiled body is entered directly (`jit_tier`).
+    let r = match jit_tier::compiled_setter(
         ctx,
         funcs,
         NanBox::from_bits(obj),
         key,
         NanBox::from_bits(val),
         cache,
-        strict,
     ) {
+        Some(r) => r.map(|_| ()),
+        None => vm_set_prop_mode(
+            ctx,
+            funcs,
+            NanBox::from_bits(obj),
+            key,
+            NanBox::from_bits(val),
+            cache,
+            strict,
+        ),
+    };
+    match r {
         Ok(()) => NanBox::undefined().to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);

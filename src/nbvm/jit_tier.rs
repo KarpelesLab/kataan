@@ -2296,6 +2296,39 @@ pub(crate) fn compiled_getter(
     }
 }
 
+/// [`compiled_getter`] for a static-key property write: when the site's
+/// prototype-chain cache finds an accessor (own or inherited, which takes
+/// precedence over everything `vm_set_prop_mode` would do) whose setter is a
+/// [`call_compiled`] target, on an ordinary object that is not host-exotic and
+/// not the global object, call it directly, `this` the receiver, the value its
+/// argument. `None`: do the ordinary write.
+pub(crate) fn compiled_setter(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    value: NanBox,
+    cache: &crate::ic::PropertyCache,
+) -> Option<Result<NanBox, VmError>> {
+    if !cache.chain.as_ref().is_some_and(|c| c.accessor) {
+        return None;
+    }
+    let h = recv.as_handle().map(Handle::from_raw)?;
+    if ctx.realm.is_host_exotic(h) || ctx.host.as_deref().is_none_or(|x| x.is_global_object(recv)) {
+        return None;
+    }
+    match ctx.realm.chain_cached_get(h, key, cache)? {
+        crate::realm::ChainHit::Accessor(_, setter, _)
+            if setter
+                .as_handle()
+                .is_some_and(|s| ctx.realm.is_vm_function(Handle::from_raw(s))) =>
+        {
+            call_compiled_with(ctx, funcs, None, setter, recv, &[value])
+        }
+        _ => None,
+    }
+}
+
 /// `Op::CallMethod` in compiled code. The one case it runs itself is the hot
 /// one: a hosted call whose method (looked up through the site's persistent
 /// cache `cache`) is a VM closure with a compiled body, which it enters
