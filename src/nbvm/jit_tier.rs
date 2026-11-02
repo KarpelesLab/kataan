@@ -1475,11 +1475,42 @@ pub(crate) extern "C" fn jit_helper_exec_op(
                 None => None,
             }
         }
+        // `f(...xs)` over a plain array (its interpreter arm), entering a
+        // compiled callee directly; when the spread is not plain, `ok` says
+        // so and nothing else happens.
+        Op::CallSpreadPlain {
+            dst,
+            callee,
+            this,
+            items,
+            src,
+            ok,
+        } => match super::plain_spread_argv(ctx, regs, items, regs[*src as usize]) {
+            None => {
+                regs[*ok as usize] = NanBox::boolean(false);
+                Some(Ok(()))
+            }
+            Some(argv) => {
+                let (f, t) = (regs[*callee as usize], regs[*this as usize]);
+                call_compiled_with(ctx, funcs, Some(regs), f, t, &argv).map(|r| {
+                    regs[*ok as usize] = NanBox::boolean(true);
+                    r.map(|v| regs[*dst as usize] = v)
+                })
+            }
+        },
         // Whether a fresh array destructures without running code (its
         // interpreter arm, which cannot fail).
         Op::FreshArrayIterPlain { dst } => {
             regs[*dst as usize] =
                 NanBox::boolean(super::iter_fast::fresh_array_is_plain(&mut ctx.realm));
+            Some(Ok(()))
+        }
+        // A fresh function's own `prototype` (its interpreter arm, which
+        // cannot fail).
+        Op::InitFnPrototype { f } => {
+            if let Some(fh) = regs[*f as usize].as_handle().map(Handle::from_raw) {
+                super::init_fn_prototype(&mut ctx.realm, fh);
+            }
             Some(Ok(()))
         }
         // Literal allocations (an object or array literal per loop iteration):
