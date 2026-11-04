@@ -554,7 +554,7 @@ impl CallSite {
         self.fills = self.fills.saturating_add(1);
         if self.fills > Self::FILL_LIMIT
             && self.targets.iter().all(|t| t.key != Self::EMPTY)
-            && self.fills % Self::MEGA_REFILL != 0
+            && !self.fills.is_multiple_of(Self::MEGA_REFILL)
         {
             return;
         }
