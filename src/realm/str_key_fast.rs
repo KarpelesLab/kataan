@@ -78,6 +78,21 @@ impl Realm {
         Some((o.key_epoch(), o.proto()))
     }
 
+    /// `obj[key]` for a `for-in` key String `key` on an object of its key
+    /// list's layout (`forin_cache`): its slot's value. `None` for anything
+    /// else (what [`own_data_by_string`](Self::own_data_by_string) answers
+    /// first).
+    #[must_use]
+    #[inline]
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn for_in_key_value(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
+        self.for_in_key_slot(obj, key)
+            .and_then(|(o, slot)| o.slot(slot))
+    }
+
     /// `obj[key]` for a String `key` naming an own **data** property of the
     /// ordinary object `obj` (no like-named accessor): its value. `None`
     /// for anything else.
@@ -112,6 +127,22 @@ impl Realm {
     pub(crate) fn has_property_by_string(&self, key: NanBox, obj: NanBox) -> Option<bool> {
         let k = self.string_key_in_place(key)?;
         self.has_property_named(Handle::from_raw(obj.as_handle()?), k)
+    }
+
+    /// [`has_property_by_string`](Self::has_property_by_string) where the
+    /// key is likely a `for-in`'s (the loop's per-key liveness check): a key
+    /// String of its list on an object of the list's layout is an own key
+    /// (`forin_cache`), tried first.
+    #[must_use]
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn has_property_by_for_in_key(&self, key: NanBox, obj: NanBox) -> Option<bool> {
+        if self.for_in_key_slot(obj, key).is_some() {
+            return Some(true);
+        }
+        self.has_property_by_string(key, obj)
     }
 
     /// `HasProperty(h, key)` for a storage key `key`, when every object on

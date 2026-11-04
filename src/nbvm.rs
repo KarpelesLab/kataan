@@ -6877,6 +6877,7 @@ pub(crate) extern "C" fn jit_helper_get_elem(
     // SAFETY: single-threaded reentrancy — as `jit_helper_get_prop`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let (recv, key) = (NanBox::from_bits(recv), NanBox::from_bits(key));
     // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
     #[allow(unsafe_code)]
     let funcs = unsafe {
@@ -6884,7 +6885,6 @@ pub(crate) extern "C" fn jit_helper_get_elem(
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    let (recv, key) = (NanBox::from_bits(recv), NanBox::from_bits(key));
     // An in-range element of a typed array wholly inside its buffer (what
     // `vm_get_elem` would reach after its plain-array / arguments / string
     // checks).
@@ -6902,6 +6902,32 @@ pub(crate) extern "C" fn jit_helper_get_elem(
             NanBox::jit_throw_bits()
         }
     }
+}
+
+/// [`jit_helper_get_elem`] at a site whose key is likely a `for-in`'s: a key
+/// String of the loop's list on an object of its layout first
+/// (`Realm::for_in_key_value`, which `vm_get_elem` would reach for it).
+///
+/// # Safety
+/// As [`jit_helper_get_elem`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_get_elem_key(
+    ctx_raw: *mut core::ffi::c_void,
+    recv: u64,
+    key: u64,
+) -> u64 {
+    {
+        // SAFETY: as `jit_helper_get_elem`; this borrow ends before it runs.
+        #[allow(unsafe_code)]
+        let ctx = unsafe { &*(ctx_raw as *const Ctx) };
+        if let Some(v) = ctx
+            .realm
+            .for_in_key_value(NanBox::from_bits(recv), NanBox::from_bits(key))
+        {
+            return v.to_bits();
+        }
+    }
+    jit_helper_get_elem(ctx_raw, recv, key)
 }
 
 /// The generic-JIT runtime helper for a computed element **set** `obj[key] = val`.
@@ -7003,12 +7029,14 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         get_method_site: jit_tier::jit_helper_get_method_site,
         init_prop: jit_helper_init_prop,
         get_elem: jit_helper_get_elem,
+        get_elem_key: jit_helper_get_elem_key,
         set_elem: jit_helper_set_elem,
         array_len: jit_helper_array_len,
         arith: jit_helper_arith,
         value_bin: jit_helper_value_bin,
         lt: jit_helper_lt,
         strict_eq: jit_helper_strict_eq,
+        has_prop: jit_helper_has_prop,
         truthy: jit_helper_truthy,
         call_native: jit_helper_call_native,
         exec_op: jit_tier::jit_helper_exec_op,
@@ -7208,6 +7236,30 @@ pub(crate) extern "C" fn jit_helper_strict_eq(ctx: *mut core::ffi::c_void, a: u6
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
     vm_strict_eq(&ctx.realm, NanBox::from_bits(a), NanBox::from_bits(b)).to_bits()
+}
+
+/// `key in obj` (`Op::Relational`, not `instanceof`) in compiled code where
+/// the key is likely a `for-in`'s (the loop's per-key liveness check), as
+/// the interpreter arm's first step decides it from the heap alone
+/// (`Realm::has_property_by_for_in_key`, then `has_property_by_string`):
+/// the boolean's bits, or `undefined`'s when it cannot tell there (the
+/// caller then runs the interpreter's op). Never throws.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_has_prop(
+    ctx: *mut core::ffi::c_void,
+    key: u64,
+    obj: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    match ctx
+        .realm
+        .has_property_by_for_in_key(NanBox::from_bits(key), NanBox::from_bits(obj))
+    {
+        Some(r) => NanBox::boolean(r).to_bits(),
+        None => NanBox::undefined().to_bits(),
+    }
 }
 
 /// Generic-JIT slow path for a truthiness test (`JumpIfFalse`/`Op::Not` on a
@@ -18934,6 +18986,20 @@ impl Compiler {
                     dst: i,
                     value: NanBox::number(0.0),
                 });
+                // Hosted: whether there is no liveness object, once (`obj` is
+                // this loop's own register, which only `EnumKeys` writes).
+                let none = if self.hosted {
+                    let undef = self.constant(NanBox::undefined())?;
+                    let none = self.alloc();
+                    self.ops.push(Op::StrictEq {
+                        dst: none,
+                        a: obj,
+                        b: undef,
+                    });
+                    Some(none)
+                } else {
+                    None
+                };
                 let top = self.ops.len();
                 let cond = self.alloc();
                 self.ops.push(Op::Lt {
@@ -18951,14 +19017,7 @@ impl Compiler {
                 // Hosted: a key whose property was deleted since the list was
                 // taken (and is not inherited) is skipped.
                 let mut dead = None;
-                if self.hosted {
-                    let undef = self.constant(NanBox::undefined())?;
-                    let none = self.alloc();
-                    self.ops.push(Op::StrictEq {
-                        dst: none,
-                        a: obj,
-                        b: undef,
-                    });
+                if let Some(none) = none {
                     let to_check = self.emit_jump_if_false(none);
                     let to_bind = self.emit_jump();
                     self.patch(to_check);
@@ -26329,6 +26388,35 @@ mod tests {
             out,
             "20000 200010000 1 19999 9001 6000 12001 TypeError true\n"
         );
+    }
+
+    /// `for-in` over memoized key lists (`realm::forin_cache`): a key deleted
+    /// and one added mid-loop, a key turned into an accessor, more layouts
+    /// than the cache holds in turn, and nested loops over one layout (which
+    /// share its key array) reading another object of it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn for_in_key_slots_follow_the_object() {
+        let (out, _) = execute(
+            "var s = 0, seen = '', g = 0;
+             for (let i = 0; i < 3000; i++) {
+               var o = { a: 1, b: 2, c: 3, d: 4 };
+               for (var k in o) {
+                 if (i === 1500 && k === 'b') { delete o.d; o.z = 9; Object.defineProperty(o, 'c', { get() { g++; return 30; } }); }
+                 s += o[k];
+                 if (i === 1500) seen += k;
+               }
+             }
+             var os = [];
+             for (let i = 0; i < 20; i++) { var p = {}; for (let j = 0; j <= i % 7; j++) p['k' + ((i + j) % 9)] = j; os.push(p); }
+             var t = 0;
+             for (let i = 0; i < 20000; i++) { var q = os[(i * 7) % 20]; for (var k2 in q) t += q[k2] + (k2 in q ? 1 : 0); }
+             var u = 0, w = { x: 1, y: 2 }, v = { x: 10, y: 20 };
+             for (let i = 0; i < 3000; i++) { for (var k3 in w) { for (var k4 in v) u += w[k3] * v[k4]; u += v[k3]; } }
+             console.log(s, seen, g, t, u);",
+        )
+        .expect("ok");
+        assert_eq!(out, "30023 abc 1 224000 360000\n");
     }
 
     #[test]

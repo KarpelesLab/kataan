@@ -154,6 +154,11 @@ pub struct Shape {
     /// code reads such a slot without a type check. Bits are only ever set.
     /// Slots from 64 on are not tracked (always "may be anything").
     any: Cell<u64>,
+    /// Where a realm's `for-in` key-list cache last put this layout's entry
+    /// (`realm::forin_cache`; `0`: nowhere, else the entry's index plus one):
+    /// a hint the cache confirms against the entry's own shape, so a lookup
+    /// is one probe whatever layouts share the cache.
+    for_in_hint: Cell<u16>,
 }
 
 /// The most cached children a [`Transitions`] list holds before it becomes a
@@ -334,6 +339,7 @@ impl Shape {
             probes: Cell::new(0),
             brands: 0,
             any: Cell::new(0),
+            for_in_hint: Cell::new(0),
         })
     }
 
@@ -364,6 +370,19 @@ impl Shape {
     #[must_use]
     pub(crate) fn any_offset() -> usize {
         core::mem::offset_of!(Shape, any)
+    }
+
+    /// The `for-in` cache's hint for this layout (see `for_in_hint`).
+    #[inline]
+    #[must_use]
+    pub(crate) fn for_in_hint(&self) -> u16 {
+        self.for_in_hint.get()
+    }
+
+    /// Records the `for-in` cache's hint for this layout.
+    #[inline]
+    pub(crate) fn set_for_in_hint(&self, hint: u16) {
+        self.for_in_hint.set(hint);
     }
 
     /// Whether some object with this layout may hold something other than a
@@ -535,6 +554,7 @@ impl Shape {
             // What may be anything in the parent's slots may be here too:
             // an object that adds a key keeps its other values.
             any: Cell::new(self.any.get()),
+            for_in_hint: Cell::new(0),
         });
         self.transitions.borrow_mut().insert(&key, &child);
         child
@@ -560,6 +580,7 @@ impl Shape {
             probes: Cell::new(0),
             brands: (length.brands & !IMPLIED_FN_ATTRS_BIT) | IMPLIED_FN_ATTRS_BIT,
             any: Cell::new(length.any.get()),
+            for_in_hint: Cell::new(0),
         })
     }
 

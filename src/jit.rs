@@ -3341,6 +3341,9 @@ pub struct GenericHelpers {
     pub init_prop: JitSetPropHelper,
     /// The computed element-get helper (`jit_helper_get_elem`) — `obj[key]`.
     pub get_elem: JitAddHelper,
+    /// [`get_elem`](Self::get_elem) for a key that is likely a `for-in`'s
+    /// (`jit_helper_get_elem_key`): that case first.
+    pub get_elem_key: JitAddHelper,
     /// The computed element-set helper (`jit_helper_set_elem`) — `obj[key] = v`.
     pub set_elem: JitSetElemHelper,
     /// The `.length` helper (`jit_helper_array_len`) — `Op::ArrayLen`.
@@ -3355,6 +3358,10 @@ pub struct GenericHelpers {
     pub lt: JitAddHelper,
     /// The strict-equality `===` helper (`jit_helper_strict_eq`) — never throws.
     pub strict_eq: JitAddHelper,
+    /// `key in obj` for a key that is likely a `for-in`'s, decided from the
+    /// heap alone (`jit_helper_has_prop`): a boolean, or `undefined` for the
+    /// interpreter's op — never throws.
+    pub has_prop: JitAddHelper,
     /// The truthiness helper (`jit_helper_truthy`), returning `0`/`1` — never throws.
     pub truthy: JitTruthyHelper,
     /// The interpreter-op helper (`jit_helper_exec_op`) — runs one bytecode op
@@ -6896,12 +6903,47 @@ impl JitFunction {
         let set_site_helper = helpers.set_site as usize as u64;
         let init_prop_helper = helpers.init_prop as usize as u64;
         let get_elem_helper = helpers.get_elem as usize as u64;
+        let get_elem_key_helper = helpers.get_elem_key as usize as u64;
+        // The registers that hold a `for-in`'s keys (an element of an
+        // `EnumKeys` list, or a copy of one): an element read keyed by one
+        // takes the helper that tries a `for-in` key first. (A guess only:
+        // either helper reads any key.)
+        let forin_keys: Vec<bool> = {
+            use crate::nbvm::Op;
+            let mut lists = alloc::vec![false; n_regs];
+            let mut keys = alloc::vec![false; n_regs];
+            for op in bytecode.iter() {
+                if let Op::EnumKeys { dst, .. } = op
+                    && let Some(l) = lists.get_mut(*dst as usize)
+                {
+                    *l = true;
+                }
+            }
+            for op in bytecode.iter() {
+                if let Op::GetElem { dst, arr, .. } = op
+                    && lists.get(*arr as usize) == Some(&true)
+                    && let Some(k) = keys.get_mut(*dst as usize)
+                {
+                    *k = true;
+                }
+            }
+            for op in bytecode.iter() {
+                if let Op::Move { dst, src } = op
+                    && keys.get(*src as usize) == Some(&true)
+                    && let Some(k) = keys.get_mut(*dst as usize)
+                {
+                    *k = true;
+                }
+            }
+            keys
+        };
         let set_elem_helper = helpers.set_elem as usize as u64;
         let array_len_helper = helpers.array_len as usize as u64;
         let arith_helper = helpers.arith as usize as u64;
         let value_bin_helper = helpers.value_bin as usize as u64;
         let lt_helper = helpers.lt as usize as u64;
         let strict_eq_helper = helpers.strict_eq as usize as u64;
+        let has_prop_helper = helpers.has_prop as usize as u64;
         let truthy_helper = helpers.truthy as usize as u64;
         let call_native_helper = helpers.call_native as usize as u64;
         let exec_op_helper = helpers.exec_op as usize as u64;
@@ -9359,6 +9401,37 @@ impl JitFunction {
                             }
                             a.bind(done);
                         }
+                        // A `for-in`'s per-key liveness check `key in obj`
+                        // (its key register one of `forin_keys`), decided
+                        // from the heap alone, else the interpreter's op.
+                        crate::nbvm::Op::Relational {
+                            dst,
+                            instanceof: false,
+                            a: key,
+                            b: obj,
+                        } if ok(*dst)
+                            && ok(*key)
+                            && ok(*obj)
+                            && forin_keys.get(*key as usize) == Some(&true) =>
+                        {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(*key));
+                            a.load_argreg(2, disp(*obj));
+                            a.movabs_rax(has_prop_helper as i64);
+                            a.call_rax();
+                            a.movabs_r11(NanBox::undefined().to_bits() as i64);
+                            a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
+                            a.g_jcc(call_seq::cc::E, slow);
+                            a.store_rax(disp(*dst));
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.jmp(done);
+                            a.cold_end(cold);
+                            a.bind(done);
+                        }
                         // A captured variable's binding cell: inline from
                         // the heap's free list, else the interpreter's op.
                         crate::nbvm::Op::NewBox { dst } if ok(*dst) => {
@@ -10337,7 +10410,12 @@ impl JitFunction {
                             Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
                             None => a.load_argreg(2, disp(index)),
                         }
-                        a.movabs_rax(get_elem_helper as i64);
+                        let h = if forin_keys.get(index as usize) == Some(&true) {
+                            get_elem_key_helper
+                        } else {
+                            get_elem_helper
+                        };
+                        a.movabs_rax(h as i64);
                         a.call_rax();
                         throw_check!();
                         a.store_rax(disp(dst));
