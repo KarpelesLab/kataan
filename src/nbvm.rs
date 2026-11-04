@@ -2087,10 +2087,16 @@ fn vm_set_prop_mode(
         // That is what the hosted rules (`plain_write_ok` holds) and
         // `vm_set_prop` (no accessor, not own) both reduce to.
         if ctx.realm.object_accepts_new_property(h) {
-            if matches!(
-                ctx.realm.chain_cached_get(h, key, cache),
-                Some(crate::realm::ChainHit::Absent)
-            ) && !typed_proto_numeric_key(&ctx.realm, h, key)
+            let hit = ctx.realm.chain_cached_get(h, key, cache);
+            // The setter feedback the machine-code tier inlines from.
+            if let Some(crate::realm::ChainHit::Accessor(_, setter, _)) = hit
+                && let Some(s) = setter.as_handle()
+                && let Some((f, c)) = ctx.realm.vm_function(Handle::from_raw(s))
+            {
+                cache.note_callee(u64::from(f) | ((c.len() as u64) << 32));
+            }
+            if matches!(hit, Some(crate::realm::ChainHit::Absent))
+                && !typed_proto_numeric_key(&ctx.realm, h, key)
             {
                 // A fresh writable/enumerable/configurable data property is
                 // the same whether made by [[Set]] or CreateDataProperty, so
@@ -26292,6 +26298,37 @@ mod tests {
         )
         .expect("ok");
         assert_eq!(out, "10000 30000 197961413 432 route true\n");
+    }
+
+    /// Inherited setters inlined at a property write: the setter's result
+    /// dropped (the assignment's value is the right-hand side), a throw out
+    /// of it, the accessor's setter replaced and then removed mid-loop
+    /// (sloppy: the write is ignored; strict: a `TypeError`), a setter
+    /// that writes through itself, and no header leaked.
+    #[cfg(feature = "std")]
+    #[test]
+    fn jit_inlined_setters() {
+        let (out, _) = execute(
+            "function maxDepth() { var d = 0; function r() { d++; r(); } try { r(); } catch (e) { return d; } return -1; }
+             var d0 = maxDepth();
+             class P { constructor() { this._x = 0; } get x() { return this._x; } set x(v) { this._x = v; return 99; } }
+             var p = new P(), r = 0;
+             for (let i = 0; i < 20000; i++) { r += (p.x = p.x + 1); }
+             var T = { set t(v) { if (v === 15000) throw new RangeError('t'); this.n = v; } }, o = Object.create(T), c = 0;
+             for (let i = 0; i < 20000; i++) { try { o.t = i; } catch (e) { c++; } }
+             var S = { set s(v) { this.a = (this.a || 0) + v; } }, w = Object.create(S);
+             for (let i = 0; i < 20000; i++) { w.s = 1; if (i === 9000) Object.defineProperty(S, 's', { set(v) { this.b = (this.b || 0) + v; } }); if (i === 15000) Object.defineProperty(S, 's', { set: undefined }); }
+             var G = { set g(v) { this.k = (this.k || 0) + 1; }, configurable: true }, gs = Object.create(G), e = '';
+             (function () { 'use strict'; try { for (let i = 0; i < 20000; i++) { gs.g = i; if (i === 12000) Object.defineProperty(G, 'g', { set: undefined }); } } catch (x) { e = x.constructor.name; } })();
+             var D = { set deep(v) { if (v > 0) this.deep = v - 1; } }, dd = Object.create(D);
+             for (let i = 0; i < 20000; i++) dd.deep = i % 3;
+             console.log(p.x, r, c, o.n, w.a, w.b, gs.k, e, maxDepth() === d0);",
+        )
+        .expect("ok");
+        assert_eq!(
+            out,
+            "20000 200010000 1 19999 9001 6000 12001 TypeError true\n"
+        );
     }
 
     #[test]

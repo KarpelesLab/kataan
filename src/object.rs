@@ -1494,6 +1494,16 @@ impl Object {
             .map(|(_, g, _)| core::ptr::from_ref(g))
     }
 
+    /// [`jit_getter_ptr`](Self::jit_getter_ptr) for accessor `i`'s setter.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_setter_ptr(&self, i: usize) -> Option<*const NanBox> {
+        self.ex()
+            .accessors
+            .get(i)
+            .map(|(_, _, s)| core::ptr::from_ref(s))
+    }
+
     /// Writes slot `slot` directly, without a name lookup or the integrity
     /// checks of [`set`](Object::set): the caller must have resolved `slot`
     /// under this object's current shape and ruled out a frozen object and a
@@ -2361,6 +2371,8 @@ pub(crate) struct ObjectLayout {
     pub acc_stride: usize,
     /// Byte offset of the getter within an accessor entry.
     pub acc_getter_off: usize,
+    /// Byte offset of the setter within an accessor entry.
+    pub acc_setter_off: usize,
     /// Offset from the shape word (the `Rc`'s stored pointer) to the shape's
     /// `brands` byte (bit 0: a primitive wrapper).
     pub shape_brands_off: isize,
@@ -2458,6 +2470,8 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         (Box::from("k"), NanBox::undefined(), NanBox::null());
     let acc_getter_off =
         core::ptr::addr_of!(acc_probe.1) as usize - core::ptr::addr_of!(acc_probe) as usize;
+    let acc_setter_off =
+        core::ptr::addr_of!(acc_probe.2) as usize - core::ptr::addr_of!(acc_probe) as usize;
     let extra_acc_ptr_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_ptr_off;
     let extra_acc_len_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_len_off;
     let extra_marks_len_off = [
@@ -2498,6 +2512,7 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         extra_spill_n_off,
         acc_stride: core::mem::size_of::<(Box<str>, NanBox, NanBox)>(),
         acc_getter_off,
+        acc_setter_off,
         shape_brands_off,
     }
 }

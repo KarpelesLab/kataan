@@ -606,9 +606,9 @@ pub(super) fn plan(
             poly,
             ..
         } if !in_spec(i) && poly & 0xff == 0 => match ops.get(call as usize)? {
-            GenericOp::CallMethod { recv: r, .. } | GenericOp::GetProp { obj: r, .. } => {
-                Some((*r, Family::Obj))
-            }
+            GenericOp::CallMethod { recv: r, .. }
+            | GenericOp::GetProp { obj: r, .. }
+            | GenericOp::SetProp { obj: r, .. } => Some((*r, Family::Obj)),
             // An inlined `new`'s guard allocates `this` (the register after
             // the captures) and fills its way with the fresh object.
             GenericOp::Construct { .. } => Some((caps + n_caps.checked_sub(1)?, Family::Obj)),

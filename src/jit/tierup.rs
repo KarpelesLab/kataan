@@ -145,7 +145,7 @@ impl TierUp {
                         | GenericOp::CallValue { cache, .. }
                         | GenericOp::CallWithMethod { cache, .. }
                         | GenericOp::Construct { cache, .. } => cache,
-                        GenericOp::GetProp { call, .. } => call,
+                        GenericOp::GetProp { call, .. } | GenericOp::SetProp { call, .. } => call,
                         _ => return None,
                     };
                     Some((pc, cache))

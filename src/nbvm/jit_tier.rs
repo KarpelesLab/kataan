@@ -4105,6 +4105,18 @@ pub(crate) extern "C" fn jit_helper_set_prop_site(
         // SAFETY: as above; the write's own borrow of the context has ended.
         #[allow(unsafe_code)]
         let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+        // A write whose chain cache found an accessor: the site's setter
+        // entry, for an inlined setter's guard (`MethodSite::fill_set`).
+        // SAFETY: the site's own `PropertyCache`, not borrowed elsewhere
+        // while this helper runs.
+        #[allow(unsafe_code)]
+        let accessor = unsafe { &*(site.cache as *const crate::ic::PropertyCache) }
+            .chain
+            .as_ref()
+            .is_some_and(|c| c.accessor);
+        if accessor {
+            site.fill_set(&mut ctx.realm, h);
+        }
         site.fill_add(&mut ctx.realm, h, &before);
     }
     r

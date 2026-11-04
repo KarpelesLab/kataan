@@ -2173,6 +2173,10 @@ pub(crate) struct InlineEmit<'a> {
     /// The call is a property read's inherited getter (`callee` the
     /// [`CalleeSrc::Method`] lookup of the read): a data property is a miss.
     pub getter: bool,
+    /// With `getter`: the call is a property write's inherited setter
+    /// instead (the lookup of the write's site finds the accessor's setter,
+    /// see `MethodSite::fill_set`).
+    pub setter: bool,
     /// The receiver cache's way for a method's receiver
     /// (`super::recv_cache`), if the guard is one of its sites.
     pub way: Option<RecvWay>,
@@ -2389,7 +2393,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
             emit_guard_fast(a, e, (way, ways.max(1)), slow, identified, miss)?;
             a.bind(slow);
             a.dbg_mark("g-lookup");
-            a.p_method_lookup_walked(jl, l.realm, site, lookup_miss, getter);
+            a.p_accessor_lookup_walked(jl, l.realm, site, lookup_miss, getter, e.setter);
             if e.getter {
                 a.jmp(lookup_miss); // a data property
                 a.bind(got);

@@ -51,6 +51,8 @@ pub(crate) struct PropsLayout {
     pub acc_stride: i32,
     /// Entry-relative offset of an accessor's getter.
     pub acc_getter: i32,
+    /// Entry-relative offset of an accessor's setter.
+    pub acc_setter: i32,
     /// Shape-word-relative offset of the shape's brand byte.
     pub shape_brands: i32,
     /// Shape-word-relative offset of the shape's may-be-non-Number slot
@@ -184,6 +186,7 @@ impl PropsLayout {
             extra_spill_n: i(obj.extra_spill_n_off),
             acc_stride: i(obj.acc_stride),
             acc_getter: i(obj.acc_getter_off),
+            acc_setter: i(obj.acc_setter_off),
             shape_brands: i32::try_from(obj.shape_brands_off)
                 .expect("jit layout offset fits in i32"),
             // (Both relative to the same `Shape`.)
@@ -524,7 +527,7 @@ impl MethodSite {
         if !self.may_fill() || self.key().starts_with('\0') {
             return;
         }
-        let Some(mut entry) = Self::entry_for(realm, recv, self.key(), false) else {
+        let Some(mut entry) = Self::entry_for(realm, recv, self.key(), Want::Method) else {
             self.count_fill(false);
             return;
         };
@@ -533,7 +536,7 @@ impl MethodSite {
         }
         watch_levels(realm, &entry.levels[..entry.depth as usize]);
         entry.stamp = crate::object::proto_epoch();
-        entry.value = holder_value_addr(realm, &entry);
+        entry.value = holder_value_addr(realm, &entry, false);
         self.store(entry);
     }
 
@@ -604,7 +607,7 @@ impl MethodSite {
         if !self.may_fill() || key.starts_with('\0') || key == "__proto__" {
             return None;
         }
-        let Some(mut entry) = Self::entry_for(realm, recv, key, true) else {
+        let Some(mut entry) = Self::entry_for(realm, recv, key, Want::Getter) else {
             self.count_fill(false);
             return None;
         };
@@ -613,7 +616,7 @@ impl MethodSite {
         }
         watch_levels(realm, &entry.levels[..entry.depth as usize]);
         entry.stamp = crate::object::proto_epoch();
-        entry.value = holder_value_addr(realm, &entry);
+        entry.value = holder_value_addr(realm, &entry, false);
         let getter = (entry.acc != 0)
             .then(|| {
                 let h =
@@ -623,6 +626,32 @@ impl MethodSite {
             .flatten();
         self.store(entry);
         getter
+    }
+
+    /// Records a property write of the site's key on the object at `recv`
+    /// that calls an inherited setter, as [`fill_get`](Self::fill_get) does a
+    /// read's getter: only an entry whose holder has the key as an accessor
+    /// with a VM-function setter is recorded (its `value` the address of that
+    /// setter), for an inlined setter's guard (`call_seq::emit_inline_guard`).
+    /// An own or inherited data property (an in-place write, an add, a
+    /// read-only failure) is not: the write is then the ordinary one. A
+    /// property-write site's entries are read by nothing else.
+    pub(crate) fn fill_set(&mut self, realm: &mut crate::realm::Realm, recv: crate::heap::Handle) {
+        let key = self.key();
+        if !self.may_fill() || key.starts_with('\0') || key == "__proto__" {
+            return;
+        }
+        let Some(mut entry) = Self::entry_for(realm, recv, key, Want::Setter) else {
+            self.count_fill(false);
+            return;
+        };
+        if !self.count_fill(self.holds_layout(&entry)) {
+            return;
+        }
+        watch_levels(realm, &entry.levels[..entry.depth as usize]);
+        entry.stamp = crate::object::proto_epoch();
+        entry.value = holder_value_addr(realm, &entry, true);
+        self.store(entry);
     }
 
     /// Puts `entry` in the way holding the same receiver layout and
@@ -652,7 +681,7 @@ impl MethodSite {
         realm: &crate::realm::Realm,
         recv: crate::heap::Handle,
         key: &str,
-        getters: bool,
+        want: Want,
     ) -> Option<MethodEntry> {
         let o = realm.jit_chain_object(recv)?;
         let shape = o.shaped_shape().filter(|_| o.has_no_accessors())?;
@@ -660,9 +689,10 @@ impl MethodSite {
             recv_shape: Some(Rc::clone(shape)),
             ..MethodEntry::default()
         };
+        // (A write's data property is no setter call.)
         if let Some(slot) = shape.lookup(key) {
             entry.slot = slot;
-            return Some(entry);
+            return (want != Want::Setter).then_some(entry);
         }
         let mut cur = o.proto();
         for (d, level) in (1u32..).zip(entry.levels.iter_mut()) {
@@ -675,12 +705,17 @@ impl MethodSite {
                 epoch: p.key_epoch(),
             };
             if let Some(i) = p.accessor_index(key) {
-                // Only a read takes an accessor, and only a VM-function getter.
-                let (getter, _) = p.accessor(key)?;
-                if !getters
-                    || !getter
-                        .as_handle()
-                        .is_some_and(|g| realm.is_vm_function(crate::heap::Handle::from_raw(g)))
+                // Only a read takes an accessor, and only a VM-function
+                // getter; only a write a VM-function setter.
+                let (getter, setter) = p.accessor(key)?;
+                let f = match want {
+                    Want::Method => return None,
+                    Want::Getter => getter,
+                    Want::Setter => setter,
+                };
+                if !f
+                    .as_handle()
+                    .is_some_and(|g| realm.is_vm_function(crate::heap::Handle::from_raw(g)))
                 {
                     return None;
                 }
@@ -690,6 +725,9 @@ impl MethodSite {
                 return Some(entry);
             }
             if let Some(slot) = ps.lookup(key) {
+                if want == Want::Setter {
+                    return None;
+                }
                 entry.depth = d;
                 entry.holder = h.to_raw();
                 entry.slot = slot;
@@ -701,17 +739,29 @@ impl MethodSite {
     }
 }
 
+/// What a [`MethodSite`] fill records ([`MethodSite::entry_for`]): a method
+/// call's data property, a read's data property or VM-function getter, or a
+/// write's VM-function setter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Method,
+    Getter,
+    Setter,
+}
+
 /// [`MethodEntry::value`] for a freshly validated `entry`: the address of its
 /// holder's slot or getter (`0` for a receiver's own property or an
 /// unaddressable one).
-fn holder_value_addr(realm: &crate::realm::Realm, entry: &MethodEntry) -> u64 {
+fn holder_value_addr(realm: &crate::realm::Realm, entry: &MethodEntry, setter: bool) -> u64 {
     if entry.depth == 0 {
         return 0;
     }
     let Some(o) = realm.jit_object(crate::heap::Handle::from_raw(entry.holder)) else {
         return 0;
     };
-    let ptr = if entry.acc != 0 {
+    let ptr = if entry.acc != 0 && setter {
+        o.jit_setter_ptr(entry.acc as usize - 1)
+    } else if entry.acc != 0 {
         o.jit_getter_ptr(entry.acc as usize - 1)
     } else {
         o.jit_slot_ptr(entry.slot)
@@ -914,7 +964,7 @@ impl X64Assembler {
         self.p_handle_check(miss);
         self.p_slot_rooted(l, r::RCX, miss);
         self.p_plain_shaped(l, miss);
-        self.p_method_lookup_from(l, site, miss, getter);
+        self.p_method_lookup_from(l, site, miss, getter, l.props.acc_getter);
     }
 
     /// The receiver walk of [`p_method_lookup`](Self::p_method_lookup) alone:
@@ -947,8 +997,29 @@ impl X64Assembler {
         miss: Label,
         getter: Option<Label>,
     ) {
+        self.p_accessor_lookup_walked(l, realm_off, site, miss, getter, false);
+    }
+
+    /// [`p_method_lookup_walked`](Self::p_method_lookup_walked), whose
+    /// accessor hit (`getter`) is the accessor's setter when `setter` (a
+    /// property write's site, whose entries record only setters: see
+    /// `MethodSite::fill_set`).
+    pub(crate) fn p_accessor_lookup_walked(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        site: *const MethodSite,
+        miss: Label,
+        getter: Option<Label>,
+        setter: bool,
+    ) {
         self.p_arena(realm_off, &l.props);
-        self.p_method_lookup_from(l, site, miss, getter);
+        let field = if setter {
+            l.props.acc_setter
+        } else {
+            l.props.acc_getter
+        };
+        self.p_method_lookup_from(l, site, miss, getter, field);
     }
 
     /// The rest of a method lookup, from the walked receiver's slot in `rcx`
@@ -962,6 +1033,7 @@ impl X64Assembler {
         site: *const MethodSite,
         miss: Label,
         getter: Option<Label>,
+        acc_field: i32,
     ) {
         use core::mem::{offset_of, size_of};
         let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
@@ -1043,7 +1115,7 @@ impl X64Assembler {
             self.imul_rax_imm(l.props.acc_stride);
             self.g_load(r::R9, r::R9, l.props.extra_acc_ptr);
             self.p_add_rax_r9();
-            self.g_load(r::RAX, r::RAX, l.props.acc_getter);
+            self.g_load(r::RAX, r::RAX, acc_field);
             self.g_movabs(r::RSI, 0);
             self.jmp(getter);
         } else {

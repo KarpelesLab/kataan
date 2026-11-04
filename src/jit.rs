@@ -1921,6 +1921,9 @@ pub enum GenericOp {
         site: u16,
         /// Strict-mode code (`Op::SetPropStrict`): a failed write throws.
         strict: bool,
+        /// Index into the per-site call caches (an inherited setter's call,
+        /// when it is inlined: the guard's memo).
+        call: u16,
     },
     /// `reg[dst] = reg[obj][reg[index]]` — a computed element read (`Op::GetKey`):
     /// inline dense-array fast path, else `jit_helper_get_elem` (`vm_get_elem`).
@@ -2749,11 +2752,14 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
             Op::SetProp { obj, key, src } | Op::SetPropStrict { obj, key, src } => {
                 let site = u16::try_from(keys.len()).ok()?;
                 keys.push(alloc::boxed::Box::from(key.as_str()));
+                let call = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
                 GenericOp::SetProp {
                     obj: r(*obj)?,
                     val: r(*src)?,
                     site,
                     strict: matches!(op, Op::SetPropStrict { .. }),
+                    call,
                 }
             }
             Op::GetKey { dst, obj, key } => GenericOp::GetElem {
@@ -2942,6 +2948,9 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                         callee: c, args: a, ..
                     }) => c == callee && a == args,
                     Some(Op::GetProp { obj, .. }) => obj == callee && args.is_empty(),
+                    Some(Op::SetProp { obj, src, .. } | Op::SetPropStrict { obj, src, .. }) => {
+                        obj == callee && args.as_slice() == [*src]
+                    }
                     Some(Op::Construct { ctor, args: a, .. }) => ctor == callee && a == args,
                     _ => false,
                 };
@@ -4250,7 +4259,9 @@ impl JitProto {
                 {
                     Some((pc, cache))
                 }
-                GenericOp::GetProp { call, .. } => Some((u32::try_from(at).ok()?, call)),
+                GenericOp::GetProp { call, .. } | GenericOp::SetProp { call, .. } => {
+                    Some((u32::try_from(at).ok()?, call))
+                }
                 _ => None,
             })
             .collect();
@@ -4398,7 +4409,9 @@ impl JitProto {
                 | crate::nbvm::Op::CallWithMethod { .. }
                 | crate::nbvm::Op::Construct { .. }
                 | crate::nbvm::Op::CallKey { .. }
-                | crate::nbvm::Op::GetProp { .. } => {
+                | crate::nbvm::Op::GetProp { .. }
+                | crate::nbvm::Op::SetProp { .. }
+                | crate::nbvm::Op::SetPropStrict { .. } => {
                     if let Some(k) = site_of(pc).map(keys) {
                         *slot = CalleeHint::of_keys(&k);
                     }
@@ -6995,7 +7008,8 @@ impl JitFunction {
                                 | GenericOp::CallValue { cache, .. }
                                 | GenericOp::CallWithMethod { cache, .. }
                                 | GenericOp::Construct { cache, .. } => *cache,
-                                GenericOp::GetProp { call, .. } => *call,
+                                GenericOp::GetProp { call, .. }
+                                | GenericOp::SetProp { call, .. } => *call,
                                 _ => return None,
                             };
                             call_sites.get(c as usize).map(|p| *p as u64)
@@ -7263,6 +7277,7 @@ impl JitFunction {
                         | GenericOp::CallWithMethod { site: args, .. } => {
                             call_args.get(*args as usize).map(Vec::len)
                         }
+                        GenericOp::SetProp { .. } => Some(1),
                         _ => Some(0),
                     },
                     _ => None,
@@ -7318,6 +7333,7 @@ impl JitFunction {
                 };
                 let (args, new_target) = match *ops.get(call as usize)? {
                     GenericOp::GetProp { .. } => (Vec::new(), None),
+                    GenericOp::SetProp { val, .. } => (alloc::vec![val], None),
                     GenericOp::CallMethod { args, .. } => {
                         (call_args.get(args as usize)?.clone(), None)
                     }
@@ -8015,6 +8031,11 @@ impl JitFunction {
                 } => {
                     let no_args: Vec<u16> = Vec::new();
                     let mut getter = false;
+                    let mut setter = false;
+                    let set_args: Vec<u16> = match ops.get(call as usize)? {
+                        GenericOp::SetProp { val, .. } => alloc::vec![*val],
+                        _ => Vec::new(),
+                    };
                     let (callee, argv) = match ops.get(call as usize)? {
                         GenericOp::GetProp { site, obj, .. } => {
                             let si = sites.get(*site as usize)?;
@@ -8030,6 +8051,26 @@ impl JitFunction {
                                     helper: method_helper,
                                 },
                                 &no_args,
+                            )
+                        }
+                        // An inherited setter's write: looked up as the
+                        // getter is, through the write site's setter
+                        // entries (`MethodSite::fill_set`).
+                        GenericOp::SetProp { site, obj, .. } => {
+                            let si = sites.get(*site as usize)?;
+                            if si.method_ptr.is_null() {
+                                return None;
+                            }
+                            getter = true;
+                            setter = true;
+                            (
+                                call_seq::CalleeSrc::Method {
+                                    recv: *obj,
+                                    site: si.method_ptr,
+                                    scratch: method_scratch,
+                                    helper: method_helper,
+                                },
+                                &set_args,
                             )
                         }
                         GenericOp::CallMethod {
@@ -8139,7 +8180,8 @@ impl JitFunction {
                                 | GenericOp::CallValue { cache, .. }
                                 | GenericOp::CallWithMethod { cache, .. }
                                 | GenericOp::Construct { cache, .. } => *cache as usize,
-                                GenericOp::GetProp { call, .. } => *call as usize,
+                                GenericOp::GetProp { call, .. }
+                                | GenericOp::SetProp { call, .. } => *call as usize,
                                 _ => return None,
                             })?;
                             Some((count, memo, bail))
@@ -8160,7 +8202,9 @@ impl JitFunction {
                             | GenericOp::CallValue { cache, .. }
                             | GenericOp::CallWithMethod { cache, .. }
                             | GenericOp::Construct { cache, .. } => *cache as usize,
-                            GenericOp::GetProp { call, .. } => *call as usize,
+                            GenericOp::GetProp { call, .. } | GenericOp::SetProp { call, .. } => {
+                                *call as usize
+                            }
                             _ => return None,
                         })
                         .copied()?;
@@ -8182,6 +8226,7 @@ impl JitFunction {
                             stub,
                             memo,
                             getter,
+                            setter,
                             way,
                             new_target,
                             new_alloc,
@@ -9790,6 +9835,7 @@ impl JitFunction {
                     val,
                     site,
                     strict,
+                    ..
                 } => {
                     if !ok(obj) || !ok(val) {
                         return None;

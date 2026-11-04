@@ -503,11 +503,16 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
 
 /// The call op at a site, as `(dst, callee or receiver, args, this)`: a
 /// method call (`this` its receiver), a call of a value (`this` undefined),
-/// a call of a method read before its arguments, or a property read that
-/// calls an inherited getter.
+/// a call of a method read before its arguments, a property read that
+/// calls an inherited getter, or a property write that calls an inherited
+/// setter (whose result is dropped: `dst` is [`Reg::MAX`], see
+/// [`discards`]).
 fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], Option<Reg>)> {
     match op {
         Op::GetProp { dst, obj, .. } => Some((*dst, *obj, &[], Some(*obj))),
+        Op::SetProp { obj, src, .. } | Op::SetPropStrict { obj, src, .. } => {
+            Some((Reg::MAX, *obj, core::slice::from_ref(src), Some(*obj)))
+        }
         // (`this` is the object the guard allocates.)
         Op::Construct { dst, ctor, args } => Some((*dst, *ctor, args, None)),
         Op::CallMethod {
@@ -528,6 +533,13 @@ fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], Option<Reg>)> {
         } => Some((*dst, *callee, args, Some(*recv))),
         _ => None,
     }
+}
+
+/// Whether the call at a site has no destination (a property write's
+/// setter, whose result is dropped): its inlined body's result goes to a
+/// scratch register above every way's window instead.
+fn discards(op: &Op) -> bool {
+    matches!(op, Op::SetProp { .. } | Op::SetPropStrict { .. })
 }
 
 /// A computed-key call `recv[key](args)` (`Op::CallKey`) is inlined as its
@@ -590,7 +602,7 @@ pub fn expand<'a>(
             continue;
         };
         if args.len() > 32
-            || (dst as usize) >= base
+            || ((dst as usize) >= base && !discards(op))
             || (callee as usize) >= base
             || this.is_some_and(|t| (t as usize) >= base)
             || args.iter().any(|&a| (a as usize) >= base)
@@ -640,7 +652,7 @@ pub fn expand<'a>(
                 continue;
             }
             added += cost;
-            window = window.max(c.proto.n_regs + 1 + usize::from(split.is_some()));
+            window = window.max(c.proto.n_regs + 1 + usize::from(split.is_some() || discards(op)));
             ways.push(c);
         }
         if !ways.is_empty() {
@@ -714,6 +726,13 @@ pub fn expand<'a>(
             };
             let op = &*op;
             let (dst, callee, args, this) = call_parts(op)?;
+            // (A dropped result: the scratch register above every way's
+            // window.)
+            let dst = if discards(op) {
+                rb((top + 1) as Reg)
+            } else {
+                dst
+            };
             // The ways' blocks in a row, then the call op itself.
             let shape = (args.len(), this.is_some());
             let fallback = ops.len()
