@@ -4880,6 +4880,109 @@ pub(crate) struct ColdMark {
 /// [`X64Assembler::finish`] has not placed yet.
 const LABEL_COLD: usize = usize::MAX - 1;
 
+/// **Jump threading** over finished code (`X64Assembler::finish_at`), which
+/// moves no instruction (every label and every reported offset keeps its
+/// place) and only rewrites branches:
+///
+/// - a branch to an unconditional `jmp` goes straight to where that `jmp`
+///   goes (a few hops, so a cycle of jumps stays as it is);
+/// - `jcc A; jmp B; A:` becomes `j!cc B` and a 5-byte `nop`, when nothing
+///   else reaches the `jmp` (no branch targets it and no reported offset is
+///   it);
+/// - a `jmp` or `jcc` to the very next instruction becomes a `nop` of its
+///   length.
+///
+/// `operands` are the offsets of every resolved `rel32` (`fixups`): a
+/// branch's is told apart by the opcode before it (`E9`, or `0F 8x`);
+/// every other `rel32` this assembler emits ends a `rip`-relative operand,
+/// whose ModRM byte (`00 reg 101`, at most `0x3D`) is neither, or a `call`
+/// (`E8`), which is left alone. `pinned` are the offsets reported to the
+/// caller (entries, labels), which keep their code.
+fn thread_jumps(code: &mut [u8], operands: &[usize], pinned: &[usize]) {
+    use alloc::collections::{BTreeMap, BTreeSet};
+    const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
+    const NOP6: [u8; 6] = [0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00];
+    let rel_at = |code: &[u8], at: usize| {
+        i32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+    };
+    let target = |code: &[u8], at: usize| (at as i64 + 4 + i64::from(rel_at(code, at))) as usize;
+    let set_target = |code: &mut [u8], at: usize, t: usize| {
+        let rel = (t as i64 - (at as i64 + 4)) as i32;
+        code[at..at + 4].copy_from_slice(&rel.to_le_bytes());
+    };
+    let is_jmp = |code: &[u8], at: usize| at >= 1 && code[at - 1] == 0xe9;
+    let is_jcc =
+        |code: &[u8], at: usize| at >= 2 && code[at - 2] == 0x0f && (code[at - 1] & 0xf0) == 0x80;
+    // Each `jmp`'s instruction start -> its operand.
+    let mut jmps: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut branches: Vec<usize> = Vec::new();
+    for &at in operands {
+        if at + 4 > code.len() {
+            continue;
+        }
+        if is_jmp(code, at) {
+            jmps.insert(at - 1, at);
+            branches.push(at);
+        } else if is_jcc(code, at) {
+            branches.push(at);
+        }
+    }
+    // Branches to a `jmp` go where it goes.
+    for &at in &branches {
+        let mut t = target(code, at);
+        let mut hops = 0;
+        while let Some(&j) = jmps.get(&t) {
+            let next = target(code, j);
+            if next == t || hops == 8 {
+                break;
+            }
+            t = next;
+            hops += 1;
+        }
+        if t != target(code, at) {
+            set_target(code, at, t);
+        }
+    }
+    // What is still reached by address: every `rel32`'s target and the
+    // reported offsets.
+    let mut reached: BTreeSet<usize> = pinned.iter().copied().collect();
+    for &at in operands {
+        if at + 4 <= code.len() {
+            reached.insert(target(code, at));
+        }
+    }
+    let mut dead_jmps: BTreeSet<usize> = BTreeSet::new();
+    for &at in &branches {
+        if dead_jmps.contains(&at) || !is_jcc(code, at) {
+            continue;
+        }
+        // `jcc A; jmp B; A:` -> `j!cc B; nop5`.
+        let next = at + 4;
+        if target(code, at) == next + 5
+            && let Some(&j) = jmps.get(&next)
+            && !reached.contains(&next)
+            && !dead_jmps.contains(&j)
+        {
+            let b = target(code, j);
+            code[at - 1] ^= 1;
+            set_target(code, at, b);
+            code[next..next + 5].copy_from_slice(&NOP5);
+            dead_jmps.insert(j);
+        }
+    }
+    // A branch to the next instruction is a `nop`.
+    for &at in &branches {
+        if dead_jmps.contains(&at) || rel_at(code, at) != 0 {
+            continue;
+        }
+        if is_jmp(code, at) {
+            code[at - 1..at + 4].copy_from_slice(&NOP5);
+        } else if is_jcc(code, at) {
+            code[at - 2..at + 4].copy_from_slice(&NOP6);
+        }
+    }
+}
+
 /// The value a receiver-cache key slot holds when it caches nothing: the
 /// handle bits of slot index `u32::MAX`, which `Heap::alloc` never hands out,
 /// so no register ever holds them.
@@ -5166,7 +5269,8 @@ impl X64Assembler {
                 self.code.extend_from_slice(&value.to_le_bytes());
             }
         }
-        for (at, label) in core::mem::take(&mut self.fixups) {
+        let fixups = core::mem::take(&mut self.fixups);
+        for &(at, label) in &fixups {
             let target = self.labels[label];
             debug_assert_ne!(target, usize::MAX, "unbound label in jump");
             // `rel32` is relative to the instruction *after* the 4-byte operand.
@@ -5174,7 +5278,9 @@ impl X64Assembler {
             let bytes = (rel as i32).to_le_bytes();
             self.code[at..at + 4].copy_from_slice(&bytes);
         }
-        let at = labels.iter().map(|l| self.labels[l.0]).collect();
+        let at: Vec<usize> = labels.iter().map(|l| self.labels[l.0]).collect();
+        let operands: Vec<usize> = fixups.iter().map(|f| f.0).collect();
+        thread_jumps(&mut self.code, &operands, &at);
         (self.code, at)
     }
 

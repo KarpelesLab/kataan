@@ -223,13 +223,22 @@ mod tests {
         let mut a = X64Assembler::new();
         let miss = a.new_label();
         a.p_is_handle(r::R9, miss);
+        a.ret();
+        // (Not right after the branch: `finish` makes a branch to the next
+        // instruction a `nop`.)
         a.bind(miss);
         a.ret();
         let code = a.finish();
-        // cmp rax, [rip + floor]; jb miss; ret; (int3 padding;) the floor.
+        // cmp rax, [rip + floor]; jb miss; ret; miss: ret; (int3 padding;)
+        // the floor.
         assert_eq!(&code[..3], &[0x48, 0x3b, 0x05]);
         assert_eq!(&code[7..9], &[0x0f, 0x82]);
+        assert_eq!(
+            i32::from_le_bytes([code[9], code[10], code[11], code[12]]),
+            1
+        );
         assert_eq!(code[13], 0xc3);
+        assert_eq!(code[14], 0xc3);
         let floor = code.len() - 8;
         assert!(floor.is_multiple_of(8));
         let rel = i32::from_le_bytes([code[3], code[4], code[5], code[6]]);
