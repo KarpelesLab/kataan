@@ -1606,6 +1606,12 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.jmp(identified);
         let cold = a.cold_begin();
         a.bind(others);
+        // A site that never took a callee (one serving a built-in) has no
+        // way to find it in: ways fill from the first and are never emptied.
+        const _: () = assert!(CallSite::EMPTY as i64 == -2);
+        a.g_mem(true, &[0x83], 7, r::R11, SITE_KEY); // cmp qword [r11], -2
+        a.code.push(0xfe);
+        a.g_jcc(cc::E, e.slow);
         for w in 1..CallSite::WAYS {
             let next = a.new_label();
             a.g_cmp_mem(r::RAX, r::R11, memo_bits(w));
@@ -1772,6 +1778,10 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // r11 = the matching way (and, to memoize the callee in, r10 = its
     // memo, addressed as way 0's).
     a.g_movabs(r::R11, e.site as u64);
+    // (No way to match at a site that never took a callee, as above.)
+    a.g_mem(true, &[0x83], 7, r::R11, SITE_KEY); // cmp qword [r11], -2
+    a.code.push(0xfe);
+    a.g_jcc(cc::E, e.slow);
     let hit = a.new_label();
     let memoize = !matches!(e.callee, CalleeSrc::Construct { .. });
     let mut way_hits = alloc::vec::Vec::with_capacity(CallSite::WAYS);
