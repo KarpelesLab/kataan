@@ -7084,6 +7084,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         lt: jit_helper_lt,
         strict_eq: jit_helper_strict_eq,
         has_prop: jit_helper_has_prop,
+        enum_keys: jit_tier::jit_helper_enum_keys,
         truthy: jit_helper_truthy,
         call_native: jit_helper_call_native,
         exec_op: jit_tier::jit_helper_exec_op,
@@ -26497,6 +26498,45 @@ mod tests {
         )
         .expect("ok");
         assert_eq!(out, "30023 abc 1 224000 360000\n");
+    }
+
+    /// A compiled `for-in`'s key reads from its key table (`jit::forin`):
+    /// keys deleted, re-added and added mid-loop (the layout changes under
+    /// the loop), nested loops over one object, a key binding reassigned in
+    /// the body, and recursion through one loop site over several layouts.
+    /// (Expected values from node.)
+    #[cfg(feature = "std")]
+    #[test]
+    fn compiled_for_in_reads_follow_the_object() {
+        let (out, _) = execute(
+            "var s = 0, seen = '';
+             for (let i = 0; i < 3000; i++) {
+               const o = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 };
+               for (const k in o) {
+                 if (i % 97 === 3 && k === 'b') { delete o.d; o.z = 100; }
+                 if (i % 89 === 7 && k === 'a') { delete o.f; }
+                 if (i % 7 === 0 && k === 'e') { delete o[k]; s += o[k] === undefined ? 1 : 100; o[k] = 5; }
+                 s += o[k] + (k in o ? 1 : 0);
+                 if (i === 3 || i === 7) seen += k;
+               }
+             }
+             var t = 0;
+             const p = { q: 1, r: 2, s: 3 };
+             for (let i = 0; i < 2000; i++) {
+               for (const k in p) { for (const k2 in p) t += p[k] * 10 + p[k2]; }
+               for (let k in p) { k = k === 'q' ? 's' : 'nope'; t += p[k] === undefined ? 7 : p[k]; }
+             }
+             function walk(o, d) {
+               let r = 0;
+               for (const k in o) { const v = o[k]; r += typeof v === 'object' ? walk(v, d + 1) : v * d + (k in o ? 1 : 0); }
+               return r;
+             }
+             var w = 0;
+             for (let i = 0; i < 1000; i++) w += walk({ a: 1, b: { a: 2, b: { a: 3, c: 4 }, c: 5 }, c: 6 }, 1);
+             console.log(s, seen, t, w);",
+        )
+        .expect("ok");
+        assert_eq!(out, "81036 abcefabcde 430000 48000\n");
     }
 
     #[test]

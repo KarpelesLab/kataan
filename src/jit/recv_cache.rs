@@ -298,7 +298,11 @@ pub(super) fn not_branches(
 }
 
 /// Which op indices (up to `ops.len()`) are branch targets or entries.
-fn branch_targets(ops: &[GenericOp], osr_entries: &[usize], catch_targets: &[usize]) -> Vec<bool> {
+pub(super) fn branch_targets(
+    ops: &[GenericOp],
+    osr_entries: &[usize],
+    catch_targets: &[usize],
+) -> Vec<bool> {
     let n = ops.len();
     let mut target = vec![false; n + 1];
     for &t in osr_entries.iter().chain(catch_targets) {
@@ -1232,7 +1236,7 @@ fn innermost_loops(ops: &[GenericOp]) -> Vec<Option<(usize, usize)>> {
 }
 
 /// Whether `op` (bytecode `bc`) may write register `r`.
-fn writes(op: &GenericOp, bc: Option<&Op>, r: u16) -> bool {
+pub(super) fn writes(op: &GenericOp, bc: Option<&Op>, r: u16) -> bool {
     match *op {
         GenericOp::InlineGuard {
             dst, caps, n_caps, ..

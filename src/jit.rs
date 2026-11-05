@@ -28,6 +28,8 @@ mod chase;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fieldrep;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod forin;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fused;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_mirror;
@@ -1847,7 +1849,7 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
 /// (which unbox to machine `i64`/`f64` at the boundary and deopt on any
 /// non-numeric argument), the generic tier operates directly on `NanBox` words
 /// held in the **interpreter's own register file** (the frame ABI, see
-/// [`JitFunction::compile_generic`]): the op stream is the function's bytecode
+/// `JitFunction::compile_generic`): the op stream is the function's bytecode
 /// one-for-one (op `i` here is bytecode op `i`, so branch targets and OSR entry
 /// points are bytecode pcs), and every op either has an inline fast path with a
 /// runtime-helper slow path, or is executed by the interpreter itself
@@ -3314,6 +3316,10 @@ struct GenericSites {
     /// (`global_persist`).
     #[allow(dead_code)]
     persist: global_persist::Persist,
+    /// The `for-in` loops' sites the code reads and its helper writes
+    /// (`forin`).
+    #[allow(dead_code)]
+    forin: forin::Plan,
 }
 
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
@@ -3363,6 +3369,9 @@ pub struct GenericHelpers {
     /// heap alone (`jit_helper_has_prop`): a boolean, or `undefined` for the
     /// interpreter's op — never throws.
     pub has_prop: JitAddHelper,
+    /// A `for-in`'s `Op::EnumKeys` (`jit_helper_enum_keys(ctx, regs, n_regs,
+    /// op, site, _)`, `site` its `ForInSite`): see `forin`.
+    pub enum_keys: JitCallMethodHelper,
     /// The truthiness helper (`jit_helper_truthy`), returning `0`/`1` — never throws.
     pub truthy: JitTruthyHelper,
     /// The interpreter-op helper (`jit_helper_exec_op`) — runs one bytecode op
@@ -4325,6 +4334,8 @@ impl JitProto {
             })
             .collect();
         tier_up.spec_off = no_spec.to_vec();
+        // The `for-in` loops' sites (`forin`), owned with the code.
+        let forin_plan = forin::plan(&ops, &bytecode, proto.n_regs);
         let (func, native_entry, spec_heads) = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
@@ -4339,6 +4350,7 @@ impl JitProto {
             &inline_closures,
             pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
             &no_spec_body,
+            &forin_plan,
         )?;
         tier_up.spec_regions = spec_heads;
         Some(Self {
@@ -4355,6 +4367,7 @@ impl JitProto {
                 baked,
                 tier_up,
                 persist,
+                forin: forin_plan,
             }),
             n_regs: proto.n_regs,
             osr_entries,
@@ -6884,7 +6897,7 @@ impl JitFunction {
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub fn compile_generic(
+    pub(crate) fn compile_generic(
         persist: u64,
         n_regs: usize,
         ops: &[GenericOp],
@@ -6898,6 +6911,7 @@ impl JitFunction {
         inline_closures: &[bool],
         pc_orig: &[u32],
         no_spec: &[usize],
+        forin_plan: &forin::Plan,
     ) -> Option<GenericCompiled> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
@@ -6952,6 +6966,7 @@ impl JitFunction {
         let lt_helper = helpers.lt as usize as u64;
         let strict_eq_helper = helpers.strict_eq as usize as u64;
         let has_prop_helper = helpers.has_prop as usize as u64;
+        let enum_keys_helper = helpers.enum_keys as usize as u64;
         let truthy_helper = helpers.truthy as usize as u64;
         let call_native_helper = helpers.call_native as usize as u64;
         let exec_op_helper = helpers.exec_op as usize as u64;
@@ -7186,6 +7201,49 @@ impl JitFunction {
         let fused_test = recv_cache::fused_guard_tests(ops, osr_entries, &catch_targets, |i| {
             rc.sites[i].is_none()
         });
+        // A compiled `for-in`'s liveness check `cur in obj` branches on its
+        // result itself (`forin`): the `JumpIfFalse` right after it, which
+        // nothing else reaches, is emitted as nothing.
+        let okr = |r: u16| (r as usize) < n_regs;
+        let forin_fuse: Vec<bool> = {
+            let bt = recv_cache::branch_targets(ops, osr_entries, &catch_targets);
+            (0..ops.len())
+                .map(|i| {
+                    i > 0
+                        && !bt[i]
+                        && !num.in_region(i)
+                        && !num.in_region(i - 1)
+                        && matches!(ops[i - 1], GenericOp::Interp { pc } if pc as usize == i - 1)
+                        && match (&bytecode[i - 1], &ops[i]) {
+                            (
+                                crate::nbvm::Op::Relational {
+                                    dst,
+                                    instanceof: false,
+                                    a: key,
+                                    b: obj,
+                                },
+                                GenericOp::JumpIfFalse { cond, target },
+                            ) => {
+                                cond == dst
+                                    && *target > i
+                                    && *target <= ops.len()
+                                    && okr(*dst)
+                                    && okr(*key)
+                                    && okr(*obj)
+                                    && forin_plan.key_loop(*key).is_some_and(|l| {
+                                        l.obj == *obj && okr(l.arr) && okr(l.index)
+                                    })
+                            }
+                            _ => false,
+                        }
+                })
+                .collect()
+        };
+        let fused_test: Vec<bool> = fused_test
+            .iter()
+            .zip(&forin_fuse)
+            .map(|(g, f)| *g || *f)
+            .collect();
         // `if (!x)`: the not branches itself (see `recv_cache::not_branches`;
         // outside promoted loops, whose emitter is `numeric`'s, and not on a
         // proven boolean, whose `Not` is two instructions anyway).
@@ -8937,6 +8995,22 @@ impl JitFunction {
                     }
                     let slow = a.new_label();
                     let done = a.new_label();
+                    // A compiled `for-in`'s key (`forin`): from its key
+                    // table, with no walk of the array.
+                    if let Some((l, site)) = forin_plan
+                        .read_at
+                        .get(op_idx)
+                        .copied()
+                        .flatten()
+                        .filter(|l| l.arr == arr && l.index == index && !num.in_region(op_idx))
+                        .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)))
+                    {
+                        let other = a.new_label();
+                        a.fi_key(site, l, disp, other);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        a.bind(other);
+                    }
                     recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
                     int_index!(index, slow);
                     a.p_arr_len_ptr(&layout);
@@ -9578,10 +9652,56 @@ impl JitFunction {
                         } if ok(*dst)
                             && ok(*key)
                             && ok(*obj)
-                            && forin_keys.get(*key as usize) == Some(&true) =>
+                            && (forin_keys.get(*key as usize) == Some(&true)
+                                || forin_plan.key_loop(*key).is_some()) =>
                         {
                             let slow = a.new_label();
                             let done = a.new_label();
+                            // The loop's own check, with the slot table its
+                            // `EnumKeys` left in the site (`forin`): `true`
+                            // for an own key of the table's layout, with no
+                            // call; else (out of line) the helper.
+                            let fast = forin_plan
+                                .key_loop(*key)
+                                .filter(|l| {
+                                    l.obj == *obj
+                                        && ok(l.arr)
+                                        && ok(l.index)
+                                        && !num.in_region(op_idx)
+                                })
+                                .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)));
+                            // Its `JumpIfFalse`, fused (`forin_fuse`): the
+                            // fast path's `true` falls through it, the slow
+                            // paths test their result here.
+                            let fused = match ops.get(op_idx + 1) {
+                                Some(&GenericOp::JumpIfFalse { target, .. })
+                                    if forin_fuse.get(op_idx + 1) == Some(&true) =>
+                                {
+                                    fast?;
+                                    Some(num.branch_label(&labels, op_idx + 1, target)?)
+                                }
+                                _ => None,
+                            };
+                            let test = a.new_label();
+                            let after = if fused.is_some() { test } else { done };
+                            let helper = a.new_label();
+                            let cold_helper = if let Some((l, site)) = fast {
+                                walk_to_slot!(*obj, helper);
+                                a.p_object_not_exotic(&layout, helper);
+                                a.fi_slot(&layout, site, l, *key, disp, helper);
+                                a.p_cmp32_imm(
+                                    call_seq::r::RAX,
+                                    crate::realm::NO_SLOT as u32 as i32,
+                                );
+                                a.g_jcc(call_seq::cc::E, helper);
+                                a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                                a.store_rax(disp(*dst));
+                                a.jmp(done);
+                                Some(a.cold_begin())
+                            } else {
+                                None
+                            };
+                            a.bind(helper);
                             a.mov_rdi_r15();
                             a.load_argreg(1, disp(*key));
                             a.load_argreg(2, disp(*obj));
@@ -9591,12 +9711,41 @@ impl JitFunction {
                             a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
                             a.g_jcc(call_seq::cc::E, slow);
                             a.store_rax(disp(*dst));
-                            let cold = a.cold_begin();
+                            let cold = match cold_helper {
+                                Some(c) => {
+                                    a.jmp(after);
+                                    c
+                                }
+                                None => a.cold_begin(),
+                            };
                             a.bind(slow);
                             exec_op!(pc);
-                            a.jmp(done);
+                            a.jmp(after);
+                            if let Some(to) = fused {
+                                // (A boolean: the op's result.)
+                                a.bind(test);
+                                a.load_rax(disp(*dst));
+                                a.movabs_r11(NanBox::boolean(false).to_bits() as i64);
+                                a.cmp_rax_r11();
+                                a.je(to);
+                                a.jmp(done);
+                            }
                             a.cold_end(cold);
                             a.bind(done);
+                        }
+                        // A compiled `for-in`'s `EnumKeys` (`forin`): the
+                        // memoized key list's array, its slot table left in
+                        // the loop's site, else the interpreter's op.
+                        crate::nbvm::Op::EnumKeys { .. }
+                            if forin_plan.site_at.get(op_idx).copied().flatten().is_some() =>
+                        {
+                            let site = forin_plan
+                                .site_at
+                                .get(op_idx)
+                                .copied()
+                                .flatten()
+                                .and_then(|s| forin_plan.site_addr(s))?;
+                            site_slow!(enum_keys_helper, site);
                         }
                         // A captured variable's binding cell: inline from
                         // the heap's free list, else the interpreter's op.
@@ -10436,6 +10585,41 @@ impl JitFunction {
                     let bail = num.spec_bail(&mut a, op_idx);
                     let helper = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
+                    // `o[k]` in a compiled `for-in` over `o` (`forin`): the
+                    // slot the loop's key table gives the key, with no call.
+                    if let Some((l, site)) = forin_plan
+                        .key_loop(index)
+                        .filter(|l| {
+                            ok(l.obj)
+                                && ok(l.arr)
+                                && ok(l.index)
+                                && bail.is_none()
+                                && !num.in_region(op_idx)
+                                && num.result_xmm(op_idx, dst).is_none()
+                        })
+                        .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)))
+                    {
+                        let other = a.new_label();
+                        let spill = a.new_label();
+                        let have = a.new_label();
+                        walk_to_slot!(obj, other);
+                        a.p_object_not_exotic(&layout, other);
+                        // (`rax`: the receiver's bits, from the walk.)
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBX, disp(l.obj));
+                        a.g_jcc(call_seq::cc::NE, other);
+                        let cl = &helpers.call_layout;
+                        a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
+                        a.fi_slot(&layout, site, l, index, disp, other);
+                        a.p_obj_slot_load_inline(&layout, other, spill);
+                        a.bind(have);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(spill);
+                        a.p_obj_slot_load_spill(&layout, have);
+                        a.cold_end(cold);
+                        a.bind(other);
+                    }
                     // A typed-array view's element (`typed::t_get`) is tried
                     // where the array path misses — except at a receiver-
                     // cache site of a speculative loop's fast version that a

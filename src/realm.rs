@@ -32,6 +32,8 @@ mod concat_fast;
 mod fn_chain;
 mod forin_cache;
 pub use fn_chain::FnChain;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use forin_cache::{ForInSite, KeyTable, NO_SLOT};
 mod gen_state;
 mod key_memo;
 mod private_fast;
@@ -8490,7 +8492,7 @@ impl Realm {
         self.unit_strings.clear();
         self.type_name_strings.clear();
         self.literal_ropes.clear();
-        self.for_in_cache = None;
+        self.for_in_cache_retire();
         self.vm_array_iter = VmArrayIterIntrinsics {
             species_key,
             ..VmArrayIterIntrinsics::default()

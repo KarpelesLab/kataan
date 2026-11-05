@@ -39,13 +39,23 @@
 //! compares, and the ordinary lookup decides. Nothing is recorded for
 //! lookups that are not of a listed key, so other key patterns cannot evict
 //! or thrash anything.
+//!
+//! Compiled code goes further (`crate::jit::forin`): an entry's per-key
+//! slots are also a [`KeyTable`], which a compiled `for-in` loop's
+//! [`ForInSite`] holds while the loop runs, so its `o[k]` and `k in o` read
+//! the slot with no call. A table names the entry's shared key array, which
+//! it keeps a GC root for as long as anything holds the table: so while a
+//! site holds it, no other array (and no other key String) can take that
+//! array's handle, and "the loop's key array is the table's" proves that the
+//! key Strings in the loop's register are the table's.
 
 use super::Realm;
 use crate::cell::Cell;
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
 use crate::shape::Shape;
-use alloc::rc::Rc;
+use alloc::boxed::Box;
+use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 
 /// How many receiver shapes the cache remembers. Each layout's entry is found
@@ -78,16 +88,142 @@ struct Entry {
     keys: Vec<NanBox>,
     /// Per key: its bits and its slot in `shape` (an own key whose String is
     /// its own storage key, see `Realm::string_key_in_place`), else
-    /// [`NO_SLOT`].
-    slots: Vec<(u64, u32)>,
+    /// [`NO_SLOT`]; and the array of `keys` handed to every loop over this
+    /// entry's layout (see [`Realm::for_in_cached_array`]), once made.
+    table: Rc<KeyTable>,
     /// The index of the key [`Realm::for_in_key_slot`] last found.
     hint: core::cell::Cell<u32>,
     /// The raw handle of the object [`Realm::for_in_key_slot`] last found
     /// not to be host-exotic (`0`: none yet).
     plain_obj: core::cell::Cell<u64>,
-    /// The array of `keys` handed to every loop over this entry's layout
-    /// (see [`Realm::for_in_cached_array`]), once made: a GC root.
-    array: core::cell::Cell<Option<NanBox>>,
+}
+
+/// An entry's keys and their slots, as compiled code reads them (see the
+/// module docs): `bits[i]` is key `i`'s bits and `slots[i]` its slot in the
+/// layout `shape` ([`NO_SLOT`] for none). While anything holds the table,
+/// `array` (once made) and the key Strings are GC roots.
+#[repr(C)]
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(crate) struct KeyTable {
+    /// The bits of the entry's key array (`0`: not made yet, or retired
+    /// before a compaction: then no loop's array is this table's).
+    pub(crate) array: core::cell::Cell<u64>,
+    /// The layout's shape word as an object's shape field holds it
+    /// (`crate::jit::shape_word`; `0` until compiled code first needs it).
+    pub(crate) shape_word: core::cell::Cell<u64>,
+    /// How many keys.
+    pub(crate) len: u64,
+    /// The first of `bits`.
+    pub(crate) bits_ptr: *const u64,
+    /// The first of `slots`.
+    pub(crate) slots_ptr: *const u64,
+    bits: Box<[u64]>,
+    slots: Box<[u64]>,
+    /// The layout (held, so its address is not reused).
+    shape: Rc<Shape>,
+    /// The prototype epoch at which the entry's chain was last found
+    /// unchanged for a receiver whose `[[Prototype]]` is `proto` (`0`:
+    /// never): see [`Realm::for_in_table_hit`].
+    stamp: core::cell::Cell<u64>,
+    /// See `stamp`.
+    proto: core::cell::Cell<Option<u64>>,
+}
+
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+impl KeyTable {
+    fn new(shape: Rc<Shape>, bits: Box<[u64]>, slots: Box<[u64]>) -> Self {
+        Self {
+            array: core::cell::Cell::new(0),
+            shape_word: core::cell::Cell::new(0),
+            len: bits.len() as u64,
+            bits_ptr: bits.as_ptr(),
+            slots_ptr: slots.as_ptr(),
+            bits,
+            slots,
+            shape,
+            stamp: core::cell::Cell::new(0),
+            proto: core::cell::Cell::new(None),
+        }
+    }
+
+    /// Key `i`'s `(bits, slot)`.
+    fn key(&self, i: usize) -> Option<(u64, u64)> {
+        Some((*self.bits.get(i)?, *self.slots.get(i)?))
+    }
+
+    /// The layout the slots are of.
+    pub(crate) fn shape(&self) -> &Rc<Shape> {
+        &self.shape
+    }
+
+    /// The table's GC roots: its key Strings and its array.
+    fn roots(&self, out: &mut Vec<Handle>) {
+        let array = Some(self.array.get()).filter(|&a| a != 0);
+        out.extend(
+            self.bits
+                .iter()
+                .chain(array.as_ref())
+                .filter_map(|&b| NanBox::from_bits(b).as_handle().map(Handle::from_raw)),
+        );
+    }
+}
+
+/// What a compiled `for-in` loop's `EnumKeys` last found (see the module
+/// docs): the key table of its array, or an empty one. Compiled code reads
+/// the table through `table`, never null.
+#[repr(C)]
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(crate) struct ForInSite {
+    /// The held table's address (else `empty`'s).
+    pub(crate) table: core::cell::Cell<*const KeyTable>,
+    held: core::cell::RefCell<Option<Rc<KeyTable>>>,
+    empty: Box<KeyTable>,
+}
+
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+impl ForInSite {
+    /// A site holding no table.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        let empty = Box::new(KeyTable::new(Shape::root(), Box::new([]), Box::new([])));
+        Self {
+            table: core::cell::Cell::new(core::ptr::from_ref(&*empty)),
+            held: core::cell::RefCell::new(None),
+            empty,
+        }
+    }
+
+    /// The held table.
+    pub(crate) fn held(&self) -> core::cell::Ref<'_, Option<Rc<KeyTable>>> {
+        self.held.borrow()
+    }
+
+    /// Holds `t` (or nothing).
+    pub(crate) fn hold(&self, t: Option<Rc<KeyTable>>) {
+        self.table.set(
+            t.as_deref()
+                .map_or(core::ptr::from_ref(&*self.empty), core::ptr::from_ref),
+        );
+        *self.held.borrow_mut() = t;
+    }
+}
+
+impl Default for ForInSite {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The handle bits of a `NanBox` handle (`NanBox::as_handle`).
@@ -97,8 +233,8 @@ struct Entry {
 )]
 const HANDLE_BITS: u64 = 0x0000_ffff_ffff_ffff;
 
-/// [`Entry::slots`] for a key with no slot of its own there.
-const NO_SLOT: u32 = u32::MAX;
+/// A [`KeyTable`] slot for a key with no slot of its own there.
+pub(crate) const NO_SLOT: u64 = u32::MAX as u64;
 
 /// The realm's `for-in` key-list cache (see the module docs).
 #[derive(Default)]
@@ -111,6 +247,9 @@ pub(crate) struct ForInCache {
     /// entry's key costs [`Realm::for_in_key_slot`] one bit test. (Never
     /// cleared: a stale bit only sends a lookup to the entry check.)
     key_bits: Vec<u64>,
+    /// The tables of entries replaced since, which a compiled loop may still
+    /// hold (their roots stay roots while one does).
+    retired: Vec<Weak<KeyTable>>,
 }
 
 /// The heap slot index of a handle (its low half; the high half is the
@@ -237,22 +376,58 @@ impl Realm {
     /// from another or change it, and every loop over the same layout may
     /// share it.
     pub(crate) fn for_in_cached_array(&mut self, h: Handle) -> Option<NanBox> {
+        self.for_in_cached_table(h).map(|(a, _)| a)
+    }
+
+    /// [`for_in_cached_array`](Self::for_in_cached_array), with the key
+    /// table whose array it is (`None` when making the array retired the
+    /// entry: then the array is only this loop's).
+    pub(crate) fn for_in_cached_table(
+        &mut self,
+        h: Handle,
+    ) -> Option<(NanBox, Option<Rc<KeyTable>>)> {
         let (w, e) = self.for_in_cached_entry(h)?;
-        if let Some(a) = e.array.get() {
-            return Some(a);
+        // (The chain was just found unchanged, for `h`'s `[[Prototype]]`.)
+        e.table.stamp.set(crate::object::proto_epoch());
+        e.table.proto.set(self.object_proto(h).map(Handle::to_raw));
+        let (w, e) = (w, self.for_in_cache.as_deref()?.entries[w].as_ref()?);
+        if e.table.array.get() != 0 {
+            let t = Rc::clone(&e.table);
+            return Some((NanBox::from_bits(t.array.get()), Some(t)));
         }
         let keys = e.keys.to_vec();
         let a = NanBox::handle(self.new_array(keys).to_raw());
-        // (Unless making it retired the entry: then it is only this loop's.)
         if let Some(e) = self
             .for_in_cache
             .as_deref()
             .and_then(|c| c.entries[w].as_ref())
             && e.swaps == self.cell_swaps
         {
-            e.array.set(Some(a));
+            e.table.array.set(a.to_bits());
+            return Some((a, Some(Rc::clone(&e.table))));
         }
-        Some(a)
+        Some((a, None))
+    }
+
+    /// The array of `t`, a key table some loop over `h` was given before,
+    /// when it is `h`'s `for-in` key list still
+    /// ([`for_in_cached_table`](Self::for_in_cached_table) without the
+    /// lookup): `h` is a plain shaped ordinary object of `t`'s layout
+    /// whose `[[Prototype]]` is the one the table's chain was last found
+    /// unchanged for, at the prototype epoch that still is current (every
+    /// link is watched).
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn for_in_table_hit(&self, h: Handle, t: &KeyTable) -> Option<NanBox> {
+        let a = t.array.get();
+        if a == 0 || t.stamp.get() != crate::object::proto_epoch() {
+            return None;
+        }
+        let (o, shape) = self.for_in_receiver(h)?;
+        (Rc::ptr_eq(shape, &t.shape) && o.proto().map(Handle::to_raw) == t.proto.get())
+            .then(|| NanBox::from_bits(a))
     }
 
     /// Records `keys` as the `for-in` key list of `h`, when `h` and its
@@ -276,13 +451,13 @@ impl Realm {
         let slots = keys
             .iter()
             .map(|&k| {
-                let slot = self
-                    .string_key_in_place(k)
+                self.string_key_in_place(k)
                     .and_then(|t| shape.lookup(t))
-                    .unwrap_or(NO_SLOT);
-                (k.to_bits(), slot)
+                    .map_or(NO_SLOT, u64::from)
             })
             .collect();
+        let bits = keys.iter().map(|k| k.to_bits()).collect();
+        let table = Rc::new(KeyTable::new(Rc::clone(&shape), bits, slots));
         // Each link is watched (`crate::object::JIT_FLAG_WATCHED`), so a
         // change to its keys or `[[Prototype]]` bumps the prototype epoch and
         // an unchanged epoch proves the chain (`for_in_cached_entry`).
@@ -296,14 +471,21 @@ impl Realm {
             swaps: self.cell_swaps,
             stamp: core::cell::Cell::new(0),
             keys: keys.to_vec(),
-            slots,
+            table,
             hint: core::cell::Cell::new(0),
             plain_obj: core::cell::Cell::new(0),
-            array: core::cell::Cell::new(None),
             shape,
         };
         let cache = self.for_in_cache.get_or_insert_with(Default::default);
         let w = cache.victim(&entry.shape);
+        // A replaced entry's table stays rooted while a compiled loop holds
+        // it (and is forgotten once nothing does).
+        cache.retired.retain(|t| t.strong_count() > 0);
+        if let Some(old) = cache.entries[w].take()
+            && Rc::strong_count(&old.table) > 1
+        {
+            cache.retired.push(Rc::downgrade(&old.table));
+        }
         for k in &entry.keys {
             if let Some(raw) = k.as_handle() {
                 let (word, bit) = key_bit(raw);
@@ -364,15 +546,16 @@ impl Realm {
         }
         let bits = key.to_bits();
         let at = e.hint.get() as usize;
-        let hit = |i: usize| e.slots.get(i).filter(|k| k.0 == bits).map(|k| (i, k.1));
+        let hit = |i: usize| e.table.key(i).filter(|k| k.0 == bits).map(|k| (i, k.1));
         let (i, slot) = hit(at).or_else(|| hit(at + 1)).or_else(|| hit(0))?;
         e.hint.set(i as u32);
+        let slot = u32::try_from(slot).ok()?;
         // `o[key]` is the slot's value when no accessor shares its name
         // (none at all, here): what `Object::get` reads in shaped mode. A
         // wrapper's or a mapped `arguments` object's layout is never an
         // entry's. (A String with an auxiliary object is the general path's,
         // as in `string_key_in_place`.)
-        if slot == NO_SLOT
+        if u64::from(slot) == NO_SLOT
             || !o.has_no_accessors()
             || o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0
             || (self.str_special && self.aux_props.contains_key(&(bits & HANDLE_BITS)))
@@ -391,16 +574,29 @@ impl Realm {
         Some((o, slot))
     }
 
-    /// The cached key Strings, which are GC roots.
+    /// The cached key Strings and arrays, which are GC roots (a replaced
+    /// entry's too, while a compiled loop holds its table).
     pub(crate) fn for_in_cache_roots(&self, out: &mut Vec<Handle>) {
         if let Some(c) = self.for_in_cache.as_deref() {
             for e in c.entries.iter().flatten() {
-                out.extend(
-                    e.keys
-                        .iter()
-                        .chain(e.array.get().as_ref())
-                        .filter_map(|k| k.as_handle().map(Handle::from_raw)),
-                );
+                e.table.roots(out);
+            }
+            for t in c.retired.iter().filter_map(Weak::upgrade) {
+                t.roots(out);
+            }
+        }
+    }
+
+    /// Drops the cache before a compaction moves every handle: a table a
+    /// compiled loop may still hold then names no array (so no loop's array
+    /// is its), and nothing is rooted for it.
+    pub(crate) fn for_in_cache_retire(&mut self) {
+        if let Some(c) = self.for_in_cache.take() {
+            for e in c.entries.iter().flatten() {
+                e.table.array.set(0);
+            }
+            for t in c.retired.iter().filter_map(Weak::upgrade) {
+                t.array.set(0);
             }
         }
     }

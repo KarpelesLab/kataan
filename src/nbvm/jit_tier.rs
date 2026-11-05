@@ -1413,6 +1413,63 @@ pub(crate) extern "C" fn jit_helper_iter_next(
     }
 }
 
+/// A compiled `for-in` loop's `Op::EnumKeys` (`crate::jit::forin`), with the
+/// exec-op ABI plus its `ForInSite` (`site`): a memoized key list's array
+/// (its interpreter arm's first step), the site then holding the list's key
+/// table, else (the site holding none) the interpreter's op.
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]; `site` must be the body's live `ForInSite`.
+pub(crate) extern "C" fn jit_helper_enum_keys(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) -> u64 {
+    {
+        // SAFETY: as `jit_helper_exec_op`; these borrows end before it runs.
+        #[allow(unsafe_code)]
+        let (ctx, regs, op, site) = unsafe {
+            (
+                &mut *(ctx_raw as *mut Ctx),
+                core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs),
+                &*op_raw,
+                &*site.cast_const().cast::<crate::realm::ForInSite>(),
+            )
+        };
+        // The table the site holds, when it still is the object's.
+        if let Op::EnumKeys { dst, obj } = op
+            && let Some(h) = regs[*obj as usize].as_handle()
+            && ctx.host.is_some()
+            && let Some(keys) = site
+                .held()
+                .as_deref()
+                .and_then(|t| ctx.realm.for_in_table_hit(Handle::from_raw(h), t))
+        {
+            regs[*dst as usize] = keys;
+            return 0;
+        }
+        if let Op::EnumKeys { dst, obj } = op
+            && ctx.host.is_some()
+            && let Some(h) = regs[*obj as usize].as_handle()
+            && let Some((keys, table)) = ctx.realm.for_in_cached_table(Handle::from_raw(h))
+        {
+            if let Some(t) = &table
+                && t.shape_word.get() == 0
+            {
+                t.shape_word.set(crate::jit::shape_word(t.shape()));
+            }
+            site.hold(table);
+            regs[*dst as usize] = keys;
+            return 0;
+        }
+        site.hold(None);
+    }
+    jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
 pub(crate) extern "C" fn jit_helper_exec_op(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
