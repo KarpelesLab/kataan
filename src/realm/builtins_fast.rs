@@ -1090,22 +1090,20 @@ pub(crate) type StampedSlot = (u64, Rc<Shape>, u32);
 /// [`ArrayIterMemo`]'s `open`, as last found valid for a plain array (no
 /// named property, the realm's first `%Array.prototype%`), flat so compiled
 /// code can make the same test inline: the prototype epoch it holds at, and
-/// per lookup the holder (raw handle), its shape word, the slot and the value
-/// found there. Compiled code re-reads both slots and compares the values (a
-/// value is no part of what the epoch watches). It never outlives the memo
-/// entry it copies (every change to the memo empties it), whose `Rc`s keep
-/// the two shapes alive. `stamp == u64::MAX`: empty.
+/// per lookup the address of the found slot's value in its (watched) holder
+/// and the value found there. While the epoch stands, neither holder has
+/// changed its layout or moved (`Object::jit_slot_ptr`), so compiled code
+/// re-reads both values through those addresses and compares them (a value
+/// is no part of what the epoch watches). It never outlives the memo entry
+/// it copies (every change to the memo empties it). `stamp == u64::MAX`:
+/// empty.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct ArrayIterJit {
     pub(crate) stamp: u64,
-    pub(crate) iter_holder: u64,
-    pub(crate) iter_shape: u64,
-    pub(crate) iter_slot: u64,
+    pub(crate) iter_ptr: u64,
     pub(crate) iter_fn: u64,
-    pub(crate) next_holder: u64,
-    pub(crate) next_shape: u64,
-    pub(crate) next_slot: u64,
+    pub(crate) next_ptr: u64,
     pub(crate) next_fn: u64,
 }
 
@@ -1113,13 +1111,9 @@ impl Default for ArrayIterJit {
     fn default() -> Self {
         Self {
             stamp: u64::MAX,
-            iter_holder: 0,
-            iter_shape: 0,
-            iter_slot: 0,
+            iter_ptr: 0,
             iter_fn: 0,
-            next_holder: 0,
-            next_shape: 0,
-            next_slot: 0,
+            next_ptr: 0,
             next_fn: 0,
         }
     }

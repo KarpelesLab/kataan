@@ -9286,7 +9286,7 @@ impl JitFunction {
                             let slow = a.new_label();
                             let called = a.new_label();
                             let done = a.new_label();
-                            a.p_array_iter_open(&layout, helpers.call_layout.realm, slow);
+                            a.p_array_iter_open(helpers.call_layout.realm, slow);
                             walk_to_slot!(*src, slow);
                             family_checks!(recv_cache::Family::Arr, slow);
                             a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
@@ -9570,7 +9570,7 @@ impl JitFunction {
                             family_checks!(recv_cache::Family::Arr, slow);
                             a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
                             a.jne(slow);
-                            a.p_array_iter_open(&layout, helpers.call_layout.realm, slow);
+                            a.p_array_iter_open(helpers.call_layout.realm, slow);
                             a.load_rax(disp(src));
                             a.store_rax(disp(next));
                             a.movabs_rax(NanBox::number(0.0).to_bits() as i64);

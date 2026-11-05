@@ -2310,11 +2310,11 @@ impl X64Assembler {
 
     /// To `miss` unless the realm's published array-iteration open
     /// (`realm::builtins_fast::ArrayIterJit`) holds: its prototype epoch is
-    /// current, and each of its two lookups' holder is still a live shaped
-    /// object of the recorded shape whose slot holds the recorded value —
-    /// what `iter_fast::can_open`'s memo hit tests (`Realm::stamped_slot`).
-    /// Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
-    pub(crate) fn p_array_iter_open(&mut self, l: &super::JitLayout, realm_off: i32, miss: Label) {
+    /// current, and each of its two lookups' slot (at the recorded address,
+    /// which the epoch keeps valid) still holds the recorded value — what
+    /// `iter_fast::can_open`'s memo hit tests (`Realm::stamped_slot`).
+    /// Clobbers `rax`, `r9`, `r11`.
+    pub(crate) fn p_array_iter_open(&mut self, realm_off: i32, miss: Label) {
         use crate::realm::builtins_fast::ArrayIterJit as J;
         let base = core::mem::offset_of!(crate::realm::Realm, array_iter_jit);
         let off = |f: usize| i32::try_from(base + f).unwrap_or(i32::MAX);
@@ -2323,44 +2323,19 @@ impl X64Assembler {
         self.g_load(r::RAX, r::R11, 0);
         self.g_cmp_mem(r::RAX, r::R9, off(core::mem::offset_of!(J, stamp)));
         self.g_jcc(cc::NE, miss);
-        for (h, sh, sl, f) in [
+        for (ptr, f) in [
             (
-                core::mem::offset_of!(J, iter_holder),
-                core::mem::offset_of!(J, iter_shape),
-                core::mem::offset_of!(J, iter_slot),
+                core::mem::offset_of!(J, iter_ptr),
                 core::mem::offset_of!(J, iter_fn),
             ),
             (
-                core::mem::offset_of!(J, next_holder),
-                core::mem::offset_of!(J, next_shape),
-                core::mem::offset_of!(J, next_slot),
+                core::mem::offset_of!(J, next_ptr),
                 core::mem::offset_of!(J, next_fn),
             ),
         ] {
-            // r11 = the realm (and the arena, unless pinned).
-            if self.pinned() {
-                self.g_load(r::R11, r::R15, realm_off);
-            } else {
-                self.p_arena(realm_off, &l.props);
-            }
-            self.g_load(r::RAX, r::R11, off(h));
-            self.p_slot_of(l, miss);
-            self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
-            self.jne(miss);
-            self.p_shaped_after_object(l, miss);
-            self.g_load(r::RAX, r::RCX, l.off_shape);
-            self.g_cmp_mem(r::RAX, r::R11, off(sh));
-            self.g_jcc(cc::NE, miss);
-            self.g_load(r::R9, r::R11, off(f));
-            self.g_load(r::RAX, r::R11, off(sl));
-            let spill = self.new_label();
-            let got = self.new_label();
-            self.p_obj_slot_load_inline(l, miss, spill);
-            self.jmp(got);
-            self.bind(spill);
-            self.p_obj_slot_load_spill(l, got);
-            self.bind(got);
-            self.g_cmp(r::RAX, r::R9);
+            self.g_load(r::R11, r::R9, off(ptr));
+            self.g_load(r::RAX, r::R11, 0);
+            self.g_cmp_mem(r::RAX, r::R9, off(f));
             self.g_jcc(cc::NE, miss);
         }
     }

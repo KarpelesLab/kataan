@@ -115,16 +115,18 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
         if ok
             && root.is_some()
             && let Some((iter_at, next_at)) = &realm.array_iter_memo.open
+            && let Some(iter_ptr) = realm
+                .jit_object(Handle::from_raw(iter_at.0))
+                .and_then(|o| o.jit_slot_ptr(iter_at.2))
+            && let Some(next_ptr) = realm
+                .jit_object(Handle::from_raw(next_at.0))
+                .and_then(|o| o.jit_slot_ptr(next_at.2))
         {
             let jit = crate::realm::builtins_fast::ArrayIterJit {
                 stamp: realm.array_iter_memo.open_stamp,
-                iter_holder: iter_at.0,
-                iter_shape: crate::jit::shape_word(&iter_at.1),
-                iter_slot: u64::from(iter_at.2),
+                iter_ptr: iter_ptr as u64,
                 iter_fn: f.to_bits(),
-                next_holder: next_at.0,
-                next_shape: crate::jit::shape_word(&next_at.1),
-                next_slot: u64::from(next_at.2),
+                next_ptr: next_ptr as u64,
                 next_fn: n.to_bits(),
             };
             realm.array_iter_jit = jit;
