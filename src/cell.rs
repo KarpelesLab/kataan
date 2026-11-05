@@ -1673,13 +1673,19 @@ impl Trace for Cell {
                 return;
             }
             let elems = core::mem::take(&mut elems.elems);
+            pool.note_swept(elems.capacity());
             core::mem::forget(place.take());
             drop(elems);
             return;
         }
         match place.take() {
             Some(Cell::Object(o)) => o.release(pool),
-            Some(other) => release_rest(other),
+            Some(other) => {
+                if let Cell::Str(s) = &other {
+                    pool.note_swept(s.len() / 8);
+                }
+                release_rest(other);
+            }
             None => {}
         }
     }

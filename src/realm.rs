@@ -694,6 +694,12 @@ const GC_NURSERY: usize = 16_384;
 /// enough to stay in cache.
 const GC_NURSERY_MAX: usize = 262_144;
 
+/// The most out-of-line storage (array elements, string bytes, in words) the
+/// garbage of one nursery may hold for the nursery to grow (16 MiB): the
+/// nursery counts objects, and a grown one of large temporary arrays would
+/// hold that many more of them between collections.
+const GC_NURSERY_GARBAGE_WORDS: usize = 1 << 21;
+
 /// The mutable state behind the Annex B.2.5 RegExp legacy static accessors
 /// (`RegExp.input`/`$_`, `RegExp.lastMatch`/`$&`, `RegExp.lastParen`/`$+`,
 /// `RegExp.leftContext`/`` $` ``, `RegExp.rightContext`/`$'`, `RegExp.$1`..`$9`).
@@ -7894,8 +7900,9 @@ impl Realm {
             self.collect_minor_with(&all, extern_expand, extern_prune)
         };
         self.heap.reset_alloc_pressure();
+        let swept_words = self.heap.take_swept_words();
         if !major {
-            self.adapt_nursery(stats.marked);
+            self.adapt_nursery(stats.marked, swept_words);
         }
         // Scaled by the live set's tracing weight, not just its object count:
         // the next full cycle re-traces all of it.
@@ -7920,11 +7927,15 @@ impl Realm {
     /// young objects out of the current nursery: doubles it when more than a
     /// quarter survived, halves it (down to [`GC_NURSERY`]) when under a
     /// sixteenth did (the gap keeps a nursery whose survival hovers near one
-    /// bound from flipping size every collection). Only the collection
-    /// frequency changes, never what is collected.
-    fn adapt_nursery(&mut self, survivors: usize) {
+    /// bound from flipping size every collection) — or at once when its
+    /// garbage held more than [`GC_NURSERY_GARBAGE_WORDS`] of out-of-line
+    /// storage (`swept_words`), which a larger nursery would multiply.
+    /// Only the collection frequency changes, never what is collected.
+    fn adapt_nursery(&mut self, survivors: usize, swept_words: usize) {
         let n = self.gc_nursery;
-        if survivors.saturating_mul(4) > n {
+        if swept_words > GC_NURSERY_GARBAGE_WORDS {
+            self.gc_nursery = (n / 2).max(GC_NURSERY);
+        } else if survivors.saturating_mul(4) > n {
             self.gc_nursery = (n * 2).min(GC_NURSERY_MAX);
         } else if survivors.saturating_mul(16) < n {
             self.gc_nursery = (n / 2).max(GC_NURSERY);

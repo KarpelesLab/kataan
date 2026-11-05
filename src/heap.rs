@@ -573,6 +573,13 @@ impl<T> Heap<T> {
         self.live + (self.allocs_since_gc - self.counted)
     }
 
+    /// The words of out-of-line storage (array elements, string bytes / 8)
+    /// the sweeps freed since the last call (see
+    /// [`ExtraPool::take_swept_words`](crate::object::ExtraPool::take_swept_words)).
+    pub fn take_swept_words(&mut self) -> usize {
+        self.extra_pool.take_swept_words()
+    }
+
     /// The raw base pointer and length of the backing slot array, for the
     /// generic-JIT inline property-get fast path. The pointer is `slots.as_ptr()`
     /// (arena base) and the length is `slots.len()` (the index bound, **not**

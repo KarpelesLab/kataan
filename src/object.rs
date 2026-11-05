@@ -710,6 +710,12 @@ pub struct ExtraPool {
     // `extra` field (an `Option<Box<ObjectExtra>>`).
     #[allow(clippy::vec_box)]
     boxes: Vec<Box<ObjectExtra>>,
+    /// The words of out-of-line storage (array elements, string bytes / 8)
+    /// the sweeps freed since [`take_swept_words`](Self::take_swept_words)
+    /// last read it: how much memory a nursery's garbage held, which bounds
+    /// the nursery's growth (`Realm::adapt_nursery`). The cells themselves
+    /// are not counted (their slots are reused, not freed).
+    swept_words: usize,
 }
 
 impl core::fmt::Debug for ExtraPool {
@@ -741,6 +747,12 @@ impl ExtraPool {
     /// so the sweep's common case (no `extra` part) stays small.
     #[inline(never)]
     fn give(&mut self, mut x: Box<ObjectExtra>) {
+        // (The part itself, its far spill and a dictionary's entries.)
+        self.note_swept(
+            core::mem::size_of::<ObjectExtra>() / 8
+                + x.spill.far.capacity()
+                + x.dict.as_ref().map_or(0, |d| d.map.len() * 4),
+        );
         if self.boxes.len() < Self::CAP && x.recyclable() {
             x.spill.n = 0;
             x.class_tag = None;
@@ -760,6 +772,19 @@ impl ExtraPool {
     pub(crate) fn jit_offsets(vec_ptr_off: usize, vec_len_off: usize) -> (usize, usize) {
         let f = core::mem::offset_of!(ExtraPool, boxes);
         (f + vec_ptr_off, f + vec_len_off)
+    }
+
+    /// Counts `words` of out-of-line storage a sweep freed (see
+    /// [`ExtraPool::swept_words`]).
+    #[inline(always)]
+    pub(crate) fn note_swept(&mut self, words: usize) {
+        self.swept_words = self.swept_words.wrapping_add(words);
+    }
+
+    /// The words counted by [`note_swept`](Self::note_swept) since the last
+    /// call, resetting the count.
+    pub(crate) fn take_swept_words(&mut self) -> usize {
+        core::mem::take(&mut self.swept_words)
     }
 
     /// The pool's `Vec` data pointer and length, for the layout test.
