@@ -2825,6 +2825,20 @@ fn emit_inline_new_this(
         load_proto_epoch(a, r::R9);
         a.g_cmp_mem(r::R9, r::R11, f(offset_of!(ConstructFast, stamp)));
         a.g_jcc(cc::NE, miss);
+        // Nothing moved, so the object's heap slot is where its index
+        // says: the way holds it as the inline allocation's does — when no
+        // incremental marking runs, as there (the fresh adds after it need
+        // nothing from the write barrier).
+        if let Some(w) = e.new_way {
+            let skip = a.new_label();
+            a.g_load(r::R9, r::R15, e.layout.realm);
+            a.g_cmp_byte_imm(r::R9, super::compute_jit_layout().props.marking, 0);
+            a.g_jcc(cc::NE, skip);
+            a.p_fresh_cell(super::compute_jit_layout(), e.layout.realm);
+            a.g_store(RBP, w.key, r::RAX);
+            a.g_store(RBP, w.cell, r::RCX);
+            a.bind(skip);
+        }
         a.bind(made);
         a.g_movabs(r::R11, e.memo as u64);
         a.g_load(

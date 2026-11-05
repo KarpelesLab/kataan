@@ -4261,3 +4261,37 @@ fn date_time_format_keeps_every_requested_field() {
         "0|Friday AD|2024 Friday|5 Anno Domini|in the afternoon 6|Friday, January 5|2024 AD"
     );
 }
+
+/// A constructor that is a straight run of `this.k = param` stores, inlined
+/// into its hot caller, makes the run's adds at once — exactly as one by
+/// one: a setter later put on the prototype for the second key sees the
+/// first already added (and its throw ends the construct there), a
+/// non-Number value takes a Number-only slot's slow path, and a recursive
+/// builder compiled before its `new` sites ran (which inlines the
+/// constructor once it warms) still meets a setter added afterwards.
+#[test]
+fn constructor_add_runs_match_one_by_one_adds() {
+    let src = r#"
+        var out = [];
+        class V { constructor(x, y) { this.x = x; this.y = y; } }
+        function mk(n, a) { var s = 0, last; for (var i = 0; i < n; i++) { last = new V(i, a); s += last.x + last.y; } return [s, last]; }
+        var r = mk(3000, 2); out.push(r[0] + ":" + Object.keys(r[1]));
+        var seen = [];
+        Object.defineProperty(V.prototype, "y", { configurable: true, set(v) { seen.push(Object.keys(this).join(",")); if (v === 3) throw new RangeError("y"); } });
+        var caught = 0;
+        for (var i = 0; i < 200; i++) { try { new V(i, i % 4); } catch (e) { caught++; } }
+        out.push(caught + ":" + seen.length + ":" + seen[7]);
+        delete V.prototype.y;
+        r = mk(3000, "s"); out.push(r[0].length + ":" + typeof r[1].y + ":" + Object.keys(r[1]));
+        class T { constructor(l, r) { this.l = l; this.r = r; } }
+        function build(d) { return d === 0 ? new T(null, null) : new T(build(d - 1), build(d - 1)); }
+        function count(t) { return t === undefined ? 0 : t.l === null ? 1 : 1 + count(t.l) + count(t.r); }
+        var c = 0;
+        for (var k = 0; k < 4; k++) c += count(build(9));
+        Object.defineProperty(T.prototype, "r", { configurable: true, set(v) { c += 1000; } });
+        c += count(build(3));
+        out.push(c);
+        out.join("|")
+    "#;
+    assert_eq!(run(src), "4504500:x,y|50:200:x|13891:string:x,y|4096");
+}

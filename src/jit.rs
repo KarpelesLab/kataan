@@ -7200,6 +7200,47 @@ impl JitFunction {
         // per op the shape a fresh add's fast path left its object in.
         let fresh_add = recv_cache::fresh_adds(ops, bytecode, osr_entries, &catch_targets);
         let mut fresh_to: Vec<Option<u64>> = alloc::vec![None; ops.len()];
+        // Per first add of a fresh chain, the straight run of its adds (two
+        // or more consecutive ops, each a fresh add that may take the fast
+        // path, every slot inline, each `from` its predecessor's `to`) that
+        // the first can make at once (`X64Assembler::p_add_fresh_run`).
+        let fresh_run: Vec<Option<Vec<usize>>> = (0..ops.len())
+            .map(|h| {
+                let f = fresh_add[h].filter(|f| f.k == 0)?;
+                let g = rc.sites[f.guard]?;
+                if g.family != recv_cache::Family::Obj || shape_ways.contains(&g.way) {
+                    return None;
+                }
+                let add_of = |q: usize| {
+                    let GenericOp::SetProp { site, .. } = ops[q] else {
+                        return None;
+                    };
+                    let s = sites.get(site as usize)?;
+                    s.add.filter(|b| {
+                        s.baked.is_none()
+                            && !s.method_ptr.is_null()
+                            && b.slot < crate::object::INLINE_SLOTS as u32
+                    })
+                };
+                let mut prev = add_of(h)?;
+                let mut run = alloc::vec![h];
+                for (q, fq) in fresh_add.iter().enumerate().take(h + 16).skip(h + 1) {
+                    let Some(b) = fq
+                        .filter(|fq| fq.guard == f.guard && fq.prev == Some(q - 1))
+                        .and_then(|_| add_of(q))
+                        .filter(|b| b.from == prev.to)
+                    else {
+                        break;
+                    };
+                    run.push(q);
+                    prev = b;
+                }
+                (run.len() >= 2).then_some(run)
+            })
+            .collect();
+        // A run being emitted: `(its first op, its last, the pass, where
+        // its fused adds resume, how many of its later ops were emitted)`.
+        let mut pending_run: Option<(usize, usize, u8, Label, usize)> = None;
         // The inlined calls' `JumpIfFalse`s the guard fuses (see
         // `call_seq::InlineEmit::fused_miss`): emitted as nothing.
         let fused_test = recv_cache::fused_guard_tests(ops, osr_entries, &catch_targets, |i| {
@@ -8045,8 +8086,21 @@ impl JitFunction {
         num.alloc_copy_labels(&mut a);
         // (After the copy's labels: `NumGen::roc_folded` needs them.)
         num.plan_math_proofs(&provable);
-        for (op_idx, pass) in num.schedule(ops.len()) {
+        let sched = num.schedule(ops.len());
+        for (si, &(op_idx, pass)) in sched.iter().enumerate() {
             let op = &ops[op_idx];
+            // The op after a fused add run: where the run's fast path
+            // resumes, every later op of the run having been emitted (as a
+            // `SetProp`, which emits nothing at its end in these passes).
+            if let Some((head, last, p, end, seen)) = pending_run
+                && (op_idx > last || pass != p)
+            {
+                if (op_idx, pass) != (last + 1, p) || seen != last - head {
+                    return None;
+                }
+                a.bind(end);
+                pending_run = None;
+            }
             a.dbg_op = Some(op_idx);
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
             a.set_recv_survive(survive.get(op_idx).cloned().unwrap_or_default(), layout);
@@ -10266,6 +10320,12 @@ impl JitFunction {
                         return None;
                     }
                     let s = sites.get(site as usize)?;
+                    if let Some((head, last, p, _, seen)) = pending_run.as_mut()
+                        && (*head + 1..=*last).contains(&op_idx)
+                        && *p == pass
+                    {
+                        *seen += 1;
+                    }
                     let helper = a.new_label();
                     let done = a.new_label();
                     // An add to the object an inlined `new` just allocated
@@ -10298,6 +10358,55 @@ impl JitFunction {
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(w));
                         a.jne(regular);
                         a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(w));
+                        // The chain's first add, the head of a straight run
+                        // (`fresh_run`): the run's adds at once, resuming
+                        // after its last op — when the schedule emits the
+                        // run's ops one after another in this pass, followed
+                        // by the op after it (so that is where the resume
+                        // label is bound), outside a region's integer
+                        // version (whose generic ops save and restore its
+                        // int registers around each), and with each later
+                        // value where it is at its own op (stored here to
+                        // the register file the adds read, as it would be
+                        // there).
+                        let run = fresh_run[op_idx].as_ref().filter(|run| {
+                            let n = run.len();
+                            pass != numeric::PASS_INT
+                                && pending_run.is_none()
+                                && run.iter().enumerate().all(|(k, &q)| {
+                                    sched.get(si + k) == Some(&(q, pass))
+                                        && matches!(ops[q], GenericOp::SetProp { val: v, .. }
+                                            if num.result_xmm(op_idx, v) == num.result_xmm(q, v))
+                                })
+                                && sched.get(si + n) == Some(&(run[n - 1] + 1, pass))
+                        });
+                        if let Some(run) = run {
+                            let mut items = Vec::with_capacity(run.len());
+                            for &q in run {
+                                let GenericOp::SetProp {
+                                    site: qs, val: qv, ..
+                                } = ops[q]
+                                else {
+                                    return None;
+                                };
+                                let si_q = sites.get(qs as usize)?;
+                                if q != op_idx {
+                                    let _ = num.operand_xmm(&mut a, q, qv, false);
+                                }
+                                items.push((
+                                    si_q.method_ptr.cast_const(),
+                                    si_q.add?,
+                                    disp(qv),
+                                    num.is_number_at(q, qv),
+                                ));
+                            }
+                            let one = a.new_label();
+                            let end = a.new_label();
+                            a.p_add_fresh_run(&layout, helpers.call_layout.realm, &items, one);
+                            a.jmp(end);
+                            a.bind(one);
+                            pending_run = Some((op_idx, run[run.len() - 1], pass, end, 0));
+                        }
                         a.p_add_fresh(
                             &layout,
                             helpers.call_layout.realm,
@@ -11744,6 +11853,9 @@ impl JitFunction {
             // (In a speculative region's integer version: its int registers
             // back, `numeric::NumGen::int_save`.)
             num.after_generic_op(&mut a);
+        }
+        if pending_run.is_some() {
+            return None;
         }
         // (The out-of-line code below keeps no way across its calls.)
         a.set_recv_survive(Vec::new(), layout);

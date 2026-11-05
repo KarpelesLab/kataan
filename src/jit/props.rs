@@ -313,6 +313,10 @@ pub(crate) struct BakedAdd {
     /// Whether `to` had the slot as Number-only when the add was compiled
     /// in (see `fieldrep`): else no value written there needs a check.
     pub num: bool,
+    /// [`Self::num`] for each of `to`'s first 64 slots (bit `k`: slot `k`),
+    /// which an add run that ends in `to` checks its values against
+    /// ([`X64Assembler::p_add_fresh_run`]).
+    pub num_mask: u64,
 }
 
 impl BakedAdd {
@@ -331,6 +335,9 @@ impl BakedAdd {
             to: shape_word(to),
             slot,
             num: !to.may_be_non_number(slot),
+            num_mask: (0..to.len().min(64))
+                .filter(|&k| !to.may_be_non_number(k))
+                .fold(0, |m, k| m | 1 << k),
         })
     }
 }
@@ -467,6 +474,25 @@ pub struct MethodSite {
     /// The proof of an inline `s.charCodeAt(i)`, kept beside the cache of the
     /// site's ordinary receivers.
     str_proof: StrProof,
+    /// For the first site of a fresh object's add run
+    /// ([`X64Assembler::p_add_fresh_run`]): the run's chain proof.
+    run: RunProof,
+}
+
+/// The chain proof of a fresh object's add run
+/// ([`X64Assembler::p_add_fresh_run`]), kept on the run's first site: at the
+/// prototype epoch `stamp`, every site of the run had its add entry
+/// validated for the prototype chain that starts at the raw handle `proto`.
+/// While the epoch stands, that chain is still as validated (every level is
+/// watched, so a change to any bumps the epoch), whatever the entries have
+/// recorded since; so the run's adds to an object whose `[[Prototype]]` is
+/// `proto` need no check of their own entries.
+#[repr(C)]
+struct RunProof {
+    /// The prototype epoch it was made under (`u64::MAX`: never).
+    stamp: u64,
+    /// The raw handle of the chain's first object.
+    proto: u64,
 }
 
 /// See [`MethodSite::set_str_proof`].
@@ -515,6 +541,10 @@ impl MethodSite {
                 stamp: u64::MAX,
                 ptr: 0,
                 method: 0,
+            },
+            run: RunProof {
+                stamp: u64::MAX,
+                proto: 0,
             },
         }
     }
@@ -1658,6 +1688,132 @@ impl X64Assembler {
         self.p_inc32_mem(r::RCX, p.off_epoch);
     }
 
+    /// The adds of a whole straight run of a fresh chain
+    /// ([`Self::p_add_fresh`]) at once: `run` is, per add in order,
+    /// `(site, add, value displacement, whether the value is proven a
+    /// Number)`, the first being the chain's first
+    /// add and each later one's `from` its predecessor's `to` (the caller's
+    /// to check), every slot inline. The object (`rcx`) goes straight from the
+    /// allocation's root shape to the run's last layout: when its shape is
+    /// the first add's `from`, the dictionary threshold is above the last
+    /// slot, every value keeps the last layout's record of its Number-only
+    /// slots, and the prototype chain is proved for every site of the run —
+    /// by the first site's [`RunProof`], else by each site's add entry as
+    /// [`Self::p_add_chain`] checks it (which then records the proof). All
+    /// of that is checked before anything is written, so the result is the
+    /// one the run's adds make one by one (none of them can run code or
+    /// throw once their checks hold); otherwise to `miss`, having changed
+    /// nothing, with `rcx` kept. Clobbers `rax`, `rsi`, `r8`, `r9`, `r11`.
+    pub(crate) fn p_add_fresh_run(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        run: &[(*const MethodSite, BakedAdd, i32, bool)],
+        miss: Label,
+    ) {
+        use core::mem::offset_of;
+        const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
+        let (Some(&(head, first, _, _)), Some(&(_, last, _, _))) = (run.first(), run.last()) else {
+            return;
+        };
+        assert!(
+            run.iter().all(|&(_, b, _, _)| b.slot < INLINE),
+            "a fresh run's slots are inline"
+        );
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        let p = &l.props;
+        self.g_movabs(r::R11, first.from);
+        self.g_cmp_mem(r::R11, r::RCX, l.off_shape);
+        self.g_jcc(cc::NE, miss);
+        // Below the dictionary threshold.
+        self.g_load(r::R8, r::R15, realm_off);
+        self.g_load(r::R8, r::R8, p.dict_threshold);
+        self.g_cmp_imm(r::R8, i32::try_from(last.slot).expect("a small slot"));
+        self.g_jcc(cc::BE, miss);
+        // The values against the result's record of its Number-only slots
+        // (a value proven a Number keeps any).
+        for &(_, b, d, number) in run {
+            if !number && b.slot < 64 && last.num_mask & (1 << b.slot) != 0 {
+                self.g_load(r::RAX, r::RBX, d);
+                self.p_field_rep_const(l, (r::RAX, r::R8), last.to, b.slot, miss);
+            }
+        }
+        // The prototype chain: the run's proof, else every site's entry.
+        let run_off = offset_of!(MethodSite, run);
+        let proof_stamp = i(run_off + offset_of!(RunProof, stamp));
+        let proof_proto = i(run_off + offset_of!(RunProof, proto));
+        let add = offset_of!(MethodSite, add);
+        let depth = i(add + offset_of!(AddEntry, depth));
+        let stamp = i(add + offset_of!(AddEntry, stamp));
+        let level0 = i(add + offset_of!(AddEntry, levels) + offset_of!(ChainLevel, handle));
+        let proved = self.new_label();
+        self.g_movabs(r::R11, head as u64);
+        self.p_load_proto_epoch(r::R9);
+        self.g_load(r::RSI, r::RCX, p.off_proto);
+        let validate = self.new_label();
+        self.g_cmp_mem(r::R9, r::R11, proof_stamp);
+        self.g_jcc(cc::NE, validate);
+        self.g_cmp_mem(r::RSI, r::R11, proof_proto);
+        self.g_jcc(cc::E, proved);
+        self.bind(validate);
+        for &(site, _, _, _) in run {
+            self.g_movabs(r::R11, site as u64);
+            // (A chain of no object never matches: the object has a
+            // prototype.)
+            self.p_cmp32_imm8(r::R11, depth, 0);
+            self.g_jcc(cc::E, miss);
+            self.g_cmp_mem(r::R9, r::R11, stamp);
+            self.g_jcc(cc::NE, miss);
+            self.g_cmp_mem(r::RSI, r::R11, level0);
+            self.g_jcc(cc::NE, miss);
+        }
+        self.g_movabs(r::R11, head as u64);
+        self.g_store(r::R11, proof_stamp, r::R9);
+        self.g_store(r::R11, proof_proto, r::RSI);
+        self.bind(proved);
+        // Commit: the values, the count, the shape, the key epoch.
+        for &(_, b, d, _) in run {
+            let slot = i32::try_from(b.slot).expect("a small slot");
+            self.g_load(r::R8, r::RBX, d);
+            self.g_store(r::RCX, l.off_inline + 8 * slot, r::R8);
+        }
+        let n = i8::try_from(run.len()).expect("a short run");
+        self.p_add16_mem_imm8(r::RCX, l.off_slots_len, n);
+        self.g_movabs(r::R9, last.to);
+        self.g_inc_mem(r::R9, p.rc_strong);
+        self.g_movabs(r::R8, first.from);
+        self.g_dec_mem(r::R8, p.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::R9);
+        self.p_add32_mem_imm8(r::RCX, p.off_epoch, n);
+    }
+
+    /// `add word [base+disp32], imm8` (sign-extended; `base` neither `rsp`
+    /// nor `r12`).
+    fn p_add16_mem_imm8(&mut self, base: u8, disp: i32, imm: i8) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        self.code.push(0x66);
+        if base >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0x83);
+        self.code.push(0x80 | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm.cast_unsigned());
+    }
+
+    /// `add dword [base+disp32], imm8` (sign-extended; `base` neither `rsp`
+    /// nor `r12`).
+    fn p_add32_mem_imm8(&mut self, base: u8, disp: i32, imm: i8) {
+        debug_assert!(base & 7 != 4, "no SIB form");
+        if base >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0x83);
+        self.code.push(0x80 | (base & 7));
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.push(imm.cast_unsigned());
+    }
+
     /// The prototype-chain half of [`MethodSite`]'s add-cache hit
     /// ([`Self::p_add_prop_inline`]) for the object whose heap slot is `rcx`,
     /// with `r11` = the site: each of the entry's `depth` prototype levels is
@@ -2339,6 +2495,11 @@ impl X64Assembler {
             && n <= u32::from(u16::MAX)
         {
             let word = u64::from(l.cell_object_disc) | u64::from(n) << 16 | u64::from(n) << 32;
+            if let Ok(imm) = i32::try_from(word) {
+                // (Sign-extended: a non-negative one is the word.)
+                self.g_store_imm32(r::RCX, t, imm);
+                return;
+            }
             self.g_movabs(r::R11, word);
             self.g_store(r::RCX, t, r::R11);
             return;
@@ -2375,6 +2536,30 @@ impl X64Assembler {
             self.imul_rax_imm(l.slot_stride);
             self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
             self.g_mov(r::RCX, r::RAX);
+        }
+    }
+
+    /// `rcx` = the heap slot of the object whose handle bits are in `rax`
+    /// (kept), by its index alone — for an object just allocated, whose
+    /// handle needs no other check. Clobbers `rdx`, `r9`, `r11`.
+    pub(crate) fn p_fresh_cell(&mut self, l: &JitLayout, realm_off: i32) {
+        let p = &l.props;
+        self.g_load(r::R9, r::R15, realm_off);
+        self.code.extend_from_slice(&[0x89, 0xc2]); // mov edx, eax
+        if l.slot_stride == 72 {
+            self.code.extend_from_slice(&[0x48, 0x8d, 0x0c, 0xd2]); // lea rcx, [rdx + rdx*8]
+            if self.pinned() {
+                self.code.extend_from_slice(&[0x49, 0x8d, 0x0c, 0xcc]); // lea rcx, [r12 + rcx*8]
+            } else {
+                self.g_load(r::R11, r::R9, p.heap_ptr);
+                self.code.extend_from_slice(&[0x49, 0x8d, 0x0c, 0xcb]); // lea rcx, [r11 + rcx*8]
+            }
+        } else {
+            self.g_mov(r::RCX, r::RAX);
+            self.g_mov(r::RAX, r::RDX);
+            self.imul_rax_imm(l.slot_stride);
+            self.g_add_mem(r::RAX, r::R9, p.heap_ptr);
+            self.code.extend_from_slice(&[0x48, 0x91]); // xchg rcx, rax
         }
     }
 
