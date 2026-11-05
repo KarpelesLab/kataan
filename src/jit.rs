@@ -9724,6 +9724,32 @@ impl JitFunction {
                         // is its own `ToObject`, so nothing to do; anything
                         // else (`undefined`, a primitive, another kind of
                         // cell) is the interpreter's op.
+                        // A derived constructor's body result: `undefined`
+                        // (any of its decoded-as-undefined words but the TDZ
+                        // sentinel) becomes the bound `this`, anything else
+                        // is kept, as the interpreter's arm does; the checks
+                        // are the construct result's.
+                        crate::nbvm::Op::DerivedResult { dst, src, this }
+                            if ok(*dst) && ok(*src) && ok(*this) =>
+                        {
+                            let use_this = a.new_label();
+                            let keep = a.new_label();
+                            a.load_rax(disp(*src));
+                            for w in [
+                                NanBox::undefined(),
+                                NanBox::hole(),
+                                NanBox::empty_completion(),
+                            ] {
+                                a.movabs_r11(w.to_bits() as i64);
+                                a.cmp_rax_r11();
+                                a.je(use_this);
+                            }
+                            a.jmp(keep);
+                            a.bind(use_this);
+                            a.load_rax(disp(*this));
+                            a.bind(keep);
+                            a.store_rax(disp(*dst));
+                        }
                         crate::nbvm::Op::BindThis { this } if ok(*this) => {
                             // (In a speculative loop's fast version, which
                             // makes no call, anything else leaves for the
