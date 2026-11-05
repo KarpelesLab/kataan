@@ -1286,6 +1286,24 @@ pub(crate) extern "C" fn jit_helper_new_object(ctx: *mut core::ffi::c_void, _unu
     NanBox::handle(ctx.realm.new_object().to_raw()).to_bits()
 }
 
+/// `Op::InitFnPrototype` of the closure `f` compiled code has just made
+/// inline (in the main realm of a single-realm run, so with no auxiliary
+/// object): what the interpreter arm does, without the one-op dispatch.
+///
+/// # Safety
+/// As [`jit_helper_new_object`].
+pub(crate) extern "C" fn jit_helper_owe_fn_proto(ctx: *mut core::ffi::c_void, f: u64) -> u64 {
+    // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    if let Some(fh) = NanBox::from_bits(f).as_handle().map(Handle::from_raw)
+        && !ctx.realm.defer_fresh_vm_fn_prototype(fh)
+    {
+        super::init_fn_prototype(&mut ctx.realm, fh);
+    }
+    0
+}
+
 /// `Op::NewArrayFrom` (and a small `Op::NewArray`) from compiled code: the
 /// array literal, written to the op's destination register — exactly the
 /// interpreter arm, without the one-op dispatch. Any other op (an `Op::NewArray`
@@ -1575,10 +1593,12 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             instanceof: true,
             a,
             b,
-        } => super::instance_of_fast(&ctx.realm, regs[*a as usize], regs[*b as usize]).map(|r| {
-            regs[*dst as usize] = NanBox::boolean(r);
-            Ok(())
-        }),
+        } => {
+            super::instance_of_fast(&mut ctx.realm, regs[*a as usize], regs[*b as usize]).map(|r| {
+                regs[*dst as usize] = NanBox::boolean(r);
+                Ok(())
+            })
+        }
         // `key in obj` over an ordinary chain (the interpreter arm's first
         // step, also a `for-in`'s per-key liveness check).
         Op::Relational {
@@ -3290,6 +3310,7 @@ pub(crate) extern "C" fn jit_construct_info(
     else {
         return NONE;
     };
+    ctx.realm.materialize_fn_proto(nth);
     let Some(p) = ctx
         .realm
         .get_property(nth, "prototype")
@@ -3332,6 +3353,8 @@ fn fill_fncall_memo(ctx: &mut Ctx, site: &mut CallSite, recv: NanBox, method: u6
     if !ctx.realm.is_vm_function(fh) {
         return;
     }
+    // (The memo watches the closure's own properties where they live.)
+    ctx.realm.materialize_fn_proto(fh);
     let Some(aux) = ctx.realm.jit_aux_of(fh) else {
         return;
     };

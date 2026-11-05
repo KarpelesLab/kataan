@@ -9430,7 +9430,12 @@ impl crate::nbvm::VmHost for Interp {
         core::mem::replace(&mut self.realm, spare)
     }
 
-    fn restore_realm(&mut self, realm: alloc::boxed::Box<crate::realm::Realm>) {
+    fn restore_realm(&mut self, mut realm: alloc::boxed::Box<crate::realm::Realm>) {
+        // The host never sees a VM closure that owes its `prototype` (see
+        // `Realm::defer_vm_fn_prototype`).
+        if realm.has_owed_fn_protos() {
+            realm.materialize_owed_fn_protos();
+        }
         let spare = core::mem::replace(&mut self.realm, realm);
         self.realm_spares.push(spare);
     }

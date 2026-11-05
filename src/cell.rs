@@ -347,6 +347,12 @@ pub enum Cell {
     VmFunction {
         /// Index into the VM program's function table.
         func: u32,
+        /// Whether the closure owes the properties `MakeConstructor` gives
+        /// it — its own `prototype` (a fresh object whose `constructor` is
+        /// the closure) and the constructible marker — not yet made: they are
+        /// made when first observed (see `Realm::defer_vm_fn_prototype`).
+        /// While set, the closure has no auxiliary object.
+        owes_proto: bool,
         /// The captured cells, in the order the function's compiled body
         /// expects (see [`Captures`]).
         captures: Captures,
@@ -1034,13 +1040,14 @@ pub(crate) fn jit_captures_offsets() -> (usize, usize, usize) {
 }
 
 /// The byte layout of a `Cell::VmFunction`, for compiled code that identifies a
-/// callee without a helper: `(discriminant, func_off, captures_off)`, the
+/// callee without a helper: `(discriminant, func_off, captures_off, owes_proto_off)`, the
 /// offsets relative to the `Cell` (the captures being a [`Captures`]: see
 /// [`jit_captures_offsets`] for its fields).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
+pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize, usize) {
     let cell = Cell::VmFunction {
         func: 7,
+        owes_proto: false,
         captures: Captures::from_slice(&[NanBox::undefined()]),
     };
     let base = core::ptr::addr_of!(cell) as usize;
@@ -1048,13 +1055,19 @@ pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize) {
     // [`Cell`]) is in bounds and always a valid `u8`.
     #[allow(unsafe_code)]
     let disc = unsafe { *(base as *const u8) };
-    let Cell::VmFunction { func, captures } = &cell else {
+    let Cell::VmFunction {
+        func,
+        owes_proto,
+        captures,
+    } = &cell
+    else {
         unreachable!("just built a Cell::VmFunction")
     };
     (
         disc,
         core::ptr::addr_of!(*func) as usize - base,
         core::ptr::addr_of!(*captures) as usize - base,
+        core::ptr::addr_of!(*owes_proto) as usize - base,
     )
 }
 

@@ -83,6 +83,13 @@ pub(crate) struct PropsLayout {
     pub off_native_id: i32,
     /// Slot-relative offset of a VM function's `func: u32`.
     pub off_vmfn_func: i32,
+    /// Slot-relative offset of a VM function's `owes_proto: bool`.
+    pub off_vmfn_owes_proto: i32,
+    /// `Realm`-relative offsets of the owing closures list's data pointer,
+    /// length and capacity (`Realm::jit_owed_offsets`).
+    pub owed_ptr: i32,
+    pub owed_len: i32,
+    pub owed_cap: i32,
     /// Slot-relative offset of a VM function's captures `Vec` data pointer
     /// (its captures when `off_vmfn_caps_inline_len` holds `ARRAY_ON_HEAP`).
     pub off_vmfn_caps_ptr: i32,
@@ -138,13 +145,17 @@ impl PropsLayout {
     ) -> Self {
         let i = |v: usize| i32::try_from(v).expect("jit layout offset fits in i32");
         let (heap_ptr, heap_len) = crate::realm::Realm::jit_heap_offsets();
-        let (vmfn_disc, func_off, caps_off) = crate::cell::jit_vm_function_layout();
+        let (vmfn_disc, func_off, caps_off, owes_off) = crate::cell::jit_vm_function_layout();
         let (caps_vec, caps_inline_len, caps_inline) = crate::cell::jit_captures_offsets();
         let (native_disc, native_id_off) = crate::cell::jit_native_layout();
         let (box_disc, box_val_off) = crate::cell::jit_box_layout();
         let (shape_parent, rc_strong) = shape_word_offsets();
         let (alloc, root_shape, default_proto) = crate::realm::Realm::jit_alloc_offsets();
+        let (owed_ptr, owed_len, owed_cap) = crate::realm::Realm::jit_owed_offsets();
         Self {
+            owed_ptr: i(owed_ptr),
+            owed_len: i(owed_len),
+            owed_cap: i(owed_cap),
             default_proto: i(default_proto),
             free_ptr: i(alloc.free_ptr),
             free_len: i(alloc.free_len),
@@ -170,6 +181,7 @@ impl PropsLayout {
             box_disc,
             off_box_val: i(cell_base + box_val_off),
             off_vmfn_func: i(cell_base + func_off),
+            off_vmfn_owes_proto: i(cell_base + owes_off),
             off_vmfn_caps_ptr: i(cell_base + caps_off + caps_vec + obj.vec_ptr_off),
             off_vmfn_caps_len: i(cell_base + caps_off + caps_vec + obj.vec_len_off),
             off_vmfn_caps_inline_len: i(cell_base + caps_off + caps_inline_len),
@@ -2670,7 +2682,9 @@ impl X64Assembler {
     /// unused inline slots `undefined`, an empty `Vec`. Then `rax` = the
     /// closure's handle bits; otherwise to `miss`, having changed nothing.
     /// (The caller checks that the closure needs nothing else: no
-    /// `[[Prototype]]` record, no realm tag.) Clobbers `rax`, `rcx`, `rdx`,
+    /// `[[Prototype]]` record, no realm tag.) `owes`: the closure owes its
+    /// `prototype` (its `owes_proto` set; the caller lists it, see
+    /// `Realm::defer_vm_fn_prototype`). Clobbers `rax`, `rcx`, `rdx`,
     /// `r9`, `r11`.
     pub(crate) fn p_alloc_closure(
         &mut self,
@@ -2678,6 +2692,7 @@ impl X64Assembler {
         realm_off: i32,
         func: u32,
         caps: &[i32],
+        owes: bool,
         miss: Label,
     ) {
         use crate::cell::CAPTURES_INLINE_CAP;
@@ -2690,6 +2705,7 @@ impl X64Assembler {
         // `Cell::VmFunction`, field by field.
         self.p_store_rcx_imm(1, l.off_cell_tag, u32::from(p.vmfn_disc));
         self.p_store_rcx_imm(4, p.off_vmfn_func, func);
+        self.p_store_rcx_imm(1, p.off_vmfn_owes_proto, u32::from(owes));
         self.p_store_empty_vec(l, p.off_vmfn_caps_vec);
         self.p_store_rcx_imm(1, p.off_vmfn_caps_inline_len, caps.len() as u32);
         // Promoted registers' current values reach the frame first.
@@ -3135,6 +3151,14 @@ mod tests {
             assert_eq!(*field(nf, l.off_native_id).cast::<u16>(), 0x4321);
             let (fid, caps) = realm.vm_function(f).unwrap();
             assert_eq!(*field(f, l.off_vmfn_func).cast::<u32>(), fid);
+            assert_eq!(*field(f, l.off_vmfn_owes_proto), 0);
+            // The owing closures list's words.
+            let (op, ol, oc) = (
+                usize::try_from(l.owed_ptr).unwrap(),
+                usize::try_from(l.owed_len).unwrap(),
+                usize::try_from(l.owed_cap).unwrap(),
+            );
+            assert!(op != ol && ol != oc && op != oc);
             if caps.len() <= crate::cell::CAPTURES_INLINE_CAP {
                 assert_eq!(
                     usize::from(*field(f, l.off_vmfn_caps_inline_len)),

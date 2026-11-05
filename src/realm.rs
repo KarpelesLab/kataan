@@ -135,6 +135,20 @@ pub struct Realm {
     /// the marker key they were grown for (see
     /// [`Realm::init_vm_fn_prototype`]), made on first use.
     vm_fn_proto_shapes: Option<(Rc<Shape>, Rc<Shape>, Rc<str>)>,
+    /// The VM closures that owe their `MakeConstructor` properties (see
+    /// [`Realm::defer_vm_fn_prototype`]): every closure whose cell has
+    /// `owes_proto` set is here (a closure materialized on its own since may
+    /// be too, and is skipped). Weak: a collection drops the dead ones.
+    /// Raw handles (compiled code appends to it, see
+    /// `Realm::jit_owed_offsets`).
+    owed_fn_protos: Vec<u64>,
+    /// The own-property object an owing closure presents to a reader (see
+    /// [`Realm::defer_vm_fn_prototype`]): its `prototype` (non-enumerable,
+    /// non-configurable, writable) and constructible marker, exactly the keys
+    /// and attributes materializing gives it. Not in the heap and never
+    /// written; its `prototype` slot holds no value a reader may use (every
+    /// reader of that value materializes the closure first).
+    owed_fn_props: Option<Object>,
     /// The `{value, done}` layout of an iterator result object (see
     /// `Realm::new_iter_result`), grown from `root_shape` once.
     iter_result_shape: Option<Rc<Shape>>,
@@ -876,6 +890,8 @@ impl Realm {
             root_shape: Shape::root(),
             builtin_fn_shape: None,
             vm_fn_proto_shapes: None,
+            owed_fn_protos: Vec::new(),
+            owed_fn_props: None,
             iter_result_shape: None,
             args_shapes: alloc::vec::Vec::new(),
             args_cells_attached: false,
@@ -1535,6 +1551,8 @@ impl Realm {
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     #[must_use]
     pub(crate) fn jit_aux_of(&self, handle: Handle) -> Option<Handle> {
+        // (An owing closure has none: compiled code's paths over one take
+        // their general path, which materializes it.)
         self.aux_props.get(&handle.to_raw()).copied()
     }
 
@@ -1666,6 +1684,40 @@ impl Realm {
         )
     }
 
+    /// The byte offsets, within a `Realm`, of the owing closures list's
+    /// data-pointer, length and capacity words (`(ptr, len, cap)`, probed: a
+    /// `Vec`'s word order is unspecified), for compiled code that appends a
+    /// closure it just made to it while it has room (see
+    /// [`defer_vm_fn_prototype`](Self::defer_vm_fn_prototype)).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_owed_offsets() -> (usize, usize, usize) {
+        // Length 1, capacity 16: the three words all differ.
+        let mut v: Vec<u64> = Vec::with_capacity(16);
+        v.push(1);
+        let vec = core::ptr::addr_of!(v) as usize;
+        let word = core::mem::size_of::<usize>();
+        let (mut ptr, mut len, mut cap) = (usize::MAX, usize::MAX, usize::MAX);
+        for i in 0..core::mem::size_of::<Vec<u64>>() / word {
+            // SAFETY: the i-th word of the live `Vec`, in bounds.
+            #[allow(unsafe_code)]
+            let w = unsafe { *((vec + i * word) as *const usize) };
+            if w == v.as_ptr() as usize {
+                ptr = i * word;
+            } else if w == 1 {
+                len = i * word;
+            } else if w == v.capacity() {
+                cap = i * word;
+            }
+        }
+        assert!(
+            ptr != usize::MAX && len != usize::MAX && cap != usize::MAX,
+            "could not derive the owing closures list's offsets"
+        );
+        let field = core::mem::offset_of!(Realm, owed_fn_protos);
+        (field + ptr, field + len, field + cap)
+    }
+
     /// The byte offsets, within a `Realm`, of the object heap's slot-array
     /// data-pointer and length words (see [`jit_arena_slots`](Self::jit_arena_slots)),
     /// for compiled code that reads them directly: `(ptr_off, len_off)`.
@@ -1732,6 +1784,7 @@ impl Realm {
 
     /// The auxiliary property object for a non-object cell, created on first use.
     fn aux_object(&mut self, handle: Handle) -> Handle {
+        self.materialize_fn_proto(handle);
         if let Some(h) = self.aux_props.get(&handle.to_raw()) {
             return *h;
         }
@@ -1896,6 +1949,180 @@ impl Realm {
         true
     }
 
+    /// [`init_vm_fn_prototype`](Self::init_vm_fn_prototype) deferred: marks
+    /// the fresh VM closure `f` (no named property yet) as *owing* its
+    /// `prototype` and constructible marker, which
+    /// [`materialize_fn_proto`](Self::materialize_fn_proto) makes when they
+    /// are first needed — making them was most of the cost of creating a
+    /// closure, and most closures are only ever called. `false`, having
+    /// changed nothing, when the deferral is not available (several realms,
+    /// whose default `[[Prototype]]` depends on the running one; intrinsics
+    /// not set up; `f` already has named properties); the caller then makes
+    /// them now.
+    ///
+    /// Nothing outside the VM ever sees an owing closure: every hand-over of
+    /// the realm to the host materializes them all first
+    /// ([`materialize_owed_fn_protos`](Self::materialize_owed_fn_protos)).
+    /// Inside the realm, every reader of a closure's own properties sees the
+    /// owed ones (through `owed_fn_props`: keys, attributes and the marker's
+    /// value); every writer, and every read of the `prototype` value (the
+    /// VM's `Get` paths, construction, `instanceof`), materializes first.
+    pub(crate) fn defer_vm_fn_prototype(&mut self, f: Handle) -> bool {
+        if self.multi_realm
+            || self.default_object_proto.is_none()
+            || self.aux_props.contains_key(&f.to_raw())
+        {
+            return false;
+        }
+        self.defer_fresh_vm_fn_prototype(f)
+    }
+
+    /// [`defer_vm_fn_prototype`](Self::defer_vm_fn_prototype) of a closure
+    /// known to have no auxiliary object (compiled code's inline closure,
+    /// just made in the main realm of a single-realm run).
+    pub(crate) fn defer_fresh_vm_fn_prototype(&mut self, f: Handle) -> bool {
+        debug_assert!(!self.aux_props.contains_key(&f.to_raw()));
+        if self.multi_realm || self.default_object_proto.is_none() {
+            return false;
+        }
+        if self.owed_fn_props.is_none() {
+            // Its own layout node (no real object ever shares it, so no
+            // shape-keyed cache can mistake one for it).
+            let shape = Shape::implied_ctor_layout(
+                &self.root_shape.transition("prototype"),
+                crate::nbvm::VM_CTOR,
+            );
+            self.owed_fn_props = Object::with_implied_ctor_attrs(
+                shape,
+                [NanBox::undefined(), NanBox::boolean(true)],
+                None,
+            );
+        }
+        let Some(Cell::VmFunction { owes_proto, .. }) = self.heap.get_mut(f) else {
+            return false;
+        };
+        // (Compiled code may have set it already, its list full.)
+        *owes_proto = true;
+        self.owed_fn_protos.push(f.to_raw());
+        true
+    }
+
+    /// Whether `h` is a VM closure that owes its `prototype` (see
+    /// [`defer_vm_fn_prototype`](Self::defer_vm_fn_prototype)).
+    #[must_use]
+    #[inline]
+    pub(crate) fn fn_owes_proto(&self, h: Handle) -> bool {
+        !self.owed_fn_protos.is_empty()
+            && matches!(
+                self.heap.get(h),
+                Some(Cell::VmFunction {
+                    owes_proto: true,
+                    ..
+                })
+            )
+    }
+
+    /// Makes the owed `prototype` and constructible marker of the VM closure
+    /// `h` (see [`defer_vm_fn_prototype`](Self::defer_vm_fn_prototype)), if it
+    /// owes them: exactly what creating it would have made. A no-op
+    /// otherwise.
+    #[inline]
+    pub(crate) fn materialize_fn_proto(&mut self, h: Handle) {
+        if self.fn_owes_proto(h) {
+            self.materialize_owing(h);
+        }
+    }
+
+    /// [`materialize_fn_proto`](Self::materialize_fn_proto) when `key` is
+    /// `prototype`: what a read of the value of `h[key]` needs first.
+    #[inline]
+    pub(crate) fn materialize_fn_proto_for(&mut self, h: Handle, key: &str) {
+        if key == "prototype" {
+            self.materialize_fn_proto(h);
+        }
+    }
+
+    /// [`materialize_fn_proto_for`](Self::materialize_fn_proto_for) of `h`
+    /// and every object on its prototype chain: what a `[[Get]]` of `key`
+    /// from `h` that may read it from any of them needs first.
+    pub(crate) fn materialize_chain_for(&mut self, h: Handle, key: &str) {
+        if key != "prototype" || self.owed_fn_protos.is_empty() {
+            return;
+        }
+        let mut cur = Some(h);
+        // (A chain is acyclic; stay bounded on a pathological one.)
+        for _ in 0..100_000 {
+            let Some(c) = cur else { break };
+            self.materialize_fn_proto(c);
+            cur = self.object_proto(c);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn materialize_owing(&mut self, h: Handle) {
+        if let Some(Cell::VmFunction { owes_proto, .. }) = self.heap.get_mut(h) {
+            *owes_proto = false;
+        }
+        let made = self.init_vm_fn_prototype(h, crate::nbvm::VM_CTOR);
+        debug_assert!(made, "an owing closure has no auxiliary object");
+    }
+
+    /// Whether some VM closure may still owe its `prototype`.
+    #[must_use]
+    #[inline]
+    pub(crate) fn has_owed_fn_protos(&self) -> bool {
+        !self.owed_fn_protos.is_empty()
+    }
+
+    /// Materializes every owing VM closure (see
+    /// [`defer_vm_fn_prototype`](Self::defer_vm_fn_prototype)): run before
+    /// the realm is handed to the host, which never sees an owing one.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn materialize_owed_fn_protos(&mut self) {
+        let mut owed = core::mem::take(&mut self.owed_fn_protos);
+        for &raw in &owed {
+            let h = Handle::from_raw(raw);
+            // (`peek`: an entry an incremental sweep freed since is no use
+            // of a freed handle; its slot's generation has moved on.)
+            if matches!(
+                self.heap.peek(h),
+                Some(Cell::VmFunction {
+                    owes_proto: true,
+                    ..
+                })
+            ) {
+                self.materialize_owing(h);
+            }
+        }
+        // Keep the allocation for the next batch.
+        owed.clear();
+        if self.owed_fn_protos.is_empty() {
+            self.owed_fn_protos = owed;
+        }
+    }
+
+    /// The own-property object of `h` as a reader sees it: its auxiliary
+    /// object, or for an owing VM closure the owed properties'
+    /// (`owed_fn_props`).
+    #[inline]
+    fn aux_obj(&self, h: Handle) -> Option<&Object> {
+        match self.aux_props.get(&h.to_raw()) {
+            Some(a) => self.heap.get(*a).and_then(Cell::as_object),
+            None if self.fn_owes_proto(h) => self.owed_fn_props.as_ref(),
+            None => None,
+        }
+    }
+
+    /// The auxiliary object of `h` for a change to it: an owing VM closure
+    /// is materialized first (its owed properties are part of what changes).
+    #[inline]
+    fn aux_for_write(&mut self, h: Handle) -> Option<Handle> {
+        self.materialize_fn_proto(h);
+        self.aux_props.get(&h.to_raw()).copied()
+    }
+
     /// Gives the function `f`, which owns no named property yet, its own
     /// `length` and `name` data properties, in that order, each `{ writable:
     /// false, enumerable: false, configurable: true }`: the same properties
@@ -1906,6 +2133,7 @@ impl Realm {
     /// in an auxiliary object; the caller then takes the general path.
     pub fn init_builtin_fn_props(&mut self, f: Handle, length: NanBox, name: NanBox) -> bool {
         if self.aux_props.get(&f.to_raw()).is_some()
+            || self.fn_owes_proto(f)
             || self.heap.get(f).is_none_or(|c| c.as_object().is_some())
             || !self.aux_eligible(f)
         {
@@ -4162,10 +4390,7 @@ impl Realm {
     /// the aux slot and to honor a user-installed `writable: false`.
     #[must_use]
     pub fn regex_aux_last_index_defined(&self, handle: Handle) -> bool {
-        self.aux_props
-            .get(&handle.to_raw())
-            .and_then(|aux| self.heap.get(*aux))
-            .and_then(Cell::as_object)
+        self.aux_obj(handle)
             .is_some_and(|o| o.contains("lastIndex") || o.accessor("lastIndex").is_some())
     }
 
@@ -4317,6 +4542,7 @@ impl Realm {
     pub fn new_vm_function(&mut self, func: u32, captures: Vec<NanBox>) -> Handle {
         self.heap.alloc(Cell::VmFunction {
             func,
+            owes_proto: false,
             captures: captures.into(),
         })
     }
@@ -4326,6 +4552,7 @@ impl Realm {
     pub fn new_vm_function_from(&mut self, func: u32, captures: &[NanBox]) -> Handle {
         self.heap.alloc(Cell::VmFunction {
             func,
+            owes_proto: false,
             captures: crate::cell::Captures::from_slice(captures),
         })
     }
@@ -4364,11 +4591,7 @@ impl Realm {
         let Some(Cell::VmFunction { func, .. }) = self.heap.get(handle) else {
             return None;
         };
-        let aux = self
-            .aux_props
-            .get(&handle.to_raw())
-            .and_then(|h| self.heap.get(*h))
-            .and_then(Cell::as_object);
+        let aux = self.aux_obj(handle);
         if let Some(o) = aux
             && (o.contains(key)
                 || o.accessor(key).is_some()
@@ -4389,7 +4612,7 @@ impl Realm {
     #[must_use]
     pub fn vm_function(&self, handle: Handle) -> Option<(u32, &[NanBox])> {
         match self.heap.get(handle) {
-            Some(Cell::VmFunction { func, captures }) => Some((*func, captures)),
+            Some(Cell::VmFunction { func, captures, .. }) => Some((*func, captures)),
             _ => None,
         }
     }
@@ -4440,11 +4663,7 @@ impl Realm {
         if !matches!(self.heap.get(handle), Some(Cell::VmFunction { .. })) {
             return;
         }
-        let aux = self
-            .aux_props
-            .get(&handle.to_raw())
-            .and_then(|h| self.heap.get(*h))
-            .and_then(Cell::as_object);
+        let aux = self.aux_obj(handle);
         let mut front = Vec::new();
         for k in ["length", "name"] {
             let deleted = aux.is_some_and(|o| fn_meta_tombstone(k).is_some_and(|t| o.contains(t)));
@@ -4514,10 +4733,7 @@ impl Realm {
     /// function whose symbol keys would otherwise be dropped.
     #[must_use]
     pub fn aux_all_keys(&self, handle: Handle) -> Vec<alloc::string::String> {
-        self.aux_props
-            .get(&handle.to_raw())
-            .and_then(|aux| self.heap.get(*aux))
-            .and_then(Cell::as_object)
+        self.aux_obj(handle)
             .map(|obj| {
                 obj.all_keys()
                     .iter()
@@ -4621,12 +4837,7 @@ impl Realm {
             // element keys, ascending) and ordinary named keys (which follow
             // `length`), per the array exotic `[[OwnPropertyKeys]]` ordering.
             let mut named: Vec<alloc::string::String> = Vec::new();
-            if let Some(aux) = self
-                .aux_props
-                .get(&handle.to_raw())
-                .and_then(|h| self.heap.get(*h))
-                .and_then(Cell::as_object)
-            {
+            if let Some(aux) = self.aux_obj(handle) {
                 for k in aux.all_keys().iter().filter(|s| !is_internal_key(s)) {
                     // A canonical array-index key (`"0".."4294967294"`, no leading
                     // zeros) is an element key; anything else is a named key.
@@ -4655,12 +4866,7 @@ impl Realm {
         if let Some(len) = self.typed_len(handle) {
             let mut names: Vec<alloc::string::String> =
                 (0..len).map(|i| alloc::format!("{i}")).collect();
-            if let Some(aux) = self
-                .aux_props
-                .get(&handle.to_raw())
-                .and_then(|h| self.heap.get(*h))
-                .and_then(Cell::as_object)
-            {
+            if let Some(aux) = self.aux_obj(handle) {
                 for k in aux.ordered_keys().iter().filter(|s| !is_internal_key(s)) {
                     names.push(alloc::string::String::from(*k));
                 }
@@ -4674,12 +4880,7 @@ impl Realm {
         if matches!(self.heap.get(handle), Some(Cell::RegExp { .. })) {
             let mut index_keys: Vec<u32> = Vec::new();
             let mut named: Vec<alloc::string::String> = Vec::new();
-            if let Some(aux) = self
-                .aux_props
-                .get(&handle.to_raw())
-                .and_then(|h| self.heap.get(*h))
-                .and_then(Cell::as_object)
-            {
+            if let Some(aux) = self.aux_obj(handle) {
                 for k in aux.ordered_keys().iter().filter(|s| !is_internal_key(s)) {
                     if let Ok(n) = k.parse::<u32>()
                         && n != u32::MAX
@@ -4712,11 +4913,7 @@ impl Realm {
             )
         ) {
             let mut names = Vec::new();
-            let aux = self
-                .aux_props
-                .get(&handle.to_raw())
-                .and_then(|h| self.heap.get(*h))
-                .and_then(Cell::as_object);
+            let aux = self.aux_obj(handle);
             // A VM closure's `length`/`name` come first (spec order): the
             // synthesized ones, and a redefinition of one (`static length()`)
             // that never deleted it keeps its original position.
@@ -4952,6 +5149,10 @@ impl Realm {
         if a.to_raw() == b.to_raw() {
             return;
         }
+        // An owing closure's debt is listed under its handle: settle it
+        // before the cell changes handles.
+        self.materialize_fn_proto(a);
+        self.materialize_fn_proto(b);
         self.heap.swap(a, b);
         self.cell_swaps = self.cell_swaps.wrapping_add(1);
         // A watched object may have moved: retire every validated chain.
@@ -5030,7 +5231,7 @@ impl Realm {
             self.gc_side_log.push(handle.to_raw());
             // Named (non-index) properties live in the aux object; freeze them too
             // (non-writable + non-configurable) so `verifyProperty` sees them frozen.
-            if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            if let Some(aux) = self.aux_for_write(handle)
                 && let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
             {
                 obj.freeze();
@@ -5065,10 +5266,7 @@ impl Realm {
                 return true;
             }
         } else if self
-            .aux_props
-            .get(&handle.to_raw())
-            .and_then(|a| self.heap.get(*a))
-            .and_then(Cell::as_object)
+            .aux_obj(handle)
             .is_some_and(crate::object::Object::is_frozen)
         {
             return true;
@@ -5246,11 +5444,7 @@ impl Realm {
         }
         let a = self.heap.get(handle).and_then(Cell::as_array)?;
         // No aux object ⇒ no index was ever demoted ⇒ every present index enumerates.
-        let hidden_owner = self
-            .aux_props
-            .get(&handle.to_raw())
-            .and_then(|aux| self.heap.get(*aux))
-            .and_then(Cell::as_object);
+        let hidden_owner = self.aux_obj(handle);
         let Some(o) = hidden_owner else {
             return Some((0..a.len()).filter(|&i| !a[i].is_hole()).collect());
         };
@@ -5344,12 +5538,7 @@ impl Realm {
     /// the dense store's non-hole slots they are the array's own indices.
     #[must_use]
     pub fn array_aux_indices(&self, handle: Handle) -> Vec<usize> {
-        let Some(o) = self
-            .aux_props
-            .get(&handle.to_raw())
-            .and_then(|aux| self.heap.get(*aux))
-            .and_then(Cell::as_object)
-        else {
+        let Some(o) = self.aux_obj(handle) else {
             return Vec::new();
         };
         o.all_keys()
@@ -6189,8 +6378,25 @@ impl Realm {
             return Some(v);
         }
         // A non-object cell (array/function): look in its auxiliary props.
-        let aux = self.aux_props.get(&handle.to_raw())?;
-        self.heap.get(*aux)?.as_object()?.get(key)
+        match self.aux_props.get(&handle.to_raw()) {
+            Some(aux) => self.heap.get(*aux)?.as_object()?.get(key),
+            None => self.owed_property(handle, key),
+        }
+    }
+
+    /// [`get_property`](Self::get_property) of an owing VM closure (see
+    /// [`defer_vm_fn_prototype`](Self::defer_vm_fn_prototype)): its marker
+    /// is `true`; its `prototype` is read only once materialized.
+    #[cold]
+    fn owed_property(&self, handle: Handle, key: &str) -> Option<NanBox> {
+        if !self.fn_owes_proto(handle) {
+            return None;
+        }
+        debug_assert!(
+            key != "prototype",
+            "the `prototype` of an owing closure read before materializing it"
+        );
+        self.owed_fn_props.as_ref()?.get(key)
     }
 
     /// A validated hit of the site's prototype-chain cache for `key` on the
@@ -6712,12 +6918,7 @@ impl Realm {
                         .is_some_and(|a| i < a.len());
                 let has_accessor = self.accessor(handle, key).is_some();
                 // An element stored past the dense cap lives in the aux object.
-                let in_aux = self
-                    .aux_props
-                    .get(&handle.to_raw())
-                    .and_then(|aux| self.heap.get(*aux))
-                    .and_then(Cell::as_object)
-                    .is_some_and(|o| o.has_own_key(key));
+                let in_aux = self.aux_obj(handle).is_some_and(|o| o.has_own_key(key));
                 if !present && !has_accessor && !in_aux {
                     return true;
                 }
@@ -6733,7 +6934,7 @@ impl Realm {
                 {
                     a[i] = NanBox::hole();
                 }
-                if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+                if let Some(aux) = self.aux_for_write(handle)
                     && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
                 {
                     o.delete(root, key);
@@ -6760,7 +6961,7 @@ impl Realm {
         // A callable/array cell stores named props in its auxiliary object (e.g. a
         // built-in function's `name`/`length`); delete there so `delete fn.length`
         // actually removes the configurable own property.
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+        if let Some(aux) = self.aux_for_write(handle)
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             if (o.is_sealed() || o.is_non_configurable(key)) && o.has_own_key(key) {
@@ -6812,7 +7013,7 @@ impl Realm {
             // too, or `delete arr.foo` would still succeed on a sealed array (the
             // side registry only governs the index properties). Mirrors
             // [`Self::freeze_object`].
-            if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+            if let Some(aux) = self.aux_for_write(handle)
                 && let Some(obj) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
             {
                 obj.seal();
@@ -6854,12 +7055,7 @@ impl Realm {
                     | Cell::Promise(_)
             )
         ) {
-            return self
-                .aux_props
-                .get(&handle.to_raw())
-                .and_then(|a| self.heap.get(*a))
-                .and_then(Cell::as_object)
-                .is_none_or(Object::is_extensible);
+            return self.aux_obj(handle).is_none_or(Object::is_extensible);
         }
         // A callable (function/class/native/bound/host) is extensible by default;
         // `preventExtensions`/`seal`/`freeze` records the flag on its aux object.
@@ -6872,12 +7068,7 @@ impl Realm {
                     | Cell::BoundNative { .. }
             )
         ) {
-            return self
-                .aux_props
-                .get(&handle.to_raw())
-                .and_then(|a| self.heap.get(*a))
-                .and_then(Cell::as_object)
-                .is_none_or(Object::is_extensible);
+            return self.aux_obj(handle).is_none_or(Object::is_extensible);
         }
         false
     }
@@ -6892,13 +7083,7 @@ impl Realm {
             if o.is_sealed() {
                 return true;
             }
-        } else if self
-            .aux_props
-            .get(&handle.to_raw())
-            .and_then(|a| self.heap.get(*a))
-            .and_then(Cell::as_object)
-            .is_some_and(Object::is_sealed)
-        {
+        } else if self.aux_obj(handle).is_some_and(Object::is_sealed) {
             return true;
         }
         // Otherwise compute `TestIntegrityLevel(sealed)`.
@@ -7014,10 +7199,7 @@ impl Realm {
             return true;
         }
         // A non-object cell: check its auxiliary props (data or accessor).
-        self.aux_props
-            .get(&handle.to_raw())
-            .and_then(|aux| self.heap.get(*aux))
-            .and_then(Cell::as_object)
+        self.aux_obj(handle)
             .is_some_and(|o| o.contains(key) || o.accessor(key).is_some())
     }
 
@@ -7054,7 +7236,7 @@ impl Realm {
             o.clear_accessor(key);
             return;
         }
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+        if let Some(aux) = self.aux_for_write(handle)
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             o.clear_accessor(key);
@@ -7071,7 +7253,7 @@ impl Realm {
             o.delete_data(root, key);
             return;
         }
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+        if let Some(aux) = self.aux_for_write(handle)
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             o.delete_data(root, key);
@@ -7088,7 +7270,7 @@ impl Realm {
             o.ensure_key_order();
             return;
         }
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+        if let Some(aux) = self.aux_for_write(handle)
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             o.ensure_key_order();
@@ -7213,8 +7395,7 @@ impl Realm {
         if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
             return Some(o);
         }
-        let aux = self.aux_props.get(&handle.to_raw())?;
-        self.heap.get(*aux)?.as_object()
+        self.aux_obj(handle)
     }
 
     /// Whether the cell at `handle` keeps its named properties (and their
@@ -7272,7 +7453,7 @@ impl Realm {
             o.clear_readonly(key);
             return;
         }
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+        if let Some(aux) = self.aux_for_write(handle)
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             o.clear_readonly(key);
@@ -7286,7 +7467,7 @@ impl Realm {
             o.clear_non_configurable(key);
             return;
         }
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+        if let Some(aux) = self.aux_for_write(handle)
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             o.clear_non_configurable(key);
@@ -7300,7 +7481,7 @@ impl Realm {
             o.clear_hidden(key);
             return;
         }
-        if let Some(aux) = self.aux_props.get(&handle.to_raw()).copied()
+        if let Some(aux) = self.aux_for_write(handle)
             && let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut)
         {
             o.clear_hidden(key);
@@ -7391,12 +7572,7 @@ impl Realm {
                 && i < a.len()
                 && crate::realm::is_canonical_decimal(key)
             {
-                let hidden = self
-                    .aux_props
-                    .get(&handle.to_raw())
-                    .and_then(|aux| self.heap.get(*aux))
-                    .and_then(Cell::as_object)
-                    .is_some_and(|o| o.is_hidden(key));
+                let hidden = self.aux_obj(handle).is_some_and(|o| o.is_hidden(key));
                 return !hidden;
             }
         }
@@ -7404,10 +7580,7 @@ impl Realm {
         // its stored hidden flag. The property may be a data slot *or* an accessor
         // (a data property converted to a getter/setter keeps its enumerable flag),
         // so consult both — `contains` only sees data slots.
-        self.aux_props
-            .get(&handle.to_raw())
-            .and_then(|aux| self.heap.get(*aux))
-            .and_then(Cell::as_object)
+        self.aux_obj(handle)
             .is_some_and(|o| (o.contains(key) || o.accessor(key).is_some()) && !o.is_hidden(key))
     }
 
@@ -7994,6 +8167,7 @@ impl Realm {
             native_class_tags,
             gc_side_log,
             gc_symbol_log,
+            owed_fn_protos,
             ..
         } = self;
         // Phase 1 — mark from the real roots, expanding the weak-key side-tables
@@ -8008,6 +8182,8 @@ impl Realm {
             },
         );
         extern_prune(&marked);
+        // The owing closures list is weak.
+        owed_fn_protos.retain(|h| marked.contains(&Handle::from_raw(*h)));
         // Phase 2 — drop every entry whose key is unmarked (full collection: an
         // unmarked key is genuinely dead, so no generation guard is needed).
         // Every table is walked whole, and every survivor ends old.
@@ -8082,6 +8258,7 @@ impl Realm {
             gc_side_log,
             gc_symbol_log,
             gc_side_walk_all,
+            owed_fn_protos,
             ..
         } = self;
         use gc::LiveSet as _;
@@ -8139,6 +8316,9 @@ impl Realm {
         {
             let live = gc::MinorLive(heap);
             extern_prune(&live);
+            // The owing closures list is weak (most entries are short-lived
+            // closures, dead by now).
+            owed_fn_protos.retain(|h| live.contains(&Handle::from_raw(*h)));
             let tables = PruneTables {
                 fn_source,
                 length_tracking_views,
@@ -8284,6 +8464,7 @@ impl Realm {
                 native_protos,
                 callable_null_protos,
                 native_class_tags,
+                owed_fn_protos,
                 ..
             } = self;
             let marked = gc::mark_with_ephemerons_scan(
@@ -8294,6 +8475,8 @@ impl Realm {
                     Self::ephemeron_expand(marked, aux_props, fn_protos, fn_ctor, extra);
                 },
             );
+            // The owing closures list is weak; the survivors move below.
+            owed_fn_protos.retain(|h| marked.contains(&Handle::from_raw(*h)));
             Self::ephemeron_prune(
                 &marked,
                 &|_| true,
@@ -8339,9 +8522,13 @@ impl Realm {
             host_persistent,
             host_native_state,
             typed_len_protos,
+            owed_fn_protos,
             ..
         } = self;
         let stats = gc::compact_with(heap, &mut all, &mut |forward| {
+            for h in owed_fn_protos.iter_mut() {
+                *h = forward(Handle::from_raw(*h)).to_raw();
+            }
             // A live one moves with its cell; a dead one (no typed array
             // links it any more) only costs a needless validation.
             for p in typed_len_protos.iter_mut() {
@@ -10772,6 +10959,108 @@ mod tests {
                 .as_deref(),
             Some("tag"),
         );
+    }
+
+    /// A fresh realm whose default `[[Prototype]]` is set, and a closure in
+    /// it owing its `prototype`.
+    fn realm_with_owing_closure() -> (Realm, Handle) {
+        let mut realm = Realm::new();
+        let op = realm.new_object();
+        realm.set_default_object_proto(op);
+        let f = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(f));
+        (realm, f)
+    }
+
+    #[test]
+    fn an_owing_closure_reads_as_materialized_and_materializes_once() {
+        let (mut realm, f) = realm_with_owing_closure();
+        assert!(realm.fn_owes_proto(f) && !realm.has_aux_object(f));
+        // Every reader sees the owed properties: keys, attributes, marker.
+        assert!(realm.has_own(f, "prototype"));
+        assert!(realm.property_is_non_configurable(f, "prototype"));
+        assert!(!realm.property_is_enumerable(f, "prototype"));
+        assert_eq!(realm.own_property_names(f).unwrap(), ["prototype"]);
+        assert!(realm.aux_named_keys(f).is_empty());
+        assert!(realm.is_extensible(f) && !realm.is_frozen(f) && !realm.is_sealed(f));
+        assert_eq!(
+            realm
+                .get_property(f, crate::nbvm::VM_CTOR)
+                .map(NanBox::to_bits),
+            Some(NanBox::boolean(true).to_bits())
+        );
+        // Made once, then stable.
+        realm.materialize_fn_proto(f);
+        assert!(!realm.fn_owes_proto(f) && realm.has_aux_object(f));
+        let p = realm.get_property(f, "prototype").unwrap();
+        let ph = Handle::from_raw(p.as_handle().unwrap());
+        assert_eq!(
+            realm.get_property(ph, "constructor").map(NanBox::to_bits),
+            Some(NanBox::handle(f.to_raw()).to_bits())
+        );
+        realm.materialize_fn_proto(f);
+        realm.materialize_owed_fn_protos();
+        assert_eq!(
+            realm.get_property(f, "prototype").map(NanBox::to_bits),
+            Some(p.to_bits())
+        );
+        assert_eq!(realm.own_property_names(f).unwrap(), ["prototype"]);
+        assert!(realm.property_is_non_configurable(f, "prototype"));
+    }
+
+    #[test]
+    fn a_change_to_an_owing_closure_materializes_it_first() {
+        let (mut realm, f) = realm_with_owing_closure();
+        realm.set_property(f, "x", NanBox::number(1.0));
+        assert!(!realm.fn_owes_proto(f));
+        assert_eq!(realm.own_property_names(f).unwrap(), ["prototype", "x"]);
+        assert!(realm.get_property(f, "prototype").is_some());
+        // Deleting the non-configurable `prototype` fails.
+        let (mut realm, g) = realm_with_owing_closure();
+        assert!(!realm.delete_property(g, "prototype"));
+        assert!(realm.has_own(g, "prototype") && !realm.fn_owes_proto(g));
+        // Freezing writes the owed properties out, then freezes them.
+        let (mut realm, h) = realm_with_owing_closure();
+        realm.freeze_object(h);
+        assert!(realm.is_frozen(h) && realm.property_is_readonly(h, "prototype"));
+        // Handing the realm over materializes every owing closure.
+        let (mut realm, k) = realm_with_owing_closure();
+        let k2 = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(k2));
+        realm.materialize_owed_fn_protos();
+        assert!(!realm.has_owed_fn_protos());
+        for c in [k, k2] {
+            assert!(!realm.fn_owes_proto(c) && realm.get_property(c, "prototype").is_some());
+        }
+    }
+
+    #[test]
+    fn collections_drop_dead_owing_closures_and_move_live_ones() {
+        // Minor: the dead one leaves the list, the live one keeps owing.
+        let (mut realm, live) = realm_with_owing_closure();
+        let dead = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(dead));
+        realm.collect_minor(&[live]);
+        assert_eq!(realm.owed_fn_protos, [live.to_raw()]);
+        assert!(realm.fn_owes_proto(live));
+        // Full: likewise.
+        let (mut realm, live) = realm_with_owing_closure();
+        let dead = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(dead));
+        realm.collect(&[live]);
+        assert_eq!(realm.owed_fn_protos, [live.to_raw()]);
+        // Compaction moves the live one's entry with it.
+        let (mut realm, _dead) = realm_with_owing_closure();
+        let f = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(f));
+        let mut roots = [f];
+        realm.compact(&mut roots);
+        let f2 = roots[0];
+        assert_ne!(f2.to_raw(), f.to_raw(), "slot relocated");
+        assert_eq!(realm.owed_fn_protos, [f2.to_raw()]);
+        assert!(realm.fn_owes_proto(f2));
+        realm.materialize_owed_fn_protos();
+        assert!(realm.get_property(f2, "prototype").is_some());
     }
 
     #[test]

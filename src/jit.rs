@@ -3480,6 +3480,9 @@ pub struct GenericHelpers {
     /// `jit_helper_new_object(ctx, _) -> bits`: `Op::NewObject`'s fresh
     /// ordinary object (never throws).
     pub new_object: JitTruthyHelper,
+    /// `jit_helper_owe_fn_proto(ctx, closure) -> 0`: `Op::InitFnPrototype`
+    /// of a closure just made inline (never throws).
+    pub owe_fn_proto: JitTruthyHelper,
     /// `jit_helper_new_array(ctx, regs, n_regs, op) -> 0`: `Op::NewArrayFrom`
     /// / `Op::NewArray`, written to the op's destination (the exec-op ABI).
     pub new_array: JitExecOpHelper,
@@ -7587,6 +7590,27 @@ impl JitFunction {
         a.test_rdx_rdx();
         a.jne(refuse_exit); // an unknown entry is a caller bug: refuse, never misrun
         let ok = |r: u16| (r as usize) < n_regs;
+        // The `Op::InitFnPrototype` ops whose closure an inline
+        // `Op::MakeClosure` right before them makes (the codegen pairs them):
+        // that op's fast path runs the prototype step's helper too, its slow
+        // path both ops, so the second emits nothing.
+        let owed_fused: Vec<bool> = (0..bytecode.len())
+            .map(|i| {
+                i > 0
+                    && matches!(
+                        (&ops[i - 1], &ops[i], &bytecode[i - 1], &bytecode[i]),
+                        (
+                            GenericOp::Interp { .. },
+                            GenericOp::Interp { .. },
+                            crate::nbvm::Op::MakeClosure { dst, captures, .. },
+                            crate::nbvm::Op::InitFnPrototype { f },
+                        ) if f == dst
+                            && inline_closures.get(i - 1).copied().unwrap_or(false)
+                            && ok(*dst)
+                            && captures.iter().all(|r| ok(*r))
+                    )
+            })
+            .collect();
         // After a helper `call`, `rax` holds the result or the throw sentinel; the
         // sentinel jumps to the shared throw exit (the caller then reads the pending
         // exception). Emitted after every throwing helper call.
@@ -8012,6 +8036,11 @@ impl JitFunction {
             }
             // The test of an `if (!x)` whose not branched itself.
             if not_tested[op_idx] && not_fused[op_idx - 1] {
+                continue;
+            }
+            // A fresh closure's `Op::InitFnPrototype`, which its inline
+            // `Op::MakeClosure` ran (see `owed_fused`).
+            if owed_fused[op_idx] {
                 continue;
             }
             // The test an inlined call's guard took over (outside promoted
@@ -9463,12 +9492,54 @@ impl JitFunction {
                             a.g_jcc(call_seq::cc::NE, slow);
                             a.g_cmp_byte_imm(call_seq::r::R9, cl.vmfn_plain, 0);
                             a.g_jcc(call_seq::cc::E, slow);
+                            // The `Op::InitFnPrototype` that follows (see
+                            // `owed_fused`) defers its work (as
+                            // `Realm::defer_vm_fn_prototype`, whose terms past
+                            // a single realm are a default `[[Prototype]]`):
+                            // the closure is made owing it and appended to
+                            // the realm's list, in place while it has room,
+                            // else by the helper.
+                            let owe = owed_fused.get(pc as usize + 1).copied().unwrap_or(false);
+                            let push_slow = a.new_label();
+                            if owe {
+                                use call_seq::r;
+                                a.g_load(r::R11, r::R9, layout.props.default_proto);
+                                a.g_cmp_imm(r::R11, -1); // `NO_PROTO`
+                                a.g_jcc(call_seq::cc::E, slow);
+                            }
                             let caps: Vec<i32> = captures.iter().map(|r| disp(*r)).collect();
-                            a.p_alloc_closure(&layout, cl.realm, *func, &caps, slow);
+                            a.p_alloc_closure(&layout, cl.realm, *func, &caps, owe, slow);
                             a.store_rax(disp(*dst));
+                            if owe {
+                                use call_seq::r;
+                                let p = &layout.props;
+                                a.g_load(r::R9, r::R15, cl.realm);
+                                a.g_load(r::R11, r::R9, p.owed_len);
+                                a.g_cmp_mem(r::R11, r::R9, p.owed_cap);
+                                a.g_jcc(call_seq::cc::AE, push_slow);
+                                a.g_load(r::RDX, r::R9, p.owed_ptr);
+                                a.g_shl3(r::R11);
+                                a.g_add(r::RDX, r::R11);
+                                a.g_movabs(r::R11, 0x0000_ffff_ffff_ffff); // the raw handle
+                                a.g_and(r::R11, r::RAX);
+                                a.g_store(r::RDX, 0, r::R11);
+                                a.g_inc_mem(r::R9, p.owed_len);
+                            }
                             let cold = a.cold_begin();
+                            if owe {
+                                // (Already owing: the helper lists it.)
+                                a.bind(push_slow);
+                                a.mov_rdi_r15();
+                                a.g_mov(call_seq::r::RSI, call_seq::r::RAX);
+                                a.movabs_rax(helpers.owe_fn_proto as usize as i64);
+                                a.call_rax();
+                                a.jmp(done);
+                            }
                             a.bind(slow);
                             exec_op!(pc);
+                            if owe {
+                                exec_op!(pc + 1);
+                            }
                             a.jmp(done);
                             a.cold_end(cold);
                             a.bind(done);

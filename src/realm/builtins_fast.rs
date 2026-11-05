@@ -505,9 +505,8 @@ impl Realm {
             | Cell::Collection { .. }
             | Cell::Native(_)
             | Cell::VmFunction { .. } => {
-                if let Some(a) = self.aux_props.get(&h.to_raw())
-                    && self.heap.get(*a)?.as_object()?.has_own_key(key)
-                {
+                // (An owing closure's own keys are its owed ones.)
+                if self.aux_obj(h).is_some_and(|o| o.has_own_key(key)) {
                     return None;
                 }
                 Some(self.object_proto(h))

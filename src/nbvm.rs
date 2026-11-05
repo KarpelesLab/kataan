@@ -2350,7 +2350,10 @@ fn proto_owns_key(realm: &Realm, h: Handle, key: &str) -> bool {
 fn vm_method_of(ctx: &Ctx, recv: NanBox, key: &str) -> Option<NanBox> {
     let mut cur = recv.as_handle().map(Handle::from_raw);
     while let Some(c) = cur {
-        if ctx.realm.proxy_at(c).is_some() || ctx.realm.accessor(c, key).is_some() {
+        if ctx.realm.proxy_at(c).is_some()
+            || ctx.realm.accessor(c, key).is_some()
+            || (key == "prototype" && ctx.realm.fn_owes_proto(c))
+        {
             return None;
         }
         if let Some(v) = ctx.realm.get_property(c, key) {
@@ -2486,8 +2489,10 @@ pub(crate) const VM_CTOR: &str = "\u{0}vmctor";
 /// non-enumerable, non-configurable property (ordinary function objects,
 /// ECMA-262 `MakeConstructor`), and marks `f` constructible.
 fn init_fn_prototype(realm: &mut Realm, f: Handle) {
-    // A fresh closure (the usual case): built in one step from cached layouts.
-    if realm.init_vm_fn_prototype(f, VM_CTOR) {
+    // A fresh closure (the usual case): owed until first observed (see
+    // `Realm::defer_vm_fn_prototype`), else built in one step from cached
+    // layouts.
+    if realm.defer_vm_fn_prototype(f) || realm.init_vm_fn_prototype(f, VM_CTOR) {
         return;
     }
     let proto = realm.new_object();
@@ -4071,6 +4076,7 @@ fn vm_construct(
         .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)));
     let proto = if nt_is_vm || ctx.host.is_none() {
         let nth = new_target.as_handle().map(Handle::from_raw).unwrap_or(fh);
+        ctx.realm.materialize_fn_proto(nth);
         ctx.realm.get_property(nth, "prototype")
     } else {
         match with_host(ctx, |h| h.proto_from_constructor(new_target)) {
@@ -4113,11 +4119,13 @@ fn vm_construct(
 /// `[[Prototype]]` chain free of proxies (whose `getPrototypeOf` may trap).
 /// `None` (nothing done) for anything else, which the host decides — and
 /// throws for.
-fn instance_of_fast(realm: &Realm, x: NanBox, y: NanBox) -> Option<bool> {
+fn instance_of_fast(realm: &mut Realm, x: NanBox, y: NanBox) -> Option<bool> {
     let f = Handle::from_raw(y.as_handle()?);
     if !realm.inherits_default_has_instance(f) {
         return None;
     }
+    realm.materialize_fn_proto(f);
+    let realm = &*realm;
     let p = realm
         .get_property(f, "prototype")
         .filter(|p| is_object_value(realm, *p))?
@@ -4581,6 +4589,10 @@ impl From<HostError> for VmError {
 /// the realm again. `None` when this run has no host.
 fn with_host<R>(ctx: &mut Ctx, f: impl FnOnce(&mut dyn VmHost) -> R) -> Option<R> {
     let host = ctx.host.as_deref_mut()?;
+    // The host never sees a closure that owes its `prototype`.
+    if ctx.realm.has_owed_fn_protos() {
+        ctx.realm.materialize_owed_fn_protos();
+    }
     core::mem::swap(&mut ctx.realm, host.realm_slot());
     let r = f(host);
     core::mem::swap(&mut ctx.realm, host.realm_slot());
@@ -6321,6 +6333,10 @@ fn vm_get_prop(
         // owns. Else the closure's own data property (in its auxiliary
         // object) through the site's slot cache.
         let closure = ctx.realm.is_vm_function(h);
+        if closure {
+            // (Its owed `prototype` is made when first read.)
+            ctx.realm.materialize_fn_proto_for(h, key);
+        }
         let hit = if closure {
             match ctx.realm.fn_chain_get(h, key, cache) {
                 None => match ctx.realm.vm_fn_cached_get(h, key, cache) {
@@ -6540,6 +6556,9 @@ fn vm_get_prop(
                 let mut found = NanBox::undefined();
                 let mut cur = ctx.realm.object_proto(handle);
                 while let Some(p) = cur {
+                    // (A closure on the chain makes its owed `prototype` when
+                    // that is read through it.)
+                    ctx.realm.materialize_fn_proto_for(p, key);
                     // An exotic object on the chain (a proxy's `get` trap) is the
                     // host's to read.
                     if ctx.host.is_some() && ctx.realm.proxy_at(p).is_some() {
@@ -7100,6 +7119,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         str_proof: jit_tier::jit_helper_str_proof,
         to_str: jit_tier::jit_helper_to_str,
         new_object: jit_tier::jit_helper_new_object,
+        owe_fn_proto: jit_tier::jit_helper_owe_fn_proto,
         new_array: jit_tier::jit_helper_new_array,
         iter_next: jit_tier::jit_helper_iter_next,
     }
@@ -7900,7 +7920,13 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
     // A hosted run collects through the host, which adds the roots only it can
     // see (its global environment, class tables, …) and prunes its weak tables.
     if ctx.host.is_some() {
-        with_host(ctx, |h| h.collect_garbage(&roots));
+        // (The collection observes no closure's properties, and drops the
+        // owing closures that died unobserved: no materialization first.)
+        if let Some(host) = ctx.host.as_deref_mut() {
+            core::mem::swap(&mut ctx.realm, host.realm_slot());
+            host.collect_garbage(&roots);
+            core::mem::swap(&mut ctx.realm, host.realm_slot());
+        }
         return;
     }
     ctx.realm.maybe_collect(&roots);
@@ -9341,7 +9367,7 @@ fn run_frame_at_ic(
             } => {
                 let (x, y) = (regs[*a as usize], regs[*b as usize]);
                 if let Some(r) = if *instanceof {
-                    instance_of_fast(&ctx.realm, x, y)
+                    instance_of_fast(&mut ctx.realm, x, y)
                 } else {
                     // `key in obj` over an ordinary chain (a `for-in`'s
                     // per-key liveness check among others).
@@ -10162,6 +10188,9 @@ fn run_frame_at_ic(
                 // invoked with the receiver as `this`); otherwise try a built-in
                 // `Array`/`String` method on the fast path.
                 let mut accessor_err = None;
+                if let Some(h) = recv_val.as_handle() {
+                    ctx.realm.materialize_chain_for(Handle::from_raw(h), key);
+                }
                 let user_method = recv_val.as_handle().map(Handle::from_raw).and_then(|h| {
                     let mut cur = Some(h);
                     while let Some(c) = cur {
@@ -10991,6 +11020,8 @@ fn vm_get_elem_from(
                 Err(_) if ctx.host.is_some() => return host_get(ctx, recv, key),
                 Err(e) => return Err(e),
             };
+            // (A closure's owed `prototype` is made when first read.)
+            ctx.realm.materialize_fn_proto_for(handle, &ks);
             // A canonical numeric string key on an array (`arr["0"]`) reads the
             // element, like `arr[0]` — for a valid array index [0, 2**32−1); the
             // boundary value is an ordinary property.
