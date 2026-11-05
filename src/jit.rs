@@ -10990,6 +10990,14 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(slow);
+                    // Not two Numbers: decided inline unless both operands are
+                    // heap values (strings and BigInts compare by contents) or
+                    // neither is (two immediates, a Number and an immediate).
+                    a.p_strict_eq_identity(
+                        (disp(ra), disp(rb), disp(dst)),
+                        (tag_true, tag_false),
+                        done,
+                    );
                     // `jit_helper_strict_eq` never throws → no sentinel check.
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(ra));

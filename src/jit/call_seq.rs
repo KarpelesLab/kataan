@@ -965,6 +965,50 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0xc1, 0xe0 | (reg & 7), 3]);
     }
 
+    /// `shr reg, imm` (64-bit).
+    pub(crate) fn g_shr_imm(&mut self, reg: u8, imm: u8) {
+        self.code.push(0x48 | ((reg >> 3) & 1));
+        self.code.extend_from_slice(&[0xc1, 0xe8 | (reg & 7), imm]);
+    }
+
+    /// The part of an inline `===` of two frame slots (`a`, `b`, at least
+    /// one not a Number) decided by the words alone, storing the boolean
+    /// (`t`/`f`'s bits) into slot `dst` and going to `done`: unless both are
+    /// heap values (strings and BigInts compare by contents), `===` is the
+    /// words' equality (`NanBox::strict_equals`; no NaN is involved, as not
+    /// both are Numbers), and so is the same word between heap values.
+    /// Falls through, with nothing stored, for two distinct heap values: the
+    /// helper's case. Clobbers `rax`, `r11`, `rsi`, `rdx`.
+    pub(crate) fn p_strict_eq_identity(
+        &mut self,
+        (a, b, dst): (i32, i32, i32),
+        (t, f): (u64, u64),
+        done: Label,
+    ) {
+        // A heap handle's top 14 bits are all set (sign + the QNAN pattern),
+        // so those of two words' AND are exactly when both are handles.
+        const HANDLE_TOP: i32 = 0x3fff;
+        let same = self.new_label();
+        let helper = self.new_label();
+        self.load_argreg(1, a);
+        self.load_argreg(2, b);
+        self.g_cmp(r::RSI, r::RDX);
+        self.g_jcc(cc::E, same);
+        self.g_mov(r::RAX, r::RSI);
+        self.g_and(r::RAX, r::RDX);
+        self.g_shr_imm(r::RAX, 50);
+        self.g_cmp_imm(r::RAX, HANDLE_TOP);
+        self.g_jcc(cc::E, helper);
+        self.g_movabs(r::RAX, f);
+        self.store_rax(dst);
+        self.jmp(done);
+        self.bind(same);
+        self.g_movabs(r::RAX, t);
+        self.store_rax(dst);
+        self.jmp(done);
+        self.bind(helper);
+    }
+
     /// `cmp a, b`.
     pub(crate) fn g_cmp(&mut self, a: u8, b: u8) {
         self.g_rr(0x39, a, b);

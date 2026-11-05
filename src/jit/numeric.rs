@@ -3011,7 +3011,13 @@ impl NumGen {
                 let fused = self.fusable(pc, ops, dst);
                 // Against a constant: the bits alone (in a general-purpose
                 // register, no type test, no slow path).
-                let kind = match (self.const_num_bits_at(pc, y), self.const_num_bits_at(pc, x)) {
+                // So is one against `undefined`, `null` or a boolean: such a
+                // value is `===` only to itself.
+                let konst = |r| {
+                    self.const_num_bits_at(pc, r)
+                        .or_else(|| self.const_imm_bits_at(pc, r))
+                };
+                let kind = match (konst(y), konst(x)) {
                     (Some(k), _) if x != y => CmpKind::Bits(x, k),
                     (_, Some(k)) if x != y => CmpKind::Bits(y, k),
                     _ => CmpKind::Eq(false),
@@ -4173,6 +4179,21 @@ impl NumGen {
         };
         let v = value.as_number().filter(|v| *dst == r && !v.is_nan())?;
         Some(v.to_bits())
+    }
+
+    /// The bits of an immediate constant (`undefined`, `null`, a boolean)
+    /// when the op just before `pc` (not a jump target) loads it into `r`:
+    /// a value strictly equal to nothing but the same word.
+    fn const_imm_bits_at(&self, pc: usize, r: u16) -> Option<u64> {
+        if pc == 0 || self.is_target.get(pc).copied().unwrap_or(true) {
+            return None;
+        }
+        let Some(Op::LoadConst { dst, value }) = self.bc(pc - 1) else {
+            return None;
+        };
+        // (`===` compares any word that is neither a Number nor a handle
+        // by its encoding: `NanBox::strict_equals`.)
+        (*dst == r && !value.is_number() && !value.is_handle()).then(|| value.to_bits())
     }
 
     /// `dst = x % y`: inline when both are integral Numbers that convert
