@@ -1021,6 +1021,14 @@ pub fn expand<'a>(
                             let Op::Return { src } = bop else {
                                 return None;
                             };
+                            // (A derived constructor's: `this`, see
+                            // `derived_tail`.)
+                            let this_reg = this_slot as Reg;
+                            let src = if derived_tail(p, construct) {
+                                &this_reg
+                            } else {
+                                src
+                            };
                             // `return r`: the call's result, then (but from the
                             // last op) to the end.
                             emit!(
@@ -1120,8 +1128,13 @@ pub fn expand<'a>(
 /// lowering drops it in the function's own code: computing the bound value
 /// has no effect) or, at a `new` site (`construct`), when it binds the
 /// guard's freshly allocated object (`OrdinaryCallBindThis` of an object is
-/// that object); anything else is itself.
+/// that object); a derived constructor's implicit `return undefined`, at a
+/// construct site, is its `return` of `this` alone (see [`derived_tail`]);
+/// anything else is itself.
 fn width(p: &FnProto, j: usize, construct: bool) -> usize {
+    if derived_tail(p, construct) && j + 3 >= p.ops.len() && j + 1 < p.ops.len() {
+        return 0;
+    }
     match &p.ops[j] {
         Op::Return { .. } => {
             if j + 1 == p.ops.len() && !falls_off(p) {
@@ -1142,6 +1155,16 @@ fn width(p: &FnProto, j: usize, construct: bool) -> usize {
         }
         _ => 1,
     }
+}
+
+/// Whether `p`, inlined at a construct site (`construct`), is a derived
+/// constructor: its last three ops are the implicit `return undefined`
+/// (`derived_ok`), whose result is the `this` its one `super(…)` bound — so
+/// the splice makes them one move of `this` to the call's result (the
+/// `LoadConst` and `Op::DerivedResult`, which nothing else reads, take no
+/// op).
+fn derived_tail(p: &FnProto, construct: bool) -> bool {
+    construct && p.derived && p.ops.len() >= 3
 }
 
 /// Whether control can fall off the callee's end (its last op is not a
@@ -1404,7 +1427,9 @@ fn live_step(
                 *o |= *l;
             }
         }
-        if width(p, j, construct) > 0 {
+        if derived_tail(p, construct) && j + 1 == n {
+            // (The move of `this`, which the guard writes.)
+        } else if width(p, j, construct) > 0 {
             def_use(op, defs, uses);
             for &d in defs.iter() {
                 if let Some(x) = out.get_mut(d as usize) {
