@@ -78,6 +78,40 @@ impl Default for KeyMemo {
     }
 }
 
+/// Where compiled code finds an entry (`crate::jit::key_probe`): the realm's
+/// field holding the entries' address (`0` before the memo is made), the
+/// entry stride and the entry's rope, layout and slot fields. An entry's
+/// index is `index` of the rope's address.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyMemoLayout {
+    pub(crate) entries: i32,
+    pub(crate) size: i32,
+    pub(crate) rope: i32,
+    pub(crate) shape: i32,
+    pub(crate) slot: i32,
+}
+
+/// [`KeyMemoLayout`], and the index's mask (`CAP - 1`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn jit_key_memo_layout() -> (KeyMemoLayout, i32) {
+    use core::mem::{offset_of, size_of};
+    let i = |v: usize| i32::try_from(v).expect("key memo offset fits in i32");
+    // (`index` as compiled code computes it: `(p >> 4 ^ p >> 14) & mask`.)
+    const _: () = assert!(CAP.is_power_of_two());
+    (
+        KeyMemoLayout {
+            entries: i(offset_of!(Realm, key_memo_entries)),
+            size: i(size_of::<Entry>()),
+            rope: i(offset_of!(Entry, rope)),
+            shape: i(offset_of!(Entry, shape)),
+            slot: i(offset_of!(Entry, slot)),
+        },
+        i(CAP - 1),
+    )
+}
+
 /// How many noted misses later a key String's second miss still records it.
 const SEEN_WINDOW: u32 = 512;
 
@@ -145,7 +179,9 @@ impl Realm {
                 let Some((_, rope)) = self.key_rope(key) else {
                     return;
                 };
-                (self.key_memo.get_or_init(Box::default), rope.addr())
+                let m = self.key_memo.get_or_init(Box::default);
+                self.key_memo_entries.set(m.entries.as_ptr() as usize);
+                (m, rope.addr())
             }
         };
         let e = &memo.entries[index(p)];

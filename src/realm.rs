@@ -36,6 +36,8 @@ pub use fn_chain::FnChain;
 pub(crate) use forin_cache::{ForInSite, KeyTable, NO_SLOT};
 mod gen_state;
 mod key_memo;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use key_memo::{KeyMemoLayout, jit_key_memo_layout};
 mod private_fast;
 pub use private_fast::PrivCache;
 pub(crate) mod hidden_layout;
@@ -370,6 +372,9 @@ pub struct Realm {
     for_in_cache: Option<alloc::boxed::Box<forin_cache::ForInCache>>,
     /// The String-key slot memo (`key_memo`), made on first use.
     key_memo: core::cell::OnceCell<alloc::boxed::Box<key_memo::KeyMemo>>,
+    /// The address of the memo's entries once it is made, else `0`: what
+    /// compiled code probes (`key_memo::KeyMemoLayout`).
+    key_memo_entries: core::cell::Cell<usize>,
     /// Compiled programs by `(source, flags)`, most recently used last: every
     /// evaluation of a regex literal creates a new RegExp object (so a literal
     /// in a loop is a fresh object per iteration), but they share one compiled
@@ -953,6 +958,7 @@ impl Realm {
             cell_swaps: 0,
             for_in_cache: None,
             key_memo: core::cell::OnceCell::new(),
+            key_memo_entries: core::cell::Cell::new(0),
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),

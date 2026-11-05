@@ -26539,6 +26539,36 @@ mod tests {
         assert_eq!(out, "81036 abcefabcde 430000 48000\n");
     }
 
+    /// Compiled `d[k]` and `k in d` with memoized String keys
+    /// (`jit::key_probe`) while the dictionary changes: a key deleted and
+    /// re-added with another kind of value, a key turned into an accessor
+    /// and back, a new prototype, keys absent or inherited. (Expected values
+    /// from node.)
+    #[cfg(feature = "std")]
+    #[test]
+    fn compiled_string_key_reads_follow_the_object() {
+        let (out, _) = execute(
+            "var d = {}; for (let i = 0; i < 40; i++) d['k' + i] = i;
+             var ks = Object.keys(d).concat(['nope', 'toString']);
+             var s = 0, g = 0, h = 0;
+             for (let r = 0; r < 2000; r++) {
+               for (let i = 0; i < ks.length; i++) {
+                 const v = d[ks[i]];
+                 s += typeof v === 'number' ? v : (v === undefined ? 1 : 2);
+                 if (ks[i] in d) h++;
+               }
+               if (r === 300) delete d.k5;
+               if (r === 400) d.k5 = 'back';
+               if (r === 500) Object.defineProperty(d, 'k7', { get() { g++; return 70; }, configurable: true });
+               if (r === 600) Object.defineProperty(d, 'k7', { value: 7, writable: true, configurable: true, enumerable: true });
+               if (r === 700) Object.setPrototypeOf(d, { nope: 3 });
+             }
+             console.log(s, g, h);",
+        )
+        .expect("ok");
+        assert_eq!(out, "1569701 100 83199\n");
+    }
+
     #[test]
     fn execute_runs_on_the_hosted_vm() {
         // A program the bytecode VM compiles fully (closures, loops, output).

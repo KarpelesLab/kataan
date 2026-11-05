@@ -40,6 +40,8 @@ mod handle;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod key_probe;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod pin;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod prologue;
@@ -7002,6 +7004,8 @@ impl JitFunction {
         // instances; see `compute_jit_layout` + the `jit_layout_matches_safe_reads`
         // verification test).
         let layout = *compute_jit_layout();
+        // Where a String key's memoized slot is (`key_probe`).
+        let key_probe = key_probe::KeyProbe::new();
         // The widest argument list across all native-call sites; a scratch buffer
         // of this many NanBox slots is reserved in the native frame so each call
         // can marshal its arguments into a contiguous region.
@@ -9733,6 +9737,39 @@ impl JitFunction {
                             a.cold_end(cold);
                             a.bind(done);
                         }
+                        // `key in obj` for a String key the String-key slot
+                        // memo names in `obj`'s layout (`key_probe`):
+                        // `true`, with no call; else the interpreter's op.
+                        crate::nbvm::Op::Relational {
+                            dst,
+                            instanceof: false,
+                            a: key,
+                            b: obj,
+                        } if ok(*dst)
+                            && ok(*key)
+                            && ok(*obj)
+                            && num.result_xmm(op_idx, *key).is_none()
+                            && num.result_xmm(op_idx, *obj).is_none() =>
+                        {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            a.load_rax(disp(*key));
+                            a.p_cmp_handle_floor(call_seq::r::RAX);
+                            a.g_jcc(call_seq::cc::B, slow);
+                            walk_to_slot!(*obj, slow);
+                            a.p_object_not_exotic(&layout, slow);
+                            let cl = &helpers.call_layout;
+                            a.fi_plain_read(&layout, (cl.realm, cl.str_special), slow);
+                            a.kp_slot(&layout, &key_probe, cl.realm, disp(*key), slow);
+                            a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                            a.store_rax(disp(*dst));
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.jmp(done);
+                            a.cold_end(cold);
+                            a.bind(done);
+                        }
                         // A compiled `for-in`'s `EnumKeys` (`forin`): the
                         // memoized key list's array, its slot table left in
                         // the loop's site, else the interpreter's op.
@@ -10585,6 +10622,8 @@ impl JitFunction {
                     let bail = num.spec_bail(&mut a, op_idx);
                     let helper = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
+                    // Where an element read's value (in `rax`) goes on.
+                    let got = a.new_label();
                     // `o[k]` in a compiled `for-in` over `o` (`forin`): the
                     // slot the loop's key table gives the key, with no call.
                     if let Some((l, site)) = forin_plan
@@ -10620,6 +10659,37 @@ impl JitFunction {
                         a.cold_end(cold);
                         a.bind(other);
                     }
+                    if bail.is_none()
+                        && !num.is_number_at(op_idx, index)
+                        && num.result_xmm(op_idx, index).is_none()
+                        && num.result_xmm(op_idx, obj).is_none()
+                        // (Both operands in the register file: no hoisted
+                        // receiver, no sunk load of it.)
+                        && num.hoisted_array(op_idx, obj).is_none()
+                        && num.hoisted_view(op_idx, obj).is_none()
+                        && (op_idx == 0 || !num.sunk_load(op_idx - 1))
+                    {
+                        // A String key's slot from the String-key slot memo
+                        // (`key_probe`), with no call, on to `got` with the
+                        // value. (A Number key goes on at once.)
+                        let other = a.new_label();
+                        let spill = a.new_label();
+                        a.load_rax(disp(index));
+                        a.p_cmp_handle_floor(call_seq::r::RAX);
+                        a.g_jcc(call_seq::cc::B, other);
+                        walk_to_slot!(obj, other);
+                        a.p_object_not_exotic(&layout, other);
+                        let cl = &helpers.call_layout;
+                        a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
+                        a.kp_slot(&layout, &key_probe, cl.realm, disp(index), other);
+                        a.p_obj_slot_load_inline(&layout, other, spill);
+                        a.jmp(got);
+                        let cold = a.cold_begin();
+                        a.bind(spill);
+                        a.p_obj_slot_load_spill(&layout, got);
+                        a.cold_end(cold);
+                        a.bind(other);
+                    }
                     // A typed-array view's element (`typed::t_get`) is tried
                     // where the array path misses — except at a receiver-
                     // cache site of a speculative loop's fast version that a
@@ -10629,7 +10699,6 @@ impl JitFunction {
                     // reads it inline.
                     let typed = bail.is_none() || !typed::relied_on(&rc, op_idx);
                     let not_arr = if typed { a.new_label() } else { helper };
-                    let got = a.new_label();
                     // Without a receiver-cache site, one walk serves both:
                     // its cell tag picks the array path or the view's (with
                     // the walk's slot in `rcx`), and the array path's misses
