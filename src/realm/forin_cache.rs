@@ -20,6 +20,10 @@
 //! non-wrapper, non-host-exotic objects take part (never a proxy, an array,
 //! a typed array, a String wrapper, the global object or a function), and a
 //! moved cell (`Realm::swap_cell_state`, compaction) retires every entry.
+//! The links are watched (`crate::object::JIT_FLAG_WATCHED`), so once the
+//! chain has been walked and found unchanged at prototype epoch `E`, a
+//! lookup while the epoch is still `E` checks only the receiver's own
+//! `[[Prototype]]`.
 //!
 //! The cached key Strings are handed to the loop as they are (a String is
 //! immutable, and its identity is not observable), so they are GC roots.
@@ -67,6 +71,9 @@ struct Entry {
     links: Vec<(u64, u32)>,
     /// `Realm::cell_swaps` when the entry was made.
     swaps: u32,
+    /// The prototype epoch (`crate::object::proto_epoch`) at which `links`
+    /// last matched the chain, all of them watched (`0`: never).
+    stamp: core::cell::Cell<u64>,
     /// The `for-in` key list.
     keys: Vec<NanBox>,
     /// Per key: its bits and its slot in `shape` (an own key whose String is
@@ -146,13 +153,20 @@ impl Realm {
     /// The receiver's shape, when `h` is a plain shaped ordinary object
     /// whose `for-in` share is decided by that shape alone.
     fn for_in_receiver_shape(&self, h: Handle) -> Option<&Rc<Shape>> {
+        self.for_in_receiver(h).map(|(_, s)| s)
+    }
+
+    /// [`for_in_receiver_shape`](Self::for_in_receiver_shape), with the
+    /// object.
+    #[inline]
+    fn for_in_receiver(&self, h: Handle) -> Option<(&crate::object::Object, &Rc<Shape>)> {
         let Some(Cell::Object(o)) = self.heap.get(h) else {
             return None;
         };
         if !o.is_plain_shaped() || o.is_prim_wrapper() || self.is_host_exotic(h) {
             return None;
         }
-        o.shaped_shape()
+        Some((o, o.shaped_shape()?))
     }
 
     /// One prototype-chain link's `(key epoch, [[Prototype]])`, when it is an
@@ -181,13 +195,20 @@ impl Realm {
     /// ([`for_in_cached`](Self::for_in_cached)).
     fn for_in_cached_entry(&self, h: Handle) -> Option<(usize, &Entry)> {
         let cache = self.for_in_cache.as_deref()?;
-        let shape = self.for_in_receiver_shape(h)?;
+        let (o, shape) = self.for_in_receiver(h)?;
         let w = cache.find(shape)?;
         let e = cache.entries[w].as_ref()?;
         if e.swaps != self.cell_swaps {
             return None;
         }
-        let mut cur = self.object_proto(h);
+        let mut cur = o.proto();
+        // Every link is watched, so while the prototype epoch is the one the
+        // whole chain was last found unchanged at, only the receiver's own
+        // `[[Prototype]]` can differ.
+        let now = crate::object::proto_epoch();
+        if e.stamp.get() == now && e.links.first().map(|l| l.0) == cur.map(Handle::to_raw) {
+            return Some((w, e));
+        }
         for &(raw, epoch) in &e.links {
             let link = cur?;
             if link.to_raw() != raw {
@@ -199,7 +220,11 @@ impl Realm {
             }
             cur = next;
         }
-        cur.is_none().then_some((w, e))
+        if cur.is_some() {
+            return None;
+        }
+        e.stamp.set(now);
+        Some((w, e))
     }
 
     /// An array of the memoized `for-in` key list of `h` (see
@@ -258,9 +283,18 @@ impl Realm {
                 (k.to_bits(), slot)
             })
             .collect();
+        // Each link is watched (`crate::object::JIT_FLAG_WATCHED`), so a
+        // change to its keys or `[[Prototype]]` bumps the prototype epoch and
+        // an unchanged epoch proves the chain (`for_in_cached_entry`).
+        for &(raw, _) in &links {
+            if let Some(Cell::Object(o)) = self.heap.get_mut(Handle::from_raw(raw)) {
+                o.watch();
+            }
+        }
         let entry = Entry {
             links,
             swaps: self.cell_swaps,
+            stamp: core::cell::Cell::new(0),
             keys: keys.to_vec(),
             slots,
             hint: core::cell::Cell::new(0),
