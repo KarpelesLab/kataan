@@ -3640,6 +3640,14 @@ impl Realm {
         self.array_proto_intrinsic.or(self.root_array_proto)
     }
 
+    /// The first `%Array.prototype%`: the prototype of every array whose
+    /// cell has never had its prototype set
+    /// ([`plain_array_root_proto`](Self::plain_array_root_proto)).
+    #[must_use]
+    pub(crate) fn root_array_proto(&self) -> Option<Handle> {
+        self.root_array_proto
+    }
+
     /// Allocates a VM-held host environment cell (see [`Cell::Env`]).
     pub fn new_env(&mut self, env: crate::env::Scope) -> Handle {
         self.heap.alloc(Cell::Env(env))

@@ -2340,6 +2340,21 @@ impl X64Assembler {
         }
     }
 
+    /// To `miss` unless destructuring a fresh array runs no code by the
+    /// realm's published open ([`Self::p_array_iter_open`], whose epoch test
+    /// covers its `fresh` stamp too): what `iter_fast::fresh_array_is_plain`
+    /// decides. Clobbers `rax`, `r9`, `r11`.
+    pub(crate) fn p_array_iter_fresh(&mut self, realm_off: i32, miss: Label) {
+        use crate::realm::builtins_fast::ArrayIterJit as J;
+        let base = core::mem::offset_of!(crate::realm::Realm, array_iter_jit);
+        let off = |f: usize| i32::try_from(base + f).unwrap_or(i32::MAX);
+        self.p_array_iter_open(realm_off, miss);
+        // `r9` is still the realm: `fresh == stamp` (the current epoch).
+        self.g_load(r::RAX, r::R9, off(core::mem::offset_of!(J, stamp)));
+        self.g_cmp_mem(r::RAX, r::R9, off(core::mem::offset_of!(J, fresh)));
+        self.g_jcc(cc::NE, miss);
+    }
+
     /// `null`/`undefined` in `rax` to `falsy` (else fall through). Clobbers
     /// `r11`.
     pub(crate) fn p_truthy_nullish(&mut self, falsy: Label) {

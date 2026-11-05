@@ -106,38 +106,9 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
         && let Some((ok, f, n)) = open_memo_hit(realm, p)
     {
         // For a plain array, publish the open to compiled code.
-        #[cfg(all(
-            feature = "jit",
-            feature = "alloc",
-            target_os = "linux",
-            target_arch = "x86_64"
-        ))]
-        if ok
-            && root.is_some()
-            && let Some((iter_at, next_at)) = &realm.array_iter_memo.open
-            && let Some(iter_ptr) = realm
-                .jit_object(Handle::from_raw(iter_at.0))
-                .and_then(|o| o.jit_slot_ptr(iter_at.2))
-            && let Some(next_ptr) = realm
-                .jit_object(Handle::from_raw(next_at.0))
-                .and_then(|o| o.jit_slot_ptr(next_at.2))
-        {
-            let jit = crate::realm::builtins_fast::ArrayIterJit {
-                stamp: realm.array_iter_memo.open_stamp,
-                iter_ptr: iter_ptr as u64,
-                iter_fn: f.to_bits(),
-                next_ptr: next_ptr as u64,
-                next_fn: n.to_bits(),
-            };
-            realm.array_iter_jit = jit;
+        if ok && root.is_some() {
+            publish_open(realm, f, n);
         }
-        #[cfg(not(all(
-            feature = "jit",
-            feature = "alloc",
-            target_os = "linux",
-            target_arch = "x86_64"
-        )))]
-        let _ = (f, n);
         return ok;
     }
     if !can_open_walk(realm, h) {
@@ -163,6 +134,58 @@ pub(super) fn plain_spread_elems(realm: &Realm, v: NanBox) -> Option<&[NanBox]> 
     let (p, elems) = realm.plain_root_array_elems(Handle::from_raw(v.as_handle()?))?;
     let (ok, _, _) = open_memo_hit(realm, p)?;
     (ok && !elems.iter().any(|e| e.is_hole())).then_some(elems)
+}
+
+/// Publishes the memo's open — found valid now for the first
+/// `%Array.prototype%`, with the values `f` (`@@iterator`) and `n` (`next`)
+/// — to compiled code ([`ArrayIterJit`](crate::realm::builtins_fast::ArrayIterJit)),
+/// with whether a fresh array's destructuring is plain at this epoch too.
+fn publish_open(realm: &mut Realm, f: NanBox, n: NanBox) {
+    #[cfg(all(
+        feature = "jit",
+        feature = "alloc",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    {
+        let m = &realm.array_iter_memo;
+        let stamp = m.open_stamp;
+        // A fresh array's prototype is the memo's (the first one), and no
+        // `return` is reachable for its close (see `fresh_pair_is_plain`).
+        let fresh = if m.close_stamp == stamp
+            && realm.root_array_proto().is_some()
+            && realm.fresh_array_proto() == realm.root_array_proto()
+            && realm.root_array_proto().map(Handle::to_raw) == Some(m.open_proto)
+        {
+            stamp
+        } else {
+            u64::MAX
+        };
+        if let Some((iter_at, next_at)) = &realm.array_iter_memo.open
+            && let Some(iter_ptr) = realm
+                .jit_object(Handle::from_raw(iter_at.0))
+                .and_then(|o| o.jit_slot_ptr(iter_at.2))
+            && let Some(next_ptr) = realm
+                .jit_object(Handle::from_raw(next_at.0))
+                .and_then(|o| o.jit_slot_ptr(next_at.2))
+        {
+            realm.array_iter_jit = crate::realm::builtins_fast::ArrayIterJit {
+                stamp,
+                iter_ptr: iter_ptr as u64,
+                iter_fn: f.to_bits(),
+                next_ptr: next_ptr as u64,
+                next_fn: n.to_bits(),
+                fresh,
+            };
+        }
+    }
+    #[cfg(not(all(
+        feature = "jit",
+        feature = "alloc",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    let _ = (realm, f, n);
 }
 
 /// The memoized [`can_open`] answer for an array with no own named
@@ -253,8 +276,13 @@ fn fresh_pair_is_plain(realm: &mut Realm) -> bool {
         return false;
     };
     if realm.array_iter_memo.close_stamp == crate::object::proto_epoch()
-        && let Some((ok, _, _)) = open_memo_hit(realm, array_proto)
+        && let Some((ok, f, n)) = open_memo_hit(realm, array_proto)
     {
+        // Published for compiled code's own test (`Op::FreshArrayIterPlain`)
+        // when the memo is the first `%Array.prototype%`'s.
+        if ok && realm.root_array_proto() == Some(array_proto) {
+            publish_open(realm, f, n);
+        }
         return ok;
     }
     if !fresh_pair_walk(realm) {

@@ -7280,6 +7280,12 @@ impl JitFunction {
                                         l.obj == *obj && okr(l.arr) && okr(l.index)
                                     })
                             }
+                            // A destructuring's `FreshArrayIterPlain` test
+                            // branches on its result itself too.
+                            (
+                                crate::nbvm::Op::FreshArrayIterPlain { dst },
+                                GenericOp::JumpIfFalse { cond, target },
+                            ) => cond == dst && *target > i && *target <= ops.len() && okr(*dst),
                             _ => false,
                         }
                 })
@@ -9578,6 +9584,42 @@ impl JitFunction {
                             a.jmp(fin);
                             a.bind(slow);
                             exec_op!(pc);
+                            a.bind(fin);
+                        }
+                        // Whether a fresh array destructures without running
+                        // code, as the realm last published it valid
+                        // (`p_array_iter_fresh`): `true` inline. Anything
+                        // else is the interpreter's op (which may publish).
+                        crate::nbvm::Op::FreshArrayIterPlain { dst } if ok(*dst) => {
+                            // Its `JumpIfFalse`, fused (`forin_fuse`): `true`
+                            // falls through it, the helper's result is tested
+                            // here (out of line).
+                            let fused = match ops.get(op_idx + 1) {
+                                Some(&GenericOp::JumpIfFalse { target, .. })
+                                    if forin_fuse.get(op_idx + 1) == Some(&true) =>
+                                {
+                                    Some(num.branch_label(&labels, op_idx + 1, target)?)
+                                }
+                                _ => None,
+                            };
+                            let slow = a.new_label();
+                            let fin = a.new_label();
+                            a.p_array_iter_fresh(helpers.call_layout.realm, slow);
+                            a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                            a.store_rax(disp(*dst));
+                            a.jmp(fin);
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            exec_op!(pc);
+                            if let Some(to) = fused {
+                                // (A boolean: the op's result.)
+                                a.load_rax(disp(*dst));
+                                a.movabs_r11(NanBox::boolean(false).to_bits() as i64);
+                                a.cmp_rax_r11();
+                                a.je(to);
+                            }
+                            a.jmp(fin);
+                            a.cold_end(cold);
                             a.bind(fin);
                         }
                         // A literal's allocation: its own helper, not the

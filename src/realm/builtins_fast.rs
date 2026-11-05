@@ -1097,6 +1097,12 @@ pub(crate) type StampedSlot = (u64, Rc<Shape>, u32);
 /// is no part of what the epoch watches). It never outlives the memo entry
 /// it copies (every change to the memo empties it). `stamp == u64::MAX`:
 /// empty.
+///
+/// `fresh` is `stamp` when, besides, a fresh array (the running realm's
+/// `%Array.prototype%`, which is then the first one) destructures without
+/// running code — the memo's "no reachable `return`" stamp
+/// (`ArrayIterMemo::close_stamp`) holds at that epoch too — as
+/// `iter_fast::fresh_array_is_plain` decides it; else `u64::MAX`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct ArrayIterJit {
@@ -1105,6 +1111,7 @@ pub(crate) struct ArrayIterJit {
     pub(crate) iter_fn: u64,
     pub(crate) next_ptr: u64,
     pub(crate) next_fn: u64,
+    pub(crate) fresh: u64,
 }
 
 impl Default for ArrayIterJit {
@@ -1115,6 +1122,7 @@ impl Default for ArrayIterJit {
             iter_fn: 0,
             next_ptr: 0,
             next_fn: 0,
+            fresh: u64::MAX,
         }
     }
 }

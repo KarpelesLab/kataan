@@ -13391,6 +13391,33 @@ fn needs_completion_register(body: &[Stmt]) -> bool {
     })
 }
 
+/// The index of the last statement of a script body (or eval code) that
+/// writes the completion value register whenever it completes: an
+/// expression statement, or one of the statements `Compiler::stmt_completion`
+/// resets it for. Nothing leaves a script body between two of its statements
+/// but a throw (which discards the completion value), so every statement
+/// before that one has a completion value nothing can observe: it compiles
+/// without tracking one (`0`: none is dead).
+fn first_live_completion(body: &[Stmt]) -> usize {
+    body.iter()
+        .rposition(|s| {
+            matches!(
+                s,
+                Stmt::Expr { .. }
+                    | Stmt::If { .. }
+                    | Stmt::While { .. }
+                    | Stmt::DoWhile { .. }
+                    | Stmt::For { .. }
+                    | Stmt::ForIn { .. }
+                    | Stmt::ForOf { .. }
+                    | Stmt::Switch { .. }
+                    | Stmt::With { .. }
+                    | Stmt::Try { .. }
+            )
+        })
+        .unwrap_or(0)
+}
+
 /// Whether `e` is a tree of literals (numbers, strings, booleans, `null`, and
 /// array/object literals of those with static keys): compiling it touches no
 /// binding and leaves no register referenced once its value is consumed.
@@ -16229,8 +16256,9 @@ impl Compiler {
             })?;
         } else if is_main && needs_completion_register(body) {
             let cv = c.constant(NanBox::undefined())?;
-            c.completion = Some(cv);
-            for stmt in body {
+            let live = first_live_completion(body);
+            for (i, stmt) in body.iter().enumerate() {
+                c.completion = (i >= live).then_some(cv);
                 c.stmt(stmt)?;
             }
             c.completion = None;
@@ -16655,8 +16683,9 @@ impl Compiler {
         }
         if is_main {
             let cv = c.constant(NanBox::undefined())?;
-            c.completion = Some(cv);
-            for stmt in body {
+            let live = first_live_completion(body);
+            for (i, stmt) in body.iter().enumerate() {
+                c.completion = (i >= live).then_some(cv);
                 c.stmt(stmt)?;
             }
             c.completion = None;
