@@ -4749,8 +4749,9 @@ pub struct X64Assembler {
     pub(crate) dbg_op: Option<usize>,
     /// Per-label byte offset (`usize::MAX` until [`bind`](Self::bind)).
     labels: Vec<usize>,
-    /// Pending `rel32` jump fixups: `(operand offset in `code`, target label)`.
-    fixups: Vec<(usize, usize)>,
+    /// Pending `rel32` jump fixups: `(operand offset in `code`, target label,
+    /// the store a branch directly follows)` (see [`Fixup`]).
+    fixups: Vec<Fixup>,
     /// **Frame mode** (the generic tier's frame ABI): a *non-negative* `[rbp+disp]`
     /// operand of the frame-slot methods is redirected to `[rbx+disp]` — the
     /// interpreter-owned register file whose base the body pins in `rbx` — while a
@@ -4850,6 +4851,36 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     consts: Vec<(u64, Label)>,
+    /// The last instruction, when it is a 64-bit store of a GPR to memory:
+    /// `(where it ends, base register, displacement, source register)`
+    /// ([`X64Assembler::forwarded_load`]).
+    last_store: Option<StoreFwd>,
+    /// Loads a store just before them makes redundant
+    /// ([`X64Assembler::note_load`]): `(where the load starts, its length,
+    /// the register the store stored, the load's destination)`, rewritten by
+    /// [`finish`](X64Assembler::finish) unless something jumps to the load.
+    fwd_loads: Vec<FwdLoad>,
+}
+
+/// A `rel32` fixup: its operand's offset, its target label, and, for a
+/// branch emitted right after a 64-bit store with no label bound between
+/// them (so every path through the branch ran the store), that store
+/// (`X64Assembler::note_load`'s forwarding holds across the branch).
+type Fixup = (usize, usize, Option<StoreFwd>);
+
+/// A load a store just before it may serve (`X64Assembler::note_load`):
+/// `(where it starts, its length, the stored address' base register and
+/// displacement, the register the store stored, the load's destination)`.
+type FwdLoad = (usize, u8, u8, i32, u8, u8);
+
+/// A 64-bit `mov [base + disp], src` that ends at `end` in the code
+/// (`X64Assembler::last_store`).
+#[derive(Clone, Copy, Default)]
+struct StoreFwd {
+    end: usize,
+    base: u8,
+    disp: i32,
+    src: u8,
 }
 
 /// A run of code [`X64Assembler::cold_end`] cut out of the main stream: its
@@ -4862,7 +4893,7 @@ pub struct X64Assembler {
 struct ColdChunk {
     code: Vec<u8>,
     labels: Vec<(usize, usize)>,
-    fixups: Vec<(usize, usize)>,
+    fixups: Vec<Fixup>,
 }
 
 /// Where a cold region began ([`X64Assembler::cold_begin`]).
@@ -4874,6 +4905,8 @@ pub(crate) struct ColdMark {
     start: usize,
     fixups: usize,
     last_bind: usize,
+    /// The store the main stream ended with (`X64Assembler::last_store`).
+    store: Option<StoreFwd>,
 }
 
 /// [`X64Assembler::labels`]' entry for a label bound in a cold chunk that
@@ -4898,10 +4931,15 @@ const LABEL_COLD: usize = usize::MAX - 1;
 /// whose ModRM byte (`00 reg 101`, at most `0x3D`) is neither, or a `call`
 /// (`E8`), which is left alone. `pinned` are the offsets reported to the
 /// caller (entries, labels), which keep their code.
-fn thread_jumps(code: &mut [u8], operands: &[usize], pinned: &[usize]) {
-    use alloc::collections::{BTreeMap, BTreeSet};
+fn thread_jumps(
+    code: &mut [u8],
+    operands: &[(usize, Option<StoreFwd>)],
+    pinned: &[usize],
+    fwd: &[FwdLoad],
+) {
     const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
     const NOP6: [u8; 6] = [0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00];
+    let n = code.len();
     let rel_at = |code: &[u8], at: usize| {
         i32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
     };
@@ -4913,15 +4951,23 @@ fn thread_jumps(code: &mut [u8], operands: &[usize], pinned: &[usize]) {
     let is_jmp = |code: &[u8], at: usize| at >= 1 && code[at - 1] == 0xe9;
     let is_jcc =
         |code: &[u8], at: usize| at >= 2 && code[at - 2] == 0x0f && (code[at - 1] & 0xf0) == 0x80;
-    // Each `jmp`'s instruction start -> its operand.
-    let mut jmps: BTreeMap<usize, usize> = BTreeMap::new();
+    // Per-byte bit sets over the code: `jmp` instruction starts, offsets
+    // still reached by address, and the `jmp`s made `nop`s (by start).
+    let words = n / 64 + 1;
+    let has = |set: &[u64], i: usize| i < n && set[i / 64] & (1u64 << (i % 64)) != 0;
+    let put = |set: &mut [u64], i: usize| {
+        if i < n {
+            set[i / 64] |= 1u64 << (i % 64);
+        }
+    };
+    let mut jmps = alloc::vec![0u64; words];
     let mut branches: Vec<usize> = Vec::new();
-    for &at in operands {
-        if at + 4 > code.len() {
+    for &(at, _) in operands {
+        if at + 4 > n {
             continue;
         }
         if is_jmp(code, at) {
-            jmps.insert(at - 1, at);
+            put(&mut jmps, at - 1);
             branches.push(at);
         } else if is_jcc(code, at) {
             branches.push(at);
@@ -4929,50 +4975,96 @@ fn thread_jumps(code: &mut [u8], operands: &[usize], pinned: &[usize]) {
     }
     // Branches to a `jmp` go where it goes.
     for &at in &branches {
-        let mut t = target(code, at);
+        let t0 = target(code, at);
+        let mut t = t0;
         let mut hops = 0;
-        while let Some(&j) = jmps.get(&t) {
-            let next = target(code, j);
+        while has(&jmps, t) {
+            let next = target(code, t + 1);
             if next == t || hops == 8 {
                 break;
             }
             t = next;
             hops += 1;
         }
-        if t != target(code, at) {
+        if t != t0 {
             set_target(code, at, t);
         }
     }
     // What is still reached by address: every `rel32`'s target and the
     // reported offsets.
-    let mut reached: BTreeSet<usize> = pinned.iter().copied().collect();
-    for &at in operands {
-        if at + 4 <= code.len() {
-            reached.insert(target(code, at));
+    // (A branch right after a store reaches its target with the stored
+    // word still in the store's source register: `via_store`.)
+    let mut reached = alloc::vec![0u64; words];
+    let mut via_store: Vec<(usize, u8, i32, u8)> = Vec::new();
+    for &p in pinned {
+        put(&mut reached, p);
+    }
+    for &(at, st) in operands {
+        if at + 4 <= n {
+            match st {
+                Some(st) => via_store.push((target(code, at), st.base, st.disp, st.src)),
+                None => put(&mut reached, target(code, at)),
+            }
         }
     }
-    let mut dead_jmps: BTreeSet<usize> = BTreeSet::new();
+    via_store.sort_unstable();
+    // Whether `p` is reached by a jump other than one right after a store
+    // of `src` to `[base + disp]`.
+    let entered = |p: usize, base: u8, disp: i32, src: u8| {
+        if has(&reached, p) {
+            return true;
+        }
+        let from = via_store.partition_point(|v| v.0 < p);
+        via_store[from..]
+            .iter()
+            .take_while(|v| v.0 == p)
+            .any(|v| (v.1, v.2, v.3) != (base, disp, src))
+    };
+    // A load a store just before it served (`X64Assembler::note_load`),
+    // when no jump lands on it.
+    for &(start, len, base, disp, src, dst) in fwd {
+        let (start, len) = (start, usize::from(len));
+        if start + len > n || entered(start, base, disp, src) {
+            continue;
+        }
+        let mut k = start;
+        if dst != src {
+            // REX.W 89 /r: `mov dst, src`.
+            code[k] = 0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1);
+            code[k + 1] = 0x89;
+            code[k + 2] = 0xc0 | ((src & 7) << 3) | (dst & 7);
+            k += 3;
+        }
+        let pad: &[u8] = match start + len - k {
+            4 => &[0x0f, 0x1f, 0x40, 0x00],
+            5 => &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+            7 => &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+            _ => &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        code[k..start + len].copy_from_slice(pad);
+    }
+    let mut dead = alloc::vec![0u64; words];
     for &at in &branches {
-        if dead_jmps.contains(&at) || !is_jcc(code, at) {
+        if has(&dead, at - 1) || !is_jcc(code, at) {
             continue;
         }
         // `jcc A; jmp B; A:` -> `j!cc B; nop5`.
         let next = at + 4;
         if target(code, at) == next + 5
-            && let Some(&j) = jmps.get(&next)
-            && !reached.contains(&next)
-            && !dead_jmps.contains(&j)
+            && has(&jmps, next)
+            && !has(&dead, next)
+            && !has(&reached, next)
         {
-            let b = target(code, j);
+            let b = target(code, next + 1);
             code[at - 1] ^= 1;
             set_target(code, at, b);
             code[next..next + 5].copy_from_slice(&NOP5);
-            dead_jmps.insert(j);
+            put(&mut dead, next);
         }
     }
     // A branch to the next instruction is a `nop`.
     for &at in &branches {
-        if dead_jmps.contains(&at) || rel_at(code, at) != 0 {
+        if has(&dead, at - 1) || rel_at(code, at) != 0 {
             continue;
         }
         if is_jmp(code, at) {
@@ -5223,7 +5315,10 @@ impl X64Assembler {
         if n >= 5
             && self.last_bind != n
             && self.code[n - 5] == 0xe9
-            && self.fixups.last() == Some(&(n - 4, label.0))
+            && self
+                .fixups
+                .last()
+                .is_some_and(|f| (f.0, f.1) == (n - 4, label.0))
         {
             self.code.truncate(n - 5);
             self.fixups.pop();
@@ -5245,7 +5340,19 @@ impl X64Assembler {
     /// [`finish`](Self::finish), also giving the byte offset each of
     /// `labels` ended up at (a label in a cold region moves in `finish`).
     #[must_use]
-    pub(crate) fn finish_at(mut self, labels: &[Label]) -> (Vec<u8>, Vec<usize>) {
+    pub(crate) fn finish_at(self, labels: &[Label]) -> (Vec<u8>, Vec<usize>) {
+        self.finish_reporting(labels, &[])
+    }
+
+    /// [`finish_at`](Self::finish_at), where `report_only` (indices into
+    /// `labels`) are offsets the caller only reports (profiling marks),
+    /// never enters: the code there may be rewritten like any other
+    /// (`thread_jumps`), so a profile sees the code that runs unprofiled.
+    pub(crate) fn finish_reporting(
+        mut self,
+        labels: &[Label],
+        report_only: &[core::ops::Range<usize>],
+    ) -> (Vec<u8>, Vec<usize>) {
         // The cold chunks, after everything else (they are position
         // independent: every jump is a `rel32` fixup).
         for chunk in core::mem::take(&mut self.cold) {
@@ -5254,8 +5361,8 @@ impl X64Assembler {
             for (label, at) in chunk.labels {
                 self.labels[label] = base + at;
             }
-            for (at, label) in chunk.fixups {
-                self.fixups.push((base + at, label));
+            for (at, label, st) in chunk.fixups {
+                self.fixups.push((base + at, label, st));
             }
         }
         // The constant words (data, after the last instruction: nothing
@@ -5270,7 +5377,7 @@ impl X64Assembler {
             }
         }
         let fixups = core::mem::take(&mut self.fixups);
-        for &(at, label) in &fixups {
+        for &(at, label, _) in &fixups {
             let target = self.labels[label];
             debug_assert_ne!(target, usize::MAX, "unbound label in jump");
             // `rel32` is relative to the instruction *after* the 4-byte operand.
@@ -5279,8 +5386,15 @@ impl X64Assembler {
             self.code[at..at + 4].copy_from_slice(&bytes);
         }
         let at: Vec<usize> = labels.iter().map(|l| self.labels[l.0]).collect();
-        let operands: Vec<usize> = fixups.iter().map(|f| f.0).collect();
-        thread_jumps(&mut self.code, &operands, &at);
+        let operands: Vec<(usize, Option<StoreFwd>)> = fixups.iter().map(|f| (f.0, f.2)).collect();
+        let fwd = core::mem::take(&mut self.fwd_loads);
+        let pinned: Vec<usize> = at
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !report_only.iter().any(|r| r.contains(i)))
+            .map(|(_, &p)| p)
+            .collect();
+        thread_jumps(&mut self.code, &operands, &pinned, &fwd);
         (self.code, at)
     }
 
@@ -5302,6 +5416,7 @@ impl X64Assembler {
             start,
             fixups: self.fixups.len(),
             last_bind: self.last_bind,
+            store: self.last_store.take(),
         };
         // No `bind` in the region may drop the jump just before it (which
         // would then fall through to whatever follows the region).
@@ -5346,7 +5461,7 @@ impl X64Assembler {
             .fixups
             .split_off(mark.fixups)
             .into_iter()
-            .map(|(at, label)| (at - start, label))
+            .map(|(at, label, st)| (at - start, label, st))
             .collect();
         // The region's end is now `start`: a label bound there keeps a
         // `bind` from dropping the jump before it.
@@ -5362,11 +5477,65 @@ impl X64Assembler {
             labels,
             fixups,
         });
+        // The main stream goes on from the store it ended with.
+        self.last_store = mark.store;
+    }
+
+    /// Notes that the instruction just emitted stores 64-bit `src` to
+    /// `[base + disp]` ([`forwarded_load`](Self::forwarded_load)).
+    pub(crate) fn note_store(&mut self, base: u8, disp: i32, src: u8) {
+        self.last_store = Some(StoreFwd {
+            end: self.code.len(),
+            base,
+            disp,
+            src,
+        });
+    }
+
+    /// **Store-to-load forwarding**: the 64-bit load of `[base + disp]`
+    /// into `dst` just emitted from `start` directly follows a store of
+    /// `src` there (the instruction before, in the main stream), so on the
+    /// path through the store it reads what `src` still holds. Unless a
+    /// jump lands on the load itself, which [`finish`](Self::finish) knows,
+    /// the load becomes `mov dst, src` (or nothing, `dst` being `src`),
+    /// padded to its length with a `nop`: no instruction moves.
+    pub(crate) fn note_load(&mut self, start: usize, dst: u8, base: u8, disp: i32) {
+        let n = self.code.len();
+        let Some(s) = self.last_store.take() else {
+            return;
+        };
+        if s.end != start || s.base != base || s.disp != disp || self.cold_binds.is_some() {
+            return;
+        }
+        let len = n - start;
+        if !(7..=8).contains(&len) {
+            return;
+        }
+        // (Only the instruction right after the store: a second load's
+        // forwarding would also need the first one never entered.)
+        self.fwd_loads
+            .push((start, len as u8, s.base, s.disp, s.src, dst));
+    }
+
+    /// The base register a `[rbp + disp]` frame-slot operand addresses
+    /// (`rbx` for a register-file slot in frame mode, see
+    /// [`rbp_disp`](Self::rbp_disp)).
+    fn frame_base(&self, disp: i32) -> u8 {
+        if self.rbx_frame && disp >= 0 { 3 } else { 5 }
     }
 
     /// Emits a `rel32` jump operand placeholder targeting `label`.
     fn emit_rel32(&mut self, label: Label) {
-        self.fixups.push((self.code.len(), label.0));
+        // A branch's opcode (`E9`, `0F 8x`) right after a store, with no
+        // label bound at the branch.
+        let n = self.code.len();
+        let store = self.last_store.filter(|st| {
+            let op = st.end;
+            self.last_bind != op
+                && ((n == op + 1 && self.code[op] == 0xe9)
+                    || (n == op + 2 && self.code[op] == 0x0f && self.code[op + 1] & 0xf0 == 0x80))
+        });
+        self.fixups.push((n, label.0, store));
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
 
@@ -5491,20 +5660,25 @@ impl X64Assembler {
 
     /// `mov rax, [rbp+disp]`.
     pub fn load_rax(&mut self, disp: i32) {
+        let start = self.code.len();
         self.code.extend_from_slice(&[0x48, 0x8b, 0x85]);
         self.rbp_disp(disp);
+        self.note_load(start, 0, self.frame_base(disp), disp);
     }
 
     /// `mov [rbp+disp], rax`.
     pub fn store_rax(&mut self, disp: i32) {
         self.code.extend_from_slice(&[0x48, 0x89, 0x85]);
         self.rbp_disp(disp);
+        self.note_store(self.frame_base(disp), disp, 0);
     }
 
     /// `mov rcx, [rbp+disp]`.
     pub fn load_rcx(&mut self, disp: i32) {
+        let start = self.code.len();
         self.code.extend_from_slice(&[0x48, 0x8b, 0x8d]);
         self.rbp_disp(disp);
+        self.note_load(start, 1, self.frame_base(disp), disp);
     }
 
     /// `movsxd rax, eax` — truncate `rax` to 32 bits then sign-extend (JS ToInt32).
@@ -6333,8 +6507,10 @@ impl X64Assembler {
     /// `mov rdx, [rbp+disp]` — load a register-file slot (the value to store) into
     /// `rdx`, the source for an in-place slot/element write.
     pub fn load_rdx(&mut self, disp: i32) {
+        let start = self.code.len();
         self.code.extend_from_slice(&[0x48, 0x8b, 0x95]);
         self.rbp_disp(disp);
+        self.note_load(start, 2, self.frame_base(disp), disp);
     }
     /// `mov [r11 + rax*8], rdx` — store `rdx` at index `rax` of the `Vec` data
     /// pointer in `r11` (the inline slot / element write; mirror of
@@ -12472,7 +12648,10 @@ impl JitFunction {
         want.push(exact_pinned.or(exact).unwrap_or(entries.0));
         let marks: Vec<(&'static str, Option<usize>)> =
             a.dbg_marks.iter().map(|m| (m.1, m.2)).collect();
-        let (code, at) = a.finish_at(&want);
+        // (The profiling labels between the entries and the exact entries
+        // are only reported.)
+        let report_only = [2..want.len() - 2];
+        let (code, at) = a.finish_reporting(&want, &report_only);
         let f = Self::from_code(&code);
         if let (Some(path), Some(f)) = (opmap, f.as_ref()) {
             use std::io::Write as _;
@@ -14314,6 +14493,59 @@ mod tests {
         // jmp E9 is at index 3, operand at 4..8.
         let jmp_rel = i32::from_le_bytes([code[4], code[5], code[6], code[7]]);
         assert!(jmp_rel >= 0, "forward jump is non-negative");
+    }
+
+    #[test]
+    fn finish_threads_jumps_and_forwards_stores() {
+        // je A; jmp B; A: ret; B: jmp C; C: ret
+        let mut a = X64Assembler::new();
+        let (la, lb, lc) = (a.new_label(), a.new_label(), a.new_label());
+        a.je(la); // 0..6
+        a.jmp(lb); // 6..11
+        a.bind(la);
+        a.ret(); // 11
+        a.bind(lb);
+        a.jmp(lc); // 12..17
+        a.ret(); // 17 (never reached)
+        a.bind(lc);
+        a.ret(); // 18
+        let code = a.finish();
+        // `je A; jmp B` became `jne C` (threaded through B's jmp) and a nop.
+        assert_eq!(&code[0..2], &[0x0f, 0x85]);
+        assert_eq!(i32::from_le_bytes(code[2..6].try_into().unwrap()), 18 - 6);
+        assert_eq!(&code[6..11], &[0x0f, 0x1f, 0x44, 0x00, 0x00]);
+        assert_eq!(code[11], 0xc3);
+        // store [rbx+8], rax; load rax, [rbx+8] (nothing jumps there): a nop.
+        let mut a = X64Assembler::new();
+        a.set_rbx_frame(true);
+        a.store_rax(8);
+        a.load_rax(8);
+        a.load_rcx(8); // (not right after the store: a load)
+        a.ret();
+        let code = a.finish();
+        assert_eq!(&code[0..3], &[0x48, 0x89, 0x83]);
+        assert_eq!(&code[7..14], &[0x0f, 0x1f, 0x80, 0, 0, 0, 0]);
+        assert_eq!(&code[14..17], &[0x48, 0x8b, 0x8b]);
+        // ...but kept when a jump without that store lands on the load, and
+        // made `mov rcx, rax` when every jump there follows the same store.
+        let mut a = X64Assembler::new();
+        a.set_rbx_frame(true);
+        let (l, skip) = (a.new_label(), a.new_label());
+        a.je(l); // 0..6
+        a.store_rax(8); // 6..13
+        a.bind(l);
+        a.load_rax(8); // 13..20
+        a.store_rax(16); // 20..27
+        a.jmp(skip); // 27..32 (right after the store of rax to [rbx+16])
+        a.ret(); // 32
+        a.store_rax(16); // 33..40
+        a.bind(skip);
+        a.load_rcx(16); // 40..47
+        a.ret();
+        let code = a.finish();
+        assert_eq!(&code[13..16], &[0x48, 0x8b, 0x83]);
+        assert_eq!(&code[40..43], &[0x48, 0x89, 0xc1]);
+        assert_eq!(&code[43..47], &[0x0f, 0x1f, 0x40, 0x00]);
     }
 
     #[test]

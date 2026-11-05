@@ -857,6 +857,17 @@ impl X64Assembler {
     /// `[REX] opcode ModRM(mod=10, reg, base) [SIB] disp32` — a register/memory
     /// operand form with a 32-bit displacement off any base register.
     pub(crate) fn g_mem(&mut self, w: bool, opcode: &[u8], reg: u8, base: u8, disp: i32) {
+        let start = self.code.len();
+        self.g_mem_raw(w, opcode, reg, base, disp);
+        if w && opcode == [0x89] {
+            self.note_store(base, disp, reg);
+        } else if w && opcode == [0x8b] {
+            self.note_load(start, reg, base, disp);
+        }
+    }
+
+    /// [`g_mem`](Self::g_mem)'s encoding.
+    fn g_mem_raw(&mut self, w: bool, opcode: &[u8], reg: u8, base: u8, disp: i32) {
         let rex = 0x40 | (u8::from(w) << 3) | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
         self.code.push(rex);
         self.code.extend_from_slice(opcode);
