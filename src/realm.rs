@@ -620,6 +620,11 @@ pub struct Realm {
     /// Allocation-triggered collections run so far (a pinned threshold makes
     /// every fourth one full, so stress runs exercise both kinds).
     gc_cycles: u32,
+    /// The current nursery size (allocations between minor collections):
+    /// [`GC_NURSERY`], doubled after a minor collection in which most of the
+    /// nursery survived (up to [`GC_NURSERY_MAX`]) and halved back once few
+    /// do (see [`adapt_nursery`](Self::adapt_nursery)).
+    gc_nursery: usize,
 }
 
 /// The remaining handle-keyed side tables [`Realm::ephemeron_prune`] must sweep,
@@ -681,6 +686,13 @@ const GC_GROWTH: usize = 2;
 /// (and the free slots they reuse) stay in cache between collections; a minor
 /// collection's cost is the survivors plus the remembered set, not the heap.
 const GC_NURSERY: usize = 16_384;
+
+/// The largest the nursery grows to while most of it keeps surviving (a
+/// program building a large structure): a minor collection then marks
+/// nearly everything it visits, so collecting less often is pure saving,
+/// while a nursery whose objects die young stays at [`GC_NURSERY`], small
+/// enough to stay in cache.
+const GC_NURSERY_MAX: usize = 262_144;
 
 /// The mutable state behind the Annex B.2.5 RegExp legacy static accessors
 /// (`RegExp.input`/`$_`, `RegExp.lastMatch`/`$&`, `RegExp.lastParen`/`$+`,
@@ -984,6 +996,7 @@ impl Realm {
             gc_generational: generational,
             gc_major_limit: GC_MIN_THRESHOLD,
             gc_cycles: 0,
+            gc_nursery: GC_NURSERY,
         }
     }
 
@@ -7881,6 +7894,9 @@ impl Realm {
             self.collect_minor_with(&all, extern_expand, extern_prune)
         };
         self.heap.reset_alloc_pressure();
+        if !major {
+            self.adapt_nursery(stats.marked);
+        }
         // Scaled by the live set's tracing weight, not just its object count:
         // the next full cycle re-traces all of it.
         let grown = || {
@@ -7892,12 +7908,25 @@ impl Realm {
         }
         self.gc_threshold = pinned.unwrap_or_else(|| {
             if self.gc_generational {
-                GC_NURSERY
+                self.gc_nursery
             } else {
                 grown()
             }
         });
         Some(stats)
+    }
+
+    /// Resizes the nursery after a minor collection that marked `survivors`
+    /// young objects out of the current nursery: doubles it when more than
+    /// half survived, halves it (down to [`GC_NURSERY`]) when under an eighth
+    /// did. Only the collection frequency changes, never what is collected.
+    fn adapt_nursery(&mut self, survivors: usize) {
+        let n = self.gc_nursery;
+        if survivors.saturating_mul(2) > n {
+            self.gc_nursery = (n * 2).min(GC_NURSERY_MAX);
+        } else if survivors.saturating_mul(8) < n {
+            self.gc_nursery = (n / 2).max(GC_NURSERY);
+        }
     }
 
     /// How many times a collected object has been used since the run began, when
