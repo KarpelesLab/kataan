@@ -19276,6 +19276,21 @@ impl Compiler {
     /// (ends in a return or tail call), so branch arms need no join jump.
     fn compile_tail_return(&mut self, e: &Expr) -> Result<(), CompileError> {
         if !self.tail_ok {
+            // `return c ? a : b;` still returns from each arm: no join
+            // register, `Move`s or join jump (a smaller body inlines).
+            if let Expr::Conditional {
+                test,
+                consequent,
+                alternate,
+                ..
+            } = e
+            {
+                let cond = self.expr(test)?;
+                let jf = self.emit_jump_if_false(cond);
+                self.compile_tail_return(consequent)?; // terminal
+                self.patch(jf);
+                return self.compile_tail_return(alternate); // terminal
+            }
             let src = self.expr(e)?;
             self.ops.push(Op::Return { src });
             return Ok(());
