@@ -4281,6 +4281,7 @@ impl JitProto {
                 | GenericOp::CallValue { pc, cache, .. }
                 | GenericOp::CallWithMethod { pc, cache, .. }
                 | GenericOp::CallKey { pc, cache, .. }
+                | GenericOp::Construct { pc, cache, .. }
                     if cache != u16::MAX =>
                 {
                     Some((pc, cache))

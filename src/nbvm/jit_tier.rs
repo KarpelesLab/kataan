@@ -485,8 +485,15 @@ pub(super) fn enter_on_call(
     if proto.tier.jit().is_none() {
         super::global_mirror::prefill(ctx, proto);
     }
-    let jit = jit_for(funcs, id, ic)?;
+    let mut jit = jit_for(funcs, id, ic)?;
     if jit.is_generic() {
+        // A call site it could not inline has settled since: recompile
+        // first (`JitProto::wants_recompile_on_entry`).
+        if jit.wants_recompile_on_entry(u32::try_from(id).unwrap_or(u32::MAX))
+            && let Some(new) = recompile(ctx, funcs, id, &jit, ic)
+        {
+            jit = new;
+        }
         return match run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false)? {
             Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
             Ok(_) => Some(Err(VmError::Unsupported)),
@@ -4022,6 +4029,7 @@ pub(super) fn cold_call_pcs(
                     | Op::CallValue { .. }
                     | Op::CallWithMethod { .. }
                     | Op::CallKey { .. }
+                    | Op::Construct { .. }
             ) && hints
                 .get(pc)
                 .is_none_or(|h| *h == crate::ic::CalleeHint::None)

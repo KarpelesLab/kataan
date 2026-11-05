@@ -68,6 +68,9 @@ pub(super) struct TierUp {
     pub(super) spec_off: Vec<usize>,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
     pub(super) countdown: core::cell::Cell<u8>,
+    /// Whether [`JitProto::wants_recompile_on_entry`] has said yes (it
+    /// does once).
+    pub(super) entry_asked: core::cell::Cell<bool>,
 }
 
 /// The hits a compiled-in layout counts as when it seeds a recompilation
@@ -79,6 +82,24 @@ const BAKED_HITS: u32 = 1 << 16;
 /// first back-edge, and a function called in a hot loop would otherwise pay
 /// for a check on every call.
 const CHECK_EVERY: u8 = 8;
+
+/// The callee key the call site whose cache is `cache` has settled on (one
+/// way filled, the others empty), if it has.
+fn settled_call(s: &super::GenericSites, cache: u16) -> Option<u64> {
+    let c = s.calls.get(cache as usize)?;
+    // SAFETY: the body that writes this cache (through its raw pointer) is
+    // suspended in the caller's call, or not running, and no other borrow
+    // of it is live.
+    #[allow(unsafe_code)]
+    let c = unsafe { &*c.get() };
+    let mut keys = c
+        .targets
+        .iter()
+        .map(|t| t.key)
+        .filter(|&k| k != super::call_seq::CallSite::EMPTY);
+    let k = keys.next()?;
+    keys.next().is_none().then_some(k)
+}
 
 impl TierUp {
     /// The checks' data for lowered `ops`, whose sites `baked` has compiled
@@ -153,6 +174,7 @@ impl TierUp {
                 .collect(),
             generation: 0,
             countdown: core::cell::Cell::new(1),
+            entry_asked: core::cell::Cell::new(false),
         }
     }
 }
@@ -272,20 +294,9 @@ impl JitProto {
         }
         t.countdown.set(CHECK_EVERY);
         if let Some((head, end)) = calls
-            && t.cold_calls.iter().any(|&(pc, cache)| {
-                (head..=end).contains(&pc)
-                    && s.calls.get(cache as usize).is_some_and(|c| {
-                        // SAFETY: as for the property caches below.
-                        #[allow(unsafe_code)]
-                        let c = unsafe { &*c.get() };
-                        let mut keys = c
-                            .targets
-                            .iter()
-                            .map(|t| t.key)
-                            .filter(|&k| k != super::call_seq::CallSite::EMPTY);
-                        keys.next().is_some() && keys.next().is_none()
-                    })
-            })
+            && t.cold_calls
+                .iter()
+                .any(|&(pc, cache)| (head..=end).contains(&pc) && settled_call(s, cache).is_some())
         {
             return true;
         }
@@ -318,6 +329,37 @@ impl JitProto {
                     .is_some_and(|b| b.as_ref().is_some_and(|(s, _)| Rc::ptr_eq(s, shape)))
                 && shape.lookup(key) == Some(slot)
         })
+    }
+
+    /// Whether a call of this body from Rust code (an interpreted caller's)
+    /// should recompile it first: a call site outside every loop that had
+    /// no callee to inline when it was compiled has since settled on a
+    /// single callee — which no back-edge poll would see (see
+    /// [`JitProto::wants_recompile`]): a recursive builder `mk` compiled
+    /// before its `new T(…)` ever ran gets its constructor inlined at its
+    /// next call from the interpreter — while the recompilation budget
+    /// lasts. (A recursive call, settled on the function `own` itself, is
+    /// no reason: a function never inlines itself. A call from Rust code
+    /// costs far more than the check, so every one checks, until the body
+    /// has said yes once: a site that settled on a callee that could not
+    /// be inlined is no cold site of the recompilation.)
+    #[must_use]
+    pub fn wants_recompile_on_entry(&self, own: u32) -> bool {
+        let Some(s) = self.sites.as_ref() else {
+            return false;
+        };
+        let t = &s.tier_up;
+        if t.generation >= MAX_GENERATION || t.cold_calls.is_empty() || t.entry_asked.get() {
+            return false;
+        }
+        let yes = t.cold_calls.iter().any(|&(pc, cache)| {
+            !t.extents
+                .iter()
+                .any(|&(head, end)| (head..=end).contains(&pc))
+                && settled_call(s, cache).is_some_and(|k| k & 0xffff_ffff != u64::from(own))
+        });
+        t.entry_asked.set(yes);
+        yes
     }
 
     /// The memos this body's own property-site caches hold, by the
