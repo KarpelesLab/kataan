@@ -6874,10 +6874,38 @@ pub(crate) extern "C" fn jit_helper_get_elem(
     recv: u64,
     key: u64,
 ) -> u64 {
+    {
+        // SAFETY: as below; this borrow ends before it runs.
+        #[allow(unsafe_code)]
+        let c = unsafe { &*(ctx as *const Ctx) };
+        // A String key whose slot in the receiver's layout is memoized (what
+        // `vm_get_elem` reads through `own_data_by_string`), decided in this
+        // small frame.
+        if let Some((o, slot)) = c
+            .realm
+            .key_memo_probe(NanBox::from_bits(recv), NanBox::from_bits(key))
+            && let Some(v) = o.slot(slot)
+        {
+            return v.to_bits();
+        }
+    }
+    jit_get_elem_general(ctx, recv, key)
+}
+
+/// [`jit_helper_get_elem`] past its memoized String-key read.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[inline(never)]
+fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64 {
     // SAFETY: single-threaded reentrancy — as `jit_helper_get_prop`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
     let (recv, key) = (NanBox::from_bits(recv), NanBox::from_bits(key));
+    // The rest of `own_data_by_string` (for a key that is not a Number,
+    // `vm_get_elem`'s first answer), which then need not run again.
+    let own_done = !key.is_number();
+    if own_done && let Some(v) = ctx.realm.own_data_missed(recv, key) {
+        return v.to_bits();
+    }
     // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
     #[allow(unsafe_code)]
     let funcs = unsafe {
@@ -6895,7 +6923,7 @@ pub(crate) extern "C" fn jit_helper_get_elem(
     {
         return v.to_bits();
     }
-    match vm_get_elem(ctx, funcs, recv, key) {
+    match vm_get_elem_from(ctx, funcs, recv, key, own_done) {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
@@ -10882,6 +10910,20 @@ fn vm_get_elem(
     recv: NanBox,
     key: NanBox,
 ) -> Result<NanBox, VmError> {
+    vm_get_elem_from(ctx, funcs, recv, key, false)
+}
+
+/// [`vm_get_elem`], where `own_done` says the caller already tried
+/// [`Realm::own_data_by_string`] (for a key that is not a Number, which
+/// every earlier check here passes over) and it missed.
+#[inline]
+fn vm_get_elem_from(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: NanBox,
+    own_done: bool,
+) -> Result<NanBox, VmError> {
     // A present element of a plain dense array: nothing can intercept it.
     if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
         && let Some(v) = ctx.realm.plain_array_get(Handle::from_raw(h), n)
@@ -10905,7 +10947,7 @@ fn vm_get_elem(
         return Ok(v);
     }
     // A String key naming an ordinary object's own data property.
-    if let Some(v) = ctx.realm.own_data_by_string(recv, key) {
+    if !own_done && let Some(v) = ctx.realm.own_data_by_string(recv, key) {
         return Ok(v);
     }
     if read_needs_host(ctx, recv)

@@ -98,10 +98,31 @@ impl Realm {
     /// for anything else.
     #[must_use]
     pub(crate) fn own_data_by_string(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
+        match self.key_memo_probe(obj, key) {
+            Some((o, slot)) => o.slot(slot),
+            None => self.own_data_missed(obj, key),
+        }
+    }
+
+    /// [`own_data_by_string`](Self::own_data_by_string) once the memo
+    /// missed.
+    #[must_use]
+    #[inline(never)]
+    pub(crate) fn own_data_missed(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
         let k = self.string_key_in_place(key)?;
         let o = self.ordinary_props(Handle::from_raw(obj.as_handle()?), true)?;
         if o.accessor(k).is_some() {
             return None;
+        }
+        // A shaped object's slot of `k` is memoized for the next read
+        // (`key_memo`): its layout is no wrapper's or mapped `arguments`
+        // object's, as `ordinary_props` checked.
+        if let Some(shape) = o.shaped_shape() {
+            let slot = shape.lookup(k)?;
+            if o.has_no_accessors() {
+                self.key_memo_note(key, shape, slot);
+            }
+            return o.slot(slot);
         }
         o.get(k)
     }
@@ -125,8 +146,31 @@ impl Realm {
     /// the module docs). `None` when that cannot be told here.
     #[must_use]
     pub(crate) fn has_property_by_string(&self, key: NanBox, obj: NanBox) -> Option<bool> {
+        if self.key_memo_probe(obj, key).is_some() {
+            return Some(true);
+        }
         let k = self.string_key_in_place(key)?;
-        self.has_property_named(Handle::from_raw(obj.as_handle()?), k)
+        let h = Handle::from_raw(obj.as_handle()?);
+        // The receiver itself (`has_property_named`'s first link): an own
+        // data slot is memoized, as `own_data_by_string` does.
+        let o = self.ordinary_props(h, false)?;
+        if let Some(shape) = o.shaped_shape() {
+            if let Some(slot) = shape.lookup(k) {
+                if o.has_no_accessors() && !shape.is_wrapper() && !self.has_argument_map_marker(h) {
+                    self.key_memo_note(key, shape, slot);
+                }
+                return Some(true);
+            }
+            if o.accessor(k).is_some() {
+                return Some(true);
+            }
+        } else if o.has_own_key(k) {
+            return Some(true);
+        }
+        match o.proto() {
+            Some(p) => self.has_property_named(p, k),
+            None => Some(false),
+        }
     }
 
     /// [`has_property_by_string`](Self::has_property_by_string) where the

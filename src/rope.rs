@@ -740,6 +740,14 @@ impl Rope {
         Some(self.share_bytes(b0, b1, units))
     }
 
+    /// The address of this rope's node: two ropes with the same address are
+    /// the same text, while some [`RopeId`] of it or a clone stands.
+    #[must_use]
+    #[inline]
+    pub fn addr(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
     /// A non-owning identity for this rope (see [`RopeId`]).
     #[must_use]
     pub fn id(&self) -> RopeId {

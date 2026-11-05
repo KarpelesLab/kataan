@@ -33,6 +33,7 @@ mod fn_chain;
 mod forin_cache;
 pub use fn_chain::FnChain;
 mod gen_state;
+mod key_memo;
 mod private_fast;
 pub use private_fast::PrivCache;
 pub(crate) mod hidden_layout;
@@ -351,6 +352,8 @@ pub struct Realm {
     /// The `for-in` key lists by receiver shape (`forin_cache`), made on
     /// first use. Boxed: the realm is moved by value on every host call.
     for_in_cache: Option<alloc::boxed::Box<forin_cache::ForInCache>>,
+    /// The String-key slot memo (`key_memo`), made on first use.
+    key_memo: core::cell::OnceCell<alloc::boxed::Box<key_memo::KeyMemo>>,
     /// Compiled programs by `(source, flags)`, most recently used last: every
     /// evaluation of a regex literal creates a new RegExp object (so a literal
     /// in a loop is a fresh object per iteration), but they share one compiled
@@ -913,6 +916,7 @@ impl Realm {
             tree_slice: None,
             cell_swaps: 0,
             for_in_cache: None,
+            key_memo: core::cell::OnceCell::new(),
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -1676,6 +1680,7 @@ impl Realm {
     /// Whether every property access on `handle` must go to the host (a module
     /// namespace exotic object).
     #[must_use]
+    #[inline]
     pub fn is_host_exotic(&self, handle: Handle) -> bool {
         !self.host_exotic.is_empty() && self.host_exotic.contains(&handle.to_raw())
     }
