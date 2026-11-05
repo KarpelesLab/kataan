@@ -2382,6 +2382,8 @@ pub(crate) struct InlineEmit<'a> {
     /// ([`MethodProof`]): the receiver value it last identified the callee
     /// on through its memo, with that receiver's heap slot and layout.
     pub mproved: Option<MethodProof>,
+    /// A monomorphic construct guard's **proof** slots ([`ConstructProof`]).
+    pub cproved: Option<ConstructProof>,
     /// Registers to keep, as `(register, rbp-relative save slot)`: the
     /// guard's code that may clobber them stores them first and reloads
     /// them after (a speculative region's integer version's int registers,
@@ -2428,6 +2430,28 @@ pub(crate) struct MethodProof {
     pub slot: i32,
     /// Its layout word.
     pub shape: i32,
+}
+
+/// A construct guard's proof (`InlineEmit::cproved`, `rbp`-relative
+/// slots): the constructor value (`ctor`, one of the receiver cache's keys:
+/// emptied by the prologue and after every call) and `new.target` value
+/// (`nt`) it last made `this` for through the call's [`ConstructFast`]
+/// record without calling (an inline allocation, or none for a derived
+/// constructor), and the constructor's captures' pointer (`caps`). While
+/// `ctor` holds a value no Rust code has run since, so the identification
+/// (by the call's memo), the limits and the record it checked all still
+/// hold: the record is written by Rust code only, and the epoch it
+/// compares only bumped there. Only the `prototype` value the record
+/// reads for an ordinary function's `new.target`, which compiled code may
+/// store, is checked again (`check_construct_proto`).
+#[derive(Clone, Copy)]
+pub(crate) struct ConstructProof {
+    /// The constructor's `NanBox` bits.
+    pub ctor: i32,
+    /// The `new.target`'s.
+    pub nt: i32,
+    /// The constructor's captures' pointer.
+    pub caps: i32,
 }
 
 /// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
@@ -2561,6 +2585,27 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.jmp(mproven);
         a.bind(full);
         a.g_store_imm32(RBP, p.slot, 0);
+    }
+    // 0c. A construct guard's proof (see `ConstructProof`): the same
+    //     constructor and `new.target` values.
+    let cproved = e
+        .cproved
+        .filter(|_| ways <= 1 && e.proved.is_none() && matches!(e.callee, CalleeSrc::Reg(_)));
+    let cproven = a.new_label();
+    if let (Some(p), Some((ctor, nt)), &CalleeSrc::Reg(c)) = (cproved, e.new_target, &e.callee) {
+        let full = a.new_label();
+        if nt != ctor {
+            a.g_load(r::RAX, r::RBX, reg(nt));
+            a.g_cmp_mem(r::RAX, RBP, p.nt);
+            a.g_jcc(cc::NE, full);
+        }
+        a.g_load(r::RAX, r::RBX, reg(c));
+        a.g_cmp_mem(r::RAX, RBP, p.ctor);
+        a.g_jcc(cc::NE, full);
+        a.g_store(RBP, e.slots.callee, r::RAX);
+        a.g_load(r::R8, RBP, p.caps);
+        a.jmp(cproven);
+        a.bind(full);
     }
     // 1. The callee value, into the `callee` slot (and rax).
     match e.callee {
@@ -2740,8 +2785,22 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.g_cmp(r::RAX, r::R11);
         a.g_jcc(cc::NE, miss);
     }
+    let this = e.caps.checked_add(n_caps)?;
     if let Some(ctor) = e.new_target {
-        emit_inline_new_this(a, e, ctor, e.caps.checked_add(n_caps)?, miss)?;
+        emit_inline_new_this(a, e, ctor, this, miss, Ok(cproved))?;
+    }
+    if let (Some(_), Some(ctor)) = (cproved, e.new_target) {
+        let made = a.new_label();
+        a.jmp(made);
+        a.bind(cproven);
+        if let Some(t) = e.super_this {
+            a.g_load(r::RAX, r::RBX, reg(t));
+            a.g_movabs(r::R11, NanBox::tdz().to_bits());
+            a.g_cmp(r::RAX, r::R11);
+            a.g_jcc(cc::NE, miss);
+        }
+        emit_inline_new_this(a, e, ctor, this, miss, Err(()))?;
+        a.bind(made);
     }
     a.dbg_mark("g-pend");
     // 4. Pending, its captures in the inlined body's registers. (An inner
@@ -2905,12 +2964,28 @@ fn emit_inline_new_this(
     (ctor, nt): (u16, u16),
     this: u16,
     miss: Label,
+    proof: Result<Option<ConstructProof>, ()>,
 ) -> Option<()> {
     use core::mem::offset_of;
     let reg = |x: u16| i32::from(x) * 8;
     let fast = offset_of!(CallSite, fast);
     let f = |o: usize| site_off(fast + o);
+    // (`Err`: the proved path, see `ConstructProof` — the record's checks
+    // hold. `Ok(Some(p))`: the full checks, then the proof recorded when
+    // `this` is made without a call.)
+    let record = |a: &mut X64Assembler| {
+        if let Ok(Some(p)) = proof {
+            a.g_load(r::R9, r::RBX, reg(ctor));
+            a.g_store(RBP, p.ctor, r::R9);
+            a.g_load(r::R9, r::RBX, reg(nt));
+            a.g_store(RBP, p.nt, r::R9);
+            a.g_store(RBP, p.caps, r::R8);
+        }
+    };
     a.g_movabs(r::R11, e.memo as u64);
+    if proof.is_err() {
+        return emit_inline_new_this_made(a, e, this, miss, record);
+    }
     a.g_load(r::RAX, r::RBX, reg(ctor));
     a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ctor)));
     a.g_jcc(cc::NE, miss);
@@ -2932,11 +3007,29 @@ fn emit_inline_new_this(
         i32::try_from(offset_of!(CallTarget, key)).ok()?,
     );
     a.g_jcc(cc::NE, miss);
+    emit_inline_new_this_made(a, e, this, miss, record)
+}
+
+/// [`emit_inline_new_this`] once the record holds (`r11` the call site):
+/// `this` unbound for a derived constructor, else allocated; `record` runs
+/// where it is made without a call (keeping `rax`, `rcx`, `r8`, `r11`).
+fn emit_inline_new_this_made(
+    a: &mut X64Assembler,
+    e: &InlineEmit<'_>,
+    this: u16,
+    miss: Label,
+    record: impl Fn(&mut X64Assembler),
+) -> Option<()> {
+    use core::mem::offset_of;
+    let reg = |x: u16| i32::from(x) * 8;
+    let fast = offset_of!(CallSite, fast);
+    let f = |o: usize| site_off(fast + o);
     let base = a.new_label();
     let bound = a.new_label();
     a.g_load(r::RAX, r::R11, f(offset_of!(ConstructFast, derived)));
     a.g_test(r::RAX);
     a.g_jcc(cc::E, base);
+    record(a);
     a.g_movabs(r::RAX, crate::nanbox::NanBox::tdz().to_bits());
     a.jmp(bound);
     a.bind(base);
@@ -2958,6 +3051,7 @@ fn emit_inline_new_this(
         a.g_store(RBP, w.key, r::RAX);
         a.g_store(RBP, w.cell, r::RCX);
     }
+    record(a);
     if let Some(alloc) = e.new_alloc {
         a.jmp(made);
         // The free list is empty: the allocation the call's sequence would

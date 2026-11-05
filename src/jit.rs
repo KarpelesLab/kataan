@@ -7530,6 +7530,14 @@ impl JitFunction {
             let k = k as i32;
             (proved_base - 16 * k - 8, proved_base - 16 * k - 16)
         };
+        // Whether op `i` is in a loop (a back-edge spans it): the guards
+        // below keep a proof only there — elsewhere a guard runs again only
+        // after a call, which empties it, so it would only cost.
+        let looped = |i: usize| {
+            ops.iter()
+                .enumerate()
+                .any(|(j, o)| matches!(*o, GenericOp::Jump { target } if target <= i && i < j))
+        };
         // The monomorphic method and accessor guards that prove their
         // receiver for the next times (`call_seq::MethodProof`), each three
         // slots under the call guards' pairs: by op, its index. (Not one
@@ -7552,7 +7560,8 @@ impl JitFunction {
                             | GenericOp::SetProp { .. }
                             | GenericOp::CallMethod { .. }
                     )
-                ) && rc.sites.get(i).is_some_and(Option::is_none) =>
+                ) && rc.sites.get(i).is_some_and(Option::is_none)
+                    && looped(i) =>
                 {
                     n_mproved += 1;
                     Some(n_mproved - 1)
@@ -7567,6 +7576,35 @@ impl JitFunction {
                 bits: mproof_base - 24 * k - 8,
                 slot: mproof_base - 24 * k - 16,
                 shape: mproof_base - 24 * k - 24,
+            }
+        };
+        // The monomorphic construct guards (a `new`'s, a `super(…)`'s)
+        // that prove their constructor for the next times
+        // (`call_seq::ConstructProof`), each three slots under those.
+        let mut n_cproved = 0usize;
+        let cproof_slot: Vec<Option<usize>> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, o)| match *o {
+                GenericOp::InlineGuard { poly: 0, call, .. }
+                    if matches!(
+                        ops.get(call as usize),
+                        Some(GenericOp::Construct { .. } | GenericOp::Interp { .. })
+                    ) && looped(i) =>
+                {
+                    n_cproved += 1;
+                    Some(n_cproved - 1)
+                }
+                _ => None,
+            })
+            .collect();
+        let cproof_base = mproof_base - 24 * n_mproved as i32;
+        let inl_cproved = |k: usize| {
+            let k = k as i32;
+            call_seq::ConstructProof {
+                ctor: cproof_base - 24 * k - 8,
+                nt: cproof_base - 24 * k - 16,
+                caps: cproof_base - 24 * k - 24,
             }
         };
         // Per op, the inlined activations enclosing it, outer first, as a
@@ -7655,7 +7693,8 @@ impl JitFunction {
                 + 3 * usize::from(has_nested)
                 + 3 * usize::from(has_nested2)
                 + 2 * n_proved
-                + 3 * n_mproved) as u32
+                + 3 * n_mproved
+                + 3 * n_cproved) as u32
                 * 8)
             + 15)
             & !15;
@@ -7727,6 +7766,7 @@ impl JitFunction {
                 .chain(has_inline.then_some(inl_slots.ok))
                 .chain((0..n_proved).map(|k| inl_proved(k).0))
                 .chain((0..n_mproved).map(|k| inl_mproved(k).bits))
+                .chain((0..n_cproved).map(|k| inl_cproved(k).ctor))
                 .collect(),
         );
         // (Also the promoted loops' epoch slots: emptying them with the
@@ -8529,6 +8569,7 @@ impl JitFunction {
                             poly,
                             proved: proved_slot[op_idx].map(inl_proved),
                             mproved: mproof_slot[op_idx].map(inl_mproved),
+                            cproved: cproof_slot[op_idx].map(inl_cproved),
                             keep: &num.guard_keep(op_idx),
                             fused_miss: match ops.get(op_idx + 1) {
                                 _ if cold_miss.is_some() => cold_miss.map(|c| c.0),
