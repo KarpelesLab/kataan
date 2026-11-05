@@ -1023,9 +1023,11 @@ program's output against node's. Ratios are kataan/node; lower is better.
 | nbody_like | 205x | 28.9x | 21.7x | 15.2x | 9.2x | 5.1x | 2.8x | 3.0x | 1.9x | 1.1x |
 
 These runs are short and whole-process, so they include node's slower startup and warm-up. Steady state is
-further behind: with the main loop scaled 4x (2e4a59e5, best of 5, kataan/node), map_set 0.68x, regex 0.84x,
-loop_arith 0.87x, json 0.97x, array_ops 1.0x, method_calls 1.2x, closures 1.2x, prop_access 1.4x,
-string_build 1.4x, objects_alloc 1.6x, nbody_like 1.8x, richards_like 2.3x.
+further behind: with the main loop scaled 4x (890ae8b3, best of 3, kataan/node, node run as plain `node FILE`),
+map_set 0.72x, loop_arith 0.91x, regex 0.95x, json 0.95x, method_calls 0.97x, prop_access 1.0x, array_ops 1.0x,
+string_build 1.1x, closures 1.3x, nbody_like 1.75x, richards_like 2.2x. (objects_alloc, 0.34x, no longer measures
+allocation: its objects are scalar-replaced.) Pattern programs still well behind: `switch` dispatch 5.3x,
+derived-class construction 5.0x, array-destructuring swap 4.5x, accessor-heavy loops 3.3x, `for…in` 2.4x.
 
 The main contributors, by landing order:
 - number fast paths;
