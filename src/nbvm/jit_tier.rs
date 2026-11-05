@@ -4030,6 +4030,7 @@ pub(super) fn cold_call_pcs(
                     | Op::CallWithMethod { .. }
                     | Op::CallKey { .. }
                     | Op::Construct { .. }
+                    | Op::SuperCallArgs { .. }
             ) && hints
                 .get(pc)
                 .is_none_or(|h| *h == crate::ic::CalleeHint::None)
@@ -4075,6 +4076,26 @@ fn inline_candidate_one(
     key: u64,
 ) -> Option<crate::jit::inline::Candidate<'_>> {
     let mut c = inline_candidate_key(funcs, caller, key)?;
+    c.nested = nested_candidates(funcs, caller, &c, false);
+    // (A derived constructor's `super(…)` callee, itself derived, brings its
+    // own `super(…)` callee: `inline::super_nested`.)
+    for (p, n) in &mut c.nested {
+        if matches!(c.proto.ops.get(*p), Some(Op::SuperCallArgs { .. })) && n.proto.derived {
+            n.nested = nested_candidates(funcs, caller, n, true);
+        }
+    }
+    Some(c)
+}
+
+/// The callees of `c`'s own call sites, by its feedback (its compiled
+/// body's, else its interpreter's) — of its `super(…)` sites only when
+/// `supers` — never `caller` itself, whose body is being compiled.
+fn nested_candidates<'a>(
+    funcs: &'a [FnProto],
+    caller: usize,
+    c: &crate::jit::inline::Candidate<'a>,
+    supers: bool,
+) -> alloc::vec::Vec<(usize, crate::jit::inline::Candidate<'a>)> {
     let fid = (c.key & 0xffff_ffff) as usize;
     let proto = c.proto;
     let mut own = match proto.tier.jit() {
@@ -4090,7 +4111,8 @@ fn inline_candidate_one(
             *h = i;
         }
     }
-    c.nested = (0..proto.ops.len())
+    (0..proto.ops.len())
+        .filter(|&p| !supers || matches!(proto.ops[p], Op::SuperCallArgs { .. }))
         .filter_map(|p| {
             let crate::ic::CalleeHint::One(k) = *own.get(p)? else {
                 return None;
@@ -4099,8 +4121,7 @@ fn inline_candidate_one(
             // (Not the outer caller again: its body is being compiled.)
             ((n.key & 0xffff_ffff) as usize != caller).then_some((p, n))
         })
-        .collect();
-    Some(c)
+        .collect()
 }
 
 /// [`inline_candidate_one`] without the callee's own inlined calls.

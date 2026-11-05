@@ -2955,7 +2955,8 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                     Some(Op::SetProp { obj, src, .. } | Op::SetPropStrict { obj, src, .. }) => {
                         obj == callee && args.as_slice() == [*src]
                     }
-                    Some(Op::Construct { ctor, args: a, .. }) => ctor == callee && a == args,
+                    Some(Op::Construct { ctor, args: a, .. })
+                    | Some(Op::SuperCallArgs { ctor, args: a, .. }) => ctor == callee && a == args,
                     _ => false,
                 };
                 if !same || args.len() > 32 || *call <= pc {
@@ -4292,6 +4293,19 @@ impl JitProto {
                 _ => None,
             })
             .collect();
+        // (And each `super(…)`'s own call site, whose callee feedback an
+        // inlining recompilation reads: `call_hints`.)
+        let mut call_pcs = call_pcs;
+        if let Some(own) = interp_sites(&bytecode, call_args.len(), n_calls) {
+            for (pc, op) in bytecode.iter().enumerate() {
+                if let (crate::nbvm::Op::SuperCallArgs { .. }, Some(Some((_, site)))) =
+                    (op, own.get(pc))
+                {
+                    call_pcs.push((u32::try_from(pc).ok()?, *site));
+                }
+            }
+            call_pcs.sort_unstable_by_key(|&(pc, _)| pc);
+        }
         let site_info: Vec<SiteInfo> = site_info
             .into_iter()
             .zip(baked_at.into_iter().zip(add_at))
@@ -4439,6 +4453,7 @@ impl JitProto {
                 | crate::nbvm::Op::CallValue { .. }
                 | crate::nbvm::Op::CallWithMethod { .. }
                 | crate::nbvm::Op::Construct { .. }
+                | crate::nbvm::Op::SuperCallArgs { .. }
                 | crate::nbvm::Op::CallKey { .. }
                 | crate::nbvm::Op::GetProp { .. }
                 | crate::nbvm::Op::SetProp { .. }
@@ -6987,6 +7002,29 @@ impl JitFunction {
         let construct_alloc_helper = helpers.construct_alloc as usize as u64;
         let super_twice_helper = helpers.super_twice as usize as u64;
         let interp_sites = interp_sites(bytecode, call_args.len(), call_sites.len())?;
+        // An inlined `super(…)`'s call op (`inline`'s construct sites: an
+        // interpreter op with a call site of its own): its constructor,
+        // `new.target` and `this` registers, its argument registers and its
+        // call site's index.
+        let super_site = |call: usize| -> Option<(u16, u16, u16, &Vec<u16>, usize)> {
+            let crate::nbvm::Op::SuperCallArgs {
+                ctor,
+                new_target,
+                this,
+                ..
+            } = bytecode.get(call)?
+            else {
+                return None;
+            };
+            let (args, site) = interp_sites.get(call).copied().flatten()?;
+            Some((
+                *ctor,
+                *new_target,
+                *this,
+                call_args.get(args as usize)?,
+                site as usize,
+            ))
+        };
         let construct_slow_helper = helpers.construct as usize as u64;
         let call_this_helper = helpers.call_this as usize as u64;
         // The catch entries of the body's `try` regions: where the throw exit
@@ -7410,10 +7448,12 @@ impl JitFunction {
             .iter()
             .any(|o| matches!(o, GenericOp::InlineGuard { .. }));
         // Each inlined-call op's level: 2 inside another inlined body (an
-        // inlined callee's own inlined call, `inline::Candidate::nested`).
+        // inlined callee's own inlined call, `inline::Candidate::nested`),
+        // 3 inside that (an inlined `super(…)`'s own).
         let inl_level = inline_levels(ops);
-        let has_nested = inl_level.contains(&2);
-        if inl_level.iter().any(|&l| l > 2) {
+        let has_nested = inl_level.iter().any(|&l| l >= 2);
+        let has_nested2 = inl_level.contains(&3);
+        if inl_level.iter().any(|&l| l > 3) {
             return None;
         }
         let inl_base = m_base - 8 * (3 * math_sites.len() as i32);
@@ -7425,6 +7465,11 @@ impl JitFunction {
                 save: inl_base - 40,
                 hdr: inl_base - 48,
                 callee: inl_base - 56,
+            }),
+            nested2: has_nested2.then_some(call_seq::NestedSlots {
+                save: inl_base - 64,
+                hdr: inl_base - 72,
+                callee: inl_base - 80,
             }),
             save: None,
             ok: inl_base - 32,
@@ -7438,6 +7483,7 @@ impl JitFunction {
                             call_args.get(*args as usize).map(Vec::len)
                         }
                         GenericOp::SetProp { .. } => Some(1),
+                        GenericOp::Interp { .. } => super_site(call as usize).map(|s| s.3.len()),
                         _ => Some(0),
                     },
                     _ => None,
@@ -7478,7 +7524,8 @@ impl JitFunction {
             })
             .collect();
         let n_proved = proof_keys.len();
-        let proved_base = inl_base - 8 * (4 + 3 * i32::from(has_nested));
+        let proved_base =
+            inl_base - 8 * (4 + 3 * i32::from(has_nested) + 3 * i32::from(has_nested2));
         let inl_proved = |k: usize| {
             let k = k as i32;
             (proved_base - 16 * k - 8, proved_base - 16 * k - 16)
@@ -7503,13 +7550,13 @@ impl JitFunction {
                     GenericOp::Construct { ctor, site, .. } => {
                         (call_args.get(site as usize)?.clone(), Some(ctor))
                     }
+                    GenericOp::Interp { .. } => {
+                        let (_, nt, _, argv, _) = super_site(call as usize)?;
+                        (argv.clone(), Some(nt))
+                    }
                     _ => return None,
                 };
-                let view = if level == 0 {
-                    inl_slots
-                } else {
-                    inl_slots.inner()?
-                };
+                let view = inl_slots.level(u8::try_from(level + 1).ok()?)?;
                 Some(call_seq::PendingAct {
                     callee: view.callee,
                     args,
@@ -7517,7 +7564,7 @@ impl JitFunction {
                 })
             };
             let ctx_of = |stack: &[usize]| -> Option<call_seq::InlineCtx> {
-                if stack.is_empty() || stack.len() > 2 {
+                if stack.is_empty() || stack.len() > 3 {
                     return None;
                 }
                 let acts = stack
@@ -7528,11 +7575,9 @@ impl JitFunction {
                 Some(call_seq::InlineCtx {
                     acts,
                     pend: inl_slots.pend,
-                    save: if stack.len() == 2 {
-                        Some(inl_slots.nested?.save)
-                    } else {
-                        None
-                    },
+                    saves: (2..=stack.len())
+                        .map(|l| inl_slots.level(l as u8)?.save)
+                        .collect::<Option<Vec<_>>>()?,
                 })
             };
             let mut stack: Vec<usize> = Vec::new();
@@ -7569,6 +7614,7 @@ impl JitFunction {
                 + 3 * math_sites.len()
                 + 4 * usize::from(has_inline)
                 + 3 * usize::from(has_nested)
+                + 3 * usize::from(has_nested2)
                 + 2 * n_proved) as u32
                 * 8)
             + 15)
@@ -7654,7 +7700,7 @@ impl JitFunction {
             // global binding cache's reset, which may run inside an inlined
             // body.)
             let mut clear = alloc::vec![inl_slots.pend, inl_slots.hdr];
-            if let Some(n) = inl_slots.nested {
+            for n in [inl_slots.nested, inl_slots.nested2].into_iter().flatten() {
                 clear.extend([n.save, n.hdr]);
             }
             a.set_inline_pend(Some(inl_slots.pend), clear);
@@ -7664,7 +7710,7 @@ impl JitFunction {
         }
         // The inlined calls' frame materialization stubs: (entry, the call's
         // argument registers).
-        let mut inline_stubs: Vec<(Label, Vec<u16>, Option<u16>, bool)> = Vec::new();
+        let mut inline_stubs: Vec<(Label, Vec<u16>, Option<u16>, u8)> = Vec::new();
         // The out-of-line full walks: (entry, resume, receiver, miss, way).
         let mut cold_walks: Vec<(Label, Label, u16, Label, usize, recv_cache::Family)> = Vec::new();
         // The global binding cache's refills: (entry, resume, done, op, slot).
@@ -8297,15 +8343,29 @@ impl JitFunction {
                             call_seq::CalleeSrc::Reg(*callee),
                             call_args.get(*site as usize)?,
                         ),
+                        GenericOp::Interp { .. } => {
+                            let (ctor, _, _, argv, _) = super_site(call as usize)?;
+                            (call_seq::CalleeSrc::Reg(ctor), argv)
+                        }
                         _ => return None,
                     };
                     // A `new`: the guard allocates `this` (`inline`'s
                     // construct sites), passing the constructor as
-                    // `new.target`.
-                    let new_target = match ops.get(call as usize)? {
-                        GenericOp::Construct { ctor, .. } => Some(*ctor),
-                        _ => None,
+                    // `new.target`; a `super(…)` passes its own, and its
+                    // guard also requires the caller's `this` unbound.
+                    let (new_target, super_this) = match ops.get(call as usize)? {
+                        GenericOp::Construct { ctor, .. } => (Some((*ctor, *ctor)), None),
+                        GenericOp::Interp { .. } => {
+                            let (ctor, nt, this, _, _) = super_site(call as usize)?;
+                            (Some((ctor, nt)), Some(this))
+                        }
+                        _ => (None, None),
                     };
+                    if super_this.is_some_and(|t| !ok(t))
+                        || new_target.is_some_and(|(_, nt)| !ok(nt))
+                    {
+                        return None;
+                    }
                     if !ok(dst)
                         || argv.iter().any(|&r| !ok(r))
                         || (0..n_caps).any(|i| !ok(caps.saturating_add(i)))
@@ -8342,11 +8402,7 @@ impl JitFunction {
                             if way.is_some() {
                                 return None;
                             }
-                            let level = if inl_level[op_idx] == 2 {
-                                inl_slots.inner()?
-                            } else {
-                                inl_slots
-                            };
+                            let level = inl_slots.level(inl_level[op_idx])?;
                             (
                                 call_seq::CalleeSrc::Frame {
                                     scratch: level.callee,
@@ -8381,6 +8437,7 @@ impl JitFunction {
                                 | GenericOp::Construct { cache, .. } => *cache as usize,
                                 GenericOp::GetProp { call, .. }
                                 | GenericOp::SetProp { call, .. } => *call as usize,
+                                GenericOp::Interp { .. } => super_site(call as usize)?.4,
                                 _ => return None,
                             })?;
                             Some((count, memo, bail))
@@ -8404,6 +8461,7 @@ impl JitFunction {
                             GenericOp::GetProp { call, .. } | GenericOp::SetProp { call, .. } => {
                                 *call as usize
                             }
+                            GenericOp::Interp { .. } => super_site(call as usize)?.4,
                             _ => return None,
                         })
                         .copied()?;
@@ -8417,17 +8475,14 @@ impl JitFunction {
                             caps,
                             n_caps,
                             layout: &helpers.call_layout,
-                            slots: if inl_level[op_idx] == 2 {
-                                inl_slots.inner()?
-                            } else {
-                                inl_slots
-                            },
+                            slots: inl_slots.level(inl_level[op_idx])?,
                             stub,
                             memo,
                             getter,
                             setter,
                             way,
                             new_target,
+                            super_this,
                             new_alloc,
                             new_way,
                             poly,
@@ -8454,14 +8509,15 @@ impl JitFunction {
                         a.jmp(bail);
                         a.cold_end(cold);
                     }
-                    inline_stubs.push((stub, argv.clone(), new_target, inl_level[op_idx] == 2));
+                    inline_stubs.push((
+                        stub,
+                        argv.clone(),
+                        new_target.map(|(_, nt)| nt),
+                        inl_level[op_idx],
+                    ));
                 }
                 GenericOp::InlineLeave => {
-                    let s = if inl_level[op_idx] == 2 {
-                        inl_slots.inner()?
-                    } else {
-                        inl_slots
-                    };
+                    let s = inl_slots.level(inl_level[op_idx])?;
                     // (In a speculative loop's fast version the activation
                     // is still pending: nothing there calls.)
                     if num.in_spec(op_idx) {
@@ -12146,8 +12202,10 @@ impl JitFunction {
         if has_inline {
             // A throw out of an inlined body: its activation ends here (an
             // inner level's first).
-            if let Some(inner) = inl_slots.inner() {
-                call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inner);
+            for level in [3, 2] {
+                if let Some(inner) = inl_slots.level(level) {
+                    call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inner);
+                }
             }
             call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &inl_slots);
         }
@@ -12171,9 +12229,9 @@ impl JitFunction {
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
         // (Out of line, called: see `call_seq::emit_inline_stub`.)
-        for (stub, argv, nt, inner) in core::mem::take(&mut inline_stubs) {
+        for (stub, argv, nt, level) in core::mem::take(&mut inline_stubs) {
             a.bind(stub);
-            let s = if inner { inl_slots.inner()? } else { inl_slots };
+            let s = inl_slots.level(level)?;
             call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &s, &argv, nt)?;
         }
         // The native-call entry (emitted before the body), behind one that

@@ -1896,9 +1896,9 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_mem(true, &[0x83], 7, RBP, c.pend); // cmp qword [rbp+pend], -1
         a.code.push(0xff);
         a.g_jcc(cc::E, plain);
-        if let Some(save) = c.save {
+        for &save in &c.saves {
             // (An inner activation pending over a materialized outer one:
-            // its stub pushes it.)
+            // its stub pushes it, and any other still pending.)
             a.g_cmp_store_zero_skip(save, hook);
         }
         emit_enter(a, e, (callee_base, callee_disp), &c.acts)?;
@@ -1957,8 +1957,9 @@ pub(crate) struct InlineCtx {
     pub acts: alloc::vec::Vec<PendingAct>,
     /// [`InlineSlots::pend`].
     pub pend: i32,
-    /// [`NestedSlots::save`], with two levels.
-    pub save: Option<i32>,
+    /// The inner levels' [`NestedSlots::save`] slots (none with one
+    /// level): every one nonzero while all of them are still pending.
+    pub saves: alloc::vec::Vec<i32>,
 }
 
 /// Steps 2 to 7 of [`emit_call`] from `identified` (the way in `r11`, the
@@ -2154,6 +2155,16 @@ fn emit_outcome(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         let have = a.new_label();
         a.p_cmp_handle_floor(r::RAX);
         a.g_jcc(cc::B, this);
+        // An ordinary object (what a constructor returns when it returns
+        // its `this`: a derived one's is the result) is the result as it
+        // is; any other heap value is the helper's to classify.
+        let jl = super::compute_jit_layout();
+        a.g_mov(r::R9, r::RAX);
+        a.p_arena(e.layout.realm, &jl.props);
+        a.g_mov(r::RAX, r::R9);
+        a.p_slot_rooted(jl, r::RCX, check);
+        a.cmp_byte_at_rcx_imm(jl.off_cell_tag, jl.cell_object_disc);
+        a.g_jcc(cc::E, have);
         a.bind(check);
         a.g_mov(r::RDI, r::R15);
         a.g_mov(r::RSI, r::RAX);
@@ -2221,6 +2232,12 @@ pub(crate) struct InlineSlots {
     /// ([`InlineSlots::inner`]); every guard's checks then ask for room and
     /// depth for both levels' activations.
     pub nested: Option<NestedSlots>,
+    /// For a body with a third level (an inner level's own inlined
+    /// `super(…)`, `inline::Candidate::nested`), that level's slots
+    /// ([`InlineSlots::level`]), kept as the second level's are: its
+    /// activation runs inside the second level's, which may still be
+    /// pending (and the first under it) when its guard hits.
+    pub nested2: Option<NestedSlots>,
     /// In an inner level's view ([`InlineSlots::inner`]): where its
     /// activation keeps what `pend` held when its guard hit (see
     /// [`NestedSlots::save`]).
@@ -2247,7 +2264,7 @@ pub(crate) struct NestedSlots {
 impl InlineSlots {
     /// How many inlined activations can be active at once.
     pub(crate) fn levels(&self) -> usize {
-        1 + usize::from(self.nested.is_some())
+        1 + usize::from(self.nested.is_some()) + usize::from(self.nested2.is_some())
     }
 
     /// The view an inner-level guard, stub or leave uses: its own header and
@@ -2261,6 +2278,27 @@ impl InlineSlots {
             save: Some(n.save),
             ..*self
         })
+    }
+
+    /// The view of the inlining level `level` (`1`, the outer one: `self`;
+    /// `2`: [`InlineSlots::inner`]; `3`: the third level's own header and
+    /// callee slots, with its `save`).
+    #[must_use]
+    pub(crate) fn level(&self, level: u8) -> Option<Self> {
+        match level {
+            0 | 1 => Some(*self),
+            2 => self.inner(),
+            3 => {
+                let n = self.nested2?;
+                Some(Self {
+                    hdr: n.hdr,
+                    callee: n.callee,
+                    save: Some(n.save),
+                    ..*self
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2300,11 +2338,16 @@ pub(crate) struct InlineEmit<'a> {
     /// The receiver cache's way for a method's receiver
     /// (`super::recv_cache`), if the guard is one of its sites.
     pub way: Option<RecvWay>,
-    /// A `new` site's constructor register (also its `new.target`): the
-    /// guard then requires the call's [`ConstructFast`] record for a base
-    /// constructor and allocates `this` as it says, into the register after
-    /// the captures (`n_caps` counts it).
-    pub new_target: Option<u16>,
+    /// A construct site's constructor and `new.target` registers (the same
+    /// for a `new`): the guard then requires the call's [`ConstructFast`]
+    /// record for them and makes `this` as it says — allocated for a base
+    /// constructor, unbound for a derived one — into the register after the
+    /// captures (`n_caps` counts it).
+    pub new_target: Option<(u16, u16)>,
+    /// A `super(…)` site's `this` register (the caller's, which its result
+    /// binds): the guard then also requires it unbound (else the call op
+    /// runs the super constructor and throws).
+    pub super_this: Option<u16>,
     /// For a `new`: the helper that allocates `this` when the heap's free
     /// list is empty ([`ConstructAllocHelper`]; `None`: that is a miss), and
     /// the receiver-cache way the fresh object fills.
@@ -2608,6 +2651,12 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     }
     // 3b. A `new`: `this`, as the call's `[[Construct]]` would make it.
     let n_caps = e.n_caps - u16::from(e.new_target.is_some());
+    if let Some(t) = e.super_this {
+        a.g_load(r::RAX, r::RBX, reg(t));
+        a.g_movabs(r::R11, NanBox::tdz().to_bits());
+        a.g_cmp(r::RAX, r::R11);
+        a.g_jcc(cc::NE, miss);
+    }
     if let Some(ctor) = e.new_target {
         emit_inline_new_this(a, e, ctor, e.caps.checked_add(n_caps)?, miss)?;
     }
@@ -2747,21 +2796,24 @@ fn emit_guard_fill(a: &mut X64Assembler, e: &InlineEmit<'_>, w: usize) {
     a.bind(skip);
 }
 
-/// An inlined `new`'s `this` (`emit_inline_guard`, `e.new_target` the
-/// constructor register `ctor`): the call's [`ConstructFast`] record must
-/// hold for this constructor as its own `new.target`, at the current
-/// prototype epoch, for a base constructor whose way is `e.key`'s — so the
-/// construct is exactly "allocate an ordinary object whose `[[Prototype]]`
-/// is `proto` (`new.target.prototype`, which the record proves fixed), then
-/// run the body" (`OrdinaryCreateFromConstructor` observes nothing else) —
-/// and the object is allocated (`p_alloc_object`, else `e.new_alloc`'s
-/// helper, else a miss), into register `this` (and `e.new_way`). Otherwise
-/// to `miss`, having changed nothing observable (the call op makes the
+/// An inlined construct's `this` (`emit_inline_guard`, `e.new_target` the
+/// constructor and `new.target` registers `(ctor, nt)`): the call's
+/// [`ConstructFast`] record must hold for this constructor and
+/// `new.target`, at the current prototype epoch, for a constructor whose
+/// way is `e.key`'s. For a derived class constructor the construct is then
+/// exactly "run the body with `this` unbound" (it allocates nothing): `this`
+/// is the TDZ sentinel. For a base constructor it is exactly "allocate an
+/// ordinary object whose `[[Prototype]]` is `proto`
+/// (`new.target.prototype`, which the record proves fixed), then run the
+/// body" (`OrdinaryCreateFromConstructor` observes nothing else) — and
+/// the object is allocated (`p_alloc_object`, else `e.new_alloc`'s helper,
+/// else a miss), into register `this` (and `e.new_way`). Otherwise to
+/// `miss`, having changed nothing observable (the call op makes the
 /// construct). Keeps `r8` (the captures' pointer).
 fn emit_inline_new_this(
     a: &mut X64Assembler,
     e: &InlineEmit<'_>,
-    ctor: u16,
+    (ctor, nt): (u16, u16),
     this: u16,
     miss: Label,
 ) -> Option<()> {
@@ -2773,13 +2825,13 @@ fn emit_inline_new_this(
     a.g_load(r::RAX, r::RBX, reg(ctor));
     a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ctor)));
     a.g_jcc(cc::NE, miss);
+    if nt != ctor {
+        a.g_load(r::RAX, r::RBX, reg(nt));
+    }
     a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, nt)));
     a.g_jcc(cc::NE, miss);
     load_proto_epoch(a, r::R9);
     a.g_cmp_mem(r::R9, r::R11, f(offset_of!(ConstructFast, stamp)));
-    a.g_jcc(cc::NE, miss);
-    a.g_load(r::RAX, r::R11, f(offset_of!(ConstructFast, derived)));
-    a.g_test(r::RAX);
     a.g_jcc(cc::NE, miss);
     a.g_load(r::R9, r::R11, f(offset_of!(ConstructFast, target)));
     a.g_test(r::R9);
@@ -2791,6 +2843,14 @@ fn emit_inline_new_this(
         i32::try_from(offset_of!(CallTarget, key)).ok()?,
     );
     a.g_jcc(cc::NE, miss);
+    let base = a.new_label();
+    let bound = a.new_label();
+    a.g_load(r::RAX, r::R11, f(offset_of!(ConstructFast, derived)));
+    a.g_test(r::RAX);
+    a.g_jcc(cc::E, base);
+    a.g_movabs(r::RAX, crate::nanbox::NanBox::tdz().to_bits());
+    a.jmp(bound);
+    a.bind(base);
     check_construct_proto(a, r::R11, fast, miss);
     a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
     let made = a.new_label();
@@ -2847,6 +2907,7 @@ fn emit_inline_new_this(
             site_off(offset_of!(CallSite, ident) + offset_of!(IdentMemo, value)),
         );
     }
+    a.bind(bound);
     a.g_store(r::RBX, reg(this), r::RAX);
     Some(())
 }

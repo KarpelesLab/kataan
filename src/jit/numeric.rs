@@ -708,10 +708,14 @@ fn guard_diamonds(
         let dst = match *guard {
             GenericOp::PlainPrims { dst, .. } => dst,
             // An inlined call's (last) guard: its fallback arm is the call
-            // op alone. (Not a `new`'s, whose guard allocates.)
+            // op alone. (Not a `new`'s or a `super(…)`'s, whose guard
+            // allocates.)
             GenericOp::InlineGuard { dst, call, .. }
                 if call as usize == f
-                    && !matches!(ops.get(f), Some(GenericOp::Construct { .. })) =>
+                    && !matches!(
+                        ops.get(f),
+                        Some(GenericOp::Construct { .. } | GenericOp::Interp { .. })
+                    ) =>
             {
                 dst
             }

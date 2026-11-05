@@ -109,7 +109,9 @@ pub struct Candidate<'a> {
     /// The callee's warm inline caches, by its own pc.
     pub warm: Vec<Option<WarmEntry>>,
     /// The callee's own call sites to inline into its spliced body, by its
-    /// own pc (one level: their candidates' `nested` are ignored).
+    /// own pc (one level: their candidates' `nested` are ignored — but at a
+    /// `super(…)` site, whose callee's own `super(…)` sites inline one more
+    /// level, see [`super_nested`]).
     pub nested: Vec<(usize, Candidate<'a>)>,
 }
 
@@ -120,6 +122,32 @@ struct Site<'a> {
     key: u64,
     proto: alloc::borrow::Cow<'a, FnProto>,
     warm: Vec<Option<WarmEntry>>,
+}
+
+/// The third inlining level (`Candidate::nested`): the `super(…)` sites of
+/// `n`, a derived constructor inlined at a `super(…)` site itself, with
+/// their candidates (and none deeper). A chain of derived class
+/// constructors is inlined whole that way, `new C` through `super(…)` to
+/// the base constructor that allocates.
+fn super_nested<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
+    if !n.proto.derived {
+        return Vec::new();
+    }
+    n.nested
+        .iter()
+        .filter(|(p, _)| n.proto.ops.get(*p).and_then(super_parts).is_some())
+        .map(|(p, m)| {
+            (
+                *p,
+                Candidate {
+                    key: m.key,
+                    proto: m.proto,
+                    warm: m.warm.clone(),
+                    nested: Vec::new(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// `c`'s body as spliced (see [`Site`]).
@@ -136,11 +164,15 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                 nested
                     .iter()
                     .filter(|(p, _)| *p == pc)
-                    .map(|(_, n)| Candidate {
+                    .map(|(p, n)| Candidate {
                         key: n.key,
                         proto: n.proto,
                         warm: n.warm.clone(),
-                        nested: Vec::new(),
+                        nested: if super_parts(&proto.ops[*p]).is_some() {
+                            super_nested(n)
+                        } else {
+                            Vec::new()
+                        },
                     })
                     .collect()
             })
@@ -208,6 +240,11 @@ fn callee_ok_sized(proto: &FnProto, spliced: bool) -> bool {
     proto.ops.iter().enumerate().all(|(pc, op)| match op {
         Op::Jump { target } => loop_ok(proto, pc, *target),
         Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
+        // (Only a derived constructor's own, inlined at a construct site.)
+        Op::SuperCtor { .. }
+        | Op::InitFields { .. }
+        | Op::DerivedResult { .. }
+        | Op::SuperCallArgs { .. } => false,
         _ => {
             let mut o = op.clone();
             remap(&mut o, &|r| r, &|t| t)
@@ -257,14 +294,14 @@ pub fn construct_ok(proto: &FnProto) -> bool {
 /// [`construct_ok`] as [`callee_ok_sized`] is [`callee_ok`].
 fn construct_ok_sized(proto: &FnProto, spliced: bool) -> bool {
     let (max_ops, max_regs) = limits(spliced);
-    if proto.derived
-        || proto.is_async
+    if proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
         || proto.ops.is_empty()
         || proto.ops.len() > max_ops
         || proto.n_regs > max_regs
         || proto.n_params + proto.n_captures >= proto.n_regs
+        || (proto.derived && !derived_ok(proto))
     {
         return false;
     }
@@ -273,12 +310,96 @@ fn construct_ok_sized(proto: &FnProto, spliced: bool) -> bool {
         Op::Jump { target } => loop_ok(proto, pc, *target),
         Op::JumpIfFalse { target, .. } => *target > pc && *target <= n,
         Op::LoadNewTarget { .. } => true,
-        Op::Return { .. } => false,
+        // (A derived constructor's own end, see `derived_ok`.)
+        Op::Return { .. } => proto.derived && pc + 1 == n,
         _ => {
             let mut o = op.clone();
             remap(&mut o, &|r| r, &|t| t)
         }
     })
+}
+
+/// Whether the derived class constructor `p` has the one shape inlined at a
+/// construct site (see [`construct_site`]): its `this` (the register after
+/// the captures, which the guard leaves unbound) is written by exactly one
+/// op, a `super(…)` with its arguments in registers (`Op::SuperCallArgs`)
+/// that every run reaches once — no branch before it, none after it back
+/// to it or before it — and the body ends with the implicit
+/// `return undefined` (`LoadConst undefined`, `Op::DerivedResult` of it,
+/// `return`), which nothing branches past the `LoadConst` into and no
+/// other `return` precedes. Then a run that does not throw binds `this`
+/// exactly once, to the object its super constructor made, and returns
+/// it: `[[Construct]]`'s checks (an object result; `this` bound) hold, so
+/// the inlined body's result is that `this`.
+fn derived_ok(p: &FnProto) -> bool {
+    let n = p.ops.len();
+    let this = (p.n_params + p.n_captures) as Reg;
+    let [
+        ..,
+        Op::LoadConst { dst: u, value },
+        Op::DerivedResult {
+            dst: d,
+            src,
+            this: t,
+        },
+        Op::Return { src: r },
+    ] = &p.ops[..]
+    else {
+        return false;
+    };
+    if value.to_bits() != NanBox::undefined().to_bits() || src != u || *t != this || r != d {
+        return false;
+    }
+    // The `super(…)`: the one call op writing `this`. (In a body that
+    // inlined it, `Candidate::nested`, its guards' blocks precede it, from
+    // `g`, each binding `this` after its leave, and branch only within
+    // them or to just past the call.)
+    let Some(s) = p.ops.iter().position(
+        |o| matches!(o, Op::SuperCallArgs { this: st, dst, .. } if *st == this && *dst != this),
+    ) else {
+        return false;
+    };
+    let g = p
+        .ops
+        .iter()
+        .position(|o| matches!(o, Op::InlineGuard { call, .. } if *call == s))
+        .unwrap_or(s);
+    let binds = |pc: usize| {
+        (g..s).contains(&pc)
+            && pc > 0
+            && matches!(p.ops[pc - 1], Op::InlineLeave)
+            && matches!(p.ops[pc], Op::Move { dst, .. } if dst == this)
+    };
+    if p.ops
+        .iter()
+        .enumerate()
+        .any(|(pc, o)| pc != s && !binds(pc) && writes_reg(o, this))
+    {
+        return false;
+    }
+    p.ops.iter().enumerate().all(|(pc, o)| match o {
+        Op::Jump { target } | Op::JumpIfFalse { target, .. } => {
+            if (g..=s).contains(&pc) {
+                *target > g && *target <= s + 1
+            } else {
+                pc > s && *target > s && *target <= n - 3
+            }
+        }
+        Op::Return { .. } => pc + 1 == n,
+        // (An inlined super constructor's own is its body's.)
+        Op::DerivedResult { this: t, .. } => *t != this || pc + 2 == n,
+        // (`super(...spread)`, `eval`, `arguments`: not this shape.)
+        Op::SuperCall { .. } => false,
+        _ => true,
+    })
+}
+
+/// Whether `op` is a construct site an inlined body allocates or leaves
+/// unbound `this` for: a `new` (whose `new.target` is the constructor) or
+/// a `super(…)` with its arguments in registers (`new.target` a register;
+/// the result also binds the caller's `this`).
+fn construct_site(op: &Op) -> bool {
+    matches!(op, Op::Construct { .. } | Op::SuperCallArgs { .. })
 }
 
 /// Whether every call op in `p` (a callee body, maybe with calls of its own
@@ -301,7 +422,20 @@ fn calls_only_inlined(p: &FnProto) -> bool {
                 | Op::CallWithMethod { .. }
                 | Op::CallKey { .. }
                 | Op::Construct { .. }
+                | Op::SuperCallArgs { .. }
+                | Op::SuperCall { .. }
         ) || fallbacks.contains(&pc)
+    })
+}
+
+/// Whether every `super(…)` in `p` (a callee body, maybe with calls of its
+/// own spliced in) is the fallback of one of its inlined calls' guards.
+fn super_inlined(p: &FnProto) -> bool {
+    p.ops.iter().enumerate().all(|(pc, o)| {
+        !matches!(o, Op::SuperCallArgs { .. } | Op::SuperCall { .. })
+            || p.ops
+                .iter()
+                .any(|g| matches!(g, Op::InlineGuard { call, .. } if *call == pc))
     })
 }
 
@@ -450,6 +584,35 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             }
         }
         Op::InlineLeave => {}
+        // A derived constructor's own steps (`derived_ok`).
+        Op::SuperCtor { dst, f } => {
+            *dst = reg(*dst);
+            *f = reg(*f);
+        }
+        Op::InitFields { ctor, this } => {
+            *ctor = reg(*ctor);
+            *this = reg(*this);
+        }
+        Op::DerivedResult { dst, src, this } => {
+            *dst = reg(*dst);
+            *src = reg(*src);
+            *this = reg(*this);
+        }
+        Op::SuperCallArgs {
+            dst,
+            ctor,
+            new_target,
+            args,
+            this,
+        } => {
+            *dst = reg(*dst);
+            *ctor = reg(*ctor);
+            *new_target = reg(*new_target);
+            *this = reg(*this);
+            for a in args.iter_mut() {
+                *a = reg(*a);
+            }
+        }
         // Calls: an inlined body may call (see the module docs).
         Op::GetMethod { dst, obj, .. } => {
             *dst = reg(*dst);
@@ -515,6 +678,11 @@ fn call_parts(op: &Op) -> Option<(Reg, Reg, &[Reg], Option<Reg>)> {
         }
         // (`this` is the object the guard allocates.)
         Op::Construct { dst, ctor, args } => Some((*dst, *ctor, args, None)),
+        // (Likewise; `new.target` and the `this` the result binds are
+        // the op's own, see `super_parts`.)
+        Op::SuperCallArgs {
+            dst, ctor, args, ..
+        } => Some((*dst, *ctor, args, None)),
         Op::CallMethod {
             dst,
             recv,
@@ -606,6 +774,7 @@ pub fn expand<'a>(
             || (callee as usize) >= base
             || this.is_some_and(|t| (t as usize) >= base)
             || args.iter().any(|&a| (a as usize) >= base)
+            || super_parts(op).is_some_and(|(nt, t)| (nt as usize) >= base || (t as usize) >= base)
         {
             continue;
         }
@@ -635,8 +804,14 @@ pub fn expand<'a>(
             if (poly || loops(&c.proto)) && !calls_only_inlined(&c.proto) {
                 continue;
             }
+            // A derived constructor only with its own `super(…)` inlined
+            // too: else that call would push the inlined activations on
+            // every construct, costing about what inlining saved.
+            if c.proto.derived && !super_inlined(&c.proto) {
+                continue;
+            }
             let spliced = matches!(c.proto, alloc::borrow::Cow::Owned(_));
-            let ok = if matches!(op, Op::Construct { .. }) {
+            let ok = if construct_site(op) {
                 construct_ok_sized(&c.proto, spliced)
             } else {
                 callee_ok_sized(&c.proto, spliced)
@@ -678,13 +853,7 @@ pub fn expand<'a>(
             next += sites[si]
                 .1
                 .iter()
-                .map(|c| {
-                    block_len(
-                        &c.proto,
-                        matches!(proto.ops[pc], Op::Construct { .. }),
-                        site_shape(&proto.ops[pc]),
-                    )
-                })
+                .map(|c| block_len(&c.proto, &proto.ops[pc]))
                 .sum::<usize>()
                 + 1;
             if matches!(proto.ops[pc], Op::CallKey { .. }) {
@@ -705,7 +874,10 @@ pub fn expand<'a>(
             si += 1;
             // A `new`: the guard also allocates `this`, into the register
             // after the captures (the callee's `this` slot).
-            let construct = matches!(op, Op::Construct { .. });
+            let construct = construct_site(op);
+            // A `super(…)`: its `new.target` register, and the caller's
+            // `this` its result binds (after the inlined body leaves).
+            let sup = super_parts(op);
             let rb = |r: Reg| -> Reg { (base + r as usize) as Reg };
             // (A computed-key call's method register is above every way's
             // window.)
@@ -738,7 +910,7 @@ pub fn expand<'a>(
             let fallback = ops.len()
                 + site_ways
                     .iter()
-                    .map(|c| block_len(&c.proto, construct, shape))
+                    .map(|c| block_len(&c.proto, op))
                     .sum::<usize>();
             let end = fallback + 1;
             let n_ways = site_ways.len();
@@ -746,8 +918,8 @@ pub fn expand<'a>(
                 let p: &FnProto = &c.proto;
                 let g = ops.len();
                 let tmp = rb(p.n_regs as Reg);
-                let next_way = g + block_len(p, construct, shape);
-                let leave = next_way - 2;
+                let next_way = g + block_len(p, op);
+                let leave = next_way - 2 - usize::from(sup.is_some());
                 macro_rules! emit {
                     ($o:expr, $w:expr, $ops:expr $(,)?) => {{
                         $ops.push($o);
@@ -863,12 +1035,13 @@ pub fn expand<'a>(
                                 emit!(Op::Jump { target: leave }, None, ops);
                             }
                         }
-                        // `new.target`: the constructor (see `construct_ok`).
+                        // `new.target`: the constructor (see `construct_ok`),
+                        // or a `super(…)`'s own.
                         _ if construct && let Op::LoadNewTarget { dst: d } = bop => {
                             emit!(
                                 Op::Move {
                                     dst: rb(*d),
-                                    src: callee,
+                                    src: sup.map_or(callee, |(nt, _)| nt),
                                 },
                                 None,
                                 ops
@@ -900,6 +1073,12 @@ pub fn expand<'a>(
                 }
                 debug_assert_eq!(ops.len(), leave);
                 emit!(Op::InlineLeave, None, ops);
+                // `super(…)` binds the caller's `this` to its result (the
+                // guard saw it unbound, and nothing but the caller's own
+                // code writes its registers).
+                if let Some((_, t)) = sup {
+                    emit!(Op::Move { dst: t, src: dst }, None, ops);
+                }
                 emit!(Op::Jump { target: end }, None, ops);
                 debug_assert_eq!(ops.len(), next_way);
             }
@@ -984,17 +1163,33 @@ fn body_pc(p: &FnProto, t: usize, construct: bool) -> usize {
         .sum()
 }
 
-/// The ops one inlined site takes before its call op: guard, branch, window,
-/// body, fall-off, leave, jump.
-/// (`construct`: a `new` site, whose `this` the guard writes. `shape`: see
-/// [`copied_param`].)
-fn block_len(p: &FnProto, construct: bool, shape: (usize, bool)) -> usize {
+/// The ops one inlined site (the call op `site`) takes before its call op:
+/// guard, branch, window, body, fall-off, leave, a `super(…)`'s binding of
+/// `this`, jump. (A construct site's guard writes `this`, see
+/// [`construct_site`]; the site's shape is [`copied_param`]'s.)
+fn block_len(p: &FnProto, site: &Op) -> usize {
+    let (construct, shape) = (construct_site(site), site_shape(site));
     let this_slot = p.n_params + p.n_captures;
     let window = window_regs(p, construct)
         .into_iter()
         .filter(|&r| !(construct && r == this_slot) && !copied_param(p, r, construct, shape))
         .count();
-    2 + window + body_pc(p, p.ops.len(), construct) + usize::from(falls_off(p)) + 2
+    2 + window
+        + body_pc(p, p.ops.len(), construct)
+        + usize::from(falls_off(p))
+        + 2
+        + usize::from(super_parts(site).is_some())
+}
+
+/// A `super(…)` site's `(new.target, this)` registers (`Op::SuperCallArgs`:
+/// the `this` its result binds); `None` for any other op.
+fn super_parts(op: &Op) -> Option<(Reg, Reg)> {
+    match op {
+        Op::SuperCallArgs {
+            new_target, this, ..
+        } => Some((*new_target, *this)),
+        _ => None,
+    }
 }
 
 /// A call op's `(arguments, has a receiver)`, as [`copied_param`] asks them.
@@ -1040,8 +1235,11 @@ fn writes_reg(op: &Op, r: Reg) -> bool {
         | Op::ThrowReferenceError { .. }
         | Op::Jump { .. }
         | Op::JumpIfFalse { .. }
-        | Op::InlineLeave => false,
+        | Op::InlineLeave
+        | Op::InitFields { .. } => false,
         Op::BindThis { this } => *this == r,
+        Op::SuperCallArgs { dst, this, .. } => *dst == r || *this == r,
+        Op::SuperCtor { dst, .. } | Op::DerivedResult { dst, .. } => *dst == r,
         Op::InlineGuard {
             dst, caps, n_caps, ..
         } => *dst == r || (*caps..caps.saturating_add(*n_caps)).contains(&r),
