@@ -363,7 +363,7 @@ pub(crate) const CHAIN_MAX: usize = 4;
 
 /// The receiver layouts a [`MethodSite`] remembers (a polymorphic site —
 /// `task.run()` over several task classes — keeps each of them).
-pub(crate) const METHOD_WAYS: usize = 4;
+pub(crate) const METHOD_WAYS: usize = 8;
 
 /// How many times a [`MethodSite`] is (re)filled before it stops trying (a
 /// site whose receivers keep changing layout).

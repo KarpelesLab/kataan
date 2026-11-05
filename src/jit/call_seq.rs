@@ -482,7 +482,7 @@ impl CallSite {
     /// The key of an empty way.
     pub const EMPTY: u64 = u64::MAX - 1;
     /// Callees a site remembers.
-    pub const WAYS: usize = 4;
+    pub const WAYS: usize = 8;
     /// The later ways' identity memos of a polymorphic inlined site
     /// ([`CallSite::poly`]).
     pub const POLY_MEMOS: usize = 2;
