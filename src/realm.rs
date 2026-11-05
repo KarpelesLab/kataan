@@ -1852,35 +1852,42 @@ impl Realm {
         let (ctor_shape, aux_shape) = match &self.vm_fn_proto_shapes {
             Some((c, a, m)) if m.as_ref() == marker => (Rc::clone(c), Rc::clone(a)),
             _ => {
-                let c = self.root_shape.transition("constructor");
-                let a = self.root_shape.transition("prototype").transition(marker);
+                // Layouts that carry the attributes themselves (every key
+                // hidden, `prototype` non-configurable), so neither object
+                // needs an attribute-mark part: that part's allocation, and
+                // its release when a short-lived closure dies, were most of
+                // the cost of making one.
+                let c = Shape::implied_ctor_layout(&self.root_shape, "constructor");
+                let a =
+                    Shape::implied_ctor_layout(&self.root_shape.transition("prototype"), marker);
                 self.vm_fn_proto_shapes = Some((Rc::clone(&c), Rc::clone(&a), Rc::from(marker)));
                 (c, a)
             }
         };
         let default_proto = self.default_object_proto;
         let fv = NanBox::handle(f.to_raw());
-        let Some(mut proto_obj) = Object::with_data_hidden_prefix(ctor_shape, &[fv], 1) else {
-            return false;
-        };
-        proto_obj.set_proto(default_proto);
-        let proto = self.heap.alloc(Cell::Object(proto_obj));
-        let pv = NanBox::handle(proto.to_raw());
-        let Some(mut aux_obj) =
-            Object::with_data_hidden_prefix(aux_shape, &[pv, NanBox::boolean(true)], 2)
+        let Some(proto_obj) = Object::with_implied_ctor_attrs(ctor_shape, [fv], default_proto)
         else {
             return false;
         };
-        aux_obj.set_non_configurable("prototype");
-        aux_obj.set_proto(default_proto);
+        let proto = self.heap.alloc(Cell::Object(proto_obj));
+        let pv = NanBox::handle(proto.to_raw());
+        let Some(aux_obj) =
+            Object::with_implied_ctor_attrs(aux_shape, [pv, NanBox::boolean(true)], default_proto)
+        else {
+            return false;
+        };
         let aux = self.heap.alloc(Cell::Object(aux_obj));
         if let (Some(p), Some(marker)) = (default_proto, self.incremental.as_mut()) {
             marker.mark_grey(p);
         }
-        self.write_barrier(proto, fv);
+        // Both containers are fresh (young), so neither store records an
+        // old→young edge: each barrier reduces to the incremental marker's
+        // shading.
+        self.shade_stored(fv);
         self.cell_link_changed(f);
         self.aux_props.insert(f.to_raw(), aux);
-        self.write_barrier(aux, pv);
+        self.shade_stored(pv);
         true
     }
 
@@ -8110,9 +8117,11 @@ impl Realm {
                     // Only the entries made since the last collection can hold
                     // a young value (see `gc_side_log`); the aux map logs its
                     // own, so no insertion site can miss one.
+                    // (Liveness first: most fresh keys are short-lived
+                    // closures and arrays, dead by now.)
                     for raw in aux_props.fresh_keys() {
-                        if let Some(obj) = aux_props.get(raw)
-                            && live.contains(&Handle::from_raw(*raw))
+                        if live.contains(&Handle::from_raw(*raw))
+                            && let Some(obj) = aux_props.get(raw)
                         {
                             extra.push(*obj);
                         }
@@ -8152,8 +8161,18 @@ impl Realm {
                 // Only the entries made since the last collection can have a
                 // young (so possibly dead) key; every older key is presumed
                 // alive.
-                let aux_fresh = aux_props.take_fresh();
-                for &raw in gc_side_log.iter().chain(&aux_fresh) {
+                // A dead key is young, so made since the last collection,
+                // and so is every entry any table holds for it: each such
+                // entry was logged as made (`gc_side_log` for the other
+                // tables). A key only the auxiliary map logged (a closure
+                // given its `prototype`, an array given a named property)
+                // therefore has an entry there alone.
+                for raw in aux_props.take_fresh() {
+                    if !live.contains(&Handle::from_raw(raw)) {
+                        aux_props.remove(&raw);
+                    }
+                }
+                for &raw in gc_side_log.iter() {
                     if live.contains(&Handle::from_raw(raw)) {
                         continue;
                     }

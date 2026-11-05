@@ -297,6 +297,16 @@ const SYMBOL_KEYS_BIT: u8 = 0x80;
 /// `Object::builtin_fn_props`). Never inherited by a child layout.
 const IMPLIED_FN_ATTRS_BIT: u8 = 0x40;
 
+/// The `brands` bit of a layout made by [`Shape::implied_ctor_layout`]: an
+/// object with exactly this layout holds every one of its keys as a
+/// non-enumerable data property, and its `prototype` key (if it has one) as
+/// a non-configurable one, without listing them in its attribute marks (see
+/// `Object::with_implied_ctor_attrs`). Never inherited by a child layout.
+const IMPLIED_CTOR_ATTRS_BIT: u8 = 0x20;
+
+/// Both implied-attribute bits (never inherited by a child layout).
+const IMPLIED_ATTRS_BITS: u8 = IMPLIED_FN_ATTRS_BIT | IMPLIED_CTOR_ATTRS_BIT;
+
 /// The [`BRAND_KEYS`] bit of `key` (0 for any other key).
 #[inline]
 #[must_use]
@@ -550,7 +560,7 @@ impl Shape {
             transitions: RefCell::new(Transitions::default()),
             index: OnceCell::new(),
             probes: Cell::new(0),
-            brands: (self.brands & !IMPLIED_FN_ATTRS_BIT) | key_bits(&key),
+            brands: (self.brands & !IMPLIED_ATTRS_BITS) | key_bits(&key),
             // What may be anything in the parent's slots may be here too:
             // an object that adds a key keeps its other values.
             any: Cell::new(self.any.get()),
@@ -578,7 +588,7 @@ impl Shape {
             transitions: RefCell::new(Transitions::default()),
             index: OnceCell::new(),
             probes: Cell::new(0),
-            brands: (length.brands & !IMPLIED_FN_ATTRS_BIT) | IMPLIED_FN_ATTRS_BIT,
+            brands: (length.brands & !IMPLIED_ATTRS_BITS) | IMPLIED_FN_ATTRS_BIT,
             any: Cell::new(length.any.get()),
             for_in_hint: Cell::new(0),
         })
@@ -591,12 +601,57 @@ impl Shape {
         self.brands & IMPLIED_FN_ATTRS_BIT != 0
     }
 
+    /// `parent + key` as a layout whose objects hold every key hidden
+    /// (non-enumerable) and `prototype`, when present, non-configurable by
+    /// layout alone (see
+    /// [`has_implied_ctor_attrs`](Self::has_implied_ctor_attrs)): a fresh
+    /// ordinary function's own `prototype` (with its constructible marker)
+    /// and that prototype object's `constructor`. Like
+    /// [`builtin_fn_layout`](Self::builtin_fn_layout), the node is not cached
+    /// as `parent`'s `key` child, which stays the ordinary layout that
+    /// [`unmarked_twin`](Self::unmarked_twin) finds; and it never gains a
+    /// child (an object moves to the twin before adding a key).
+    #[must_use]
+    pub fn implied_ctor_layout(parent: &Rc<Self>, key: &str) -> Rc<Shape> {
+        debug_assert!(parent.lookup(key).is_none());
+        debug_assert!(parent.brands & IMPLIED_ATTRS_BITS == 0);
+        let key: Rc<str> = Rc::from(key);
+        Rc::new(Shape {
+            parent: Some(Rc::clone(parent)),
+            slot: parent.len,
+            len: parent.len + 1,
+            transitions: RefCell::new(Transitions::default()),
+            index: OnceCell::new(),
+            probes: Cell::new(0),
+            brands: parent.brands | key_bits(&key) | IMPLIED_CTOR_ATTRS_BIT,
+            key: Some(key),
+            any: Cell::new(parent.any.get()),
+            for_in_hint: Cell::new(0),
+        })
+    }
+
+    /// Whether this is an [`implied_ctor_layout`](Self::implied_ctor_layout).
+    #[inline]
+    #[must_use]
+    pub fn has_implied_ctor_attrs(&self) -> bool {
+        self.brands & IMPLIED_CTOR_ATTRS_BIT != 0
+    }
+
+    /// Whether this layout implies attribute marks of either kind
+    /// ([`builtin_fn_layout`](Self::builtin_fn_layout),
+    /// [`implied_ctor_layout`](Self::implied_ctor_layout)).
+    #[inline]
+    #[must_use]
+    pub fn has_implied_attrs(&self) -> bool {
+        self.brands & IMPLIED_ATTRS_BITS != 0
+    }
+
     /// The ordinary layout with the same keys in the same slots as this
     /// [`builtin_fn_layout`](Self::builtin_fn_layout) (`self` for any other).
     #[must_use]
     pub fn unmarked_twin(self: &Rc<Self>) -> Rc<Shape> {
         match (&self.parent, &self.key) {
-            (Some(parent), Some(key)) if self.has_implied_fn_attrs() => parent.transition(key),
+            (Some(parent), Some(key)) if self.has_implied_attrs() => parent.transition(key),
             _ => Rc::clone(self),
         }
     }

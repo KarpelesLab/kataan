@@ -872,17 +872,87 @@ impl Object {
         o
     }
 
-    /// Whether the object's layout implies its `length`/`name` marks (see
-    /// [`builtin_fn_props`](Self::builtin_fn_props)).
+    /// An object on a [`Shape::implied_ctor_layout`] holding `values` (one
+    /// per key, in slot order): every key non-enumerable, and `prototype`
+    /// (when a key) non-configurable, the attributes held by the layout
+    /// rather than by attribute-mark lists, so making one allocates nothing
+    /// past the cell — what adding each key then marking it hidden (and
+    /// `prototype` non-configurable) leaves. As with
+    /// [`builtin_fn_props`](Self::builtin_fn_props), the first change the
+    /// layout cannot describe writes the marks out first.
+    /// `proto` is the object's `[[Prototype]]`. `None` when the layout does
+    /// not have exactly `N` keys.
+    #[must_use]
     #[inline]
-    fn implied_attrs(&self) -> bool {
-        !self.is_dict() && self.shape.has_implied_fn_attrs()
+    pub fn with_implied_ctor_attrs<const N: usize>(
+        shape: Rc<Shape>,
+        values: [NanBox; N],
+        proto: Option<crate::heap::Handle>,
+    ) -> Option<Self> {
+        const { assert!(N <= INLINE_SLOTS) };
+        debug_assert!(shape.has_implied_ctor_attrs());
+        if shape.len() as usize != N {
+            return None;
+        }
+        // As `with_data` records them (nothing to do once the layout knows).
+        let mut pending = shape.number_only_slots();
+        while pending != 0 {
+            let i = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            if values.get(i).is_some_and(|v| !v.is_number()) {
+                shape.note_non_number(i as u32);
+            }
+        }
+        Some(Self {
+            mode: Mode::Shaped,
+            flags: 0,
+            len: N as u16,
+            key_epoch: N as u32,
+            shape,
+            proto: proto.map_or(NO_PROTO, crate::heap::Handle::to_raw),
+            extra: None,
+            inline: core::array::from_fn(|i| values.get(i).copied().unwrap_or(NanBox::undefined())),
+        })
     }
 
-    /// Whether `key` is non-writable and non-enumerable by layout alone.
+    /// Whether the object's layout implies attribute marks (see
+    /// [`builtin_fn_props`](Self::builtin_fn_props) and
+    /// [`with_implied_ctor_attrs`](Self::with_implied_ctor_attrs)).
+    #[inline]
+    fn implied_attrs(&self) -> bool {
+        !self.is_dict() && self.shape.has_implied_attrs()
+    }
+
+    /// Whether `key` is non-writable by layout alone.
+    #[inline]
+    fn implied_readonly(&self, key: &str) -> bool {
+        !self.is_dict() && self.shape.has_implied_fn_attrs() && (key == "length" || key == "name")
+    }
+
+    /// Whether `key` is non-enumerable by layout alone.
+    #[inline]
+    fn implied_hidden(&self, key: &str) -> bool {
+        self.implied_attrs()
+            && if self.shape.has_implied_fn_attrs() {
+                key == "length" || key == "name"
+            } else {
+                self.shape.lookup(key).is_some()
+            }
+    }
+
+    /// Whether `key` is non-configurable by layout alone.
+    #[inline]
+    fn implied_non_configurable(&self, key: &str) -> bool {
+        key == "prototype"
+            && !self.is_dict()
+            && self.shape.has_implied_ctor_attrs()
+            && self.shape.lookup(key).is_some()
+    }
+
+    /// Whether `key` carries any attribute mark by layout alone.
     #[inline]
     fn implied_mark(&self, key: &str) -> bool {
-        self.implied_attrs() && (key == "length" || key == "name")
+        self.implied_hidden(key) || self.implied_non_configurable(key)
     }
 
     /// Writes the marks a [`builtin_fn_props`](Self::builtin_fn_props)
@@ -899,14 +969,25 @@ impl Object {
     #[cold]
     #[inline(never)]
     fn write_out_implied_attrs(&mut self) {
+        let ctor = self.shape.has_implied_ctor_attrs();
+        let len = self.shape.len();
+        let has_proto = ctor && self.shape.lookup("prototype").is_some();
         let x = self.extra_mut();
-        for k in ["length", "name"] {
-            x.add_mark(Mark::Readonly, k);
-        }
-        // Slots 0 and 1: the two keys are the start of a hidden prefix,
-        // which a constructor's `prototype` and static methods extend.
         debug_assert_eq!(x.hidden_prefix, 0);
-        x.hidden_prefix = 2;
+        if ctor {
+            // Every key is hidden: the whole layout is the hidden prefix.
+            x.hidden_prefix = len;
+            if has_proto && !x.has_mark(Mark::NonConfigurable, "prototype") {
+                x.add_mark(Mark::NonConfigurable, "prototype");
+            }
+        } else {
+            for k in ["length", "name"] {
+                x.add_mark(Mark::Readonly, k);
+            }
+            // Slots 0 and 1: the two keys are the start of a hidden prefix,
+            // which a constructor's `prototype` and static methods extend.
+            x.hidden_prefix = 2;
+        }
         self.layout_changed();
         self.shape = self.shape.unmarked_twin();
         // Another layout than one this object grew into: it learns the
@@ -972,6 +1053,7 @@ impl Object {
         !self.is_dict()
             && self.extra.as_deref().is_none_or(ObjectExtra::only_spill)
             && self.flags == 0
+            && !self.shape.has_implied_attrs()
             && self.shape.len() as usize == self.len as usize
     }
 
@@ -1411,7 +1493,7 @@ impl Object {
                     && e.hidden_prefix == 0
                     && e.key_order.is_none()
             })
-            && !self.shape.has_implied_fn_attrs()
+            && !self.shape.has_implied_attrs()
     }
 
     /// The object's current shape (its hidden class). In dictionary mode this is
@@ -1885,7 +1967,7 @@ impl Object {
         if !self.is_dict()
             && self.shape.last_key() == Some(key)
             && self.shape.len() == prefix + 1
-            && !self.implied_mark(key)
+            && !self.implied_attrs()
         {
             if !self.ex().has_mark(Mark::Hidden, key) {
                 self.extra_mut().hidden_prefix = prefix + 1;
@@ -1904,7 +1986,7 @@ impl Object {
     #[inline]
     pub fn is_hidden(&self, key: &str) -> bool {
         let x = self.ex();
-        self.implied_mark(key)
+        self.implied_hidden(key)
             || self.prefix_hidden(key)
             || (!x.hidden.is_empty() && x.has_mark(Mark::Hidden, key))
     }
@@ -1980,7 +2062,7 @@ impl Object {
     #[inline]
     pub fn is_readonly(&self, key: &str) -> bool {
         let x = self.ex();
-        self.implied_mark(key) || (!x.readonly.is_empty() && x.has_mark(Mark::Readonly, key))
+        self.implied_readonly(key) || (!x.readonly.is_empty() && x.has_mark(Mark::Readonly, key))
     }
 
     /// Clears the non-writable mark for `key` (a `defineProperty` redefines
@@ -2004,12 +2086,14 @@ impl Object {
     #[inline]
     pub fn is_non_configurable(&self, key: &str) -> bool {
         let x = self.ex();
-        !x.non_configurable.is_empty() && x.has_mark(Mark::NonConfigurable, key)
+        self.implied_non_configurable(key)
+            || (!x.non_configurable.is_empty() && x.has_mark(Mark::NonConfigurable, key))
     }
 
     /// Clears the non-configurable mark for `key` (a `defineProperty` redefining a
     /// configurable property whose new descriptor keeps it configurable).
     pub fn clear_non_configurable(&mut self, key: &str) {
+        self.materialize_implied_attrs();
         if let Some(x) = self.extra.as_deref_mut() {
             x.remove_mark(Mark::NonConfigurable, key);
         }
@@ -2020,6 +2104,9 @@ impl Object {
     #[must_use]
     pub fn non_configurable_is_empty(&self) -> bool {
         self.ex().non_configurable.is_empty()
+            && !(self.implied_attrs()
+                && self.shape.has_implied_ctor_attrs()
+                && self.shape.lookup("prototype").is_some())
     }
 
     /// Whether a `CreateDataProperty(key)` on this object is a plain store:
@@ -2610,6 +2697,52 @@ mod tests {
         assert_eq!(all.last(), Some(&"k9"));
         assert!(!o.enumerable_keys().contains(&"k2"));
         assert!(o.enumerable_keys().contains(&"k4"));
+    }
+
+    #[test]
+    fn implied_ctor_attrs_hold_until_changed() {
+        let root = Shape::root();
+        let layout = Shape::implied_ctor_layout(&root.add("prototype"), "\u{0}m");
+        assert!(layout.has_implied_ctor_attrs() && !layout.has_implied_fn_attrs());
+        let fresh =
+            || Object::with_implied_ctor_attrs(Rc::clone(&layout), [n(1.0), n(2.0)], None).unwrap();
+        let o = fresh();
+        assert_eq!(o.keys(), ["prototype", "\u{0}m"]);
+        assert!(o.is_hidden("prototype") && o.is_hidden("\u{0}m"));
+        assert!(o.is_non_configurable("prototype") && !o.is_non_configurable("\u{0}m"));
+        assert!(!o.is_readonly("prototype") && !o.non_configurable_is_empty());
+        assert!(o.enumerable_keys().is_empty() && !o.keys_follow_shape() && !o.is_plain_shaped());
+        // A write to the writable `prototype` is a store.
+        let mut w = fresh();
+        w.set("prototype", n(3.0));
+        assert!(matches!(w.get("prototype").unwrap().unpack(), Unpacked::Number(x) if x == 3.0));
+        assert!(w.shape().has_implied_ctor_attrs());
+        // A new key moves to the ordinary layout, marks written out.
+        let mut a = fresh();
+        a.set("x", n(4.0));
+        assert!(!a.shape().has_implied_attrs());
+        assert_eq!(a.keys(), ["prototype", "\u{0}m", "x"]);
+        assert!(a.is_hidden("prototype") && a.is_hidden("\u{0}m") && !a.is_hidden("x"));
+        assert!(a.is_non_configurable("prototype") && !a.is_non_configurable("x"));
+        assert_eq!(a.enumerable_keys(), ["x"]);
+        // Clearing the implied non-configurable mark keeps the hidden ones.
+        let mut c = fresh();
+        c.clear_non_configurable("prototype");
+        assert!(!c.is_non_configurable("prototype") && c.is_hidden("prototype"));
+        assert!(!c.shape().has_implied_attrs() && c.non_configurable_is_empty());
+        // Clearing a hidden mark keeps the other one and the non-configurable mark.
+        let mut h = fresh();
+        h.clear_hidden("prototype");
+        assert!(!h.is_hidden("prototype") && h.is_hidden("\u{0}m"));
+        assert!(h.is_non_configurable("prototype"));
+        // A one-key `constructor` layout: hidden, configurable.
+        let ctor = Shape::implied_ctor_layout(&root, "constructor");
+        let mut p = Object::with_implied_ctor_attrs(ctor, [n(5.0)], None).unwrap();
+        assert!(p.is_hidden("constructor") && !p.is_non_configurable("constructor"));
+        assert!(p.non_configurable_is_empty());
+        p.set("m", n(6.0));
+        assert_eq!(p.enumerable_keys(), ["m"]);
+        assert!(p.is_hidden("constructor"));
     }
 
     #[test]
