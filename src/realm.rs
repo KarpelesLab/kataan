@@ -621,7 +621,7 @@ pub struct Realm {
     /// every fourth one full, so stress runs exercise both kinds).
     gc_cycles: u32,
     /// The current nursery size (allocations between minor collections):
-    /// [`GC_NURSERY`], doubled after a minor collection in which most of the
+    /// [`GC_NURSERY`], doubled after a minor collection in which much of the
     /// nursery survived (up to [`GC_NURSERY_MAX`]) and halved back once few
     /// do (see [`adapt_nursery`](Self::adapt_nursery)).
     gc_nursery: usize,
@@ -7917,14 +7917,16 @@ impl Realm {
     }
 
     /// Resizes the nursery after a minor collection that marked `survivors`
-    /// young objects out of the current nursery: doubles it when more than
-    /// half survived, halves it (down to [`GC_NURSERY`]) when under an eighth
-    /// did. Only the collection frequency changes, never what is collected.
+    /// young objects out of the current nursery: doubles it when more than a
+    /// quarter survived, halves it (down to [`GC_NURSERY`]) when under a
+    /// sixteenth did (the gap keeps a nursery whose survival hovers near one
+    /// bound from flipping size every collection). Only the collection
+    /// frequency changes, never what is collected.
     fn adapt_nursery(&mut self, survivors: usize) {
         let n = self.gc_nursery;
         if survivors.saturating_mul(4) > n {
             self.gc_nursery = (n * 2).min(GC_NURSERY_MAX);
-        } else if survivors.saturating_mul(8) < n {
+        } else if survivors.saturating_mul(16) < n {
             self.gc_nursery = (n / 2).max(GC_NURSERY);
         }
     }
