@@ -1841,6 +1841,16 @@ impl Object {
         data + self.ex().accessors.len()
     }
 
+    /// Whether [`Self::for_each_symbol_key`] may find a key: `false` for an
+    /// object with no out-of-line part (which a dictionary and the
+    /// accessors live in) whose layout records no Symbol key — one bit test
+    /// and a word compare, for the collector's per-object scan.
+    #[inline]
+    #[must_use]
+    pub fn may_have_symbol_keys(&self) -> bool {
+        self.extra.is_some() || self.shape.has_symbol_keys()
+    }
+
     /// Calls `f` with every own key that encodes a Symbol (the `\0sym:{id}`
     /// form), data or accessor, in no particular order and possibly more than
     /// once. The collector's symbol-liveness scan: unlike [`Self::all_keys`] it
@@ -1848,6 +1858,9 @@ impl Object {
     /// sorted map in O(log n + symbols) — `\0` sorts first, so the symbol keys
     /// are its smallest — rather than walking every key on every collection.
     pub fn for_each_symbol_key(&self, mut f: impl FnMut(&str)) {
+        if !self.may_have_symbol_keys() {
+            return;
+        }
         const SYM: &str = crate::shape::SYMBOL_KEY_PREFIX;
         if self.is_dict() {
             use core::ops::Bound;

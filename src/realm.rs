@@ -7922,7 +7922,7 @@ impl Realm {
     /// did. Only the collection frequency changes, never what is collected.
     fn adapt_nursery(&mut self, survivors: usize) {
         let n = self.gc_nursery;
-        if survivors.saturating_mul(2) > n {
+        if survivors.saturating_mul(4) > n {
             self.gc_nursery = (n * 2).min(GC_NURSERY_MAX);
         } else if survivors.saturating_mul(8) < n {
             self.gc_nursery = (n / 2).max(GC_NURSERY);
@@ -8047,21 +8047,42 @@ impl Realm {
     /// uses it as a property key (stored as the string `\0sym:{id}`, which
     /// carries no handle edge). The collector calls this for every object it
     /// marks ([`gc::mark_with_ephemerons_scan`]).
+    ///
+    /// Inlined into the mark loops for its common answer, nothing: no symbol
+    /// is keyed by id at all, or the cell is no object, or an object with no
+    /// out-of-line part (so no dictionary or accessor) whose layout holds no
+    /// Symbol key.
+    #[inline]
     fn symbol_key_edges(
         symbols_by_id: &alloc::collections::BTreeMap<u64, Handle>,
         cell: &Cell,
         out: &mut Vec<Handle>,
     ) {
-        if let Some(obj) = cell.as_object() {
-            obj.for_each_symbol_key(|k| {
-                if let Some(idstr) = k.strip_prefix(crate::shape::SYMBOL_KEY_PREFIX)
-                    && let Ok(id) = idstr.parse::<u64>()
-                    && let Some(sym) = symbols_by_id.get(&id)
-                {
-                    out.push(*sym);
-                }
-            });
+        if symbols_by_id.is_empty() {
+            return;
         }
+        if let Some(obj) = cell.as_object()
+            && obj.may_have_symbol_keys()
+        {
+            Self::symbol_key_edges_of(symbols_by_id, obj, out);
+        }
+    }
+
+    /// [`Self::symbol_key_edges`] of an object that may have Symbol keys.
+    #[inline(never)]
+    fn symbol_key_edges_of(
+        symbols_by_id: &alloc::collections::BTreeMap<u64, Handle>,
+        obj: &crate::object::Object,
+        out: &mut Vec<Handle>,
+    ) {
+        obj.for_each_symbol_key(|k| {
+            if let Some(idstr) = k.strip_prefix(crate::shape::SYMBOL_KEY_PREFIX)
+                && let Ok(id) = idstr.parse::<u64>()
+                && let Some(sym) = symbols_by_id.get(&id)
+            {
+                out.push(*sym);
+            }
+        });
     }
 
     /// Drops every side-table entry whose key is **not** marked-live (a dead key
