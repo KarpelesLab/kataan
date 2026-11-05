@@ -4295,3 +4295,49 @@ fn constructor_add_runs_match_one_by_one_adds() {
     "#;
     assert_eq!(run(src), "4504500:x,y|50:200:x|13891:string:x,y|4096");
 }
+
+/// A chain of derived class constructors inlined whole into a hot `new`
+/// (each `super(...)` a construct site of its own) and an inlined accessor
+/// pair whose guards prove their receiver behave as the calls they replace:
+/// a base constructor's throw ends the construct, a second `super()`
+/// throws after the parent ran, a parent swapped by `Object.setPrototypeOf`
+/// is the one constructed, `new.target` is passed down (also from
+/// `Reflect.construct`), and a prototype method replaced by a plain store
+/// or an accessor redefined mid-loop is the one called.
+#[test]
+fn inlined_super_chains_and_proved_accessors_match_calls() {
+    let src = r#"
+        var out = [];
+        class A { constructor(x) { if (x === -1) throw new RangeError("a"); this.x = x; this.t = new.target.name; } }
+        class B extends A { constructor(x, y) { super(x); this.y = y; } }
+        class C extends B { constructor(x, y, z) { super(x, y); this.z = z; } }
+        class X { constructor(x) { this.w = x; } }
+        class D extends A { constructor(x, twice) { super(x); if (twice) super(x); this.d = 1; } }
+        function mk(n) { var s = 0, last; for (var i = 0; i < n; i++) { last = new C(i, 1, 2); s += last.x + last.y + last.z; } return [s, last]; }
+        var r = mk(3000); out.push(r[0] + ":" + Object.keys(r[1]) + ":" + r[1].t);
+        var caught = 0;
+        for (var i = 0; i < 3000; i++) { try { new C(i % 700 === 3 ? -1 : i, 1, 2); } catch (e) { caught += e instanceof RangeError ? 1 : 100; } }
+        out.push(caught);
+        var twice = 0, made = 0;
+        for (var i = 0; i < 3000; i++) { try { new D(i, i % 1000 === 9); made++; } catch (e) { twice += e instanceof ReferenceError ? 1 : 100; } }
+        out.push(made + ":" + twice);
+        Object.setPrototypeOf(B, X);
+        r = mk(3000); out.push(r[0] + ":" + Object.keys(r[1]));
+        Object.setPrototypeOf(B, A);
+        var o = Reflect.construct(C, [5, 6, 7], X);
+        out.push(Object.getPrototypeOf(o) === X.prototype ? "X:" + o.t : "bad");
+        class P { constructor() { this._x = 0; } get x() { return this._x; } set x(v) { this._x = v; } m() { return 1; } }
+        var p = new P(), s = 0;
+        for (var i = 0; i < 6000; i++) {
+          p.x = p.x + 1; s += p.m();
+          if (i === 2000) P.prototype.m = function () { return 10; };
+          if (i === 4000) Object.defineProperty(P.prototype, "x", { configurable: true, get() { return this._x + 5; }, set(v) { this._x = v; } });
+        }
+        out.push(p._x + ":" + s);
+        out.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "4507500:x,t,y,z:C|5|2997:3|NaN:w,y,z|X:X|15995:41991"
+    );
+}
