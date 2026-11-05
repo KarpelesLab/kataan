@@ -111,7 +111,7 @@ pub struct Candidate<'a> {
     /// The callee's own call sites to inline into its spliced body, by its
     /// own pc (one level: their candidates' `nested` are ignored — but at a
     /// `super(…)` site, whose callee's own `super(…)` sites inline one more
-    /// level, see [`super_nested`]).
+    /// level, see `super_nested`).
     pub nested: Vec<(usize, Candidate<'a>)>,
 }
 
