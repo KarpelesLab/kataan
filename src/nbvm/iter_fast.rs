@@ -149,6 +149,20 @@ pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
     true
 }
 
+/// The values `[...v]` would iterate, read without running code, when `v`
+/// is a plain array (no side-table state, the first `%Array.prototype%`)
+/// whose iteration [`can_open`]'s memo currently answers as the built-in
+/// one, and none of whose indices below `length` is a hole: then every step
+/// is `Get(v, k)` of a present own data element. `None` means "ask
+/// [`can_open`]" (a cold or stale memo, any other array or value), never
+/// "not plain". Unlike [`can_open`] it publishes nothing to compiled code.
+#[inline]
+pub(super) fn plain_spread_elems(realm: &Realm, v: NanBox) -> Option<&[NanBox]> {
+    let (p, elems) = realm.plain_root_array_elems(Handle::from_raw(v.as_handle()?))?;
+    let (ok, _, _) = open_memo_hit(realm, p)?;
+    (ok && !elems.iter().any(|e| e.is_hole())).then_some(elems)
+}
+
 /// The memoized [`can_open`] answer for an array with no own named
 /// properties and the prototype `p`, while the memo's stamp is current:
 /// whether both found values are still the intrinsics, and those values.

@@ -1763,6 +1763,21 @@ impl Realm {
         }
     }
 
+    /// [`plain_array_root_proto`](Realm::plain_array_root_proto) together
+    /// with the array's dense elements, from one heap lookup: for such an
+    /// array (never any side-table state) the elements are exactly its
+    /// indices below `length`, each a plain data property unless a hole.
+    #[must_use]
+    #[inline]
+    pub(crate) fn plain_root_array_elems(&self, handle: Handle) -> Option<(Handle, &[NanBox])> {
+        match self.heap.get(handle) {
+            Some(Cell::Array(a)) if !a.has_side_state() && !a.has_proto_set() => {
+                Some((self.root_array_proto?, a))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the cell at `handle` is an array that owns no named property
     /// and whose `[[Prototype]]` is the realm's first `%Array.prototype%`, as
     /// its two sticky flags tell (`None` for any other cell, or when a flag is

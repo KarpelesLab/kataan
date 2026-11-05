@@ -2884,6 +2884,43 @@ pub(crate) extern "C" fn jit_helper_construct(
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
 }
 
+/// `Op::CallSpreadPlain`'s slow path in compiled code: point the site's
+/// cache at the callee when the native sequence can enter it, and — for a
+/// plain array whose iteration is the built-in one — publish that open to
+/// the sequence's inline test (`iter_fast::can_open`, whose answer is
+/// side-effect free), then run the op as the interpreter does (which says
+/// in `ok` whether it made the call).
+///
+/// # Safety
+/// As [`jit_helper_call_value`].
+pub(crate) extern "C" fn jit_helper_call_spread(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    if let Op::CallSpreadPlain { callee, src, .. } = op {
+        // SAFETY: see the function contract.
+        #[allow(unsafe_code)]
+        let (ctx, callee_val, src_val, site) = unsafe {
+            (
+                &mut *(ctx_raw as *mut Ctx),
+                NanBox::from_bits(*regs_raw.add(*callee as usize)),
+                NanBox::from_bits(*regs_raw.add(*src as usize)),
+                &mut *site.cast::<CallSite>(),
+            )
+        };
+        let _ = super::iter_fast::can_open(&mut ctx.realm, src_val);
+        fill_call_site(ctx, callee_val, site);
+    }
+    jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
 /// `Op::SuperCallArgs`'s slow path in compiled code: point the site's cache
 /// at the super constructor when the native sequence can run its
 /// `[[Construct]]` ([`construct_target`]), then run `super(…)` as the

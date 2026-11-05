@@ -7059,6 +7059,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         construct_alloc: jit_tier::jit_construct_alloc,
         super_twice: jit_tier::jit_super_twice,
         super_call: jit_tier::jit_helper_super_call,
+        call_spread: jit_tier::jit_helper_call_spread,
         super_ctor: jit_tier::jit_helper_ident_op,
         init_fields: jit_tier::jit_helper_ident_op,
         callee_info: jit_tier::jit_callee_info,
@@ -11191,6 +11192,12 @@ fn spread_argv(ctx: &Ctx, args: NanBox) -> Result<Vec<NanBox>, VmError> {
 /// those values and runs no code. `None` otherwise (nothing observable has
 /// happened).
 fn plain_spread_argv(ctx: &mut Ctx, regs: &[NanBox], items: &[Reg], src: NanBox) -> Option<ArgBuf> {
+    // The common case — a plain array under a warm memo — in one heap lookup.
+    if let Some(elems) = iter_fast::plain_spread_elems(&ctx.realm, src) {
+        let mut argv = ArgBuf::from_regs(regs, items);
+        argv.extend_from_slice(elems);
+        return Some(argv);
+    }
     if !iter_fast::can_open(&mut ctx.realm, src) {
         return None;
     }

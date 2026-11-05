@@ -954,6 +954,17 @@ impl X64Assembler {
         self.g_rr(0x89, dst, src);
     }
 
+    /// `add dst, src`.
+    pub(crate) fn g_add(&mut self, dst: u8, src: u8) {
+        self.g_rr(0x01, dst, src);
+    }
+
+    /// `shl reg, 3` (a count of words to bytes).
+    pub(crate) fn g_shl3(&mut self, reg: u8) {
+        self.code.push(0x48 | ((reg >> 3) & 1));
+        self.code.extend_from_slice(&[0xc1, 0xe0 | (reg & 7), 3]);
+    }
+
     /// `cmp a, b`.
     pub(crate) fn g_cmp(&mut self, a: u8, b: u8) {
         self.g_rr(0x39, a, b);
@@ -1272,6 +1283,10 @@ pub(crate) struct CallEmit<'a> {
     pub this: Option<u16>,
     /// The argument registers.
     pub args: &'a [u16],
+    /// Further arguments after `args`, read from memory (a spread call's
+    /// array elements, `Op::CallSpreadPlain`); only without enclosing
+    /// pending inlined activations.
+    pub spread: Option<SpreadArgs>,
     /// The site's cache.
     pub site: *const CallSite,
     /// The VM state layout.
@@ -1282,6 +1297,21 @@ pub(crate) struct CallEmit<'a> {
     pub slow: Label,
     /// Where execution continues after the call.
     pub done: Label,
+}
+
+/// Where a call sequence finds the arguments that follow its argument
+/// registers when their count is known only at run time (a spread call over
+/// a plain array's elements): `[rbp + ptr]` is the address of the first,
+/// and register `len` holds how many there are as a raw integer, both set
+/// just before the sequence (nothing it runs before copying them can move
+/// the heap). The site then always enters its targets at their general
+/// entry (see [`CallSite::entry_argc`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpreadArgs {
+    /// The `rbp`-relative slot holding the elements' address.
+    pub ptr: i32,
+    /// The register holding their count.
+    pub len: u16,
 }
 
 /// The native-frame slot (`rbp`-relative) of what the running activation's
@@ -1907,7 +1937,12 @@ fn emit_enter(
     }
     let below_b = hdr(below)?;
     let levels = i32::try_from(acts.len()).ok()?;
-    note_entry(e.site, argc, a.pinned());
+    if e.spread.is_some() && !acts.is_empty() {
+        return None;
+    }
+    // (A run-time argument count enters at the general entry.)
+    let noted = if e.spread.is_some() { usize::MAX } else { argc };
+    note_entry(e.site, noted, a.pinned());
     a.dbg_mark("c-limits");
     // 2. The activation may make native calls (`ACT_OK`), one realm, and
     //    room under the depth limit (for the pending activations too).
@@ -1916,6 +1951,11 @@ fn emit_enter(
     //    rcx = the first header, rsi = window, rax = new top.
     a.g_load(r::RCX, r::R10, STACK_TOP);
     a.g_lea(r::RSI, r::RCX, hdr(below + FRAME_HEADER + argc)?);
+    if let Some(sp) = e.spread {
+        a.g_load(r::RDX, r::RBX, reg(sp.len));
+        a.g_shl3(r::RDX);
+        a.g_add(r::RSI, r::RDX);
+    }
     a.g_mov(r::RAX, r::RSI);
     a.g_add_mem(r::RAX, r::R11, SITE_FRAME);
     a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
@@ -1963,12 +2003,34 @@ fn emit_enter(
         a.g_store_imm32(r::RCX, 24, argc_word(argc, true)?);
         a.g_load(r::RDX, r::RBX, reg(new_target));
         a.g_store(r::RCX, 32, r::RDX);
+    } else if let Some(sp) = e.spread {
+        a.g_load(r::RDX, r::RBX, reg(sp.len));
+        a.g_lea(r::RDX, r::RDX, i32::try_from(argc).ok()?);
+        a.g_store(r::RCX, 24, r::RDX);
     } else {
         a.g_store_imm32(r::RCX, 24, argc_word(argc, false)?);
     }
     for (i, &ar) in e.args.iter().enumerate() {
         a.g_load(r::RDX, r::RBX, reg(ar));
         a.g_store(r::RCX, hdr(FRAME_HEADER + i)?, r::RDX);
+    }
+    if let Some(sp) = e.spread {
+        // The elements, up to the window (`rsi`): rdi = from, r9 = to;
+        // then r9 the realm again.
+        let top = a.new_label();
+        let end = a.new_label();
+        a.g_load(r::RDI, RBP, sp.ptr);
+        a.g_lea(r::R9, r::RCX, hdr(FRAME_HEADER + argc)?);
+        a.bind(top);
+        a.g_cmp(r::R9, r::RSI);
+        a.g_jcc(cc::AE, end);
+        a.g_load(r::RDX, r::RDI, 0);
+        a.g_store(r::R9, 0, r::RDX);
+        a.g_lea(r::RDI, r::RDI, 8);
+        a.g_lea(r::R9, r::R9, 8);
+        a.jmp(top);
+        a.bind(end);
+        a.g_load(r::R9, r::R15, l.realm);
     }
     // 5. Commit: the activation is on the stack and counted.
     a.g_store(r::R10, STACK_FRAMES, r::RCX);
@@ -1980,7 +2042,11 @@ fn emit_enter(
     }
     a.dbg_mark("c-entry");
     // 6. entry(ctx, window, argc, argv, caps, this), `ctx` in `r15`.
-    a.g_movabs(r::RDX, argc as u64);
+    if e.spread.is_some() {
+        a.g_load(r::RDX, r::RCX, 24);
+    } else {
+        a.g_movabs(r::RDX, argc as u64);
+    }
     a.g_lea(r::RCX, r::RCX, hdr(FRAME_HEADER)?);
     match (&e.callee, e.this) {
         (CalleeSrc::Construct { scratch, .. }, _) => a.g_load(r::R9, RBP, *scratch),

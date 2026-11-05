@@ -3064,7 +3064,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
     // after every other site (see `interp_sites`).
     for op in &proto.ops {
         match op {
-            Op::SuperCallArgs { args, .. } => {
+            Op::SuperCallArgs { args, .. } | Op::CallSpreadPlain { items: args, .. } => {
                 call_args.push(args.clone());
                 n_calls += 1;
             }
@@ -3083,7 +3083,8 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
 
 /// Per bytecode pc, the `(argument-list index, call-site index)` of an
 /// interpreter op [`lower_nbvm_generic`] gave a call site of its own
-/// (`Op::SuperCallArgs`, `Op::SuperCtor`, `Op::InitFields`): those sites
+/// (`Op::SuperCallArgs`, `Op::CallSpreadPlain`, `Op::SuperCtor`,
+/// `Op::InitFields`): those sites
 /// come after every other one, in pc order, so they are the last of the
 /// `n_args` argument lists and `n_sites` sites.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -3096,7 +3097,7 @@ fn interp_sites(
     let (mut extra_args, mut extra_sites) = (0usize, 0usize);
     for op in bytecode {
         match op {
-            Op::SuperCallArgs { .. } => {
+            Op::SuperCallArgs { .. } | Op::CallSpreadPlain { .. } => {
                 extra_args += 1;
                 extra_sites += 1;
             }
@@ -3109,7 +3110,7 @@ fn interp_sites(
     let mut out = Vec::with_capacity(bytecode.len());
     for op in bytecode {
         let here = match op {
-            Op::SuperCallArgs { .. } => {
+            Op::SuperCallArgs { .. } | Op::CallSpreadPlain { .. } => {
                 let v = (u16::try_from(args).ok()?, u16::try_from(site).ok()?);
                 args += 1;
                 site += 1;
@@ -3427,6 +3428,10 @@ pub struct GenericHelpers {
     /// `Op::SuperCallArgs`'s slow path (`jit_helper_super_call(ctx, regs,
     /// n_regs, op, site, _)`): the interpreter's, refilling the site's cache.
     pub super_call: JitCallMethodHelper,
+    /// `Op::CallSpreadPlain`'s slow path (`jit_helper_call_spread(ctx,
+    /// regs, n_regs, op, site, _)`): the interpreter's, refilling the site's
+    /// cache.
+    pub call_spread: JitCallMethodHelper,
     /// `Op::SuperCtor`'s slow path (`jit_helper_ident_op`, same ABI): the
     /// interpreter's, refilling the site's identity cache.
     pub super_ctor: JitCallMethodHelper,
@@ -8666,6 +8671,7 @@ impl JitFunction {
                                 callee: call_seq::CalleeSrc::Reg(recv),
                                 this: Some(this),
                                 args: rest,
+                                spread: None,
                                 site: site_ptr,
                                 layout: &helpers.call_layout,
                                 throw_exit,
@@ -8758,6 +8764,7 @@ impl JitFunction {
                                 },
                                 this: Some(recv),
                                 args: argv,
+                                spread: None,
                                 site: site_ptr,
                                 layout: &helpers.call_layout,
                                 throw_exit,
@@ -9082,6 +9089,93 @@ impl JitFunction {
                         }
                         // `super(…)`: the native call sequence, `new.target`
                         // passed on and `this` bound from the result.
+                        // `f(...xs)` over a plain array whose iteration is
+                        // the built-in one (`p_array_iter_open`, as
+                        // `iter_fast::plain_spread_elems` decides it) and
+                        // holds no hole: the native call sequence with the
+                        // items then the elements as its arguments, `ok`
+                        // set. Anything else — another iterable, a hole, a
+                        // callee the sequence does not enter — is the
+                        // interpreter's op (which also tells `ok`), through
+                        // the site-filling helper. (`ok` carries the
+                        // element count into the sequence.)
+                        crate::nbvm::Op::CallSpreadPlain {
+                            dst,
+                            callee,
+                            this,
+                            items,
+                            src,
+                            ok: ok_reg,
+                        } if ok(*dst)
+                            && ok(*callee)
+                            && ok(*this)
+                            && ok(*src)
+                            && ok(*ok_reg)
+                            && items.iter().all(|&r| ok(r))
+                            && own_site.is_some()
+                            && a.inline_ctx.as_ref().is_none_or(|c| c.acts.is_empty()) =>
+                        {
+                            use call_seq::r as R;
+                            let (args_site, site_ptr) = own_site?;
+                            let argregs = call_args.get(args_site as usize)?;
+                            if argregs != items {
+                                return None;
+                            }
+                            let slow = a.new_label();
+                            let called = a.new_label();
+                            let done = a.new_label();
+                            a.p_array_iter_open(&layout, helpers.call_layout.realm, slow);
+                            walk_to_slot!(*src, slow);
+                            family_checks!(recv_cache::Family::Arr, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
+                            a.jne(slow);
+                            // r8 = the count, r11 = the first element.
+                            a.p_arr_len_ptr(&layout);
+                            a.g_store(R::RBP, method_scratch, R::R11);
+                            a.g_store(R::RBX, disp(*ok_reg), R::R8);
+                            // No hole among them (rax = past the last).
+                            let scan = a.new_label();
+                            let plain = a.new_label();
+                            a.g_mov(R::RAX, R::R8);
+                            a.g_shl3(R::RAX);
+                            a.g_add(R::RAX, R::R11);
+                            a.g_movabs(R::RDX, NanBox::hole().to_bits());
+                            a.bind(scan);
+                            a.g_cmp(R::R11, R::RAX);
+                            a.g_jcc(call_seq::cc::AE, plain);
+                            a.g_cmp_mem(R::RDX, R::R11, 0);
+                            a.g_jcc(call_seq::cc::E, slow);
+                            a.g_lea(R::R11, R::R11, 8);
+                            a.jmp(scan);
+                            a.bind(plain);
+                            call_seq::emit_call(
+                                &mut a,
+                                &call_seq::CallEmit {
+                                    dst: *dst,
+                                    callee: call_seq::CalleeSrc::Reg(*callee),
+                                    this: Some(*this),
+                                    args: argregs,
+                                    spread: Some(call_seq::SpreadArgs {
+                                        ptr: method_scratch,
+                                        len: *ok_reg,
+                                    }),
+                                    site: site_ptr,
+                                    layout: &helpers.call_layout,
+                                    throw_exit,
+                                    slow,
+                                    done: called,
+                                },
+                            )?;
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            site_slow!(helpers.call_spread, site_ptr);
+                            a.jmp(done);
+                            a.cold_end(cold);
+                            a.bind(called);
+                            a.movabs_rax(tag_true as i64);
+                            a.store_rax(disp(*ok_reg));
+                            a.bind(done);
+                        }
                         crate::nbvm::Op::SuperCallArgs {
                             dst,
                             ctor,
@@ -9118,6 +9212,7 @@ impl JitFunction {
                                     },
                                     this: None,
                                     args: argregs,
+                                    spread: None,
                                     site: site_ptr,
                                     layout: &helpers.call_layout,
                                     throw_exit,
@@ -11024,6 +11119,7 @@ impl JitFunction {
                             },
                             this: Some(recv),
                             args,
+                            spread: None,
                             site: site_ptr,
                             layout: &helpers.call_layout,
                             throw_exit,
@@ -11079,6 +11175,7 @@ impl JitFunction {
                             },
                             this: None,
                             args,
+                            spread: None,
                             site: site_ptr,
                             layout: &helpers.call_layout,
                             throw_exit,
@@ -11209,6 +11306,7 @@ impl JitFunction {
                                 callee: call_seq::CalleeSrc::Reg(callee),
                                 this: Some(recv),
                                 args,
+                                spread: None,
                                 site: site_ptr,
                                 layout: &helpers.call_layout,
                                 throw_exit,
@@ -11276,6 +11374,7 @@ impl JitFunction {
                             callee: call_seq::CalleeSrc::Reg(callee),
                             this: None,
                             args,
+                            spread: None,
                             site: site_ptr,
                             layout: &helpers.call_layout,
                             throw_exit,
@@ -11504,6 +11603,7 @@ impl JitFunction {
                     },
                     this: Some(obj),
                     args: &[],
+                    spread: None,
                     site: call_site,
                     layout: &helpers.call_layout,
                     throw_exit,
