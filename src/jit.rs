@@ -4860,6 +4860,16 @@ pub struct X64Assembler {
     /// the register the store stored, the load's destination)`, rewritten by
     /// [`finish`](X64Assembler::finish) unless something jumps to the load.
     fwd_loads: Vec<FwdLoad>,
+    /// Inside an inlined call's body in a speculative loop's fast version
+    /// whose guard left its activation's pending marker unset
+    /// (`NumGen::lazy_pend`): the materialization stub and the marker's
+    /// slot, which a `call` emitted there sets first
+    /// ([`inline_frame_hook`](Self::inline_frame_hook)).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    lazy_pend: Option<(Label, i32)>,
 }
 
 /// A `rel32` fixup: its operand's offset, its target label, and, for a
@@ -4907,6 +4917,9 @@ pub(crate) struct ColdMark {
     last_bind: usize,
     /// The store the main stream ended with (`X64Assembler::last_store`).
     store: Option<StoreFwd>,
+    /// The labels bound just before the region stay with the code after it
+    /// ([`X64Assembler::cold_begin_after`]).
+    keep: bool,
 }
 
 /// [`X64Assembler::labels`]' entry for a label bound in a cold chunk that
@@ -5341,17 +5354,17 @@ impl X64Assembler {
     /// `labels` ended up at (a label in a cold region moves in `finish`).
     #[must_use]
     pub(crate) fn finish_at(self, labels: &[Label]) -> (Vec<u8>, Vec<usize>) {
-        self.finish_reporting(labels, &[])
+        self.finish_reporting(labels, 0..0)
     }
 
-    /// [`finish_at`](Self::finish_at), where `report_only` (indices into
-    /// `labels`) are offsets the caller only reports (profiling marks),
+    /// [`finish_at`](Self::finish_at), where `report_only` (a range of
+    /// indices into `labels`) are offsets the caller only reports (profiling marks),
     /// never enters: the code there may be rewritten like any other
     /// (`thread_jumps`), so a profile sees the code that runs unprofiled.
     pub(crate) fn finish_reporting(
         mut self,
         labels: &[Label],
-        report_only: &[core::ops::Range<usize>],
+        report_only: core::ops::Range<usize>,
     ) -> (Vec<u8>, Vec<usize>) {
         // The cold chunks, after everything else (they are position
         // independent: every jump is a `rel32` fixup).
@@ -5391,7 +5404,7 @@ impl X64Assembler {
         let pinned: Vec<usize> = at
             .iter()
             .enumerate()
-            .filter(|(i, _)| !report_only.iter().any(|r| r.contains(i)))
+            .filter(|(i, _)| !report_only.contains(i))
             .map(|(_, &p)| p)
             .collect();
         thread_jumps(&mut self.code, &operands, &pinned, &fwd);
@@ -5417,6 +5430,7 @@ impl X64Assembler {
             fixups: self.fixups.len(),
             last_bind: self.last_bind,
             store: self.last_store.take(),
+            keep: false,
         };
         // No `bind` in the region may drop the jump just before it (which
         // would then fall through to whatever follows the region).
@@ -5425,6 +5439,20 @@ impl X64Assembler {
         self.cold_binds = Some(Vec::new());
         self.dbg_mark("cold");
         mark
+    }
+
+    /// [`cold_begin`](Self::cold_begin) for out-of-line code placed after
+    /// an op's code, whose labels bound at this point (where that code
+    /// ends, maybe with nothing after them) mark the code after the region,
+    /// not the region's first instruction.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn cold_begin_after(&mut self) -> ColdMark {
+        let mut m = self.cold_begin();
+        m.keep = true;
+        m
     }
 
     /// Ends the cold region `mark` began (see [`cold_begin`](Self::cold_begin)).
@@ -5438,7 +5466,7 @@ impl X64Assembler {
         // A label bound in the region, or just before it (at its first
         // instruction), moves with it — unless bound at its end.
         let mut bound = self.cold_binds.take().unwrap_or_default();
-        if mark.last_bind == start {
+        if mark.last_bind == start && !mark.keep {
             for (i, &l) in self.labels.iter().enumerate() {
                 if l == start {
                     bound.push(i);
@@ -5465,7 +5493,7 @@ impl X64Assembler {
             .collect();
         // The region's end is now `start`: a label bound there keeps a
         // `bind` from dropping the jump before it.
-        self.last_bind = if at_start {
+        self.last_bind = if at_start || (mark.keep && mark.last_bind == start) {
             start
         } else if mark.last_bind < start {
             mark.last_bind
@@ -7567,6 +7595,77 @@ impl JitFunction {
         let fused_test = recv_cache::fused_guard_tests(ops, osr_entries, &catch_targets, |i| {
             rc.sites[i].is_none()
         });
+        // Per outermost inlined call's guard, the pc of its `InlineLeave`
+        // when its body is a straight-forward window a speculative loop's
+        // fast version may keep its activation's pending marker out of
+        // memory in (`NumGen::lazy_pend`): no other guard, no backward
+        // branch (no back-edge poll, no loop header), no entry or catch.
+        let lazy_leave: Vec<Option<usize>> = {
+            let mut out = alloc::vec![None; ops.len()];
+            let levels = inline_levels(ops);
+            for g in 0..ops.len() {
+                if !matches!(ops[g], GenericOp::InlineGuard { .. }) || levels[g] != 1 {
+                    continue;
+                }
+                let mut leave = None;
+                for (p, op) in ops.iter().enumerate().skip(g + 1) {
+                    if osr_entries.contains(&p) || catch_targets.binary_search(&p).is_ok() {
+                        break;
+                    }
+                    match *op {
+                        GenericOp::InlineLeave => {
+                            leave = Some(p);
+                            break;
+                        }
+                        GenericOp::InlineGuard { .. }
+                        | GenericOp::PushHandler { .. }
+                        | GenericOp::PopHandler => break,
+                        GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. }
+                            if target <= p =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                out[g] = leave;
+            }
+            out
+        };
+        // An inlined call's guard whose boolean only its own fused test
+        // names (nothing enters the body there): where that test is emitted
+        // as nothing, no code reads it, so it is not stored
+        // (`call_seq::InlineEmit::dst_dead`).
+        let guard_dst_dead: Vec<bool> = {
+            let mut named: Vec<u32> = alloc::vec![0; n_regs];
+            for op in bytecode {
+                let seen = core::cell::RefCell::new(Vec::new());
+                crate::bytecode::op_for_each_reg(op, &|r| seen.borrow_mut().push(r));
+                let mut seen = seen.into_inner();
+                seen.sort_unstable();
+                seen.dedup();
+                for r in seen {
+                    if let Some(c) = named.get_mut(r as usize) {
+                        *c += 1;
+                    }
+                }
+            }
+            (0..ops.len())
+                .map(|i| match (&ops[i], ops.get(i + 1), bytecode.get(i + 1)) {
+                    (
+                        &GenericOp::InlineGuard { dst, .. },
+                        Some(&GenericOp::JumpIfFalse { cond, .. }),
+                        Some(crate::nbvm::Op::JumpIfFalse { cond: bc, .. }),
+                    ) => {
+                        cond == dst
+                            && *bc == dst
+                            && fused_test.get(i + 1) == Some(&true)
+                            && named.get(dst as usize) == Some(&2)
+                    }
+                    _ => false,
+                })
+                .collect()
+        };
         // A compiled `for-in`'s liveness check `cur in obj` branches on its
         // result itself (`forin`): the `JumpIfFalse` right after it, which
         // nothing else reaches, is emitted as nothing.
@@ -8503,6 +8602,9 @@ impl JitFunction {
         // (After the copy's labels: `NumGen::roc_folded` needs them.)
         num.plan_math_proofs(&provable);
         let sched = num.schedule(ops.len());
+        // The lazily pending activation whose body is being emitted:
+        // `(its guard, its leave, the pass)`.
+        let mut lazy_open: Option<(usize, usize, u8)> = None;
         for (si, &(op_idx, pass)) in sched.iter().enumerate() {
             let op = &ops[op_idx];
             // The op after a fused add run: where the run's fast path
@@ -8518,6 +8620,14 @@ impl JitFunction {
                 pending_run = None;
             }
             a.dbg_op = Some(op_idx);
+            // (A lazily pending activation's window is its body's ops in
+            // the pass that emitted its guard.)
+            if let Some((g, l, p)) = lazy_open
+                && !(g < op_idx && op_idx <= l && p == pass)
+            {
+                lazy_open = None;
+                a.set_lazy_pend(None);
+            }
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
             a.set_recv_survive(survive.get(op_idx).cloned().unwrap_or_default(), layout);
             // (The body, a speculative region's plain copy, or its integer
@@ -8815,6 +8925,15 @@ impl JitFunction {
                         num.guard_args(&mut a, op_idx, gargs);
                     }
                     let stub = a.new_label();
+                    // In a speculative loop's fast version, an outermost
+                    // guard of a straight body leaves its activation's
+                    // pending marker unset: no call runs there, and every
+                    // leave for the plain copy inside the body sets it
+                    // (`NumGen::lazy_pend`).
+                    let slots0 = inl_slots.level(inl_level[op_idx])?;
+                    let lazy = lazy_leave[op_idx].filter(|&l| {
+                        slots0.save.is_none() && num.in_spec(op_idx) && num.same_region(op_idx, l)
+                    });
                     let memo = call_sites
                         .get(match ops.get(call as usize)? {
                             GenericOp::CallMethod { cache, .. }
@@ -8853,6 +8972,12 @@ impl JitFunction {
                             mproved: mproof_slot[op_idx].map(inl_mproved),
                             cproved: cproof_slot[op_idx].map(inl_cproved),
                             keep: &num.guard_keep(op_idx),
+                            // (In a promoted loop `numeric` emits the test
+                            // itself, reading the boolean, but in a
+                            // speculative fast version's guard diamond.)
+                            dst_dead: guard_dst_dead.get(op_idx) == Some(&true)
+                                && (cold_miss.is_some() || !num.in_region(op_idx)),
+                            lazy_pend: lazy.is_some(),
                             fused_miss: match ops.get(op_idx + 1) {
                                 _ if cold_miss.is_some() => cold_miss.map(|c| c.0),
                                 Some(&GenericOp::JumpIfFalse { target, .. })
@@ -8867,12 +8992,18 @@ impl JitFunction {
                     // (Out of line, after the guard's code: a cold chunk
                     // must not start where the op's label is bound.)
                     if let Some((count, memo, bail)) = cold_miss {
-                        let cold = a.cold_begin();
+                        // (Its labels bound here mark the inlined body.)
+                        let cold = a.cold_begin_after();
                         a.bind(count);
                         a.g_movabs(call_seq::r::R11, memo as u64);
                         a.g_inc_mem(call_seq::r::R11, call_seq::SPEC_MISSES);
                         a.jmp(bail);
                         a.cold_end(cold);
+                    }
+                    if let Some(l) = lazy {
+                        num.note_lazy(op_idx, l, stub, slots0.pend);
+                        a.set_lazy_pend(Some((stub, slots0.pend)));
+                        lazy_open = Some((op_idx, l, pass));
                     }
                     inline_stubs.push((
                         stub,
@@ -8886,7 +9017,15 @@ impl JitFunction {
                     // (In a speculative loop's fast version the activation
                     // is still pending: nothing there calls.)
                     if num.in_spec(op_idx) {
-                        call_seq::emit_inline_leave_pending(&mut a, &s);
+                        // (A lazily pending one's marker was never set: a
+                        // leave sets it on its way out, a call in the
+                        // body first, and materializing empties it.)
+                        if lazy_open.is_some_and(|(_, l, p)| l == op_idx && p == pass) {
+                            lazy_open = None;
+                            a.set_lazy_pend(None);
+                        } else {
+                            call_seq::emit_inline_leave_pending(&mut a, &s);
+                        }
                     } else {
                         call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
                     }
@@ -12347,6 +12486,8 @@ impl JitFunction {
         if pending_run.is_some() {
             return None;
         }
+        // (No inlined body's window reaches the out-of-line code.)
+        a.set_lazy_pend(None);
         // (The out-of-line code below keeps no way across its calls.)
         a.set_recv_survive(Vec::new(), layout);
         num.set_copy(false);
@@ -12650,8 +12791,7 @@ impl JitFunction {
             a.dbg_marks.iter().map(|m| (m.1, m.2)).collect();
         // (The profiling labels between the entries and the exact entries
         // are only reported.)
-        let report_only = [2..want.len() - 2];
-        let (code, at) = a.finish_reporting(&want, &report_only);
+        let (code, at) = a.finish_reporting(&want, 2..want.len() - 2);
         let f = Self::from_code(&code);
         if let (Some(path), Some(f)) = (opmap, f.as_ref()) {
             use std::io::Write as _;

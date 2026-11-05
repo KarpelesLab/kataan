@@ -985,6 +985,10 @@ pub(super) struct NumGen {
     /// Per register: how many ops name it.
     mentions: Vec<u32>,
     stubs: Vec<Stub>,
+    /// The lazily pending activations ([`NumGen::note_lazy`]): `(guard pc,
+    /// leave pc, in the integer version, materialization stub, marker
+    /// slot)`.
+    lazy: Vec<(usize, usize, bool, Label, i32)>,
     /// Per pc: a `JumpIfFalse` folded into the comparison before it (emits
     /// nothing).
     skip: Vec<bool>,
@@ -1528,6 +1532,7 @@ impl NumGen {
             is_target,
             mentions,
             stubs: Vec::new(),
+            lazy: Vec::new(),
             skip,
             cur_pc: 0,
             gslot,
@@ -2622,6 +2627,36 @@ impl NumGen {
     /// none of its paths runs Rust code and then rejoins it (every one
     /// leaves for the region's plain copy instead), so from the region's
     /// header to its back-edge no call is made.
+    /// Whether ops `p` and `q` lie in one promoted region.
+    pub(super) fn same_region(&self, p: usize, q: usize) -> bool {
+        self.region_at(p).is_some() && self.region_at(p) == self.region_at(q)
+    }
+
+    /// Records that the fast version being emitted (integer or double) left
+    /// the activation of the inlined call whose guard is at `g` and leave at
+    /// `l` **lazily pending**: its marker (`[rbp + pend]`) unset, as no call
+    /// runs in the body there. A leave of that version for the plain copy at
+    /// a pc in the body, where the copy expects the activation pending, sets
+    /// the marker on its way ([`lazy_pend`](Self::lazy_pend)).
+    pub(super) fn note_lazy(&mut self, g: usize, l: usize, stub: Label, pend: i32) {
+        let int = self.imode.is_some();
+        self.lazy.push((g, l, int, stub, pend));
+    }
+
+    /// Before a leave of a fast version (`int`: the integer one) for op `pc`
+    /// of the plain copy: sets the marker of a lazily pending activation
+    /// ([`note_lazy`](Self::note_lazy)) whose body `pc` lies in. Changes no
+    /// register.
+    pub(super) fn lazy_pend(&self, a: &mut X64Assembler, pc: usize, int: bool) {
+        if let Some(&(_, _, _, stub, d)) = self
+            .lazy
+            .iter()
+            .find(|w| w.0 < pc && pc <= w.1 && w.2 == int)
+        {
+            a.lazy_pend_store(stub, d);
+        }
+    }
+
     pub(super) fn in_spec(&self, pc: usize) -> bool {
         self.region_at(pc)
             .is_some_and(|ri| self.regions[ri].spec.is_some())
@@ -4713,6 +4748,9 @@ impl NumGen {
                     self.flush(a, s.region);
                     // Planned with every region pc's copy label.
                     if let Some(l) = self.copy_label(pc as usize) {
+                        if !s.copy {
+                            self.lazy_pend(a, pc as usize, s.int);
+                        }
                         a.jmp(l);
                     }
                 }
@@ -4818,6 +4856,7 @@ impl NumGen {
                         && self.regions[ri].spec.is_some()
                         && let Some(l) = self.copy_label(self.bail_pc(pc))
                     {
+                        self.lazy_pend(a, self.bail_pc(pc), false);
                         a.jmp(l);
                         continue;
                     }
@@ -7411,9 +7450,11 @@ impl X64Assembler {
 
     /// `mov gpr, [rbx + disp]` (rax / rcx / rdx).
     fn mov_gpr_mem(&mut self, gpr: u8, disp: i32) {
+        let start = self.code.len();
         self.code
             .extend_from_slice(&[0x48, 0x8b, 0x80 | ((gpr & 7) << 3) | 3]);
         self.code.extend_from_slice(&disp.to_le_bytes());
+        self.note_load(start, gpr & 7, 3, disp);
     }
 
     /// `mov [rbx + disp], gpr` (rax / rcx / rdx).
@@ -7421,6 +7462,7 @@ impl X64Assembler {
         self.code
             .extend_from_slice(&[0x48, 0x89, 0x80 | ((gpr & 7) << 3) | 3]);
         self.code.extend_from_slice(&disp.to_le_bytes());
+        self.note_store(3, disp, gpr & 7);
     }
 
     /// `cmp gpr, r11` (rax / rcx / rdx).

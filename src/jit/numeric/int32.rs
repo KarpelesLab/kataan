@@ -1287,7 +1287,9 @@ impl NumGen {
             } if (1..=crate::nbvm::VB_USHR).contains(&vop)
                 && (ii(self, dst) || ii(self, x) || ii(self, y)) =>
             {
-                self.ibitwise(a, vop, dst, x, y)?;
+                if !self.iand_test(a, labels, pc, ops, vop, dst, x, y)? {
+                    self.ibitwise(a, vop, dst, x, y)?;
+                }
             }
             GenericOp::ValueBin {
                 dst,
@@ -1629,6 +1631,42 @@ impl NumGen {
         Some(())
     }
 
+    /// `if (x & y)` over int registers, `dst` only tested by the
+    /// `JumpIfFalse` right after (nothing else names it, nothing else reaches
+    /// the test: `fusable`): a `test` and the branch, `dst` never written (an
+    /// int32 is falsy exactly when it is `0`). Whether it emitted the op so.
+    #[allow(clippy::too_many_arguments)]
+    fn iand_test(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        pc: usize,
+        ops: &[GenericOp],
+        vop: u8,
+        dst: u16,
+        x: u16,
+        y: u16,
+    ) -> Option<bool> {
+        if vop != crate::nbvm::VB_BIT_AND || !self.is_int(x) || !self.is_int(y) || !self.is_int(dst)
+        {
+            return Some(false);
+        }
+        let Some((target, false)) = self.fusable(pc, ops, dst) else {
+            return Some(false);
+        };
+        match (self.ik(x)?, self.ik(y)?) {
+            (IK::Gpr(g), IK::Imm(v)) | (IK::Imm(v), IK::Gpr(g)) => a.test32_imm(g, v),
+            (IK::Gpr(g), IK::Gpr(h)) => a.test32_rr(g, h),
+            (IK::Imm(_), IK::Imm(_)) => return Some(false),
+        }
+        self.jcc_to(a, labels, self.imode, CC_E, target);
+        // (`fusable` without a store: nothing else reaches the test.)
+        if let Some(k) = self.skip.get_mut(pc + 1) {
+            *k = true;
+        }
+        Some(true)
+    }
+
     /// `dst = x <bitwise op> y` with an int operand or result: double operands
     /// go through `ToInt32` (bailing on a non-Number or a huge value).
     fn ibitwise(&mut self, a: &mut X64Assembler, vop: u8, dst: u16, x: u16, y: u16) -> Option<()> {
@@ -1644,6 +1682,27 @@ impl NumGen {
                     self.num_guard(a, reg, r, bail);
                 }
                 self.to_int32(a, reg, g, r, bail);
+            }
+        }
+        // (An `&`/`|`/`^` of an int register and a constant takes the
+        // constant as an immediate.)
+        let ext = match vop {
+            VB_BIT_AND => Some(4),
+            VB_BIT_OR => Some(1),
+            VB_BIT_XOR => Some(6),
+            _ => None,
+        };
+        if let Some(ext) = ext
+            && !dbl_ops
+        {
+            let (g, v) = match (self.ik(x)?, self.ik(y)?) {
+                (IK::Gpr(g), IK::Imm(v)) | (IK::Imm(v), IK::Gpr(g)) => (g, v),
+                _ => (u8::MAX, 0),
+            };
+            if g != u8::MAX {
+                a.mov32_rr(RAX, g);
+                a.alu32_imm(ext, RAX, v);
+                return self.ibitwise_result(a, vop, dst);
             }
         }
         if self.is_int(y) {
@@ -1663,6 +1722,14 @@ impl NumGen {
             VB_USHR => a.shift32_cl(5, RAX),
             _ => return None,
         }
+        self.ibitwise_result(a, vop, dst)
+    }
+
+    /// [`ibitwise`](Self::ibitwise)'s result, in `eax`, into `dst`.
+    fn ibitwise_result(&mut self, a: &mut X64Assembler, vop: u8, dst: u16) -> Option<()> {
+        use crate::nbvm::VB_USHR;
+        let reg = self.imode;
+        let pc = self.cur_pc;
         if self.is_int(dst) {
             let IK::Gpr(d) = self.ik(dst)? else {
                 return None;
@@ -1889,6 +1956,7 @@ impl NumGen {
         a.g_movabs(r11, self.env.persist);
         a.g_inc_mem(r11, super::super::global_persist::counter_off(ri));
         if let Some(l) = self.copy_label(pc) {
+            self.lazy_pend(a, pc, true);
             a.jmp(l);
         }
     }
@@ -2185,6 +2253,7 @@ impl NumGen {
         a.g_movabs(r11, self.env.persist);
         a.g_inc_mem(r11, super::super::global_persist::counter_off(ri));
         if let Some(l) = self.copy_label(pc) {
+            self.lazy_pend(a, pc, true);
             a.jmp(l);
         }
     }
@@ -2232,6 +2301,25 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.push(0xb8 + (r & 7));
+        self.code.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// `op r32, imm32` (`81 /ext`: `4` and, `1` or, `6` xor).
+    fn alu32_imm(&mut self, ext: u8, r: u8, v: i32) {
+        if r >= 8 {
+            self.code.push(0x41);
+        }
+        self.code
+            .extend_from_slice(&[0x81, 0xc0 | (ext << 3) | (r & 7)]);
+        self.code.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// `test r32, imm32`.
+    fn test32_imm(&mut self, r: u8, v: i32) {
+        if r >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.extend_from_slice(&[0xf7, 0xc0 | (r & 7)]);
         self.code.extend_from_slice(&v.to_le_bytes());
     }
 

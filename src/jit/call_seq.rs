@@ -2367,8 +2367,15 @@ pub(crate) struct InlineEmit<'a> {
     /// Where the guard's `JumpIfFalse` would branch, when the emitter fuses
     /// that test into the guard (it emits nothing for it): a miss then
     /// jumps there itself, out of line, and a hit falls through into the
-    /// inlined body. `dst` is written either way.
+    /// inlined body. `dst` is written either way, unless `dst_dead`.
     pub fused_miss: Option<Label>,
+    /// No code reads `dst`: only the guard and its fused test name it,
+    /// and every version emits that test as nothing (nothing enters there),
+    /// so neither the hit nor the miss stores it.
+    pub dst_dead: bool,
+    /// The activation's pending marker is left unset (a speculative loop's
+    /// fast version: `numeric::NumGen::lazy_pend`).
+    pub lazy_pend: bool,
     /// A polymorphic site's way (`Op::InlineGuard::poly`: the index in the
     /// low byte, the number of ways in the high one, `0` when monomorphic).
     /// Each way memoizes its own callee value (way 0 in `ident`, the others
@@ -2826,14 +2833,19 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.bind(keep);
         a.g_store(RBP, save, r::RAX);
     }
-    a.g_lea_label(r::RAX, e.stub);
-    a.g_store(RBP, e.slots.pend, r::RAX);
+    if !e.lazy_pend {
+        a.g_lea_label(r::RAX, e.stub);
+        a.g_store(RBP, e.slots.pend, r::RAX);
+    }
     for i in 0..n_caps {
         a.g_load(r::RAX, r::R8, hdr(usize::from(i))?);
         a.g_store(r::RBX, reg(e.caps.checked_add(i)?), r::RAX);
     }
-    a.g_movabs(r::RAX, NanBox::boolean(true).to_bits());
-    a.g_store(r::RBX, reg(e.dst), r::RAX);
+    let dst_dead = e.dst_dead && e.fused_miss.is_some();
+    if !dst_dead {
+        a.g_movabs(r::RAX, NanBox::boolean(true).to_bits());
+        a.g_store(r::RBX, reg(e.dst), r::RAX);
+    }
     a.jmp(done);
     // (Fused: the miss is out of line and takes the test's branch itself;
     // the jump over it is dropped once it is.)
@@ -2845,8 +2857,10 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     }
     a.bind(miss);
     a.dbg_mark("g-miss");
-    a.g_movabs(r::RAX, NanBox::boolean(false).to_bits());
-    a.g_store(r::RBX, reg(e.dst), r::RAX);
+    if !dst_dead {
+        a.g_movabs(r::RAX, NanBox::boolean(false).to_bits());
+        a.g_store(r::RBX, reg(e.dst), r::RAX);
+    }
     if keep_full && e.fused_miss.is_none() {
         reload(a);
     }
@@ -3256,6 +3270,11 @@ impl X64Assembler {
     /// empty { call [rbp + pend] }` (see [`emit_inline_guard`]). Changes no
     /// register.
     pub(crate) fn inline_frame_hook(&mut self) {
+        // (A lazily pending activation is pending from here: its marker
+        // first, `rax` kept.)
+        if let Some((stub, d)) = self.lazy_pend {
+            self.lazy_pend_store(stub, d);
+        }
         if let Some(d) = self.inline_pend {
             // cmp qword [rbp+d], -1 ; je +7 ; call qword [rbp+d] (7 bytes)
             self.g_mem(true, &[0x83], 7, RBP, d);
@@ -3263,6 +3282,22 @@ impl X64Assembler {
             self.code.extend_from_slice(&[0x74, 0x07]);
             self.g_mem(false, &[0xff], 2, RBP, d);
         }
+    }
+
+    /// Sets the lazily pending activation of the code emitted next (see
+    /// the `lazy_pend` field).
+    pub(crate) fn set_lazy_pend(&mut self, p: Option<(Label, i32)>) {
+        self.lazy_pend = p;
+    }
+
+    /// `[rbp + d] = &stub`, every register and the flags kept (`push rax;
+    /// lea rax, [rip + stub]; mov [rbp + d], rax; pop rax`): a lazily
+    /// pending activation's marker, set.
+    pub(crate) fn lazy_pend_store(&mut self, stub: Label, d: i32) {
+        self.code.push(0x50);
+        self.g_lea_label(r::RAX, stub);
+        self.g_store(RBP, d, r::RAX);
+        self.code.push(0x58);
     }
 
     /// `cmp qword [rbp+disp], 0; je skip`.
