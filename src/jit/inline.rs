@@ -1296,6 +1296,52 @@ fn writes_reg(op: &Op, r: Reg) -> bool {
     }
 }
 
+/// `numeric::def_use`, exact for a constructor's own ops (which it takes as
+/// using every register they name): `new.target`'s read and the steps of a
+/// derived constructor (`derived_ok`).
+fn def_use(op: &Op, defs: &mut Vec<Reg>, uses: &mut Vec<Reg>) {
+    match op {
+        Op::LoadNewTarget { dst } => {
+            defs.clear();
+            uses.clear();
+            defs.push(*dst);
+        }
+        Op::SuperCtor { dst, f } => {
+            defs.clear();
+            uses.clear();
+            uses.push(*f);
+            if dst != f {
+                defs.push(*dst);
+            }
+        }
+        Op::DerivedResult { dst, src, this } => {
+            defs.clear();
+            uses.clear();
+            uses.extend([*src, *this]);
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
+        // (`this` is read, to be checked unbound, then bound.)
+        Op::SuperCallArgs {
+            dst,
+            ctor,
+            new_target,
+            args,
+            this,
+        } => {
+            defs.clear();
+            uses.clear();
+            uses.extend([*ctor, *new_target, *this]);
+            uses.extend(args.iter().copied());
+            if !uses.contains(dst) {
+                defs.push(*dst);
+            }
+        }
+        _ => super::numeric::def_use(op, defs, uses),
+    }
+}
+
 /// The callee registers an inlined site initializes as a call's register
 /// window would be (its parameters, `this`, every other register
 /// `undefined`; the captures are the guard's): those the spliced body may
@@ -1359,7 +1405,7 @@ fn live_step(
             }
         }
         if width(p, j, construct) > 0 {
-            super::numeric::def_use(op, defs, uses);
+            def_use(op, defs, uses);
             for &d in defs.iter() {
                 if let Some(x) = out.get_mut(d as usize) {
                     *x = false;
