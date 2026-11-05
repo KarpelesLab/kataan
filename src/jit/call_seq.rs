@@ -2378,6 +2378,10 @@ pub(crate) struct InlineEmit<'a> {
     /// are fixed): it is identified by one compare. A plain call of a
     /// register's value only (`CalleeSrc::Reg`, monomorphic, not a `new`).
     pub proved: Option<(i32, i32)>,
+    /// A monomorphic accessor or method guard's **proof** slots
+    /// ([`MethodProof`]): the receiver value it last identified the callee
+    /// on through its memo, with that receiver's heap slot and layout.
+    pub mproved: Option<MethodProof>,
     /// Registers to keep, as `(register, rbp-relative save slot)`: the
     /// guard's code that may clobber them stores them first and reloads
     /// them after (a speculative region's integer version's int registers,
@@ -2385,6 +2389,45 @@ pub(crate) struct InlineEmit<'a> {
     /// only the guard's identification does (the proved path touches
     /// `rax` alone); else the whole guard. A miss leaves with them saved.
     pub keep: &'a [(u8, i32)],
+}
+
+impl InlineEmit<'_> {
+    /// The guard's method proof, when it takes one: a monomorphic method
+    /// or accessor guard without a receiver-cache way (whose fills the
+    /// proved path would skip), no captures and no other proof.
+    fn mproof(&self) -> Option<MethodProof> {
+        self.mproved.filter(|_| {
+            self.poly >> 8 <= 1
+                && self.way.is_none()
+                && self.new_target.is_none()
+                && self.n_caps == 0
+                && self.proved.is_none()
+                && matches!(self.callee, CalleeSrc::Method { .. })
+        })
+    }
+}
+
+/// A method guard's proof (`InlineEmit::mproved`, `rbp`-relative slots):
+/// the receiver value whose lookup its memo answered (`bits`, one of the
+/// receiver cache's keys: emptied by the prologue and after every call),
+/// that receiver's heap slot (`slot`; `0` while a full identification has
+/// not hit the memo) and its layout then (`shape`). While `bits` holds a
+/// value, no Rust code has run since that identification, so nothing it
+/// checked but what compiled code itself changes can differ: the
+/// receiver's `[[Prototype]]`, its own accessors and flags, the prototype
+/// epoch (bumped by Rust code only), the heap (no cell moves or is reused)
+/// and the realm, the stack and the depths (the limits are checked).
+/// Compiled code may change the receiver's layout (an inline add) and a
+/// data property's value, so the proved path compares the layout and the
+/// memo's holder value; the same receiver value then has the same callee.
+#[derive(Clone, Copy)]
+pub(crate) struct MethodProof {
+    /// The receiver's `NanBox` bits.
+    pub bits: i32,
+    /// Its heap slot's address, or `0`.
+    pub slot: i32,
+    /// Its layout word.
+    pub shape: i32,
 }
 
 /// A receiver-cache way as one site uses it (see `super::recv_cache::SitePlan`).
@@ -2488,6 +2531,36 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         if keep_full {
             save(a);
         }
+    }
+    // 0b. A method guard's proof (see `MethodProof`): the same receiver,
+    //     in the same layout, whose holder still holds the callee.
+    let mproved = e.mproof();
+    let mproven = a.new_label();
+    if let (Some(p), &CalleeSrc::Method { recv, .. }) = (mproved, &e.callee) {
+        let full = a.new_label();
+        let lk =
+            |f: usize| site_off(offset_of!(CallSite, guard) + offset_of!(GuardMemo, lookup) + f);
+        a.g_load(r::RAX, r::RBX, reg(recv));
+        a.g_cmp_mem(r::RAX, RBP, p.bits);
+        a.g_jcc(cc::NE, full);
+        a.g_load(r::RCX, RBP, p.slot);
+        a.p_object_not_exotic(jl, full);
+        a.g_load(r::RAX, r::RCX, jl.off_shape);
+        a.g_cmp_mem(r::RAX, RBP, p.shape);
+        a.g_jcc(cc::NE, full);
+        a.g_movabs(r::R11, e.memo as u64);
+        a.g_load(r::R9, r::R11, lk(offset_of!(LookupMemo, value)));
+        a.g_load(r::RAX, r::R9, 0);
+        a.g_cmp_mem(
+            r::RAX,
+            r::R11,
+            site_off(offset_of!(CallSite, guard) + offset_of!(GuardMemo, bits)),
+        );
+        a.g_jcc(cc::NE, full);
+        a.g_store(RBP, e.slots.callee, r::RAX);
+        a.jmp(mproven);
+        a.bind(full);
+        a.g_store_imm32(RBP, p.slot, 0);
     }
     // 1. The callee value, into the `callee` slot (and rax).
     match e.callee {
@@ -2649,6 +2722,16 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         }
         a.bind(proven);
     }
+    if let (Some(p), &CalleeSrc::Method { recv, .. }) = (mproved, &e.callee) {
+        // (Proved only by an identification through the memo, which
+        // recorded the receiver's slot and layout.)
+        let skip = a.new_label();
+        a.g_cmp_store_zero_skip(p.slot, skip);
+        a.g_load(r::RAX, r::RBX, reg(recv));
+        a.g_store(RBP, p.bits, r::RAX);
+        a.bind(skip);
+        a.bind(mproven);
+    }
     // 3b. A `new`: `this`, as the call's `[[Construct]]` would make it.
     let n_caps = e.n_caps - u16::from(e.new_target.is_some());
     if let Some(t) = e.super_this {
@@ -2764,6 +2847,12 @@ fn emit_guard_fast(
             let n_caps = e.n_caps - u16::from(e.new_target.is_some());
             if n_caps > 0 || e.proved.is_some() {
                 a.g_load(r::R8, r::R11, g(w, offset_of!(GuardMemo, caps)));
+            }
+            // (What a proof records: see `MethodProof`.)
+            if let Some(p) = e.mproof() {
+                a.g_store(RBP, p.slot, r::RCX);
+                a.g_load(r::R9, r::RCX, jl.off_shape);
+                a.g_store(RBP, p.shape, r::R9);
             }
             a.jmp(identified);
         } else {

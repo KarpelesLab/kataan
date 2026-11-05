@@ -7530,6 +7530,45 @@ impl JitFunction {
             let k = k as i32;
             (proved_base - 16 * k - 8, proved_base - 16 * k - 16)
         };
+        // The monomorphic method and accessor guards that prove their
+        // receiver for the next times (`call_seq::MethodProof`), each three
+        // slots under the call guards' pairs: by op, its index. (Not one
+        // with a receiver-cache way, whose fills its proved path would
+        // skip, nor one loading captures.)
+        let mut n_mproved = 0usize;
+        let mproof_slot: Vec<Option<usize>> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, o)| match *o {
+                GenericOp::InlineGuard {
+                    poly: 0,
+                    call,
+                    n_caps: 0,
+                    ..
+                } if matches!(
+                    ops.get(call as usize),
+                    Some(
+                        GenericOp::GetProp { .. }
+                            | GenericOp::SetProp { .. }
+                            | GenericOp::CallMethod { .. }
+                    )
+                ) && rc.sites.get(i).is_some_and(Option::is_none) =>
+                {
+                    n_mproved += 1;
+                    Some(n_mproved - 1)
+                }
+                _ => None,
+            })
+            .collect();
+        let mproof_base = proved_base - 16 * n_proved as i32;
+        let inl_mproved = |k: usize| {
+            let k = k as i32;
+            call_seq::MethodProof {
+                bits: mproof_base - 24 * k - 8,
+                slot: mproof_base - 24 * k - 16,
+                shape: mproof_base - 24 * k - 24,
+            }
+        };
         // Per op, the inlined activations enclosing it, outer first, as a
         // call sequence there pushes them (`call_seq::InlineCtx`): each its
         // guard's callee slot and its call's arguments, as its stub's.
@@ -7615,7 +7654,8 @@ impl JitFunction {
                 + 4 * usize::from(has_inline)
                 + 3 * usize::from(has_nested)
                 + 3 * usize::from(has_nested2)
-                + 2 * n_proved) as u32
+                + 2 * n_proved
+                + 3 * n_mproved) as u32
                 * 8)
             + 15)
             & !15;
@@ -7686,6 +7726,7 @@ impl JitFunction {
                 .chain((0..math_sites.len()).flat_map(|m| [m_slot(m, 0), m_slot(m, 2)]))
                 .chain(has_inline.then_some(inl_slots.ok))
                 .chain((0..n_proved).map(|k| inl_proved(k).0))
+                .chain((0..n_mproved).map(|k| inl_mproved(k).bits))
                 .collect(),
         );
         // (Also the promoted loops' epoch slots: emptying them with the
@@ -8487,6 +8528,7 @@ impl JitFunction {
                             new_way,
                             poly,
                             proved: proved_slot[op_idx].map(inl_proved),
+                            mproved: mproof_slot[op_idx].map(inl_mproved),
                             keep: &num.guard_keep(op_idx),
                             fused_miss: match ops.get(op_idx + 1) {
                                 _ if cold_miss.is_some() => cold_miss.map(|c| c.0),
