@@ -564,6 +564,20 @@ struct Slot {
     dirty: bool,
 }
 
+/// A **carried field** of a speculative region ([`plan_carried_fields`]):
+/// the property read at `read` yields, from the second iteration of a fast
+/// version's run on, the value the store at `store` stored last, which
+/// register `src` still holds: the read's value is copied from it.
+#[derive(Clone, Copy, Debug)]
+struct FCarry {
+    read: usize,
+    store: usize,
+    src: u16,
+    /// Its native frame slot ([`NumGen::fcarry_disp`]): nonzero when the
+    /// store has run since the fast version was entered.
+    flag: u32,
+}
+
 /// A promoted loop: bytecode pcs `head..=end` (`end` the unconditional back-edge
 /// `Jump` to `head`) and its promoted registers.
 struct Region {
@@ -617,6 +631,8 @@ struct Region {
     /// The **carried bindings** ([`plan_carried_globals`]): `(name, the
     /// register its one `StoreGlobal` stores, a `LoadGlobal` of it)`.
     gcarry: Vec<(alloc::string::String, u16, usize)>,
+    /// The **carried fields** ([`plan_carried_fields`]).
+    fcarry: Vec<FCarry>,
     /// For a body that branches inside itself: the registers live on entry
     /// to each of its ops (`live_words` words per pc from `head`), which
     /// [`Region::defined`] reads; empty otherwise.
@@ -1030,6 +1046,9 @@ pub(super) struct NumGen {
     /// The hoisted views' frame slots ([`Region::views`]), after the
     /// regions' epoch slots.
     n_view_slots: usize,
+    /// The carried fields' flag slots ([`FCarry::flag`]), after the int
+    /// GPRs' save slots.
+    n_fcarry: usize,
     /// Per pc: its label in its region's integer version, for a
     /// speculative region's ([`Self::spec_int`]).
     int_labels: Vec<Option<Label>>,
@@ -1441,6 +1460,27 @@ impl NumGen {
             }
             r.alt_int = None;
         }
+        // The carried fields ([`plan_carried_fields`]) of the speculative
+        // versions that leave out the arms they were planned with, on
+        // Number-only fields; each gets its flag's frame slot.
+        let mut n_fcarry = 0usize;
+        for r in &mut regions {
+            let keep = r.spec.is_some() && r.arms.iter().all(|a| r.cold.contains(a));
+            let reuse = &r.reuse;
+            let int = r.int.as_ref();
+            r.fcarry.retain(|f| {
+                keep && env.fields.get(f.read).is_some_and(Option::is_some)
+                    && !reuse.iter().any(|x| x.0 == f.read)
+                    && !int.is_some_and(|p| p.has_int(f.src))
+            });
+            for f in &mut r.fcarry {
+                f.flag = n_fcarry as u32;
+                n_fcarry += 1;
+                if fcarry_log() {
+                    std::eprintln!("[fcarry] read {} store {} src r{}", f.read, f.store, f.src);
+                }
+            }
+        }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
         {
@@ -1551,6 +1591,7 @@ impl NumGen {
             nest_entries: Vec::new(),
             inner_entries: Vec::new(),
             n_view_slots,
+            n_fcarry,
             int_labels: vec![None; n + 1],
             ilabels: Vec::new(),
             int_saved: false,
@@ -1676,7 +1717,20 @@ impl NumGen {
     /// global binding addresses, then one epoch slot per region, then the
     /// hoisted views' ([`Region::views`]).
     pub(super) fn frame_slots(&self) -> usize {
-        self.n_gslots + self.regions.len() + self.n_view_slots + self.int_save_slots()
+        self.n_gslots
+            + self.regions.len()
+            + self.n_view_slots
+            + self.int_save_slots()
+            + self.n_fcarry
+    }
+
+    /// The frame slot of carried field flag `k` ([`FCarry::flag`]), after
+    /// the int GPRs' save slots.
+    fn fcarry_disp(&self, k: u32) -> i32 {
+        self.gslot_disp(
+            (self.n_gslots + self.regions.len() + self.n_view_slots + self.int_save_slots()) as u32
+                + k,
+        )
     }
 
     /// The frame slots an integer version of a speculative region saves its
@@ -2522,6 +2576,39 @@ impl NumGen {
         true
     }
 
+    /// After the generic emitter's code for op `pc` of a speculative
+    /// region's fast version (either one): a carried field's store sets its
+    /// flag, and its read, when the flag is set, takes the stored register's
+    /// value in place of the load's ([`plan_carried_fields`]). (Every path
+    /// of either op that does not end here leaves the fast version.)
+    fn fcarry_after(&self, a: &mut X64Assembler) {
+        let pc = self.cur_pc;
+        if self.copy {
+            return;
+        }
+        let Some(ri) = self.region_at(pc) else { return };
+        let r = &self.regions[ri];
+        if r.spec.is_none() || (self.imode.is_some() && !self.spec_int_mode()) {
+            return;
+        }
+        for f in &r.fcarry {
+            if f.store == pc {
+                a.g_store_imm32(super::call_seq::r::RBP, self.fcarry_disp(f.flag), 1);
+            }
+        }
+        for f in &r.fcarry {
+            if f.read == pc
+                && let Some(Op::GetProp { dst, .. }) = self.bc(pc)
+            {
+                let skip = a.new_label();
+                a.cmp_frame_imm8(self.fcarry_disp(f.flag), 0);
+                a.jcc(CC_E, skip);
+                self.copy_reg(a, Some(ri), *dst, f.src);
+                a.bind(skip);
+            }
+        }
+    }
+
     /// The entry check of speculative region `ri`'s fast version: every one
     /// of its global ops has a validated binding address (else, with
     /// nothing promoted yet, the plain copy runs the iteration) and its
@@ -2530,6 +2617,10 @@ impl NumGen {
     /// more). Clobbers `r11` when it has any, else nothing.
     fn spec_globals_ready(&self, a: &mut X64Assembler, ri: usize, pc: usize) -> Option<()> {
         let copy = self.copy_label(pc)?;
+        // (No carried field's store has run in this run of it yet.)
+        for f in &self.regions[ri].fcarry {
+            a.mov_frame_zero(self.fcarry_disp(f.flag));
+        }
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
             a.jcc(CC_E, copy);
@@ -5626,6 +5717,28 @@ fn plan_regions(
                     numeric.extend(op_regs(&bytecode[pc]));
                 }
             }
+            // So is a carried field's read's result, a copy of the stored
+            // SSE register ([`plan_carried_fields`]).
+            if loops.is_empty() && fcarry_enabled() {
+                let carried_pre = |r: u16| {
+                    is_live(head, r)
+                        || exits.iter().any(|&t| is_live(t, r))
+                        || catches.iter().any(|&c| is_live(c, r))
+                };
+                let pre = plan_carried_fields(
+                    ops,
+                    bytecode,
+                    (head, end),
+                    &arms,
+                    &|r| numeric.contains(&r),
+                    &carried_pre,
+                );
+                for f in pre {
+                    if let Op::GetProp { dst, .. } = bytecode[f.read] {
+                        numeric.push(dst);
+                    }
+                }
+            }
             info.retain(|x| numeric.contains(&x.0));
         }
         // In a nest, a register live into an inner loop's header holds its
@@ -5675,7 +5788,22 @@ fn plan_regions(
         } else {
             Vec::new()
         };
-        let in_gcarry = |r: u16| gcarry.iter().any(|g| g.1 == r);
+        // The carried fields' registers (a loop that may get a speculative
+        // version: `NumGen::new` keeps only those of one that has).
+        let fcarry: Vec<FCarry> = if generic && loops.is_empty() && fcarry_enabled() {
+            plan_carried_fields(
+                ops,
+                bytecode,
+                (head, end),
+                &arms,
+                &|r| info.iter().any(|x| x.0 == r),
+                &carried_r,
+            )
+        } else {
+            Vec::new()
+        };
+        let in_gcarry =
+            |r: u16| gcarry.iter().any(|g| g.1 == r) || fcarry.iter().any(|f| f.src == r);
         carried.extend(info.iter().filter(|x| in_gcarry(x.0)));
         carried.sort_by(|p, q| q.3.cmp(&p.3).then(p.0.cmp(&q.0)));
         // Body temporaries, by the start of their live intervals.
@@ -5801,7 +5929,9 @@ fn plan_regions(
             // (A speculative region's integer version has the carried
             // bindings' registers carried as well: its entry loads them from
             // the bindings, `NumGen::spec_int_entry`.)
-            let carried_spec = |r: u16| carried_r(r) || in_gcarry(r);
+            // (Not the carried fields': their registers need not hold the
+            // field on entry, `FCarry::flag`.)
+            let carried_spec = |r: u16| carried_r(r) || gcarry.iter().any(|g| g.1 == r);
             let plan = |elems: bool, spec: bool| {
                 int32::plan(
                     bytecode,
@@ -5890,6 +6020,7 @@ fn plan_regions(
             aviews: Vec::new(),
             cold: Vec::new(),
             gcarry,
+            fcarry,
         });
     }
     out
@@ -5959,6 +6090,237 @@ fn plan_carried_globals(
             continue;
         }
         out.push((name.clone(), *src, read));
+    }
+    out
+}
+
+/// Whether carried fields ([`plan_carried_fields`]) are planned: unless
+/// `KATAAN_JIT_FCARRY=0`. Read once per process.
+fn fcarry_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FCARRY").is_none_or(|v| v != "0"))
+}
+
+/// Whether `KATAAN_JIT_FCARRY=log`: report each carried field kept.
+fn fcarry_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FCARRY").is_some_and(|v| v == "log"))
+}
+
+/// A loop's **carried fields**. `o.x = o.x + 1` reads the field and stores it
+/// back every iteration; the store-to-load forward of the value through the
+/// object's slot (a GPR store, then an SSE load: about 10 cycles) is then
+/// on the value's dependency chain, and bounds the loop. In a speculative
+/// version's fast version only the region's own property stores change a
+/// field (no Rust code runs there), so once its one store of `x` has run,
+/// a read of `x` on the same object is the value it stored: the stored
+/// register stays in its SSE register around the back-edge, and the read
+/// is a copy of it. The store still happens (every way out finds the field
+/// right), and so does the read's own load (its receiver checks too:
+/// nothing the receiver cache plans changes); the copy only replaces its
+/// result, after a test of the flag the store sets ([`FCarry::flag`],
+/// cleared at every entry into the fast version, whose first read takes
+/// the field).
+///
+/// A candidate (`(read, store, src)`): a loop whose control runs straight
+/// from its header to its back-edge but for guard diamonds (`arms`, whose
+/// fallback arms the fast version leaves out) and exits; the one store of
+/// key `x` outside the arms (`o.x = src`), `src` written by one op before
+/// it, after the read (so from the store around the back-edge to the
+/// read, `src` holds what it stored), dead at the header (its frame slot
+/// is free: the region carries it); a read of `x` before that write, on a
+/// receiver that is the store's in every run of the fast version (a
+/// register the loop never writes, or registers whose every write reads
+/// the same global binding, which the loop never stores); and between the
+/// store and the read, around the back-edge, only ops that store no
+/// property `x` (stores of other keys, register ops, reads, branches out,
+/// inline guards).
+///
+/// `NumGen::new` keeps those of regions that got a speculative version
+/// whose fast version leaves out these very arms, whose read is a
+/// Number-only field of a compiled-in layout, and whose `src` is no int
+/// register of the integer version.
+fn plan_carried_fields(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    arms: &[(usize, usize, usize)],
+    in_info: &dyn Fn(u16) -> bool,
+    carried_r: &dyn Fn(u16) -> bool,
+) -> Vec<FCarry> {
+    let mut out = Vec::new();
+    if end >= ops.len() || end >= bytecode.len() || head >= end {
+        return out;
+    }
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    // Straight control (outside the fallback arms): a guard's test, a fast
+    // arm's jump to its join, an exit, the back-edge.
+    for (pc, op) in ops.iter().enumerate().take(end + 1).skip(head) {
+        if in_arm(pc) {
+            continue;
+        }
+        let ok = match *op {
+            GenericOp::JumpIfFalse { target, .. } => {
+                arms.iter().any(|a| a.0 == pc) || target < head || target > end
+            }
+            GenericOp::Jump { target } => {
+                (pc == end && target == head)
+                    || arms.iter().any(|&(_, f, e)| f == pc + 1 && e == target)
+                    || target < head
+                    || target > end
+            }
+            GenericOp::PushHandler { .. } | GenericOp::PopHandler => false,
+            _ => true,
+        };
+        if !ok {
+            return out;
+        }
+    }
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    let defs_of = |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| -> Vec<usize> {
+        (head..=end)
+            .filter(|&pc| {
+                def_use(&bytecode[pc], d, u);
+                d.contains(&r)
+            })
+            .collect()
+    };
+    // The receiver's value class: `(true, r)` for a register the loop never
+    // writes, `(false, k)` for registers whose writes all read global `k`
+    // (by position of its first such load) that the loop never stores.
+    let class = |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| -> Option<(bool, usize)> {
+        let ds = defs_of(r, d, u);
+        if ds.is_empty() {
+            return Some((true, r as usize));
+        }
+        if carried_r(r) {
+            return None;
+        }
+        let mut name: Option<&str> = None;
+        for &pc in &ds {
+            let Op::LoadGlobal { name: n, .. } = &bytecode[pc] else {
+                return None;
+            };
+            if name.is_some_and(|m| m != n.as_str()) || n.starts_with('\u{1}') {
+                return None;
+            }
+            name = Some(n.as_str());
+        }
+        let name = name?;
+        let stored = (head..=end).any(|pc| match &bytecode[pc] {
+            Op::StoreGlobal { name: n, .. } | Op::InitGlobal { name: n, .. } => n == name,
+            _ => false,
+        });
+        if stored {
+            return None;
+        }
+        (head..=end)
+            .find(|&pc| matches!(&bytecode[pc], Op::LoadGlobal { name: n, .. } if n == name))
+            .map(|k| (false, k))
+    };
+    // An op the path from the store around to the read may run.
+    let harmless = |pc: usize, key: &str| match (&ops[pc], &bytecode[pc]) {
+        (_, Op::SetProp { key: k, .. } | Op::SetPropStrict { key: k, .. }) => k.as_str() != key,
+        (_, Op::StoreGlobal { name, .. }) => name.as_str() != key,
+        (GenericOp::GetProp { .. }, Op::GetProp { .. }) => true,
+        (
+            GenericOp::Const { .. }
+            | GenericOp::Move { .. }
+            | GenericOp::Nop
+            | GenericOp::Add { .. }
+            | GenericOp::NumAdd { .. }
+            | GenericOp::Arith { .. }
+            | GenericOp::Lt { .. }
+            | GenericOp::Compare { .. }
+            | GenericOp::StrictEq { .. }
+            | GenericOp::ValueBin { .. }
+            | GenericOp::Not { .. }
+            | GenericOp::ToNumeric { .. }
+            | GenericOp::Step { .. }
+            | GenericOp::CheckTdz { .. }
+            | GenericOp::GetElem { .. }
+            | GenericOp::ArrayLen { .. }
+            | GenericOp::Jump { .. }
+            | GenericOp::JumpIfFalse { .. }
+            | GenericOp::InlineGuard { .. }
+            | GenericOp::InlineLeave,
+            _,
+        ) => true,
+        (GenericOp::CallMethod { .. }, bc) => super::inline_math(bc).is_some(),
+        (GenericOp::CallWithMethod { .. }, bc) => super::inline_math_got(bc).is_some(),
+        (
+            GenericOp::Interp { .. },
+            Op::LoadGlobal { .. }
+            | Op::RequireObjectCoercible { .. }
+            | Op::Neg { .. }
+            | Op::BitNot { .. },
+        ) => true,
+        _ => false,
+    };
+    for store in head..=end {
+        if in_arm(store) {
+            continue;
+        }
+        let (
+            GenericOp::SetProp { .. },
+            Op::SetProp { obj, key, src } | Op::SetPropStrict { obj, key, src },
+        ) = (&ops[store], &bytecode[store])
+        else {
+            continue;
+        };
+        let (obj, src, key) = (*obj, *src, key.as_str());
+        let stores = (head..=end)
+            .filter(|&q| {
+                !in_arm(q)
+                    && matches!(&bytecode[q], Op::SetProp { key: k, .. } | Op::SetPropStrict { key: k, .. } if k.as_str() == key)
+            })
+            .count();
+        if stores != 1 || obj == src || !in_info(src) || carried_r(src) {
+            continue;
+        }
+        let ws = defs_of(src, &mut d, &mut u);
+        let &[w] = ws.as_slice() else { continue };
+        if w >= store || in_arm(w) {
+            continue;
+        }
+        let Some(sclass) = class(obj, &mut d, &mut u) else {
+            continue;
+        };
+        // Around the back-edge, from the store to the header.
+        if !(store + 1..=end).all(|q| in_arm(q) || harmless(q, key)) {
+            continue;
+        }
+        for read in head..w {
+            if in_arm(read) {
+                continue;
+            }
+            let (
+                GenericOp::GetProp { .. },
+                Op::GetProp {
+                    dst,
+                    obj: ro,
+                    key: rk,
+                },
+            ) = (&ops[read], &bytecode[read])
+            else {
+                continue;
+            };
+            if rk.as_str() != key || *dst == src || out.iter().any(|f: &FCarry| f.read == read) {
+                continue;
+            }
+            if class(*ro, &mut d, &mut u) != Some(sclass) {
+                continue;
+            }
+            if !(head..read).all(|q| in_arm(q) || harmless(q, key)) {
+                continue;
+            }
+            out.push(FCarry {
+                read,
+                store,
+                src,
+                flag: u32::MAX,
+            });
+        }
     }
     out
 }
@@ -8046,6 +8408,37 @@ mod tests {
         assert_eq!(cold, arms);
         let types = infer(&p.ops, p.n_regs);
         assert!(plan_spec(r, &ops, &p.ops, &types, p.n_regs, &[]).is_some());
+    }
+
+    #[test]
+    fn carried_fields_are_planned_only_without_aliasing_writes() {
+        // `q.x = q.x + 1`: the read takes the stored register; with a second
+        // store of `x` (through another reference), a computed-key store
+        // around the back-edge, a different receiver register, or a branch
+        // that may skip the store, it does not.
+        let plan = |src: &str| {
+            let funcs = hosted_protos(src);
+            let f = funcs.iter().find(|p| p.name == "f").expect("fn");
+            let (ops, ..) = crate::jit::lower_nbvm_generic(f).expect("generic");
+            let regions = plan_regions(&ops, &f.ops, &[], f.n_regs);
+            regions
+                .iter()
+                .flat_map(|r| r.fcarry.iter().map(|c| (c.read, c.store)))
+                .collect::<Vec<_>>()
+        };
+        let one = plan(
+            "function f(n){ const q = { x: 0 }; for (let i = 0; i < n; i++) { q.x = q.x + 1; } return q.x; }",
+        );
+        assert_eq!(one.len(), 1);
+        assert!(one[0].0 < one[0].1);
+        for src in [
+            "function f(n){ const q = { x: 0 }; const b = q; for (let i = 0; i < n; i++) { q.x = q.x + 1; b.x = 2; } return q.x; }",
+            "function f(n, k){ const q = { x: 0 }; for (let i = 0; i < n; i++) { q.x = q.x + 1; q[k] = 2; } return q.x; }",
+            "function f(n){ const q = { x: 0 }; const b = q; for (let i = 0; i < n; i++) { b.x = q.x + 1; } return q.x; }",
+            "function f(n){ const q = { x: 0 }; for (let i = 0; i < n; i++) { const t = q.x + 1; if (i & 1) q.x = t; } return q.x; }",
+        ] {
+            assert!(plan(src).is_empty(), "{src}");
+        }
     }
 
     #[test]

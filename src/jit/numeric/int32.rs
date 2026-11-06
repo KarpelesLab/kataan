@@ -123,7 +123,6 @@ pub(super) struct PGlobal {
 
 impl IntPlan {
     /// Whether `r` is one of its int registers.
-    #[cfg(test)]
     pub(super) fn has_int(&self, r: u16) -> bool {
         self.ints.binary_search(&r).is_ok()
     }
@@ -1928,6 +1927,7 @@ impl NumGen {
     pub(crate) fn after_generic_op(&mut self, a: &mut X64Assembler) {
         self.int_saved = false;
         self.int_math = None;
+        self.fcarry_after(a);
         if core::mem::take(&mut self.int_reload) {
             // (Those it reads last need not, nor its result.)
             let pc = self.cur_pc;
