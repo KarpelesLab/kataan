@@ -152,68 +152,141 @@ pub(super) struct FreshAdd {
     pub(super) prev: Option<usize>,
 }
 
-/// The `SetProp`s that may add to the object an inlined `new`'s guard has
-/// just allocated (`this`, see `call_seq::emit_inline_new_this`) while
-/// nothing but the chain's own earlier `SetProp`s on it can have touched it:
-/// from the guard on, with no branch target in between (so every path to
-/// such a site came through the guard's success), every op naming `this` is
-/// a `SetProp` on it storing another register. The plan is static only;
-/// what holds at run time is the emitter's to check (see
-/// `X64Assembler::p_add_fresh`): that the guard's way still holds the
-/// object (no call — so no Rust code — since the allocation, and every
-/// earlier add of the chain took its fast path, whose other paths empty
-/// the way).
+/// The `SetProp`s that may add to the object an inlined `new`'s guard (or a
+/// `super(…)`'s, into a base constructor) has just allocated (`this`, see
+/// `call_seq::emit_inline_new_this`) while nothing but the chain's own
+/// earlier `SetProp`s on it can have touched it: from the guard on, every op
+/// naming `this` — or a register a `Move` copied it to (an inlined
+/// constructor's result, the caller's `this` after `super(…)`) — is a
+/// `SetProp` on it storing another register, a copy, a `CheckTdz` of it or
+/// an `InitFields` on it (whose fast path does nothing; its slow path's
+/// call empties the way); an `InlineLeave` or a super constructor's lookup
+/// may come between. A branch target ends the chain, except the join after
+/// an inlined call whose only other way in is falling through its fallback
+/// call op (every path of which makes a call, which empties every way, and
+/// the ops from there to the next site fill none): the chain goes on with
+/// what the one branch in knew. The plan is static only; what holds at run
+/// time is the emitter's to check (see `X64Assembler::p_add_fresh`): that
+/// the guard's way still holds the object (no call — so no Rust code —
+/// since the allocation, and every earlier add of the chain took its fast
+/// path, whose other paths empty the way).
 pub(super) fn fresh_adds(
     ops: &[GenericOp],
     bytecode: &[Op],
     osr_entries: &[usize],
     catch_targets: &[usize],
 ) -> Vec<Option<FreshAdd>> {
+    /// (guard, the registers holding `this`, adds so far, last add)
+    type Chain = (usize, Vec<u16>, u32, Option<usize>);
     let n = ops.len();
     let target = branch_targets(ops, osr_entries, catch_targets);
+    let mut into = vec![0u32; n + 1];
+    for op in ops {
+        if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
+            && t <= n
+        {
+            into[t] += 1;
+        }
+    }
+    // The fallback ops of the body's inlined calls (each a call on every
+    // path: a `new`, or a `super(…)` through the interpreter's op).
+    let mut fallback = vec![false; n];
+    for op in ops {
+        if let GenericOp::InlineGuard { call, .. } = *op
+            && let Some(c) = fallback.get_mut(call as usize)
+        {
+            *c = match ops[call as usize] {
+                GenericOp::Construct { .. } => true,
+                GenericOp::Interp { .. } => is_super_call(bytecode, call as usize),
+                _ => false,
+            };
+        }
+    }
+    let entry = |i: usize| osr_entries.contains(&i) || catch_targets.contains(&i);
     let mut out = vec![None; n];
-    // (guard, this register, adds so far, last add)
-    let mut cur: Option<(usize, u16, u32, Option<usize>)> = None;
+    // Per join, the chain at its one forward branch.
+    let mut snap: Vec<Option<Chain>> = vec![None; n + 1];
+    let mut cur: Option<Chain> = None;
     for (i, op) in ops.iter().enumerate() {
         if target[i] {
-            cur = None;
+            let joined = snap[i].take();
+            cur = match joined {
+                Some(c) if into[i] == 1 && i > 0 && fallback[i - 1] && !entry(i) => Some(c),
+                _ => None,
+            };
         }
         if let GenericOp::InlineGuard {
             call, caps, n_caps, ..
         } = *op
         {
-            cur = match ops.get(call as usize) {
-                Some(GenericOp::Construct { .. }) => n_caps
+            let allocates = match ops.get(call as usize) {
+                Some(GenericOp::Construct { .. }) => true,
+                Some(GenericOp::Interp { .. }) => is_super_call(bytecode, call as usize),
+                _ => false,
+            };
+            cur = if allocates {
+                n_caps
                     .checked_sub(1)
                     .and_then(|k| caps.checked_add(k))
-                    .map(|t| (i, t, 0, None)),
-                _ => None,
+                    .map(|t| (i, vec![t], 0, None))
+            } else {
+                None
             };
             continue;
         }
-        let Some((g, t, k, prev)) = cur else {
+        let Some((g, mut ts, k, prev)) = cur.take() else {
             continue;
         };
-        if let GenericOp::SetProp { obj, val, .. } = *op
-            && obj == t
-            && val != t
+        let is_t = |r: u16| ts.contains(&r);
+        match (*op, bytecode.get(i)) {
+            (GenericOp::SetProp { obj, val, .. }, _) if is_t(obj) && !is_t(val) => {
+                out[i] = Some(FreshAdd { guard: g, k, prev });
+                cur = Some((g, ts, k + 1, Some(i)));
+                continue;
+            }
+            (GenericOp::Move { dst, src }, _) => {
+                if is_t(src) {
+                    if !ts.contains(&dst) {
+                        ts.push(dst);
+                    }
+                } else {
+                    ts.retain(|&x| x != dst);
+                }
+            }
+            (GenericOp::CheckTdz { .. } | GenericOp::InlineLeave, _) => {}
+            (GenericOp::Jump { target: t }, _) if t > i && t <= n => {
+                snap[t] = Some((g, ts, k, prev));
+                continue;
+            }
+            (GenericOp::Interp { .. }, Some(Op::InitFields { ctor, .. })) if !is_t(*ctor) => {}
+            (GenericOp::Interp { .. }, Some(Op::SuperCtor { dst, f })) if !is_t(*f) => {
+                let d = *dst;
+                ts.retain(|&x| x != d);
+            }
+            (GenericOp::Interp { .. } | GenericOp::PushHandler { .. }, _) => continue,
+            (_, Some(b)) => {
+                let names_t = core::cell::Cell::new(false);
+                crate::bytecode::op_for_each_reg(b, &|r| {
+                    if ts.contains(&r) {
+                        names_t.set(true);
+                    }
+                });
+                if names_t.get() {
+                    continue;
+                }
+            }
+            (_, None) => continue,
+        }
+        if let GenericOp::JumpIfFalse { target: t, .. } = *op
+            && t <= n
         {
-            out[i] = Some(FreshAdd { guard: g, k, prev });
-            cur = Some((g, t, k + 1, Some(i)));
+            // (Its target is no join this chain goes on at.)
+            snap[t] = None;
+        }
+        if ts.is_empty() {
             continue;
         }
-        let names_t = core::cell::Cell::new(false);
-        match bytecode.get(i) {
-            Some(b) => crate::bytecode::op_for_each_reg(b, &|r| {
-                if r == t {
-                    names_t.set(true);
-                }
-            }),
-            None => names_t.set(true),
-        }
-        if names_t.get() || matches!(op, GenericOp::Interp { .. } | GenericOp::PushHandler { .. }) {
-            cur = None;
-        }
+        cur = Some((g, ts, k, prev));
     }
     out
 }
@@ -355,7 +428,7 @@ pub(super) enum Family {
 /// call): `Obj` ways first, then `Arr`, then `Cell` ways.
 const MAX_OBJ_WAYS: usize = 12;
 const MAX_ARR_WAYS: usize = 1;
-const MAX_CELL_WAYS: usize = 1;
+const MAX_CELL_WAYS: usize = 2;
 
 /// How one property op uses the receiver cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,6 +495,12 @@ fn site_recv(op: &GenericOp, bc: Option<&Op>) -> Option<(u16, Family)> {
         | GenericOp::ArrayLen { arr, .. } => Some((arr, Family::Arr)),
         _ => None,
     }
+}
+
+/// Whether bytecode op `pc` is a `super(…)` call whose inlined guard makes
+/// `this` (`jit`'s `super_site`).
+fn is_super_call(bytecode: &[Op], pc: usize) -> bool {
+    matches!(bytecode.get(pc), Some(Op::SuperCallArgs { .. }))
 }
 
 /// The register an op writes, when it names one.
@@ -526,6 +605,19 @@ pub(super) fn shape_ways(
     let mut out: Vec<Option<Option<u64>>> = vec![None; plan.ways];
     for (op, site) in ops.iter().zip(&plan.sites) {
         let Some(p) = site else { continue };
+        // An inlined `new` / `super(…)`'s guard fills its way with the
+        // fresh `this`, of no property's layout: such a way proves none.
+        if let GenericOp::InlineGuard { call, .. } = *op
+            && matches!(
+                ops.get(call as usize),
+                Some(GenericOp::Construct { .. } | GenericOp::Interp { .. })
+            )
+        {
+            if let Some(slot) = out.get_mut(p.way) {
+                *slot = Some(None);
+            }
+            continue;
+        }
         // A truthiness test fills such a way only with an object of the
         // way's layout (`compile_generic`'s `truthy_rax!`), and so does an
         // inlined call's guard on its method's receiver
@@ -614,8 +706,13 @@ pub(super) fn plan(
             | GenericOp::GetProp { obj: r, .. }
             | GenericOp::SetProp { obj: r, .. } => Some((*r, Family::Obj)),
             // An inlined `new`'s guard allocates `this` (the register after
-            // the captures) and fills its way with the fresh object.
+            // the captures) and fills its way with the fresh object; so does
+            // an inlined `super(…)`'s, into a base constructor (a derived
+            // one's `this` stays unbound, and fills nothing).
             GenericOp::Construct { .. } => Some((caps + n_caps.checked_sub(1)?, Family::Obj)),
+            GenericOp::Interp { .. } if is_super_call(bytecode, call as usize) => {
+                Some((caps + n_caps.checked_sub(1)?, Family::Obj))
+            }
             _ => None,
         },
         _ => site_recv(op, bytecode.get(i)),
@@ -710,7 +807,10 @@ pub(super) fn plan(
     let new_this = |op: &GenericOp| match *op {
         GenericOp::InlineGuard {
             call, caps, n_caps, ..
-        } if matches!(ops.get(call as usize), Some(GenericOp::Construct { .. })) => {
+        } if matches!(ops.get(call as usize), Some(GenericOp::Construct { .. }))
+            || (matches!(ops.get(call as usize), Some(GenericOp::Interp { .. }))
+                && is_super_call(bytecode, call as usize)) =>
+        {
             n_caps.checked_sub(1).map(|k| caps + k)
         }
         _ => None,
@@ -806,6 +906,11 @@ pub(super) fn plan(
             Some(Op::LoadGlobal { .. } | Op::StoreGlobal { .. }) => {
                 globals.site.get(i).copied().flatten().is_some() || in_region(i)
             }
+            // A constructor's super constructor / "no instance fields"
+            // through the site's identity memo (its miss calls a helper,
+            // which empties every way): outside speculative loops only,
+            // whose `known` sites follow one path's walks.
+            Some(Op::SuperCtor { .. } | Op::InitFields { .. }) => !in_spec(i),
             _ => usually_inline(bytecode, i),
         };
         if ends_knowledge(op) && !inline {
@@ -887,6 +992,14 @@ pub(super) fn plan(
                 GenericOp::Interp { .. },
                 Some(Op::StoreGlobal { .. } | Op::RequireObjectCoercible { .. }),
             ) => {}
+            // (They write their `dst` only, or no register: `InitFields`'
+            // field initializers run in frames of their own.)
+            (GenericOp::Interp { .. }, Some(Op::SuperCtor { dst, .. })) if !in_spec(i) => {
+                let d = *dst;
+                ids.retain(|&(x, _)| x != d);
+                fresh.retain(|&x| x != d);
+            }
+            (GenericOp::Interp { .. }, Some(Op::InitFields { .. })) if !in_spec(i) => {}
             (GenericOp::Interp { .. } | GenericOp::PushHandler { .. }, _) => {
                 // It may write any register.
                 ids.clear();
