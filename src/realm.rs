@@ -701,6 +701,11 @@ const GC_NURSERY: usize = 16_384;
 /// enough to stay in cache.
 const GC_NURSERY_MAX: usize = 262_144;
 
+/// The most vacant slots a collection appends to the slot table for the
+/// allocations until the next one (`Heap::reserve_free`): 64 Ki slots, under
+/// 5 MiB of table.
+const GC_FREE_RESERVE_MAX: usize = 65_536;
+
 /// The most out-of-line storage (array elements, string bytes, in words) the
 /// garbage of one nursery may hold for the nursery to grow (16 MiB): the
 /// nursery counts objects, and a grown one of large temporary arrays would
@@ -7945,6 +7950,11 @@ impl Realm {
                 grown()
             }
         });
+        // Free slots for the allocations until the next collection (up to a
+        // bound), so compiled code's inline allocation keeps finding one
+        // (`Heap::reserve_free`).
+        self.heap
+            .reserve_free(self.gc_threshold.min(GC_FREE_RESERVE_MAX));
         Some(stats)
     }
 

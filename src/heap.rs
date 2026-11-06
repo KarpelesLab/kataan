@@ -616,6 +616,45 @@ impl<T> Heap<T> {
         }
     }
 
+    /// Right after a collection (every free-list entry still free, no slot
+    /// pushed since): tops the free list up to `target` entries with vacant
+    /// slots appended to the table, so that the next `target` allocations
+    /// all take the free-list path — the only one compiled code's inline
+    /// allocation has (`X64Assembler::p_alloc_object`), which otherwise
+    /// misses into a call for every allocation that would push a slot. The
+    /// appended slots go under the free list's existing entries, in
+    /// ascending order from its top: they are handed out after the freed
+    /// slots and in the order (with the generation, `0`) the pushes they
+    /// stand for would have numbered them. A no-op at any other time.
+    pub fn reserve_free(&mut self, target: usize) {
+        if self.free_top != self.free.len() || self.young_floor != self.slots.len() {
+            return;
+        }
+        let start = self.slots.len();
+        // (Slot index `u32::MAX` is never handed out, as in `alloc`.)
+        let add = target
+            .saturating_sub(self.free_top)
+            .min((u32::MAX as usize).saturating_sub(start + 1));
+        if add == 0 {
+            return;
+        }
+        self.reserve(add);
+        self.slots.extend((0..add).map(|_| Slot {
+            value: None,
+            generation: 0,
+            age: 0,
+            occupied: 0,
+            dirty: CLEAN,
+            scan_lo: 0,
+            scan_hi: 0,
+        }));
+        // Popped from the top: the last entry is handed out first.
+        self.free
+            .splice(0..0, (start..start + add).rev().map(|i| i as u32));
+        self.free_top = self.free.len();
+        self.young_floor = self.slots.len();
+    }
+
     pub fn alloc(&mut self, value: T) -> Handle {
         // (Counted in `len` through `allocs_since_gc`.)
         self.allocs_since_gc += 1;
