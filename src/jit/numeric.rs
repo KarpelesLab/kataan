@@ -2298,10 +2298,16 @@ impl NumGen {
         let Op::LoadGlobal { name, .. } = self.bc(pc)? else {
             return None;
         };
-        if self.copy || self.imode.is_some() {
+        // (In a speculative region's integer version, a register that is not
+        // an int register keeps its double location: `spec_int_entry` loads
+        // it from the binding too. An int one: `carried_int_global`.)
+        if self.copy || (self.imode.is_some() && !self.spec_int_mode()) {
             return None;
         }
         let g = self.regions[ri].gcarry.iter().find(|g| &g.0 == name)?;
+        if self.is_int(g.1) {
+            return None;
+        }
         if self.gslot.get(g.2).is_none_or(|&k| k == u32::MAX) {
             return None;
         }
@@ -5648,11 +5654,12 @@ fn plan_regions(
             info.iter().filter(|x| carried_r(x.0)).collect();
         carried.sort_by(|p, q| q.3.cmp(&p.3).then(p.0.cmp(&q.0)));
         // The carried bindings' registers (a loop that may get a speculative
-        // version and has no integer version to keep in step).
+        // version, whose integer version, if any, keeps them in step: its
+        // entry loads them and its plan has them carried; an `elems`
+        // version goes with no speculative one, `plan_spec`). A call in a
+        // guard diamond's fallback arm only ever runs in the plain copy.
         let gcarry = if generic
-            && !elem_cand
-            && !spec_int_cand
-            && !(head..=end).any(|pc| region_call(&ops[pc], &bytecode[pc]))
+            && !(head..=end).any(|pc| !in_arm(pc) && region_call(&ops[pc], &bytecode[pc]))
         {
             let target = |q: usize| {
                 ops.iter()
@@ -5791,18 +5798,27 @@ fn plan_regions(
             // reads.
             // (A loop of element reads may have both: the speculative
             // region's, else, without a speculative version, `elems`'.)
+            // (A speculative region's integer version has the carried
+            // bindings' registers carried as well: its entry loads them from
+            // the bindings, `NumGen::spec_int_entry`.)
+            let carried_spec = |r: u16| carried_r(r) || in_gcarry(r);
             let plan = |elems: bool, spec: bool| {
                 int32::plan(
                     bytecode,
                     head,
                     end,
                     &info,
-                    &carried_r,
+                    if spec {
+                        &carried_spec as &dyn Fn(u16) -> bool
+                    } else {
+                        &carried_r
+                    },
                     n_regs,
                     &dbl_xmm,
                     elems,
                     spec.then_some(&arms[..]),
                     &is_live,
+                    if spec { &gcarry[..] } else { &[] },
                 )
             };
             let (sp, el) = if generic && !elem_cand && !(spec_int_cand && no_reuse) {

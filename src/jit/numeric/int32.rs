@@ -170,7 +170,12 @@ pub(super) fn plan(
     elems: bool,
     spec: Option<&[(usize, usize, usize)]>,
     live: &dyn Fn(usize, u16) -> bool,
+    gcarry: &[(alloc::string::String, u16, usize)],
 ) -> Option<IntPlan> {
+    // A speculative region's read of a binding its register carries
+    // (`plan_carried_globals`) is a copy of that register: an int register
+    // when that one is (`NumGen::carried_int_global`).
+    let carrier = |name: &str| gcarry.iter().find(|g| g.0 == name).map(|g| g.1);
     // A speculative region's integer version (`spec`, with its guard
     // diamonds as `(test, fallback, join)`, whose fallback arms neither fast
     // version has): see `NumGen::emit_spec_int_op`.
@@ -454,7 +459,8 @@ pub(super) fn plan(
                 Op::GetKey { dst, .. } => (elems || spec) && elem_reader_ok(*dst),
                 Op::ArrayLen { .. } => elems || spec,
                 // A promoted global reads / writes its pseudo-register.
-                Op::LoadGlobal { name, .. } => !spec && vreg_of(name).is_none_or(inn),
+                Op::LoadGlobal { name, .. } if spec => carrier(name).is_some_and(inn),
+                Op::LoadGlobal { name, .. } => vreg_of(name).is_none_or(inn),
                 Op::StoreGlobal { src, .. } => inn(*src),
                 Op::BitNot { .. } => true,
                 // `Math.imul` over int registers (`NumGen::emit_int_math`).
@@ -469,6 +475,12 @@ pub(super) fn plan(
                     return body.iter().any(|op| {
                         matches!(op, Op::LoadGlobal { dst, name, .. } if vreg_of(name) == Some(r) && inn(*dst))
                     });
+                }
+                // A carried binding's register: the read it carries is one.
+                if gcarry.iter().any(|g| {
+                    g.1 == r && matches!(bytecode.get(g.2), Some(Op::LoadGlobal { dst, .. }) if inn(*dst))
+                }) {
+                    return true;
                 }
                 body.iter().any(|op| {
                     def_use(op, du_d, du_u);
@@ -1450,6 +1462,11 @@ impl NumGen {
                     let IK::Gpr(d) = self.ik(dst)? else {
                         return None;
                     };
+                    if let Some(src) = self.carried_int_global(pc) {
+                        let s = self.ival(a, src, RAX)?;
+                        a.mov32_rr(d, s);
+                        return Some(true);
+                    }
                     let k = *self.gslot.get(pc)?;
                     if k == u32::MAX {
                         return None;
@@ -1844,8 +1861,34 @@ impl NumGen {
 /// (through the integer version's write-back).
 impl NumGen {
     /// Whether the integer version being emitted is a speculative region's.
-    fn spec_int_mode(&self) -> bool {
+    pub(super) fn spec_int_mode(&self) -> bool {
         self.imode.is_some_and(|ri| self.regions[ri].spec_int)
+    }
+
+    /// For the `LoadGlobal` at `pc` of a speculative region's integer
+    /// version: the int register carrying its binding around the back-edge
+    /// (`plan_carried_globals`), when that one is a carried int register of
+    /// the version. The version's entry loads it from the binding (exactly:
+    /// an int32 or the double version runs), and the region's one store of
+    /// the binding stores it, so wherever the read can be it equals the
+    /// binding: the read is a copy of it.
+    fn carried_int_global(&self, pc: usize) -> Option<u16> {
+        if !self.spec_int_mode() {
+            return None;
+        }
+        let ri = self.imode?;
+        let Op::LoadGlobal { name, .. } = self.bc(pc)? else {
+            return None;
+        };
+        let g = self.regions[ri].gcarry.iter().find(|g| &g.0 == name)?;
+        if self.gslot.get(g.2).is_none_or(|&k| k == u32::MAX) {
+            return None;
+        }
+        let p = self.iplan()?;
+        p.slots
+            .iter()
+            .any(|s| s.reg == g.1 && s.carried)
+            .then_some(g.1)
     }
 
     /// The int slots live at `pc`, as `(gpr, its save slot index)`.
@@ -2113,6 +2156,10 @@ impl NumGen {
         self.refresh_globals(a, ri, true);
         self.spec_globals_ready(a, ri, head)?;
         self.hoist_views(a, ri);
+        // The carried bindings' registers start as the bindings, as in the
+        // double version (their plan has them carried, so a bail into the
+        // double version finds them equal to the bindings).
+        self.load_carried_globals(a, ri);
         let p = self.regions[ri].int.as_ref()?;
         for s in &self.regions[ri].slots {
             if s.carried && p.ints.binary_search(&s.reg).is_err() {
