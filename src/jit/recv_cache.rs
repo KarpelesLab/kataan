@@ -428,7 +428,7 @@ pub(super) enum Family {
 /// call): `Obj` ways first, then `Arr`, then `Cell` ways.
 const MAX_OBJ_WAYS: usize = 12;
 const MAX_ARR_WAYS: usize = 1;
-const MAX_CELL_WAYS: usize = 2;
+const MAX_CELL_WAYS: usize = 1;
 
 /// How one property op uses the receiver cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
