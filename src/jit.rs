@@ -11498,10 +11498,7 @@ impl JitFunction {
                                 if q != op_idx {
                                     let _ = num.operand_xmm(&mut a, q, qv, false);
                                 }
-                                // (A value promoted to an SSE register is a Number.)
-                                let number =
-                                    num.is_number_at(q, qv) || num.result_xmm(q, qv).is_some();
-                                items.push((si_q.add?, disp(qv), number));
+                                items.push((si_q.add?, disp(qv), num.is_number_at(q, qv)));
                             }
                             let one = a.new_label();
                             let end = a.new_label();
@@ -11516,11 +11513,7 @@ impl JitFunction {
                             s.method_ptr,
                             b,
                             (first, proven),
-                            (
-                                disp(val),
-                                num.is_number_at(op_idx, val)
-                                    || num.result_xmm(op_idx, val).is_some(),
-                            ),
+                            (disp(val), num.is_number_at(op_idx, val)),
                             regular,
                         );
                         a.jmp(fresh_done);
@@ -11551,11 +11544,12 @@ impl JitFunction {
                     // version leaves for the plain copy), or it is stored to
                     // the register file first (`NumGen::operand_xmm`).
                     let val_x = num.operand_xmm(&mut a, op_idx, val, true);
-                    // A value proven a Number, or promoted to an SSE register
-                    // (which holds only Numbers): nothing for the write
-                    // barrier or the slot's record of Number-only values.
-                    let val_num =
-                        num.is_number_at(op_idx, val) || num.result_xmm(op_idx, val).is_some();
+                    // A value proven a Number: nothing for the write barrier
+                    // or the slot's record of Number-only values. (A value
+                    // promoted to an SSE register is no proof: outside a
+                    // speculative fast version a generic op's slow path
+                    // leaves any value's bits there.)
+                    let val_num = num.is_number_at(op_idx, val);
                     // A known site of the fast version whose flags test is
                     // proven, storing a Number through the frame's `extra`
                     // pointer, never reads the heap slot (`rcx`).
