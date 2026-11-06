@@ -1610,8 +1610,8 @@ fn release_cold(cell: Cell) {
 #[inline(never)]
 fn release_rest(cell: Cell) {
     match cell {
-        // (Reached by `release` alone: the sweep's `release_in` frees an
-        // array inline.)
+        // (Arrays, closures and the plain-data kinds reach here by
+        // `release` alone: the sweep's `release_in` frees them inline.)
         Cell::Array(a) => drop(a),
         Cell::VmFunction { captures, .. } => drop(captures),
         Cell::Str(s) => drop(s),
@@ -1663,30 +1663,65 @@ impl Trace for Cell {
     /// the compiler copy all of it, and one three-arm `match` computes the
     /// full discriminant (the object's tag is a niche) rather than compare
     /// the tag byte.
+    ///
+    /// The kinds that own nothing out of line — a captured variable's box,
+    /// a closure whose captures are inline, the plain-data natives — are
+    /// recognized where they lie and vacated outright: moving a cell out to
+    /// hand it to an out-of-line function copies all of it, which cost more
+    /// than everything else a dead closure's sweep does.
     #[inline(always)]
     fn release_in(place: &mut Option<Self>, pool: &mut crate::object::ExtraPool) {
-        if let Some(Cell::Array(elems)) = place {
-            // `ArrayElems` owns nothing else (and has no `Drop` of its own).
-            if elems.elems.capacity() == 0 {
-                // Elements inline (or none): nothing owned at all.
+        // The plain object first: by far the most common, and its test is
+        // one compare of the tag byte.
+        if let Some(Cell::Object(_)) = place {
+            match place.take() {
+                Some(Cell::Object(o)) => o.release(pool),
+                // (Not reached: just tested. Forgotten, not dropped, so no
+                // path needs the whole cell moved out.)
+                other => core::mem::forget(other),
+            }
+            return;
+        }
+        match place {
+            Some(Cell::Array(elems)) => {
+                // `ArrayElems` owns nothing else (and has no `Drop` of its own).
+                if elems.elems.capacity() != 0 {
+                    let elems = core::mem::take(&mut elems.elems);
+                    pool.note_swept(elems.capacity());
+                    drop(elems);
+                }
+                // Elements inline (or none, or just moved out): nothing owned.
                 core::mem::forget(place.take());
                 return;
             }
-            let elems = core::mem::take(&mut elems.elems);
-            pool.note_swept(elems.capacity());
-            core::mem::forget(place.take());
-            drop(elems);
-            return;
-        }
-        match place.take() {
-            Some(Cell::Object(o)) => o.release(pool),
-            Some(other) => {
-                if let Cell::Str(s) = &other {
-                    pool.note_swept(s.len() / 8);
+            Some(Cell::VmFunction { captures, .. }) => {
+                // `Captures` owns its `Vec` alone (and has no `Drop` of its own).
+                if captures.elems.capacity() != 0 {
+                    drop(core::mem::take(&mut captures.elems));
                 }
-                release_rest(other);
+                core::mem::forget(place.take());
+                return;
             }
-            None => {}
+            // Plain data (numbers, ids and handles): nothing to drop.
+            Some(
+                Cell::Box(_)
+                | Cell::Native(_)
+                | Cell::HostFn(_)
+                | Cell::BoundNative { .. }
+                | Cell::Date(_)
+                | Cell::TypedArray { .. }
+                | Cell::Proxy { .. },
+            ) => {
+                core::mem::forget(place.take());
+                return;
+            }
+            _ => {}
+        }
+        if let Some(other) = place.take() {
+            if let Cell::Str(s) = &other {
+                pool.note_swept(s.len() / 8);
+            }
+            release_rest(other);
         }
     }
 

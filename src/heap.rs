@@ -1411,7 +1411,10 @@ fn sweep_young_fast<T: crate::gc::Trace>(
                 }
                 r += 1;
             }
-            if gap > 0 {
+            // (Survivors come in runs of their own — a structure the
+            // program keeps was allocated in one go — so an empty run, which
+            // would still cost a call, is the common one between them.)
+            if gap > 0 && r > run {
                 free.copy_within(run..r, run - gap);
             }
             if r == n {
