@@ -1276,7 +1276,11 @@ pub(crate) extern "C" fn jit_helper_str_proof(
             &mut *(site as usize as *mut crate::jit::MethodSite),
         )
     };
-    super::native_call::prove_char_code_at(&mut ctx.realm, site);
+    if site.key() == "push" {
+        super::native_call::prove_array_push(&mut ctx.realm, site);
+    } else {
+        super::native_call::prove_char_code_at(&mut ctx.realm, site);
+    }
     0
 }
 

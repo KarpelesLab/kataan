@@ -22,6 +22,8 @@
 use alloc::vec::Vec;
 
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod arr_push;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod chase;
@@ -3634,6 +3636,9 @@ pub(crate) struct JitLayout {
     /// Slot-relative offset of a `Cell::Array`'s element `Vec` length (the dense
     /// bound for the inline element GET/SET bounds check).
     pub off_arr_len: i32,
+    /// Slot-relative offset of a `Cell::Array`'s element `Vec` capacity (an
+    /// inline `push`'s room: `arr_push`).
+    pub off_arr_cap: i32,
     /// Slot-relative offset of a `Cell::Array`'s side-state flag byte
     /// (`crate::cell::ArrayElems`): non-zero routes an element access to the
     /// helper.
@@ -3700,6 +3705,7 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
             // ptr / len are the generic `Vec<NanBox>` offsets within that Vec.
             off_arr_ptr: to_i32(cell_base + cell.array_vec_off + obj.vec_ptr_off),
             off_arr_len: to_i32(cell_base + cell.array_vec_off + obj.vec_len_off),
+            off_arr_cap: to_i32(cell_base + cell.array_vec_off + obj.vec_cap_off),
             off_arr_side: to_i32(cell_base + cell.array_side_off),
             off_arr_proto_set: to_i32(cell_base + cell.array_proto_set_off),
             off_arr_inline_len: to_i32(cell_base + cell.array_inline_len_off),
@@ -8007,6 +8013,19 @@ impl JitFunction {
                 caps: cproof_base - 24 * k - 24,
             }
         };
+        // Per compiled `for-in` loop, its memo (`forin::Memo`), four slots
+        // under those.
+        let n_forin = forin_plan.sites.len();
+        // (As the frame counts the slots above: the inlined calls' four
+        // only when the body has one.)
+        let fi_base = inl_base
+            - 8 * (4 * i32::from(has_inline)
+                + 3 * i32::from(has_nested)
+                + 3 * i32::from(has_nested2)
+                + 2 * n_proved as i32
+                + 3 * n_mproved as i32
+                + 3 * n_cproved as i32);
+        let fi_memo = |site: usize| forin::Memo::at(fi_base - 32 * site as i32);
         // Per op, the inlined activations enclosing it, outer first, as a
         // call sequence there pushes them (`call_seq::InlineCtx`): each its
         // guard's callee slot and its call's arguments, as its stub's.
@@ -8094,7 +8113,8 @@ impl JitFunction {
                 + 3 * usize::from(has_nested2)
                 + 2 * n_proved
                 + 3 * n_mproved
-                + 3 * n_cproved) as u32
+                + 3 * n_cproved
+                + 4 * n_forin) as u32
                 * 8)
             + 15)
             & !15;
@@ -8273,6 +8293,7 @@ impl JitFunction {
                 .chain((0..n_proved).map(|k| inl_proved(k).0))
                 .chain((0..n_mproved).map(|k| inl_mproved(k).bits))
                 .chain((0..n_cproved).map(|k| inl_cproved(k).ctor))
+                .chain((0..n_forin).map(|k| fi_memo(k).obj))
                 .collect(),
         );
         // (Also the promoted loops' epoch slots: emptying them with the
@@ -9580,6 +9601,50 @@ impl JitFunction {
                         a.cold_end(cold);
                         a.bind(general);
                     }
+                    // `a.push(x)` on an array without side-table state, with
+                    // no call when it needs no allocation (`arr_push`).
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && key == "push"
+                        && margs.len() == 1
+                        && ok(dst)
+                        && ok(recv)
+                        && ok(margs[0])
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                        && num.result_xmm(op_idx, dst).is_none()
+                    {
+                        // (A promoted argument is in the register file:
+                        // `arg_x` above stored it.)
+                        let x = margs[0];
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.p_str_proof(si.method_ptr, prove, general);
+                        walk_to_slot!(recv, general);
+                        a.ap_push(&layout, cl.realm, disp(x), general);
+                        a.g_mov(call_seq::r::RAX, call_seq::r::R8);
+                        a.cvtsi2sd_xmm0_rax();
+                        numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
                     // The native call sequence, when the site has one.
                     let native = call_args
                         .get(args as usize)
@@ -10502,18 +10567,49 @@ impl JitFunction {
                             let after = if fused.is_some() { test } else { done };
                             let helper = a.new_label();
                             let cold_helper = if let Some((l, site)) = fast {
-                                walk_to_slot!(*obj, helper);
-                                a.p_object_not_exotic(&layout, helper);
+                                use call_seq::r as R;
+                                // The receiver: the memo's (`forin::Memo`),
+                                // else walked and recorded there.
+                                let m = fi_memo(l.site);
+                                let walk = a.new_label();
+                                let walked = a.new_label();
+                                let found = a.new_label();
+                                a.load_rax(disp(*obj));
+                                a.g_cmp_mem(R::RAX, R::RBP, m.obj);
+                                a.g_jcc(call_seq::cc::NE, walk);
+                                a.g_load(R::RCX, R::RBP, m.cell);
+                                a.bind(walked);
                                 a.fi_slot(&layout, site, l, *key, disp, helper);
-                                a.p_cmp32_imm(
-                                    call_seq::r::RAX,
-                                    crate::realm::NO_SLOT as u32 as i32,
-                                );
+                                a.p_cmp32_imm(R::RAX, crate::realm::NO_SLOT as u32 as i32);
                                 a.g_jcc(call_seq::cc::E, helper);
+                                // The key's slot, for the body's `o[k]`.
+                                a.g_store(R::RBP, m.slot, R::RAX);
+                                a.g_load(R::R9, R::RBX, disp(*key));
+                                a.g_store(R::RBP, m.key, R::R9);
+                                a.bind(found);
                                 a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
                                 a.store_rax(disp(*dst));
                                 a.jmp(done);
-                                Some(a.cold_begin())
+                                let cold = a.cold_begin();
+                                a.bind(walk);
+                                walk_to_slot!(*obj, helper);
+                                a.p_object_not_exotic(&layout, helper);
+                                // A receiver a read in the body may take its
+                                // keys' slots for (none found yet), else no
+                                // memo.
+                                let no_memo = a.new_label();
+                                let cl = &helpers.call_layout;
+                                a.fi_plain_read(&layout, (cl.realm, cl.str_special), no_memo);
+                                a.g_store(R::RBP, m.obj, R::RAX);
+                                a.g_store(R::RBP, m.cell, R::RCX);
+                                a.store_empty(m.key);
+                                a.jmp(walked);
+                                a.bind(no_memo);
+                                a.fi_slot(&layout, site, l, *key, disp, helper);
+                                a.p_cmp32_imm(R::RAX, crate::realm::NO_SLOT as u32 as i32);
+                                a.g_jcc(call_seq::cc::E, helper);
+                                a.jmp(found);
+                                Some(cold)
                             } else {
                                 None
                             };
@@ -10594,7 +10690,30 @@ impl JitFunction {
                                 .copied()
                                 .flatten()
                                 .and_then(|s| forin_plan.site_addr(s))?;
-                            site_slow!(enum_keys_helper, site);
+                            // The table the site holds, when it still is
+                            // the receiver's: its array, with no call.
+                            if let crate::nbvm::Op::EnumKeys { dst, obj } = bytecode.get(op_idx)?
+                                && ok(*dst)
+                                && ok(*obj)
+                            {
+                                let slow = a.new_label();
+                                let done = a.new_label();
+                                a.g_cmp_byte_imm(call_seq::r::R15, helpers.call_layout.hosted, 0);
+                                a.g_jcc(call_seq::cc::E, slow);
+                                walk_to_slot!(*obj, slow);
+                                a.p_object_not_exotic(&layout, slow);
+                                a.fi_enum_hit(&layout, site, slow);
+                                a.store_rax(disp(*dst));
+                                a.jmp(done);
+                                let cold = a.cold_begin();
+                                a.bind(slow);
+                                site_slow!(enum_keys_helper, site);
+                                a.jmp(done);
+                                a.cold_end(cold);
+                                a.bind(done);
+                            } else {
+                                site_slow!(enum_keys_helper, site);
+                            }
                         }
                         // A captured variable's binding cell: inline from
                         // the heap's free list, else the interpreter's op.
@@ -11570,17 +11689,24 @@ impl JitFunction {
                         })
                         .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)))
                     {
+                        use call_seq::r as R;
                         let other = a.new_label();
                         let spill = a.new_label();
                         let have = a.new_label();
-                        walk_to_slot!(obj, other);
-                        a.p_object_not_exotic(&layout, other);
-                        // (`rax`: the receiver's bits, from the walk.)
-                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBX, disp(l.obj));
-                        a.g_jcc(call_seq::cc::NE, other);
-                        let cl = &helpers.call_layout;
-                        a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
-                        a.fi_slot(&layout, site, l, index, disp, other);
+                        let full = a.new_label();
+                        let slot = a.new_label();
+                        // The key the loop's liveness check found for this
+                        // very receiver since the last call (`forin::Memo`).
+                        let m = fi_memo(l.site);
+                        a.load_rax(disp(obj));
+                        a.g_cmp_mem(R::RAX, R::RBP, m.obj);
+                        a.g_jcc(call_seq::cc::NE, full);
+                        a.g_load(R::R9, R::RBX, disp(index));
+                        a.g_cmp_mem(R::R9, R::RBP, m.key);
+                        a.g_jcc(call_seq::cc::NE, full);
+                        a.g_load(R::RCX, R::RBP, m.cell);
+                        a.g_load(R::RAX, R::RBP, m.slot);
+                        a.bind(slot);
                         a.p_obj_slot_load_inline(&layout, other, spill);
                         a.bind(have);
                         a.store_rax(disp(dst));
@@ -11588,6 +11714,16 @@ impl JitFunction {
                         let cold = a.cold_begin();
                         a.bind(spill);
                         a.p_obj_slot_load_spill(&layout, have);
+                        a.bind(full);
+                        walk_to_slot!(obj, other);
+                        a.p_object_not_exotic(&layout, other);
+                        // (`rax`: the receiver's bits, from the walk.)
+                        a.g_cmp_mem(R::RAX, R::RBX, disp(l.obj));
+                        a.g_jcc(call_seq::cc::NE, other);
+                        let cl = &helpers.call_layout;
+                        a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
+                        a.fi_slot(&layout, site, l, index, disp, other);
+                        a.jmp(slot);
                         a.cold_end(cold);
                         a.bind(other);
                     }

@@ -528,21 +528,56 @@ pub(super) fn try_call(
 /// `%String.prototype%`, is the built-in (`MethodSite::set_str_proof`).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn prove_char_code_at(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
-    let found = realm.string_proto_intrinsic.and_then(|start| {
-        // (`%String.prototype%` is a String wrapper, whose string only owns
-        // indices and `length`.)
+    // (`%String.prototype%` is a String wrapper, whose string only owns
+    // indices and `length`.)
+    let start = realm.string_proto_intrinsic;
+    prove_proto_method(realm, site, start, "charCodeAt", FastOp::StrCharCodeAt);
+}
+
+/// What compiled code's inline `a.push(x)` relies on, for `site`: the method
+/// the lookup of an array without side-table state or a set `[[Prototype]]`
+/// finds (`plain_recv_lookup_start`: an own data property of the realm's
+/// first `%Array.prototype%`) is the built-in `push` (as
+/// [`prove_char_code_at`]).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prove_array_push(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
+    // (`%Array.prototype%` is an array, whose named properties are its
+    // auxiliary object's: the object watched and read here. An array keeps
+    // its auxiliary object for life, except across a cell swap, which bumps
+    // the prototype epoch.)
+    let start = realm
+        .root_array_proto()
+        .and_then(|p| match realm.jit_object(p) {
+            Some(_) => Some(p),
+            None => realm.jit_aux_of(p),
+        });
+    prove_proto_method(realm, site, start, "push", FastOp::ArrayPush);
+}
+
+/// The proof of [`prove_char_code_at`] / [`prove_array_push`]: `key` is a
+/// data property of the ordinary object `start` (watched), the built-in
+/// `want`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn prove_proto_method(
+    realm: &mut Realm,
+    site: &mut crate::jit::MethodSite,
+    start: Option<Handle>,
+    key: &str,
+    want: FastOp,
+) {
+    let found = start.and_then(|start| {
         let o = realm.jit_object(start)?;
         let shape = o.shaped_shape()?;
-        if o.accessor_index("charCodeAt").is_some() {
+        if o.accessor_index(key).is_some() {
             return None;
         }
-        let slot = shape.lookup("charCodeAt")?;
+        let slot = shape.lookup(key)?;
         let ptr = o.jit_slot_ptr(slot)?;
         let value = o.slot(slot)?;
         Some((start, ptr as u64, value))
     });
     match found {
-        Some((start, ptr, value)) if classify(realm, value) == FastOp::StrCharCodeAt => {
+        Some((start, ptr, value)) if classify(realm, value) == want => {
             realm.jit_watch(start);
             site.set_str_proof(Some((ptr, value.to_bits())));
         }

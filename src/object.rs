@@ -109,6 +109,9 @@ struct DictSlot {
     pos: usize,
 }
 
+/// `ObjectExtra`'s `class_tag` for "no class".
+const NO_CLASS_TAG: u32 = u32::MAX;
+
 /// [`Object`]'s `proto` word for "no prototype" (no handle packs to it: a
 /// raw handle uses only the low 48 bits).
 pub(crate) const NO_PROTO: u64 = u64::MAX;
@@ -333,7 +336,6 @@ impl Default for Spill {
 
 /// The out-of-line part of an [`Object`]: everything an ordinary data object
 /// leaves empty. Allocated on first use (see `Object::extra_mut`).
-#[derive(Default)]
 struct ObjectExtra {
     /// Slot values past the inline room (shaped mode).
     spill: Spill,
@@ -351,8 +353,9 @@ struct ObjectExtra {
     /// Own keys that are **non-configurable** (`defineProperty` with
     /// `configurable: false`): they cannot be deleted.
     non_configurable: Vec<alloc::boxed::Box<str>>,
-    /// The class this object was instantiated from (for `instanceof`), if any.
-    class_tag: Option<u32>,
+    /// The class this object was instantiated from (for `instanceof`), if any
+    /// ([`NO_CLASS_TAG`] for none: a plain word compiled code can test).
+    class_tag: u32,
     /// How many of the first slots (shaped mode) hold **non-enumerable**
     /// keys not listed in `hidden`: a built-in prototype or namespace marks
     /// each method hidden right after adding it, which only moves this count
@@ -456,7 +459,7 @@ impl ObjectExtra {
             && self.accessors.is_empty()
             && self.hidden.is_empty()
             && self.non_configurable.is_empty()
-            && self.class_tag.is_none()
+            && self.class_tag == NO_CLASS_TAG
             && self.hidden_prefix == 0
             && self.key_order.is_none()
             && self.index.is_none()
@@ -662,11 +665,28 @@ static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
     accessors: Vec::new(),
     hidden: Vec::new(),
     non_configurable: Vec::new(),
-    class_tag: None,
+    class_tag: NO_CLASS_TAG,
     hidden_prefix: 0,
     key_order: None,
     index: None,
 };
+
+impl Default for ObjectExtra {
+    fn default() -> Self {
+        Self {
+            spill: Spill::EMPTY,
+            dict: None,
+            readonly: Vec::new(),
+            accessors: Vec::new(),
+            hidden: Vec::new(),
+            non_configurable: Vec::new(),
+            class_tag: NO_CLASS_TAG,
+            hidden_prefix: 0,
+            key_order: None,
+            index: None,
+        }
+    }
+}
 
 /// An empty dictionary, for reads of a dictionary-mode object's map.
 static EMPTY_DICT: DictData = DictData {
@@ -755,7 +775,7 @@ impl ExtraPool {
         );
         if self.boxes.len() < Self::CAP && x.recyclable() {
             x.spill.n = 0;
-            x.class_tag = None;
+            x.class_tag = NO_CLASS_TAG;
             x.hidden_prefix = 0;
             self.boxes.push(x);
         } else {
@@ -1408,13 +1428,14 @@ impl Object {
 
     /// Tags this object with the class it was constructed from.
     pub fn set_class_tag(&mut self, class_id: u32) {
-        self.extra_mut().class_tag = Some(class_id);
+        debug_assert!(class_id != NO_CLASS_TAG);
+        self.extra_mut().class_tag = class_id;
     }
 
     /// The class this object was constructed from, if any.
     #[must_use]
     pub fn class_tag(&self) -> Option<u32> {
-        self.ex().class_tag
+        Some(self.ex().class_tag).filter(|&t| t != NO_CLASS_TAG)
     }
 
     /// Defines an accessor property `name` with `getter`/`setter` (either may be
@@ -2471,6 +2492,8 @@ pub(crate) struct ObjectLayout {
     pub vec_ptr_off: usize,
     /// Byte offset of the length within a `Vec<NanBox>`.
     pub vec_len_off: usize,
+    /// Byte offset of the capacity within a `Vec<NanBox>`.
+    pub vec_cap_off: usize,
     /// Byte offset of the flags byte (the `JIT_FLAG_*` and `OBJ_FLAG_*` bits).
     pub jit_flags_off: usize,
     /// Byte offset of the raw `proto` word.
@@ -2490,6 +2513,13 @@ pub(crate) struct ObjectLayout {
     /// Byte offset of the key-order log's word within `ObjectExtra` (null
     /// for none).
     pub extra_key_order_off: usize,
+    /// Byte offsets, within `ObjectExtra`, of the words of the dictionary
+    /// and of the attribute index (null for none), and of the `u32`s of the
+    /// class tag (`u32::MAX` for none) and the hidden-prefix count: with the
+    /// lists above, what `ObjectExtra::only_spill` tests.
+    pub extra_other_words_off: [usize; 2],
+    pub extra_class_tag_off: usize,
+    pub extra_hidden_prefix_off: usize,
     /// Byte offset of the spilled-value count (`u32`) within `ObjectExtra`.
     pub extra_spill_n_off: usize,
     /// The size of one accessor entry (`(name, getter, setter)`).
@@ -2535,9 +2565,11 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
     let vec_base = core::ptr::addr_of!(probe) as usize;
     let want_ptr = probe.as_ptr() as usize;
     let want_len = probe.len(); // == 3, capacity >= 11
+    let want_cap = probe.capacity();
     let words = core::mem::size_of::<Vec<NanBox>>() / core::mem::size_of::<usize>();
     let mut vec_ptr_off = usize::MAX;
     let mut vec_len_off = usize::MAX;
+    let mut vec_cap_off = usize::MAX;
     for i in 0..words {
         // SAFETY: reading the i-th usize-word of a live `Vec<NanBox>`, in bounds.
         #[allow(unsafe_code)]
@@ -2546,11 +2578,16 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
             vec_ptr_off = i * core::mem::size_of::<usize>();
         } else if w == want_len {
             vec_len_off = i * core::mem::size_of::<usize>();
+        } else if w == want_cap {
+            vec_cap_off = i * core::mem::size_of::<usize>();
         }
     }
     assert!(
-        vec_ptr_off != usize::MAX && vec_len_off != usize::MAX && vec_ptr_off != vec_len_off,
-        "could not derive Vec ptr/len offsets"
+        vec_ptr_off != usize::MAX
+            && vec_len_off != usize::MAX
+            && vec_cap_off != usize::MAX
+            && want_cap != want_len,
+        "could not derive Vec ptr/len/cap offsets"
     );
 
     // The shape's brand byte, relative to the stored `Rc` word.
@@ -2626,6 +2663,7 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         extra_far_ptr_off,
         vec_ptr_off,
         vec_len_off,
+        vec_cap_off,
         jit_flags_off: core::mem::offset_of!(Object, flags),
         proto_off: core::mem::offset_of!(Object, proto),
         epoch_off: core::mem::offset_of!(Object, key_epoch),
@@ -2634,6 +2672,12 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         extra_acc_ptr_off,
         extra_marks_len_off,
         extra_key_order_off,
+        extra_other_words_off: [
+            core::mem::offset_of!(ObjectExtra, dict),
+            core::mem::offset_of!(ObjectExtra, index),
+        ],
+        extra_class_tag_off: core::mem::offset_of!(ObjectExtra, class_tag),
+        extra_hidden_prefix_off: core::mem::offset_of!(ObjectExtra, hidden_prefix),
         extra_spill_n_off,
         acc_stride: core::mem::size_of::<(Box<str>, NanBox, NanBox)>(),
         acc_getter_off,

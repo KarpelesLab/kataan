@@ -45,6 +45,12 @@ pub(crate) struct PropsLayout {
     /// `ObjectExtra`-relative offset of the key-order log's word (null for
     /// none).
     pub extra_key_order: i32,
+    /// `ObjectExtra`-relative offsets of the dictionary's and the attribute
+    /// index's words, the class tag and the hidden-prefix count (see
+    /// `ObjectLayout::extra_other_words_off`).
+    pub extra_other_words: [i32; 2],
+    pub extra_class_tag: i32,
+    pub extra_hidden_prefix: i32,
     /// `ObjectExtra`-relative offset of the spilled-value count (`u32`).
     pub extra_spill_n: i32,
     /// The size of one accessor entry.
@@ -110,6 +116,9 @@ pub(crate) struct PropsLayout {
     pub dict_threshold: i32,
     /// `Realm`-relative offset of `max_array_len`.
     pub max_array_len: i32,
+    /// `Realm`-relative offset of the "an array prototype has an index
+    /// accessor" flag (a `bool`), which an inline `push` requires clear.
+    pub proto_index_dirty: i32,
     /// `Realm`-relative offsets of the heap's free-list data pointer and
     /// length and its allocations-since-collection count, which also counts
     /// the allocation as live (inline object allocation, `p_alloc_object`).
@@ -171,6 +180,7 @@ impl PropsLayout {
             max_array_len: i(core::mem::offset_of!(crate::realm::Realm, limits)
                 + core::mem::offset_of!(crate::limits::Limits, max_array_len)),
             marking: i(crate::realm::Realm::jit_marking_offset()),
+            proto_index_dirty: i(crate::realm::Realm::jit_proto_index_dirty_offset()),
             off_slot_age: i(slot.age_off),
             off_slot_dirty: i(slot.dirty_off),
             off_slot_scan_lo: i(slot.scan_lo_off),
@@ -195,6 +205,9 @@ impl PropsLayout {
             extra_acc_ptr: i(obj.extra_acc_ptr_off),
             extra_marks_len: obj.extra_marks_len_off.map(i),
             extra_key_order: i(obj.extra_key_order_off),
+            extra_other_words: obj.extra_other_words_off.map(i),
+            extra_class_tag: i(obj.extra_class_tag_off),
+            extra_hidden_prefix: i(obj.extra_hidden_prefix_off),
             extra_spill_n: i(obj.extra_spill_n_off),
             acc_stride: i(obj.acc_stride),
             acc_getter: i(obj.acc_getter_off),
@@ -838,7 +851,7 @@ impl X64Assembler {
     }
 
     /// `movzx r32, word [base+disp32]`.
-    fn p_load16(&mut self, dst: u8, base: u8, disp: i32) {
+    pub(crate) fn p_load16(&mut self, dst: u8, base: u8, disp: i32) {
         debug_assert!(base & 7 != 4, "no SIB form");
         let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((base >> 3) & 1);
         if rex != 0x40 {
@@ -1336,7 +1349,7 @@ impl X64Assembler {
     }
 
     /// `movzx r32, byte [base+disp32]`.
-    fn p_load8(&mut self, dst: u8, base: u8, disp: i32) {
+    pub(crate) fn p_load8(&mut self, dst: u8, base: u8, disp: i32) {
         debug_assert!(base & 7 != 4, "no SIB form");
         let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((base >> 3) & 1);
         if rex != 0x40 {
@@ -1443,6 +1456,21 @@ impl X64Assembler {
             self.g_or_mem(r::R8, r::R9, off);
         }
         self.g_test(r::R8);
+        self.g_jcc(cc::NE, miss);
+    }
+
+    /// For the `extra` part in `r9`: to `miss` unless it holds nothing but
+    /// spilled values (`ObjectExtra::only_spill`). Clobbers `r8`.
+    pub(crate) fn p_extra_only_spill(&mut self, l: &JitLayout, miss: Label) {
+        let p = &l.props;
+        self.p_extra_plain(l, miss);
+        self.g_load(r::R8, r::R9, p.extra_other_words[0]);
+        self.g_or_mem(r::R8, r::R9, p.extra_other_words[1]);
+        self.g_test(r::R8);
+        self.g_jcc(cc::NE, miss);
+        self.p_cmp32_imm8(r::R9, p.extra_hidden_prefix, 0);
+        self.g_jcc(cc::NE, miss);
+        self.p_cmp32_imm8(r::R9, p.extra_class_tag, -1);
         self.g_jcc(cc::NE, miss);
     }
 

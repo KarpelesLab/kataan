@@ -1652,6 +1652,15 @@ impl Realm {
         core::mem::offset_of!(Realm, jit_marking)
     }
 
+    /// The byte offset, within a `Realm`, of `proto_index_accessor_dirty` (a
+    /// `bool`), which compiled code's inline `push` requires clear (as
+    /// [`array_push_plain`](Self::array_push_plain) does).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_proto_index_dirty_offset() -> usize {
+        core::mem::offset_of!(Realm, proto_index_accessor_dirty)
+    }
+
     /// The byte offset, within a `Realm`, of `jit_array_proto_default` (a
     /// `bool`), which compiled code's inline array allocation requires set.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

@@ -127,9 +127,15 @@ pub(crate) struct KeyTable {
     /// The prototype epoch at which the entry's chain was last found
     /// unchanged for a receiver whose `[[Prototype]]` is `proto` (`0`:
     /// never): see [`Realm::for_in_table_hit`].
-    stamp: core::cell::Cell<u64>,
+    pub(crate) stamp: core::cell::Cell<u64>,
     /// See `stamp`.
     proto: core::cell::Cell<Option<u64>>,
+    /// `proto` as an object's raw `[[Prototype]]` word holds it
+    /// (`crate::object::NO_PROTO` for `null`), for compiled code's hit
+    /// (`crate::jit::forin`).
+    pub(crate) proto_raw: core::cell::Cell<u64>,
+    /// The layout's slot count, for compiled code's hit.
+    pub(crate) shape_len: u64,
 }
 
 #[cfg_attr(
@@ -146,9 +152,11 @@ impl KeyTable {
             slots_ptr: slots.as_ptr(),
             bits,
             slots,
+            shape_len: u64::from(shape.len()),
             shape,
             stamp: core::cell::Cell::new(0),
             proto: core::cell::Cell::new(None),
+            proto_raw: core::cell::Cell::new(crate::object::NO_PROTO),
         }
     }
 
@@ -389,7 +397,11 @@ impl Realm {
         let (w, e) = self.for_in_cached_entry(h)?;
         // (The chain was just found unchanged, for `h`'s `[[Prototype]]`.)
         e.table.stamp.set(crate::object::proto_epoch());
-        e.table.proto.set(self.object_proto(h).map(Handle::to_raw));
+        let proto = self.object_proto(h).map(Handle::to_raw);
+        e.table.proto.set(proto);
+        e.table
+            .proto_raw
+            .set(proto.unwrap_or(crate::object::NO_PROTO));
         let (w, e) = (w, self.for_in_cache.as_deref()?.entries[w].as_ref()?);
         if e.table.array.get() != 0 {
             let t = Rc::clone(&e.table);

@@ -50,6 +50,43 @@ pub(super) struct Loop {
     pub(super) obj: u16,
 }
 
+/// A compiled `for-in` loop's **memo** (four frame slots): the receiver
+/// its liveness check last walked and the key it last found there.
+///
+/// `obj` (a receiver-cache key: emptied in the prologue and by every call,
+/// see `X64Assembler::clear_recv_cache`) holds the bits of an object the
+/// check walked to the heap slot `cell` and found a shaped ordinary object
+/// without the host-exotic flag and without accessors, with no String
+/// having an auxiliary object (`fi_plain_read`); `key` holds the bits of a
+/// key the check then found at slot `slot` of the object's layout (the
+/// walk empties it). Until Rust code runs (behind a call, which empties
+/// `obj`) all of that stays true: only Rust code can move or free a heap
+/// slot, make an object a dictionary, host-exotic or give it an accessor,
+/// delete or redefine a property, or set `str_special`; compiled code only
+/// adds properties after the existing ones (which moves no slot) and
+/// writes values. So with `obj` equal to a receiver's bits, `cell` is its
+/// heap slot, and with `key` equal to a key's bits too, `r[k]` is the value
+/// at `slot`, read now.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Memo {
+    pub(super) obj: i32,
+    pub(super) cell: i32,
+    pub(super) key: i32,
+    pub(super) slot: i32,
+}
+
+impl Memo {
+    /// The memo whose slots are the four frame slots under `base`.
+    pub(super) fn at(base: i32) -> Self {
+        Self {
+            obj: base - 8,
+            cell: base - 16,
+            key: base - 24,
+            slot: base - 32,
+        }
+    }
+}
+
 /// The `for-in` loops of a body (see the module docs).
 #[derive(Default)]
 pub(crate) struct Plan {
@@ -235,6 +272,46 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
         self.g_load(r::R9, r::R11, table_off!(slots_ptr));
         self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
+    }
+
+    /// A loop's `EnumKeys` when the table its site holds is still the key
+    /// list of the receiver whose heap slot is `rcx` (a shaped ordinary
+    /// object without the host-exotic flag: the caller checked), as
+    /// `Realm::for_in_table_hit` decides it: `rax` = the table's array;
+    /// else to `miss`. The receiver is plain shaped
+    /// (`Object::is_plain_shaped`) with the
+    /// table's layout — which decides that it is no primitive wrapper — and
+    /// the `[[Prototype]]` the table's chain was found unchanged for at the
+    /// prototype epoch that still is current. Clobbers `r8`, `r9`, `r11`.
+    pub(super) fn fi_enum_hit(&mut self, l: &JitLayout, site: u64, miss: Label) {
+        let site_table = i32::try_from(core::mem::offset_of!(ForInSite, table)).expect("offset");
+        // Flags byte 0, an `extra` part (if any) of spilled values only.
+        self.cmp_byte_at_rcx_imm(l.props.off_jit_flags, 0);
+        self.jne(miss);
+        let plain = self.new_label();
+        self.g_load(r::R9, r::RCX, l.props.off_extra);
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, plain);
+        self.p_extra_only_spill(l, miss);
+        self.bind(plain);
+        self.g_movabs(r::R11, site);
+        self.g_load(r::R11, r::R11, site_table);
+        self.g_load(r::R9, r::RCX, l.off_shape);
+        self.g_cmp_mem(r::R9, r::R11, table_off!(shape_word));
+        self.g_jcc(cc::NE, miss);
+        self.p_load16(r::R9, r::RCX, l.off_slots_len);
+        self.g_cmp_mem(r::R9, r::R11, table_off!(shape_len));
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::R9, r::RCX, l.props.off_proto);
+        self.g_cmp_mem(r::R9, r::R11, table_off!(proto_raw));
+        self.g_jcc(cc::NE, miss);
+        self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
+        self.g_load(r::R9, r::R9, 0);
+        self.g_cmp_mem(r::R9, r::R11, table_off!(stamp));
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RAX, r::R11, table_off!(array));
+        self.g_test(r::RAX);
+        self.g_jcc(cc::E, miss);
     }
 
     /// To `miss` unless the object whose heap slot is `rcx` has no
