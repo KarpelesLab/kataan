@@ -743,6 +743,8 @@ pub(super) fn plan(
     // another value), so such an id is never a site's certain predecessor
     // (`guessed`): a key compare decides every hit.
     let mut reads: Vec<(u32, &str, u32)> = Vec::new();
+    // (No value id is `u32::MAX`.)
+    const GLOBALS: u32 = u32::MAX;
     let mut guessed: Vec<u32> = Vec::new();
     // Per site: the previous site of the same iteration on its value, both
     // in a speculative loop.
@@ -984,14 +986,33 @@ pub(super) fn plan(
                 ids.retain(|&(x, _)| x != d);
                 ids.push((d, id));
             }
-            (GenericOp::Interp { .. }, Some(Op::LoadGlobal { dst, .. })) => {
+            // A global binding is a property of a pseudo object (`GLOBALS`)
+            // for `reads`: a repeated read (with no store or call between)
+            // most likely gets the same value.
+            (GenericOp::Interp { .. }, Some(Op::LoadGlobal { dst, name, .. })) => {
                 let d = *dst;
                 ids.retain(|&(x, _)| x != d);
+                match reads
+                    .iter()
+                    .find(|r| r.0 == GLOBALS && r.1 == name.as_str())
+                    .map(|r| r.2)
+                {
+                    Some(vid) => {
+                        ids.push((d, vid));
+                        guessed.push(vid);
+                    }
+                    None => {
+                        let vid = id_of(&mut ids, &mut next_id, d);
+                        reads.push((GLOBALS, name.as_str(), vid));
+                    }
+                }
             }
-            (
-                GenericOp::Interp { .. },
-                Some(Op::StoreGlobal { .. } | Op::RequireObjectCoercible { .. }),
-            ) => {}
+            (GenericOp::Interp { .. }, Some(Op::StoreGlobal { name, src, .. })) => {
+                reads.retain(|r| !(r.0 == GLOBALS && r.1 == name.as_str()));
+                let vid = id_of(&mut ids, &mut next_id, *src);
+                reads.push((GLOBALS, name.as_str(), vid));
+            }
+            (GenericOp::Interp { .. }, Some(Op::RequireObjectCoercible { .. })) => {}
             // (They write their `dst` only, or no register: `InitFields`'
             // field initializers run in frames of their own.)
             (GenericOp::Interp { .. }, Some(Op::SuperCtor { dst, .. })) if !in_spec(i) => {
@@ -1038,7 +1059,11 @@ pub(super) fn plan(
             (op, bytecode.get(i)),
             (
                 GenericOp::Interp { .. },
-                Some(Op::RequireObjectCoercible { .. })
+                Some(
+                    Op::RequireObjectCoercible { .. }
+                        | Op::LoadGlobal { .. }
+                        | Op::StoreGlobal { .. }
+                )
             )
         ) {
             reads.clear();
@@ -1046,12 +1071,17 @@ pub(super) fn plan(
         // A property store most likely changes only its own key's value (an
         // accessor's or a `valueOf`'s code may do more: the reads are only
         // guesses, which a key compare decides).
+        // A later read of the key on the same object most likely gets the
+        // value stored (`h.cur = {…}; h.cur.x`).
         if let (
-            GenericOp::SetProp { .. },
+            GenericOp::SetProp { obj, val, .. },
             Some(Op::SetProp { key, .. } | Op::SetPropStrict { key, .. }),
         ) = (op, bytecode.get(i))
         {
             reads.retain(|r| r.1 != key.as_str());
+            let oid = id_of(&mut ids, &mut next_id, *obj);
+            let vid = id_of(&mut ids, &mut next_id, *val);
+            reads.push((oid, key.as_str(), vid));
         }
         if let GenericOp::Jump { target: t } | GenericOp::JumpIfFalse { target: t, .. } = *op
             && t > i
@@ -1310,19 +1340,68 @@ fn carried_aliases(
             v.retain(|e| e.0 != r);
             v.push((r, t));
         };
+        // A global binding is a register too (past the real ones): a loop
+        // that reads it at the top and stores it at the end
+        // (`v = v.add(d)` at the top level) carries its value like one.
+        let globals = core::cell::RefCell::new(Vec::<(alloc::string::String, u64)>::new());
+        let global = |name: &str| {
+            let mut g = globals.borrow_mut();
+            if let Some((_, t)) = g.iter().find(|e| e.0 == name) {
+                return *t;
+            }
+            let t = ENTRY | ((1 << 16) + g.len() as u64);
+            g.push((name.into(), t));
+            t
+        };
+        // Per global binding, the token it holds (its entry one until stored).
+        let gtok = core::cell::RefCell::new(Vec::<(u64, u64)>::new());
+        let get_g = |name: &str| {
+            let e = global(name);
+            gtok.borrow().iter().find(|x| x.0 == e).map_or(e, |x| x.1)
+        };
         // The first site on each entry value, and the last site per token.
-        let mut first: Vec<(u16, usize)> = Vec::new();
+        let mut first: Vec<(u64, usize)> = Vec::new();
         let mut walked: Vec<(u64, usize)> = Vec::new();
+        // The end of an inlined call jumps over its fallback call op (which
+        // joins it after): the values are the inlined path's.
+        let mut skip_to = 0;
         for (pc, op) in ops.iter().enumerate().take(end).skip(head) {
+            if pc < skip_to {
+                continue;
+            }
+            if let GenericOp::Jump { target } = *op
+                && target == pc + 2
+                && pc > 0
+                && matches!(ops[pc - 1], GenericOp::InlineLeave)
+            {
+                skip_to = target;
+                continue;
+            }
             if let Some((r, _)) = site_recv(op, pc) {
                 let t = get(r);
-                if t == ENTRY | u64::from(r) && !first.iter().any(|f| f.0 == r) {
-                    first.push((r, pc));
+                if t & ENTRY != 0 && !first.iter().any(|f| f.0 == t) {
+                    first.push((t, pc));
                 }
                 walked.retain(|w| w.0 != t);
                 walked.push((t, pc));
             }
             let def = pc as u64 + 1;
+            match (*op, bytecode.get(pc)) {
+                (GenericOp::Interp { .. }, Some(Op::LoadGlobal { dst, name, .. })) => {
+                    set(*dst, get_g(name));
+                    continue;
+                }
+                // (A check names a register it only reads.)
+                (GenericOp::Interp { .. }, Some(Op::RequireObjectCoercible { .. })) => continue,
+                (GenericOp::Interp { .. }, Some(Op::StoreGlobal { name, src, .. })) => {
+                    let (e, t) = (global(name), get(*src));
+                    let mut g = gtok.borrow_mut();
+                    g.retain(|x| x.0 != e);
+                    g.push((e, t));
+                    continue;
+                }
+                _ => {}
+            }
             match *op {
                 GenericOp::Move { dst, src } => set(dst, get(src)),
                 GenericOp::GetProp { dst, .. } if let Some(src) = reused(pc) => {
@@ -1348,9 +1427,13 @@ fn carried_aliases(
                 }
             }
         }
-        for (r, i) in first {
-            let t = get(r);
-            if t == ENTRY | u64::from(r) {
+        for (e, i) in first {
+            // The entry value's register (or global binding) at the end.
+            let t = match u16::try_from(e & !ENTRY) {
+                Ok(r) => get(r),
+                Err(_) => gtok.borrow().iter().find(|x| x.0 == e).map_or(e, |x| x.1),
+            };
+            if t == e {
                 continue;
             }
             let Some(&(_, s)) = walked.iter().find(|w| w.0 == t) else {

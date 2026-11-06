@@ -1716,7 +1716,7 @@ impl X64Assembler {
         site: *const MethodSite,
         b: BakedAdd,
         (first, proven): (bool, bool),
-        val_disp: i32,
+        (val_disp, number): (i32, bool),
         miss: Label,
     ) {
         const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
@@ -1737,7 +1737,8 @@ impl X64Assembler {
             self.g_movabs(r::R11, site as u64);
             self.p_add_chain(l, miss);
         }
-        if b.num {
+        // (A value proven a Number keeps the slot's record.)
+        if b.num && !number {
             self.g_load(r::RAX, r::RBX, val_disp);
             self.p_field_rep_const(l, (r::RAX, r::R8), b.to, b.slot, miss);
         }

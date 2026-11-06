@@ -11498,7 +11498,10 @@ impl JitFunction {
                                 if q != op_idx {
                                     let _ = num.operand_xmm(&mut a, q, qv, false);
                                 }
-                                items.push((si_q.add?, disp(qv), num.is_number_at(q, qv)));
+                                // (A value promoted to an SSE register is a Number.)
+                                let number =
+                                    num.is_number_at(q, qv) || num.result_xmm(q, qv).is_some();
+                                items.push((si_q.add?, disp(qv), number));
                             }
                             let one = a.new_label();
                             let end = a.new_label();
@@ -11513,7 +11516,11 @@ impl JitFunction {
                             s.method_ptr,
                             b,
                             (first, proven),
-                            disp(val),
+                            (
+                                disp(val),
+                                num.is_number_at(op_idx, val)
+                                    || num.result_xmm(op_idx, val).is_some(),
+                            ),
                             regular,
                         );
                         a.jmp(fresh_done);
@@ -11544,6 +11551,11 @@ impl JitFunction {
                     // version leaves for the plain copy), or it is stored to
                     // the register file first (`NumGen::operand_xmm`).
                     let val_x = num.operand_xmm(&mut a, op_idx, val, true);
+                    // A value proven a Number, or promoted to an SSE register
+                    // (which holds only Numbers): nothing for the write
+                    // barrier or the slot's record of Number-only values.
+                    let val_num =
+                        num.is_number_at(op_idx, val) || num.result_xmm(op_idx, val).is_some();
                     // A known site of the fast version whose flags test is
                     // proven, storing a Number through the frame's `extra`
                     // pointer, never reads the heap slot (`rcx`).
@@ -11645,7 +11657,7 @@ impl JitFunction {
                             );
                             a.jne(cached);
                         }
-                        if !num.is_number_at(op_idx, val) {
+                        if !val_num {
                             a.load_rax(disp(val));
                             if b.num {
                                 // (The slot's record of Number-only values,
@@ -11745,7 +11757,7 @@ impl JitFunction {
                     // A primitive wrapper (its shape's brand bit 0) — the helper.
                     a.p_test_byte_imm(call_seq::r::RAX, layout.props.shape_brands, 1);
                     a.jne(helper);
-                    if num.is_number_at(op_idx, val) {
+                    if val_num {
                         // A Number: nothing for the write barrier to do, so
                         // straight to the slot (`r11` still the cache).
                         let spill = a.new_label();
