@@ -12200,11 +12200,10 @@ impl JitFunction {
                         return None;
                     }
                     let to = num.branch_label(&labels, op_idx + 1, nb.target)?;
-                    if nb.dead {
-                        truthy_rax!(op_idx, ra, None, Some(to));
-                    } else {
-                        truthy_rax!(op_idx, ra, None);
-                    }
+                    // (An object its way proves truthy: `!x` is false, stored
+                    // out of line on the way to the branch.)
+                    let yes = if nb.dead { to } else { a.new_label() };
+                    truthy_rax!(op_idx, ra, None, Some(yes));
                     not_fused[op_idx] = true;
                     if nb.dead {
                         a.test_rax_rax();
@@ -12216,6 +12215,12 @@ impl JitFunction {
                         a.store_rax(disp(dst));
                         a.cmp_rax_r11();
                         a.je(to);
+                        let cold = a.cold_begin();
+                        a.bind(yes);
+                        a.movabs_rax(tag_false as i64);
+                        a.store_rax(disp(dst));
+                        a.jmp(to);
+                        a.cold_end(cold);
                     }
                 }
                 GenericOp::Not { dst, a: ra } => {
@@ -12228,16 +12233,30 @@ impl JitFunction {
                         a.movabs_r11(tag_true as i64);
                         a.cmp_rax_r11();
                         a.setne_rax();
+                        a.movabs_r11(tag_false as i64);
+                        a.add_rax_r11();
+                        a.store_rax(disp(dst));
                     } else {
                         // (In a speculative loop's fast version, the helper's
                         // values leave for the plain copy.)
                         let bail = num.spec_bail(&mut a, op_idx);
-                        truthy_rax!(op_idx, ra, bail);
+                        // (An object its way proves truthy: `!x` is false,
+                        // stored out of line.)
+                        let yes = a.new_label();
+                        let past = a.new_label();
+                        truthy_rax!(op_idx, ra, bail, Some(yes));
                         a.xor_rax_imm(1);
+                        a.movabs_r11(tag_false as i64);
+                        a.add_rax_r11();
+                        a.store_rax(disp(dst));
+                        let cold = a.cold_begin();
+                        a.bind(yes);
+                        a.movabs_rax(tag_false as i64);
+                        a.store_rax(disp(dst));
+                        a.jmp(past);
+                        a.cold_end(cold);
+                        a.bind(past);
                     }
-                    a.movabs_r11(tag_false as i64);
-                    a.add_rax_r11();
-                    a.store_rax(disp(dst));
                 }
                 GenericOp::Jump { target } => {
                     if target > ops.len() {
