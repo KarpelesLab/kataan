@@ -7671,38 +7671,71 @@ impl JitFunction {
         // or more consecutive ops, each a fresh add that may take the fast
         // path, every slot inline, each `from` its predecessor's `to`) that
         // the first can make at once (`X64Assembler::p_add_fresh_run`).
-        let fresh_run: Vec<Option<Vec<usize>>> = (0..ops.len())
+        // A fresh add's compiled-in transition, when its site qualifies (as
+        // the emitter's `fresh` test below).
+        let add_of = |q: usize| {
+            let GenericOp::SetProp { site, .. } = ops[q] else {
+                return None;
+            };
+            let s = sites.get(site as usize)?;
+            s.add.filter(|b| {
+                s.baked.is_none()
+                    && !s.method_ptr.is_null()
+                    && b.slot < crate::object::INLINE_SLOTS as u32
+            })
+        };
+        // Per first add of a fresh chain whose guard's way may hold the
+        // object, the chain's adds that take the fast path after it (each
+        // the previous one's successor, its `from` that one's `to`), the
+        // first included: the first makes the checks of the world outside
+        // the object for all of them (`X64Assembler::p_add_fresh_prelude`),
+        // which `fresh_proven` marks.
+        let fresh_chain: Vec<Option<Vec<usize>>> = (0..ops.len())
             .map(|h| {
                 let f = fresh_add[h].filter(|f| f.k == 0)?;
                 let g = rc.sites[f.guard]?;
                 if g.family != recv_cache::Family::Obj || shape_ways.contains(&g.way) {
                     return None;
                 }
-                let add_of = |q: usize| {
-                    let GenericOp::SetProp { site, .. } = ops[q] else {
-                        return None;
-                    };
-                    let s = sites.get(site as usize)?;
-                    s.add.filter(|b| {
-                        s.baked.is_none()
-                            && !s.method_ptr.is_null()
-                            && b.slot < crate::object::INLINE_SLOTS as u32
-                    })
-                };
                 let mut prev = add_of(h)?;
-                let mut run = alloc::vec![h];
-                for (q, fq) in fresh_add.iter().enumerate().take(h + 16).skip(h + 1) {
-                    let Some(b) = fq
-                        .filter(|fq| fq.guard == f.guard && fq.prev == Some(q - 1))
-                        .and_then(|_| add_of(q))
-                        .filter(|b| b.from == prev.to)
+                let mut chain = alloc::vec![h];
+                for (q, fq) in fresh_add.iter().enumerate().skip(h + 1) {
+                    if chain.len() >= 16 {
+                        break;
+                    }
+                    let Some(fq) = fq.filter(|fq| fq.guard == f.guard) else {
+                        continue;
+                    };
+                    let Some(b) =
+                        add_of(q).filter(|b| fq.prev == chain.last().copied() && b.from == prev.to)
                     else {
                         break;
                     };
-                    run.push(q);
+                    chain.push(q);
                     prev = b;
                 }
-                (run.len() >= 2).then_some(run)
+                Some(chain)
+            })
+            .collect();
+        let mut fresh_proven = alloc::vec![false; ops.len()];
+        for chain in fresh_chain.iter().flatten() {
+            for &q in chain {
+                fresh_proven[q] = true;
+            }
+        }
+        // Per first add of a fresh chain, the straight run of its adds (two
+        // or more consecutive ops of the chain) that the first can make at
+        // once (`X64Assembler::p_add_fresh_run`).
+        let fresh_run: Vec<Option<Vec<usize>>> = fresh_chain
+            .iter()
+            .map(|c| {
+                let c = c.as_ref()?;
+                let n = c
+                    .iter()
+                    .enumerate()
+                    .take_while(|&(k, &q)| q == c[0] + k)
+                    .count();
+                (n >= 2).then(|| c[..n].to_vec())
             })
             .collect();
         // A run being emitted: `(its first op, its last, the pass, where
@@ -11402,6 +11435,33 @@ impl JitFunction {
                         a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(w));
                         a.jne(regular);
                         a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(w));
+                        // The chain's first add checks the world outside the
+                        // object for every add of the chain at once.
+                        let chain = fresh_chain[op_idx].as_ref().filter(|_| first);
+                        if let Some(chain) = chain {
+                            let mut chain_sites = Vec::with_capacity(chain.len());
+                            let mut max_slot = 0;
+                            for &q in chain {
+                                let GenericOp::SetProp { site: qs, .. } = ops[q] else {
+                                    return None;
+                                };
+                                let si_q = sites.get(qs as usize)?;
+                                chain_sites.push(si_q.method_ptr.cast_const());
+                                max_slot = max_slot.max(add_of(q)?.slot);
+                            }
+                            a.p_add_fresh_prelude(
+                                &layout,
+                                helpers.call_layout.realm,
+                                &chain_sites,
+                                max_slot,
+                                regular,
+                            );
+                        }
+                        let proven = if first {
+                            chain.is_some()
+                        } else {
+                            fresh_proven[op_idx]
+                        };
                         // The chain's first add, the head of a straight run
                         // (`fresh_run`): the run's adds at once, resuming
                         // after its last op — when the schedule emits the
@@ -11415,7 +11475,8 @@ impl JitFunction {
                         // there).
                         let run = fresh_run[op_idx].as_ref().filter(|run| {
                             let n = run.len();
-                            pass != numeric::PASS_INT
+                            proven
+                                && pass != numeric::PASS_INT
                                 && pending_run.is_none()
                                 && run.iter().enumerate().all(|(k, &q)| {
                                     sched.get(si + k) == Some(&(q, pass))
@@ -11437,16 +11498,11 @@ impl JitFunction {
                                 if q != op_idx {
                                     let _ = num.operand_xmm(&mut a, q, qv, false);
                                 }
-                                items.push((
-                                    si_q.method_ptr.cast_const(),
-                                    si_q.add?,
-                                    disp(qv),
-                                    num.is_number_at(q, qv),
-                                ));
+                                items.push((si_q.add?, disp(qv), num.is_number_at(q, qv)));
                             }
                             let one = a.new_label();
                             let end = a.new_label();
-                            a.p_add_fresh_run(&layout, helpers.call_layout.realm, &items, one);
+                            a.p_add_fresh_run(&layout, &items, one);
                             a.jmp(end);
                             a.bind(one);
                             pending_run = Some((op_idx, run[run.len() - 1], pass, end, 0));
@@ -11456,7 +11512,7 @@ impl JitFunction {
                             helpers.call_layout.realm,
                             s.method_ptr,
                             b,
-                            first,
+                            (first, proven),
                             disp(val),
                             regular,
                         );

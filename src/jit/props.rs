@@ -1333,19 +1333,20 @@ impl X64Assembler {
     /// For the array whose heap slot is `rcx`: to `miss` unless it has no
     /// side-table state (`crate::cell::ArrayElems`) — its `length` is its
     /// element count and its in-bounds elements are plain writable data
-    /// properties — and, for a store (`set`), its length is within
-    /// `max_array_len`. What `Realm::jit_array_len_is_dense` (and, for a store,
-    /// `Realm::jit_array_unrestricted`) decide, from the cell alone. Clobbers
-    /// `r8`, `r11`.
-    pub(crate) fn p_array_plain(&mut self, l: &JitLayout, realm_off: i32, set: bool, miss: Label) {
+    /// properties. What `Realm::jit_array_len_is_dense` decides, from the
+    /// cell alone. Every compiled store through it is in bounds, which
+    /// `Realm::set_element` makes whatever the length (only a growth checks
+    /// `max_array_len`), so a store (`set`) needs no length bound either.
+    /// Clobbers `r8`, `r11`.
+    pub(crate) fn p_array_plain(
+        &mut self,
+        l: &JitLayout,
+        _realm_off: i32,
+        _set: bool,
+        miss: Label,
+    ) {
         self.cmp_byte_at_rcx_imm(l.off_arr_side, 0);
         self.jne(miss);
-        if set {
-            self.g_load(r::R11, r::R15, realm_off);
-            self.p_arr_len(l, r::R8);
-            self.g_cmp_mem(r::R8, r::R11, l.props.max_array_len);
-            self.g_jcc(cc::A, miss);
-        }
     }
 
     /// `movzx r32, byte [base+disp32]`.
@@ -1702,8 +1703,11 @@ impl X64Assembler {
     /// predecessor left (the caller checks `b.from` is that one's `to`).
     /// What may have changed since the allocation is checked as there: the
     /// dictionary threshold, and the prototype chain by the site's add entry
-    /// ([`Self::p_add_chain`]). Then the add is made; otherwise to `miss`,
-    /// having changed nothing. Clobbers `rax`, `rsi`, `r8`, `r9`, `r11`.
+    /// ([`Self::p_add_chain`]) — unless `proven`: the chain's first add made
+    /// [`Self::p_add_fresh_prelude`]'s checks for this add too (and, the way
+    /// still holding the object, no Rust code has run since to change what
+    /// they read). Then the add is made; otherwise to `miss`, having changed
+    /// nothing. Clobbers `rax`, `rsi`, `r8`, `r9`, `r11`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn p_add_fresh(
         &mut self,
@@ -1711,7 +1715,7 @@ impl X64Assembler {
         realm_off: i32,
         site: *const MethodSite,
         b: BakedAdd,
-        first: bool,
+        (first, proven): (bool, bool),
         val_disp: i32,
         miss: Label,
     ) {
@@ -1724,13 +1728,15 @@ impl X64Assembler {
             self.g_cmp_mem(r::R11, r::RCX, l.off_shape);
             self.g_jcc(cc::NE, miss);
         }
-        // Below the dictionary threshold.
-        self.g_load(r::R8, r::R15, realm_off);
-        self.g_load(r::R8, r::R8, p.dict_threshold);
-        self.g_cmp_imm(r::R8, slot);
-        self.g_jcc(cc::BE, miss);
-        self.g_movabs(r::R11, site as u64);
-        self.p_add_chain(l, miss);
+        if !proven {
+            // Below the dictionary threshold.
+            self.g_load(r::R8, r::R15, realm_off);
+            self.g_load(r::R8, r::R8, p.dict_threshold);
+            self.g_cmp_imm(r::R8, slot);
+            self.g_jcc(cc::BE, miss);
+            self.g_movabs(r::R11, site as u64);
+            self.p_add_chain(l, miss);
+        }
         if b.num {
             self.g_load(r::RAX, r::RBX, val_disp);
             self.p_field_rep_const(l, (r::RAX, r::R8), b.to, b.slot, miss);
@@ -1747,57 +1753,40 @@ impl X64Assembler {
         self.p_inc32_mem(r::RCX, p.off_epoch);
     }
 
-    /// The adds of a whole straight run of a fresh chain
-    /// ([`Self::p_add_fresh`]) at once: `run` is, per add in order,
-    /// `(site, add, value displacement, whether the value is proven a
-    /// Number)`, the first being the chain's first
-    /// add and each later one's `from` its predecessor's `to` (the caller's
-    /// to check), every slot inline. The object (`rcx`) goes straight from the
-    /// allocation's root shape to the run's last layout: when its shape is
-    /// the first add's `from`, the dictionary threshold is above the last
-    /// slot, every value keeps the last layout's record of its Number-only
-    /// slots, and the prototype chain is proved for every site of the run —
-    /// by the first site's [`RunProof`], else by each site's add entry as
-    /// [`Self::p_add_chain`] checks it (which then records the proof). All
-    /// of that is checked before anything is written, so the result is the
-    /// one the run's adds make one by one (none of them can run code or
-    /// throw once their checks hold); otherwise to `miss`, having changed
-    /// nothing, with `rcx` kept. Clobbers `rax`, `rsi`, `r8`, `r9`, `r11`.
-    pub(crate) fn p_add_fresh_run(
+    /// What the adds of a fresh chain ([`Self::p_add_fresh`]) check of the
+    /// world outside the object, made once by the chain's first add for all
+    /// of them (`sites`, the chain's sites in order, the first being the
+    /// chain's head; `max_slot` the largest slot any of them adds): the
+    /// dictionary threshold is above `max_slot`, and the prototype chain of
+    /// the object (`rcx`) is proved for every site — by the head site's
+    /// [`RunProof`], else by each site's add entry as [`Self::p_add_chain`]
+    /// checks it (which then records the proof). Rust code alone changes
+    /// either (the threshold; a prototype's layout, which bumps the
+    /// prototype epoch; the object's `[[Prototype]]`), and a later add of
+    /// the chain takes its fast path only while the allocation's way still
+    /// holds the object — no call since — so the checks hold for it too.
+    /// Otherwise to `miss`, having changed nothing, with `rcx` kept.
+    /// Clobbers `rsi`, `r8`, `r9`, `r11`.
+    pub(crate) fn p_add_fresh_prelude(
         &mut self,
         l: &JitLayout,
         realm_off: i32,
-        run: &[(*const MethodSite, BakedAdd, i32, bool)],
+        sites: &[*const MethodSite],
+        max_slot: u32,
         miss: Label,
     ) {
         use core::mem::offset_of;
-        const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
-        let (Some(&(head, first, _, _)), Some(&(_, last, _, _))) = (run.first(), run.last()) else {
+        let Some(&head) = sites.first() else {
             return;
         };
-        assert!(
-            run.iter().all(|&(_, b, _, _)| b.slot < INLINE),
-            "a fresh run's slots are inline"
-        );
         let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
         let p = &l.props;
-        self.g_movabs(r::R11, first.from);
-        self.g_cmp_mem(r::R11, r::RCX, l.off_shape);
-        self.g_jcc(cc::NE, miss);
         // Below the dictionary threshold.
         self.g_load(r::R8, r::R15, realm_off);
         self.g_load(r::R8, r::R8, p.dict_threshold);
-        self.g_cmp_imm(r::R8, i32::try_from(last.slot).expect("a small slot"));
+        self.g_cmp_imm(r::R8, i32::try_from(max_slot).expect("a small slot"));
         self.g_jcc(cc::BE, miss);
-        // The values against the result's record of its Number-only slots
-        // (a value proven a Number keeps any).
-        for &(_, b, d, number) in run {
-            if !number && b.slot < 64 && last.num_mask & (1 << b.slot) != 0 {
-                self.g_load(r::RAX, r::RBX, d);
-                self.p_field_rep_const(l, (r::RAX, r::R8), last.to, b.slot, miss);
-            }
-        }
-        // The prototype chain: the run's proof, else every site's entry.
+        // The prototype chain: the chain's proof, else every site's entry.
         let run_off = offset_of!(MethodSite, run);
         let proof_stamp = i(run_off + offset_of!(RunProof, stamp));
         let proof_proto = i(run_off + offset_of!(RunProof, proto));
@@ -1815,7 +1804,7 @@ impl X64Assembler {
         self.g_cmp_mem(r::RSI, r::R11, proof_proto);
         self.g_jcc(cc::E, proved);
         self.bind(validate);
-        for &(site, _, _, _) in run {
+        for &site in sites {
             self.g_movabs(r::R11, site as u64);
             // (A chain of no object never matches: the object has a
             // prototype.)
@@ -1830,8 +1819,50 @@ impl X64Assembler {
         self.g_store(r::R11, proof_stamp, r::R9);
         self.g_store(r::R11, proof_proto, r::RSI);
         self.bind(proved);
+    }
+
+    /// The adds of a whole straight run of a fresh chain
+    /// ([`Self::p_add_fresh`]) at once, past the chain's
+    /// [`Self::p_add_fresh_prelude`] (which covers every add of the run):
+    /// `run` is, per add in order, `(add, value displacement, whether the
+    /// value is proven a Number)`, the first being the chain's first add and
+    /// each later one's `from` its predecessor's `to` (the caller's to
+    /// check), every slot inline. The object (`rcx`) goes straight from the
+    /// allocation's root shape to the run's last layout: when its shape is
+    /// the first add's `from` and every value keeps the last layout's record
+    /// of its Number-only slots. All of that is checked before anything is
+    /// written, so the result is the one the run's adds make one by one
+    /// (none of them can run code or throw once their checks hold);
+    /// otherwise to `miss`, having changed nothing, with `rcx` kept.
+    /// Clobbers `rax`, `r8`, `r9`, `r11`.
+    pub(crate) fn p_add_fresh_run(
+        &mut self,
+        l: &JitLayout,
+        run: &[(BakedAdd, i32, bool)],
+        miss: Label,
+    ) {
+        const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
+        let (Some(&(first, _, _)), Some(&(last, _, _))) = (run.first(), run.last()) else {
+            return;
+        };
+        assert!(
+            run.iter().all(|&(b, _, _)| b.slot < INLINE),
+            "a fresh run's slots are inline"
+        );
+        let p = &l.props;
+        self.g_movabs(r::R11, first.from);
+        self.g_cmp_mem(r::R11, r::RCX, l.off_shape);
+        self.g_jcc(cc::NE, miss);
+        // The values against the result's record of its Number-only slots
+        // (a value proven a Number keeps any).
+        for &(b, d, number) in run {
+            if !number && b.slot < 64 && last.num_mask & (1 << b.slot) != 0 {
+                self.g_load(r::RAX, r::RBX, d);
+                self.p_field_rep_const(l, (r::RAX, r::R8), last.to, b.slot, miss);
+            }
+        }
         // Commit: the values, the count, the shape, the key epoch.
-        for &(_, b, d, _) in run {
+        for &(b, d, _) in run {
             let slot = i32::try_from(b.slot).expect("a small slot");
             self.g_load(r::R8, r::RBX, d);
             self.g_store(r::RCX, l.off_inline + 8 * slot, r::R8);
@@ -2346,6 +2377,14 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
         self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
         self.g_jcc(cc::B, done);
+        // An old container whose next minor collection rescans it whole
+        // records nothing, whatever the target (the usual state of an old
+        // object stored into repeatedly: only the first store after a
+        // collection takes the helper's barrier). Tested before the target's
+        // slot is decoded. (Compared with the slot's state byte: only
+        // compiled-in constants, no field of the cell.)
+        self.p_test_byte_imm(r::RCX, l.props.off_slot_dirty, crate::heap::JIT_DIRTY_WHOLE);
+        self.g_jcc(cc::NE, done);
         // The arena, for the target's slot (`r11` is still the realm).
         if !self.pinned() {
             self.g_load(r::R10, r::R11, l.props.heap_ptr);
@@ -2356,10 +2395,7 @@ impl X64Assembler {
         self.p_slot_rooted(l, r::R9, miss);
         self.g_cmp_byte_imm(r::R9, l.props.off_slot_age, old);
         self.g_jcc(cc::AE, done);
-        // A young target in an old container. (Compared with the slot's
-        // state byte: only compiled-in constants, no field of the cell.)
-        self.p_test_byte_imm(r::RCX, l.props.off_slot_dirty, crate::heap::JIT_DIRTY_WHOLE);
-        self.g_jcc(cc::NE, done);
+        // A young target in an old container not due a whole rescan.
         self.p_test_byte_imm(
             r::RCX,
             l.props.off_slot_dirty,

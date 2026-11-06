@@ -1199,6 +1199,41 @@ pub(super) fn plan(
             pred: None,
         });
     }
+    // More binding cells in one innermost loop than cell ways: each
+    // iteration's sites would evict one another (every check a miss, then
+    // the walk and a refill), so the cells past the first `cell_ways` of the
+    // loop walk at once, with no way (`ctor_chain`'s inlined levels each
+    // read their own parent class binding).
+    {
+        let inner = innermost_loops(ops);
+        let mut per_loop: Vec<((usize, usize), Vec<u32>)> = Vec::new();
+        for i in 0..n {
+            let (Some(lp), Some(p)) = (inner[i], sites[i]) else {
+                continue;
+            };
+            if p.family != Family::Cell {
+                continue;
+            }
+            let id = gid(i);
+            let ids = match per_loop.iter_mut().find(|(l, _)| *l == lp) {
+                Some((_, ids)) => ids,
+                None => {
+                    per_loop.push((lp, Vec::new()));
+                    &mut per_loop.last_mut().expect("just pushed").1
+                }
+            };
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+            if ids
+                .iter()
+                .position(|&x| x == id)
+                .is_some_and(|k| k >= cell_ways)
+            {
+                sites[i] = None;
+            }
+        }
+    }
     // A site is known when its predecessor of the iteration used the same
     // way and no site between them used it for another value.
     for i in 0..n {
