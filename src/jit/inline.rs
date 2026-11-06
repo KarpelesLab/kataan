@@ -58,11 +58,12 @@
 //! `call_seq::InlineCtx`.)
 //!
 //! An inlined callee's own call sites may be inlined into its spliced body
-//! in turn ([`Candidate::nested`], one more level): such an inner
+//! in turn ([`Candidate::nested`], two more levels): such an inner
 //! activation runs inside the outer one, which may still be pending when the
-//! inner guard hits, and the inner stub then pushes the outer activation
+//! inner guard hits, and the inner stub then pushes the outer activations
 //! first (`call_seq::NestedSlots`). A `Vec.add` that returns `new Vec(…)`
-//! inlines both the method and the constructor this way.
+//! inlines both the method and the constructor this way, and a method that
+//! calls a helper that calls another (`run` → `route` → `give`) all three.
 //!
 //! The spliced bytecode numbers its ops differently from the function's own:
 //! the body keeps both maps (`orig_of`, `new_of`), and every pc that crosses
@@ -109,9 +110,10 @@ pub struct Candidate<'a> {
     /// The callee's warm inline caches, by its own pc.
     pub warm: Vec<Option<WarmEntry>>,
     /// The callee's own call sites to inline into its spliced body, by its
-    /// own pc (one level: their candidates' `nested` are ignored — but at a
-    /// `super(…)` site, whose callee's own `super(…)` sites inline one more
-    /// level, see `super_nested`).
+    /// own pc, each with its own call sites' candidates in turn (the third
+    /// level, see `third_level`; at a `super(…)` site only its derived
+    /// callee's own `super(…)` sites, see `super_nested`), whose `nested`
+    /// are ignored.
     pub nested: Vec<(usize, Candidate<'a>)>,
 }
 
@@ -150,6 +152,28 @@ fn super_nested<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
         .collect()
 }
 
+/// The third inlining level of an ordinary call (`Candidate::nested`): the
+/// call sites of `n`, a callee inlined into an inlined body, with their
+/// candidates (and none deeper). A method that calls a helper that calls
+/// another (`run` → `route` → `give`) is then inlined whole, which a
+/// polymorphic site requires of each way (`calls_only_inlined`).
+fn third_level<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
+    n.nested
+        .iter()
+        .map(|(p, m)| {
+            (
+                *p,
+                Candidate {
+                    key: m.key,
+                    proto: m.proto,
+                    warm: m.warm.clone(),
+                    nested: Vec::new(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// `c`'s body as spliced (see [`Site`]).
 fn site_body(c: Candidate<'_>) -> Site<'_> {
     let Candidate {
@@ -171,7 +195,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                         nested: if super_parts(&proto.ops[*p]).is_some() {
                             super_nested(n)
                         } else {
-                            Vec::new()
+                            third_level(n)
                         },
                     })
                     .collect()

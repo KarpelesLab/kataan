@@ -353,7 +353,7 @@ pub(super) enum Family {
 
 /// The most ways a body uses per family (each way costs a store after every
 /// call): `Obj` ways first, then `Arr`, then `Cell` ways.
-const MAX_OBJ_WAYS: usize = 6;
+const MAX_OBJ_WAYS: usize = 12;
 const MAX_ARR_WAYS: usize = 1;
 const MAX_CELL_WAYS: usize = 1;
 
@@ -1241,6 +1241,15 @@ pub(super) fn writes(op: &GenericOp, bc: Option<&Op>, r: u16) -> bool {
         GenericOp::InlineGuard {
             dst, caps, n_caps, ..
         } => r == dst || (r >= caps && r - caps < n_caps),
+        // (A check or a global store names registers it only reads.)
+        GenericOp::Interp { .. }
+            if matches!(
+                bc,
+                Some(Op::RequireObjectCoercible { .. } | Op::StoreGlobal { .. })
+            ) =>
+        {
+            false
+        }
         GenericOp::Interp { .. } | GenericOp::PushHandler { .. } => bc.is_none_or(|b| {
             let hit = core::cell::Cell::new(false);
             crate::bytecode::op_for_each_reg(b, &|x| hit.set(hit.get() || x == r));

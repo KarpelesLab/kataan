@@ -4079,9 +4079,15 @@ fn inline_candidate_one(
     c.nested = nested_candidates(funcs, caller, &c, false);
     // (A derived constructor's `super(…)` callee, itself derived, brings its
     // own `super(…)` callee: `inline::super_nested`.)
+    // (Any other callee brings the callees of its own call sites: the third
+    // level, `inline::third_level`.)
     for (p, n) in &mut c.nested {
-        if matches!(c.proto.ops.get(*p), Some(Op::SuperCallArgs { .. })) && n.proto.derived {
-            n.nested = nested_candidates(funcs, caller, n, true);
+        if matches!(c.proto.ops.get(*p), Some(Op::SuperCallArgs { .. })) {
+            if n.proto.derived {
+                n.nested = nested_candidates(funcs, caller, n, true);
+            }
+        } else {
+            n.nested = nested_candidates(funcs, caller, n, false);
         }
     }
     Some(c)
