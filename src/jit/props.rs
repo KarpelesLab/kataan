@@ -2658,19 +2658,41 @@ impl X64Assembler {
         }
     }
 
-    /// The string `.length` of the slot in `rcx`, when it is a string: a leaf
-    /// with its UTF-16 length known has `rax` = that and goes to `got`, any other
-    /// string to `slow`; anything else falls through with `rcx` intact.
+    /// The string `.length` of the slot in `rcx`, when it is a string: a
+    /// leaf, a short inline string or a concatenation with its UTF-16 length
+    /// known (memoized) has `rax` = that and goes to `got`, any other string
+    /// to `slow`; anything else falls through with `rcx` intact.
     /// Clobbers `rax`, `r11`.
     pub(crate) fn p_str_len(&mut self, l: &JitLayout, slow: Label, got: Label) {
         let other = self.new_label();
+        let not_leaf = self.new_label();
+        let not_small = self.new_label();
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_str_disc);
         self.jne(other);
         self.g_load(r::R11, r::RCX, l.off_str_rope);
         self.g_cmp_byte_imm(r::R11, l.rope.tag, l.rope.leaf_tag);
-        self.g_jcc(cc::NE, slow);
+        self.g_jcc(cc::NE, not_leaf);
         self.g_load(r::RAX, r::R11, l.rope.leaf_u16);
         // cmp rax, -1 (unknown)
+        self.code.extend_from_slice(&[0x48, 0x83, 0xf8, 0xff]);
+        self.g_jcc(cc::E, slow);
+        self.jmp(got);
+        // A short string held in its node: a one-byte memo (0xff unknown).
+        self.bind(not_leaf);
+        self.g_cmp_byte_imm(r::R11, l.rope.tag, l.rope.small_tag);
+        self.g_jcc(cc::NE, not_small);
+        // movzx eax, byte [r11 + disp32]
+        self.code.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x83]);
+        self.code.extend_from_slice(&l.rope.small_u16.to_le_bytes());
+        // cmp eax, 0xff
+        self.code.extend_from_slice(&[0x3d, 0xff, 0x00, 0x00, 0x00]);
+        self.g_jcc(cc::E, slow);
+        self.jmp(got);
+        // A concatenation whose total is memoized.
+        self.bind(not_small);
+        self.g_cmp_byte_imm(r::R11, l.rope.tag, l.rope.concat_tag);
+        self.g_jcc(cc::NE, slow);
+        self.g_load(r::RAX, r::R11, l.rope.concat_u16);
         self.code.extend_from_slice(&[0x48, 0x83, 0xf8, 0xff]);
         self.g_jcc(cc::E, slow);
         self.jmp(got);

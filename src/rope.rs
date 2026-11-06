@@ -114,6 +114,14 @@ pub(crate) struct RopeLayout {
     /// A leaf's byte pointer and byte length.
     pub(crate) leaf_ptr: i32,
     pub(crate) leaf_len: i32,
+    /// The tag byte of a [`Node::Small`], and its memoized UTF-16 length (a
+    /// byte, [`SMALL_U16_UNKNOWN`] until first asked).
+    pub(crate) small_tag: u8,
+    pub(crate) small_u16: i32,
+    /// The tag byte of a [`Node::Concat`], and its memoized UTF-16 length
+    /// ([`U16_LEN_UNKNOWN`] until first asked).
+    pub(crate) concat_tag: u8,
+    pub(crate) concat_u16: i32,
 }
 
 /// Derives [`RopeLayout`].
@@ -158,12 +166,37 @@ pub(crate) fn jit_rope_layout() -> RopeLayout {
         assert!(w1 == bytes.as_ptr() as usize && w0 == bytes.len());
         (boxed + core::mem::size_of::<usize>(), boxed)
     };
+    // The other flat-length memos, at their own nodes' offsets (each from its
+    // node's value, as `off` is from the leaf's).
+    let field_off = |r: &Rope, a: usize| {
+        base + i32::try_from(a - Rc::as_ptr(&r.0) as usize).expect("a node field's offset")
+    };
+    let Node::Small {
+        u16: small_memo, ..
+    } = &*small.0
+    else {
+        unreachable!("shorter than SMALL_CAP")
+    };
+    let Node::Concat {
+        u16_len: concat_memo,
+        ..
+    } = &*concat.0
+    else {
+        unreachable!("two leaves concatenate into a concat node")
+    };
+    let small_tag = tag_of(&small);
+    let concat_tag = tag_of(&concat);
+    assert!(small_tag != concat_tag, "distinct rope node tags");
     RopeLayout {
         tag: base,
         leaf_tag,
         leaf_u16: off(core::ptr::addr_of!(*memo) as usize),
         leaf_ptr: off(ptr_at),
         leaf_len: off(len_at),
+        small_tag,
+        small_u16: field_off(&small, core::ptr::addr_of!(*small_memo) as usize),
+        concat_tag,
+        concat_u16: field_off(&concat, core::ptr::addr_of!(*concat_memo) as usize),
     }
 }
 
