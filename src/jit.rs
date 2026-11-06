@@ -4862,6 +4862,12 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     call_globals: Vec<i32>,
+    /// In a generic body with a global binding cache: the frame slot of the
+    /// epoch its slots were validated under and the stub that empties them,
+    /// which every `call` runs when the epoch changed under it (see
+    /// [`recheck_body_globals`](Self::recheck_body_globals)).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    gc_body: Option<(i32, Label)>,
     /// In a body that inlines calls (`inline`): the native-frame slot of a
     /// pending inlined activation's materialization stub, which every
     /// `call` first runs when set (`call_seq::emit_inline_guard`).
@@ -5329,6 +5335,51 @@ impl X64Assembler {
     )]
     pub(crate) fn call_globals_now(&self) -> Vec<i32> {
         self.call_globals.clone()
+    }
+
+    /// Makes every `call` emitted from now on re-check the generic body's
+    /// global binding cache (see the `gc_body` field): `epoch` is its epoch
+    /// slot, `stub` the label of its emptying stub
+    /// ([`emit_body_globals_stub`](Self::emit_body_globals_stub)).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn set_body_globals(&mut self, on: Option<(i32, Label)>) {
+        self.gc_body = on;
+    }
+
+    /// After a `call`: when the global binding epoch is no longer the one the
+    /// generic body's global binding cache noted, empty its slots (`call`
+    /// the stub, which keeps every register). So a filled slot is always one
+    /// validated since the last time Rust code ran, or under the epoch that
+    /// is still current — and the slots' reads need no epoch check of their
+    /// own. Clobbers only `r11` and the flags (the call's results in
+    /// `rax`/`rdx` survive).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    fn recheck_body_globals(&mut self) {
+        let Some((noted, stub)) = self.gc_body else {
+            return;
+        };
+        let keep = self.new_label();
+        self.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
+        self.code.extend_from_slice(&[0x4d, 0x8b, 0x1b]); // mov r11, [r11]
+        self.code.extend_from_slice(&[0x4c, 0x3b, 0x9d]); // cmp r11, [rbp + noted]
+        self.code.extend_from_slice(&noted.to_le_bytes());
+        self.je(keep);
+        self.g_call_label(stub);
+        self.bind(keep);
+    }
+
+    /// The generic body's global binding cache's emptying stub (`stub`, the
+    /// label [`set_body_globals`](Self::set_body_globals) was given): every
+    /// slot of `slots` emptied, then `ret` to the call site. It writes only
+    /// the frame (its caller's `rbp` is the body's) and keeps every register
+    /// and the stack.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn emit_body_globals_stub(&mut self, stub: Label, slots: &[i32]) {
+        self.bind(stub);
+        for &d in slots {
+            self.store_empty(d);
+        }
+        self.code.push(0xc3); // ret
     }
 
     /// Sets the slots only the frame prologue empties (see the `entry_clear`
@@ -6155,6 +6206,8 @@ impl X64Assembler {
         self.survive_reload();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.reload_after_call();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        self.recheck_body_globals();
     }
 
     /// `mov <argreg[i]>, [rbp+disp]` — load a frame slot into System V integer
@@ -8406,6 +8459,9 @@ impl JitFunction {
         let leave_exit = a.new_label();
         num.set_leave_exit(leave_exit);
         a.frame_prologue(frame);
+        // From here on every call keeps the global binding cache current.
+        let gc_stub = (gc_plan.slots > 0).then(|| a.new_label());
+        a.set_body_globals(gc_stub.map(|l| (gc_epoch, l)));
         a.mov_r15_rdi(); // pin ctx
         a.mov_rbx_rsi(); // pin the register file
         a.pin_enter(); // the caller's `r12`/`r13`, and the arena (clobbers `r11` only)
@@ -8868,19 +8924,18 @@ impl JitFunction {
                 let fetch = a.new_label();
                 let back = a.new_label();
                 let done = a.new_label();
-                let reset = a.new_label();
+                let pre = a.new_label();
                 let recheck = a.new_label();
-                // The epoch the slots were validated under must still be
-                // current (else, out of line, they are all emptied).
-                a.g_movabs(call_seq::r::R11, epoch_addr as u64);
-                a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
-                a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, gc_epoch);
-                a.jne(reset);
-                cold_epochs.push((reset, fetch, recheck));
+                // A filled slot is current: every call empties the slots
+                // when the epoch changed under it (`recheck_body_globals`),
+                // as do the prologue and a `catch` entry. An empty one is
+                // filled out of line, the epoch checked first (a changed
+                // one empties them all).
                 a.bind(recheck);
                 a.g_load(call_seq::r::RAX, call_seq::r::RBP, slot);
                 a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
-                a.je(fetch);
+                a.je(pre);
+                cold_epochs.push((pre, fetch, recheck));
                 a.bind(back);
                 match *bytecode.get(op_idx)? {
                     crate::nbvm::Op::LoadGlobal { dst, .. } if ok(dst) => {
@@ -12946,8 +13001,12 @@ impl JitFunction {
         // the current epoch, the frame takes them and the op looks again.)
         let gc_persisted: Vec<(usize, i32)> =
             gc_reads.iter().map(|&k| (1 + k, gc_slot(k))).collect();
-        for (reset, fetch, recheck) in core::mem::take(&mut cold_epochs) {
-            a.bind(reset);
+        for (pre, fetch, recheck) in core::mem::take(&mut cold_epochs) {
+            a.bind(pre);
+            a.g_movabs(call_seq::r::R11, epoch_addr as u64);
+            a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
+            a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, gc_epoch);
+            a.je(fetch);
             a.clear_entry_slots();
             a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
             if !gc_persisted.is_empty() {
@@ -12989,6 +13048,10 @@ impl JitFunction {
             a.bind(slow);
             exec_op!(pc);
             a.jmp(done);
+        }
+        if let Some(stub) = gc_stub {
+            let slots: Vec<i32> = (0..gc_plan.slots).map(gc_slot).collect();
+            a.emit_body_globals_stub(stub, &slots);
         }
         // The out-of-line halves of promoted-loop `GetProp`s: the spill-array
         // read, and the slow paths' reload of the promoted result.
@@ -13173,8 +13236,12 @@ impl JitFunction {
             a.call_rax();
             // A throw may have left the host's running scope elsewhere: the
             // global binding cache starts over in the handler.
+            // (Its slots are read with no epoch check: emptied too.)
             if gc_plan.slots > 0 {
                 a.store_empty(gc_epoch);
+                for k in 0..gc_plan.slots {
+                    a.store_empty(gc_slot(k));
+                }
             }
             for &t in &catch_targets {
                 a.cmp_rax_imm(i32::try_from(orig_pc(t)).ok()?);
@@ -13204,6 +13271,8 @@ impl JitFunction {
         } else {
             (Some(native_exact), native_exact_pinned)
         };
+        // (The handler entry's calls are not the body's.)
+        a.set_body_globals(None);
         let entries = if uses_handlers {
             // The handler entry is the Rust caller's, and behind a stub that
             // passes it the context, the call sequence's.
