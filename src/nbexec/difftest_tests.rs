@@ -4341,3 +4341,39 @@ fn inlined_super_chains_and_proved_accessors_match_calls() {
         "4507500:x,t,y,z:C|5|2997:3|NaN:w,y,z|X:X|15995:41991"
     );
 }
+
+/// Compiled `while (q.link) q = q.link` walks: every falsy and truthy
+/// non-object end, a node of another layout, a getter and a proxy on the
+/// way, the walk inside a counted loop with a double live across it; and the
+/// truthiness of every kind of value read from a property.
+#[test]
+fn compiled_chase_walks_and_truthiness() {
+    let src = r#"
+        var out = [];
+        class N { constructor(id, link) { this.link = link; this.id = id; } }
+        function build(n, end) { var h = new N(n, end); for (var i = n - 1; i >= 0; i--) h = new N(i, h); return h; }
+        function last(q) { while (q.link) q = q.link; return q; }
+        var ends = [null, undefined, false, 0, "", true, "s"];
+        var heads = ends.map(function (e, k) { return build(3 + k * 50, e); });
+        var s = 0, t = "";
+        for (var i = 0; i < 7000; i++) {
+          var q = last(heads[i % 7]);
+          s += typeof q === "object" ? q.id : 1000;
+          if (i === 3000) heads[1].link.link.extra = 1;
+          if (i === 4000) Object.defineProperty(heads[2].link, "link", { get() { s += 1; return null; } });
+          if (i === 5000) heads[3].link = new Proxy(heads[3].link, {});
+        }
+        out.push(s);
+        var acc = 0;
+        function walk(h) { var x = 0.5; for (var j = 0; j < 4; j++) { var q = h; while (q.link) q = q.link; x += typeof q === "object" ? q.id : 7; } return x; }
+        for (var i = 0; i < 3000; i++) acc += walk(heads[i % 7]);
+        out.push(acc);
+        var truth = [undefined, null, false, true, 0, NaN, 1, "", "a", 0n, 1n, {}, []];
+        var boxes = truth.map(function (v) { return { v: v }; });
+        var bits = 0;
+        for (var i = 0; i < 3000; i++) { var b = boxes[i % 13]; if (b.v) bits += 1 << (i % 13); if (!b.v) bits += 3; }
+        out.push(bits);
+        out.join("|")
+    "#;
+    assert_eq!(run(src), "2471772|733364|1729259");
+}

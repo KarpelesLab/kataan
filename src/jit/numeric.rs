@@ -4601,24 +4601,19 @@ impl NumGen {
                     a.bind(other);
                     self.load_gpr(a, reg, RAX, cond);
                 }
-                a.movabs_r11(self.tag_true as i64);
-                a.cmp_rax_r11();
+                // `undefined`, `null`, `false` / `true` (one classification).
+                a.p_imm_class(RCX);
+                self.jcc_to(a, labels, reg, CC_B, target);
                 a.jcc(CC_E, resume);
-                a.movabs_r11(self.tag_false as i64);
-                a.cmp_rax_r11();
-                self.jcc_to(a, labels, reg, CC_E, target);
                 a.mov_rcx_rax();
                 a.movabs_r11(QNAN as i64);
                 a.and_rcx_r11();
                 a.cmp_rcx_r11();
                 a.jcc(CC_NE, num);
-                // `null` / `undefined`, an ordinary object or a function,
-                // inline; anything else through the helper.
-                let falsy = a.new_label();
-                a.p_truthy_heap(self.env.realm, resume, falsy);
+                // An ordinary object or a function inline; anything else
+                // through the helper.
+                a.p_truthy_handle_any(self.env.realm, resume);
                 a.jmp(stub);
-                a.bind(falsy);
-                self.jump(a, labels, reg, target);
                 a.bind(num);
                 a.movq_x_gpr(0, RAX);
                 a.sse_rr(0x66, 0x57, 1, 1); // xorpd xmm1, xmm1
@@ -4684,6 +4679,37 @@ impl NumGen {
             return self.copy_label(target);
         }
         labels.get(target).copied()
+    }
+
+    /// `goto target` as a branch of op `from` takes it, whichever emitter
+    /// emits that op: flushing first if that leaves its region.
+    pub(super) fn jump_from(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        from: usize,
+        target: usize,
+    ) {
+        let pc = core::mem::replace(&mut self.cur_pc, from);
+        let reg = self.region_at(from);
+        self.jump(a, labels, reg, target);
+        self.cur_pc = pc;
+    }
+
+    /// The label a branch of op `from` to `target` lands on directly, when
+    /// it needs no code on the way ([`jump_from`](Self::jump_from)'s plain
+    /// `jmp`).
+    pub(super) fn direct_from(
+        &mut self,
+        labels: &[Label],
+        from: usize,
+        target: usize,
+    ) -> Option<Label> {
+        let pc = core::mem::replace(&mut self.cur_pc, from);
+        let reg = self.region_at(from);
+        let l = self.in_region_target(labels, reg, target);
+        self.cur_pc = pc;
+        l
     }
 
     /// `goto target` (flushing first if that leaves region `reg`).

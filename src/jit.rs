@@ -6393,6 +6393,10 @@ impl X64Assembler {
         {
             self.p_cmp_handle_floor(call_seq::r::RAX);
             self.g_jcc(call_seq::cc::AE, heap);
+            // `undefined`, `null`, `false` / `true` (one classification).
+            self.p_imm_class(call_seq::r::RCX);
+            self.g_jcc(call_seq::cc::B, set0);
+            self.je(set1);
         }
         // is_number(v) == (v & QNAN) != QNAN — test on a copy, keeping v in rax.
         self.movabs_r11(qnan as i64);
@@ -6400,18 +6404,20 @@ impl X64Assembler {
         self.and_rcx_r11();
         self.cmp_rcx_r11();
         self.jne(numl); // a number → numeric truthiness
-        // boolean? compare the raw word against the two boolean tags.
-        self.movabs_r11(tag_true as i64);
-        self.cmp_rax_r11();
-        self.je(set1);
-        self.movabs_r11(tag_false as i64);
-        self.cmp_rax_r11();
-        self.je(set0);
-        // `null`/`undefined` inline; an ordinary object or a VM function
-        // inline above.
+        // boolean? compare the raw word against the two boolean tags (an
+        // ordinary object or a VM function inline above).
+        #[cfg(not(all(feature = "alloc", target_os = "linux", target_arch = "x86_64")))]
+        {
+            self.movabs_r11(tag_true as i64);
+            self.cmp_rax_r11();
+            self.je(set1);
+            self.movabs_r11(tag_false as i64);
+            self.cmp_rax_r11();
+            self.je(set0);
+        }
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         {
-            self.p_truthy_nullish(set0);
+            let _ = (tag_true, tag_false);
             self.jmp(helper);
             self.bind(heap);
             self.p_truthy_handle(realm_off, set1, helper);
@@ -10801,25 +10807,56 @@ impl JitFunction {
                             a.p_cmp_shape(r::RCX, layout.off_shape, b.shape, r::R11);
                             a.jne(normal);
                         }
-                        a.g_mov(r::RSI, r::RAX);
-                        a.g_movabs(r::RDX, chase::MAX_HOPS);
-                        a.bind(hop);
-                        a.g_mov(r::RDI, r::RCX);
-                        a.p_obj_fixed_slot_load(&layout, b.slot);
-                        a.p_is_handle(r::RCX, leave);
-                        a.p_slot_rooted(&layout, r::RCX, leave);
-                        a.p_object_not_exotic(&layout, leave);
-                        a.p_cmp_shape(r::RCX, layout.off_shape, b.shape, r::R11);
-                        a.jne(leave);
-                        a.g_mov(r::RSI, r::RAX);
-                        a.raw(&[0xff, 0xca]); // dec edx
-                        a.jne(hop);
-                        a.g_mov(r::RDI, r::RCX);
-                        a.bind(leave);
-                        a.g_store(r::RBX, disp(obj), r::RSI);
-                        a.g_store(r::RBP, rc_key(p.way), r::RSI);
-                        a.g_store(r::RBP, rc_cell(p.way), r::RDI);
-                        a.bind(normal);
+                        if a.chase_hops_ok(&layout, b.slot) {
+                            // (A falsy field ends the loop where the
+                            // condition's branch would: `jump_from`.)
+                            let exit = match ops.get(op_idx + 1) {
+                                Some(&GenericOp::JumpIfFalse { cond, target })
+                                    if cond == dst
+                                        && target > op_idx + 1
+                                        && target <= ops.len() =>
+                                {
+                                    Some(target)
+                                }
+                                _ => None,
+                            };
+                            let direct = exit.and_then(|e| num.direct_from(&labels, op_idx + 1, e));
+                            let falsy = direct.or_else(|| exit.map(|_| a.new_label()));
+                            let frame = chase::ChaseFrame {
+                                q: disp(obj),
+                                t: disp(dst),
+                                key: rc_key(p.way),
+                                cell: rc_cell(p.way),
+                            };
+                            a.p_chase_hops(&layout, (b.shape, b.slot), &frame, falsy, normal);
+                            if let (Some(falsy), Some(exit), None) = (falsy, exit, direct) {
+                                let cold = a.cold_begin();
+                                a.bind(falsy);
+                                num.jump_from(&mut a, &labels, op_idx + 1, exit);
+                                a.cold_end(cold);
+                            }
+                            a.bind(normal);
+                        } else {
+                            a.g_mov(r::RSI, r::RAX);
+                            a.g_movabs(r::RDX, chase::MAX_HOPS);
+                            a.bind(hop);
+                            a.g_mov(r::RDI, r::RCX);
+                            a.p_obj_fixed_slot_load(&layout, b.slot);
+                            a.p_is_handle(r::RCX, leave);
+                            a.p_slot_rooted(&layout, r::RCX, leave);
+                            a.p_object_not_exotic(&layout, leave);
+                            a.p_cmp_shape(r::RCX, layout.off_shape, b.shape, r::R11);
+                            a.jne(leave);
+                            a.g_mov(r::RSI, r::RAX);
+                            a.raw(&[0xff, 0xca]); // dec edx
+                            a.jne(hop);
+                            a.g_mov(r::RDI, r::RCX);
+                            a.bind(leave);
+                            a.g_store(r::RBX, disp(obj), r::RSI);
+                            a.g_store(r::RBP, rc_key(p.way), r::RSI);
+                            a.g_store(r::RBP, rc_cell(p.way), r::RDI);
+                            a.bind(normal);
+                        }
                     }
                     // In a speculative loop's fast version, a promoted
                     // result of a compiled-in layout is loaded straight into

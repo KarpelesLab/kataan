@@ -67,6 +67,11 @@ impl X64Assembler {
         self.g_jcc(super::call_seq::cc::B, miss);
     }
 
+    /// `sub reg, [rip + c]`, `c` a constant word with the value `value`.
+    pub(crate) fn p_sub_const(&mut self, reg: u8, value: u64) {
+        self.p_rip_const(0x2b, reg, value);
+    }
+
     /// `cmp reg, [rip + floor]`, `floor` the code's constant
     /// `NanBox::handle(0)` word (placed by `finish`): a value has all of the
     /// top 14 bits that make a heap handle exactly when it is, unsigned, at
@@ -162,14 +167,45 @@ impl X64Assembler {
         }
     }
 
+    /// [`p_slot_rooted`](Self::p_slot_rooted) between any two of the first
+    /// eight registers, pinned code only, a 72-byte slot stride: from the
+    /// handle bits in `h`, `s` = the address of the arena slot at its index,
+    /// else (index out of bounds) to `miss`. Preserves `h`; clobbers `r8`
+    /// in audit mode only. (`h` must already be known to be a handle.)
+    pub(crate) fn p_slot_rooted_rr(&mut self, l: &JitLayout, h: u8, s: u8, miss: Label) {
+        debug_assert!(self.pinned() && l.slot_stride == 72 && h < 8 && s < 8 && h != s);
+        // mov s32, h32 (the index, zero-extended); cmp s, r13
+        self.code.extend_from_slice(&[0x89, 0xc0 | (h << 3) | s]);
+        self.code
+            .extend_from_slice(&[0x4c, 0x39, 0xc0 | (5 << 3) | s]);
+        self.jae(miss);
+        // lea s, [s + s*8]; lea s, [r12 + s*8]
+        self.code
+            .extend_from_slice(&[0x48, 0x8d, (s << 3) | 4, 0xc0 | (s << 3) | s]);
+        self.code.extend_from_slice(&[
+            0x49,
+            0x8d,
+            (s << 3) | 4,
+            0xc0 | (s << 3) | (super::pin::R12 & 7),
+        ]);
+        if handle_audit() {
+            self.p_audit_live_of(l, h, s);
+        }
+    }
+
     /// Audit mode's check after a rooted walk: the slot at `dst` occupied
     /// and of `rax`'s generation, or `ud2`. Clobbers `r8`.
     fn p_audit_live(&mut self, l: &JitLayout, dst: u8) {
+        self.p_audit_live_of(l, r::RAX, dst);
+    }
+
+    /// [`p_audit_live`](Self::p_audit_live) of the handle in `h`.
+    fn p_audit_live_of(&mut self, l: &JitLayout, h: u8, dst: u8) {
         let ok = self.new_label();
         let trap = self.new_label();
         self.g_cmp_byte_imm(dst, l.off_slot_occ, l.slot_occupied_disc);
         self.jne(trap);
-        self.mov_r8_rax();
+        self.g_mov(r::R8, h);
         self.shr_r8_imm(32);
         // cmp word [dst + disp32], r8w
         self.code

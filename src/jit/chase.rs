@@ -20,11 +20,119 @@
 //! [`MAX_HOPS`] of them run between two ordinary iterations, which do, so an
 //! interrupt still reaches a walk around a cycle, a bounded factor later.
 
+//!
+//! Where the field is an inline slot (the usual case), the hops are
+//! [`X64Assembler::p_chase_hops`]: unrolled by two, the current object and
+//! the next one alternating between two register pairs, so a hop moves no
+//! register and only every other one counts down, and a `null`, `undefined`
+//! or `false` next value ends the loop right there (the ordinary loop would
+//! read that same value into the condition and branch out on it), writing the
+//! condition temporary as the ordinary read would.
+
+use super::call_seq::{cc, r};
+use super::{JitLayout, Label, X64Assembler};
 use crate::nbvm::Op;
 use alloc::vec::Vec;
 
 /// The most hops between two ordinary iterations of the loop.
 pub(super) const MAX_HOPS: u64 = 256;
+
+/// The frame operands of [`X64Assembler::p_chase_hops`].
+pub(super) struct ChaseFrame {
+    /// The loop's object register (`rbx`-relative).
+    pub q: i32,
+    /// The condition temporary (`rbx`-relative).
+    pub t: i32,
+    /// The receiver-cache way's key and cell slots (`rbp`-relative).
+    pub key: i32,
+    /// See `key`.
+    pub cell: i32,
+}
+
+impl X64Assembler {
+    /// Whether [`p_chase_hops`](Self::p_chase_hops) can walk field slot
+    /// `slot` under layout `l`.
+    pub(super) fn chase_hops_ok(&self, l: &JitLayout, slot: u32) -> bool {
+        self.pinned()
+            && l.slot_stride == 72
+            && Self::not_exotic_one_test(l)
+            && Self::inline_slot_disp(l, slot).is_some()
+    }
+
+    /// The hops, entered with `rax` = `q` (a hit of the way), `rcx` = its heap
+    /// slot, of layout `shape` whose data property at inline slot `slot` is
+    /// the field. Leaves for `normal` with `q` and the way set to the last
+    /// object reached; with `falsy`, when the field's value there is
+    /// `undefined`, `null` or `false`, goes to `falsy` instead, having also
+    /// stored that value in the condition temporary. Clobbers `rax`, `rcx`,
+    /// `rdx`, `rsi`, `rdi`, `r11` (and `r8` in audit mode).
+    pub(super) fn p_chase_hops(
+        &mut self,
+        l: &JitLayout,
+        (shape, slot): (u64, u32),
+        f: &ChaseFrame,
+        falsy: Option<Label>,
+        normal: Label,
+    ) {
+        let Some(d) = Self::inline_slot_disp(l, slot) else {
+            return;
+        };
+        // Per pair: (current handle, its slot) → (next handle, its slot).
+        let pairs = [
+            ((r::RAX, r::RCX), (r::RSI, r::RDI)),
+            ((r::RSI, r::RDI), (r::RAX, r::RCX)),
+        ];
+        let leave = [self.new_label(), self.new_label()];
+        let value = [self.new_label(), self.new_label()];
+        let top = self.new_label();
+        self.g_movabs(r::RDX, MAX_HOPS / 2);
+        self.bind(top);
+        for (i, &((_, cs), (nh, ns))) in pairs.iter().enumerate() {
+            self.g_load(nh, cs, d);
+            self.p_cmp_handle_floor(nh);
+            self.g_jcc(cc::B, value[i]);
+            self.p_slot_rooted_rr(l, nh, ns, leave[i]);
+            self.p_object_not_exotic_at(l, ns, leave[i]);
+            self.p_cmp_shape(ns, l.off_shape, shape, r::R11);
+            self.jne(leave[i]);
+        }
+        self.raw(&[0xff, 0xca]); // dec edx
+        self.jne(top);
+        // (The current object is in the first pair again.)
+        self.jmp(leave[0]);
+        for (i, &((ch, cs), (nh, _))) in pairs.iter().enumerate() {
+            let exit = falsy.map(|_| self.new_label());
+            self.bind(value[i]);
+            if let Some(exit) = exit {
+                // `undefined`, `null`, `false`: the three words from
+                // `undefined`'s up.
+                const _: () = assert!(
+                    crate::nanbox::NanBox::null().to_bits()
+                        == crate::nanbox::NanBox::undefined().to_bits() + 1
+                        && crate::nanbox::NanBox::boolean(false).to_bits()
+                            == crate::nanbox::NanBox::undefined().to_bits() + 2
+                );
+                self.g_mov(r::R11, nh);
+                self.p_sub_const(r::R11, crate::nanbox::NanBox::undefined().to_bits());
+                self.g_cmp_imm(r::R11, 2);
+                self.g_jcc(cc::BE, exit);
+            }
+            self.bind(leave[i]);
+            self.g_store(r::RBX, f.q, ch);
+            self.g_store(r::RBP, f.key, ch);
+            self.g_store(r::RBP, f.cell, cs);
+            self.jmp(normal);
+            if let (Some(falsy), Some(exit)) = (falsy, exit) {
+                self.bind(exit);
+                self.g_store(r::RBX, f.t, nh);
+                self.g_store(r::RBX, f.q, ch);
+                self.g_store(r::RBP, f.key, ch);
+                self.g_store(r::RBP, f.cell, cs);
+                self.jmp(falsy);
+            }
+        }
+    }
+}
 
 /// Per op: whether it is the first op of such a loop.
 #[must_use]

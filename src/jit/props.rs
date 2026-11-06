@@ -972,6 +972,37 @@ impl X64Assembler {
         self.jne(miss);
     }
 
+    /// Whether the layout lets one `test word` make the three tests of
+    /// [`p_object_not_exotic`](Self::p_object_not_exotic) (what
+    /// [`p_object_not_exotic_at`](Self::p_object_not_exotic_at) needs).
+    pub(crate) fn not_exotic_one_test(l: &JitLayout) -> bool {
+        l.props.off_jit_flags == l.off_cell_tag + 1
+            && l.cell_object_disc == 0
+            && (l.off_od_tag, l.obj_shaped_disc) == (l.off_cell_tag, l.cell_object_disc)
+    }
+
+    /// [`p_object_not_exotic`](Self::p_object_not_exotic)'s one-test form on
+    /// the slot in `base` (one of the first eight registers, not `rsp`), for
+    /// a layout [`not_exotic_one_test`](Self::not_exotic_one_test) accepts.
+    pub(crate) fn p_object_not_exotic_at(&mut self, l: &JitLayout, base: u8, miss: Label) {
+        debug_assert!(Self::not_exotic_one_test(l) && base < 8 && base != 4);
+        // test word [base + disp32], imm16
+        self.code.extend_from_slice(&[0x66, 0xf7, 0x80 | base]);
+        self.code.extend_from_slice(&l.off_cell_tag.to_le_bytes());
+        self.code
+            .extend_from_slice(&(0x00ff_u16 | (u16::from(FLAG_EXOTIC) << 8)).to_le_bytes());
+        self.jne(miss);
+    }
+
+    /// The displacement of slot `slot` from an object's heap slot when it is
+    /// an inline one, else `None`.
+    pub(crate) fn inline_slot_disp(l: &JitLayout, slot: u32) -> Option<i32> {
+        match Self::fixed_slot(l, slot) {
+            FixedSlot::Inline(d) => Some(d),
+            _ => None,
+        }
+    }
+
     /// After the slot in `rcx` compared equal to the object cell tag: to
     /// `miss` unless its object data is shaped — no code when the object-data
     /// tag is the very byte and value just compared.
@@ -2295,19 +2326,6 @@ impl X64Assembler {
         self.g_jcc(cc::B, miss);
     }
 
-    /// The truthiness of the value in `rax`, inline where it is not the
-    /// helper's to decide: `null`/`undefined` to `falsy`; a VM function, or a
-    /// shaped ordinary object without the `[[IsHTMLDDA]]` brand, to `truthy`.
-    /// Anything else falls through (to the helper), with `rax` clobbered as
-    /// are `rcx`, `rdx`, `r8`–`r11`.
-    pub(crate) fn p_truthy_heap(&mut self, realm_off: i32, truthy: Label, falsy: Label) {
-        let other = self.new_label();
-        self.p_truthy_nullish(falsy);
-        self.p_handle_check(other);
-        self.p_truthy_handle(realm_off, truthy, other);
-        self.bind(other);
-    }
-
     /// To `miss` unless the realm's published array-iteration open
     /// (`realm::builtins_fast::ArrayIterJit`) holds: its prototype epoch is
     /// current, and each of its two lookups' slot (at the recorded address,
@@ -2355,16 +2373,32 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
     }
 
-    /// `null`/`undefined` in `rax` to `falsy` (else fall through). Clobbers
-    /// `r11`.
-    pub(crate) fn p_truthy_nullish(&mut self, falsy: Label) {
+    /// Classifies the immediate in `rax` (kept) through `scratch`: the
+    /// flags say `B` for `undefined`, `null` or `false` (the three falsy
+    /// words from `undefined`'s up), `E` for `true`, neither for any other
+    /// value. Three instructions where comparing with each took twelve.
+    pub(crate) fn p_imm_class(&mut self, scratch: u8) {
         use crate::nanbox::NanBox;
-        self.g_movabs(r::R11, NanBox::null().to_bits());
-        self.g_cmp(r::RAX, r::R11);
-        self.g_jcc(cc::E, falsy);
-        self.g_movabs(r::R11, NanBox::undefined().to_bits());
-        self.g_cmp(r::RAX, r::R11);
-        self.g_jcc(cc::E, falsy);
+        const U: u64 = NanBox::undefined().to_bits();
+        const _: () = assert!(
+            NanBox::null().to_bits() == U + 1
+                && NanBox::boolean(false).to_bits() == U + 2
+                && NanBox::boolean(true).to_bits() == U + 3
+        );
+        self.g_mov(scratch, r::RAX);
+        self.p_sub_const(scratch, U);
+        self.g_cmp_imm(scratch, 3);
+    }
+
+    /// The truthiness of a heap handle in `rax`, where it is not the
+    /// helper's to decide (see [`p_truthy_handle`](Self::p_truthy_handle)):
+    /// to `truthy`; any other value, or a handle the helper decides, falls
+    /// through. Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
+    pub(crate) fn p_truthy_handle_any(&mut self, realm_off: i32, truthy: Label) {
+        let other = self.new_label();
+        self.p_handle_check(other);
+        self.p_truthy_handle(realm_off, truthy, other);
+        self.bind(other);
     }
 
     /// The truthiness of the heap handle in `rax`, where it is not the
