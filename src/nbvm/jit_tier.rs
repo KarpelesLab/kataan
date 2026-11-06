@@ -18,6 +18,9 @@ use super::{
 use crate::jit::{CallSite, CalleeInfo, FRAME_HEADER, JitStack};
 use alloc::rc::Rc;
 
+mod deopt;
+pub(crate) use deopt::jit_helper_deopt;
+
 /// Back-edges an interpreted activation runs before it tries to continue in
 /// native code (on-stack replacement).
 const OSR_THRESHOLD: u32 = 500;
@@ -110,6 +113,10 @@ pub(super) struct TierRuntime {
     /// function's own), the value it yields and the register a `next(v)`
     /// lands `v` in.
     suspended: Option<(usize, NanBox, Reg)>,
+    /// An activation that just left its compiled body at a deoptimization
+    /// exit (`crate::jit::deopt`, [`jit_helper_deopt`]): the function's own
+    /// pc the interpreter continues it at and its handler stack there.
+    deopt: Option<(usize, alloc::vec::Vec<(usize, Reg)>)>,
 }
 
 impl Default for TierRuntime {
@@ -127,6 +134,7 @@ impl Default for TierRuntime {
             left: None,
             poll_interval: if exit_stress() { 1 } else { POLL_INTERVAL },
             suspended: None,
+            deopt: None,
         }
     }
 }
@@ -437,6 +445,11 @@ fn left_at(
             dst,
         });
     }
+    // A deoptimization exit: the interpreter continues the frame (see
+    // `run_tiering`; the exit took the handler stack).
+    if ctx.jit_rt.deopt.is_some() {
+        return Ok(FrameExit::Return(None));
+    }
     match ctx.jit_rt.resume.take() {
         Some(pc) => {
             ctx.jit_rt.left = Some((pc, handlers));
@@ -444,6 +457,13 @@ fn left_at(
         }
         None => Err(VmError::Unsupported),
     }
+}
+
+/// The frame an on-stack replacement ([`osr`]) entered, which left its
+/// compiled body at a deoptimization exit: the pc its interpreter loop
+/// continues at and the handler stack there.
+pub(super) fn take_deopt(ctx: &mut Ctx) -> Option<(usize, alloc::vec::Vec<(usize, Reg)>)> {
+    ctx.jit_rt.deopt.take()
 }
 
 /// A compiled activation's raw result word as the interpreter's frame
@@ -494,7 +514,7 @@ pub(super) fn enter_on_call(
         {
             jit = new;
         }
-        return match run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false)? {
+        return match run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false, false)? {
             Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
             Ok(_) => Some(Err(VmError::Unsupported)),
             Err(e) => Some(Err(e)),
@@ -533,7 +553,7 @@ pub(super) fn enter_async_on_call(
     if !jit.is_generic() {
         return None;
     }
-    run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false)
+    run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false, false)
 }
 
 /// On-stack replacement from a hot interpreted loop: `program` is the running
@@ -584,7 +604,7 @@ pub(super) fn osr(
             &alloc::format!("on-stack replacement at pc {target}"),
         );
     }
-    run_tiering(ctx, funcs, id, jit, regs, target, handlers, ic, true)
+    run_tiering(ctx, funcs, id, jit, regs, target, handlers, ic, true, true)
 }
 
 /// Resumes the suspended sync generator of function `id` in native code: its
@@ -619,7 +639,7 @@ pub(super) fn resume_generator(
     // under `KATAAN_JIT_EXIT_STRESS`), which still recompiles a body whose
     // sites learned more.
     if resumes.is_multiple_of(RECOMPILE_EVERY) || exit_stress() {
-        run_tiering(ctx, funcs, id, jit, regs, pc, handlers, ic, true)
+        run_tiering(ctx, funcs, id, jit, regs, pc, handlers, ic, true, false)
     } else {
         run_compiled_at(ctx, funcs, &jit, regs, pc, handlers, false, true)
     }
@@ -842,6 +862,11 @@ pub(crate) extern "C" fn jit_helper_suspend(
 /// header to be recompiled, continuing there in the new code; `ic` is the
 /// activation's interpreter caches, if it holds them. `keep`: as
 /// [`run_compiled_at`]'s.
+///
+/// An activation that leaves at a deoptimization exit (`crate::jit::deopt`)
+/// continues in the interpreter: here, or — `own_loop`, an on-stack
+/// replacement — in the interpreter loop that entered it, which
+/// [`take_deopt`] tells where.
 #[allow(clippy::too_many_arguments)]
 fn run_tiering(
     ctx: &mut Ctx,
@@ -853,6 +878,7 @@ fn run_tiering(
     handlers: &[(usize, Reg)],
     ic: &[crate::ic::PropertyCache],
     keep: bool,
+    own_loop: bool,
 ) -> Option<Result<FrameExit, VmError>> {
     let mut r = run_compiled_at(ctx, funcs, &jit, regs, entry, handlers, true, keep)?;
     // The body left at loop header `pc` to be recompiled: continue there in
@@ -869,6 +895,13 @@ fn run_tiering(
             }
             None => run_compiled_at(ctx, funcs, &jit, regs, pc, &h, true, keep)?,
         };
+    }
+    if !own_loop && let Some((pc, h)) = ctx.jit_rt.deopt.take() {
+        // (`regs` holds the frame: the exit's sentinel had it copied back.)
+        let proto = funcs.get(id)?;
+        return Some(super::run_frame_at(
+            ctx, funcs, &proto.ops, regs, pc, h, None,
+        ));
     }
     Some(r)
 }
@@ -930,6 +963,7 @@ fn recompile(
         &old.spec_off(),
     )?;
     new.note_cold_calls(&cold_call_pcs(proto, &hints));
+    new.note_function(id);
     new.set_generation(old.generation() + 1);
     let new = Rc::new(new);
     if jit_log_enabled() {

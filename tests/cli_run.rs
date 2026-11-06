@@ -225,3 +225,58 @@ fn module_file_urls_and_missing_imports() {
     assert!(!ok);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The JIT's deoptimization exits (`KATAAN_JIT_DEOPT_STRESS` takes one every
+/// few eligible op starts) leave a program's output exactly the
+/// interpreter's: exits in the function's own code and one to three levels
+/// deep in inlined callees, next to `try`/`catch`, throws out of inlined
+/// bodies, layout changes, and loops re-entered after the interpreter took
+/// over.
+#[test]
+fn forced_deopt_exits_match_the_interpreter() {
+    let source = r#"
+        class A { constructor(x) { if (x % 997 === 996) throw new RangeError("a" + x); this.x = x; } }
+        class B extends A { constructor(x, y) { super(x); this.y = y; } }
+        class C extends B { constructor(x, y, z) { super(x, y); this.z = z; } get sum() { return this.x + this.y + this.z; } }
+        class T {
+            constructor(id) { this.id = id; this.q = null; this.n = 0; }
+            take() { const p = this.q; if (p) this.q = p.next; return p; }
+            give(p) { p.next = null; if (!this.q) { this.q = p; return; } let r = this.q; while (r.next) r = r.next; r.next = p; }
+            run(s) { const p = this.take(); if (!p) return; p.v = (p.v + this.id) % 101; this.n++; s.route(p, (this.id + 1) % s.ts.length); }
+        }
+        const s = { ts: [], routed: 0, route(p, to) { this.routed++; this.ts[to].give(p); } };
+        for (let i = 0; i < 4; i++) s.ts.push(new T(i));
+        for (let i = 0; i < 9; i++) s.ts[i % 4].give({ next: null, v: i });
+        let acc = 0, caught = 0;
+        for (let i = 0; i < 3000; i++) {
+            for (let k = 0; k < s.ts.length; k++) s.ts[k].run(s);
+            try { const c = new C(i, i + 1, i + 2); acc = (acc + c.sum) | 0; } catch (e) { caught += e.message.length; }
+            const o = { a: i, b: 2 };
+            if (i % 50 === 0) delete o.a;
+            acc = (acc + (o.a | 0) + o.b) | 0;
+        }
+        let n = 0;
+        for (const t of s.ts) n += t.n;
+        console.log(acc, caught, s.routed, n);
+    "#;
+    let run = |envs: &[(&str, &str)]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_kataan"))
+            .args(["run", "-e", source])
+            .envs(envs.iter().copied())
+            .output()
+            .expect("spawn kataan");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (want, err) = run(&[("KATAAN_JIT", "0")]);
+    assert!(!want.is_empty(), "stderr: {err}");
+    for envs in [
+        &[("KATAAN_JIT_DEOPT_STRESS", "1")][..],
+        &[("KATAAN_JIT", "eager"), ("KATAAN_JIT_DEOPT_STRESS", "1")][..],
+    ] {
+        let (got, err) = run(envs);
+        assert_eq!(got, want, "{envs:?}: stderr: {err}");
+    }
+}

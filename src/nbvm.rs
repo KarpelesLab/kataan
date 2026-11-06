@@ -5615,6 +5615,7 @@ fn ensure_jit(
             )
             .map(|mut j| {
                 j.note_cold_calls(&jit_tier::cold_call_pcs(&funcs[id], &hints));
+                j.note_function(id);
                 j
             })
         })
@@ -7123,6 +7124,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         owe_fn_proto: jit_tier::jit_helper_owe_fn_proto,
         new_array: jit_tier::jit_helper_new_array,
         iter_next: jit_tier::jit_helper_iter_next,
+        deopt: jit_tier::jit_helper_deopt,
     }
 }
 
@@ -9514,6 +9516,14 @@ fn run_frame_at_ic(
                             if let Some(r) =
                                 jit_tier::osr(ctx, funcs, program, regs, *target, &handlers, ic)
                             {
+                                // It left at a deoptimization exit: this
+                                // loop goes on from there.
+                                if let Some((at, h)) = jit_tier::take_deopt(ctx) {
+                                    pc = at;
+                                    handlers = h;
+                                    osr_count = 0;
+                                    continue;
+                                }
                                 return r;
                             }
                             osr_count = u32::MAX;

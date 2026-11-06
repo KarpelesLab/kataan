@@ -28,6 +28,8 @@ mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod chase;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod deopt;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fieldrep;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod forin;
@@ -61,6 +63,10 @@ pub use call_seq::{
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, FnCallMemo, HDR_CONSTRUCT,
     IdentMemo, JitStack, MethodHelper, PollLayout, SuperTwiceHelper, header_argc,
 };
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub use deopt::DeoptInfo;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use deopt::{leave_of as deopt_leave_of, site_end as deopt_site_end};
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -3325,6 +3331,9 @@ struct GenericSites {
     /// (`forin`).
     #[allow(dead_code)]
     forin: forin::Plan,
+    /// What the body's deoptimization exits tell their helper (`deopt`),
+    /// when it has any.
+    deopt: Option<alloc::boxed::Box<deopt::DeoptInfo>>,
 }
 
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
@@ -3503,7 +3512,19 @@ pub struct GenericHelpers {
     /// `jit_helper_iter_next(ctx, regs, n_regs, op) -> 0`: `Op::IterNext`
     /// (the exec-op ABI), which resumes a hot generator directly.
     pub iter_next: JitExecOpHelper,
+    /// `jit_helper_deopt(ctx, regs, n_regs, info, at) -> bits`: a
+    /// deoptimization exit (`deopt`): the interpreter finishes the
+    /// activation from body pc `at` (low half; the inlining depth there in
+    /// the high half), and the result is the body's.
+    pub deopt: JitDeoptHelper,
 }
+
+/// The runtime-helper ABI for a deoptimization exit: `(ctx, regs, n_regs,
+/// info, at) -> bits` (a value, the throw sentinel, the fall-off sentinel
+/// or the exit sentinel: see `jit_tier::jit_helper_deopt`).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitDeoptHelper =
+    extern "C" fn(*mut core::ffi::c_void, *mut u64, usize, *const DeoptInfo, u64) -> u64;
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
 /// 0` (or the throw sentinel).
@@ -4104,6 +4125,8 @@ impl JitProto {
         let nt_ok = new_target.is_none_or(|nt| nt > proto.n_params + proto.n_captures);
         // A sync generator's resumption points (its own pcs).
         let resume_pcs = generator_resume_pcs(proto);
+        // Deoptimization exits (`deopt`): never in a body that suspends.
+        let can_deopt = !proto.is_async && !proto.is_generator && deopt::stress();
         let expanded = inline::expand(proto, warm, pick);
         let spliced;
         let (proto, warm, pc_map) = match expanded {
@@ -4359,6 +4382,16 @@ impl JitProto {
         tier_up.spec_off = no_spec.to_vec();
         // The `for-in` loops' sites (`forin`), owned with the code.
         let forin_plan = forin::plan(&ops, &bytecode, proto.n_regs);
+        let deopt_info = can_deopt.then(|| {
+            alloc::boxed::Box::new(deopt::DeoptInfo::new(
+                &bytecode,
+                pc_map
+                    .as_ref()
+                    .map_or_else(Default::default, |m| (m.1.clone(), m.0.clone())),
+                ops.iter()
+                    .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler)),
+            ))
+        });
         let (func, native_entry, spec_heads) = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
@@ -4374,6 +4407,7 @@ impl JitProto {
             pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
             &no_spec_body,
             &forin_plan,
+            deopt_info.as_deref(),
         )?;
         tier_up.spec_regions = spec_heads;
         Some(Self {
@@ -4391,6 +4425,7 @@ impl JitProto {
                 tier_up,
                 persist,
                 forin: forin_plan,
+                deopt: deopt_info,
             }),
             n_regs: proto.n_regs,
             osr_entries,
@@ -4472,6 +4507,23 @@ impl JitProto {
             }
         }
         out
+    }
+
+    /// Records that this body is function `id`'s (of its function table),
+    /// which its deoptimization exits finish the activation of (`deopt`).
+    pub fn note_function(&self, id: usize) {
+        if let Some(d) = self.sites.as_ref().and_then(|s| s.deopt.as_ref()) {
+            d.func.set(u32::try_from(id).unwrap_or(u32::MAX));
+        }
+    }
+
+    /// Whether `info` is this body's deoptimization record (`deopt`).
+    #[must_use]
+    pub fn owns_deopt_info(&self, info: *const DeoptInfo) -> bool {
+        self.sites
+            .as_ref()
+            .and_then(|s| s.deopt.as_deref())
+            .is_some_and(|d| core::ptr::eq(d, info))
     }
 
     /// How many call sites this body inlined (`inline`).
@@ -7252,6 +7304,7 @@ impl JitFunction {
         pc_orig: &[u32],
         no_spec: &[usize],
         forin_plan: &forin::Plan,
+        deopt_info: Option<&deopt::DeoptInfo>,
     ) -> Option<GenericCompiled> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
@@ -8099,6 +8152,22 @@ impl JitFunction {
                 None => t,
             }
         };
+        // Where the body may leave for the interpreter (`deopt`): per op,
+        // its inlining depth and whether an exit may be taken at its start.
+        let deopt_levels = deopt::levels(ops);
+        let deopt_at: Vec<bool> = if deopt_info.is_some() {
+            deopt::points(
+                ops,
+                &deopt_levels,
+                |pc| num.in_any_region(pc),
+                |pc| fresh_add[pc].is_some() || fresh_init[pc],
+                |pc| deopt_info.and_then(|d| d.own_start(pc)),
+            )
+        } else {
+            alloc::vec![false; ops.len()]
+        };
+        // The exits' stubs, emitted out of line: (entry, the op).
+        let mut deopt_stubs: Vec<(Label, usize)> = Vec::new();
         // (The last 16 bytes: the caller's `r12`/`r13`, see `pin`.)
         let frame = ((24
             + 16
@@ -8779,6 +8848,18 @@ impl JitFunction {
             // (The body, a speculative region's plain copy, or its integer
             // version: `numeric::NumGen::schedule`.)
             a.bind(num.begin_op(&labels, op_idx, pass)?);
+            // Under `KATAAN_JIT_DEOPT_STRESS`, every few eligible op
+            // starts leave for the interpreter (`deopt`).
+            if pass == numeric::PASS_MAIN
+                && deopt_at[op_idx]
+                && let Some(info) = deopt_info
+            {
+                let stub = a.new_label();
+                a.g_movabs(call_seq::r::R11, info.countdown.as_ptr() as u64);
+                a.g_dec_mem(call_seq::r::R11, 0);
+                a.g_jcc(call_seq::cc::E, stub);
+                deopt_stubs.push((stub, op_idx));
+            }
             // A global binding read or write through the global binding
             // cache: the cached address, else (out of line) a fresh one from
             // `jit_helper_global_ref`, else the interpreter.
@@ -13048,6 +13129,26 @@ impl JitFunction {
             a.jmp(done);
             a.set_call_spill(Vec::new());
             a.set_call_globals(Vec::new());
+        }
+        // The deoptimization exits (`deopt`): the interpreter finishes the
+        // activation from the op, and its outcome is the body's (falling
+        // off the end returns what the body's own end would).
+        if let Some(info) = deopt_info {
+            for (stub, pc) in core::mem::take(&mut deopt_stubs) {
+                a.bind(stub);
+                let at = pc as u64 | u64::from(deopt_levels[pc]) << 32;
+                a.mov_rdi_r15();
+                a.mov_rsi_rbx();
+                a.movabs_argreg(2, n_regs as i64);
+                a.movabs_argreg(3, core::ptr::from_ref(info) as i64);
+                a.movabs_argreg(4, at as i64);
+                a.movabs_rax(helpers.deopt as usize as i64);
+                a.call_rax();
+                a.g_movabs(call_seq::r::R11, NanBox::jit_falloff_bits());
+                a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
+                a.g_jcc(call_seq::cc::E, labels[ops.len()]);
+                a.frame_epilogue();
+            }
         }
         // Throw exit. In a body with `try` regions, first offer the pending fault
         // to the activation's innermost handler (exactly the interpreter's

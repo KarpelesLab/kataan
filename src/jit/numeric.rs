@@ -2014,6 +2014,12 @@ impl NumGen {
         !self.copy && self.region_of.get(pc).is_some_and(|&r| r != u32::MAX)
     }
 
+    /// Whether `pc` lies in a promoted loop region, whichever version is
+    /// being emitted (its registers may be held in SSE registers there).
+    pub(super) fn in_any_region(&self, pc: usize) -> bool {
+        self.region_of.get(pc).is_some_and(|&r| r != u32::MAX)
+    }
+
     /// Whether `pc` lies in a speculative promoted loop region, whichever
     /// version is being emitted: such an op is emitted more than once
     /// ([`Self::schedule`]), and its slow paths leave for another version.
