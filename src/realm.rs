@@ -146,6 +146,13 @@ pub struct Realm {
     /// Raw handles (compiled code appends to it, see
     /// `Realm::jit_owed_offsets`).
     owed_fn_protos: Vec<u64>,
+    /// How many of `owed_fn_protos`' first entries are known to name old
+    /// objects (survivors of the last collection, which a minor collection
+    /// cannot free): a minor collection prunes only the entries past it.
+    /// Without it, every minor collection rechecked the closures that had
+    /// ever survived one, however long ago (they leave only with a full
+    /// collection), which grew with the program's run.
+    owed_fn_protos_old: usize,
     /// The own-property object an owing closure presents to a reader (see
     /// [`Realm::defer_vm_fn_prototype`]): its `prototype` (non-enumerable,
     /// non-configurable, writable) and constructible marker, exactly the keys
@@ -921,6 +928,7 @@ impl Realm {
             builtin_fn_shape: None,
             vm_fn_proto_shapes: None,
             owed_fn_protos: Vec::new(),
+            owed_fn_protos_old: 0,
             owed_fn_props: None,
             iter_result_shape: None,
             args_shapes: alloc::vec::Vec::new(),
@@ -2142,6 +2150,7 @@ impl Realm {
         if self.owed_fn_protos.is_empty() {
             self.owed_fn_protos = owed;
         }
+        self.owed_fn_protos_old = 0;
     }
 
     /// The own-property object of `h` as a reader sees it: its auxiliary
@@ -8266,6 +8275,7 @@ impl Realm {
             gc_side_log,
             gc_symbol_log,
             owed_fn_protos,
+            owed_fn_protos_old,
             ..
         } = self;
         // Phase 1 — mark from the real roots, expanding the weak-key side-tables
@@ -8280,8 +8290,9 @@ impl Realm {
             },
         );
         extern_prune(&marked);
-        // The owing closures list is weak.
+        // The owing closures list is weak; every survivor ends old.
         owed_fn_protos.retain(|h| marked.contains(&Handle::from_raw(*h)));
+        *owed_fn_protos_old = owed_fn_protos.len();
         // Phase 2 — drop every entry whose key is unmarked (full collection: an
         // unmarked key is genuinely dead, so no generation guard is needed).
         // Every table is walked whole, and every survivor ends old.
@@ -8357,6 +8368,7 @@ impl Realm {
             gc_symbol_log,
             gc_side_walk_all,
             owed_fn_protos,
+            owed_fn_protos_old,
             ..
         } = self;
         use gc::LiveSet as _;
@@ -8415,8 +8427,13 @@ impl Realm {
             let live = gc::MinorLive(heap);
             extern_prune(&live);
             // The owing closures list is weak (most entries are short-lived
-            // closures, dead by now).
-            owed_fn_protos.retain(|h| live.contains(&Handle::from_raw(*h)));
+            // closures, dead by now). The entries before `owed_fn_protos_old`
+            // name old objects, which a minor collection does not free; every
+            // survivor ends old.
+            retain_from(owed_fn_protos, *owed_fn_protos_old, |h| {
+                live.contains(&Handle::from_raw(h))
+            });
+            *owed_fn_protos_old = owed_fn_protos.len();
             let tables = PruneTables {
                 fn_source,
                 length_tracking_views,
@@ -8563,6 +8580,7 @@ impl Realm {
                 callable_null_protos,
                 native_class_tags,
                 owed_fn_protos,
+                owed_fn_protos_old,
                 ..
             } = self;
             let marked = gc::mark_with_ephemerons_scan(
@@ -8574,7 +8592,10 @@ impl Realm {
                 },
             );
             // The owing closures list is weak; the survivors move below.
+            // Compaction keeps ages, so a young survivor stays young: the
+            // next minor collection checks the whole list.
             owed_fn_protos.retain(|h| marked.contains(&Handle::from_raw(*h)));
+            *owed_fn_protos_old = 0;
             Self::ephemeron_prune(
                 &marked,
                 &|_| true,
@@ -9549,6 +9570,26 @@ impl Realm {
             _ => a.strict_equals(b),
         }
     }
+}
+
+/// [`Vec::retain`] of `list[from..]` alone: the entries before `from` all
+/// stay, unvisited.
+fn retain_from(list: &mut Vec<u64>, from: usize, mut keep: impl FnMut(u64) -> bool) {
+    let from = from.min(list.len());
+    let tail = &mut list[from..];
+    // Up to the first entry that leaves, nothing is written.
+    let Some(first) = tail.iter().position(|&x| !keep(x)) else {
+        return;
+    };
+    let mut w = first;
+    for r in first + 1..tail.len() {
+        let x = tail[r];
+        if keep(x) {
+            tail[w] = x;
+            w += 1;
+        }
+    }
+    list.truncate(from + w);
 }
 
 /// Borrows a rope's WTF-8 bytes zero-copy when it is an unconcatenated leaf, and
@@ -11159,6 +11200,40 @@ mod tests {
         assert!(realm.fn_owes_proto(f2));
         realm.materialize_owed_fn_protos();
         assert!(realm.get_property(f2, "prototype").is_some());
+    }
+
+    #[test]
+    fn minor_collections_prune_only_the_young_owing_closures() {
+        // `old` survives a minor collection; `young` is made after it.
+        let (mut realm, old) = realm_with_owing_closure();
+        realm.collect_minor(&[old]);
+        let young = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(young));
+        let kept = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(kept));
+        // Unrooted, `old` is not freed by a minor collection (and keeps its
+        // entry); the dead young one leaves, the rooted one stays.
+        realm.collect_minor(&[kept]);
+        assert_eq!(realm.owed_fn_protos, [old.to_raw(), kept.to_raw()]);
+        assert!(realm.fn_owes_proto(old) && realm.fn_owes_proto(kept));
+        // A full collection frees `old`, and its entry goes with it.
+        realm.collect(&[kept]);
+        assert_eq!(realm.owed_fn_protos, [kept.to_raw()]);
+        // After a compaction (which keeps ages) the whole list is checked.
+        let mut roots = [kept];
+        realm.compact(&mut roots);
+        let k2 = roots[0];
+        let dead = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(dead));
+        realm.collect_minor(&[k2]);
+        assert_eq!(realm.owed_fn_protos, [k2.to_raw()]);
+        // Materializing empties the list; a later minor collection checks
+        // what is appended from the start.
+        realm.materialize_owed_fn_protos();
+        let again = realm.new_vm_function(1, Vec::new());
+        assert!(realm.defer_vm_fn_prototype(again));
+        realm.collect_minor(&[]);
+        assert!(realm.owed_fn_protos.is_empty());
     }
 
     #[test]
