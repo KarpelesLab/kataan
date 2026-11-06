@@ -2094,25 +2094,20 @@ impl X64Assembler {
         }
     }
 
-    /// `movq [base + disp32], xmm(x)` (`base` neither `rsp` nor `r12`).
-    fn p_movq_mem_x(&mut self, base: u8, disp: i32, x: u8) {
-        debug_assert!(base & 7 != 4, "no SIB form");
-        self.raw(&[
-            0x66,
-            0x48 | (((x >> 3) & 1) << 2) | ((base >> 3) & 1),
-            0x0f,
-            0x7e,
-        ]);
-        self.raw(&[0x80 | ((x & 7) << 3) | (base & 7)]);
-        self.raw(&disp.to_le_bytes());
-    }
-
     /// The store twin of
     /// [`p_obj_fixed_slot_ex_xmm`](Self::p_obj_fixed_slot_ex_xmm): slot
     /// `slot` = the bits of `xmm(x)` (a promoted Number), with the same
     /// addressing (`ex`: the frame slot caching the object's `extra`
     /// pointer, `have`: it holds this object's). Returns whether the frame
-    /// slot then holds the object's `extra` pointer. Clobbers `r11`.
+    /// slot then holds the object's `extra` pointer. Clobbers `rdx`, `r11`.
+    ///
+    /// The bits go through `rdx` (`movq rdx, xmm` then an integer store),
+    /// not a `movq` store straight from the SSE register: the slot's next
+    /// read is an integer load, and a load of what an SSE store just wrote
+    /// waits for the store to retire (no forwarding across register files
+    /// on recent cores), while an integer store forwards to it at once. A
+    /// loop that reads back the field it stores each iteration (`o.x =
+    /// o.x + 1`) ran ~1.6x slower on that wait alone.
     pub(crate) fn p_obj_fixed_slot_store_xmm(
         &mut self,
         l: &JitLayout,
@@ -2121,31 +2116,14 @@ impl X64Assembler {
         have: bool,
         x: u8,
     ) -> bool {
-        match (Self::fixed_slot(l, slot), ex) {
-            (FixedSlot::Inline(disp), _) => {
-                self.p_movq_mem_x(r::RCX, disp, x);
-                have
-            }
-            (FixedSlot::Near(disp), Some(ex)) => {
-                if have {
-                    self.g_load(r::R11, r::RBP, ex);
-                } else {
-                    self.g_load(r::R11, r::RCX, l.props.off_extra);
-                    self.g_store(r::RBP, ex, r::R11);
-                }
-                self.p_movq_mem_x(r::R11, disp, x);
-                true
-            }
-            (FixedSlot::Near(disp), None) => {
-                self.g_load(r::R11, r::RCX, l.props.off_extra);
-                self.p_movq_mem_x(r::R11, disp, x);
+        // movq rdx, xmm(x): 66 REX.W(+R) 0F 7E /r, ModRM 11 xmm rdx.
+        self.raw(&[0x66, 0x48 | (((x >> 3) & 1) << 2), 0x0f, 0x7e]);
+        self.raw(&[0xc0 | ((x & 7) << 3) | r::RDX]);
+        match ex {
+            Some(ex) => self.p_obj_fixed_slot_ex(l, slot, true, ex, have),
+            None => {
+                self.p_obj_fixed_slot_store(l, slot);
                 false
-            }
-            (FixedSlot::Far(disp), _) => {
-                self.g_load(r::R11, r::RCX, l.props.off_extra);
-                self.g_load(r::R11, r::R11, l.extra_far_ptr);
-                self.p_movq_mem_x(r::R11, disp, x);
-                have
             }
         }
     }
