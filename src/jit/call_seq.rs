@@ -2626,7 +2626,12 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.g_store(RBP, e.slots.callee, r::RAX);
         a.jmp(mproven);
         a.bind(full);
+        // (The proof is void until a full identification records it again:
+        // its receiver too, or that receiver's next run here would take
+        // the proved path with no heap slot — the identification of
+        // another receiver that misses the memo records neither.)
         a.g_store_imm32(RBP, p.slot, 0);
+        a.store_empty(p.bits);
     }
     // 0c. A construct guard's proof (see `ConstructProof`): the same
     //     constructor and `new.target` values.
