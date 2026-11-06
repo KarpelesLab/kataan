@@ -287,7 +287,8 @@ fn property_attributes_scale_linearly() {
             "let c=0; for(let r=0;r<5;r++) c+=Object.keys(o).length;",
         )
     });
-    assert_scaling("getters on many accessors", 2_000, 8.0, |n| {
+    // n=2000 timed ~1 ms (the floor), so one millisecond of rounding decided the ratio.
+    assert_scaling("getters on many accessors", 8_000, 8.0, |n| {
         timed(
             &format!(
                 "const o={{}}; for(let i=0;i<{n};i++) Object.defineProperty(o,'k'+i,{{get(){{return i;}},enumerable:true}});"
