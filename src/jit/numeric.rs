@@ -2014,6 +2014,15 @@ impl NumGen {
         !self.copy && self.region_of.get(pc).is_some_and(|&r| r != u32::MAX)
     }
 
+    /// Whether `pc` lies in a speculative promoted loop region, whichever
+    /// version is being emitted: such an op is emitted more than once
+    /// ([`Self::schedule`]), and its slow paths leave for another version.
+    pub(super) fn in_any_spec(&self, pc: usize) -> bool {
+        self.region_of
+            .get(pc)
+            .is_some_and(|&r| r != u32::MAX && self.regions[r as usize].spec.is_some())
+    }
+
     /// Where those frame slots start: slot `k` is at `[rbp + base - 8(k+1)]`.
     /// Whether region op `pc` is a forward `JumpIfFalse` this emitter tests
     /// with [`Self::branch_if_false`]'s general path (its condition neither
@@ -5295,7 +5304,7 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
 /// Backward register liveness: the live-in set of every pc, as bitsets of
 /// `words` words. A `catch` entry's live-in is live out of every op (any op
 /// may throw to it). `None` if the table would be too large.
-fn liveness(ops: &[Op], n_regs: usize, catches: &[usize]) -> Option<(usize, Vec<u64>)> {
+pub(super) fn liveness(ops: &[Op], n_regs: usize, catches: &[usize]) -> Option<(usize, Vec<u64>)> {
     let n = ops.len();
     let words = n_regs.div_ceil(64);
     if n.saturating_mul(words).saturating_mul(64) > MAX_STATE * 8 {

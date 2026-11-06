@@ -1147,6 +1147,11 @@ pub(crate) fn emit_native_entry(
                 a.g_cmp_mem(r::RAX, r::R11, l.max_depth);
                 a.code.push(0xf5); // cmc: CF = depth >= max
                 a.code.extend_from_slice(&[0x4d, 0x19, 0xdb]); // sbb r11, r11
+                // (And a hosted run, which the slot proves too: see
+                // `emit_inline_guard`.) CF = hosted < 1.
+                a.g_cmp_byte_imm(r::R15, l.hosted, 1);
+                a.code.extend_from_slice(&[0x48, 0x19, 0xc0]); // sbb rax, rax
+                a.code.extend_from_slice(&[0x49, 0x09, 0xc3]); // or r11, rax
                 a.g_store(RBP, io.ok, r::R11);
             }
             None => a.frame_prologue(frame),
@@ -2229,7 +2234,7 @@ pub(crate) struct InlineSlots {
     pub hdr: i32,
     /// The active activation's callee value (the header's second word).
     pub callee: i32,
-    /// Whether the guards' limit checks hold (anything but
+    /// Whether the guards' limit checks hold, in a hosted run (anything but
     /// `RECV_CACHE_EMPTY`): set by a guard that made them, and emptied with
     /// the receiver cache's keys — by the prologue and after every call,
     /// the only places the facts they check (the caller's window on the
@@ -2385,6 +2390,25 @@ pub(crate) struct InlineEmit<'a> {
     /// lookup miss, `undefined`, which no way identifies); the later ways
     /// take it from there ([`CalleeSrc::Frame`]).
     pub poly: u16,
+    /// A polymorphic site's first way: per later way `w`, where its guard
+    /// takes a callee its own way identified (`poly_entry`), and whether
+    /// that way's inlined body loads captures. When the first way's guard
+    /// memos find way `w`'s callee (`emit_guard_fast`), it goes there
+    /// directly, with the callee in `slots.callee` and its captures'
+    /// pointer in `r8`, instead of missing into way `w`'s guard (whose
+    /// identification of that value is the memo's). Empty: miss as usual.
+    pub poly_direct: &'a [Option<(Label, bool)>],
+    /// A polymorphic site's later way: the label its guard binds where the
+    /// callee is identified as its way's (`poly_direct`).
+    pub poly_entry: Option<Label>,
+    /// A method or accessor guard reached only from an earlier method or
+    /// accessor guard's hit on the same receiver register, through ops that
+    /// run no Rust code and leave that register alone (a constant, a copy,
+    /// the receiver's own coercibility check, the hit's fused test): what
+    /// that hit checked and only Rust code changes still holds — the
+    /// limits and the host (the `ok` slot it set), and the receiver's lack
+    /// of own accessors. So this guard checks neither again.
+    pub after_hit: bool,
     /// The guard's **proof** slots (`rbp`-relative): the callee value it
     /// last identified, with its limits checked, and that value's
     /// captures' pointer. The first is one of the receiver cache's keys,
@@ -2625,14 +2649,54 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.jmp(cproven);
         a.bind(full);
     }
-    // 1. The callee value, into the `callee` slot (and rax).
+    // 1. The caller's window on the register stack, one realm, room under
+    //    both depth limits and for the header and the arguments (as
+    //    `emit_call`), and a hosted run (the method lookups' memos are a
+    //    hosted realm's) — unless no call since a guard checked them.
+    //    (An unhosted run checks again each time: a plain call's guard
+    //    needs no host, but must not prove one.)
+    //    (Nor after an earlier method guard's hit on this receiver with no
+    //    Rust code run since, `after_hit`: that guard checked them.)
+    a.dbg_mark(if e.after_hit {
+        "g-after-hit"
+    } else {
+        "g-limits"
+    });
+    if !e.after_hit {
+        let checked = a.new_label();
+        a.g_load(r::RAX, RBP, e.slots.ok);
+        a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
+        a.g_jcc(cc::NE, checked);
+        let method = matches!(e.callee, CalleeSrc::Method { .. } | CalleeSrc::Frame { .. });
+        if method {
+            a.g_cmp_byte_imm(r::R15, l.hosted, 0);
+            a.g_jcc(cc::E, lookup_miss);
+        }
+        // (With two levels, room and depth for both activations, either of
+        // which this one may be: a guard that cannot tell takes the call.)
+        let levels = e.slots.levels();
+        emit_limit_checks_deep(a, l, i32::try_from(levels - 1).ok()?, lookup_miss);
+        a.g_load(r::RAX, r::R10, STACK_TOP);
+        a.g_lea(
+            r::RAX,
+            r::RAX,
+            hdr(levels * (FRAME_HEADER + argc.max(e.slots.max_argc)))?,
+        );
+        a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
+        a.g_jcc(cc::A, lookup_miss);
+        if !method {
+            a.g_cmp_byte_imm(r::R15, l.hosted, 0);
+            a.g_jcc(cc::E, checked);
+        }
+        a.g_store_imm32(RBP, e.slots.ok, 0);
+        a.bind(checked);
+    }
+    // 2. The callee value, into the `callee` slot (and rax).
     match e.callee {
         CalleeSrc::Reg(c) => a.g_load(r::RAX, r::RBX, reg(c)),
         // A later way's: the value the first way's guard found.
         CalleeSrc::Frame { scratch } if way > 0 => a.g_load(r::RAX, RBP, scratch),
         CalleeSrc::Method { recv, site, .. } => {
-            a.g_cmp_byte_imm(r::R15, l.hosted, 0);
-            a.g_jcc(cc::E, lookup_miss);
             let got = a.new_label();
             let getter = e.getter.then_some(got);
             match e.way {
@@ -2703,7 +2767,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     }
     a.g_store(RBP, e.slots.callee, r::RAX);
     a.dbg_mark("g-ident");
-    // 2. Its function: the memo (the same value at the same prototype
+    // 3. Its function: the memo (the same value at the same prototype
     //    epoch, see `CallMemo`), else the cell, memoized when it is `key`'s.
     let decode = a.new_label();
     a.g_movabs(r::R11, e.memo as u64);
@@ -2754,28 +2818,12 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         emit_guard_fill(a, e, way);
     }
     a.bind(identified);
-    a.dbg_mark("g-limits");
-    // 3. The caller's window on the register stack, one realm, room under
-    //    both depth limits and for the header and the arguments (as
-    //    `emit_call`) — unless no call since a guard checked them.
-    let checked = a.new_label();
-    a.g_load(r::RAX, RBP, e.slots.ok);
-    a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
-    a.g_jcc(cc::NE, checked);
-    // (With two levels, room and depth for both activations, either of
-    // which this one may be: a guard that cannot tell takes the call.)
-    let levels = e.slots.levels();
-    emit_limit_checks_deep(a, l, i32::try_from(levels - 1).ok()?, miss);
-    a.g_load(r::RAX, r::R10, STACK_TOP);
-    a.g_lea(
-        r::RAX,
-        r::RAX,
-        hdr(levels * (FRAME_HEADER + argc.max(e.slots.max_argc)))?,
-    );
-    a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
-    a.g_jcc(cc::A, miss);
-    a.g_store_imm32(RBP, e.slots.ok, 0);
-    a.bind(checked);
+    // (Where the first way's guard brings a callee its memos identified as
+    // this way's: see `poly_direct`.)
+    if let Some(l) = e.poly_entry {
+        a.bind(l);
+    }
+    a.dbg_mark("g-proof");
     if let Some((bits, caps)) = proved {
         a.g_load(r::RAX, RBP, e.slots.callee);
         a.g_store(RBP, bits, r::RAX);
@@ -2795,7 +2843,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.bind(skip);
         a.bind(mproven);
     }
-    // 3b. A `new`: `this`, as the call's `[[Construct]]` would make it.
+    // 4. A `new`: `this`, as the call's `[[Construct]]` would make it.
     let n_caps = e.n_caps - u16::from(e.new_target.is_some());
     if let Some(t) = e.super_this {
         a.g_load(r::RAX, r::RBX, reg(t));
@@ -2821,7 +2869,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.bind(made);
     }
     a.dbg_mark("g-pend");
-    // 4. Pending, its captures in the inlined body's registers. (An inner
+    // 5. Pending, its captures in the inlined body's registers. (An inner
     //    level's activation keeps what `pend` held: the outer one's stub,
     //    or `0` when that one is materialized.)
     if let Some(save) = e.slots.save {
@@ -2917,8 +2965,12 @@ fn emit_guard_fast(
         load_proto_epoch(a, r::R9);
         a.g_cmp_mem(r::R9, r::R11, g(w, offset_of!(GuardMemo, stamp)));
         a.g_jcc(cc::NE, slow);
-        // No accessors on the receiver (as the lookup requires).
-        emit_no_accessors(a, slow);
+        // No accessors on the receiver (as the lookup requires) — as an
+        // earlier guard's hit found, with no Rust code run since
+        // (`after_hit`: only Rust code adds an accessor).
+        if !e.after_hit {
+            emit_no_accessors(a, slow);
+        }
         // (A data property for a call, a getter for a read: the memo's
         // lookup was this guard's.)
         a.g_load(r::R9, r::R11, lk(w, offset_of!(LookupMemo, value)));
@@ -2939,6 +2991,18 @@ fn emit_guard_fast(
                 a.g_store(RBP, p.shape, r::R9);
             }
             a.jmp(identified);
+        } else if let Some(&Some((entry, caps))) = e.poly_direct.get(w) {
+            // Way `w`'s callee: into its guard, as identified there (this
+            // guard's miss, which it skips, only stores `false`).
+            a.dbg_mark("g-direct");
+            if caps {
+                a.g_load(r::R8, r::R11, g(w, offset_of!(GuardMemo, caps)));
+            }
+            if !(e.dst_dead && e.fused_miss.is_some()) {
+                a.g_movabs(r::R9, crate::nanbox::NanBox::boolean(false).to_bits());
+                a.g_store(r::RBX, i32::from(e.dst) * 8, r::R9);
+            }
+            a.jmp(entry);
         } else {
             a.jmp(miss);
         }

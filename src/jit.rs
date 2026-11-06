@@ -7650,17 +7650,30 @@ impl JitFunction {
                     }
                 }
             }
+            // (Or not live after that test: every path on writes it before
+            // reading it.)
+            let live = numeric::liveness(bytecode, n_regs, &catch_targets);
+            let live_in = |pc: usize, r: u16| match &live {
+                Some((words, l)) => {
+                    pc >= bytecode.len()
+                        || (r as usize) >= n_regs
+                        || l.get(pc * words + r as usize / 64)
+                            .is_none_or(|w| w & (1u64 << (r % 64)) != 0)
+                }
+                None => true,
+            };
             (0..ops.len())
                 .map(|i| match (&ops[i], ops.get(i + 1), bytecode.get(i + 1)) {
                     (
                         &GenericOp::InlineGuard { dst, .. },
                         Some(&GenericOp::JumpIfFalse { cond, .. }),
-                        Some(crate::nbvm::Op::JumpIfFalse { cond: bc, .. }),
+                        Some(crate::nbvm::Op::JumpIfFalse { cond: bc, target }),
                     ) => {
                         cond == dst
                             && *bc == dst
                             && fused_test.get(i + 1) == Some(&true)
-                            && named.get(dst as usize) == Some(&2)
+                            && (named.get(dst as usize) == Some(&2)
+                                || (!live_in(i + 2, dst) && !live_in(*target, dst)))
                     }
                     _ => false,
                 })
@@ -8081,6 +8094,112 @@ impl JitFunction {
             & !15;
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
+        // Per polymorphic method site's first way, its later ways' guards'
+        // entries for a callee its memos identified (`call_seq::InlineEmit::
+        // poly_direct`), and per such later way, its entry: outside
+        // speculative loops (whose ops are emitted more than once), at one
+        // level.
+        let mut poly_entry: Vec<Option<Label>> = alloc::vec![None; ops.len()];
+        let mut poly_direct: Vec<Vec<Option<(Label, bool)>>> = alloc::vec![Vec::new(); ops.len()];
+        for (i, op) in ops.iter().enumerate() {
+            let GenericOp::InlineGuard { call, poly, .. } = *op else {
+                continue;
+            };
+            let ways = usize::from(poly >> 8);
+            if ways < 2
+                || poly & 0xff != 0
+                || num.in_any_spec(i)
+                || !matches!(
+                    ops.get(call as usize),
+                    Some(
+                        GenericOp::CallMethod { .. }
+                            | GenericOp::GetProp { .. }
+                            | GenericOp::SetProp { .. }
+                    )
+                )
+            {
+                continue;
+            }
+            let mut direct = alloc::vec![None; ways];
+            for (w, d) in direct.iter_mut().enumerate().skip(1) {
+                let Some(j) = (i + 1..ops.len()).find(|&j| {
+                    matches!(ops[j], GenericOp::InlineGuard { call: c, poly: p, .. }
+                        if c == call && usize::from(p) == (ways << 8) | w)
+                }) else {
+                    continue;
+                };
+                let GenericOp::InlineGuard { n_caps, .. } = ops[j] else {
+                    continue;
+                };
+                if num.in_any_spec(j) || inl_level[j] != inl_level[i] || poly_entry[j].is_some() {
+                    continue;
+                }
+                let l = a.new_label();
+                poly_entry[j] = Some(l);
+                *d = Some((l, n_caps > 0));
+            }
+            poly_direct[i] = direct;
+        }
+        // (Which of those entries are bound: all of them, or no code.)
+        let mut poly_bound: Vec<bool> = alloc::vec![false; ops.len()];
+        // The method guards reached only from an earlier method guard's
+        // hit on the same receiver register with no Rust code run between
+        // (`call_seq::InlineEmit::after_hit`): back from the guard through
+        // constants, copies and that receiver's coercibility check (none
+        // entered from elsewhere, none writing the receiver) to the earlier
+        // guard's test, outside speculative loops (whose slow paths leave
+        // for another version of the body).
+        let after_hit: Vec<bool> = {
+            let bt = recv_cache::branch_targets(ops, osr_entries, &catch_targets);
+            let recv_of = |k: usize| match ops.get(k)? {
+                GenericOp::InlineGuard { call, .. } => match ops.get(*call as usize)? {
+                    GenericOp::CallMethod { recv, .. } => Some(*recv),
+                    GenericOp::GetProp { obj, .. } | GenericOp::SetProp { obj, .. } => Some(*obj),
+                    _ => None,
+                },
+                _ => None,
+            };
+            (0..ops.len())
+                .map(|j| {
+                    let (Some(r), GenericOp::InlineGuard { poly, .. }) = (recv_of(j), &ops[j])
+                    else {
+                        return false;
+                    };
+                    if poly & 0xff != 0 || num.in_any_spec(j) {
+                        return false;
+                    }
+                    let mut p = j;
+                    loop {
+                        if bt[p] || p < 2 {
+                            return false;
+                        }
+                        let q = p - 1;
+                        match ops[q] {
+                            GenericOp::Const { dst, .. } | GenericOp::Move { dst, .. }
+                                if dst != r => {}
+                            GenericOp::Interp { .. }
+                                if matches!(
+                                    bytecode.get(q),
+                                    Some(crate::nbvm::Op::RequireObjectCoercible { src, .. })
+                                        if *src == r
+                                ) => {}
+                            GenericOp::JumpIfFalse { cond, .. } if !bt[q] => {
+                                let k = q - 1;
+                                return matches!(ops[k], GenericOp::InlineGuard {
+                                    dst, caps, n_caps, ..
+                                } if dst == cond
+                                    && dst != r
+                                    && !(caps..caps.saturating_add(n_caps)).contains(&r)
+                                    && recv_of(k) == Some(r)
+                                    && !num.in_any_spec(k));
+                            }
+                            _ => return false,
+                        }
+                        p = q;
+                    }
+                })
+                .collect()
+        };
         // The heap arena in `r12`/`r13` for the whole body (`pin`), the
         // caller's in the frame's deepest two slots.
         if pin::worth_pinning(ops) {
@@ -8968,6 +9087,10 @@ impl JitFunction {
                             new_alloc,
                             new_way,
                             poly,
+                            poly_direct: &poly_direct[op_idx],
+                            after_hit: after_hit[op_idx],
+                            poly_entry: poly_entry[op_idx]
+                                .filter(|_| !core::mem::replace(&mut poly_bound[op_idx], true)),
                             proved: proved_slot[op_idx].map(inl_proved),
                             mproved: mproof_slot[op_idx].map(inl_mproved),
                             cproved: cproof_slot[op_idx].map(inl_cproved),
@@ -12791,6 +12914,13 @@ impl JitFunction {
             a.dbg_marks.iter().map(|m| (m.1, m.2)).collect();
         // (The profiling labels between the entries and the exact entries
         // are only reported.)
+        if poly_entry
+            .iter()
+            .zip(&poly_bound)
+            .any(|(e, &b)| e.is_some() && !b)
+        {
+            return None;
+        }
         let (code, at) = a.finish_reporting(&want, 2..want.len() - 2);
         let f = Self::from_code(&code);
         if let (Some(path), Some(f)) = (opmap, f.as_ref()) {
@@ -12803,8 +12933,12 @@ impl JitFunction {
                 let mut s = alloc::format!("B {:x} {} {}\n", f.code_ptr(), code.len(), ops.len());
                 for i in 0..ops.len() {
                     let name = alloc::format!("{:?}", ops[i]);
-                    let name = name.split([' ', '{', '(']).next().unwrap_or("");
-                    s.push_str(&alloc::format!("O {} {} {}\n", i, at[2 + i], name));
+                    let short = name.split([' ', '{', '(']).next().unwrap_or("");
+                    s.push_str(&alloc::format!("O {} {} {}\n", i, at[2 + i], short));
+                    s.push_str(&alloc::format!("F {i} {name}\n"));
+                    if let Some(b) = bytecode.get(i) {
+                        s.push_str(&alloc::format!("Y {i} {b:?}\n"));
+                    }
                 }
                 let mut k = 2 + ops.len();
                 for i in 0..ops.len() {
