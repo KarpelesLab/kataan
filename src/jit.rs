@@ -11353,19 +11353,53 @@ impl JitFunction {
                         if val_x.is_none() {
                             a.load_rdx(disp(val));
                         }
+                        // Whether some read of this layout's slot loads it
+                        // straight into an SSE register (`GetProp`'s
+                        // `direct`), which an SSE store suits; any other
+                        // read is an integer load, which an integer store
+                        // suits (`p_obj_fixed_slot_store_xmm_gpr`).
+                        let sse_read = || {
+                            ops.iter().enumerate().any(|(q, o)| match *o {
+                                GenericOp::GetProp { dst, site, .. } => {
+                                    sites
+                                        .get(site as usize)
+                                        .and_then(|t| t.baked)
+                                        .is_some_and(|g| g.shape == b.shape && g.slot == b.slot)
+                                        && num.result_xmm(q, dst).is_some()
+                                        && num.in_spec(q)
+                                }
+                                _ => false,
+                            })
+                        };
                         match (ex, val_x) {
                             (Some(p), Some(x)) => {
                                 let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
-                                extra_in_frame[op_idx] = a.p_obj_fixed_slot_store_xmm(
-                                    &layout,
-                                    b.slot,
-                                    Some(rc_extra(p.way)),
-                                    have,
-                                    x,
-                                );
+                                extra_in_frame[op_idx] = if sse_read() {
+                                    a.p_obj_fixed_slot_store_xmm(
+                                        &layout,
+                                        b.slot,
+                                        Some(rc_extra(p.way)),
+                                        have,
+                                        x,
+                                    )
+                                } else {
+                                    a.p_obj_fixed_slot_store_xmm_gpr(
+                                        &layout,
+                                        b.slot,
+                                        Some(rc_extra(p.way)),
+                                        have,
+                                        x,
+                                    )
+                                };
                             }
                             (None, Some(x)) => {
-                                a.p_obj_fixed_slot_store_xmm(&layout, b.slot, None, false, x);
+                                if sse_read() {
+                                    a.p_obj_fixed_slot_store_xmm(&layout, b.slot, None, false, x);
+                                } else {
+                                    a.p_obj_fixed_slot_store_xmm_gpr(
+                                        &layout, b.slot, None, false, x,
+                                    );
+                                }
                             }
                             (Some(p), None) => {
                                 let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
