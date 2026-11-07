@@ -42,8 +42,9 @@ use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
     N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_GEN_NEXT, N_GEN_RETURN,
     N_GEN_THROW, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN, N_NUMBER_PROTO_FN,
-    N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_KEYS,
-    N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
+    N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_HAS_OWN,
+    N_OBJECT_KEYS, N_OBJECT_VALUES, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD,
+    N_STRING_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -143,6 +144,10 @@ enum FastOp {
     ObjKeys,
     /// `Object.entries`.
     ObjEntries,
+    /// `Object.values`.
+    ObjValues,
+    /// `Object.hasOwn(o, k)`: `ObjHasOwn` with `o` the receiver.
+    ObjStaticHasOwn,
     /// `Object.create(proto)` (no property descriptors).
     ObjCreate,
     /// A built-in `Math` function (its native id), computed by
@@ -213,6 +218,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_ARRAY_IS_ARRAY) => return FastOp::ArrayIsArray,
         Some(N_OBJECT_KEYS) => return FastOp::ObjKeys,
         Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
+        Some(N_OBJECT_VALUES) => return FastOp::ObjValues,
+        Some(N_OBJECT_HAS_OWN) => return FastOp::ObjStaticHasOwn,
         Some(N_OBJECT_CREATE) => return FastOp::ObjCreate,
         Some(N_OBJECT_ASSIGN | N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
         Some(N_GEN_NEXT) => return FastOp::GenResume(0),
@@ -785,6 +792,45 @@ fn run_op(
     if let FastOp::GenResume(mode) = op {
         return super::gen_fast::call(ctx, funcs, recv, mode, arg(0));
     }
+    // `Object.prototype.hasOwnProperty.call(o, k)` (the `for-in` idiom):
+    // `hasOwnProperty`'s own fast op, with `o` its receiver — what the call
+    // amounts to once `Function.prototype.call` (which the site proved) has
+    // run. (Anything that op does not decide is the general path's.)
+    // `Object.hasOwn(o, k)` likewise (`o` an object, `k` a key whose
+    // ToPropertyKey runs no code: the order of the two conversions is then
+    // unobservable).
+    if op == FastOp::ObjStaticHasOwn {
+        let t = arg(0).as_handle()?;
+        let rest = args.get(1..).unwrap_or(&[]);
+        return run_op(
+            ctx,
+            funcs,
+            FastOp::ObjHasOwn,
+            method,
+            arg(0),
+            Handle::from_raw(t),
+            false,
+            regs,
+            rest,
+        );
+    }
+    if op == FastOp::FnCall
+        && let Some(t) = arg(0).as_handle()
+        && ctx.realm.native_at(h) == Some(N_OBJ_PROTO_HASOWN)
+    {
+        let rest = args.get(1..).unwrap_or(&[]);
+        return run_op(
+            ctx,
+            funcs,
+            FastOp::ObjHasOwn,
+            recv.to_bits(),
+            arg(0),
+            Handle::from_raw(t),
+            false,
+            regs,
+            rest,
+        );
+    }
     if let FastOp::ArrayHof(op) = op {
         let argv = super::ArgBuf::from_regs(regs, args);
         return super::array_hof::run(ctx, funcs, regs, recv, op, &argv);
@@ -808,7 +854,11 @@ fn run_op(
     }
     let realm = &mut ctx.realm;
     let v = match op {
-        FastOp::None | FastOp::ArrayHof(_) | FastOp::StrReplaceAll | FastOp::GenResume(_) => {
+        FastOp::None
+        | FastOp::ArrayHof(_)
+        | FastOp::StrReplaceAll
+        | FastOp::GenResume(_)
+        | FastOp::ObjStaticHasOwn => {
             return None;
         }
         #[cfg(feature = "std")]
@@ -962,9 +1012,22 @@ fn run_op(
         FastOp::ObjHasOwn => {
             // An ordinary object receiver (ToObject is the identity), and a key
             // whose ToPropertyKey runs no code: a string or another primitive
-            // that is not a Symbol.
+            // that is not a Symbol. (A host-exotic receiver — a module
+            // namespace, whose [[GetOwnProperty]] may throw for a binding
+            // still in its TDZ, which `.call` and `Object.hasOwn` reach —
+            // is the general path's.)
             realm.object_key_epoch(h)?;
+            if realm.is_host_exotic(h) {
+                return None;
+            }
             let k = arg(0);
+            // A key String whose own slot in the receiver's layout is
+            // memoized (a `for-in` key of its list, a key the String-key slot
+            // memo names): an own data property.
+            let o = NanBox::handle(h.to_raw());
+            if realm.for_in_key_slot(o, k).is_some() || realm.key_memo_probe(o, k).is_some() {
+                return Some(Ok(NanBox::boolean(true)));
+            }
             let leaf;
             let owned;
             let key: &str = match k.as_handle().map(Handle::from_raw) {
@@ -1431,13 +1494,20 @@ fn run_op(
                 }
             }
         }
-        FastOp::ObjKeys | FastOp::ObjEntries => {
+        FastOp::ObjKeys | FastOp::ObjEntries | FastOp::ObjValues => {
             let o = arg(0).as_handle().map(Handle::from_raw)?;
             let strs = realm.plain_enumerable_key_strings(o)?;
             if op == FastOp::ObjKeys {
                 return Some(Ok(NanBox::handle(realm.new_array(strs.to_vec()).to_raw())));
             }
             let keys = realm.plain_enumerable_key_ropes(o)?;
+            if op == FastOp::ObjValues {
+                let mut out = alloc::vec::Vec::with_capacity(keys.len());
+                for k in keys.iter() {
+                    out.push(realm.get_property(o, k.as_leaf_str()?)?);
+                }
+                return Some(Ok(NanBox::handle(realm.new_array(out).to_raw())));
+            }
             let mut out = alloc::vec::Vec::with_capacity(keys.len());
             for (k, &kv) in keys.iter().zip(strs.iter()) {
                 let v = realm.get_property(o, k.as_leaf_str()?)?;

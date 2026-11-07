@@ -89,8 +89,16 @@ impl Realm {
         allow(dead_code)
     )]
     pub(crate) fn for_in_key_value(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
-        self.for_in_key_slot(obj, key)
-            .and_then(|(o, slot)| o.slot(slot))
+        if let Some((o, slot)) = self.for_in_key_slot(obj, key) {
+            return o.slot(slot);
+        }
+        // An own key of a dictionary receiver's memoized list: its value,
+        // unless it is an accessor.
+        let (o, name) = self.for_in_dict_own_key(obj, key)?;
+        if o.accessor(name).is_some() {
+            return None;
+        }
+        o.get(name)
     }
 
     /// `obj[key]` for a String `key` naming an own **data** property of the
@@ -141,6 +149,47 @@ impl Realm {
         o.get(key)
     }
 
+    /// The array index a String key names, when its text is that index's
+    /// canonical form (`"0"`, `"17"`; not `"01"`, `"-1"`, `"1.0"` or
+    /// `"4294967295"`): the property key the Number index would convert to.
+    #[must_use]
+    pub(crate) fn string_array_index(&self, key: NanBox) -> Option<usize> {
+        let b = self
+            .heap
+            .get(Handle::from_raw(key.as_handle()?))?
+            .as_str()?
+            .as_leaf_bytes()?;
+        if b.is_empty() || b.len() > 10 || (b.len() > 1 && b[0] == b'0') {
+            return None;
+        }
+        let mut n: u64 = 0;
+        for &c in b {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + u64::from(c - b'0');
+        }
+        (n < u64::from(u32::MAX)).then_some(n as usize)
+    }
+
+    /// `obj[key]` for a key (a Number, or a String in an array index's
+    /// canonical form) naming a present element of a plain dense array
+    /// (`plain_array_get`): the element. `None` for anything else.
+    #[must_use]
+    #[inline]
+    pub(crate) fn plain_array_get_key(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
+        let h = Handle::from_raw(obj.as_handle()?);
+        // (The receiver first: most keys reach here for other objects.)
+        if !matches!(self.heap.get(h), Some(Cell::Array(_))) {
+            return None;
+        }
+        let n = match key.as_number() {
+            Some(n) => n,
+            None => self.string_array_index(key)? as f64,
+        };
+        self.plain_array_get(h, n)
+    }
+
     /// `key in obj` (`[[HasProperty]]`) for a String `key`, when every object
     /// on `obj`'s prototype chain up to the answer is an ordinary one (see
     /// the module docs). `None` when that cannot be told here.
@@ -152,8 +201,11 @@ impl Realm {
         let k = self.string_key_in_place(key)?;
         let h = Handle::from_raw(obj.as_handle()?);
         // The receiver itself (`has_property_named`'s first link): an own
-        // data slot is memoized, as `own_data_by_string` does.
-        let o = self.ordinary_props(h, false)?;
+        // data slot is memoized, as `own_data_by_string` does. (A present
+        // element of a plain dense array is an own property.)
+        let Some(o) = self.ordinary_props(h, false) else {
+            return self.plain_array_get_key(obj, key).map(|_| true);
+        };
         if let Some(shape) = o.shaped_shape() {
             if let Some(slot) = shape.lookup(k) {
                 if o.has_no_accessors() && !shape.is_wrapper() && !self.has_argument_map_marker(h) {
@@ -183,7 +235,8 @@ impl Realm {
         allow(dead_code)
     )]
     pub(crate) fn has_property_by_for_in_key(&self, key: NanBox, obj: NanBox) -> Option<bool> {
-        if self.for_in_key_slot(obj, key).is_some() {
+        if self.for_in_key_slot(obj, key).is_some() || self.for_in_dict_own_key(obj, key).is_some()
+        {
             return Some(true);
         }
         self.has_property_by_string(key, obj)

@@ -11959,6 +11959,40 @@ fn object_keys_of_one_layout_are_fresh_arrays() {
 }
 
 #[test]
+fn for_in_over_arrays_and_dictionaries_sees_chain_changes() {
+    // The chain proof of a plain array's key list, and a dictionary-mode
+    // receiver's memoized list, both follow later changes.
+    assert_eq!(
+        run(
+            "function ks(x){ var r=[]; for (var k in x) r.push(k); return r.join(); }\
+             var out=[ks([1,,3])];\
+             Array.prototype.e=1; out.push(ks([1,2])); delete Array.prototype.e;\
+             out.push(ks([1,2])); Array.prototype[2]='x'; out.push(ks([1,2])); Array.prototype.length=0;\
+             var d={a:1,b:2,c:3}; delete d.b; out.push(ks(d)); d.z=1; out.push(ks(d));\
+             Object.defineProperty(d,'a',{enumerable:false}); out.push(ks(d));\
+             Object.prototype.q=1; out.push(ks(d)); delete Object.prototype.q; out.push(ks(d));\
+             out.join('|')"
+        ),
+        "0,2|0,1,e|0,1|0,1,2|a,c|a,c,z|c,z|c,z,q|c,z"
+    );
+}
+
+#[test]
+fn has_own_and_values_fast_paths() {
+    assert_eq!(
+        run(
+            "var hop=Object.prototype.hasOwnProperty, o={a:1}, c=Object.create(o); c.b=2;\
+             var r=[hop.call(c,'a'), hop.call(c,'b'), Object.hasOwn(c,'b'), Object.hasOwn(c,'a'),\
+                    hop.call('ab',1), Object.hasOwn([5],0), 0 in [5], 1 in [5], '0' in [5],\
+                    '01' in [5], [5,6]['1'], [5,6]['01'], JSON.stringify(Object.values({x:1,y:'t'}))];\
+             var t; try { Object.hasOwn(null,'a'); } catch(e) { t = e.constructor.name; }\
+             r.push(t); r.join()"
+        ),
+        "false,true,true,false,true,true,true,false,true,false,6,,[1,\"t\"],TypeError"
+    );
+}
+
+#[test]
 fn proxy_is_extensible_invariant() {
     // The isExtensible trap result must equal the target's actual extensibility.
     assert_eq!(

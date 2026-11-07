@@ -7314,10 +7314,15 @@ pub(crate) extern "C" fn jit_helper_has_prop(
     // SAFETY: as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
-    match ctx
-        .realm
-        .has_property_by_for_in_key(NanBox::from_bits(key), NanBox::from_bits(obj))
-    {
+    let (k, o) = (NanBox::from_bits(key), NanBox::from_bits(obj));
+    // A Number index of a present element of a plain dense array.
+    if k.is_number() {
+        return match ctx.realm.plain_array_get_key(o, k) {
+            Some(_) => NanBox::boolean(true).to_bits(),
+            None => NanBox::undefined().to_bits(),
+        };
+    }
+    match ctx.realm.has_property_by_for_in_key(k, o) {
         Some(r) => NanBox::boolean(r).to_bits(),
         None => NanBox::undefined().to_bits(),
     }
@@ -11030,6 +11035,13 @@ fn vm_get_elem_from(
                         .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))))))
     {
         return host_get(ctx, recv, key);
+    }
+    // So is one keyed by a String in an index's canonical form, as
+    // `for (k in a) a[k]` reads it.
+    if !key.is_number()
+        && let Some(v) = ctx.realm.plain_array_get_key(recv, key)
+    {
+        return Ok(v);
     }
     let handle = recv
         .as_handle()

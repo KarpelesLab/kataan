@@ -258,6 +258,58 @@ pub(crate) struct ForInCache {
     /// The tables of entries replaced since, which a compiled loop may still
     /// hold (their roots stay roots while one does).
     retired: Vec<Weak<KeyTable>>,
+    /// The chain last found to add no key to a plain dense array's `for-in`.
+    array_chain: Option<ArrayChain>,
+    /// The key lists of receivers that are no plain shaped object (a
+    /// dictionary-mode one: [`Realm::for_in_cached_dict_array`]), round-robin.
+    dicts: [Option<DictEntry>; DICT_CAP],
+    /// The entry a new receiver replaces next.
+    dict_next: usize,
+    /// As `key_bits`, for the dictionary entries' key Strings.
+    dict_bits: Vec<u64>,
+}
+
+/// How many non-shaped receivers' key lists the cache remembers.
+const DICT_CAP: usize = 4;
+
+/// Whether the object at `h` owns `key`.
+fn o_has_own(realm: &Realm, h: Handle, key: &str) -> bool {
+    matches!(realm.heap.get(h), Some(Cell::Object(o)) if o.has_own_key(key))
+}
+
+/// The memoized `for-in` key list of one ordinary object whose keys its
+/// shape does not decide (see [`Realm::for_in_cached_dict_array`]).
+struct DictEntry {
+    /// The receiver's raw handle (its slot's generation included).
+    obj: u64,
+    /// Its key epoch then: equal later, it has the same own keys, with the
+    /// same enumerability.
+    epoch: u32,
+    /// `(handle, key epoch)` per prototype-chain link, nearest first.
+    links: Vec<(u64, u32)>,
+    /// `Realm::cell_swaps` when the entry was made.
+    swaps: u32,
+    /// The `for-in` key list.
+    keys: Vec<NanBox>,
+    /// Per key: its storage name when it is an own key of the receiver whose
+    /// String is its own storage key (`Realm::string_key_in_place`), else
+    /// `None`.
+    own: Vec<Option<alloc::string::String>>,
+    /// The index of the key [`Realm::for_in_dict_own_key`] last found.
+    hint: core::cell::Cell<u32>,
+    /// The bits of the array of `keys` handed to every loop over the
+    /// receiver (`0` until one is made), as `Realm::for_in_cached_array`'s.
+    array: core::cell::Cell<u64>,
+}
+
+/// A prototype chain that adds no key to a plain dense array's `for-in`
+/// ([`Realm::for_in_plain_array`]): its links' raw handles, nearest first
+/// (the last one's `[[Prototype]]` is `null`), the prototype epoch they were
+/// found at (every link's keys watched) and `Realm::cell_swaps` then.
+struct ArrayChain {
+    links: Vec<u64>,
+    stamp: u64,
+    swaps: u32,
 }
 
 /// The heap slot index of a handle (its low half; the high half is the
@@ -510,6 +562,291 @@ impl Realm {
         cache.entries[w] = Some(entry);
     }
 
+    /// A receiver [`for_in_cached_dict_array`](Self::for_in_cached_dict_array) can
+    /// describe: an ordinary object that is no plain shaped one (whose
+    /// entries the shape-keyed ones are), no primitive wrapper, global object,
+    /// host-exotic object or mapped `arguments` object.
+    fn for_in_dict_receiver(&self, h: Handle) -> Option<&crate::object::Object> {
+        let Some(Cell::Object(o)) = self.heap.get(h) else {
+            return None;
+        };
+        if o.is_plain_shaped()
+            || o.is_prim_wrapper()
+            || o.jit_flags() & crate::object::JIT_FLAG_GLOBAL != 0
+            || self.is_host_exotic(h)
+            || self.has_argument_map_marker(h)
+        {
+            return None;
+        }
+        Some(o)
+    }
+
+    /// An array of the memoized `for-in` key list of `h`, an ordinary
+    /// object whose keys its shape does not decide (a dictionary-mode one,
+    /// say), when an entry still describes it exactly: the very object (by
+    /// handle) with the key epoch it had (the same own keys, equally
+    /// enumerable), and every prototype-chain link the same object with its
+    /// key epoch then. The array is the entry's own, made once and shared by
+    /// every loop over `h` while the list stands, as
+    /// [`for_in_cached_array`](Self::for_in_cached_array)'s is.
+    pub(crate) fn for_in_cached_dict_array(&mut self, h: Handle) -> Option<NanBox> {
+        let e = self.for_in_cached_dict_entry(h)?;
+        if e.array.get() != 0 {
+            return Some(NanBox::from_bits(e.array.get()));
+        }
+        let keys = e.keys.clone();
+        let a = NanBox::handle(self.new_array(keys).to_raw());
+        // (Allocating moves no cell: the entry still stands.)
+        if let Some(e) = self.for_in_cached_dict_entry(h) {
+            e.array.set(a.to_bits());
+        }
+        Some(a)
+    }
+
+    /// The entry [`for_in_cached_dict_array`](Self::for_in_cached_dict_array)
+    /// finds for `h`.
+    fn for_in_cached_dict_entry(&self, h: Handle) -> Option<&DictEntry> {
+        let cache = self.for_in_cache.as_deref()?;
+        let o = self.for_in_dict_receiver(h)?;
+        let raw = h.to_raw();
+        let e = cache
+            .dicts
+            .iter()
+            .flatten()
+            .find(|e| e.obj == raw && e.epoch == o.key_epoch())?;
+        if e.swaps != self.cell_swaps {
+            return None;
+        }
+        let mut cur = o.proto();
+        for &(link_raw, epoch) in &e.links {
+            let link = cur?;
+            if link.to_raw() != link_raw {
+                return None;
+            }
+            let (now, next) = self.for_in_link(link)?;
+            if now != epoch {
+                return None;
+            }
+            cur = next;
+        }
+        if cur.is_some() {
+            return None;
+        }
+        Some(e)
+    }
+
+    /// Records `keys` as the `for-in` key list of `h` when it is a receiver
+    /// [`for_in_cached_dict_array`](Self::for_in_cached_dict_array) can describe and its
+    /// chain one an entry can.
+    pub(crate) fn for_in_remember_dict(&mut self, h: Handle, keys: &[NanBox]) {
+        let Some(o) = self.for_in_dict_receiver(h) else {
+            return;
+        };
+        let epoch = o.key_epoch();
+        let mut links = Vec::new();
+        let mut cur = o.proto();
+        while let Some(link) = cur {
+            if links.len() == MAX_LINKS {
+                return;
+            }
+            let Some((e, next)) = self.for_in_link(link) else {
+                return;
+            };
+            links.push((link.to_raw(), e));
+            cur = next;
+        }
+        let own = keys
+            .iter()
+            .map(|&k| {
+                let t = self.string_key_in_place(k)?;
+                o_has_own(self, h, t).then(|| alloc::string::String::from(t))
+            })
+            .collect();
+        let entry = DictEntry {
+            obj: h.to_raw(),
+            epoch,
+            links,
+            swaps: self.cell_swaps,
+            keys: keys.to_vec(),
+            own,
+            hint: core::cell::Cell::new(0),
+            array: core::cell::Cell::new(0),
+        };
+        let cache = self.for_in_cache.get_or_insert_with(Default::default);
+        for k in &entry.keys {
+            if let Some(raw) = k.as_handle() {
+                let (word, bit) = key_bit(raw);
+                if word >= cache.dict_bits.len() {
+                    cache.dict_bits.resize(word + 1, 0);
+                }
+                cache.dict_bits[word] |= bit;
+            }
+        }
+        let w = cache
+            .dicts
+            .iter()
+            .position(|e| e.as_ref().is_some_and(|e| e.obj == entry.obj))
+            .unwrap_or_else(|| {
+                let w = cache.dict_next % DICT_CAP;
+                cache.dict_next = (w + 1) % DICT_CAP;
+                w
+            });
+        cache.dicts[w] = Some(entry);
+    }
+
+    /// The receiver `obj` and the storage name of `key`, when `key` is one of
+    /// the key Strings of `obj`'s memoized dictionary key list
+    /// ([`for_in_cached_dict_array`](Self::for_in_cached_dict_array)) that is an own key
+    /// of it, and `obj`'s own keys are still the ones the list was made
+    /// with (its key epoch): `key in obj` is then true, and `obj[key]` the
+    /// value of that own property. Found by handle near the entry's hint
+    /// (a loop presents the keys in order); `None` otherwise.
+    #[must_use]
+    #[inline]
+    pub(crate) fn for_in_dict_own_key(
+        &self,
+        obj: NanBox,
+        key: NanBox,
+    ) -> Option<(&crate::object::Object, &str)> {
+        let cache = self.for_in_cache.as_deref()?;
+        let (word, bit) = key_bit(key.as_handle()?);
+        if cache.dict_bits.get(word).is_none_or(|w| w & bit == 0) {
+            return None;
+        }
+        self.for_in_dict_own_key_of(cache, obj, key)
+    }
+
+    /// [`for_in_dict_own_key`](Self::for_in_dict_own_key) once the key's
+    /// bit is set.
+    #[inline(never)]
+    fn for_in_dict_own_key_of<'a>(
+        &'a self,
+        cache: &'a ForInCache,
+        obj: NanBox,
+        key: NanBox,
+    ) -> Option<(&'a crate::object::Object, &'a str)> {
+        let raw = obj.as_handle()?;
+        let Some(Cell::Object(o)) = self.heap.get(Handle::from_raw(raw)) else {
+            return None;
+        };
+        let e = cache
+            .dicts
+            .iter()
+            .flatten()
+            .find(|e| e.obj == raw && e.epoch == o.key_epoch() && e.swaps == self.cell_swaps)?;
+        let bits = key.to_bits();
+        let at = e.hint.get() as usize;
+        let hit = |i: usize| (e.keys.get(i)?.to_bits() == bits).then_some(i);
+        let i = hit(at).or_else(|| hit(at + 1)).or_else(|| hit(0))?;
+        e.hint.set(i as u32);
+        // (A String with an auxiliary object is the general path's, as in
+        // `string_key_in_place`.)
+        if self.str_special && self.aux_props.contains_key(&key.as_handle()?) {
+            return None;
+        }
+        Some((o, e.own.get(i)?.as_deref()?))
+    }
+
+    /// The indices a `for (k in a)` over the plain dense array `h` lists, in
+    /// order, when they are the whole key list: `h` keeps every element in
+    /// its element vector and has no named own property (no auxiliary
+    /// object), and its prototype chain has no enumerable String key at all,
+    /// so it adds nothing whatever the shadowing. A link is an ordinary
+    /// object, or an array with no element (`%Array.prototype%`) whose named
+    /// properties (its auxiliary object's) are all non-enumerable. The chain
+    /// is walked once, every link's keys watched (an object's, an array
+    /// link's auxiliary object's: a change to them bumps the prototype
+    /// epoch), and then proved by the epoch, the links' identities and the
+    /// array links' element counts. `None` for anything else (the general
+    /// walk decides).
+    pub(crate) fn for_in_plain_array(&mut self, h: Handle) -> Option<Vec<usize>> {
+        let Some(Cell::Array(a)) = self.heap.get(h) else {
+            return None;
+        };
+        if self.aux_props.contains_key(&h.to_raw()) || self.is_host_exotic(h) {
+            return None;
+        }
+        let indices: Vec<usize> = (0..a.len()).filter(|&i| !a[i].is_hole()).collect();
+        let proto = self.object_proto(h);
+        if self.for_in_array_chain_hit(proto) {
+            return Some(indices);
+        }
+        let mut links = Vec::new();
+        let mut watch = Vec::new();
+        let mut cur = proto;
+        while let Some(link) = cur {
+            if links.len() == MAX_LINKS || self.is_host_exotic(link) {
+                return None;
+            }
+            match self.heap.get(link)? {
+                Cell::Object(_) => {
+                    self.for_in_link(link)?;
+                    if !self.object_keys(link)?.is_empty() {
+                        return None;
+                    }
+                    watch.push(link);
+                }
+                Cell::Array(el) => {
+                    if !el.is_empty() || !self.aux_named_keys(link).is_empty() {
+                        return None;
+                    }
+                    if let Some(&aux) = self.aux_props.get(&link.to_raw()) {
+                        if !matches!(self.heap.get(aux), Some(Cell::Object(_))) {
+                            return None;
+                        }
+                        watch.push(aux);
+                    }
+                }
+                _ => return None,
+            }
+            links.push(link.to_raw());
+            cur = self.object_proto(link);
+        }
+        for &w in &watch {
+            if let Some(Cell::Object(o)) = self.heap.get_mut(w) {
+                o.watch();
+            }
+        }
+        let chain = ArrayChain {
+            links,
+            stamp: crate::object::proto_epoch(),
+            swaps: self.cell_swaps,
+        };
+        self.for_in_cache
+            .get_or_insert_with(Default::default)
+            .array_chain = Some(chain);
+        Some(indices)
+    }
+
+    /// Whether the chain from `proto` is the one
+    /// [`for_in_plain_array`](Self::for_in_plain_array) last found to add no
+    /// key, unchanged.
+    fn for_in_array_chain_hit(&self, proto: Option<Handle>) -> bool {
+        let Some(c) = self
+            .for_in_cache
+            .as_deref()
+            .and_then(|c| c.array_chain.as_ref())
+        else {
+            return false;
+        };
+        if c.stamp != crate::object::proto_epoch() || c.swaps != self.cell_swaps {
+            return false;
+        }
+        let mut cur = proto;
+        for &raw in &c.links {
+            let Some(link) = cur.filter(|l| l.to_raw() == raw) else {
+                return false;
+            };
+            if let Some(Cell::Array(el)) = self.heap.get(link)
+                && !el.is_empty()
+            {
+                return false;
+            }
+            cur = self.object_proto(link);
+        }
+        cur.is_none()
+    }
+
     /// The ordinary object `obj` and the slot of the key String `key` in it,
     /// when `key` is one of the memoized key Strings of an entry for `obj`'s
     /// shape and an own key there, and `obj` has no accessors and is not
@@ -592,6 +929,16 @@ impl Realm {
         if let Some(c) = self.for_in_cache.as_deref() {
             for e in c.entries.iter().flatten() {
                 e.table.roots(out);
+            }
+            for e in c.dicts.iter().flatten() {
+                let array = Some(e.array.get()).filter(|&a| a != 0);
+                out.extend(
+                    e.keys
+                        .iter()
+                        .map(|k| k.to_bits())
+                        .chain(array)
+                        .filter_map(|b| NanBox::from_bits(b).as_handle().map(Handle::from_raw)),
+                );
             }
             for t in c.retired.iter().filter_map(Weak::upgrade) {
                 t.roots(out);

@@ -1214,7 +1214,7 @@ const N_CONSOLE_LOG: u16 = 7;
 pub(crate) const N_JSON_STRINGIFY: u16 = 8;
 pub(crate) const N_JSON_PARSE: u16 = 27;
 pub(crate) const N_OBJECT_KEYS: u16 = 9;
-const N_OBJECT_VALUES: u16 = 10;
+pub(crate) const N_OBJECT_VALUES: u16 = 10;
 pub(crate) const N_ARRAY_IS_ARRAY: u16 = 11;
 pub(crate) const N_MATH_FLOOR: u16 = 12;
 pub(crate) const N_MATH_CEIL: u16 = 13;
@@ -1761,7 +1761,7 @@ const N_OBJECT_DEFINE_PROP: u16 = 110;
 const N_OBJECT_GET_OWN_DESC: u16 = 111;
 const N_WEAKMAP: u16 = 112;
 const N_OBJECT_IS: u16 = 123;
-const N_OBJECT_HAS_OWN: u16 = 129;
+pub(crate) const N_OBJECT_HAS_OWN: u16 = 129;
 const N_OBJECT_GROUP_BY: u16 = 138;
 const N_OBJECT_GET_OWN_DESCS: u16 = 130;
 const N_WEAKREF: u16 = 131;
@@ -10150,6 +10150,39 @@ impl crate::nbvm::VmHost for Interp {
             let keys = keys.to_vec();
             return Ok((NanBox::handle(self.realm.new_array(keys).to_raw()), obj));
         }
+        // An ordinary object whose keys its shape does not decide (a
+        // dictionary-mode one), memoized by identity and key epoch.
+        // (Its array is the entry's own, shared as the layout-keyed
+        // entries' is: only the loop's element reads see it.)
+        if let Some(raw) = obj.as_handle()
+            && let Some(a) = self.realm.for_in_cached_dict_array(Handle::from_raw(raw))
+        {
+            return Ok((a, obj));
+        }
+        // A plain dense array over a chain that adds no key: its present
+        // indices, without walking the chain's (non-enumerable) methods.
+        if let Some(raw) = obj.as_handle()
+            && let Some(indices) = self.realm.for_in_plain_array(Handle::from_raw(raw))
+        {
+            let keys: Vec<NanBox> = indices
+                .into_iter()
+                .map(|i| {
+                    // (The index's decimal text, without a formatter.)
+                    let mut b = [0u8; 20];
+                    let (mut n, mut p) = (i, b.len());
+                    loop {
+                        p -= 1;
+                        b[p] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    self.new_str(core::str::from_utf8(&b[p..]).unwrap_or("0"))
+                })
+                .collect();
+            return Ok((NanBox::handle(self.realm.new_array(keys).to_raw()), obj));
+        }
         // A Proxy anywhere on the chain is walked through its traps (including
         // `getPrototypeOf`, so the keys it inherits are enumerated too).
         let trap_keys = match obj.as_handle() {
@@ -10177,6 +10210,8 @@ impl crate::nbvm::VmHost for Interp {
                 let keys = self.iterate_keys(obj);
                 if let Some(raw) = obj.as_handle() {
                     self.realm.for_in_remember(Handle::from_raw(raw), &keys);
+                    self.realm
+                        .for_in_remember_dict(Handle::from_raw(raw), &keys);
                 }
                 (keys, live)
             }

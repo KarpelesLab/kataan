@@ -11201,7 +11201,22 @@ impl JitFunction {
                             a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
                             a.store_rax(disp(*dst));
                             let cold = a.cold_begin();
+                            // What the heap alone decides (an element of a
+                            // plain array, an ordinary chain's String key:
+                            // `jit_helper_has_prop`), else the interpreter.
+                            let exec = a.new_label();
                             a.bind(slow);
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(*key));
+                            a.load_argreg(2, disp(*obj));
+                            a.movabs_rax(has_prop_helper as i64);
+                            a.call_rax();
+                            a.movabs_r11(NanBox::undefined().to_bits() as i64);
+                            a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
+                            a.g_jcc(call_seq::cc::E, exec);
+                            a.store_rax(disp(*dst));
+                            a.jmp(done);
+                            a.bind(exec);
                             exec_op!(pc);
                             a.jmp(done);
                             a.cold_end(cold);
