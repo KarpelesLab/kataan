@@ -542,6 +542,12 @@ pub enum Op {
         src: Reg,
         ok: Reg,
     },
+    /// The spread of an inlined `f(...src)` (machine-code tier only, see
+    /// `jit::inline`): when spreading `src` runs no code (as for
+    /// [`Op::CallSpreadPlain`]) and yields exactly `dsts.len()` elements,
+    /// they go to `dsts` in order and `ok = true`; otherwise nothing happens
+    /// and `ok = false`.
+    SpreadInto { ok: Reg, src: Reg, dsts: Vec<Reg> },
     /// `dst = true` when destructuring a fresh array literal runs no code:
     /// its `@@iterator` (from `%Array.prototype%`) is the built-in one, the
     /// iterator's `next` the intrinsic one, and no `return` is reachable for
@@ -9293,6 +9299,7 @@ fn run_frame_at_ic(
                 regs[*dst as usize] =
                     NanBox::boolean(iter_fast::fresh_array_is_plain(&mut ctx.realm));
             }
+            Op::SpreadInto { ok, src, dsts } => spread_into(ctx, regs, *ok, *src, dsts),
             Op::CallSpreadPlain {
                 dst,
                 callee,
@@ -9307,6 +9314,13 @@ fn run_frame_at_ic(
                 };
                 regs[*ok as usize] = NanBox::boolean(true);
                 let (f, t) = (regs[*callee as usize], regs[*this as usize]);
+                // The callee feedback the machine-code tier inlines from.
+                if let Some((fid, c)) = f
+                    .as_handle()
+                    .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+                {
+                    site_cache!(site).note_callee(u64::from(fid) | ((c.len() as u64) << 32));
+                }
                 let pub_mark = ctx.frame_shadow.len();
                 ctx.frame_shadow.extend_from_slice(regs);
                 ctx.frames_published += 1;
@@ -11298,6 +11312,20 @@ fn plain_spread_argv(ctx: &mut Ctx, regs: &[NanBox], items: &[Reg], src: NanBox)
     let mut argv = ArgBuf::from_regs(regs, items);
     argv.extend_from_slice(elems);
     Some(argv)
+}
+
+/// [`Op::SpreadInto`]: the elements of `src` into `dsts` and `ok = true` when
+/// spreading it runs no code ([`plain_spread_argv`]) and yields exactly
+/// `dsts.len()` of them; else `ok = false` and nothing else.
+fn spread_into(ctx: &mut Ctx, regs: &mut [NanBox], ok: Reg, src: Reg, dsts: &[Reg]) {
+    let argv = plain_spread_argv(ctx, regs, &[], regs[src as usize]);
+    let hit = argv.as_ref().is_some_and(|a| a.len() == dsts.len());
+    if let (true, Some(a)) = (hit, argv) {
+        for (&d, &v) in dsts.iter().zip(a.iter()) {
+            regs[d as usize] = v;
+        }
+    }
+    regs[ok as usize] = NanBox::boolean(hit);
 }
 
 /// A call's argument (or capture) values, inline up to eight so an ordinary

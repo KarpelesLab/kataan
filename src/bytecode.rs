@@ -841,6 +841,11 @@ fn verify_op_with(
             regs(items)
         }
         Op::FreshArrayIterPlain { dst } => reg(*dst),
+        Op::SpreadInto { ok, src, dsts } => {
+            reg(*ok)?;
+            reg(*src)?;
+            regs(dsts)
+        }
         Op::ConstructSpread { dst, ctor, args } => {
             reg(*dst)?;
             reg(*ctor)?;
@@ -1928,6 +1933,12 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(226, out);
             w_reg(*dst, out);
         }
+        Op::SpreadInto { ok, src, dsts } => {
+            w_u8(227, out);
+            w_reg(*ok, out);
+            w_reg(*src, out);
+            w_regs(dsts, out);
+        }
         Op::CallSpreadPlain {
             dst,
             callee,
@@ -2747,6 +2758,11 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             this: r.reg()?,
         },
         226 => Op::FreshArrayIterPlain { dst: r.reg()? },
+        227 => Op::SpreadInto {
+            ok: r.reg()?,
+            src: r.reg()?,
+            dsts: r.regs()?,
+        },
         225 => {
             let (dst, callee, this, src, ok) = (r.reg()?, r.reg()?, r.reg()?, r.reg()?, r.reg()?);
             Op::CallSpreadPlain {

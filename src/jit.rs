@@ -4322,13 +4322,15 @@ impl JitProto {
                 _ => None,
             })
             .collect();
-        // (And each `super(…)`'s own call site, whose callee feedback an
+        // (And each `super(…)`'s and spread call's own call site, whose callee feedback an
         // inlining recompilation reads: `call_hints`.)
         let mut call_pcs = call_pcs;
         if let Some(own) = interp_sites(&bytecode, call_args.len(), n_calls) {
             for (pc, op) in bytecode.iter().enumerate() {
-                if let (crate::nbvm::Op::SuperCallArgs { .. }, Some(Some((_, site)))) =
-                    (op, own.get(pc))
+                if let (
+                    crate::nbvm::Op::SuperCallArgs { .. } | crate::nbvm::Op::CallSpreadPlain { .. },
+                    Some(Some((_, site))),
+                ) = (op, own.get(pc))
                 {
                     call_pcs.push((u32::try_from(pc).ok()?, *site));
                 }
@@ -4495,6 +4497,7 @@ impl JitProto {
                 | crate::nbvm::Op::CallWithMethod { .. }
                 | crate::nbvm::Op::Construct { .. }
                 | crate::nbvm::Op::SuperCallArgs { .. }
+                | crate::nbvm::Op::CallSpreadPlain { .. }
                 | crate::nbvm::Op::CallKey { .. }
                 | crate::nbvm::Op::GetProp { .. }
                 | crate::nbvm::Op::SetProp { .. }
@@ -7871,6 +7874,19 @@ impl JitFunction {
                                 crate::nbvm::Op::FreshArrayIterPlain { dst },
                                 GenericOp::JumpIfFalse { cond, target },
                             ) => cond == dst && *target > i && *target <= ops.len() && okr(*dst),
+                            // So does an inlined spread's `SpreadInto`.
+                            (
+                                crate::nbvm::Op::SpreadInto { ok: dst, src, dsts },
+                                GenericOp::JumpIfFalse { cond, target },
+                            ) => {
+                                cond == dst
+                                    && *target > i
+                                    && *target <= ops.len()
+                                    && okr(*dst)
+                                    && okr(*src)
+                                    && dsts.len() <= 32
+                                    && dsts.iter().all(|&r| okr(r))
+                            }
                             _ => false,
                         }
                 })
@@ -10555,6 +10571,63 @@ impl JitFunction {
                         // code, as the realm last published it valid
                         // (`p_array_iter_fresh`): `true` inline. Anything
                         // else is the interpreter's op (which may publish).
+                        // An inlined `f(...xs)`'s spread (`inline::split_spread`):
+                        // over a plain array whose iteration is the built-in
+                        // one (as `Op::CallSpreadPlain`'s test) of exactly
+                        // `dsts.len()` elements, none a hole, those elements
+                        // and `true` inline; anything else `false` (the
+                        // spread call the site falls back to handles it, and
+                        // publishes the iteration memo this test reads).
+                        crate::nbvm::Op::SpreadInto {
+                            ok: flag,
+                            src,
+                            dsts,
+                        } if ok(*flag)
+                            && ok(*src)
+                            && dsts.len() <= 32
+                            && dsts.iter().all(|&r| ok(r)) =>
+                        {
+                            use call_seq::r as R;
+                            // Its `JumpIfFalse`, fused (`forin_fuse`): a miss
+                            // branches from here.
+                            let fused = match ops.get(op_idx + 1) {
+                                Some(&GenericOp::JumpIfFalse { target, .. })
+                                    if forin_fuse.get(op_idx + 1) == Some(&true) =>
+                                {
+                                    Some(num.branch_label(&labels, op_idx + 1, target)?)
+                                }
+                                _ => None,
+                            };
+                            let slow = a.new_label();
+                            let fin = a.new_label();
+                            a.p_array_iter_open(helpers.call_layout.realm, slow);
+                            walk_to_slot!(*src, slow);
+                            family_checks!(recv_cache::Family::Arr, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
+                            a.jne(slow);
+                            // r8 = the count, r11 = the first element.
+                            a.p_arr_len_ptr(&layout);
+                            a.g_cmp_imm(R::R8, i32::try_from(dsts.len()).ok()?);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            a.g_movabs(R::RDX, NanBox::hole().to_bits());
+                            for i in 0..dsts.len() {
+                                a.g_cmp_mem(R::RDX, R::R11, 8 * i as i32);
+                                a.g_jcc(call_seq::cc::E, slow);
+                            }
+                            for (i, &d) in dsts.iter().enumerate() {
+                                a.g_load(R::RAX, R::R11, 8 * i as i32);
+                                a.g_store(R::RBX, disp(d), R::RAX);
+                            }
+                            a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                            a.store_rax(disp(*flag));
+                            a.bind(fin);
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            a.movabs_rax(NanBox::boolean(false).to_bits() as i64);
+                            a.store_rax(disp(*flag));
+                            a.jmp(fused.unwrap_or(fin));
+                            a.cold_end(cold);
+                        }
                         crate::nbvm::Op::FreshArrayIterPlain { dst } if ok(*dst) => {
                             // Its `JumpIfFalse`, fused (`forin_fuse`): `true`
                             // falls through it, the helper's result is tested

@@ -766,6 +766,69 @@ fn split_call_key(op: &Op, m: Reg) -> Option<(Op, Op)> {
     ))
 }
 
+/// A spread call `f(items…, ...src)` (`Op::CallSpreadPlain`) is inlined,
+/// for a callee of `n_params` parameters, as its spread into the scratch
+/// registers from `from` on — `Op::SpreadInto`, which takes only a spread
+/// that runs no code and yields exactly the `k` elements the parameters
+/// leave after the items (so the inlined activation's arguments are the
+/// call's), its `ok` the scratch register `flag` — then the plain call of
+/// `items…` and those registers with `this` the call's (`Op::CallWithMethod`
+/// with no key, the guard's fallback). The site, as spliced:
+///
+/// ```text
+///       SpreadInto { ok: flag, src, dsts }
+///       JumpIfFalse flag → S
+///       the way (guard … InlineLeave), then ok = flag, Jump E
+///       CallWithMethod { dst, callee, recv: this, args: items… dsts… }
+///       ok = flag
+///       Jump E
+/// S     the CallSpreadPlain itself (any other spread)
+/// E     past the site: the op after it, or the spread's own test of `ok`
+///       jumped over (it would fall through to its jump)
+/// ```
+///
+/// `None` for any other op. (Returns the spread, the call, `ok` and the
+/// argument count.)
+fn split_spread(op: &Op, n_params: usize, from: Reg) -> Option<(Op, Op, Reg, usize)> {
+    let Op::CallSpreadPlain {
+        dst,
+        callee,
+        this,
+        items,
+        src,
+        ok,
+    } = op
+    else {
+        return None;
+    };
+    let k = n_params.saturating_sub(items.len());
+    let dsts: Vec<Reg> = (0..k).map(|i| from + i as Reg).collect();
+    let flag = from + k as Reg;
+    let mut args = items.clone();
+    args.extend_from_slice(&dsts);
+    Some((
+        Op::SpreadInto {
+            ok: flag,
+            src: *src,
+            dsts,
+        },
+        Op::CallWithMethod {
+            dst: *dst,
+            callee: *callee,
+            recv: *this,
+            key: alloc::string::String::new(),
+            args,
+        },
+        *ok,
+        items.len() + k,
+    ))
+}
+
+/// The ops a spread site (`split_spread`) adds to its way's block and its
+/// call: the spread and its test, the way's `ok` move, the call's `ok` move
+/// and jump, and the spread call itself.
+const SPREAD_EXTRA: usize = 6;
+
 /// Splices the callees `pick` names into `proto`'s bytecode (see the module
 /// docs); `warm` is the caller's warm inline caches by its own pc. `None` when
 /// no call was inlined.
@@ -783,12 +846,24 @@ pub fn expand<'a>(
         // (A computed-key call's callee is its read's scratch register, above
         // the caller's: its receiver and key must be the caller's.)
         let split = split_call_key(op, Reg::MAX);
-        let parts = match (&split, op) {
-            (Some((_, call)), Op::CallKey { key, .. }) if (*key as usize) < base => {
+        // (A spread call's: its items' call; its spread and `ok` registers
+        // must be the caller's.)
+        let spread = match op {
+            Op::CallSpreadPlain { src, ok, .. }
+                if (*src as usize) < base && (*ok as usize) < base =>
+            {
+                split_spread(op, 0, 0)
+            }
+            _ => None,
+        };
+        let parts = match (&split, &spread, op) {
+            (Some((_, call)), _, Op::CallKey { key, .. }) if (*key as usize) < base => {
                 call_parts(call).map(|(d, _, a, t)| (d, 0, a, t))
             }
-            (Some(_), _) => None,
-            (None, _) => call_parts(op),
+            (Some(_), _, _) => None,
+            (None, Some((_, call, _, _)), _) => call_parts(call),
+            (None, None, Op::CallSpreadPlain { .. }) => None,
+            (None, None, _) => call_parts(op),
         };
         let Some((dst, callee, args, this)) = parts else {
             continue;
@@ -846,12 +921,22 @@ pub fn expand<'a>(
             {
                 continue;
             }
-            let cost = c.proto.ops.len() + c.proto.n_regs + 6;
+            // (A spread's scratch registers: its arguments and its flag.)
+            let spread_regs = match &spread {
+                Some(_) => match split_spread(op, c.proto.n_params, 0) {
+                    Some((_, _, _, argc)) if argc <= 32 => argc + 1,
+                    _ => continue,
+                },
+                None => 0,
+            };
+            let cost = c.proto.ops.len() + c.proto.n_regs + 6 + SPREAD_EXTRA;
             if added + cost > MAX_ADDED_OPS {
                 continue;
             }
             added += cost;
-            window = window.max(c.proto.n_regs + 1 + usize::from(split.is_some() || discards(op)));
+            window = window.max(
+                c.proto.n_regs + 1 + usize::from(split.is_some() || discards(op)) + spread_regs,
+            );
             ways.push(c);
         }
         if !ways.is_empty() {
@@ -877,11 +962,15 @@ pub fn expand<'a>(
             next += sites[si]
                 .1
                 .iter()
-                .map(|c| block_len(&c.proto, &proto.ops[pc]))
+                .map(|c| way_len(&c.proto, &proto.ops[pc]))
                 .sum::<usize>()
                 + 1;
             if matches!(proto.ops[pc], Op::CallKey { .. }) {
                 next += 1;
+            }
+            // (A spread's own two before its way, three after its call.)
+            if matches!(proto.ops[pc], Op::CallSpreadPlain { .. }) {
+                next += 5;
             }
             si += 1;
         } else {
@@ -908,8 +997,46 @@ pub fn expand<'a>(
             let top = site_ways.iter().map(|c| c.proto.n_regs).max().unwrap_or(0);
             let split = split_call_key(op, rb((top + 1) as Reg));
             let mut w = w;
-            let op = match split {
-                Some((read, call)) => {
+            // A spread call (monomorphic): its spread first (a branch to
+            // the call enters it), then the way and the plain call of its
+            // arguments; the spread call itself after those, for any other
+            // spread (see `split_spread`).
+            let spread = match site_ways.first() {
+                Some(c) if split.is_none() => {
+                    split_spread(op, c.proto.n_params, rb((top + 1) as Reg))
+                }
+                _ => None,
+            };
+            // (Past the site: over the spread's own test of `ok` when it
+            // falls through to a jump.)
+            let spread_end = match (proto.ops.get(pc + 1), proto.ops.get(pc + 2)) {
+                (Some(Op::JumpIfFalse { cond, target }), Some(Op::Jump { target: t }))
+                    if spread.as_ref().is_some_and(|s| s.2 == *cond) && *target == pc + 3 =>
+                {
+                    own(*t)
+                }
+                _ => own(pc + 1),
+            };
+            let mut spread_tail: Option<(Reg, Reg, Option<WarmEntry>)> = None;
+            let op = match (split, spread) {
+                (_, Some((pre, call, ok, _))) => {
+                    let Op::SpreadInto { ok: flag, .. } = pre else {
+                        return None;
+                    };
+                    let ways_len = site_ways
+                        .iter()
+                        .map(|c| way_len(&c.proto, op))
+                        .sum::<usize>();
+                    let target = ops.len() + 2 + ways_len + 3;
+                    for o in [pre, Op::JumpIfFalse { cond: flag, target }] {
+                        ops.push(o);
+                        nwarm.push(None);
+                        orig_of.push(u32::MAX);
+                    }
+                    spread_tail = Some((ok, flag, w.take()));
+                    alloc::borrow::Cow::Owned(call)
+                }
+                (Some((read, call)), None) => {
                     // The read first (a branch to the call enters it); a
                     // throw from it is the call's, as `Op::CallKey`'s is.
                     ops.push(read);
@@ -918,10 +1045,13 @@ pub fn expand<'a>(
                     w = None;
                     alloc::borrow::Cow::Owned(call)
                 }
-                None => alloc::borrow::Cow::Borrowed(op),
+                (None, None) => alloc::borrow::Cow::Borrowed(op),
             };
+            let spread_op = spread_tail.as_ref().map(|_| proto.ops[pc].clone());
             let op = &*op;
             let (dst, callee, args, this) = call_parts(op)?;
+            // (A spread's way also sets its `ok`, before its jump past it.)
+            let tail_move = usize::from(sup.is_some() || spread_tail.is_some());
             // (A dropped result: the scratch register above every way's
             // window.)
             let dst = if discards(op) {
@@ -934,16 +1064,20 @@ pub fn expand<'a>(
             let fallback = ops.len()
                 + site_ways
                     .iter()
-                    .map(|c| block_len(&c.proto, op))
+                    .map(|c| block_len(&c.proto, op) + usize::from(spread_tail.is_some()))
                     .sum::<usize>();
-            let end = fallback + 1;
+            let end = if spread_tail.is_some() {
+                spread_end
+            } else {
+                fallback + 1
+            };
             let n_ways = site_ways.len();
             for (way, c) in site_ways.iter().enumerate() {
                 let p: &FnProto = &c.proto;
                 let g = ops.len();
                 let tmp = rb(p.n_regs as Reg);
-                let next_way = g + block_len(p, op);
-                let leave = next_way - 2 - usize::from(sup.is_some());
+                let next_way = g + block_len(p, op) + usize::from(spread_tail.is_some());
+                let leave = next_way - 2 - tail_move;
                 macro_rules! emit {
                     ($o:expr, $w:expr, $ops:expr $(,)?) => {{
                         $ops.push($o);
@@ -1111,6 +1245,9 @@ pub fn expand<'a>(
                 if let Some((_, t)) = sup {
                     emit!(Op::Move { dst: t, src: dst }, None, ops);
                 }
+                if let Some((ok, flag, _)) = spread_tail {
+                    emit!(Op::Move { dst: ok, src: flag }, None, ops);
+                }
                 emit!(Op::Jump { target: end }, None, ops);
                 debug_assert_eq!(ops.len(), next_way);
             }
@@ -1119,6 +1256,17 @@ pub fn expand<'a>(
             ops.push(op.clone());
             nwarm.push(w);
             orig_of.push(u32::MAX);
+            // A spread's: `ok`, the jump past the site, the spread call.
+            if let (Some((ok, flag, sw)), Some(sop)) = (spread_tail, spread_op) {
+                for o in [Op::Move { dst: ok, src: flag }, Op::Jump { target: end }] {
+                    ops.push(o);
+                    nwarm.push(None);
+                    orig_of.push(u32::MAX);
+                }
+                ops.push(sop);
+                nwarm.push(sw);
+                orig_of.push(u32::MAX);
+            }
             continue;
         }
         let mut o = op.clone();
@@ -1226,6 +1374,15 @@ fn block_len(p: &FnProto, site: &Op) -> usize {
         + usize::from(falls_off(p))
         + 2
         + usize::from(super_parts(site).is_some())
+}
+
+/// The ops one way of an inlined site takes ([`block_len`]; a spread
+/// call's also sets its `ok`, see [`split_spread`]).
+fn way_len(p: &FnProto, site: &Op) -> usize {
+    match split_spread(site, p.n_params, 0) {
+        Some((_, call, _, _)) => block_len(p, &call) + 1,
+        None => block_len(p, site),
+    }
 }
 
 /// A `super(…)` site's `(new.target, this)` registers (`Op::SuperCallArgs`:

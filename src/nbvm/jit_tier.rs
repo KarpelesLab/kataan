@@ -1618,6 +1618,12 @@ pub(crate) extern "C" fn jit_helper_exec_op(
                 })
             }
         },
+        // An inlined spread's elements (its interpreter arm, which cannot
+        // fail).
+        Op::SpreadInto { ok, src, dsts } => {
+            super::spread_into(ctx, regs, *ok, *src, dsts);
+            Some(Ok(()))
+        }
         // Whether a fresh array destructures without running code (its
         // interpreter arm, which cannot fail).
         Op::FreshArrayIterPlain { dst } => {
@@ -4069,6 +4075,7 @@ pub(super) fn cold_call_pcs(
                     | Op::CallKey { .. }
                     | Op::Construct { .. }
                     | Op::SuperCallArgs { .. }
+                    | Op::CallSpreadPlain { .. }
             ) && hints
                 .get(pc)
                 .is_none_or(|h| *h == crate::ic::CalleeHint::None)
