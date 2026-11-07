@@ -7828,6 +7828,34 @@ impl Realm {
     /// object. Callers append their own roots and pass the union to
     /// [`collect`](Self::collect).
     pub fn gc_roots(&self, out: &mut Vec<Handle>) {
+        self.gc_roots_but_native_protos(out);
+        out.extend(self.native_protos.values().copied());
+    }
+
+    /// [`gc_roots`](Self::gc_roots) for a **minor** collection: the same, but
+    /// of the explicit `[[Prototype]]` overrides only those recorded since the
+    /// last collection (every other one was a root of that collection, so is
+    /// old, and a minor collection need not trace an old root). There is one
+    /// override per collection, `Map`, `Set`, `Date`, typed array... ever
+    /// made: rooting them all made each minor collection's cost grow with
+    /// the number of such objects alive. Every change to the table logs its
+    /// key in `gc_side_log` (a compaction, which leaves young survivors
+    /// young, asks for the whole table instead: `gc_side_walk_all`).
+    fn gc_roots_minor(&self, out: &mut Vec<Handle>) {
+        self.gc_roots_but_native_protos(out);
+        if self.gc_side_walk_all {
+            out.extend(self.native_protos.values().copied());
+        } else {
+            out.extend(
+                self.gc_side_log
+                    .iter()
+                    .filter_map(|raw| self.native_protos.get(raw).copied()),
+            );
+        }
+    }
+
+    /// [`gc_roots`](Self::gc_roots) but for the `native_protos` values.
+    fn gc_roots_but_native_protos(&self, out: &mut Vec<Handle>) {
         out.extend(
             [
                 self.default_object_proto,
@@ -7856,7 +7884,6 @@ impl Realm {
         // Explicit prototype links for cells with no inline object part, and the
         // class prototypes: both are keyed by an identity the heap graph does not
         // reach, so their values are strong roots.
-        out.extend(self.native_protos.values().copied());
         out.extend(self.typed_len_protos.iter().copied());
         out.extend(self.vm_fn_default_proto);
         out.extend(self.regexp_default_proto);
@@ -7922,8 +7949,6 @@ impl Realm {
         if self.heap.allocs_since_gc() < self.gc_threshold {
             return None;
         }
-        let mut all: Vec<Handle> = roots.to_vec();
-        self.gc_roots(&mut all);
         let pinned = self.gc_threshold_pinned;
         // A full collection once the heap has outgrown the last full one's
         // live set (old objects that died are reclaimed only then), and
@@ -7932,6 +7957,12 @@ impl Realm {
             || self.incremental.is_some()
             || self.heap.len() >= self.gc_major_limit
             || (pinned.is_some() && self.gc_cycles % 4 == 3);
+        let mut all: Vec<Handle> = roots.to_vec();
+        if major {
+            self.gc_roots(&mut all);
+        } else {
+            self.gc_roots_minor(&mut all);
+        }
         self.gc_cycles = self.gc_cycles.wrapping_add(1);
         let stats = if major {
             self.collect_with(&all, extern_expand, extern_prune)
@@ -11200,6 +11231,37 @@ mod tests {
         assert!(realm.fn_owes_proto(f2));
         realm.materialize_owed_fn_protos();
         assert!(realm.get_property(f2, "prototype").is_some());
+    }
+
+    #[test]
+    fn native_proto_overrides_stay_roots_of_minor_collections() {
+        // Allocates until the pressure trigger runs a collection.
+        fn collect_once(realm: &mut Realm, roots: &[Handle]) {
+            for _ in 0..1_000_000 {
+                realm.new_object();
+                if realm.maybe_collect(roots).is_some() {
+                    return;
+                }
+            }
+            panic!("no collection ran");
+        }
+        let mut realm = Realm::new();
+        let a = realm.new_native(1);
+        let pa = realm.new_object();
+        realm.set_native_proto(a, pa);
+        collect_once(&mut realm, &[a]);
+        // `pa` survived as a root (and is old now); a later override with a
+        // young prototype, and a replaced one, are roots of the next.
+        let b = realm.new_native(1);
+        let pb = realm.new_object();
+        realm.set_native_proto(b, pb);
+        let pa2 = realm.new_object();
+        realm.set_native_proto(a, pa2);
+        collect_once(&mut realm, &[a, b]);
+        collect_once(&mut realm, &[a, b]);
+        assert_eq!(realm.object_proto(a), Some(pa2));
+        assert_eq!(realm.object_proto(b), Some(pb));
+        assert!(realm.heap.is_live(pb) && realm.heap.is_live(pa2));
     }
 
     #[test]
