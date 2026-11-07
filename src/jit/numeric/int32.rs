@@ -934,6 +934,7 @@ impl NumGen {
             }
         }
         self.gstore(a, p);
+        self.store_lazy_args(a);
     }
 
     /// Whether `r` is a promoted global's pseudo-register.

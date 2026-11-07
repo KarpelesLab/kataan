@@ -3420,6 +3420,9 @@ impl X64Assembler {
         // (A lazily pending activation is pending from here: its marker
         // first, `rax` kept.)
         if let Some((stub, d, copy)) = self.lazy_pend {
+            for (x, d) in self.lazy_args.clone() {
+                self.movsd_mem_x(d, x);
+            }
             self.lazy_pend_store(stub, d, copy);
         }
         if let Some(d) = self.inline_pend {
@@ -3435,6 +3438,13 @@ impl X64Assembler {
     /// the `lazy_pend` field).
     pub(crate) fn set_lazy_pend(&mut self, p: Option<LazyPend>) {
         self.lazy_pend = p;
+        self.lazy_args.clear();
+    }
+
+    /// Sets the lazily pending activation's arguments still in SSE
+    /// registers (see the `lazy_args` field), after [`set_lazy_pend`](Self::set_lazy_pend).
+    pub(crate) fn set_lazy_args(&mut self, args: alloc::vec::Vec<(u8, i32)>) {
+        self.lazy_args = args;
     }
 
     /// `[rbp + d] = &stub`, every register and the flags kept (`push rax;

@@ -1076,6 +1076,11 @@ struct Stub {
     restore: bool,
 }
 
+/// A lazily pending activation's arguments its guard left in their SSE
+/// registers ([`NumGen::guard_args`]): `(guard pc, leave pc, in the integer
+/// version, (xmm, register) each)`.
+type LazyArgs = (usize, usize, bool, Vec<(u8, u16)>);
+
 /// The per-compilation state of the numeric emitter.
 pub(super) struct NumGen {
     types: Types,
@@ -1094,6 +1099,10 @@ pub(super) struct NumGen {
     /// leave pc, in the integer version, materialization stub, marker
     /// slot)`.
     lazy: Vec<(usize, usize, bool, Label, i32, super::call_seq::CalleeCopy)>,
+    /// The lazily pending activations' arguments left in SSE registers
+    /// ([`NumGen::guard_args`]): `(guard pc, leave pc, in the integer
+    /// version, (xmm, register) each)`.
+    lazy_args: Vec<LazyArgs>,
     /// Per pc: a `JumpIfFalse` folded into the comparison before it (emits
     /// nothing).
     skip: Vec<bool>,
@@ -1764,6 +1773,7 @@ impl NumGen {
             mentions,
             stubs: Vec::new(),
             lazy: Vec::new(),
+            lazy_args: Vec::new(),
             skip,
             cur_pc: 0,
             gslot,
@@ -2256,6 +2266,79 @@ impl NumGen {
     /// At the start of the non-hoisted paths of op `pc` (see
     /// [`sunk_load`](Self::sunk_load)): the sunk `LoadGlobal` before it,
     /// its binding's value into its register. Clobbers `rax`.
+    /// For the inlined plain call's guard at `g`, emitted now in a fast
+    /// version where its run proof ([`plan_run_proofs`]) holds: the
+    /// `LoadGlobal` of its callee a few ops before it, when that load is
+    /// **sunk** into the guard. The callee register is named only there, by
+    /// the guard and by the guard's call (the fallback arm, which the fast
+    /// version leaves out), is not promoted, and only loads, constants and
+    /// moves of other registers lie in between, which no branch enters:
+    /// the guard is the one reader, and once its proof holds it reads
+    /// nothing. Its own code (out of line, once per run) loads the binding
+    /// first ([`materialize_callee`](Self::materialize_callee)).
+    pub(crate) fn sunk_callee_load(&self, g: usize) -> Option<usize> {
+        if self.copy {
+            return None;
+        }
+        self.guard_run_proof(g)?;
+        let ri = self.region_at(g)?;
+        let Some(&Op::InlineGuard { callee, call, .. }) = self.bc(g) else {
+            return None;
+        };
+        if !matches!(self.bc(call), Some(Op::CallValue { callee: c, .. }) if *c == callee)
+            || self.mentions.get(callee as usize) != Some(&3)
+            || self.regions[ri].slots.iter().any(|s| s.reg == callee)
+            || self.is_int(callee)
+        {
+            return None;
+        }
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        for q in (g.saturating_sub(4)..g).rev() {
+            if self.region_at(q) != Some(ri) || self.is_target.get(q + 1).copied().unwrap_or(true) {
+                return None;
+            }
+            let o = self.bc(q)?;
+            match o {
+                Op::LoadGlobal { dst, .. } if *dst == callee => {
+                    return self
+                        .gslot
+                        .get(q)
+                        .is_some_and(|&k| k != u32::MAX)
+                        .then_some(q);
+                }
+                Op::LoadGlobal { .. } | Op::LoadConst { .. } | Op::Move { .. } => {
+                    def_use(o, &mut d, &mut u);
+                    if d.contains(&callee) || written_reg(o) == Some(callee) {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether the fast version's `LoadGlobal` at `pc` is sunk into a guard
+    /// after it ([`sunk_callee_load`](Self::sunk_callee_load)).
+    fn callee_load_sunk(&self, pc: usize) -> bool {
+        (pc + 1..pc + 5).any(|g| self.sunk_callee_load(g) == Some(pc))
+    }
+
+    /// In the inlined call's guard at `g`, before its code reads the callee
+    /// register: the sunk `LoadGlobal` ([`sunk_callee_load`](Self::sunk_callee_load)),
+    /// its binding's value into that register. Clobbers `rax`.
+    pub(crate) fn materialize_callee(&self, a: &mut X64Assembler, g: usize) {
+        let Some(q) = self.sunk_callee_load(g) else {
+            return;
+        };
+        let (Some(&Op::LoadGlobal { dst, .. }), Some(&k)) = (self.bc(q), self.gslot.get(q)) else {
+            return;
+        };
+        a.load_rax(self.gslot_disp(k));
+        a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+        a.store_rax(disp(dst));
+    }
+
     pub(super) fn materialize_sunk(&self, a: &mut X64Assembler, pc: usize) {
         if pc == 0 || !self.sunk_load(pc - 1) {
             return;
@@ -2543,6 +2626,7 @@ impl NumGen {
                 }
                 if self.math_load_dead(pc)
                     || (!self.copy && self.imode.is_none() && self.sunk_load(pc))
+                    || self.callee_load_sunk(pc)
                 {
                     return Some(true);
                 }
@@ -3363,6 +3447,37 @@ impl NumGen {
         let op = ops[pc];
         let bc = self.bc(pc)?;
         match op {
+            // A constant only the `===` right after it reads, as the bits it
+            // compares against (`CmpKind::Bits`): nothing reads the register.
+            GenericOp::Const { dst, .. }
+                if reg.is_some()
+                    && matches!(ops.get(pc + 1), Some(GenericOp::StrictEq { .. }))
+                    && self.const_only_bits(pc, dst) => {}
+            // A constant only the `Move` right after it reads (an inlined
+            // `return k`'s result): into the move's destination, which then
+            // emits nothing.
+            GenericOp::Const { imm, .. }
+                if reg.is_some()
+                    && matches!(ops.get(pc + 1), Some(GenericOp::Move { .. }))
+                    && self.const_moved(pc).is_some() =>
+            {
+                // (Where the move's op would put it: the SSE register its
+                // destination has from there, which no register live here
+                // but the constant's own may hold.)
+                let d = self.const_moved(pc)?;
+                match self.result_xmm(pc + 1, d) {
+                    Some(x) => a.sse_rip_const(0xf2, 0x10, x, imm),
+                    None => {
+                        a.movabs_rax(imm as i64);
+                        a.mov_mem_gpr(disp(d), RAX);
+                    }
+                }
+            }
+            GenericOp::Move { .. }
+                if reg.is_some()
+                    && pc > 0
+                    && matches!(ops[pc - 1], GenericOp::Const { .. })
+                    && self.const_moved(pc - 1).is_some() => {}
             GenericOp::Const { dst, imm } if reg.is_some() => match self.xmm_of(reg, dst) {
                 // (A promoted register: from the code's constant words, no
                 // general-purpose detour.)
@@ -3978,7 +4093,23 @@ impl NumGen {
     /// inlined body never writes them, so they stay true there until its
     /// end). `plan_regions` leaves them promoted: the guard itself does not
     /// read them.
-    pub(super) fn guard_args(&self, a: &mut X64Assembler, pc: usize, args: &[u16]) {
+    ///
+    /// A lazily pending activation's (`lazy`: its `InlineLeave`, in a fast
+    /// version) argument whose SSE register holds it through the whole body
+    /// is left out: it is stored only on the way to where the activation
+    /// may be materialized, a leave for the plain copy from inside the body
+    /// (whose flush stores it, [`store_lazy_args`](Self::store_lazy_args))
+    /// or a call there (`X64Assembler::inline_frame_hook`). Returns those,
+    /// as `(xmm, register)`.
+    pub(crate) fn guard_args(
+        &mut self,
+        a: &mut X64Assembler,
+        pc: usize,
+        args: &[u16],
+        lazy: Option<usize>,
+    ) -> Vec<(u8, u16)> {
+        let mut deferred = Vec::new();
+        let ri = self.region_at(pc);
         for (i, &r) in args.iter().enumerate() {
             if args[..i].contains(&r) {
                 continue;
@@ -3989,7 +4120,42 @@ impl NumGen {
                 continue;
             }
             if let Some(x) = self.result_xmm(pc, r) {
-                a.movsd_mem_x(disp(r), x);
+                let held = |l: usize| {
+                    ri.is_some_and(|ri| {
+                        self.regions[ri]
+                            .slots
+                            .iter()
+                            .any(|s| s.reg == r && s.xmm == x && s.start <= pc && l <= s.end)
+                    })
+                };
+                match lazy {
+                    Some(l) if !self.copy && held(l) => deferred.push((x, r)),
+                    _ => a.movsd_mem_x(disp(r), x),
+                }
+            }
+        }
+        if let (Some(l), false) = (lazy, deferred.is_empty()) {
+            let int = self.imode.is_some();
+            self.lazy_args.push((pc, l, int, deferred.clone()));
+        }
+        deferred
+    }
+
+    /// In a flush at the current pc of a fast version: the arguments of the
+    /// lazily pending activation whose body the pc lies in that its guard
+    /// left in their SSE registers ([`guard_args`](Self::guard_args)), into
+    /// the register file, where the activation's materialization reads them.
+    fn store_lazy_args(&self, a: &mut X64Assembler) {
+        if self.copy {
+            return;
+        }
+        let pc = self.cur_pc;
+        let int = self.imode.is_some();
+        for w in &self.lazy_args {
+            if w.0 < pc && pc <= w.1 && w.2 == int {
+                for &(x, r) in &w.3 {
+                    a.movsd_mem_x(disp(r), x);
+                }
             }
         }
     }
@@ -4310,6 +4476,7 @@ impl NumGen {
                 a.movsd_mem_x(disp(s.reg), s.xmm);
             }
         }
+        self.store_lazy_args(a);
     }
 
     /// Reloads the promoted registers live at the current pc from the register
@@ -4703,6 +4870,57 @@ impl NumGen {
     /// The bits of an immediate constant (`undefined`, `null`, a boolean)
     /// when the op just before `pc` (not a jump target) loads it into `r`:
     /// a value strictly equal to nothing but the same word.
+    /// Whether the `LoadConst` of `r` at `pc` feeds only the `===` at
+    /// `pc + 1`, which compares its other operand against the constant's
+    /// bits ([`const_num_bits_at`](Self::const_num_bits_at),
+    /// [`const_imm_bits_at`](Self::const_imm_bits_at)) and reads no
+    /// register for it: `r` is named by those two ops alone, so the load
+    /// is dead. (Not where either operand is an int register of an
+    /// integer version: its emitter compares those itself.)
+    fn const_only_bits(&self, pc: usize, r: u16) -> bool {
+        let Some(&Op::StrictEq { a: x, b: y, .. }) = self.bc(pc + 1) else {
+            return false;
+        };
+        let other = if y == r && x != r {
+            x
+        } else if x == r && y != r {
+            y
+        } else {
+            return false;
+        };
+        let konst = self
+            .const_num_bits_at(pc + 1, r)
+            .or_else(|| self.const_imm_bits_at(pc + 1, r))
+            .is_some();
+        konst
+            && self.mentions.get(r as usize) == Some(&2)
+            && self.region_at(pc).is_some()
+            && self.region_at(pc) == self.region_at(pc + 1)
+            && !self.is_int(r)
+            && !self.is_int(other)
+    }
+
+    /// For the `LoadConst` of `t` at `pc` followed by `Move { dst, src: t }`
+    /// (no branch entering the move, `t` named by these two ops alone, one
+    /// region, neither an int register of an integer version): `dst`, which
+    /// the constant goes straight into.
+    fn const_moved(&self, pc: usize) -> Option<u16> {
+        let (Some(&Op::LoadConst { dst: t, .. }), Some(&Op::Move { dst, src })) =
+            (self.bc(pc), self.bc(pc + 1))
+        else {
+            return None;
+        };
+        let ok = src == t
+            && dst != t
+            && self.mentions.get(t as usize) == Some(&2)
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && self.region_at(pc).is_some()
+            && self.region_at(pc) == self.region_at(pc + 1)
+            && !self.is_int(t)
+            && !self.is_int(dst);
+        ok.then_some(dst)
+    }
+
     fn const_imm_bits_at(&self, pc: usize, r: u16) -> Option<u64> {
         if pc == 0 || self.is_target.get(pc).copied().unwrap_or(true) {
             return None;
@@ -6605,9 +6823,9 @@ fn plan_run_proofs(
     if end >= ops.len() || end >= bytecode.len() || head >= end {
         return out;
     }
-    if !straight_body(ops, (head, end), arms) {
-        return out;
-    }
+    // (A plain call's guard needs no straight body: its receiver class
+    // holds the one value on every path, branches or not.)
+    let straight = straight_body(ops, (head, end), arms);
     let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
     let (mut d, mut u) = (Vec::new(), Vec::new());
     for g in head..=end {
@@ -6633,8 +6851,18 @@ fn plan_run_proofs(
             | (Some(GenericOp::CallMethod { .. }), Some(Op::CallMethod { recv: obj, key, .. })) => {
                 (*obj, key.as_str())
             }
+            // A plain call's guard identifies its callee by value alone (the
+            // value's function, at the prototype epoch only Rust code bumps):
+            // no property lookup, so no key the loop might store. (`""`: a
+            // property key it may store too, which only keeps this out.)
+            (Some(GenericOp::CallValue { .. }), Some(Op::CallValue { callee, .. })) => {
+                (*callee, "")
+            }
             _ => continue,
         };
+        if !straight && !matches!(ops.get(call), Some(GenericOp::CallValue { .. })) {
+            continue;
+        }
         if key == "__proto__"
             || receiver_class(bytecode, (head, end), carried_r, obj, &mut d, &mut u).is_none()
             || !(head..=end).all(|q| in_arm(q) || stores_no_key(ops, bytecode, q, key))
@@ -8722,7 +8950,7 @@ impl X64Assembler {
     }
 
     /// `movsd [rbx + disp], xmm(x)`.
-    fn movsd_mem_x(&mut self, disp: i32, x: u8) {
+    pub(crate) fn movsd_mem_x(&mut self, disp: i32, x: u8) {
         self.sse_rm(0xf2, false, 0x11, x, disp);
     }
 

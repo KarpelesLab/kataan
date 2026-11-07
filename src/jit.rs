@@ -5022,6 +5022,11 @@ pub struct X64Assembler {
     )]
     #[allow(clippy::type_complexity)]
     lazy_pend: Option<(Label, i32, Option<(i32, i32)>)>,
+    /// With `lazy_pend`: the activation's arguments still held in SSE
+    /// registers, as `(xmm, register-file disp)`, which a call in its body
+    /// stores first (`numeric::NumGen::guard_args`).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    lazy_args: Vec<(u8, i32)>,
 }
 
 /// A `rel32` fixup: its operand's offset, its target label, and, for a
@@ -9453,13 +9458,6 @@ impl JitFunction {
                         Some(_) if new_target.is_some() => num.spec_alloc_bail(&mut a, op_idx),
                         _ => None,
                     };
-                    // (The arguments a promoted loop keeps in SSE registers,
-                    // into the register file for the activation.)
-                    if let crate::nbvm::Op::InlineGuard { args: gargs, .. } =
-                        bytecode.get(op_idx)?
-                    {
-                        num.guard_args(&mut a, op_idx, gargs);
-                    }
                     let stub = a.new_label();
                     // In a speculative loop's fast version, an outermost
                     // guard of a straight body leaves its activation's
@@ -9470,6 +9468,17 @@ impl JitFunction {
                     let lazy = lazy_leave[op_idx].filter(|&l| {
                         slots0.save.is_none() && num.in_spec(op_idx) && num.same_region(op_idx, l)
                     });
+                    // (The arguments a promoted loop keeps in SSE registers,
+                    // into the register file for the activation: a lazily
+                    // pending one's that keep their SSE register through
+                    // the body only where it is made pending, see
+                    // `NumGen::guard_args`.)
+                    let lazy_args = match bytecode.get(op_idx)? {
+                        crate::nbvm::Op::InlineGuard { args: gargs, .. } => {
+                            num.guard_args(&mut a, op_idx, gargs, lazy)
+                        }
+                        _ => Vec::new(),
+                    };
                     let memo = call_sites
                         .get(match ops.get(call as usize)? {
                             GenericOp::CallMethod { cache, .. }
@@ -9511,6 +9520,9 @@ impl JitFunction {
                         }
                         None => None,
                     };
+                    // (Its callee's load, when sunk into it, before its code
+                    // reads the register: out of line with that code.)
+                    num.materialize_callee(&mut a, op_idx);
                     call_seq::emit_inline_guard(
                         &mut a,
                         &call_seq::InlineEmit {
@@ -9585,6 +9597,7 @@ impl JitFunction {
                         let copy = run_proof.map(|slot| (slot, slots0.callee));
                         num.note_lazy(op_idx, l, stub, slots0.pend, copy);
                         a.set_lazy_pend(Some((stub, slots0.pend, copy)));
+                        a.set_lazy_args(lazy_args.iter().map(|&(x, r)| (x, disp(r))).collect());
                         lazy_open = Some((op_idx, l, pass));
                     }
                     inline_stubs.push((
