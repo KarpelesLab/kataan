@@ -1433,16 +1433,15 @@ fn run_op(
         }
         FastOp::ObjKeys | FastOp::ObjEntries => {
             let o = arg(0).as_handle().map(Handle::from_raw)?;
+            let strs = realm.plain_enumerable_key_strings(o)?;
+            if op == FastOp::ObjKeys {
+                return Some(Ok(NanBox::handle(realm.new_array(strs.to_vec()).to_raw())));
+            }
             let keys = realm.plain_enumerable_key_ropes(o)?;
             let mut out = alloc::vec::Vec::with_capacity(keys.len());
-            for k in keys.iter() {
-                let kv = NanBox::handle(realm.new_string_from_rope(k.clone()).to_raw());
-                out.push(if op == FastOp::ObjKeys {
-                    kv
-                } else {
-                    let v = realm.get_property(o, k.as_leaf_str()?)?;
-                    NanBox::handle(realm.new_array(alloc::vec![kv, v]).to_raw())
-                });
+            for (k, &kv) in keys.iter().zip(strs.iter()) {
+                let v = realm.get_property(o, k.as_leaf_str()?)?;
+                out.push(NanBox::handle(realm.new_array(alloc::vec![kv, v]).to_raw()));
             }
             NanBox::handle(realm.new_array(out).to_raw())
         }

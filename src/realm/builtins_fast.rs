@@ -76,6 +76,36 @@ impl Realm {
         Some(keys)
     }
 
+    /// [`plain_enumerable_key_ropes`](Self::plain_enumerable_key_ropes) as
+    /// String values, for `Object.keys`: the same cells for every object of
+    /// a layout, remembered per layout (a String is immutable and its
+    /// identity is not observable), so listing the keys of objects built
+    /// alike allocates only the result array, and a read `o[k]` of a listed
+    /// key sees the same key String every time (which the String-key slot
+    /// memo, `key_memo`, then remembers).
+    pub fn plain_enumerable_key_strings(&mut self, handle: Handle) -> Option<Rc<[NanBox]>> {
+        /// The number of layouts remembered (a power of two).
+        const WAYS: usize = 8;
+        let shape = Rc::clone(self.plain_keyed_shape(handle)?);
+        let way =
+            ((Rc::as_ptr(&shape) as usize >> 4) ^ (Rc::as_ptr(&shape) as usize >> 10)) & (WAYS - 1);
+        if let Some(Some((s, ks))) = self.key_strings.get(way)
+            && Rc::ptr_eq(s, &shape)
+        {
+            return Some(Rc::clone(ks));
+        }
+        let ropes = self.plain_enumerable_key_ropes(handle)?;
+        let ks: Rc<[NanBox]> = ropes
+            .iter()
+            .map(|r| NanBox::handle(self.new_string_from_rope(r.clone()).to_raw()))
+            .collect();
+        if self.key_strings.is_empty() {
+            self.key_strings.resize(WAYS, None);
+        }
+        self.key_strings[way] = Some((shape, Rc::clone(&ks)));
+        Some(ks)
+    }
+
     /// Slot `slot` of the object at `handle`, provided the object still has
     /// shape `shape` and still satisfies
     /// [`plain_keyed_shape`](Self::plain_keyed_shape)'s conditions — so the slot

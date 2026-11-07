@@ -11945,6 +11945,20 @@ fn object_keys_proxy_calls_get_own_property() {
 }
 
 #[test]
+fn object_keys_of_one_layout_are_fresh_arrays() {
+    // `Object.keys` remembers a layout's key Strings, never the array.
+    assert_eq!(
+        run("var out=[];\
+             for (var i=0;i<4;i++){ var o={a:i,b:i}; var k=Object.keys(o); k.push('x'); k[0]='z';\
+               out.push(Object.keys(o).join()); }\
+             var p={a:1,b:2}; delete p.a; p.c=3; out.push(Object.keys(p).join());\
+             out.push(JSON.stringify(Object.entries({a:5,b:6})));\
+             out.join('|')"),
+        "a,b|a,b|a,b|a,b|b,c|[[\"a\",5],[\"b\",6]]"
+    );
+}
+
+#[test]
 fn proxy_is_extensible_invariant() {
     // The isExtensible trap result must equal the target's actual extensibility.
     assert_eq!(

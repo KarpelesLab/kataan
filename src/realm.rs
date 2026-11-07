@@ -122,6 +122,10 @@ pub fn typed_elem_size(kind: u8) -> usize {
 /// `builtins_fast::plain_enumerable_key_ropes`).
 type ShapeKeyRopes = (Rc<crate::shape::Shape>, Rc<[Rope]>);
 
+/// A shape and the key String cells `Object.keys` lists for it (see
+/// `builtins_fast::plain_enumerable_key_strings`).
+type ShapeKeyStrings = (Rc<crate::shape::Shape>, Rc<[NanBox]>);
+
 /// How many slices in a row of one string walk its rope (see
 /// [`Realm::new_string_slice_tree`]) before it is flattened instead.
 const TREE_SLICE_REPEAT: u32 = 32;
@@ -399,6 +403,11 @@ pub struct Realm {
     /// The key strings of the last plain-keyed shape `Object.keys` listed
     /// (see `builtins_fast::plain_enumerable_key_ropes`).
     key_ropes: core::cell::RefCell<Option<ShapeKeyRopes>>,
+    /// The key String cells `Object.keys` last handed out per plain-keyed
+    /// shape (see `builtins_fast::plain_enumerable_key_strings`). The cells
+    /// are GC roots and the memo is dropped by a moving
+    /// [`compact`](Realm::compact).
+    key_strings: alloc::vec::Vec<Option<ShapeKeyStrings>>,
     /// The hidden-state layout of a live Set/Map iterator (see
     /// `hidden_layout`), learned from the first one the bytecode VM steps.
     pub(crate) coll_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
@@ -977,6 +986,7 @@ impl Realm {
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
             literal_ropes: alloc::vec::Vec::new(),
             key_ropes: core::cell::RefCell::new(None),
+            key_strings: alloc::vec::Vec::new(),
             coll_iter_layout: None,
             buf_iter_layout: None,
             str_iter_layout: None,
@@ -7878,6 +7888,13 @@ impl Realm {
         );
         out.extend(self.vm_array_iter.values_fns.iter().copied());
         self.for_in_cache_roots(out);
+        out.extend(
+            self.key_strings
+                .iter()
+                .flatten()
+                .flat_map(|(_, ks)| ks.iter())
+                .filter_map(|k| k.as_handle().map(Handle::from_raw)),
+        );
         out.extend(self.unit_strings.iter().flatten().copied());
         out.extend(self.type_name_strings.iter().flatten().copied());
         out.extend(self.literal_ropes.iter().flatten().map(|(_, _, h)| *h));
@@ -8573,6 +8590,7 @@ impl Realm {
         self.unit_strings.clear();
         self.type_name_strings.clear();
         self.literal_ropes.clear();
+        self.key_strings.clear();
         self.for_in_cache_retire();
         self.vm_array_iter = VmArrayIterIntrinsics {
             species_key,
