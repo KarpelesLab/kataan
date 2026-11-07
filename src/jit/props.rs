@@ -508,7 +508,15 @@ struct NativeOwn {
     stamp: u64,
     /// The address of the property's value slot in the auxiliary object.
     value: u64,
+    /// How many receivers it has recorded (capped at
+    /// [`NATIVE_OWN_FILLS`]: each one is added to the realm's never-pruned
+    /// watched set, so a site that sees ever new receivers — a fresh match
+    /// array's `index` — stops recording).
+    fills: u32,
 }
+
+/// See [`NativeOwn::fills`].
+const NATIVE_OWN_FILLS: u32 = 4;
 
 /// The chain proof of a fresh object's add run
 /// ([`X64Assembler::p_add_fresh_run`]), kept on the run's first site: at the
@@ -581,12 +589,14 @@ impl MethodSite {
                 recv: super::CallSite::EMPTY,
                 stamp: u64::MAX,
                 value: 0,
+                fills: 0,
             },
         }
     }
 
     /// After a property read of the site's key on `recv`: when `recv` is a
-    /// built-in function cell (`Cell::Native`, not host-exotic, one realm)
+    /// built-in function cell (or an array and a named key: see
+    /// `Realm::aux_named_key`; not host-exotic, one realm)
     /// whose auxiliary object is shaped and owns the key as a data property
     /// (no accessor of that name), records it in the site's [`NativeOwn`]
     /// memo, for compiled code's inline read
@@ -607,10 +617,13 @@ impl MethodSite {
         recv: crate::heap::Handle,
     ) {
         let key = self.key();
+        let bits = crate::nanbox::NanBox::handle(recv.to_raw()).to_bits();
+        // (A receiver recorded before is only restamped.)
         if realm.multi_realm
+            || (self.native_own.fills >= NATIVE_OWN_FILLS && self.native_own.recv != bits)
             || key.starts_with('\0')
             || key == "__proto__"
-            || realm.native_at(recv).is_none()
+            || !realm.aux_named_key(recv, key)
             || realm.is_host_exotic(recv)
         {
             return;
@@ -632,10 +645,12 @@ impl MethodSite {
         let Some(ptr) = realm.jit_object(aux).and_then(|o| o.jit_slot_ptr(slot)) else {
             return;
         };
+        let fills = self.native_own.fills + u32::from(self.native_own.recv != bits);
         self.native_own = NativeOwn {
-            recv: crate::nanbox::NanBox::handle(recv.to_raw()).to_bits(),
+            recv: bits,
             stamp,
             value: ptr as u64,
+            fills,
         };
     }
 

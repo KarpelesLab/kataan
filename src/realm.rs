@@ -2175,6 +2175,21 @@ impl Realm {
         }
     }
 
+    /// Whether every own property `key` of the cell at `h` lives in its
+    /// auxiliary object: any key of a built-in function (`Cell::Native`,
+    /// `Cell::BoundNative`), a key of an array other than `length` and an
+    /// index (here: any key starting with a digit).
+    #[must_use]
+    pub(crate) fn aux_named_key(&self, h: Handle, key: &str) -> bool {
+        match self.heap.get(h) {
+            Some(Cell::Native(_) | Cell::BoundNative { .. }) => true,
+            Some(Cell::Array(_)) => {
+                key != "length" && !key.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            }
+            _ => false,
+        }
+    }
+
     /// The value of the own **data** property `key` of the built-in
     /// function at `h` (a `Cell::Native`, whose own properties all live in
     /// its auxiliary object: `has_own` / `get_property` read nothing else
@@ -2185,6 +2200,11 @@ impl Realm {
     /// the auxiliary object's shape (as `vm_fn_cached_get` arms it for a
     /// closure's): an ordinary object of that shape owns `key` in that slot
     /// too, so the cache's other readers stay right.
+    ///
+    /// Likewise a bound built-in (`Array.prototype.slice`, a
+    /// `Cell::BoundNative`) and an array's named key (`Array.prototype
+    /// .slice`: an array's own properties are its indices, its `length` and
+    /// what its auxiliary object holds) — see [`aux_named_key`](Self::aux_named_key).
     #[must_use]
     pub fn native_own_data(
         &self,
@@ -2192,7 +2212,7 @@ impl Realm {
         key: &str,
         cache: &mut crate::ic::PropertyCache,
     ) -> Option<NanBox> {
-        if !matches!(self.heap.get(h), Some(Cell::Native(_))) {
+        if !self.aux_named_key(h, key) {
             return None;
         }
         let o = self.aux_obj(h)?;

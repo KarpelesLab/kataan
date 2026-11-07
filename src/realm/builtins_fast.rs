@@ -452,15 +452,19 @@ impl Realm {
     /// key epoch that changes with the link's set of own named keys (an
     /// array's, a RegExp's or a Map/Set's live in its auxiliary object, which
     /// may come and go), and the next link. `None` for anything other than an
-    /// ordinary object, an array, a RegExp or a collection, and for a
-    /// host-exotic one.
+    /// ordinary object, an array, a RegExp, a collection or a built-in
+    /// function, and for a host-exotic one.
     pub(super) fn key_link(&self, h: Handle) -> Option<(Option<u64>, u32, Option<Handle>)> {
         if self.is_host_exotic(h) {
             return None;
         }
         match self.heap.get(h)? {
             Cell::Object(o) => Some((None, o.key_epoch(), o.proto())),
-            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } | Cell::Native(_) => {
+            Cell::Array(_)
+            | Cell::RegExp { .. }
+            | Cell::Collection { .. }
+            | Cell::Native(_)
+            | Cell::BoundNative { .. } => {
                 let (aux, epoch) = match self.aux_props.get(&h.to_raw()) {
                     Some(a) => (
                         Some(a.to_raw()),
@@ -479,8 +483,10 @@ impl Realm {
     /// not `lastIndex`) continues at once `h` itself is known not to own it —
     /// its `[[Prototype]]`, possibly `None`. `None` when `h` does own `key`, or
     /// is anything other than a string primitive, an ordinary non-wrapper
-    /// object, an array, a RegExp or a Map/Set (or is host-exotic), whose own
-    /// properties this cannot rule out. `recv_shape` memoizes one receiver
+    /// object, an array, a RegExp, a Map/Set or a function (or is
+    /// host-exotic), whose own properties this cannot rule out (a built-in
+    /// function's — a bound one's too, `Array.prototype.slice` — all live in
+    /// its auxiliary object). `recv_shape` memoizes one receiver
     /// shape already known to lack `key` (a shape fixes its data keys, so an
     /// accessor-free object of that shape lacks it too).
     fn method_lookup_start(
@@ -534,6 +540,7 @@ impl Realm {
             | Cell::RegExp { .. }
             | Cell::Collection { .. }
             | Cell::Native(_)
+            | Cell::BoundNative { .. }
             | Cell::VmFunction { .. } => {
                 // (An owing closure's own keys are its owed ones.)
                 if self.aux_obj(h).is_some_and(|o| o.has_own_key(key)) {
@@ -595,11 +602,14 @@ impl Realm {
     fn named_props(&self, h: Handle) -> Option<&crate::object::Object> {
         match self.heap.get(h)? {
             Cell::Object(o) => Some(o),
-            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } | Cell::Native(_) => {
-                self.heap
-                    .get(*self.aux_props.get(&h.to_raw())?)?
-                    .as_object()
-            }
+            Cell::Array(_)
+            | Cell::RegExp { .. }
+            | Cell::Collection { .. }
+            | Cell::Native(_)
+            | Cell::BoundNative { .. } => self
+                .heap
+                .get(*self.aux_props.get(&h.to_raw())?)?
+                .as_object(),
             _ => None,
         }
     }
@@ -1060,11 +1070,14 @@ impl Realm {
     fn holder_data(&self, h: Handle, key: &str) -> Option<NanBox> {
         let o = match self.heap.get(h)? {
             Cell::Object(o) => o,
-            Cell::Array(_) | Cell::RegExp { .. } | Cell::Collection { .. } | Cell::Native(_) => {
-                self.heap
-                    .get(*self.aux_props.get(&h.to_raw())?)?
-                    .as_object()?
-            }
+            Cell::Array(_)
+            | Cell::RegExp { .. }
+            | Cell::Collection { .. }
+            | Cell::Native(_)
+            | Cell::BoundNative { .. } => self
+                .heap
+                .get(*self.aux_props.get(&h.to_raw())?)?
+                .as_object()?,
             _ => return None,
         };
         if o.accessor(key).is_some() {

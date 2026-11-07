@@ -873,22 +873,46 @@ fn run_op(
             rest,
         );
     }
+    // `F.call(t, …)` of a built-in `F` served here (`Array.prototype.slice
+    // .call(a, 1)`, `Map.prototype.get.call(m, k)`) with an object `t`: `F`'s
+    // own fast op, with `t` its receiver — what `Call(F, t, …)` amounts to
+    // (each op checks its receiver's brand itself; anything it does not
+    // decide is the host's call of `F`, below).
+    // (A string cell with a function marker is a function, which no string
+    // op may take for a string.)
     if matches!(op, FastOp::FnCall)
         && let Some(t) = arg(0).as_handle()
-        && ctx.realm.native_at(h) == Some(N_OBJ_PROTO_HASOWN)
+        && !ctx.realm.is_vm_function(h)
+        && !(ctx.realm.is_string_handle(Handle::from_raw(t))
+            && !ctx.realm.typeof_is_string(Handle::from_raw(t)))
     {
-        let rest = args.get(1..).unwrap_or(&[]);
-        return run_op(
-            ctx,
-            funcs,
-            FastOp::ObjHasOwn,
-            recv.to_bits(),
-            arg(0),
-            Handle::from_raw(t),
-            false,
-            regs,
-            rest,
-        );
+        let inner = classify(&ctx.realm, recv);
+        if !matches!(
+            inner,
+            FastOp::None
+                | FastOp::HostDirect
+                | FastOp::FnCall
+                | FastOp::FnApply
+                | FastOp::ObjStaticHasOwn
+                | FastOp::NumToFixed
+                | FastOp::NumToString
+                | FastOp::GenResume(_)
+        ) {
+            let rest = args.get(1..).unwrap_or(&[]);
+            if let Some(r) = run_op(
+                ctx,
+                funcs,
+                inner,
+                recv.to_bits(),
+                arg(0),
+                Handle::from_raw(t),
+                false,
+                regs,
+                rest,
+            ) {
+                return Some(r);
+            }
+        }
     }
     if let FastOp::ArrayHof(op) = op {
         let argv = super::ArgBuf::from_regs(regs, args);
@@ -1272,7 +1296,10 @@ fn run_op(
             None => NanBox::boolean(false),
         },
         FastOp::FnCall | FastOp::FnApply => {
-            if !realm.is_vm_function(h) {
+            // (Another callable — a built-in — is called through the host
+            // below, with the same `this` and arguments.)
+            let vm = realm.is_vm_function(h);
+            if !vm && (!realm.is_callable_cell(h) || realm.proxy_at(h).is_some()) {
                 return None;
             }
             let this = arg(0);
@@ -1301,6 +1328,15 @@ fn run_op(
                     None => return None,
                 }
             };
+            // `Call(F, this, argv)` of a built-in `F`: the host's call of the
+            // function itself, as `FastOp::HostDirect` makes it.
+            if !vm {
+                return Some(
+                    with_host(ctx, |host| host.call(recv, this, &argv))
+                        .unwrap_or(Err(super::HostError::Fault))
+                        .map_err(VmError::from),
+                );
+            }
             // A callee with a compiled body is entered directly, as a
             // compiled caller's `f(...)` enters it.
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
