@@ -673,6 +673,55 @@ impl Realm {
         false
     }
 
+    /// [`has_own`](Self::has_own) for an ordinary object that is no
+    /// primitive wrapper (whose own properties are exactly its data keys and
+    /// accessors); `None` for any other cell.
+    #[inline]
+    pub(crate) fn ordinary_has_own(&self, h: Handle, key: &str) -> Option<bool> {
+        match self.heap.get(h)? {
+            Cell::Object(o) if !o.is_prim_wrapper() => {
+                Some(o.contains(key) || (!o.has_no_accessors() && o.accessor(key).is_some()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The static-method fast form of [`method_site_get`](Self::method_site_get)
+    /// (`Object.hasOwn`, `Number.isInteger`, `JSON.stringify`): whether `cache`
+    /// was filled for a receiver that owns the method itself (its one link,
+    /// the holder) and that receiver is `recv`, with the link unchanged since
+    /// it was validated with every link watched (the prototype epoch is still
+    /// the stamp: no own key added, removed or turned into an accessor) and
+    /// the holder's slot still `method` (a plain store to the property does
+    /// not move the epoch, so the value is re-read). `false` sends the caller
+    /// to the general check. A receiver handle carries its generation, so a
+    /// collected-and-reused slot cannot match the recorded link.
+    #[inline]
+    pub(crate) fn method_site_own_hit(
+        &self,
+        recv: Handle,
+        cache: &MethodSiteCache,
+        method: u64,
+    ) -> bool {
+        if !cache.armed
+            || !cache.own
+            || cache.stamp != crate::object::proto_epoch()
+            || cache.swaps != self.cell_swaps
+            || cache.links.first().is_none_or(|l| l.0 != recv.to_raw())
+        {
+            return false;
+        }
+        if let Some(Cell::Object(o)) = self.heap.get(Handle::from_raw(cache.holder_props))
+            && let (Some(s), Some(m)) = (o.shaped_shape(), cache.holder_shape.as_ref())
+            && Rc::ptr_eq(s, m)
+        {
+            return o
+                .slot(cache.holder_slot)
+                .is_some_and(|v| v.to_bits() == method);
+        }
+        false
+    }
+
     /// After a [`method_site_get`](Self::method_site_get) hit on the Map/Set
     /// `recv` with every link watched at the current prototype epoch: watches
     /// `recv` (its cell and auxiliary object, so a new own property or a

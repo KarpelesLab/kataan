@@ -41,7 +41,7 @@ use crate::ic::PropertyCache;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
     N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_GEN_NEXT, N_GEN_RETURN,
-    N_GEN_THROW, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN, N_NUMBER_PROTO_FN,
+    N_GEN_THROW, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN, N_NUMBER, N_NUMBER_PROTO_FN,
     N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_HAS_OWN,
     N_OBJECT_KEYS, N_OBJECT_VALUES, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD,
     N_STRING_PROTO_FN,
@@ -105,6 +105,10 @@ enum FastOp {
     StrIncludes,
     /// `String.fromCharCode`.
     StrFromCharCode,
+    /// `Number.isInteger` / `isSafeInteger` / `isFinite` / `isNaN`: a
+    /// predicate of its argument that converts nothing (anything but a
+    /// Number is `false`).
+    NumPred(NumPred),
     /// `Array.isArray`.
     ArrayIsArray,
     /// `Function.prototype.call` on a VM function.
@@ -167,6 +171,39 @@ enum FastOp {
     HostDirect,
 }
 
+/// Which `Number` static predicate a [`FastOp::NumPred`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NumPred {
+    Integer,
+    SafeInteger,
+    Finite,
+    NaN,
+}
+
+/// IsIntegralNumber(`n`): finite, and its own truncation — the host's
+/// `n % 1 == 0` without the software `fmod`. A double of magnitude at least
+/// 2^52 has no fraction bits; below that, the conversion to `i64` truncates
+/// exactly.
+fn integral(n: f64) -> bool {
+    const BIG: f64 = 4_503_599_627_370_496.0;
+    n.is_finite() && (!(-BIG..=BIG).contains(&n) || (n as i64) as f64 == n)
+}
+
+impl NumPred {
+    /// The predicate on `v` (the host's `Number.*` static on it).
+    fn test(self, v: NanBox) -> bool {
+        v.as_number().is_some_and(|n| match self {
+            NumPred::Integer => integral(n),
+            NumPred::SafeInteger => {
+                // (`|n| <= 2^53 - 1`, without `f64::abs`, a std method.)
+                integral(n) && (-9_007_199_254_740_991.0..=9_007_199_254_740_991.0).contains(&n)
+            }
+            NumPred::Finite => n.is_finite(),
+            NumPred::NaN => n.is_nan(),
+        })
+    }
+}
+
 impl FastOp {
     /// The `Map`/`Set` method this is, for `Realm::coll_fast`.
     #[inline]
@@ -204,7 +241,7 @@ pub(super) fn fn_call_method(cache: &PropertyCache) -> Option<u64> {
     cache
         .native
         .as_deref()
-        .filter(|s| s.op == FastOp::FnCall)
+        .filter(|s| matches!(s.op, FastOp::FnCall))
         .map(|s| s.method)
 }
 
@@ -235,13 +272,24 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
     // A readable static method binds `[constructor, name]`; only `String`
     // has a `fromCharCode`.
     if id == N_STATIC_METHOD {
-        return match realm
-            .array_elements(target)
+        let pair = realm.array_elements(target);
+        let ctor = pair
+            .and_then(|p| p.first().copied())
+            .and_then(NanBox::as_handle)
+            .and_then(|c| realm.native_at(Handle::from_raw(c)));
+        return match pair
             .and_then(|p| p.get(1).copied())
             .and_then(NanBox::as_handle)
             .and_then(|n| realm.string_leaf_bytes(Handle::from_raw(n)))
         {
             Some(b"fromCharCode") => FastOp::StrFromCharCode,
+            // (The host dispatches these by the bound constructor's native id.)
+            Some(b"isInteger") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::Integer),
+            Some(b"isSafeInteger") if ctor == Some(N_NUMBER) => {
+                FastOp::NumPred(NumPred::SafeInteger)
+            }
+            Some(b"isFinite") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::Finite),
+            Some(b"isNaN") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::NaN),
             _ => FastOp::HostDirect,
         };
     }
@@ -326,7 +374,7 @@ fn cacheable_key(key: &str) -> bool {
 /// `prim`: `h` is a primitive receiver's prototype intrinsic, where the
 /// lookup starts.
 fn site_hit(realm: &Realm, site: &mut NativeSite, h: Handle, prim: bool, key: &str) -> bool {
-    site.op != FastOp::None
+    !matches!(site.op, FastOp::None)
         && if prim {
             realm.method_site_get_prim(h, key, &mut site.chain)
         } else {
@@ -396,7 +444,7 @@ pub(super) fn is_native_site(cache: &PropertyCache) -> bool {
     cache
         .native
         .as_deref()
-        .is_some_and(|s| s.op != FastOp::None)
+        .is_some_and(|s| !matches!(s.op, FastOp::None))
 }
 
 /// `ToIntegerOrInfinity(v)` when it runs no code: `Some(None)` for
@@ -471,6 +519,17 @@ pub(super) fn try_call(
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }
+    // A static method (`Object.hasOwn`, `Number.isInteger`): the receiver the
+    // site recorded, owning the method itself, unchanged — the general
+    // path's `site_hit` on it, in a few compares.
+    if let Some(site) = cache.native.as_deref()
+        && !matches!(site.op, FastOp::None)
+        && let Some(r) = recv.as_handle().map(Handle::from_raw)
+        && ctx.realm.method_site_own_hit(r, &site.chain, site.method)
+    {
+        let (op, method) = (site.op, site.method);
+        return run_op(ctx, funcs, op, method, recv, r, false, regs, args);
+    }
     if cache
         .native
         .as_deref()
@@ -516,7 +575,7 @@ pub(super) fn try_call(
             return None;
         }
         fill(&mut ctx.realm, site, h, prim, key);
-        if site.op == FastOp::None {
+        if matches!(site.op, FastOp::None) {
             return None;
         }
     } else if !prim {
@@ -700,7 +759,7 @@ pub(super) fn try_call_got(
         site.method = method.to_bits();
         site.op = classify(&ctx.realm, method);
     }
-    if site.op == FastOp::None {
+    if matches!(site.op, FastOp::None) {
         return None;
     }
     let (op, method) = (site.op, site.method);
@@ -735,7 +794,7 @@ pub(super) fn try_get(
     });
     // (The proof `site_hit` / `fill` make for `try_call`, written out here so
     // that those stay `try_call`'s alone: inlined into it as before.)
-    let hit = site.op != FastOp::None
+    let hit = !matches!(site.op, FastOp::None)
         && if prim {
             ctx.realm.method_site_get_prim(h, key, &mut site.chain)
         } else {
@@ -757,7 +816,7 @@ pub(super) fn try_get(
         let v = found?;
         site.op = classify(&ctx.realm, v);
         site.method = v.to_bits();
-        if site.op == FastOp::None {
+        if matches!(site.op, FastOp::None) {
             return None;
         }
     }
@@ -799,7 +858,7 @@ fn run_op(
     // `Object.hasOwn(o, k)` likewise (`o` an object, `k` a key whose
     // ToPropertyKey runs no code: the order of the two conversions is then
     // unobservable).
-    if op == FastOp::ObjStaticHasOwn {
+    if matches!(op, FastOp::ObjStaticHasOwn) {
         let t = arg(0).as_handle()?;
         let rest = args.get(1..).unwrap_or(&[]);
         return run_op(
@@ -814,7 +873,7 @@ fn run_op(
             rest,
         );
     }
-    if op == FastOp::FnCall
+    if matches!(op, FastOp::FnCall)
         && let Some(t) = arg(0).as_handle()
         && ctx.realm.native_at(h) == Some(N_OBJ_PROTO_HASOWN)
     {
@@ -838,7 +897,7 @@ fn run_op(
     // A RegExp and a VM function: the replacer calls run here
     // (`str_replace`).
     if matches!(op, FastOp::StrReplace | FastOp::StrReplaceAll) {
-        let all = op == FastOp::StrReplaceAll;
+        let all = matches!(op, FastOp::StrReplaceAll);
         if let Some(r) = super::str_replace::try_run(ctx, funcs, regs, recv, args, all) {
             return Some(r);
         }
@@ -1057,7 +1116,17 @@ fn run_op(
                     _ => return None,
                 },
             };
-            NanBox::boolean(realm.has_own(h, key))
+            // (A plain ordinary object's own keys are its own; `has_own`'s
+            // String-wrapper and function-metadata checks are for others.)
+            let own = realm
+                .ordinary_has_own(h, key)
+                .unwrap_or_else(|| realm.has_own(h, key));
+            // An own data key String: noted in the String-key slot memo, so
+            // the next ask is its probe above (`key_memo_note`'s rules).
+            if own && k.as_handle().is_some() {
+                let _ = realm.own_data_missed(o, k);
+            }
+            NanBox::boolean(own)
         }
         FastOp::StrSlice | FastOp::StrSubstring => {
             // A `Concat` is sliced by walking its tree when that is cheap (see
@@ -1074,7 +1143,7 @@ fn run_op(
             let units = rope.utf16_len();
             let start = int_arg(arg(0))?.unwrap_or(0.0);
             let end = int_arg(arg(1))?;
-            let (a, b) = if op == FastOp::StrSlice {
+            let (a, b) = if matches!(op, FastOp::StrSlice) {
                 let idx = |n: f64| -> usize {
                     if n < 0.0 {
                         (units as f64 + n).max(0.0) as usize
@@ -1108,7 +1177,7 @@ fn run_op(
             let pat = needle.as_leaf_bytes()?;
             // An affix test on a `Concat` compares just the window it names
             // (`str_rope::window_is`), without flattening the receiver.
-            if op != FastOp::StrIncludes
+            if !matches!(op, FastOp::StrIncludes)
                 && let Some(r) = realm
                     .typeof_is_string(h)
                     .then(|| realm.string_rope(h))
@@ -1117,10 +1186,14 @@ fn run_op(
                 && realm.rope_walk_ok(&r)
             {
                 let units = r.utf16_len();
-                let default = if op == FastOp::StrEndsWith { units } else { 0 };
+                let default = if matches!(op, FastOp::StrEndsWith) {
+                    units
+                } else {
+                    0
+                };
                 let pos = int_arg(arg(1))?.map_or(default, |n| (n.max(0.0) as usize).min(units));
                 let pat_units = needle.utf16_len();
-                let at = if op == FastOp::StrEndsWith {
+                let at = if matches!(op, FastOp::StrEndsWith) {
                     pos.checked_sub(pat_units)
                 } else {
                     Some(pos)
@@ -1135,7 +1208,11 @@ fn run_op(
             }
             let rope = str_parts(realm, h)?;
             let (bytes, units) = (rope.as_leaf_bytes()?, rope.utf16_len());
-            let default = if op == FastOp::StrEndsWith { units } else { 0 };
+            let default = if matches!(op, FastOp::StrEndsWith) {
+                units
+            } else {
+                0
+            };
             let pos = int_arg(arg(1))?.map_or(default, |n| (n.max(0.0) as usize).min(units));
             NanBox::boolean(match op {
                 FastOp::StrStartsWith => {
@@ -1187,6 +1264,7 @@ fn run_op(
             };
             NanBox::handle(realm.new_object_with_proto(proto).to_raw())
         }
+        FastOp::NumPred(p) => NanBox::boolean(p.test(arg(0))),
         FastOp::ArrayIsArray => match arg(0).as_handle().map(Handle::from_raw) {
             // A proxy is unwrapped (and may be revoked): the host's.
             Some(a) if realm.proxy_at(a).is_some() => return None,
@@ -1198,7 +1276,7 @@ fn run_op(
                 return None;
             }
             let this = arg(0);
-            let argv: alloc::vec::Vec<NanBox> = if op == FastOp::FnCall {
+            let argv: alloc::vec::Vec<NanBox> = if matches!(op, FastOp::FnCall) {
                 args.iter().skip(1).map(|r| regs[*r as usize]).collect()
             } else {
                 // CreateListFromArrayLike of a plain dense array reads only its
@@ -1305,7 +1383,8 @@ fn run_op(
             // A primitive target is decided by the boxed values alone (no
             // string or BigInt content to compare): the tight loop.
             let prim = target.as_handle().is_none();
-            let nan = op == FastOp::ArrIncludes && target.as_number().is_some_and(f64::is_nan);
+            let nan =
+                matches!(op, FastOp::ArrIncludes) && target.as_number().is_some_and(f64::is_nan);
             let pos = if prim && !nan {
                 tail.iter()
                     .position(|e| e.is_hole() || e.strict_equals(target))
@@ -1319,7 +1398,7 @@ fn run_op(
             if pos.is_some_and(|i| tail[i].is_hole()) {
                 return None;
             }
-            if op == FastOp::ArrIndexOf {
+            if matches!(op, FastOp::ArrIndexOf) {
                 NanBox::number(pos.map_or(-1.0, |i| (from + i) as f64))
             } else {
                 NanBox::boolean(pos.is_some())
@@ -1497,11 +1576,11 @@ fn run_op(
         FastOp::ObjKeys | FastOp::ObjEntries | FastOp::ObjValues => {
             let o = arg(0).as_handle().map(Handle::from_raw)?;
             let strs = realm.plain_enumerable_key_strings(o)?;
-            if op == FastOp::ObjKeys {
+            if matches!(op, FastOp::ObjKeys) {
                 return Some(Ok(NanBox::handle(realm.new_array(strs.to_vec()).to_raw())));
             }
             let keys = realm.plain_enumerable_key_ropes(o)?;
-            if op == FastOp::ObjValues {
+            if matches!(op, FastOp::ObjValues) {
                 let mut out = alloc::vec::Vec::with_capacity(keys.len());
                 for k in keys.iter() {
                     out.push(realm.get_property(o, k.as_leaf_str()?)?);

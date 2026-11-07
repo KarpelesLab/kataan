@@ -2181,8 +2181,17 @@ impl Realm {
     /// for one) — `F.prototype`, `Object.keys`, `Math.max`'s `name` — which
     /// is then `F[key]` (`[[Get]]` finds the own data property first).
     /// `None` for anything else (another cell, an absent key, an accessor).
+    /// The slot is found through the site's inline cache `cache`, armed with
+    /// the auxiliary object's shape (as `vm_fn_cached_get` arms it for a
+    /// closure's): an ordinary object of that shape owns `key` in that slot
+    /// too, so the cache's other readers stay right.
     #[must_use]
-    pub fn native_own_data(&self, h: Handle, key: &str) -> Option<NanBox> {
+    pub fn native_own_data(
+        &self,
+        h: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
         if !matches!(self.heap.get(h), Some(Cell::Native(_))) {
             return None;
         }
@@ -2190,7 +2199,7 @@ impl Realm {
         if !o.has_no_accessors() && o.accessor(key).is_some() {
             return None;
         }
-        o.get(key)
+        o.cached_get(key, cache)
     }
 
     /// The auxiliary object of `h` for a change to it: an owing VM closure

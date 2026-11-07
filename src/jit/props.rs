@@ -490,6 +490,24 @@ pub struct MethodSite {
     /// For the first site of a fresh object's add run
     /// ([`X64Assembler::p_add_fresh_run`]): the run's chain proof.
     run: RunProof,
+    /// A property read's memo of a built-in function receiver's own data
+    /// property (`Object.prototype`, `Number.MAX_SAFE_INTEGER`), which the
+    /// entries (ordinary shaped receivers only) cannot record.
+    native_own: NativeOwn,
+}
+
+/// See [`MethodSite::fill_native_own`]: at the prototype epoch `stamp`, the
+/// site's key read on the receiver whose `NanBox` bits are `recv` (a
+/// built-in function cell, watched with its auxiliary object) is its own
+/// data property, whose value is at the address `value`.
+#[repr(C)]
+struct NativeOwn {
+    /// The receiver's bits, or [`super::CallSite::EMPTY`].
+    recv: u64,
+    /// The prototype epoch it was made under (`u64::MAX`: never).
+    stamp: u64,
+    /// The address of the property's value slot in the auxiliary object.
+    value: u64,
 }
 
 /// The chain proof of a fresh object's add run
@@ -559,7 +577,66 @@ impl MethodSite {
                 stamp: u64::MAX,
                 proto: 0,
             },
+            native_own: NativeOwn {
+                recv: super::CallSite::EMPTY,
+                stamp: u64::MAX,
+                value: 0,
+            },
         }
+    }
+
+    /// After a property read of the site's key on `recv`: when `recv` is a
+    /// built-in function cell (`Cell::Native`, not host-exotic, one realm)
+    /// whose auxiliary object is shaped and owns the key as a data property
+    /// (no accessor of that name), records it in the site's [`NativeOwn`]
+    /// memo, for compiled code's inline read
+    /// ([`X64Assembler::p_native_own_hit`]): the cell and the auxiliary
+    /// object are watched first, so that while the prototype epoch stays at
+    /// the stamp the cell has the same auxiliary object (a change to a
+    /// watched cell's auxiliary object or `[[Prototype]]`, and any cell swap,
+    /// bumps the epoch) and that object the same layout, its cell unmoved
+    /// (a key added, removed or turned into an accessor, an arena growth or
+    /// compaction, all bump it): the key's `[[Get]]` on `recv` is then the
+    /// value at the recorded slot address, read live (a plain store to the
+    /// property does not move the epoch). A built-in function keeps all its
+    /// own properties in its auxiliary object, and its handle carries its
+    /// generation, so a collected-and-reused slot never matches `recv`.
+    pub(crate) fn fill_native_own(
+        &mut self,
+        realm: &mut crate::realm::Realm,
+        recv: crate::heap::Handle,
+    ) {
+        let key = self.key();
+        if realm.multi_realm
+            || key.starts_with('\0')
+            || key == "__proto__"
+            || realm.native_at(recv).is_none()
+            || realm.is_host_exotic(recv)
+        {
+            return;
+        }
+        let Some(aux) = realm.jit_aux_of(recv) else {
+            return;
+        };
+        let Some(o) = realm.jit_object(aux) else {
+            return;
+        };
+        if !o.has_no_accessors() && o.accessor(key).is_some() {
+            return;
+        }
+        let Some(slot) = o.shaped_shape().and_then(|s| s.lookup(key)) else {
+            return;
+        };
+        realm.watch_link(recv.to_raw(), Some(aux.to_raw()));
+        let stamp = crate::object::proto_epoch();
+        let Some(ptr) = realm.jit_object(aux).and_then(|o| o.jit_slot_ptr(slot)) else {
+            return;
+        };
+        self.native_own = NativeOwn {
+            recv: crate::nanbox::NanBox::handle(recv.to_raw()).to_bits(),
+            stamp,
+            value: ptr as u64,
+        };
     }
 
     /// The site's key.
@@ -1030,6 +1107,34 @@ impl X64Assembler {
     fn p_load_proto_epoch(&mut self, dst: u8) {
         self.g_movabs(dst, crate::object::proto_epoch_addr() as u64);
         self.g_load(dst, dst, 0);
+    }
+
+    /// The read of a [`MethodSite`]'s [`NativeOwn`] memo on the receiver
+    /// value at `[recv_base + recv_disp]`: on a hit (that very receiver, the
+    /// prototype epoch still the memo's stamp, one realm), the property's
+    /// value in `rax`; otherwise to `miss`. Clobbers `rax`, `r9`, `r11`.
+    pub(crate) fn p_native_own_hit(
+        &mut self,
+        (realm_off, multi_realm_off): (i32, i32),
+        (recv_base, recv_disp): (u8, i32),
+        site: *const MethodSite,
+        miss: Label,
+    ) {
+        use core::mem::offset_of;
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        let own = offset_of!(MethodSite, native_own);
+        self.g_load(r::RAX, recv_base, recv_disp);
+        self.g_movabs(r::R11, site as u64);
+        self.g_cmp_mem(r::RAX, r::R11, i(own + offset_of!(NativeOwn, recv)));
+        self.g_jcc(cc::NE, miss);
+        self.p_load_proto_epoch(r::R9);
+        self.g_cmp_mem(r::R9, r::R11, i(own + offset_of!(NativeOwn, stamp)));
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R9, multi_realm_off, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::R9, r::R11, i(own + offset_of!(NativeOwn, value)));
+        self.g_load(r::RAX, r::R9, 0);
     }
 
     /// The method lookup of a [`MethodSite`] (see its docs), on the receiver

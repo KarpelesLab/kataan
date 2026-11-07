@@ -6339,7 +6339,7 @@ fn vm_get_prop(
             return Ok(v);
         }
         // A built-in function's own data property (`Object.prototype`).
-        if let Some(v) = ctx.realm.native_own_data(h, key) {
+        if let Some(v) = ctx.realm.native_own_data(h, key, cache) {
             return Ok(v);
         }
         // A VM closure's chain (a static member, `C.kind`, or its own data

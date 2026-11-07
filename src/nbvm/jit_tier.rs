@@ -2851,6 +2851,7 @@ pub(crate) extern "C" fn jit_helper_get_method_site(
                 #[allow(unsafe_code)]
                 let site = unsafe { &mut *site };
                 site.fill(&mut ctx.realm, Handle::from_raw(h));
+                site.fill_native_own(&mut ctx.realm, Handle::from_raw(h));
             }
             return v.to_bits();
         }
@@ -4354,6 +4355,7 @@ pub(crate) extern "C" fn jit_helper_get_prop_site(
         if let Some(getter) = site.fill_get(&mut ctx.realm, h) {
             fill_call_site(ctx, getter, call);
         }
+        site.fill_native_own(&mut ctx.realm, h);
     }
     r
 }

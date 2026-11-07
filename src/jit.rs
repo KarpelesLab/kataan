@@ -11995,6 +11995,18 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(helper);
+                    // A built-in function receiver's own method
+                    // (`Array.isArray`): the site's memo of it.
+                    let call_helper = a.new_label();
+                    a.p_native_own_hit(
+                        (helpers.call_layout.realm, helpers.call_layout.multi_realm),
+                        (call_seq::r::RBX, disp(obj)),
+                        s.method_ptr,
+                        call_helper,
+                    );
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                    a.bind(call_helper);
                     // (In a speculative loop's fast version, which makes
                     // no call, the slow path leaves for the plain copy.)
                     if let Some(b) = num.spec_bail(&mut a, op_idx) {
@@ -13497,19 +13509,40 @@ impl JitFunction {
                     let bail = num.spec_bail(&mut a, op_idx);
                     let slow = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
+                    let mut heaps = Vec::new();
                     for &r in rs {
                         if num.is_number_at(op_idx, r) {
                             continue;
                         }
-                        // A heap value (a String among them): the interpreter's.
                         a.load_rax(disp(r));
                         a.p_cmp_handle_floor(call_seq::r::RAX);
-                        a.g_jcc(call_seq::cc::AE, slow);
+                        if bail.is_some() {
+                            a.g_jcc(call_seq::cc::AE, slow);
+                        } else {
+                            let heap = a.new_label();
+                            a.g_jcc(call_seq::cc::AE, heap);
+                            heaps.push((heap, r));
+                        }
                     }
                     a.movabs_rax(tag_true as i64);
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     if bail.is_none() {
+                        // A heap value that is no string cell (an object,
+                        // a BigInt, a Symbol: `plain_prim` is false for
+                        // it): `false`. A string cell (plain, unless it is
+                        // a function-like marker) is the interpreter's.
+                        for (heap, r) in heaps {
+                            a.bind(heap);
+                            a.p_arena(helpers.call_layout.realm, &layout.props);
+                            a.load_rax(disp(r));
+                            a.p_slot_rooted(&layout, call_seq::r::RCX, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_str_disc);
+                            a.je(slow);
+                            a.movabs_rax(NanBox::boolean(false).to_bits() as i64);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                        }
                         a.bind(slow);
                         exec_op!(pc);
                     }
@@ -13880,6 +13913,18 @@ impl JitFunction {
             a.dbg_mark("x-get");
             let slow = a.new_label();
             let getter = a.new_label();
+            // A built-in function receiver's own data property
+            // (`Object.prototype`): the site's memo of it.
+            let chain = a.new_label();
+            a.p_native_own_hit(
+                (helpers.call_layout.realm, helpers.call_layout.multi_realm),
+                (call_seq::r::RBX, disp(obj)),
+                method_ptr,
+                chain,
+            );
+            a.store_rax(disp(dst));
+            a.jmp(done);
+            a.bind(chain);
             a.p_method_lookup(
                 &layout,
                 helpers.call_layout.realm,
