@@ -821,6 +821,7 @@ fn verify_op_with(
             callee,
             this,
             args,
+            ..
         } => {
             reg(*dst)?;
             reg(*callee)?;
@@ -1569,6 +1570,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             callee,
             this,
             args,
+            ..
         } => {
             w_u8(87, out);
             w_reg(*dst, out);
@@ -2504,6 +2506,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             callee: r.reg()?,
             this: r.reg()?,
             args: r.reg()?,
+            name: None,
         },
         89 => Op::LoadNewTarget { dst: r.reg()? },
         90 => Op::MakeClass {

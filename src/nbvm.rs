@@ -527,6 +527,9 @@ pub enum Op {
         callee: Reg,
         this: Reg,
         args: Reg,
+        /// The callee's source text for a not-callable `TypeError` (`k`,
+        /// `o.m`), as [`Op::CallValue`]'s; not encoded in serialized bytecode.
+        name: Option<Box<str>>,
     },
     /// `f(items…, ...src)` when spreading `src` runs no code: `src` is a plain
     /// array iterated by the built-in `%ArrayIterator%` (see `iter_fast`)
@@ -9281,6 +9284,7 @@ fn run_frame_at_ic(
                 callee,
                 this,
                 args,
+                name,
             } => {
                 let argv = spread_argv(ctx, regs[*args as usize])?;
                 let (f, t) = (regs[*callee as usize], regs[*this as usize]);
@@ -9292,7 +9296,10 @@ fn run_frame_at_ic(
                 ctx.frame_shadow.truncate(pub_mark);
                 match r {
                     Ok(v) => regs[*dst as usize] = v,
-                    Err(e) => handle_throw!(e),
+                    Err(e) => {
+                        let e = name_not_callable(ctx, f, name.as_deref(), e);
+                        handle_throw!(e)
+                    }
                 }
             }
             Op::FreshArrayIterPlain { dst } => {
@@ -9329,6 +9336,12 @@ fn run_frame_at_ic(
                 ctx.frame_shadow.truncate(pub_mark);
                 match r {
                     Ok(v) => regs[*dst as usize] = v,
+                    // A callee that is not callable threw before running
+                    // anything (and this spread ran no code): the general
+                    // `CallSpread` after it throws again, naming the callee.
+                    Err(_) if !callee_is_callable(ctx, f) => {
+                        regs[*ok as usize] = NanBox::boolean(false);
+                    }
                     Err(e) => handle_throw!(e),
                 }
             }
@@ -13914,6 +13927,11 @@ const NOT_CALLABLE_MSG: &str = "is not a function";
 /// anything), and the site knows the callee's text, the error becomes one
 /// that says what was called (`u is not a function`). Any other error is
 /// `e` unchanged.
+/// Whether `callee` is a callable value (as `name_not_callable` decides it).
+fn callee_is_callable(ctx: &mut Ctx, callee: NanBox) -> bool {
+    callee.as_handle().is_some() && with_host(ctx, |h| h.is_callable_value(callee)).unwrap_or(true)
+}
+
 fn name_not_callable(ctx: &mut Ctx, callee: NanBox, name: Option<&str>, e: VmError) -> VmError {
     let (Some(name), VmError::Thrown(v)) = (name, &e) else {
         return e;
@@ -20379,7 +20397,7 @@ impl Compiler {
                     let jf = self.emit_jump_if_false(go);
                     self.optchain_ends.last_mut().expect("a chain").push(jf);
                 }
-                self.call_spread(f, this, arguments)
+                self.call_spread(f, this, arguments, callee_text(callee))
             }
             // `f?.(args)` / `o.m?.(args)`: a nullish callee short-circuits the
             // whole chain (to its `OptChain` end) before the arguments run.
@@ -20427,7 +20445,7 @@ impl Compiler {
                 let go = self.emit_not_nullish(f)?;
                 let jf = self.emit_jump_if_false(go);
                 self.optchain_ends.last_mut().expect("a chain").push(jf);
-                self.call_spread(f, this, arguments)
+                self.call_spread(f, this, arguments, callee_text(callee))
             }
             // A bare-identifier callee resolved through the environment: the
             // reference supplies `this` (a `with` object), and `eval(…)` is a
@@ -20452,6 +20470,7 @@ impl Compiler {
                     callee: f,
                     this,
                     args,
+                    name: callee_text(callee),
                 });
                 Ok(dst)
             }
@@ -20497,7 +20516,7 @@ impl Compiler {
                         (f, self.constant(NanBox::undefined())?)
                     }
                 };
-                self.call_spread(f, this, arguments)
+                self.call_spread(f, this, arguments, callee_text(callee))
             }
             Expr::Call {
                 callee,
@@ -20545,6 +20564,7 @@ impl Compiler {
                         callee: f,
                         this,
                         args,
+                        name: None,
                     });
                     return Ok(dst);
                 }
@@ -20732,6 +20752,7 @@ impl Compiler {
                         callee: f,
                         this: recv,
                         args,
+                        name: None,
                     });
                     return Ok(dst);
                 }
@@ -21820,6 +21841,7 @@ impl Compiler {
         f: Reg,
         this: Reg,
         arguments: &[crate::ast::Argument],
+        name: Option<Box<str>>,
     ) -> Result<Reg, CompileError> {
         let dst = self.alloc();
         if let Some((crate::ast::Argument::Spread(last), init)) = arguments.split_last()
@@ -21863,6 +21885,7 @@ impl Compiler {
                 callee: f,
                 this,
                 args: arr,
+                name,
             });
             self.patch(done);
             return Ok(dst);
@@ -21873,6 +21896,7 @@ impl Compiler {
             callee: f,
             this,
             args,
+            name,
         });
         Ok(dst)
     }
@@ -22344,6 +22368,7 @@ impl Compiler {
             callee: f,
             this,
             args,
+            name: None,
         });
         Ok(dst)
     }
@@ -23509,6 +23534,7 @@ impl Compiler {
                         callee: init,
                         this: f,
                         args: none,
+                        name: None,
                     });
                     continue;
                 }
@@ -23541,6 +23567,7 @@ impl Compiler {
                     callee: thunk,
                     this: f,
                     args: none,
+                    name: None,
                 });
                 match st {
                     Static::Field(key, _, _) if named => self.ops.push(Op::DefineMethod {
