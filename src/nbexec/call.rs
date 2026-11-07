@@ -1203,6 +1203,11 @@ impl Interp {
             // A readable static method: `target` is `[constructor, name]`. Route to the
             // constructor's static dispatch regardless of the call's `this` (so a detached
             // `var f = Number.isInteger; f(x)` works like `Number.isInteger(x)`).
+            if id == N_STATIC_METHOD
+                && let Some(v) = self.static_method_fast(target, args)
+            {
+                return Ok(v);
+            }
             if id == N_STATIC_METHOD {
                 let pair = self.realm.array_elements(target).map(<[_]>::to_vec);
                 if let Some(pair) = pair
@@ -3761,3 +3766,29 @@ impl Interp {
 
 // --- native superclasses (`class extends <built-in>`) ---
 impl Interp {}
+
+impl Interp {
+    /// A readable static method's call (`target` is its `[constructor,
+    /// name]` pair) answered without the by-name dispatch, when that answer
+    /// runs no code: `Symbol.for(s)` of a flat String already in the global
+    /// symbol registry (whose `ToString` is itself, and whose registry key is
+    /// its text when that is well-formed and does not start with NUL, see
+    /// `realm::user_key`). `None` for anything else.
+    fn static_method_fast(&self, target: Handle, args: &[NanBox]) -> Option<NanBox> {
+        let pair = self.realm.array_elements(target)?;
+        let (ctor, name) = (pair.first()?.as_handle()?, pair.get(1)?.as_handle()?);
+        if self.realm.native_at(Handle::from_raw(ctor)) != Some(N_SYMBOL)
+            || self.realm.string_leaf_bytes(Handle::from_raw(name))? != b"for"
+        {
+            return None;
+        }
+        let bytes = self
+            .realm
+            .string_leaf_bytes(Handle::from_raw(args.first()?.as_handle()?))?;
+        let key = core::str::from_utf8(bytes).ok()?;
+        if key.starts_with('\0') {
+            return None;
+        }
+        self.symbol_registry.get(key).copied()
+    }
+}

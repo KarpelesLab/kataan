@@ -228,30 +228,46 @@ impl Interp {
         } else {
             String::new()
         };
-        // The wrapper holder `{ "": value }`.
-        let holder = self.realm.new_object();
-        self.realm.set_property(holder, "", value);
+        // The wrapper holder `{ "": value }`: only a replacer function sees it
+        // (as its `this`), and its `[[Get]]` of `""` is `value` itself. With
+        // none, no step reads the holder, so none is made.
+        let holder = if self.is_callable_value(replacer_fn) {
+            let holder = self.realm.new_object();
+            self.realm.set_property(holder, "", value);
+            Some(holder)
+        } else {
+            None
+        };
         let mut cx = JsonOut {
             replacer_fn,
             property_list: property_list.as_deref(),
             gap: &gap,
             stack: Vec::new(),
             deep: alloc::collections::BTreeSet::new(),
-            out: Vec::new(),
+            out: Vec::with_capacity(self.json_out_hint),
             shape_keys: core::mem::take(&mut self.json_shape_memo),
             tojson_obj: crate::ic::PropertyCache::new(),
             tojson_arr: Default::default(),
             fast: replacer_fn.as_handle().is_none() && property_list.is_none() && gap.is_empty(),
             max_len: self.realm.limits.max_string_len,
             slow: 0,
-            proofs: [(0, 0); 4],
+            proofs: self.json_proofs,
             last_plan: None,
         };
-        let wrote = match self.read_member(holder, "") {
-            Ok(value) => self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, ""),
-            Err(e) => Err(e),
+        let wrote = match holder {
+            Some(holder) => match self.read_member(holder, "") {
+                Ok(value) => self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, ""),
+                Err(e) => Err(e),
+            },
+            // No step dereferences the holder without a replacer function:
+            // a handle to no cell stands in for it.
+            None => self.json_ser_got(&mut cx, NO_HOLDER, JsonKey::Str(""), value, ""),
         };
         self.json_shape_memo = core::mem::take(&mut cx.shape_keys);
+        self.json_proofs = cx.proofs;
+        // The next output buffer starts at this one's size (small outputs
+        // then grow in place at most rarely; a huge one is not kept).
+        self.json_out_hint = cx.out.len().clamp(64, 4096);
         Ok(wrote?.then_some(cx.out))
     }
 
@@ -1512,11 +1528,18 @@ struct JsonOut<'a> {
     /// from the heap before the count last moved are still current.
     slow: u64,
     /// Prototypes shown (by [`Realm::prove_chain_lacks`]) to have no
-    /// `toJSON` on their chain, each with the prototype epoch it holds at.
+    /// `toJSON` on their chain, each with the prototype epoch it holds at
+    /// (kept from one call to the next: a proof is only as good as its
+    /// epoch, and every link it covers is watched).
     proofs: [(u64, u64); 4],
     /// The plan [`Interp::json_fast_object`] used last.
     last_plan: Option<Rc<JsonShapeKeys>>,
 }
+
+/// The holder `JSON.stringify` passes along when there is no replacer
+/// function (the only step that observes the holder): a handle naming no
+/// heap cell.
+const NO_HOLDER: Handle = Handle::from_raw(u64::MAX >> 16);
 
 /// How many enclosing objects the `JSON.stringify` cycle check scans before
 /// it keeps the deeper ones in a set (see `Interp::json_enter`).

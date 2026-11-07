@@ -62,9 +62,23 @@ struct Site {
     misses: u8,
     learns: u32,
     hits: u32,
+    /// The parse (see [`JsonParseMemo::parse`]) `learns` and `hits` count
+    /// for: the template itself outlives a parse, its learning budget does
+    /// not.
+    parse: u32,
 }
 
 impl Site {
+    /// Starts this site's learning budget afresh when it was last counted
+    /// by an earlier parse than `parse`.
+    fn enter(&mut self, parse: u32) {
+        if self.parse != parse {
+            self.parse = parse;
+            self.learns = 0;
+            self.hits = 0;
+        }
+    }
+
     /// Whether a missed object should become this site's template.
     fn should_learn(&self) -> bool {
         (self.template.is_none() || self.misses >= TEMPLATE_REPLACE_MISSES)
@@ -92,6 +106,25 @@ struct JsonParser<'a> {
     buf: Vec<u8>,
     /// The realm's root shape (every template grew from it).
     root: Rc<Shape>,
+    /// This parse's number (see [`Site::enter`]).
+    parse: u32,
+}
+
+/// The parts of [`JsonParser`] kept from one parse to the next: the
+/// transition caches and record templates (each validated where it is used:
+/// a cache by the shapes it saw, a template by the input's bytes and its
+/// root shape), and the stacks' and scratch buffer's storage (left empty).
+/// Documents of the same form, parsed one call each, then meet their
+/// templates on the first record.
+#[derive(Default)]
+pub(crate) struct JsonParseMemo {
+    caches: Vec<Option<(Box<str>, PropertyCache)>>,
+    sites: Vec<Site>,
+    vals: Vec<NanBox>,
+    keys: Vec<JsonKey>,
+    buf: Vec<u8>,
+    /// The number of parses begun, wrapping.
+    parse: u32,
 }
 
 impl JsonParser<'_> {
@@ -194,18 +227,39 @@ impl Interp {
 
     /// [`json_parse_text`](Self::json_parse_text) of a string's WTF-8 bytes.
     pub(crate) fn json_parse_wtf8(&mut self, src: &[u8]) -> Result<NanBox, ExecError> {
+        let mut m = self.json_parse_memo.take().unwrap_or_default();
+        m.parse = m.parse.wrapping_add(1);
         let mut p = JsonParser {
             src,
             pos: 0,
-            caches: Vec::new(),
-            sites: Vec::new(),
-            vals: Vec::new(),
-            keys: Vec::new(),
+            caches: core::mem::take(&mut m.caches),
+            sites: core::mem::take(&mut m.sites),
+            vals: core::mem::take(&mut m.vals),
+            keys: core::mem::take(&mut m.keys),
             units: [None; 128],
-            buf: Vec::new(),
+            buf: core::mem::take(&mut m.buf),
             root: self.realm.root_shape_rc(),
+            parse: m.parse,
         };
-        let value = self.json_fast_value(&mut p)?;
+        let value = self.json_parse_run(&mut p);
+        // Back into the memo, the stacks emptied (an error leaves values
+        // on them).
+        p.vals.clear();
+        p.keys.clear();
+        p.buf.clear();
+        m.caches = p.caches;
+        m.sites = p.sites;
+        m.vals = p.vals;
+        m.keys = p.keys;
+        m.buf = p.buf;
+        self.json_parse_memo = Some(m);
+        value
+    }
+
+    /// The whole text at `p`: one JSON value plus optional whitespace.
+    #[inline(never)]
+    fn json_parse_run(&mut self, p: &mut JsonParser<'_>) -> Result<NanBox, ExecError> {
+        let value = self.json_fast_value(p)?;
         p.skip_ws();
         if p.pos != p.src.len() {
             return Err(self.json_error("Unexpected token in JSON"));
@@ -383,6 +437,7 @@ impl Interp {
             p.vals.truncate(vstart);
             p.keys.truncate(kstart);
             if let Some(s) = p.sites.get_mut(site) {
+                s.enter(p.parse);
                 s.misses = 0;
                 s.hits = s.hits.saturating_add(1);
             }
@@ -426,6 +481,7 @@ impl Interp {
             p.sites.resize_with(TEMPLATE_SITES, Site::default);
         }
         let s = &mut p.sites[site];
+        s.enter(p.parse);
         s.misses = s.misses.saturating_add(1);
         if learnable
             && s.should_learn()
@@ -532,6 +588,7 @@ impl Interp {
         self.realm.set_property(obj, key, v);
     }
 
+    #[inline]
     fn json_fast_lit(
         &mut self,
         p: &mut JsonParser<'_>,

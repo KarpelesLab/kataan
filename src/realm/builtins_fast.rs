@@ -1006,6 +1006,13 @@ impl Realm {
         None
     }
 
+    /// [`watch_link`](Self::watch_link) of the cell `raw` with its own
+    /// auxiliary object, if any.
+    pub(crate) fn watch_cell(&mut self, raw: u64) {
+        let aux = self.aux_props.get(&raw).map(|a| a.to_raw());
+        self.watch_link(raw, aux);
+    }
+
     /// Watches a recorded chain link (see `crate::object::JIT_FLAG_WATCHED`):
     /// the link `raw` itself when it is an ordinary object, else the cell (in
     /// the realm's watched set, so a change to its auxiliary object or
@@ -1245,6 +1252,20 @@ impl Default for ArrayIterJit {
             fresh: u64::MAX,
         }
     }
+}
+
+/// The memo of `ArraySpeciesCreate`'s default-case proof for arrays with no
+/// own named properties (`nbvm::array_hof::default_species`): the
+/// `[[Get]]` of `constructor` from the array prototype `proto` finds the data
+/// property `at` (every link on the way watched at prototype epoch `stamp`),
+/// which then held the `%Array%` intrinsic `ctor`. A hit re-reads that slot
+/// and `ctor`'s `@@species` getter, which an in-place write could change
+/// without moving the epoch.
+pub(crate) struct ArraySpeciesMemo {
+    pub(crate) proto: u64,
+    pub(crate) stamp: u64,
+    pub(crate) at: StampedSlot,
+    pub(crate) ctor: u64,
 }
 
 /// The VM's memo of the fixed lookups of its array-iteration fast path

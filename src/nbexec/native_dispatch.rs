@@ -2151,6 +2151,19 @@ impl Interp {
                 let target = self.coerce_to_object(arg(0));
                 if let Some(t) = target.as_handle().map(Handle::from_raw) {
                     for src in &args[1.min(args.len())..] {
+                        // A plain data source onto a plain target: the stores
+                        // alone (see `realm::assign_fast`).
+                        if let Some(sh) = src.as_handle().map(Handle::from_raw)
+                            && !self.is_mapped_arguments(sh)
+                            && !self.is_mapped_arguments(t)
+                        {
+                            let mut memo = core::mem::take(&mut self.assign_memo);
+                            let done = self.realm.assign_plain(t, sh, &mut memo);
+                            self.assign_memo = memo;
+                            if done {
+                                continue;
+                            }
+                        }
                         // A primitive string source contributes its character indices.
                         if let Some(s) = src
                             .as_handle()

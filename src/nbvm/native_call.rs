@@ -42,9 +42,9 @@ use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
     N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_GEN_NEXT, N_GEN_RETURN,
     N_GEN_THROW, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN, N_NUMBER, N_NUMBER_PROTO_FN,
-    N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_HAS_OWN,
-    N_OBJECT_KEYS, N_OBJECT_VALUES, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD,
-    N_STRING_PROTO_FN,
+    N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_GET_OWN_NAMES,
+    N_OBJECT_GET_PROTO, N_OBJECT_HAS_OWN, N_OBJECT_KEYS, N_OBJECT_VALUES, N_REFLECT_GET_PROTO,
+    N_REFLECT_HAS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -146,6 +146,12 @@ enum FastOp {
     StrReplaceAll,
     /// `Object.keys`.
     ObjKeys,
+    /// `Object.getOwnPropertyNames`.
+    ObjNames,
+    /// `Object.getPrototypeOf` / `Reflect.getPrototypeOf`.
+    ObjGetProto,
+    /// `Reflect.has`.
+    ReflectHas,
     /// `Object.entries`.
     ObjEntries,
     /// `Object.values`.
@@ -254,6 +260,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_OBJ_PROTO_HASOWN) => return FastOp::ObjHasOwn,
         Some(N_ARRAY_IS_ARRAY) => return FastOp::ArrayIsArray,
         Some(N_OBJECT_KEYS) => return FastOp::ObjKeys,
+        Some(N_OBJECT_GET_OWN_NAMES) => return FastOp::ObjNames,
+        Some(N_OBJECT_GET_PROTO | N_REFLECT_GET_PROTO) => return FastOp::ObjGetProto,
+        Some(N_REFLECT_HAS) => return FastOp::ReflectHas,
         Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
         Some(N_OBJECT_VALUES) => return FastOp::ObjValues,
         Some(N_OBJECT_HAS_OWN) => return FastOp::ObjStaticHasOwn,
@@ -1020,7 +1029,7 @@ fn run_op(
                 1 => len - start,
                 _ => length_arg(arg(1))?.min(len - start),
             };
-            if !super::array_hof::default_species(realm, h) {
+            if !super::array_hof::default_species_armed(realm, h) {
                 return None;
             }
             let items = args.get(2..).unwrap_or(&[]);
@@ -1506,7 +1515,7 @@ fn run_op(
         }
         FastOp::ArrSlice => {
             // `ArraySpeciesCreate` must be the plain `ArrayCreate`.
-            if !super::array_hof::default_species(realm, h) {
+            if !super::array_hof::default_species_armed(realm, h) {
                 return None;
             }
             let elems = dense_elements(realm, h)?;
@@ -1633,6 +1642,72 @@ fn run_op(
                     NanBox::handle(realm.new_string_wtf8(out).to_raw())
                 }
             }
+        }
+        FastOp::ObjNames => {
+            // An object whose own properties are exactly its layout's
+            // enumerable data keys, none a Symbol or other internal key:
+            // its own String keys are its `Object.keys` (the same shared
+            // key Strings, see `plain_enumerable_key_strings`).
+            let o = arg(0).as_handle().map(Handle::from_raw)?;
+            let strs = realm.plain_enumerable_key_strings(o)?;
+            NanBox::handle(realm.new_array(strs.to_vec()).to_raw())
+        }
+        FastOp::ObjGetProto => {
+            // An ordinary object or a plain array (no proxy, no host hook):
+            // `[[GetPrototypeOf]]` is the ordinary one, the stored link.
+            // (`ToObject` of a primitive, and `Reflect`'s TypeError for one,
+            // are the host's.)
+            let o = arg(0).as_handle().map(Handle::from_raw)?;
+            let p = if let Some(p) = realm.plain_array_root_proto(o) {
+                Some(p)
+            } else if realm.is_object_cell(o) {
+                realm.object_proto(o)
+            } else {
+                return None;
+            };
+            if realm.is_host_exotic(o) {
+                return None;
+            }
+            p.map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()))
+        }
+        FastOp::ReflectHas => {
+            // `HasProperty(target, key)` for a String key that is its own
+            // storage key, along a chain of ordinary objects and plain arrays
+            // (no proxy `has` trap, no host hook, no index side table): each
+            // link's own-key test, in turn.
+            let t = arg(0).as_handle().map(Handle::from_raw)?;
+            let kh = arg(1).as_handle().map(Handle::from_raw)?;
+            let b = realm.string_leaf_bytes(kh)?;
+            if b.first() == Some(&0) {
+                return None;
+            }
+            let key = core::str::from_utf8(b).ok()?;
+            let mut cur = Some(t);
+            let mut found = false;
+            for _ in 0..64 {
+                let Some(c) = cur else {
+                    break;
+                };
+                let next = if let Some(p) = realm.plain_array_root_proto(c) {
+                    Some(p)
+                } else if realm.is_object_cell(c) {
+                    realm.object_proto(c)
+                } else {
+                    return None;
+                };
+                if realm.is_host_exotic(c) {
+                    return None;
+                }
+                if realm.has_own(c, key) {
+                    found = true;
+                    break;
+                }
+                cur = next;
+            }
+            if cur.is_some() && !found {
+                return None;
+            }
+            NanBox::boolean(found)
         }
         FastOp::ObjKeys | FastOp::ObjEntries | FastOp::ObjValues => {
             let o = arg(0).as_handle().map(Handle::from_raw)?;

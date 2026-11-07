@@ -25,6 +25,7 @@
 
 mod args_fast;
 pub use args_fast::ARGS_CELLS;
+pub(crate) mod assign_fast;
 pub(crate) mod builtins_fast;
 pub(crate) mod coll_fast;
 mod coll_index;
@@ -521,6 +522,9 @@ pub struct Realm {
     /// The VM's stamped memo of the array-iteration lookups (see
     /// [`builtins_fast::ArrayIterMemo`]).
     pub(crate) array_iter_memo: builtins_fast::ArrayIterMemo,
+    /// The memo of the default-`ArraySpeciesCreate` proof (see
+    /// [`builtins_fast::ArraySpeciesMemo`]).
+    pub(crate) species_memo: Option<alloc::boxed::Box<builtins_fast::ArraySpeciesMemo>>,
     /// The memo's validated open, flat for compiled code (see
     /// [`builtins_fast::ArrayIterJit`]).
     pub(crate) array_iter_jit: builtins_fast::ArrayIterJit,
@@ -1010,6 +1014,7 @@ impl Realm {
             root_array_proto: None,
             vm_array_iter: VmArrayIterIntrinsics::default(),
             array_iter_memo: builtins_fast::ArrayIterMemo::default(),
+            species_memo: None,
             array_iter_jit: builtins_fast::ArrayIterJit::default(),
             promise_proto_intrinsic: None,
             symbol_proto_intrinsic: None,

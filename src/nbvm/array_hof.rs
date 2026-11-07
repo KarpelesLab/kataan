@@ -107,13 +107,67 @@ fn chain_data(realm: &Realm, h: Handle, key: &str) -> Result<Option<NanBox>, ()>
 
 /// Whether `ArraySpeciesCreate(O, n)` for the array `h` is the default
 /// `ArrayCreate(n)`, decided with no observable effect (see the module docs).
+/// From the realm's memo when it covers `h` (see [`default_species_armed`]).
 pub(super) fn default_species(realm: &Realm, h: Handle) -> bool {
-    let Ok(Some(c)) = chain_data(realm, h, "constructor") else {
+    if let Some(ok) = species_memo_hit(realm, h) {
+        return ok;
+    }
+    default_species_walk(realm, h)
+}
+
+/// [`default_species`], arming the realm's memo (see
+/// [`ArraySpeciesMemo`](crate::realm::builtins_fast::ArraySpeciesMemo)) on
+/// a positive walk for an array with no own named properties, so the next
+/// such array with the same prototype skips the walk.
+pub(super) fn default_species_armed(realm: &mut Realm, h: Handle) -> bool {
+    if let Some(ok) = species_memo_hit(realm, h) {
+        return ok;
+    }
+    if !default_species_walk(realm, h) {
         return false;
-    };
-    let Some(ch) = c.as_handle().map(Handle::from_raw) else {
-        return false;
-    };
+    }
+    if !realm.is_host_exotic(h)
+        && let Some(p) = realm.plain_array_root_proto(h)
+        && let Some(Some(at)) = realm.watch_get_chain(p, "constructor")
+        && let Some(ctor) = realm.stamped_slot(&at).and_then(|c| c.as_handle())
+    {
+        // The `@@species` getter lives on `%Array%` itself: watched too, so
+        // redefining that accessor moves the epoch.
+        realm.watch_cell(ctor);
+        realm.species_memo = Some(alloc::boxed::Box::new(
+            crate::realm::builtins_fast::ArraySpeciesMemo {
+                proto: p.to_raw(),
+                stamp: crate::object::proto_epoch(),
+                at,
+                ctor,
+            },
+        ));
+    }
+    true
+}
+
+/// `Some(true)` when the memo covers the array `h`: `h` owns no named
+/// property (so no own `constructor`) and has the realm's first
+/// `%Array.prototype%` as its prototype (as its sticky flags tell), that
+/// prototype is the memo's, the epoch is the memo's, and the found slot
+/// still holds the memo's `%Array%` (an in-place write would not move the
+/// epoch; redefining `%Array%`'s `@@species` accessor would, as `%Array%` is
+/// watched). `None` otherwise (the walk decides).
+#[inline]
+fn species_memo_hit(realm: &Realm, h: Handle) -> Option<bool> {
+    let m = realm.species_memo.as_deref()?;
+    if m.stamp != crate::object::proto_epoch()
+        || realm.plain_array_root_proto(h).map(Handle::to_raw) != Some(m.proto)
+        || realm.is_host_exotic(h)
+        || realm.stamped_slot(&m.at).and_then(|c| c.as_handle()) != Some(m.ctor)
+    {
+        return None;
+    }
+    Some(true)
+}
+
+/// Whether `ch` is `%Array%` with its built-in `@@species` getter.
+fn species_getter_intrinsic(realm: &Realm, ch: Handle) -> bool {
     if realm.native_at(ch) != Some(N_BASE_ARRAY) {
         return false;
     }
@@ -124,6 +178,17 @@ pub(super) fn default_species(realm: &Realm, h: Handle) -> bool {
         g.as_handle()
             .is_some_and(|g| realm.native_at(Handle::from_raw(g)) == Some(N_TYPED_ARRAY_SPECIES))
     })
+}
+
+/// [`default_species`] by the lookups themselves.
+fn default_species_walk(realm: &Realm, h: Handle) -> bool {
+    let Ok(Some(c)) = chain_data(realm, h, "constructor") else {
+        return false;
+    };
+    let Some(ch) = c.as_handle().map(Handle::from_raw) else {
+        return false;
+    };
+    species_getter_intrinsic(realm, ch)
 }
 
 /// `recv[key](...args)` when `recv` is a plain array, `key` resolves to one
@@ -178,7 +243,7 @@ pub(super) fn run(
     {
         return None;
     }
-    if matches!(op, Hof::Map | Hof::Filter) && !default_species(&ctx.realm, h) {
+    if matches!(op, Hof::Map | Hof::Filter) && !default_species_armed(&mut ctx.realm, h) {
         return None;
     }
     // `sort` collects then writes back; here only over an array whose every

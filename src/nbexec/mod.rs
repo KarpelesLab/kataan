@@ -261,6 +261,19 @@ pub struct Interp {
     /// (a plan depends on the shape alone), so serializing many objects built
     /// alike, one call each, plans each shape once.
     json_shape_memo: Vec<alloc::rc::Rc<json::JsonShapeKeys>>,
+    /// `JSON.stringify`'s "no `toJSON` on this prototype's chain" proofs,
+    /// `(prototype, prototype epoch)`, kept from one call to the next.
+    json_proofs: [(u64, u64); 4],
+    /// The capacity `JSON.stringify` gives its next output buffer: the last
+    /// output's size, clamped.
+    json_out_hint: usize,
+    /// `JSON.parse`'s transition caches, record templates and stack storage,
+    /// kept from one call to the next (see `json_parse::JsonParseMemo`);
+    /// taken out for the length of a parse.
+    json_parse_memo: Option<alloc::boxed::Box<json_parse::JsonParseMemo>>,
+    /// `Object.assign`'s plain-copy proofs, kept from one call to the next
+    /// (see `realm::assign_fast`).
+    assign_memo: crate::realm::assign_fast::AssignMemo,
     /// When a *generic* array-like receiver is materialized for an iteration
     /// method (`map`/`filter`/`forEach`/`reduce`/…), this records which indices
     /// were actually *present* (`HasProperty`) on the source object, so those
@@ -1243,7 +1256,7 @@ const N_OBJECT_SEAL: u16 = 125;
 const N_OBJECT_IS_SEALED: u16 = 126;
 const N_OBJECT_PREVENT_EXT: u16 = 127;
 const N_OBJECT_IS_EXTENSIBLE: u16 = 128;
-const N_OBJECT_GET_OWN_NAMES: u16 = 37;
+pub(crate) const N_OBJECT_GET_OWN_NAMES: u16 = 37;
 const N_OBJECT_GET_OWN_SYMBOLS: u16 = 158;
 const N_ENCODE_URI_COMPONENT: u16 = 159;
 const N_DECODE_URI_COMPONENT: u16 = 160;
@@ -1755,7 +1768,7 @@ pub(crate) const N_OBJ_PROTO_HASOWN: u16 = 181;
 const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;
 const N_OBJ_PROTO_PROPISENUM: u16 = 183;
 pub(crate) const N_OBJECT_CREATE: u16 = 107;
-const N_OBJECT_GET_PROTO: u16 = 108;
+pub(crate) const N_OBJECT_GET_PROTO: u16 = 108;
 const N_OBJECT_SET_PROTO: u16 = 109;
 const N_OBJECT_DEFINE_PROP: u16 = 110;
 const N_OBJECT_GET_OWN_DESC: u16 = 111;
@@ -1785,14 +1798,14 @@ const N_OBJECT_DEFINE_PROPS: u16 = 124;
 const N_WEAKSET: u16 = 113;
 const N_REFLECT_GET: u16 = 114;
 const N_REFLECT_SET: u16 = 115;
-const N_REFLECT_HAS: u16 = 116;
+pub(crate) const N_REFLECT_HAS: u16 = 116;
 const N_REFLECT_OWN_KEYS: u16 = 117;
 const N_REFLECT_DELETE: u16 = 118;
 const N_REFLECT_APPLY: u16 = 119;
 const N_REFLECT_CONSTRUCT: u16 = 120;
 const N_REFLECT_DEFINE_PROP: u16 = 135;
 const N_REFLECT_GET_OWN_DESC: u16 = 136;
-const N_REFLECT_GET_PROTO: u16 = 137;
+pub(crate) const N_REFLECT_GET_PROTO: u16 = 137;
 /// `Reflect.setPrototypeOf` / `preventExtensions` — like the `Object.*` forms but
 /// returning a boolean success flag.
 const N_REFLECT_SET_PROTO: u16 = 204;
@@ -3035,6 +3048,10 @@ impl Interp {
             regexp_pattern_is_regexp: None,
             join_stack: Vec::new(),
             json_shape_memo: Vec::new(),
+            json_proofs: [(0, 0); 4],
+            json_out_hint: 64,
+            json_parse_memo: None,
+            assign_memo: Default::default(),
             array_like_present: None,
             wasm_states: alloc::collections::BTreeMap::new(),
             wasm_modules: alloc::collections::BTreeMap::new(),

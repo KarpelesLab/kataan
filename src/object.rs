@@ -1409,6 +1409,32 @@ impl Object {
         true
     }
 
+    /// Makes this empty ordinary object (shaped, no own keys, no out-of-line
+    /// part, flags `0`: extensible and unwatched) hold `values` as the plain
+    /// data properties of `shape`, one per key in slot order, keeping its
+    /// `[[Prototype]]` — what adding each of `shape`'s keys in turn leaves
+    /// (the key epoch moves once per key). `false`, having changed nothing,
+    /// when the object is not such an empty one or `shape` does not fit
+    /// `values`.
+    pub fn adopt_data(&mut self, shape: Rc<Shape>, values: &[NanBox]) -> bool {
+        if self.is_dict()
+            || self.len != 0
+            || self.flags != 0
+            || self.extra.is_some()
+            || !self.shape.is_empty()
+            || self.shape.has_implied_attrs()
+        {
+            return false;
+        }
+        let Some(mut o) = Self::with_data(shape, values) else {
+            return false;
+        };
+        o.proto = self.proto;
+        o.key_epoch = self.key_epoch.wrapping_add(values.len() as u32);
+        *self = o;
+        true
+    }
+
     /// The position of the accessor named `name` in the object's accessor
     /// list (stable while [`key_epoch`](Self::key_epoch) is: every change to
     /// the list bumps it).
