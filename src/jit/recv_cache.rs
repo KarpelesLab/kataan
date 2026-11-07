@@ -503,7 +503,7 @@ pub(super) enum Family {
 /// call): `Obj` ways first, then `Arr`, then `Cell` ways.
 const MAX_OBJ_WAYS: usize = 12;
 const MAX_ARR_WAYS: usize = 1;
-const MAX_CELL_WAYS: usize = 1;
+const MAX_CELL_WAYS: usize = 2;
 
 /// How one property op uses the receiver cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1005,9 +1005,10 @@ pub(super) fn plan(
             }
             // A constructor's super constructor / "no instance fields"
             // through the site's identity memo (its miss calls a helper,
-            // which empties every way): outside speculative loops only,
-            // whose `known` sites follow one path's walks.
-            Some(Op::SuperCtor { .. } | Op::InitFields { .. }) => !in_spec(i),
+            // which empties every way — or, in a speculative loop's fast
+            // version, whose `known` sites follow one path's walks, leaves
+            // for the plain copy: `jit`'s `spec_bail`).
+            Some(Op::SuperCtor { .. } | Op::InitFields { .. }) => true,
             _ => usually_inline(bytecode, i),
         };
         if ends_knowledge(op) && !inline {
@@ -1110,12 +1111,12 @@ pub(super) fn plan(
             (GenericOp::Interp { .. }, Some(Op::RequireObjectCoercible { .. })) => {}
             // (They write their `dst` only, or no register: `InitFields`'
             // field initializers run in frames of their own.)
-            (GenericOp::Interp { .. }, Some(Op::SuperCtor { dst, .. })) if !in_spec(i) => {
+            (GenericOp::Interp { .. }, Some(Op::SuperCtor { dst, .. })) => {
                 let d = *dst;
                 ids.retain(|&(x, _)| x != d);
                 fresh.retain(|&x| x != d);
             }
-            (GenericOp::Interp { .. }, Some(Op::InitFields { .. })) if !in_spec(i) => {}
+            (GenericOp::Interp { .. }, Some(Op::InitFields { .. })) => {}
             (GenericOp::Interp { .. } | GenericOp::PushHandler { .. }, _) => {
                 // It may write any register.
                 ids.clear();

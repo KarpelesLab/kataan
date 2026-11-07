@@ -4207,6 +4207,10 @@ impl JitProto {
         let can_deopt = !proto.is_async && !proto.is_generator && deopt::stress();
         let expanded = inline::expand(proto, warm, pick);
         let spliced;
+        // The inlined derived class constructors' keys (`InlineEmit::derived`).
+        let derived_keys = expanded
+            .as_ref()
+            .map_or_else(Vec::new, |e| e.derived.clone());
         let (proto, warm, pc_map) = match expanded {
             Some(e) => {
                 let mut p = proto.clone();
@@ -4488,6 +4492,7 @@ impl JitProto {
             &no_spec_body,
             &forin_plan,
             deopt_info.as_deref(),
+            &derived_keys,
         )?;
         tier_up.spec_regions = spec_heads;
         Some(Self {
@@ -7441,6 +7446,7 @@ impl JitFunction {
         no_spec: &[usize],
         forin_plan: &forin::Plan,
         deopt_info: Option<&deopt::DeoptInfo>,
+        derived_keys: &[u64],
     ) -> Option<GenericCompiled> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
@@ -9504,6 +9510,7 @@ impl JitFunction {
                             setter,
                             way,
                             new_target,
+                            derived: derived_keys.binary_search(&key).is_ok(),
                             super_this,
                             new_alloc,
                             new_way,
@@ -10574,7 +10581,15 @@ impl JitFunction {
                             // (A speculative loop's fast version leaves for
                             // its copy: `spec_alloc_inline`.)
                             let bail = num.spec_bail(&mut a, op_idx);
-                            a.p_ident_hit(site_ptr, disp(*f), bail.unwrap_or(slow));
+                            // (A run-proved one, `numeric::plan_op_proofs`:
+                            // the operand the memo hit on in this run of the
+                            // fast version hits again, unchecked.)
+                            match (bail, num.op_run_proof(op_idx)) {
+                                (Some(bail), Some(ps)) => {
+                                    a.p_ident_proved(site_ptr, disp(*f), ps, bail, true);
+                                }
+                                _ => a.p_ident_hit(site_ptr, disp(*f), bail.unwrap_or(slow)),
+                            }
                             a.g_load(call_seq::r::RAX, call_seq::r::R11, call_seq::IDENT_VALUE);
                             a.store_rax(disp(*dst));
                             a.jmp(done);
@@ -10591,7 +10606,12 @@ impl JitFunction {
                             let slow = a.new_label();
                             let done = a.new_label();
                             let bail = num.spec_bail(&mut a, op_idx);
-                            a.p_ident_hit(site_ptr, disp(*ctor), bail.unwrap_or(slow));
+                            match (bail, num.op_run_proof(op_idx)) {
+                                (Some(bail), Some(ps)) => {
+                                    a.p_ident_proved(site_ptr, disp(*ctor), ps, bail, false);
+                                }
+                                _ => a.p_ident_hit(site_ptr, disp(*ctor), bail.unwrap_or(slow)),
+                            }
                             a.jmp(done);
                             a.bind(slow);
                             if bail.is_none() {
@@ -11788,10 +11808,11 @@ impl JitFunction {
                                 None => f.k == 0,
                                 Some(q) => fresh_to[q] == Some(b.from),
                             };
-                        ok.then_some((b, g.way, f.k == 0))
+                        ok.then_some((b, g.way, f.k))
                     });
                     let fresh_done = a.new_label();
-                    if let Some((b, w, first)) = fresh {
+                    if let Some((b, w, k)) = fresh {
+                        let first = k == 0;
                         let regular = a.new_label();
                         // (In a promoted loop: the value, if in an SSE
                         // register, to the register file the add reads.)
@@ -11877,7 +11898,7 @@ impl JitFunction {
                             helpers.call_layout.realm,
                             s.method_ptr,
                             b,
-                            (first, proven),
+                            (first, proven, k),
                             (disp(val), num.is_number_at(op_idx, val)),
                             regular,
                         );
@@ -12554,18 +12575,38 @@ impl JitFunction {
                     } else {
                         recv_slot!(op_idx, obj, not_arr, recv_cache::Family::Arr);
                     }
-                    a.p_array_plain(&layout, helpers.call_layout.realm, true, helper);
                     let appended = a.new_label();
                     let checked = a.new_label();
+                    // A run-proved store of a speculative loop's fast version
+                    // (`numeric::plan_op_proofs`): once the container alone
+                    // has let a store need nothing of the write barrier in
+                    // this run (its slot address in the proof's frame
+                    // slot), its side-table state and barrier state hold.
+                    let proof = bail
+                        .and(num.op_run_proof(op_idx))
+                        .filter(|_| !merged && val_x.is_none());
+                    if let Some(ps) = proof {
+                        a.g_cmp_mem(call_seq::r::RCX, call_seq::r::RBP, ps);
+                        a.g_jcc(call_seq::cc::E, checked);
+                    }
+                    a.p_array_plain(&layout, helpers.call_layout.realm, true, helper);
                     if val_x.is_none() {
                         // (A promoted value is a Number: nothing to check.)
                         a.load_rax(disp(val));
-                        a.p_barrier_check_appended(
-                            &layout,
-                            helpers.call_layout.realm,
-                            helper,
-                            appended,
-                        );
+                        match proof {
+                            Some(ps) => a.p_barrier_check_proving(
+                                &layout,
+                                helpers.call_layout.realm,
+                                (helper, appended),
+                                ps,
+                            ),
+                            None => a.p_barrier_check_appended(
+                                &layout,
+                                helpers.call_layout.realm,
+                                helper,
+                                appended,
+                            ),
+                        }
                     }
                     a.bind(checked);
                     store_index!(helper);

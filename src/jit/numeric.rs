@@ -364,8 +364,8 @@ pub(super) fn infer(ops: &[Op], n_regs: usize) -> Types {
 }
 
 /// The integrality facts of `ops` ([`I_INT`]), for the registers that may
-/// reach an element read's index (the only consumer): those indices, and
-/// the operands of the ops below that write a tracked register.
+/// reach an element read's or write's index (the only consumers): those
+/// indices, and the operands of the ops below that write a tracked register.
 pub(super) struct Ints {
     /// Per register: its column, or `u32::MAX` (untracked: [`T_ANY`]).
     col: Vec<u32>,
@@ -420,7 +420,7 @@ pub(super) fn infer_integral(ops: &[Op], n_regs: usize) -> Ints {
         }
     };
     for op in ops {
-        if let Op::GetKey { key, .. } = op {
+        if let Op::GetKey { key, .. } | Op::SetKey { key, .. } | Op::SetKeyStrict { key, .. } = op {
             track(*key, &mut col, &mut k);
         }
     }
@@ -604,6 +604,22 @@ struct PProof {
     slot: u32,
 }
 
+/// A **run-proved op** of a speculative region ([`plan_op_proofs`]): the
+/// `Op::SuperCtor` / `Op::InitFields` at `op`, once its site's identity memo
+/// has hit on an operand value in a run of the fast version, hits again on
+/// that value for the rest of the run; the element store at `op`, once the
+/// write barrier had nothing to do for a store into a container whatever
+/// the value, has nothing to do for one into that container for the rest
+/// of the run.
+#[derive(Clone, Copy, Debug)]
+struct IProof {
+    op: usize,
+    /// Its native frame slot ([`NumGen::iproof_disp`]): the operand's bits
+    /// the memo hit on (the container's heap slot address) in this run of
+    /// the fast version, or `u64::MAX`.
+    slot: u32,
+}
+
 /// A promoted loop: bytecode pcs `head..=end` (`end` the unconditional back-edge
 /// `Jump` to `head`) and its promoted registers.
 struct Region {
@@ -663,6 +679,8 @@ struct Region {
     gproof: Vec<GProof>,
     /// The run-proved property sites ([`plan_site_proofs`]).
     pproof: Vec<PProof>,
+    /// The run-proved ops ([`plan_op_proofs`]).
+    iproof: Vec<IProof>,
     /// For a body that branches inside itself: the registers live on entry
     /// to each of its ops (`live_words` words per pc from `head`), which
     /// [`Region::defined`] reads; empty otherwise.
@@ -1118,6 +1136,8 @@ pub(super) struct NumGen {
     n_gproof: usize,
     /// The run-proved property sites' slots ([`PProof::slot`]), after those.
     n_pproof: usize,
+    /// The run-proved ops' slots ([`IProof::slot`]), after those.
+    n_iproof: usize,
     /// Per pc: its label in its region's integer version, for a
     /// speculative region's ([`Self::spec_int`]).
     int_labels: Vec<Option<Label>>,
@@ -1612,6 +1632,19 @@ impl NumGen {
                 }
             }
         }
+        // The run-proved ops ([`plan_op_proofs`]) of the same
+        // versions, each with its slot.
+        let mut n_iproof = 0usize;
+        for r in &mut regions {
+            let keep = r.spec.is_some() && r.arms.iter().all(|a| r.cold.contains(a));
+            if !keep {
+                r.iproof.clear();
+            }
+            for g in &mut r.iproof {
+                g.slot = n_iproof as u32;
+                n_iproof += 1;
+            }
+        }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
         {
@@ -1725,6 +1758,7 @@ impl NumGen {
             n_fcarry,
             n_gproof,
             n_pproof,
+            n_iproof,
             int_labels: vec![None; n + 1],
             ilabels: Vec::new(),
             int_saved: false,
@@ -1858,6 +1892,7 @@ impl NumGen {
             + self.n_fcarry
             + self.n_gproof
             + self.n_pproof
+            + self.n_iproof
     }
 
     /// The frame slot of carried field flag `k` ([`FCarry::flag`]), after
@@ -1879,6 +1914,31 @@ impl NumGen {
     /// after the run-proved guards'.
     fn pproof_disp(&self, k: u32) -> i32 {
         self.gproof_disp(self.n_gproof as u32 + k)
+    }
+
+    /// The frame slot of run-proved op `k` ([`IProof::slot`]),
+    /// after the run-proved property sites'.
+    fn iproof_disp(&self, k: u32) -> i32 {
+        self.pproof_disp(self.n_pproof as u32 + k)
+    }
+
+    /// For the `Op::SuperCtor` / `Op::InitFields` / element store at `pc` in
+    /// a speculative region's fast version (either one): its run proof's
+    /// frame slot, when it is a run-proved op ([`plan_op_proofs`]). The slot
+    /// holds the operand's bits once the site's identity memo has hit on
+    /// them (the container's heap slot address once the container alone
+    /// spared a store the write barrier) since the fast version was
+    /// entered, else `u64::MAX` (no value's bits, nor any address): while
+    /// the operand (container) equals it, the memo hits (the barrier has
+    /// nothing to do).
+    pub(crate) fn op_run_proof(&self, pc: usize) -> Option<i32> {
+        let ri = self.region_at(pc)?;
+        let r = &self.regions[ri];
+        if r.spec.is_none() || (self.imode.is_some() && !self.spec_int_mode()) {
+            return None;
+        }
+        let g = r.iproof.iter().find(|g| g.op == pc)?;
+        Some(self.iproof_disp(g.slot))
     }
 
     /// For the property read or write at `pc` in a speculative region's fast
@@ -2848,6 +2908,10 @@ impl NumGen {
         // (Nor has any run-proved property site passed its checks.)
         for g in &self.regions[ri].pproof {
             a.mov_frame_zero(self.pproof_disp(g.slot));
+        }
+        // (Nor has any run-proved op passed its checks.)
+        for g in &self.regions[ri].iproof {
+            a.mov_frame_all_ones(self.iproof_disp(g.slot));
         }
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
@@ -4001,8 +4065,8 @@ impl NumGen {
         a.jcc(CC_P, miss);
     }
 
-    /// `rax` = the truncation of the Number in `xmm x` (an element read's
-    /// promoted index proven integral, `is_integral_at`).
+    /// `rax` = the truncation of the Number in `xmm x` (an element read's or
+    /// write's promoted index proven integral, `is_integral_at`).
     pub(super) fn trunc_from_xmm(a: &mut X64Assembler, x: u8) {
         a.cvttsd2si_gpr_x(RAX, x);
     }
@@ -6124,6 +6188,11 @@ fn plan_regions_sa(
         } else {
             Vec::new()
         };
+        let iproof: Vec<IProof> = if generic && loops.is_empty() && iproof_enabled() {
+            plan_op_proofs(ops, bytecode, (head, end), &arms)
+        } else {
+            Vec::new()
+        };
         let in_gcarry =
             |r: u16| gcarry.iter().any(|g| g.1 == r) || fcarry.iter().any(|f| f.src == r);
         carried.extend(info.iter().filter(|x| in_gcarry(x.0)));
@@ -6345,6 +6414,7 @@ fn plan_regions_sa(
             fcarry,
             gproof,
             pproof,
+            iproof,
         });
     }
     out
@@ -6547,6 +6617,57 @@ impl Drop for LeaveReport {
 }
 std::thread_local! {
     static LEAVE_REPORT: LeaveReport = const { LeaveReport };
+}
+
+/// Whether run-proved ops ([`plan_op_proofs`]) are planned:
+/// unless `KATAAN_JIT_IPROOF=0`. Read once per process.
+fn iproof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IPROOF").is_none_or(|v| v != "0"))
+}
+
+/// A loop's **run-proved ops**. An `Op::SuperCtor` (a class
+/// constructor's `[[Prototype]]`) or `Op::InitFields` (a constructor without
+/// instance fields does nothing) compiles to its site's identity memo
+/// (`call_seq::IdentMemo`): the operand against the memo's key, the
+/// prototype epoch against the memo's stamp. In a speculative version's
+/// fast version no Rust code runs, and only Rust code refills a memo or
+/// bumps the epoch; so once the memo has hit on an operand value in a run
+/// of the fast version, it hits on that value for the rest of the run: the
+/// op's later runs on the same value, until the fast version is entered
+/// again (which empties its slot), skip the memo's checks. Likewise an
+/// element store's container: whether it has side-table state, is young or
+/// due a whole rescan, and whether incremental marking runs, change only in
+/// Rust code; once a store found them sparing every store into it the write
+/// barrier's work, later stores into the same container (by its heap slot's
+/// address, which no other object takes while none is freed) skip those
+/// checks (`X64Assembler::p_barrier_check_proving`).
+///
+/// A candidate: such an op outside the fallback arms (`arms`) of the loop
+/// (whose ops a fast version leaves out). The operand is compared every
+/// time, so it may vary. `NumGen::new` keeps those of regions that got a
+/// speculative version whose fast version leaves out these very arms.
+fn plan_op_proofs(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    arms: &[(usize, usize, usize)],
+) -> Vec<IProof> {
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    (head..=end.min(ops.len().saturating_sub(1)))
+        .filter(|&pc| {
+            !in_arm(pc)
+                && match ops[pc] {
+                    GenericOp::Interp { .. } => matches!(
+                        bytecode.get(pc),
+                        Some(Op::SuperCtor { .. } | Op::InitFields { .. })
+                    ),
+                    GenericOp::SetElem { .. } => true,
+                    _ => false,
+                }
+        })
+        .map(|op| IProof { op, slot: u32::MAX })
+        .collect()
 }
 
 /// Whether run-proved property sites ([`plan_site_proofs`]) are planned:
@@ -8599,6 +8720,13 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
         self.code.extend_from_slice(&disp.to_le_bytes());
         self.code.extend_from_slice(&0i32.to_le_bytes());
+    }
+
+    /// `mov qword [rbp + disp], -1` (`u64::MAX`).
+    fn mov_frame_all_ones(&mut self, disp: i32) {
+        self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
+        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&(-1i32).to_le_bytes());
     }
 
     /// `jcc rel32` to `label` (`cc` an x86 condition code).

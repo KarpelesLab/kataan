@@ -679,6 +679,43 @@ impl X64Assembler {
     }
 }
 
+impl X64Assembler {
+    /// [`Self::p_ident_hit`] for a run-proved identity op of a speculative
+    /// loop's fast version (`numeric::plan_op_proofs`): when the value at
+    /// `[rbx + disp]` equals the bits in frame slot `[rbp + proof]` (those
+    /// the memo hit on earlier in this run of the fast version, where no
+    /// Rust code refills the memo or bumps the epoch) it hits without the
+    /// memo's checks; else the memo's checks out of line, a hit recording
+    /// the value in the slot, a miss to `miss`. On a hit `r11` = the site
+    /// when `want_site` (else clobbered). Clobbers `rax`, `r9`, `r11`.
+    pub(crate) fn p_ident_proved(
+        &mut self,
+        site: *const CallSite,
+        disp: i32,
+        proof: i32,
+        miss: Label,
+        want_site: bool,
+    ) {
+        let full = self.new_label();
+        let hit = self.new_label();
+        self.g_load(r::RAX, r::RBX, disp);
+        self.g_cmp_mem(r::RAX, r::RBP, proof);
+        self.g_jcc(cc::NE, full);
+        self.bind(hit);
+        if want_site {
+            self.g_movabs(r::R11, site as u64);
+        }
+        // (`hit` may be bound just before: it stays here.)
+        let cold = self.cold_begin_after();
+        self.bind(full);
+        self.p_ident_hit(site, disp, miss);
+        self.g_load(r::RAX, r::RBX, disp);
+        self.g_store(r::RBP, proof, r::RAX);
+        self.jmp(hit);
+        self.cold_end(cold);
+    }
+}
+
 /// `mov dst, [PROTO_EPOCH]`.
 fn load_proto_epoch(a: &mut X64Assembler, dst: u8) {
     a.g_movabs(dst, crate::object::proto_epoch_addr() as u64);
@@ -2360,6 +2397,12 @@ pub(crate) struct InlineEmit<'a> {
     /// constructor, unbound for a derived one — into the register after the
     /// captures (`n_caps` counts it).
     pub new_target: Option<(u16, u16)>,
+    /// With `new_target`: the callee (`key`'s function) is a derived class
+    /// constructor. A [`ConstructFast`] record for a way of `key` then has
+    /// `derived` `1` (else `0`): its fill takes it from that very function
+    /// (`nbvm::jit_tier::fill_construct_fast`), so the guard compiles in
+    /// which `this` it makes.
+    pub derived: bool,
     /// A `super(…)` site's `this` register (the caller's, which its result
     /// binds): the guard then also requires it unbound (else the call op
     /// runs the super constructor and throws).
@@ -3108,10 +3151,14 @@ fn emit_inline_new_this(
             a.g_store(RBP, p.caps, r::R8);
         }
     };
-    a.g_movabs(r::R11, e.memo as u64);
     if proof.is_err() {
+        // (A derived constructor's needs nothing of the record.)
+        if !e.derived {
+            a.g_movabs(r::R11, e.memo as u64);
+        }
         return emit_inline_new_this_made(a, e, this, miss, record);
     }
+    a.g_movabs(r::R11, e.memo as u64);
     a.g_load(r::RAX, r::RBX, reg(ctor));
     a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ctor)));
     a.g_jcc(cc::NE, miss);
@@ -3136,7 +3183,8 @@ fn emit_inline_new_this(
     emit_inline_new_this_made(a, e, this, miss, record)
 }
 
-/// [`emit_inline_new_this`] once the record holds (`r11` the call site):
+/// [`emit_inline_new_this`] once the record holds (`r11` the call site, but
+/// for a derived constructor, which needs nothing of it):
 /// `this` unbound for a derived constructor, else allocated; `record` runs
 /// where it is made without a call (keeping `rax`, `rcx`, `r8`, `r11`).
 fn emit_inline_new_this_made(
@@ -3150,15 +3198,14 @@ fn emit_inline_new_this_made(
     let reg = |x: u16| i32::from(x) * 8;
     let fast = offset_of!(CallSite, fast);
     let f = |o: usize| site_off(fast + o);
-    let base = a.new_label();
-    let bound = a.new_label();
-    a.g_load(r::RAX, r::R11, f(offset_of!(ConstructFast, derived)));
-    a.g_test(r::RAX);
-    a.g_jcc(cc::E, base);
-    record(a);
-    a.g_movabs(r::RAX, crate::nanbox::NanBox::tdz().to_bits());
-    a.jmp(bound);
-    a.bind(base);
+    // (The record is a way of `e.key`'s: its `derived` is the function's,
+    // see `InlineEmit::derived`.)
+    if e.derived {
+        record(a);
+        a.g_movabs(r::RAX, crate::nanbox::NanBox::tdz().to_bits());
+        a.g_store(r::RBX, reg(this), r::RAX);
+        return Some(());
+    }
     check_construct_proto(a, r::R11, fast, miss);
     a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
     let made = a.new_label();
@@ -3216,7 +3263,6 @@ fn emit_inline_new_this_made(
             site_off(offset_of!(CallSite, ident) + offset_of!(IdentMemo, value)),
         );
     }
-    a.bind(bound);
     a.g_store(r::RBX, reg(this), r::RAX);
     Some(())
 }

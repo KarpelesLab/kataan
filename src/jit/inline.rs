@@ -124,6 +124,9 @@ struct Site<'a> {
     key: u64,
     proto: alloc::borrow::Cow<'a, FnProto>,
     warm: Vec<Option<WarmEntry>>,
+    /// The keys of the derived class constructors among it and the calls
+    /// spliced into it ([`Expanded::derived`]).
+    derived: Vec<u64>,
 }
 
 /// The third inlining level (`Candidate::nested`): the `super(…)` sites of
@@ -202,21 +205,26 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             })
         })
         .flatten();
+    let own = proto.derived.then_some(key);
     match inner {
         Some(e) => {
             let mut p = proto.clone();
             p.ops = e.ops;
             p.n_regs = e.n_regs;
+            let mut derived = e.derived;
+            derived.extend(own);
             Site {
                 key,
                 proto: alloc::borrow::Cow::Owned(p),
                 warm: e.warm,
+                derived,
             }
         }
         None => Site {
             key,
             proto: alloc::borrow::Cow::Borrowed(proto),
             warm,
+            derived: own.into_iter().collect(),
         },
     }
 }
@@ -234,6 +242,10 @@ pub struct Expanded {
     pub orig_of: Vec<u32>,
     /// Per own pc (and one past the end): its new pc.
     pub new_of: Vec<u32>,
+    /// The callee keys (`Op::InlineGuard::key`) of the inlined calls, at
+    /// any depth, whose function is a derived class constructor (whose
+    /// construct leaves `this` unbound: `call_seq::ConstructFast::derived`).
+    pub derived: Vec<u64>,
 }
 
 /// Whether `proto` can be inlined: small, a plain call target, and every op
@@ -1285,12 +1297,19 @@ pub fn expand<'a>(
     }
     orig_of.push(u32::try_from(proto.ops.len()).ok()?);
     debug_assert_eq!(ops.len() + 1, orig_of.len());
+    let mut derived: Vec<u64> = sites
+        .iter()
+        .flat_map(|(_, ways)| ways.iter().flat_map(|w| w.derived.iter().copied()))
+        .collect();
+    derived.sort_unstable();
+    derived.dedup();
     Some(Expanded {
         ops,
         n_regs,
         warm: nwarm,
         orig_of,
         new_of,
+        derived,
     })
 }
 

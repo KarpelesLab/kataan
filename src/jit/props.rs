@@ -1708,6 +1708,12 @@ impl X64Assembler {
     /// still holding the object, no Rust code has run since to change what
     /// they read). Then the add is made; otherwise to `miss`, having changed
     /// nothing. Clobbers `rax`, `rsi`, `r8`, `r9`, `r11`.
+    ///
+    /// `k` is how many adds of the chain come before this one: the object
+    /// then has `k` slots and key epoch `k` (`Object::new` makes both `0`,
+    /// as `p_alloc_object` does, and each earlier add of the chain bumped
+    /// both), so when this add's slot is the `k`th the commit stores both
+    /// counts, `k + 1`, at once rather than bumping each.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn p_add_fresh(
         &mut self,
@@ -1715,7 +1721,7 @@ impl X64Assembler {
         realm_off: i32,
         site: *const MethodSite,
         b: BakedAdd,
-        (first, proven): (bool, bool),
+        (first, proven, k): (bool, bool, u32),
         (val_disp, number): (i32, bool),
         miss: Label,
     ) {
@@ -1745,13 +1751,23 @@ impl X64Assembler {
         // Commit: the value, the count, the shape, the key epoch.
         self.g_load(r::R8, r::RBX, val_disp);
         self.g_store(r::RCX, l.off_inline + 8 * slot, r::R8);
-        self.p_inc16_mem(r::RCX, l.off_slots_len);
+        // (Both counts at once: the 16-bit count and the epoch's low half
+        // are adjacent, and the epoch's high half stays `0`.)
+        let both = b.slot == k && k < 0xffff && p.off_epoch == l.off_slots_len + 2;
+        if both {
+            let n = k + 1;
+            self.p_store_rcx_imm(4, l.off_slots_len, n | n << 16);
+        } else {
+            self.p_inc16_mem(r::RCX, l.off_slots_len);
+        }
         self.g_movabs(r::R9, b.to);
         self.g_inc_mem(r::R9, p.rc_strong);
         self.g_movabs(r::R8, b.from);
         self.g_dec_mem(r::R8, p.rc_strong);
         self.g_store(r::RCX, l.off_shape, r::R9);
-        self.p_inc32_mem(r::RCX, p.off_epoch);
+        if !both {
+            self.p_inc32_mem(r::RCX, p.off_epoch);
+        }
     }
 
     /// What the adds of a fresh chain ([`Self::p_add_fresh`]) check of the
@@ -2404,6 +2420,54 @@ impl X64Assembler {
         );
         self.g_jcc(cc::NE, appended);
         self.jmp(miss);
+        self.bind(done);
+    }
+
+    /// [`p_barrier_check_appended`](Self::p_barrier_check_appended) for an
+    /// element store of a speculative loop's fast version with a run proof
+    /// (`numeric::plan_op_proofs`): when the store needs nothing because of
+    /// the container alone — no incremental marking runs, and the container
+    /// (`rcx`) is young or due a whole rescan by its next minor collection —
+    /// the container's heap slot address goes to frame slot `[rbp + proof]`.
+    /// Only Rust code (a collection, a barrier's helper, the marker) changes
+    /// either, and none runs in the fast version, so any later store into
+    /// that container in the same run needs nothing either (nor, as
+    /// [`p_array_plain`](Self::p_array_plain) checked, has the array gained
+    /// side-table state). Clobbers what that one does.
+    pub(crate) fn p_barrier_check_proving(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        (miss, appended): (Label, Label),
+        proof: i32,
+    ) {
+        let done = self.new_label();
+        let prove = self.new_label();
+        let old = crate::gc::OLD_AGE;
+        self.p_is_handle(r::R9, done);
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R11, l.props.marking, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, old);
+        self.g_jcc(cc::B, prove);
+        self.p_test_byte_imm(r::RCX, l.props.off_slot_dirty, crate::heap::JIT_DIRTY_WHOLE);
+        self.g_jcc(cc::NE, prove);
+        if !self.pinned() {
+            self.g_load(r::R10, r::R11, l.props.heap_ptr);
+            self.g_load(r::RDX, r::R11, l.props.heap_len);
+        }
+        self.p_slot_rooted(l, r::R9, miss);
+        self.g_cmp_byte_imm(r::R9, l.props.off_slot_age, old);
+        self.g_jcc(cc::AE, done);
+        self.p_test_byte_imm(
+            r::RCX,
+            l.props.off_slot_dirty,
+            crate::heap::JIT_DIRTY_APPENDED,
+        );
+        self.g_jcc(cc::NE, appended);
+        self.jmp(miss);
+        self.bind(prove);
+        self.g_store(r::RBP, proof, r::RCX);
         self.bind(done);
     }
 
