@@ -4928,12 +4928,14 @@ pub struct X64Assembler {
     /// whose guard left its activation's pending marker unset
     /// (`NumGen::lazy_pend`): the materialization stub and the marker's
     /// slot, which a `call` emitted there sets first
-    /// ([`inline_frame_hook`](Self::inline_frame_hook)).
+    /// ([`inline_frame_hook`](Self::inline_frame_hook)), and a run-proved
+    /// guard's callee copy (`(from, to)` slots, `numeric::plan_run_proofs`).
     #[cfg_attr(
         not(all(target_os = "linux", target_arch = "x86_64")),
         allow(dead_code)
     )]
-    lazy_pend: Option<(Label, i32)>,
+    #[allow(clippy::type_complexity)]
+    lazy_pend: Option<(Label, i32, Option<(i32, i32)>)>,
 }
 
 /// A `rel32` fixup: its operand's offset, its target label, and, for a
@@ -9262,6 +9264,34 @@ impl JitFunction {
                             _ => return None,
                         })
                         .copied()?;
+                    // A run-proved guard (`numeric::plan_run_proofs`): once
+                    // it has hit in this run of the fast version, the callee
+                    // value it found (in its slot, else `0`) is the callee.
+                    // (Its miss leaves out of line, so the fall-through
+                    // after its code is a hit; its activation's pending
+                    // marker is left unset and it loads no captures.) The
+                    // guard's own code, which runs once per run, goes out
+                    // of line.
+                    let run_proof = num
+                        .guard_run_proof(op_idx)
+                        .filter(|_| cold_miss.is_some() && lazy.is_some() && n_caps == 0);
+                    let run_proven = a.new_label();
+                    let run_cold = match run_proof {
+                        Some(slot) => {
+                            let full = a.new_label();
+                            a.cmp_frame_imm8(slot, 0);
+                            a.g_jcc(call_seq::cc::E, full);
+                            if guard_dst_dead.get(op_idx) != Some(&true) {
+                                a.g_movabs(call_seq::r::RAX, NanBox::boolean(true).to_bits());
+                                a.g_store(call_seq::r::RBX, disp(dst), call_seq::r::RAX);
+                            }
+                            a.jmp(run_proven);
+                            let cold = a.cold_begin();
+                            a.bind(full);
+                            Some((slot, cold))
+                        }
+                        None => None,
+                    };
                     call_seq::emit_inline_guard(
                         &mut a,
                         &call_seq::InlineEmit {
@@ -9306,8 +9336,16 @@ impl JitFunction {
                                 }
                                 _ => None,
                             },
+                            in_cold: run_cold.is_some(),
                         },
                     )?;
+                    if let Some((slot, cold)) = run_cold {
+                        a.g_load(call_seq::r::RAX, call_seq::r::RBP, slots0.callee);
+                        a.g_store(call_seq::r::RBP, slot, call_seq::r::RAX);
+                        a.jmp(run_proven);
+                        a.cold_end(cold);
+                        a.bind(run_proven);
+                    }
                     // (Out of line, after the guard's code: a cold chunk
                     // must not start where the op's label is bound.)
                     if let Some((count, memo, bail)) = cold_miss {
@@ -9320,8 +9358,12 @@ impl JitFunction {
                         a.cold_end(cold);
                     }
                     if let Some(l) = lazy {
-                        num.note_lazy(op_idx, l, stub, slots0.pend);
-                        a.set_lazy_pend(Some((stub, slots0.pend)));
+                        // (A run-proved guard's proved path leaves the callee
+                        // slot as it was: a leave or a call in the body sets
+                        // it from the proof's.)
+                        let copy = run_proof.map(|slot| (slot, slots0.callee));
+                        num.note_lazy(op_idx, l, stub, slots0.pend, copy);
+                        a.set_lazy_pend(Some((stub, slots0.pend, copy)));
                         lazy_open = Some((op_idx, l, pass));
                     }
                     inline_stubs.push((

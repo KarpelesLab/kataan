@@ -2374,6 +2374,10 @@ pub(crate) struct InlineEmit<'a> {
     /// jumps there itself, out of line, and a hit falls through into the
     /// inlined body. `dst` is written either way, unless `dst_dead`.
     pub fused_miss: Option<Label>,
+    /// The guard's whole code is already out of line (a run-proved guard's
+    /// identification, in the caller's cold region): its fused miss stays
+    /// where it is (cold regions do not nest).
+    pub in_cold: bool,
     /// No code reads `dst`: only the guard and its fused test name it,
     /// and every version emits that test as nothing (nothing enters there),
     /// so neither the hit nor the miss stores it.
@@ -2450,6 +2454,15 @@ impl InlineEmit<'_> {
         })
     }
 }
+
+/// A run-proved guard's callee copy (`(from, to)`: its proof's slot, the
+/// callee slot), which a leave or call in its lazily pending body makes
+/// (`X64Assembler::lazy_pend_store`).
+pub(crate) type CalleeCopy = Option<(i32, i32)>;
+
+/// A lazily pending activation (`X64Assembler::set_lazy_pend`): its
+/// materialization stub, its marker's slot and its callee copy.
+pub(crate) type LazyPend = (Label, i32, CalleeCopy);
 
 /// A method guard's proof (`InlineEmit::mproved`, `rbp`-relative slots):
 /// the receiver value whose lookup its memo answered (`bits`, one of the
@@ -2902,7 +2915,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.jmp(done);
     // (Fused: the miss is out of line and takes the test's branch itself;
     // the jump over it is dropped once it is.)
-    let cold = e.fused_miss.map(|_| a.cold_begin());
+    let cold = e.fused_miss.filter(|_| !e.in_cold).map(|_| a.cold_begin());
     if chain_first {
         a.bind(lookup_miss);
         a.g_movabs(r::RAX, NanBox::undefined().to_bits());
@@ -2917,8 +2930,10 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     if keep_full && e.fused_miss.is_none() {
         reload(a);
     }
-    if let (Some(to), Some(cold)) = (e.fused_miss, cold) {
+    if let Some(to) = e.fused_miss {
         a.jmp(to);
+    }
+    if let Some(cold) = cold {
         a.cold_end(cold);
     }
     a.bind(done);
@@ -3341,8 +3356,8 @@ impl X64Assembler {
     pub(crate) fn inline_frame_hook(&mut self) {
         // (A lazily pending activation is pending from here: its marker
         // first, `rax` kept.)
-        if let Some((stub, d)) = self.lazy_pend {
-            self.lazy_pend_store(stub, d);
+        if let Some((stub, d, copy)) = self.lazy_pend {
+            self.lazy_pend_store(stub, d, copy);
         }
         if let Some(d) = self.inline_pend {
             // cmp qword [rbp+d], -1 ; je +7 ; call qword [rbp+d] (7 bytes)
@@ -3355,15 +3370,21 @@ impl X64Assembler {
 
     /// Sets the lazily pending activation of the code emitted next (see
     /// the `lazy_pend` field).
-    pub(crate) fn set_lazy_pend(&mut self, p: Option<(Label, i32)>) {
+    pub(crate) fn set_lazy_pend(&mut self, p: Option<LazyPend>) {
         self.lazy_pend = p;
     }
 
     /// `[rbp + d] = &stub`, every register and the flags kept (`push rax;
     /// lea rax, [rip + stub]; mov [rbp + d], rax; pop rax`): a lazily
-    /// pending activation's marker, set.
-    pub(crate) fn lazy_pend_store(&mut self, stub: Label, d: i32) {
+    /// pending activation's marker, set. With `copy` (`(from, to)`), the
+    /// activation's callee value first, from a run-proved guard's slot into
+    /// the callee slot (`numeric::plan_run_proofs`).
+    pub(crate) fn lazy_pend_store(&mut self, stub: Label, d: i32, copy: CalleeCopy) {
         self.code.push(0x50);
+        if let Some((from, to)) = copy {
+            self.g_load(r::RAX, RBP, from);
+            self.g_store(RBP, to, r::RAX);
+        }
         self.g_lea_label(r::RAX, stub);
         self.g_store(RBP, d, r::RAX);
         self.code.push(0x58);

@@ -578,6 +578,18 @@ struct FCarry {
     flag: u32,
 }
 
+/// A **run-proved guard** of a speculative region ([`plan_run_proofs`]):
+/// the monomorphic method or accessor guard at `guard`, once it has hit in
+/// a run of the fast version, identifies the same callee for the rest of
+/// that run, which is then a copy of the one it found.
+#[derive(Clone, Copy, Debug)]
+struct GProof {
+    guard: usize,
+    /// Its native frame slot ([`NumGen::gproof_disp`]): the callee value
+    /// the guard identified in this run of the fast version, or `0`.
+    slot: u32,
+}
+
 /// A promoted loop: bytecode pcs `head..=end` (`end` the unconditional back-edge
 /// `Jump` to `head`) and its promoted registers.
 struct Region {
@@ -633,6 +645,8 @@ struct Region {
     gcarry: Vec<(alloc::string::String, u16, usize)>,
     /// The **carried fields** ([`plan_carried_fields`]).
     fcarry: Vec<FCarry>,
+    /// The run-proved guards ([`plan_run_proofs`]).
+    gproof: Vec<GProof>,
     /// For a body that branches inside itself: the registers live on entry
     /// to each of its ops (`live_words` words per pc from `head`), which
     /// [`Region::defined`] reads; empty otherwise.
@@ -1004,7 +1018,7 @@ pub(super) struct NumGen {
     /// The lazily pending activations ([`NumGen::note_lazy`]): `(guard pc,
     /// leave pc, in the integer version, materialization stub, marker
     /// slot)`.
-    lazy: Vec<(usize, usize, bool, Label, i32)>,
+    lazy: Vec<(usize, usize, bool, Label, i32, super::call_seq::CalleeCopy)>,
     /// Per pc: a `JumpIfFalse` folded into the comparison before it (emits
     /// nothing).
     skip: Vec<bool>,
@@ -1049,6 +1063,8 @@ pub(super) struct NumGen {
     /// The carried fields' flag slots ([`FCarry::flag`]), after the int
     /// GPRs' save slots.
     n_fcarry: usize,
+    /// The run-proved guards' slots ([`GProof::slot`]), after those.
+    n_gproof: usize,
     /// Per pc: its label in its region's integer version, for a
     /// speculative region's ([`Self::spec_int`]).
     int_labels: Vec<Option<Label>>,
@@ -1481,6 +1497,22 @@ impl NumGen {
                 }
             }
         }
+        // The run-proved guards ([`plan_run_proofs`]) of the same versions,
+        // each with its slot.
+        let mut n_gproof = 0usize;
+        for r in &mut regions {
+            let keep = r.spec.is_some() && r.arms.iter().all(|a| r.cold.contains(a));
+            if !keep {
+                r.gproof.clear();
+            }
+            for g in &mut r.gproof {
+                g.slot = n_gproof as u32;
+                n_gproof += 1;
+                if gproof_log() {
+                    std::eprintln!("[gproof] guard {}", g.guard);
+                }
+            }
+        }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
         {
@@ -1592,6 +1624,7 @@ impl NumGen {
             inner_entries: Vec::new(),
             n_view_slots,
             n_fcarry,
+            n_gproof,
             int_labels: vec![None; n + 1],
             ilabels: Vec::new(),
             int_saved: false,
@@ -1722,6 +1755,7 @@ impl NumGen {
             + self.n_view_slots
             + self.int_save_slots()
             + self.n_fcarry
+            + self.n_gproof
     }
 
     /// The frame slot of carried field flag `k` ([`FCarry::flag`]), after
@@ -1731,6 +1765,27 @@ impl NumGen {
             (self.n_gslots + self.regions.len() + self.n_view_slots + self.int_save_slots()) as u32
                 + k,
         )
+    }
+
+    /// The frame slot of run-proved guard `k` ([`GProof::slot`]), after the
+    /// carried fields' flags.
+    fn gproof_disp(&self, k: u32) -> i32 {
+        self.fcarry_disp(self.n_fcarry as u32 + k)
+    }
+
+    /// For the inline guard at `pc` in a speculative region's fast version
+    /// (either one): its run proof's frame slot, when it is a run-proved
+    /// guard ([`plan_run_proofs`]). The slot holds the callee value the
+    /// guard identified since the fast version was entered, or `0`: while
+    /// it holds one, the guard is a copy of it into the callee slot.
+    pub(crate) fn guard_run_proof(&self, pc: usize) -> Option<i32> {
+        let ri = self.region_at(pc)?;
+        let r = &self.regions[ri];
+        if r.spec.is_none() || (self.imode.is_some() && !self.spec_int_mode()) {
+            return None;
+        }
+        let g = r.gproof.iter().find(|g| g.guard == pc)?;
+        Some(self.gproof_disp(g.slot))
     }
 
     /// The frame slots an integer version of a speculative region saves its
@@ -2621,6 +2676,10 @@ impl NumGen {
         for f in &self.regions[ri].fcarry {
             a.mov_frame_zero(self.fcarry_disp(f.flag));
         }
+        // (Nor has any run-proved guard hit.)
+        for g in &self.regions[ri].gproof {
+            a.mov_frame_zero(self.gproof_disp(g.slot));
+        }
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
             a.jcc(CC_E, copy);
@@ -2749,10 +2808,19 @@ impl NumGen {
     /// `l` **lazily pending**: its marker (`[rbp + pend]`) unset, as no call
     /// runs in the body there. A leave of that version for the plain copy at
     /// a pc in the body, where the copy expects the activation pending, sets
-    /// the marker on its way ([`lazy_pend`](Self::lazy_pend)).
-    pub(super) fn note_lazy(&mut self, g: usize, l: usize, stub: Label, pend: i32) {
+    /// the marker on its way ([`lazy_pend`](Self::lazy_pend)), and, for a
+    /// run-proved guard (`copy`: its run proof's slot and the callee slot,
+    /// which its proved path leaves alone), the activation's callee value.
+    pub(super) fn note_lazy(
+        &mut self,
+        g: usize,
+        l: usize,
+        stub: Label,
+        pend: i32,
+        copy: super::call_seq::CalleeCopy,
+    ) {
         let int = self.imode.is_some();
-        self.lazy.push((g, l, int, stub, pend));
+        self.lazy.push((g, l, int, stub, pend, copy));
     }
 
     /// Before a leave of a fast version (`int`: the integer one) for op `pc`
@@ -2760,12 +2828,12 @@ impl NumGen {
     /// ([`note_lazy`](Self::note_lazy)) whose body `pc` lies in. Changes no
     /// register.
     pub(super) fn lazy_pend(&self, a: &mut X64Assembler, pc: usize, int: bool) {
-        if let Some(&(_, _, _, stub, d)) = self
+        if let Some(&(_, _, _, stub, d, copy)) = self
             .lazy
             .iter()
             .find(|w| w.0 < pc && pc <= w.1 && w.2 == int)
         {
-            a.lazy_pend_store(stub, d);
+            a.lazy_pend_store(stub, d, copy);
         }
     }
 
@@ -5802,6 +5870,11 @@ fn plan_regions(
         } else {
             Vec::new()
         };
+        let gproof: Vec<GProof> = if generic && loops.is_empty() && gproof_enabled() {
+            plan_run_proofs(ops, bytecode, (head, end), &arms, &carried_r)
+        } else {
+            Vec::new()
+        };
         let in_gcarry =
             |r: u16| gcarry.iter().any(|g| g.1 == r) || fcarry.iter().any(|f| f.src == r);
         carried.extend(info.iter().filter(|x| in_gcarry(x.0)));
@@ -6021,6 +6094,7 @@ fn plan_regions(
             cold: Vec::new(),
             gcarry,
             fcarry,
+            gproof,
         });
     }
     out
@@ -6094,6 +6168,98 @@ fn plan_carried_globals(
     out
 }
 
+/// Whether run-proved guards ([`plan_run_proofs`]) are planned: unless
+/// `KATAAN_JIT_GPROOF=0`. Read once per process.
+fn gproof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GPROOF").is_none_or(|v| v != "0"))
+}
+
+/// Whether `KATAAN_JIT_GPROOF=log`: report each run-proved guard kept.
+fn gproof_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GPROOF").is_some_and(|v| v == "log"))
+}
+
+/// A loop's **run-proved guards**. An inlined getter, setter or method in a
+/// loop is guarded every iteration: the receiver value its proof recorded
+/// (`call_seq::MethodProof`), its flags and layout, the holder's value:
+/// about a dozen memory operations each, which on a short body are the
+/// loop's bound. In a speculative version's fast version no Rust code runs,
+/// so what only Rust code changes (a binding, an accessor, a prototype, an
+/// object's flags, the heap, the limits) holds from one iteration to the
+/// next; compiled code there changes only the properties its stores name.
+/// So once a guard on a receiver that is the same in every run of the fast
+/// version has hit, while the loop stores no property of the guard's key
+/// the same lookup finds the same callee: the guard's later runs, until the
+/// fast version is entered again (which empties its slot), copy the callee
+/// value it found.
+///
+/// A candidate: a monomorphic guard with no captures, outside the fallback
+/// arms (`arms`), of a diamond, of a property read, write or method call
+/// whose receiver is a register the loop never writes or whose writes all
+/// load the same global binding, which the loop never stores; in a loop
+/// whose control runs straight but for the diamonds and exits, and whose
+/// ops outside the arms all run no Rust code and store no property of the
+/// guard's key ([`stores_no_key`]).
+///
+/// `NumGen::new` keeps those of regions that got a speculative version
+/// whose fast version leaves out these very arms.
+fn plan_run_proofs(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    arms: &[(usize, usize, usize)],
+    carried_r: &dyn Fn(u16) -> bool,
+) -> Vec<GProof> {
+    let mut out = Vec::new();
+    if end >= ops.len() || end >= bytecode.len() || head >= end {
+        return out;
+    }
+    if !straight_body(ops, (head, end), arms) {
+        return out;
+    }
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    for g in head..=end {
+        if in_arm(g) || !arms.iter().any(|a| a.0 == g + 1) {
+            continue;
+        }
+        let GenericOp::InlineGuard {
+            poly: 0,
+            call,
+            n_caps: 0,
+            ..
+        } = ops[g]
+        else {
+            continue;
+        };
+        let call = call as usize;
+        let (obj, key) = match (ops.get(call), bytecode.get(call)) {
+            (Some(GenericOp::GetProp { .. }), Some(Op::GetProp { obj, key, .. }))
+            | (
+                Some(GenericOp::SetProp { .. }),
+                Some(Op::SetProp { obj, key, .. } | Op::SetPropStrict { obj, key, .. }),
+            )
+            | (Some(GenericOp::CallMethod { .. }), Some(Op::CallMethod { recv: obj, key, .. })) => {
+                (*obj, key.as_str())
+            }
+            _ => continue,
+        };
+        if key == "__proto__"
+            || receiver_class(bytecode, (head, end), carried_r, obj, &mut d, &mut u).is_none()
+            || !(head..=end).all(|q| in_arm(q) || stores_no_key(ops, bytecode, q, key))
+        {
+            continue;
+        }
+        out.push(GProof {
+            guard: g,
+            slot: u32::MAX,
+        });
+    }
+    out
+}
+
 /// Whether carried fields ([`plan_carried_fields`]) are planned: unless
 /// `KATAAN_JIT_FCARRY=0`. Read once per process.
 fn fcarry_enabled() -> bool {
@@ -6105,6 +6271,146 @@ fn fcarry_enabled() -> bool {
 fn fcarry_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FCARRY").is_some_and(|v| v == "log"))
+}
+
+/// Whether region `head..=end`'s control runs straight from its header to
+/// its back-edge outside the fallback arms of its guard diamonds (`arms`):
+/// a guard's test, a fast arm's jump to its join, an exit, the back-edge.
+fn straight_body(
+    ops: &[GenericOp],
+    (head, end): (usize, usize),
+    arms: &[(usize, usize, usize)],
+) -> bool {
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    // Straight control (outside the fallback arms): a guard's test, a fast
+    // arm's jump to its join, an exit, the back-edge.
+    for (pc, op) in ops.iter().enumerate().take(end + 1).skip(head) {
+        if in_arm(pc) {
+            continue;
+        }
+        let ok = match *op {
+            GenericOp::JumpIfFalse { target, .. } => {
+                arms.iter().any(|a| a.0 == pc) || target < head || target > end
+            }
+            GenericOp::Jump { target } => {
+                (pc == end && target == head)
+                    || arms.iter().any(|&(_, f, e)| f == pc + 1 && e == target)
+                    || target < head
+                    || target > end
+            }
+            GenericOp::PushHandler { .. } | GenericOp::PopHandler => false,
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// The pcs of region `head..=end` that write register `r`.
+fn defs_in(
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    r: u16,
+    d: &mut Vec<u16>,
+    u: &mut Vec<u16>,
+) -> Vec<usize> {
+    (head..=end)
+        .filter(|&pc| {
+            def_use(&bytecode[pc], d, u);
+            d.contains(&r)
+        })
+        .collect()
+}
+
+/// A receiver register's value class in region `head..=end`: `(true, r)`
+/// for a register the loop never writes, `(false, k)` for registers whose
+/// writes all read global `k` (by position of its first such load) that
+/// the loop never stores. Either holds one value in every run of a
+/// speculative version's fast version (only Rust code changes a binding
+/// otherwise). `None` for another, or one of `carried_r`.
+fn receiver_class(
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    carried_r: &dyn Fn(u16) -> bool,
+    r: u16,
+    d: &mut Vec<u16>,
+    u: &mut Vec<u16>,
+) -> Option<(bool, usize)> {
+    let ds = defs_in(bytecode, (head, end), r, d, u);
+    if ds.is_empty() {
+        return Some((true, r as usize));
+    }
+    if carried_r(r) {
+        return None;
+    }
+    let mut name: Option<&str> = None;
+    for &pc in &ds {
+        let Op::LoadGlobal { name: n, .. } = &bytecode[pc] else {
+            return None;
+        };
+        if name.is_some_and(|m| m != n.as_str()) || n.starts_with('\u{1}') {
+            return None;
+        }
+        name = Some(n.as_str());
+    }
+    let name = name?;
+    let stored = (head..=end).any(|pc| match &bytecode[pc] {
+        Op::StoreGlobal { name: n, .. } | Op::InitGlobal { name: n, .. } => n == name,
+        _ => false,
+    });
+    if stored {
+        return None;
+    }
+    (head..=end)
+        .find(|&pc| matches!(&bytecode[pc], Op::LoadGlobal { name: n, .. } if n == name))
+        .map(|k| (false, k))
+}
+
+/// Whether op `pc` of a speculative region's fast version can run there
+/// without storing a property `key` or running Rust code: a store of
+/// another key or binding, a register op, a read, a branch, an inline
+/// guard or leave, an inlined `Math` call.
+fn stores_no_key(ops: &[GenericOp], bytecode: &[Op], pc: usize, key: &str) -> bool {
+    match (&ops[pc], &bytecode[pc]) {
+        (_, Op::SetProp { key: k, .. } | Op::SetPropStrict { key: k, .. }) => k.as_str() != key,
+        (_, Op::StoreGlobal { name, .. }) => name.as_str() != key,
+        (GenericOp::GetProp { .. }, Op::GetProp { .. }) => true,
+        (
+            GenericOp::Const { .. }
+            | GenericOp::Move { .. }
+            | GenericOp::Nop
+            | GenericOp::Add { .. }
+            | GenericOp::NumAdd { .. }
+            | GenericOp::Arith { .. }
+            | GenericOp::Lt { .. }
+            | GenericOp::Compare { .. }
+            | GenericOp::StrictEq { .. }
+            | GenericOp::ValueBin { .. }
+            | GenericOp::Not { .. }
+            | GenericOp::ToNumeric { .. }
+            | GenericOp::Step { .. }
+            | GenericOp::CheckTdz { .. }
+            | GenericOp::GetElem { .. }
+            | GenericOp::ArrayLen { .. }
+            | GenericOp::Jump { .. }
+            | GenericOp::JumpIfFalse { .. }
+            | GenericOp::InlineGuard { .. }
+            | GenericOp::InlineLeave,
+            _,
+        ) => true,
+        (GenericOp::CallMethod { .. }, bc) => super::inline_math(bc).is_some(),
+        (GenericOp::CallWithMethod { .. }, bc) => super::inline_math_got(bc).is_some(),
+        (
+            GenericOp::Interp { .. },
+            Op::LoadGlobal { .. }
+            | Op::RequireObjectCoercible { .. }
+            | Op::Neg { .. }
+            | Op::BitNot { .. },
+        ) => true,
+        _ => false,
+    }
 }
 
 /// A loop's **carried fields**. `o.x = o.x + 1` reads the field and stores it
@@ -6153,110 +6459,16 @@ fn plan_carried_fields(
         return out;
     }
     let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
-    // Straight control (outside the fallback arms): a guard's test, a fast
-    // arm's jump to its join, an exit, the back-edge.
-    for (pc, op) in ops.iter().enumerate().take(end + 1).skip(head) {
-        if in_arm(pc) {
-            continue;
-        }
-        let ok = match *op {
-            GenericOp::JumpIfFalse { target, .. } => {
-                arms.iter().any(|a| a.0 == pc) || target < head || target > end
-            }
-            GenericOp::Jump { target } => {
-                (pc == end && target == head)
-                    || arms.iter().any(|&(_, f, e)| f == pc + 1 && e == target)
-                    || target < head
-                    || target > end
-            }
-            GenericOp::PushHandler { .. } | GenericOp::PopHandler => false,
-            _ => true,
-        };
-        if !ok {
-            return out;
-        }
+    if !straight_body(ops, (head, end), arms) {
+        return out;
     }
     let (mut d, mut u) = (Vec::new(), Vec::new());
-    let defs_of = |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| -> Vec<usize> {
-        (head..=end)
-            .filter(|&pc| {
-                def_use(&bytecode[pc], d, u);
-                d.contains(&r)
-            })
-            .collect()
+    let defs_of =
+        |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| defs_in(bytecode, (head, end), r, d, u);
+    let class = |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| {
+        receiver_class(bytecode, (head, end), carried_r, r, d, u)
     };
-    // The receiver's value class: `(true, r)` for a register the loop never
-    // writes, `(false, k)` for registers whose writes all read global `k`
-    // (by position of its first such load) that the loop never stores.
-    let class = |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| -> Option<(bool, usize)> {
-        let ds = defs_of(r, d, u);
-        if ds.is_empty() {
-            return Some((true, r as usize));
-        }
-        if carried_r(r) {
-            return None;
-        }
-        let mut name: Option<&str> = None;
-        for &pc in &ds {
-            let Op::LoadGlobal { name: n, .. } = &bytecode[pc] else {
-                return None;
-            };
-            if name.is_some_and(|m| m != n.as_str()) || n.starts_with('\u{1}') {
-                return None;
-            }
-            name = Some(n.as_str());
-        }
-        let name = name?;
-        let stored = (head..=end).any(|pc| match &bytecode[pc] {
-            Op::StoreGlobal { name: n, .. } | Op::InitGlobal { name: n, .. } => n == name,
-            _ => false,
-        });
-        if stored {
-            return None;
-        }
-        (head..=end)
-            .find(|&pc| matches!(&bytecode[pc], Op::LoadGlobal { name: n, .. } if n == name))
-            .map(|k| (false, k))
-    };
-    // An op the path from the store around to the read may run.
-    let harmless = |pc: usize, key: &str| match (&ops[pc], &bytecode[pc]) {
-        (_, Op::SetProp { key: k, .. } | Op::SetPropStrict { key: k, .. }) => k.as_str() != key,
-        (_, Op::StoreGlobal { name, .. }) => name.as_str() != key,
-        (GenericOp::GetProp { .. }, Op::GetProp { .. }) => true,
-        (
-            GenericOp::Const { .. }
-            | GenericOp::Move { .. }
-            | GenericOp::Nop
-            | GenericOp::Add { .. }
-            | GenericOp::NumAdd { .. }
-            | GenericOp::Arith { .. }
-            | GenericOp::Lt { .. }
-            | GenericOp::Compare { .. }
-            | GenericOp::StrictEq { .. }
-            | GenericOp::ValueBin { .. }
-            | GenericOp::Not { .. }
-            | GenericOp::ToNumeric { .. }
-            | GenericOp::Step { .. }
-            | GenericOp::CheckTdz { .. }
-            | GenericOp::GetElem { .. }
-            | GenericOp::ArrayLen { .. }
-            | GenericOp::Jump { .. }
-            | GenericOp::JumpIfFalse { .. }
-            | GenericOp::InlineGuard { .. }
-            | GenericOp::InlineLeave,
-            _,
-        ) => true,
-        (GenericOp::CallMethod { .. }, bc) => super::inline_math(bc).is_some(),
-        (GenericOp::CallWithMethod { .. }, bc) => super::inline_math_got(bc).is_some(),
-        (
-            GenericOp::Interp { .. },
-            Op::LoadGlobal { .. }
-            | Op::RequireObjectCoercible { .. }
-            | Op::Neg { .. }
-            | Op::BitNot { .. },
-        ) => true,
-        _ => false,
-    };
+    let harmless = |pc: usize, key: &str| stores_no_key(ops, bytecode, pc, key);
     for store in head..=end {
         if in_arm(store) {
             continue;
