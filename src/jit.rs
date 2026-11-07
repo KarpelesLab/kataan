@@ -7993,23 +7993,35 @@ impl JitFunction {
         // Per op: a `Not` emitted with its test (`not_branch`).
         let mut not_fused = alloc::vec![false; ops.len()];
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
-        let rc_key = |w: usize| rc_base - 8 * (3 * w as i32 + 1);
-        let rc_cell = |w: usize| rc_base - 8 * (3 * w as i32 + 2);
+        let rc_key = |w: usize| rc_base - 8 * (4 * w as i32 + 1);
+        let rc_cell = |w: usize| rc_base - 8 * (4 * w as i32 + 2);
         // Per way, its receiver's `extra` part pointer, as a speculative
         // loop's site last loaded it (see `extra_in_frame`).
-        let rc_extra = |w: usize| rc_base - 8 * (3 * w as i32 + 3);
+        let rc_extra = |w: usize| rc_base - 8 * (4 * w as i32 + 3);
+        // Per way, the distance between its last two fills' heap slots
+        // (`X64Assembler::p_fill_way`'s prediction).
+        // (Only a way filled with a walk register's object predicts.)
+        let walk_regs = recv_cache::walk_regs(bytecode);
+        let rc_delta = |w: usize, recv: u16| {
+            walk_regs
+                .get(usize::from(recv))
+                .copied()
+                .unwrap_or(false)
+                .then_some(rc_base - 8 * (4 * w as i32 + 4))
+        };
         num.set_rc_relied((0..ops.len()).map(|pc| typed::relied_on(&rc, pc)).collect());
         // A promoted loop's truthiness tests on objects go through their
         // ways (`numeric::TruthyWay`).
         num.set_truthy_ways(
             (0..ops.len())
                 .map(|pc| match (&ops[pc], rc.sites[pc]) {
-                    (GenericOp::JumpIfFalse { .. }, Some(p))
+                    (&GenericOp::JumpIfFalse { cond, .. }, Some(p))
                         if p.family == recv_cache::Family::Obj && num.truthy_cacheable(pc, ops) =>
                     {
                         Some(numeric::TruthyWay {
                             key: rc_key(p.way),
                             cell: rc_cell(p.way),
+                            delta: rc_delta(p.way, cond),
                             check: p.check,
                             shape: way_shape[p.way],
                             plain: way_plain[p.way],
@@ -8027,7 +8039,7 @@ impl JitFunction {
         // all, as does a `catch` entry). The prologue empties both.
         // (Under the ways, the arena base as of the latest call: see
         // `recv_cache::survive_reload`.)
-        let rc_seen = rc_base - 24 * rc.ways as i32 - 8;
+        let rc_seen = rc_base - 32 * rc.ways as i32 - 8;
         let gc_base = rc_seen;
         let gc_slot = |k: usize| gc_base - 8 * (k as i32 + 1);
         let gc_epoch = gc_base - 8 * (gc_plan.slots as i32 + 1);
@@ -8359,7 +8371,7 @@ impl JitFunction {
             + 16
             + max_argc as u32 * 8
             + (num.frame_slots()
-                + 3 * rc.ways
+                + 4 * rc.ways
                 + 1
                 + gc_frame_slots
                 + 3 * math_sites.len()
@@ -8845,8 +8857,7 @@ impl JitFunction {
                         }) = plan
                         {
                             // (`rax`: the receiver's bits, from the walk.)
-                            a.g_store(call_seq::r::RBP, rc_key(way), call_seq::r::RAX);
-                            a.g_store(call_seq::r::RBP, rc_cell(way), call_seq::r::RCX);
+                            a.p_fill_way(rc_key(way), rc_cell(way), rc_delta(way, $recv));
                         }
                     }
                 }
@@ -8931,8 +8942,7 @@ impl JitFunction {
                             );
                             a.jne(skip_fill);
                         }
-                        a.g_store(call_seq::r::RBP, rc_key(p.way), call_seq::r::RAX);
-                        a.g_store(call_seq::r::RBP, rc_cell(p.way), call_seq::r::RCX);
+                        a.p_fill_way(rc_key(p.way), rc_cell(p.way), rc_delta(p.way, $r));
                         if plain {
                             // (Straight to the branch's target, if any.)
                             a.jmp($yes.unwrap_or(yes));
@@ -13539,8 +13549,7 @@ impl JitFunction {
             a.bind(walk);
             walk_to_slot!(recv, miss);
             family_checks!(fam, miss);
-            a.g_store(call_seq::r::RBP, rc_key(w), call_seq::r::RAX);
-            a.g_store(call_seq::r::RBP, rc_cell(w), call_seq::r::RCX);
+            a.p_fill_way(rc_key(w), rc_cell(w), rc_delta(w, recv));
             a.jmp(back);
         }
         for (entry, bail) in core::mem::take(&mut cold_bails) {

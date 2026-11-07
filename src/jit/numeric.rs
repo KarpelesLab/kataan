@@ -957,6 +957,9 @@ pub(super) const SA_CALL: u8 = 2;
 pub(super) struct TruthyWay {
     pub(super) key: i32,
     pub(super) cell: i32,
+    /// The way's prediction slot, for a walk register
+    /// (`X64Assembler::p_fill_way`).
+    pub(super) delta: Option<i32>,
     pub(super) check: bool,
     pub(super) shape: Option<u64>,
     /// The way's layout (`shape`) lacks the `[[IsHTMLDDA]]` brand.
@@ -4949,7 +4952,7 @@ impl NumGen {
                     let other = a.new_label();
                     a.p_truthy_way(
                         self.env.realm,
-                        (w.key, w.cell),
+                        (w.key, w.cell, w.delta),
                         w.check,
                         (w.shape, w.plain),
                         resume,

@@ -2538,11 +2538,12 @@ impl X64Assembler {
     /// `[[IsHTMLDDA]]` brand goes to `truthy`; anything else to `other`,
     /// having filled nothing. With `plain` (the way proves `shape`, which
     /// lacks the brand), a hit or a fill is truthy without a test.
-    /// Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
+    /// (`delta`: the way's prediction slot, see `p_fill_way`.) Clobbers
+    /// `rax`, `rcx`, `rdx`, `r8`–`r11`.
     pub(crate) fn p_truthy_way(
         &mut self,
         realm_off: i32,
-        (key, cell): (i32, i32),
+        (key, cell, delta): (i32, i32, Option<i32>),
         check: bool,
         (shape, plain): (Option<u64>, bool),
         truthy: Label,
@@ -2582,8 +2583,12 @@ impl X64Assembler {
             self.p_cmp_shape(r::RCX, l.off_shape, s, r::RDX);
             self.jne(skip_fill);
         }
-        self.g_store(r::RBP, key, bits);
-        self.g_store(r::RBP, cell, r::RCX);
+        if bits == r::RAX {
+            self.p_fill_way(key, cell, delta);
+        } else {
+            self.g_store(r::RBP, key, bits);
+            self.g_store(r::RBP, cell, r::RCX);
+        }
         if plain {
             self.jmp(truthy);
         }

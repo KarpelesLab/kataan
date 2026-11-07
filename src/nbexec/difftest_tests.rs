@@ -4377,3 +4377,41 @@ fn compiled_chase_walks_and_truthiness() {
     "#;
     assert_eq!(run(src), "2471772|733364|1729259");
 }
+
+/// Walks whose heap layout the compiled code predicts (`jit::chase` hops and
+/// receiver-cache fills of a walk register): a list in allocation order,
+/// relinked in reverse and in a shuffled order, interleaved with other
+/// allocations, very short lists, an array of objects in and out of order,
+/// and a node changing layout part-way. Every prediction is checked, so
+/// each layout gives the plain walk's answer.
+#[test]
+fn predicted_walks_of_every_layout() {
+    let src = r#"
+        var out = [];
+        class N { constructor(v, n) { this.v = v; this.next = n; } }
+        var seed = 7;
+        function rnd(n) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }
+        function build(n) { var h = null; for (var i = 0; i < n; i++) h = new N(i, h); return h; }
+        function nodes(h) { var a = []; for (var p = h; p; p = p.next) a.push(p); return a; }
+        function relink(a) { for (var i = 0; i < a.length - 1; i++) a[i].next = a[i + 1]; a[a.length - 1].next = null; return a[0]; }
+        function shuffle(a) { for (var i = a.length - 1; i > 0; i--) { var j = rnd(i + 1), t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
+        function tail(q) { while (q.next) q = q.next; return q; }
+        function sum(q) { var s = 0; for (var p = q; p; p = p.next) s += p.v; return s; }
+        function dot(a) { var s = 0; for (var i = 0; i < a.length; i++) { var o = a[i]; s += o.v * (i & 7); } return s; }
+        var h = build(700), a = nodes(h);
+        var lists = [h, relink(a.slice().reverse()), relink(shuffle(a.slice())), build(3), build(1)];
+        var junk = [], mixed = null;
+        for (var i = 0; i < 600; i++) { mixed = new N(i, mixed); if (i % 3) junk.push({ i: i }); }
+        lists.push(mixed);
+        var s = 0, t = 0, d = 0;
+        for (var r = 0; r < 300; r++) {
+          var l = lists[r % lists.length];
+          s += tail(l).v; t += sum(l);
+          d += dot(r & 1 ? a : shuffle(a.slice(0, 200)));
+          if (r === 150) a[350].w = 1;
+        }
+        out.push(s, t, d, junk.length);
+        out.join("|")
+    "#;
+    assert_eq!(run(src), "27450|23344800|190637778|400");
+}

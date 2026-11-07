@@ -200,7 +200,7 @@ impl X64Assembler {
     }
 
     /// [`p_audit_live`](Self::p_audit_live) of the handle in `h`.
-    fn p_audit_live_of(&mut self, l: &JitLayout, h: u8, dst: u8) {
+    pub(super) fn p_audit_live_of(&mut self, l: &JitLayout, h: u8, dst: u8) {
         let ok = self.new_label();
         let trap = self.new_label();
         self.g_cmp_byte_imm(dst, l.off_slot_occ, l.slot_occupied_disc);

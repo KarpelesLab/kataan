@@ -28,6 +28,25 @@
 //! or `false` next value ends the loop right there (the ordinary loop would
 //! read that same value into the condition and branch out on it), writing the
 //! condition temporary as the ordinary read would.
+//!
+//! **Stride prediction.** A plain hop is one dependency chain: the field's
+//! load, then the handle walk (two `lea`s), then the next load at the
+//! address it made, about six cycles where the load alone is four. But a
+//! structure built by a loop usually sits at a constant distance between
+//! consecutive objects (the allocator hands out neighbouring slots), so the
+//! hops run first in a **predicted** form: the next slot's address is the
+//! current one plus the distance the first hop measured, a one-cycle add,
+//! and the walk of the handle actually read is computed beside it and only
+//! *compared* with the prediction. Every check of the plain hop is still
+//! made, on the walked address, which the compare proves equal to the
+//! predicted one; what changes is that the next load no longer waits for the
+//! walk (the processor runs ahead past the compare's branch), so consecutive
+//! hops overlap: about half the time per hop on a structure laid out in
+//! order. The first two hops of a run are plain (they measure the distance,
+//! and a short walk is over before a prediction could pay); the first
+//! predicted hop whose address differs from the prediction leaves for the
+//! plain hops, which finish the run from that object: a scattered structure
+//! pays one mispredicted branch per run.
 
 use super::call_seq::{cc, r};
 use super::{JitLayout, Label, X64Assembler};
@@ -65,7 +84,7 @@ impl X64Assembler {
     /// object reached; with `falsy`, when the field's value there is
     /// `undefined`, `null` or `false`, goes to `falsy` instead, having also
     /// stored that value in the condition temporary. Clobbers `rax`, `rcx`,
-    /// `rdx`, `rsi`, `rdi`, `r11` (and `r8` in audit mode).
+    /// `rdx`, `rsi`, `rdi`, `r9`, `r10`, `r11` (and `r8` in audit mode).
     pub(super) fn p_chase_hops(
         &mut self,
         l: &JitLayout,
@@ -84,20 +103,51 @@ impl X64Assembler {
         ];
         let leave = [self.new_label(), self.new_label()];
         let value = [self.new_label(), self.new_label()];
-        let top = self.new_label();
+        // The plain hops' entries, with the current object in pair `i`.
+        let plain = [self.new_label(), self.new_label()];
         self.g_movabs(r::RDX, MAX_HOPS / 2);
+        // The first two hops are plain ones (a short walk is over before
+        // any prediction could pay); the distance the second went is the
+        // prediction (`r10`).
+        for (i, &pair) in pairs.iter().enumerate() {
+            self.p_chase_plain_hop(l, (shape, d), pair, (value[i], leave[i]));
+        }
+        self.raw(&[0xff, 0xca]); // dec edx
+        self.je(leave[0]);
+        self.g_mov(r::R10, r::RCX);
+        self.raw(&[0x49, 0x29, 0xfa]); // sub r10, rdi
+        // The predicted hops (the current object in pair `i`).
+        let top = self.new_label();
         self.bind(top);
         for (i, &((_, cs), (nh, ns))) in pairs.iter().enumerate() {
             self.g_load(nh, cs, d);
+            p_lea_sum(self, ns, cs, r::R10);
             self.p_cmp_handle_floor(nh);
             self.g_jcc(cc::B, value[i]);
-            self.p_slot_rooted_rr(l, nh, ns, leave[i]);
+            p_walk_r9(self, nh, leave[i]);
+            // cmp ns, r9
+            self.raw(&[0x4c, 0x39, 0xc8 | ns]);
+            self.jne(plain[i]);
+            if super::handle::handle_audit() {
+                self.p_audit_live_of(l, nh, ns);
+            }
             self.p_object_not_exotic_at(l, ns, leave[i]);
             self.p_cmp_shape(ns, l.off_shape, shape, r::R11);
             self.jne(leave[i]);
         }
         self.raw(&[0xff, 0xca]); // dec edx
         self.jne(top);
+        self.jmp(leave[0]);
+        // The plain hops (entered with at least one count left).
+        self.bind(plain[0]);
+        for (i, &pair) in pairs.iter().enumerate() {
+            if i == 1 {
+                self.bind(plain[1]);
+            }
+            self.p_chase_plain_hop(l, (shape, d), pair, (value[i], leave[i]));
+        }
+        self.raw(&[0xff, 0xca]); // dec edx
+        self.jne(plain[0]);
         // (The current object is in the first pair again.)
         self.jmp(leave[0]);
         for (i, &((ch, cs), (nh, _))) in pairs.iter().enumerate() {
@@ -132,6 +182,52 @@ impl X64Assembler {
             }
         }
     }
+}
+
+impl X64Assembler {
+    /// One plain hop of [`p_chase_hops`](X64Assembler::p_chase_hops), from
+    /// the current pair `(_, cs)` to the next `(nh, ns)`: the field at `d`
+    /// into `nh`, to `value` unless a handle, its walk into `ns`, to `leave`
+    /// unless an in-bounds plain object of layout `shape`.
+    fn p_chase_plain_hop(
+        &mut self,
+        l: &JitLayout,
+        (shape, d): (u64, i32),
+        ((_, cs), (nh, ns)): ((u8, u8), (u8, u8)),
+        (value, leave): (Label, Label),
+    ) {
+        self.g_load(nh, cs, d);
+        self.p_cmp_handle_floor(nh);
+        self.g_jcc(cc::B, value);
+        self.p_slot_rooted_rr(l, nh, ns, leave);
+        self.p_object_not_exotic_at(l, ns, leave);
+        self.p_cmp_shape(ns, l.off_shape, shape, r::R11);
+        self.jne(leave);
+    }
+}
+
+/// `lea dst, [base + index]` (`dst`, `base` among the first eight
+/// registers, `base` not `rbp`; `index` any but `rsp`).
+fn p_lea_sum(a: &mut X64Assembler, dst: u8, base: u8, index: u8) {
+    debug_assert!(dst < 8 && base < 8 && base != 5 && index != 4);
+    a.raw(&[
+        0x48 | (((index >> 3) & 1) << 1),
+        0x8d,
+        (dst << 3) | 4,
+        ((index & 7) << 3) | base,
+    ]);
+}
+
+/// The rooted handle walk (`X64Assembler::p_slot_rooted_rr`) of the handle
+/// in `h` (one of the first eight registers) into `r9`, pinned code, a
+/// 72-byte stride: to `miss` if its index is out of bounds.
+fn p_walk_r9(a: &mut X64Assembler, h: u8, miss: Label) {
+    debug_assert!(h < 8);
+    // mov r9d, h32; cmp r9, r13
+    a.raw(&[0x41, 0x89, 0xc1 | (h << 3), 0x4d, 0x39, 0xe9]);
+    a.jae(miss);
+    // lea r9, [r9 + r9*8]; lea r9, [r12 + r9*8]
+    a.raw(&[0x4f, 0x8d, 0x0c, 0xc9, 0x4f, 0x8d, 0x0c, 0xcc]);
 }
 
 /// Per op: whether it is the first op of such a loop.

@@ -25,6 +25,81 @@ use alloc::vec::Vec;
 use super::GenericOp;
 use crate::nbvm::Op;
 
+/// Per register of a body: whether it holds the objects of a **walk**, so a
+/// way filled with it predicts the next one's heap slot
+/// (`X64Assembler::p_fill_way`): a register that some op steps to a new
+/// object of a sequence (an element read, `GetKey`; an iterator's value,
+/// `IterNext`; a link of its own object, `r = r.link`, maybe through a
+/// temporary; a copy of such a register) and that nothing else defines but
+/// copies and constants (its initial value). Those visit a new object each
+/// time, often laid out in order. Other receivers (a method's `this`, a few
+/// objects taking turns, a register reused for another value) would mostly
+/// miss the prediction, and pay its instructions for nothing. (Only a guess
+/// of the profit: every prediction is checked.)
+pub(super) fn walk_regs(bytecode: &[Op]) -> Vec<bool> {
+    let (mut defs, mut uses) = (Vec::new(), Vec::new());
+    let mut n = 0;
+    for op in bytecode {
+        super::numeric::def_use(op, &mut defs, &mut uses);
+        if let Op::GetKey { dst, .. } | Op::GetProp { dst, .. } = *op {
+            defs.push(dst);
+        }
+        for &r in defs.iter().chain(&uses) {
+            n = n.max(usize::from(r) + 1);
+        }
+    }
+    // `t = r.link` reads (for `r = t`), and the registers defined otherwise
+    // than by a copy or a constant.
+    let mut link_of: Vec<(u16, u16)> = Vec::new();
+    let mut other = vec![false; n];
+    let mut walk = vec![false; n];
+    for op in bytecode {
+        super::numeric::def_use(op, &mut defs, &mut uses);
+        match *op {
+            Op::GetKey { dst, .. } | Op::IterNext { dst, .. } => walk[usize::from(dst)] = true,
+            Op::GetProp { dst, obj, .. } if dst == obj => walk[usize::from(dst)] = true,
+            Op::GetProp { dst, obj, .. } => link_of.push((dst, obj)),
+            _ => {}
+        }
+        let plain = matches!(op, Op::Move { .. } | Op::LoadConst { .. });
+        for &d in &defs {
+            let d = usize::from(d);
+            // (An `IterNext` also defines its `done` and cursor.)
+            let step = matches!(*op, Op::IterNext { dst, .. } if usize::from(dst) == d);
+            if !plain && !step && !walk[d] {
+                other[d] = true;
+            }
+        }
+    }
+    for op in bytecode {
+        if let Op::Move { dst, src } = *op
+            && link_of.contains(&(src, dst))
+        {
+            walk[usize::from(dst)] = true;
+        }
+    }
+    // A copy of a walk register is one.
+    loop {
+        let mut changed = false;
+        for op in bytecode {
+            if let Op::Move { dst, src } = *op
+                && walk[usize::from(src)]
+                && !walk[usize::from(dst)]
+            {
+                walk[usize::from(dst)] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (w, o) in walk.iter_mut().zip(&other) {
+        *w &= !o;
+    }
+    walk
+}
+
 /// The most global binding addresses a body caches (each costs a frame slot
 /// and a store in the prologue).
 const MAX_GLOBAL_SLOTS: usize = 8;
@@ -1620,6 +1695,43 @@ pub(super) fn survivors(plan: &RecvPlan, ops: &[GenericOp], excluded: &[usize]) 
 }
 
 impl super::X64Assembler {
+    /// A way's fill after a full walk: `rax` = the receiver's bits, `rcx` =
+    /// its heap slot (checked), into the way's `key` and `cell` slots.
+    ///
+    /// With a `delta` slot (a receiver of [`walk_regs`]), pinned code also
+    /// **predicts** the slot (see `chase`'s stride
+    /// prediction): a site whose receiver changes every time it runs, as a
+    /// walk along a list or over an array of objects, usually finds the next
+    /// one at the same distance from the last one as that one was from its
+    /// predecessor. The way's `delta` slot keeps that distance; when the
+    /// walked slot is the way's last one plus it, `rcx` is made the
+    /// predicted address (the same value) rather than the walked one, so the
+    /// loads through it no longer wait for the walk: the processor runs on
+    /// past the compare's branch while the walk is still being computed. A
+    /// wrong prediction just records the new distance. (`cell` and `delta`
+    /// may hold anything: they only make a guess, which the compare checks.)
+    /// Clobbers `r10` (pinned code only, where it holds no arena).
+    pub(super) fn p_fill_way(&mut self, key: i32, cell: i32, delta: Option<i32>) {
+        use super::call_seq::r;
+        if let Some(delta) = delta.filter(|_| self.pinned()) {
+            let hit = self.new_label();
+            let back = self.new_label();
+            self.g_load(r::R10, r::RBP, cell);
+            self.g_add_mem(r::R10, r::RBP, delta);
+            self.raw(&[0x4c, 0x39, 0xd1]); // cmp rcx, r10
+            self.je(hit);
+            self.g_mov(r::R10, r::RCX);
+            self.g_mem(true, &[0x2b], r::R10, r::RBP, cell); // sub r10, [rbp + cell]
+            self.g_store(r::RBP, delta, r::R10);
+            self.jmp(back);
+            self.bind(hit);
+            self.g_mov(r::RCX, r::R10);
+            self.bind(back);
+        }
+        self.g_store(r::RBP, key, r::RAX);
+        self.g_store(r::RBP, cell, r::RCX);
+    }
+
     /// Sets the ways the `call`s emitted next keep (see [`survivors`]).
     pub(super) fn set_recv_survive(&mut self, ways: Vec<SurviveWay>, layout: super::JitLayout) {
         self.recv_survive = ways;
@@ -1728,5 +1840,60 @@ impl super::X64Assembler {
             }
         }
         self.recv_survive = ways;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    fn get(dst: u16, obj: u16, key: &str) -> Op {
+        Op::GetProp {
+            dst,
+            obj,
+            key: key.to_string(),
+        }
+    }
+
+    /// `for (p = q; p; p = p.next) s += p.v`: `p` (and nothing else) walks.
+    #[test]
+    fn a_list_walk_register() {
+        let ops = alloc::vec![
+            Op::Move { dst: 8, src: 0 },
+            Op::JumpIfFalse { cond: 8, target: 7 },
+            get(9, 8, "v"),
+            Op::AddValue { dst: 5, a: 5, b: 9 },
+            get(11, 8, "next"),
+            Op::Move { dst: 8, src: 11 },
+            Op::Jump { target: 1 },
+            Op::Return { src: 5 },
+        ];
+        let w = walk_regs(&ops);
+        assert!(w[8]);
+        assert!(!w[0] && !w[9] && !w[11] && !w[5]);
+    }
+
+    /// `o = a[i]` and its copies walk; a register also defined by another
+    /// read (`p = this.queue`, a reused temporary) does not.
+    #[test]
+    fn element_reads_and_other_definitions() {
+        let ops = alloc::vec![
+            Op::GetKey {
+                dst: 14,
+                obj: 0,
+                key: 9
+            },
+            Op::Move { dst: 15, src: 14 },
+            get(16, 15, "x"),
+            get(20, 1, "queue"),
+            Op::Move { dst: 21, src: 20 },
+            get(22, 21, "link"),
+            Op::Move { dst: 21, src: 22 },
+            get(21, 3, "other"),
+        ];
+        let w = walk_regs(&ops);
+        assert!(w[14] && w[15]);
+        assert!(!w[16] && !w[20] && !w[21] && !w[22]);
     }
 }
