@@ -6338,6 +6338,10 @@ fn vm_get_prop(
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
             return Ok(v);
         }
+        // A built-in function's own data property (`Object.prototype`).
+        if let Some(v) = ctx.realm.native_own_data(h, key) {
+            return Ok(v);
+        }
         // A VM closure's chain (a static member, `C.kind`, or its own data
         // property): its own cache, whose hit also proves what the closure
         // owns. Else the closure's own data property (in its auxiliary

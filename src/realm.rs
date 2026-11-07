@@ -2175,6 +2175,24 @@ impl Realm {
         }
     }
 
+    /// The value of the own **data** property `key` of the built-in
+    /// function at `h` (a `Cell::Native`, whose own properties all live in
+    /// its auxiliary object: `has_own` / `get_property` read nothing else
+    /// for one) — `F.prototype`, `Object.keys`, `Math.max`'s `name` — which
+    /// is then `F[key]` (`[[Get]]` finds the own data property first).
+    /// `None` for anything else (another cell, an absent key, an accessor).
+    #[must_use]
+    pub fn native_own_data(&self, h: Handle, key: &str) -> Option<NanBox> {
+        if !matches!(self.heap.get(h), Some(Cell::Native(_))) {
+            return None;
+        }
+        let o = self.aux_obj(h)?;
+        if !o.has_no_accessors() && o.accessor(key).is_some() {
+            return None;
+        }
+        o.get(key)
+    }
+
     /// The auxiliary object of `h` for a change to it: an owing VM closure
     /// is materialized first (its owed properties are part of what changes).
     #[inline]
