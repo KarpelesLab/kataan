@@ -9955,6 +9955,43 @@ impl JitFunction {
                             return None;
                         }
                         let general = a.new_label();
+                        // `hasOwnProperty.call(o, k)` in a compiled `for-in`
+                        // over `o`, `k` its key: `true` when the loop's
+                        // liveness check found `k` an own data property of
+                        // this very `o` since the last call (`forin::Memo`;
+                        // only Rust code, behind a call, could have removed
+                        // it since) and `f` is the built-in reached through
+                        // `%Function.prototype.call%`.
+                        if let [k] = *rest
+                            && let Some(l) = forin_plan.key_loop(k)
+                            && [dst, recv, this, k]
+                                .iter()
+                                .all(|&r| num.result_xmm(op_idx, r).is_none())
+                        {
+                            use call_seq::r as R;
+                            let other = a.new_label();
+                            let m = fi_memo(l.site);
+                            a.load_rax(disp(this));
+                            a.g_cmp_mem(R::RAX, R::RBP, m.obj);
+                            a.g_jcc(call_seq::cc::NE, other);
+                            a.load_rax(disp(k));
+                            a.g_cmp_mem(R::RAX, R::RBP, m.key);
+                            a.g_jcc(call_seq::cc::NE, other);
+                            a.load_rax(disp(recv));
+                            a.movabs_r11(site_ptr as i64);
+                            call_seq::emit_fncall_check(&mut a, other);
+                            a.load_rax(disp(recv));
+                            a.p_is_native(
+                                &layout,
+                                helpers.call_layout.realm,
+                                crate::nbexec::N_OBJ_PROTO_HASOWN,
+                                other,
+                            );
+                            a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                            a.bind(other);
+                        }
                         a.load_rax(disp(recv));
                         a.movabs_r11(site_ptr as i64);
                         call_seq::emit_fncall_check(&mut a, general);
@@ -10072,6 +10109,65 @@ impl JitFunction {
                         a.load_argreg(1, disp(recv));
                         a.movabs_argreg(2, si.method_ptr as i64);
                         a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
+                    // `o.hasOwnProperty(k)` in a compiled `for-in` over `o`,
+                    // `k` its key: `true` when the loop's liveness check
+                    // found `k` an own data property of this very `o` since
+                    // the last call (`forin::Memo`) and the site's chain
+                    // cache finds the built-in on `o` (a miss refills it).
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && key == "hasOwnProperty"
+                        && let [k] = margs[..]
+                        && ok(dst)
+                        && ok(recv)
+                        && ok(k)
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                        && let Some(l) = forin_plan.key_loop(k)
+                        && [dst, recv, k]
+                            .iter()
+                            .all(|&r| num.result_xmm(op_idx, r).is_none())
+                    {
+                        use call_seq::r as R;
+                        let general = a.new_label();
+                        let fill = a.new_label();
+                        let m = fi_memo(l.site);
+                        let cl = &helpers.call_layout;
+                        a.load_rax(disp(recv));
+                        a.g_cmp_mem(R::RAX, R::RBP, m.obj);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.load_rax(disp(k));
+                        a.g_cmp_mem(R::RAX, R::RBP, m.key);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.p_method_lookup(
+                            &layout,
+                            cl.realm,
+                            (R::RBX, disp(recv)),
+                            si.method_ptr,
+                            fill,
+                            None,
+                        );
+                        a.p_is_native(
+                            &layout,
+                            cl.realm,
+                            crate::nbexec::N_OBJ_PROTO_HASOWN,
+                            general,
+                        );
+                        a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(fill);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.site_fill as usize as i64);
                         a.call_rax();
                         a.jmp(general);
                         a.cold_end(cold);

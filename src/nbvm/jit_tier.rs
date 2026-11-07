@@ -3458,7 +3458,11 @@ fn fill_fncall_memo(ctx: &mut Ctx, site: &mut CallSite, recv: NanBox, method: u6
     let Some(fh) = recv.as_handle().map(Handle::from_raw) else {
         return;
     };
-    if !ctx.realm.is_vm_function(fh) {
+    // A built-in function (`hasOwnProperty.call(o, k)`): the memo alone,
+    // which compiled code may use to identify `f` (`compile_generic`); the
+    // call sequence knows no native callee (its slow path calls it).
+    let native = ctx.realm.native_at(fh).is_some();
+    if !native && !ctx.realm.is_vm_function(fh) {
         return;
     }
     // (The memo watches the closure's own properties where they live.)
@@ -3486,7 +3490,9 @@ fn fill_fncall_memo(ctx: &mut Ctx, site: &mut CallSite, recv: NanBox, method: u6
     };
     ctx.realm.watch_link(fh.to_raw(), Some(aux.to_raw()));
     ctx.realm.watch_link(holder.to_raw(), None);
-    fill_call_site(ctx, recv, site);
+    if !native {
+        fill_call_site(ctx, recv, site);
+    }
     site.fncall = crate::jit::FnCallMemo {
         recv: recv.to_bits(),
         stamp: crate::object::proto_epoch(),
