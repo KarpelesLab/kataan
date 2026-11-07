@@ -823,6 +823,24 @@ pub(super) fn try_get(
     Some(NanBox::from_bits(site.method))
 }
 
+/// [`run_op`] for an object receiver, not inlined: the `F.call(t, …)` form
+/// re-enters it from inside itself, which would otherwise keep it out of
+/// line in its callers.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn run_op_out_of_line(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    op: FastOp,
+    method: u64,
+    recv: NanBox,
+    h: Handle,
+    regs: &[NanBox],
+    args: &[Reg],
+) -> Option<Result<NanBox, VmError>> {
+    run_op(ctx, funcs, op, method, recv, h, false, regs, args)
+}
+
 /// The rest of [`try_call`] / [`try_call_got`] once the site knows its
 /// built-in `op` (the function cell `method`).
 #[allow(clippy::too_many_arguments)]
@@ -899,14 +917,13 @@ fn run_op(
                 | FastOp::GenResume(_)
         ) {
             let rest = args.get(1..).unwrap_or(&[]);
-            if let Some(r) = run_op(
+            if let Some(r) = run_op_out_of_line(
                 ctx,
                 funcs,
                 inner,
                 recv.to_bits(),
                 arg(0),
                 Handle::from_raw(t),
-                false,
                 regs,
                 rest,
             ) {

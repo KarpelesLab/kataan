@@ -618,12 +618,13 @@ impl MethodSite {
     ) {
         let key = self.key();
         let bits = crate::nanbox::NanBox::handle(recv.to_raw()).to_bits();
-        // (A receiver recorded before is only restamped.)
-        if realm.multi_realm
+        // (Every slow read comes here: the cell kind turns most away first.
+        // A receiver recorded before is only restamped.)
+        if !realm.aux_named_key(recv, key)
             || (self.native_own.fills >= NATIVE_OWN_FILLS && self.native_own.recv != bits)
+            || realm.multi_realm
             || key.starts_with('\0')
             || key == "__proto__"
-            || !realm.aux_named_key(recv, key)
             || realm.is_host_exotic(recv)
         {
             return;

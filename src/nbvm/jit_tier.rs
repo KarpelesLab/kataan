@@ -2851,7 +2851,11 @@ pub(crate) extern "C" fn jit_helper_get_method_site(
                 #[allow(unsafe_code)]
                 let site = unsafe { &mut *site };
                 site.fill(&mut ctx.realm, Handle::from_raw(h));
-                site.fill_native_own(&mut ctx.realm, Handle::from_raw(h));
+                // (A built-in function's own method: `Array.isArray`. An
+                // array's are inherited.)
+                if ctx.realm.native_at(Handle::from_raw(h)).is_some() {
+                    site.fill_native_own(&mut ctx.realm, Handle::from_raw(h));
+                }
             }
             return v.to_bits();
         }
