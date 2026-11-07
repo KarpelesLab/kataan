@@ -8423,6 +8423,59 @@ impl JitFunction {
                 })
             })
             .collect();
+        // Per op: a run-proved property site (`numeric::plan_site_proofs`)
+        // whose code fits — a compiled-in layout's in-object slot, the
+        // ordinary store (no fresh add) or read (no chase) — and that no
+        // later known site of the iteration (`recv_cache::SitePlan::known`)
+        // follows unless it is one too: a proved site's later runs leave
+        // its way as it is, so a known successor's would find what another
+        // site last put there.
+        let pproved: Vec<bool> = {
+            let mut ok: Vec<bool> = (0..ops.len())
+                .map(|i| {
+                    num.site_proof_planned(i)
+                        && !chase_at.get(i).copied().unwrap_or(true)
+                        && fresh_add.get(i).is_none_or(Option::is_none)
+                        && rc.sites[i].is_none_or(|p| p.family == recv_cache::Family::Obj)
+                        && match ops[i] {
+                            GenericOp::GetProp { site, .. } | GenericOp::SetProp { site, .. } => {
+                                sites
+                                    .get(site as usize)
+                                    .and_then(|s| s.baked)
+                                    .is_some_and(|b| {
+                                        X64Assembler::inline_slot_disp(&layout, b.slot).is_some()
+                                    })
+                            }
+                            _ => false,
+                        }
+                })
+                .collect();
+            loop {
+                let mut changed = false;
+                for i in 0..ops.len() {
+                    if let Some(p) = rc.sites[i]
+                        && p.known
+                        && let Some(q) = p.pred
+                        && ok.get(q).copied().unwrap_or(false)
+                        && !ok[i]
+                    {
+                        ok[q] = false;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            ok
+        };
+        // (Their code keeps `rsi`/`rdi`: no chase, no fresh add, a
+        // compiled-in layout, and every slow path leaving the fast version.)
+        num.set_keeps_si_di(
+            (0..ops.len())
+                .map(|i| pproved[i] && num.in_spec(i))
+                .collect(),
+        );
         // Per op, the ways a call there keeps, re-validated after it
         // (`recv_cache::survivors`); never an inlined `new`'s.
         let survive: Vec<Vec<recv_cache::SurviveWay>> = {
@@ -8714,6 +8767,34 @@ impl JitFunction {
                             a.g_store(call_seq::r::RBP, rc_cell(way), call_seq::r::RCX);
                         }
                     }
+                }
+            }};
+        }
+        // A run-proved property site's start (`pproved`): while its proof's
+        // slot holds the receiver's heap slot (set by its checks' first pass
+        // in this run of the fast version, `pproof_end!`), `rcx` = it and
+        // straight past the checks. `(slot, past)` for `pproof_end!`.
+        macro_rules! pproof_begin {
+            ($at:expr) => {{
+                match num.site_run_proof($at).filter(|_| pproved[$at]) {
+                    Some(slot) => {
+                        let past = a.new_label();
+                        a.g_load(call_seq::r::RCX, call_seq::r::RBP, slot);
+                        a.g_test(call_seq::r::RCX);
+                        a.g_jcc(call_seq::cc::NE, past);
+                        Some((slot, past))
+                    }
+                    None => None,
+                }
+            }};
+        }
+        // After a run-proved site's checks (`rcx` the receiver's heap slot):
+        // the proof's slot holds it from here on in this run.
+        macro_rules! pproof_end {
+            ($p:expr) => {{
+                if let Some((slot, past)) = $p {
+                    a.g_store(call_seq::r::RBP, slot, call_seq::r::RCX);
+                    a.bind(past);
                 }
             }};
         }
@@ -11277,6 +11358,10 @@ impl JitFunction {
                     let cell = !matches!(direct, Some(((b, _, p, have), _))
                         if p.known && known.is_some()
                             && !X64Assembler::p_fixed_slot_needs_rcx(&layout, b.slot, have));
+                    // A run-proved site (`numeric::plan_site_proofs`) whose
+                    // checks have passed in this run of the fast version
+                    // has the receiver's heap slot in its proof's slot.
+                    let proof = pproof_begin!(op_idx);
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify, cell);
                     // (A compiled-in layout compares the shape word in place:
                     // its cache path loads it, out of line.)
@@ -11298,6 +11383,7 @@ impl JitFunction {
                             );
                             a.jne(cached);
                         }
+                        pproof_end!(proof);
                         extra_in_frame[op_idx] = a.p_obj_fixed_slot_ex_xmm(
                             &layout,
                             b.slot,
@@ -11337,6 +11423,7 @@ impl JitFunction {
                             );
                             a.jne(cached);
                         }
+                        pproof_end!(proof);
                         match rc.sites[op_idx].filter(|_| num.in_spec(op_idx)) {
                             Some(p) => {
                                 let have = p.known && p.pred.is_some_and(|q| extra_in_frame[q]);
@@ -11684,6 +11771,7 @@ impl JitFunction {
                                     )
                             })
                         }));
+                    let proof = pproof_begin!(op_idx);
                     recv_slot!(op_idx, obj, helper, recv_cache::Family::Obj, verify, cell);
                     // A site the interpreter saw add one key to one layout
                     // tries that add first, compiled in, and has everything
@@ -11766,6 +11854,7 @@ impl JitFunction {
                             );
                             a.jne(cached);
                         }
+                        pproof_end!(proof);
                         if !val_num {
                             a.load_rax(disp(val));
                             if b.num {

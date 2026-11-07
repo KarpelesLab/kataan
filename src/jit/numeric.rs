@@ -590,6 +590,20 @@ struct GProof {
     slot: u32,
 }
 
+/// A **run-proved property site** of a speculative region
+/// ([`plan_site_proofs`]): the property read or in-place write at `site`,
+/// once its receiver checks have passed in a run of the fast version, finds
+/// the same object of the same layout (and, for a write, flags) for the rest
+/// of that run.
+#[derive(Clone, Copy, Debug)]
+struct PProof {
+    site: usize,
+    /// Its native frame slot ([`NumGen::pproof_disp`]): the receiver's heap
+    /// slot address the site's checks passed on in this run of the fast
+    /// version, or `0`.
+    slot: u32,
+}
+
 /// A promoted loop: bytecode pcs `head..=end` (`end` the unconditional back-edge
 /// `Jump` to `head`) and its promoted registers.
 struct Region {
@@ -647,6 +661,8 @@ struct Region {
     fcarry: Vec<FCarry>,
     /// The run-proved guards ([`plan_run_proofs`]).
     gproof: Vec<GProof>,
+    /// The run-proved property sites ([`plan_site_proofs`]).
+    pproof: Vec<PProof>,
     /// For a body that branches inside itself: the registers live on entry
     /// to each of its ops (`live_words` words per pc from `head`), which
     /// [`Region::defined`] reads; empty otherwise.
@@ -1065,6 +1081,8 @@ pub(super) struct NumGen {
     n_fcarry: usize,
     /// The run-proved guards' slots ([`GProof::slot`]), after those.
     n_gproof: usize,
+    /// The run-proved property sites' slots ([`PProof::slot`]), after those.
+    n_pproof: usize,
     /// Per pc: its label in its region's integer version, for a
     /// speculative region's ([`Self::spec_int`]).
     int_labels: Vec<Option<Label>>,
@@ -1086,6 +1104,10 @@ pub(super) struct NumGen {
     /// Per pc: a later site of the iteration takes the receiver-cache way
     /// this op fills as filled (`typed::relied_on`).
     rc_relied: Vec<bool>,
+    /// Per pc: a property op whose code (its every path in a speculative
+    /// region's fast version, up to its leaves) keeps `rsi` and `rdi`
+    /// ([`Self::set_keeps_si_di`]).
+    keeps_si_di: Vec<bool>,
     /// The inline `Math.f(x)` calls whose receiver and method the fast
     /// version's entry checks prove ([`Self::plan_math_proofs`]).
     math_proofs: Vec<MathProof>,
@@ -1513,6 +1535,31 @@ impl NumGen {
                 }
             }
         }
+        // The run-proved property sites ([`plan_site_proofs`]) of the same
+        // versions, each with its slot.
+        let mut n_pproof = 0usize;
+        for r in &mut regions {
+            let keep = r.spec.is_some() && r.arms.iter().all(|a| r.cold.contains(a));
+            if pproof_log() {
+                std::eprintln!(
+                    "[pproof] region {}..={}: spec {} keep {keep} sites {}",
+                    r.head,
+                    r.end,
+                    r.spec.is_some(),
+                    r.pproof.len()
+                );
+            }
+            if !keep {
+                r.pproof.clear();
+            }
+            for g in &mut r.pproof {
+                g.slot = n_pproof as u32;
+                n_pproof += 1;
+                if pproof_log() {
+                    std::eprintln!("[pproof] site {}", g.site);
+                }
+            }
+        }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
         {
@@ -1625,6 +1672,7 @@ impl NumGen {
             n_view_slots,
             n_fcarry,
             n_gproof,
+            n_pproof,
             int_labels: vec![None; n + 1],
             ilabels: Vec::new(),
             int_saved: false,
@@ -1632,6 +1680,7 @@ impl NumGen {
             int_math: None,
             int_post: None,
             rc_relied: Vec::new(),
+            keeps_si_di: Vec::new(),
             math_proofs: Vec::new(),
         }
     }
@@ -1756,6 +1805,7 @@ impl NumGen {
             + self.int_save_slots()
             + self.n_fcarry
             + self.n_gproof
+            + self.n_pproof
     }
 
     /// The frame slot of carried field flag `k` ([`FCarry::flag`]), after
@@ -1771,6 +1821,36 @@ impl NumGen {
     /// carried fields' flags.
     fn gproof_disp(&self, k: u32) -> i32 {
         self.fcarry_disp(self.n_fcarry as u32 + k)
+    }
+
+    /// The frame slot of run-proved property site `k` ([`PProof::slot`]),
+    /// after the run-proved guards'.
+    fn pproof_disp(&self, k: u32) -> i32 {
+        self.gproof_disp(self.n_gproof as u32 + k)
+    }
+
+    /// For the property read or write at `pc` in a speculative region's fast
+    /// version (either one): its run proof's frame slot, when it is a
+    /// run-proved site ([`plan_site_proofs`]). The slot holds the receiver's
+    /// heap slot address once the site's receiver checks have passed since
+    /// the fast version was entered, or `0`: while it holds one, the site
+    /// needs no receiver check.
+    pub(crate) fn site_run_proof(&self, pc: usize) -> Option<i32> {
+        let ri = self.region_at(pc)?;
+        let r = &self.regions[ri];
+        if r.spec.is_none() || (self.imode.is_some() && !self.spec_int_mode()) {
+            return None;
+        }
+        let g = r.pproof.iter().find(|g| g.site == pc)?;
+        Some(self.pproof_disp(g.slot))
+    }
+
+    /// Whether the property site at `pc` is a planned run-proved site
+    /// ([`plan_site_proofs`]), whichever version is being emitted.
+    pub(crate) fn site_proof_planned(&self, pc: usize) -> bool {
+        self.region_of.get(pc).is_some_and(|&r| {
+            r != u32::MAX && self.regions[r as usize].pproof.iter().any(|g| g.site == pc)
+        })
     }
 
     /// For the inline guard at `pc` in a speculative region's fast version
@@ -2151,6 +2231,22 @@ impl NumGen {
     /// Which ops' receiver-cache ways later sites rely on (per pc).
     pub(super) fn set_rc_relied(&mut self, relied: Vec<bool>) {
         self.rc_relied = relied;
+    }
+
+    /// Which property ops' code keeps `rsi` and `rdi` on every path of a
+    /// speculative region's fast version (per pc): a compiled-in layout's
+    /// read or in-place write, whose slow paths there leave the version
+    /// (their walks clobber `r8`/`r10`, a store's barrier check `r8`-`r11`,
+    /// and nothing of it `rsi`/`rdi`). The integer version saves no int
+    /// register around one where only those two are live
+    /// (`int32::emit_spec_int_op`).
+    pub(super) fn set_keeps_si_di(&mut self, keeps: Vec<bool>) {
+        self.keeps_si_di = keeps;
+    }
+
+    /// Whether op `pc` keeps `rsi` and `rdi` ([`Self::set_keeps_si_di`]).
+    pub(super) fn keeps_si_di(&self, pc: usize) -> bool {
+        self.keeps_si_di.get(pc).copied().unwrap_or(false)
     }
 
     /// The receiver-cache ways of the region truthiness tests (per pc).
@@ -2679,6 +2775,10 @@ impl NumGen {
         // (Nor has any run-proved guard hit.)
         for g in &self.regions[ri].gproof {
             a.mov_frame_zero(self.gproof_disp(g.slot));
+        }
+        // (Nor has any run-proved property site passed its checks.)
+        for g in &self.regions[ri].pproof {
+            a.mov_frame_zero(self.pproof_disp(g.slot));
         }
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
@@ -5875,6 +5975,11 @@ fn plan_regions(
         } else {
             Vec::new()
         };
+        let pproof: Vec<PProof> = if generic && loops.is_empty() && pproof_enabled() {
+            plan_site_proofs(ops, bytecode, (head, end), &arms, &carried_r)
+        } else {
+            Vec::new()
+        };
         let in_gcarry =
             |r: u16| gcarry.iter().any(|g| g.1 == r) || fcarry.iter().any(|f| f.src == r);
         carried.extend(info.iter().filter(|x| in_gcarry(x.0)));
@@ -6095,6 +6200,7 @@ fn plan_regions(
             gcarry,
             fcarry,
             gproof,
+            pproof,
         });
     }
     out
@@ -6258,6 +6364,180 @@ fn plan_run_proofs(
         });
     }
     out
+}
+
+/// Whether run-proved property sites ([`plan_site_proofs`]) are planned:
+/// unless `KATAAN_JIT_PPROOF=0`. Read once per process.
+fn pproof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PPROOF").is_none_or(|v| v != "0"))
+}
+
+/// Whether `KATAAN_JIT_PPROOF=log`: report each run-proved site kept.
+fn pproof_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PPROOF").is_some_and(|v| v == "log"))
+}
+
+/// A loop's **run-proved property sites**. A property read or in-place
+/// write with a compiled-in layout checks its receiver every iteration:
+/// the receiver's bits against its receiver-cache way's, the way's heap
+/// slot, the object's shape word, and, for a write, its flags byte. In a
+/// speculative version's fast version no Rust code runs, so an object's
+/// flags and its kind hold from one iteration to the next, and its shape
+/// changes only by an inline add — which there leaves the fast version, but
+/// for the adds to an object the iteration has just allocated
+/// (`recv_cache::fresh_adds`, an object literal's `InitProp`s). So once a
+/// site whose receiver is the same object in every iteration of a run has
+/// passed its checks, the checks pass again for the rest of the run, on
+/// the same heap slot: the site's later runs, until the fast version is
+/// entered again (which empties its slot), take that slot's address from
+/// the frame.
+///
+/// A candidate: a `GetProp` or `SetProp` outside the fallback arms (`arms`)
+/// of a loop whose control runs straight but for the diamonds and exits,
+/// whose ops outside the arms all run no Rust code and change no shape but
+/// a fresh object's ([`shape_safe`]), on a receiver that holds the same
+/// value wherever the site runs ([`invariant_at`]).
+///
+/// `NumGen::new` keeps those of regions that got a speculative version
+/// whose fast version leaves out these very arms; the generic emitter
+/// keeps those whose code fits (a compiled-in layout's in-object slot, a
+/// slow path that leaves the fast version, and no later site of the
+/// iteration relying on the way it would no longer fill).
+fn plan_site_proofs(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    arms: &[(usize, usize, usize)],
+    carried_r: &dyn Fn(u16) -> bool,
+) -> Vec<PProof> {
+    let mut out = Vec::new();
+    if end >= ops.len() || end >= bytecode.len() || head >= end {
+        return out;
+    }
+    if !straight_body(ops, (head, end), arms) {
+        return out;
+    }
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    if let Some(q) = (head..=end).find(|&q| !in_arm(q) && !shape_safe(ops, bytecode, q)) {
+        if pproof_log() {
+            std::eprintln!(
+                "[pproof] region {head}..={end}: op {q} {:?} / {:?}",
+                ops[q],
+                bytecode[q]
+            );
+        }
+        return out;
+    }
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    for s in head..=end {
+        if in_arm(s) {
+            continue;
+        }
+        let (obj, key) = match (&ops[s], &bytecode[s]) {
+            (GenericOp::GetProp { .. }, Op::GetProp { obj, key, .. })
+            | (
+                GenericOp::SetProp { .. },
+                Op::SetProp { obj, key, .. } | Op::SetPropStrict { obj, key, .. },
+            ) => (*obj, key.as_str()),
+            _ => continue,
+        };
+        if key == "__proto__" {
+            continue;
+        }
+        if !invariant_at(
+            bytecode,
+            (head, end),
+            &in_arm,
+            carried_r,
+            obj,
+            s,
+            4,
+            &mut d,
+            &mut u,
+        ) {
+            if pproof_log() {
+                std::eprintln!("[pproof] site {s}: receiver r{obj} varies");
+            }
+            continue;
+        }
+        out.push(PProof {
+            site: s,
+            slot: u32::MAX,
+        });
+    }
+    out
+}
+
+/// Whether register `r` holds the same value wherever op `at` of region
+/// `head..=end` runs, in every run of a speculative version's fast version
+/// (whose runs start at the header): no op of the loop writes it, or every
+/// op of the loop that does is one before `at` outside the fallback arms
+/// (so one runs before `at` in every iteration) and reads a binding no op
+/// of the loop stores (a global's), or copies a register that holds the
+/// same value there (`depth` levels of copies at most). Not one of
+/// `carried_r`.
+#[allow(clippy::too_many_arguments)]
+fn invariant_at(
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    in_arm: &dyn Fn(usize) -> bool,
+    carried_r: &dyn Fn(u16) -> bool,
+    r: u16,
+    at: usize,
+    depth: u32,
+    d: &mut Vec<u16>,
+    u: &mut Vec<u16>,
+) -> bool {
+    let ds = defs_in(bytecode, (head, end), r, d, u);
+    if ds.is_empty() {
+        return true;
+    }
+    if depth == 0 || carried_r(r) {
+        return false;
+    }
+    ds.iter().all(|&pc| {
+        if pc >= at || in_arm(pc) {
+            return false;
+        }
+        match &bytecode[pc] {
+            Op::LoadGlobal { name, .. } => {
+                !name.starts_with('\u{1}')
+                    && !(head..=end).any(|q| match &bytecode[q] {
+                        Op::StoreGlobal { name: n, .. } | Op::InitGlobal { name: n, .. } => {
+                            n == name
+                        }
+                        _ => false,
+                    })
+            }
+            &Op::Move { src, .. } => invariant_at(
+                bytecode,
+                (head, end),
+                in_arm,
+                carried_r,
+                src,
+                pc,
+                depth - 1,
+                d,
+                u,
+            ),
+            _ => false,
+        }
+    })
+}
+
+/// Whether op `pc` of a speculative region's fast version can run there
+/// without running Rust code or changing an object's shape or flags, but
+/// for adds to an object it has just allocated: a property store (an add
+/// to another object leaves the fast version), a binding's, a register op,
+/// a read, a branch, an inline guard or leave, an inlined `Math` call.
+fn shape_safe(ops: &[GenericOp], bytecode: &[Op], pc: usize) -> bool {
+    match (&ops[pc], &bytecode[pc]) {
+        (GenericOp::SetProp { .. }, Op::SetProp { .. } | Op::SetPropStrict { .. }) => true,
+        (_, Op::SetProp { .. } | Op::SetPropStrict { .. }) => false,
+        _ => stores_no_key(ops, bytecode, pc, ""),
+    }
 }
 
 /// Whether carried fields ([`plan_carried_fields`]) are planned: unless

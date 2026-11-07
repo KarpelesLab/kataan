@@ -69,6 +69,8 @@ const CC_LE: u8 = 0xe;
 const CC_G: u8 = 0xf;
 
 const R11: u8 = 11;
+const RSI: u8 = 6;
+const RDI: u8 = 7;
 
 /// One int register with a GPR: `reg` lives in `gpr` at pcs `start..=end`.
 pub(super) struct ISlot {
@@ -2271,6 +2273,14 @@ impl NumGen {
             // (`rcx` / `rax` only.)
             GenericOp::InlineLeave | GenericOp::PlainPrims { .. } => {}
             GenericOp::InlineGuard { .. } => self.int_saved = true,
+            // (A property op that keeps `rsi` and `rdi` when only they are
+            // live: nothing to save, and its leaves find them in place.)
+            GenericOp::GetProp { .. } | GenericOp::SetProp { .. }
+                if self.keeps_si_di(pc)
+                    && self
+                        .live_int_gprs(pc)
+                        .iter()
+                        .all(|&(g, _)| g == RSI || g == RDI) => {}
             _ => {
                 self.int_save(a, pc);
                 self.int_saved = true;
