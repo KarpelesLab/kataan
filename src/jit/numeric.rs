@@ -186,9 +186,11 @@ fn transfer(op: &Op, s: &mut [u8]) {
         Op::Add { dst, a, b } | Op::AddValue { dst, a, b } => {
             (*dst, num_if(t(s, *a) == T_NUM && t(s, *b) == T_NUM))
         }
+        // (`in` and `instanceof` give a boolean, or throw.)
         Op::Lt { dst, .. }
         | Op::StrictEq { dst, .. }
         | Op::Not { dst, .. }
+        | Op::Relational { dst, .. }
         | Op::PlainPrims { dst, .. } => (*dst, T_BOOL),
         Op::Compare { dst, op, .. } => (*dst, if *op <= 3 { T_BOOL } else { T_ANY }),
         Op::ToNumeric { dst, src } | Op::Step { dst, src, .. } => {
@@ -964,6 +966,10 @@ pub(super) const SA_INLINE: u8 = 1;
 /// [`NumEnv::alloc_inline`]: the op is a call (an inlined `super(…)`'s
 /// fallback arm), and a region op.
 pub(super) const SA_CALL: u8 = 2;
+/// [`NumEnv::alloc_inline`]: a compiled `for-in`'s key read or liveness
+/// check (`super::forin::region_flags`), a region op whose fast path makes
+/// no call and whose every other path leaves a speculative version.
+pub(super) const SA_FORIN: u8 = 4;
 
 /// A region truthiness test's receiver-cache way: its key and slot-address
 /// frame slots (`rbp`-relative), whether to compare the key first, and the
@@ -1287,6 +1293,9 @@ fn region_op_ok(op: &GenericOp, bc: &Op, sa: u8) -> bool {
 /// registers. (A callee reaches the caller's registers only through the
 /// register file: as the collector's roots, which a relocation may update.)
 pub(super) fn generic_region_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
+    if sa & SA_FORIN != 0 && matches!(op, GenericOp::ArrGet { .. } | GenericOp::Interp { .. }) {
+        return true;
+    }
     match op {
         GenericOp::GetProp { .. }
         | GenericOp::GetMethod { .. }
@@ -1383,7 +1392,10 @@ fn cold_arms(ops: &[GenericOp], head: usize, end: usize) -> Vec<(usize, usize, u
 /// one's fast-version code reads its operands from the register file and
 /// leaves for the plain copy on every path but its fast one, which ends at
 /// the op's end (no branch to another op).
-fn spec_int_op(op: &GenericOp, bc: &Op) -> bool {
+fn spec_int_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
+    if sa & SA_FORIN != 0 {
+        return true;
+    }
     match op {
         GenericOp::InlineGuard { poly, .. } => *poly == 0,
         GenericOp::InlineLeave
@@ -1569,6 +1581,21 @@ impl NumGen {
                 };
             }
             r.alt_int = None;
+        }
+        if specalloc_log() {
+            for r in &regions {
+                std::eprintln!(
+                    "[specalloc] region {}..={}: spec {} int {} spec_int {} xmm {:?} ints {:?} globals {:?}",
+                    r.head,
+                    r.end,
+                    r.spec.is_some(),
+                    r.int.is_some(),
+                    r.spec_int,
+                    r.slots.iter().map(|s| s.reg).collect::<Vec<_>>(),
+                    r.int.as_ref().map(int32::IntPlan::regs),
+                    r.gcarry.iter().map(|g| g.1).collect::<Vec<_>>(),
+                );
+            }
         }
         // The carried fields ([`plan_carried_fields`]) of the speculative
         // versions that leave out the arms they were planned with, on
@@ -3040,6 +3067,24 @@ impl NumGen {
     /// leaves for the region's plain copy instead), so from the region's
     /// header to its back-edge no call is made.
     /// Whether ops `p` and `q` lie in one promoted region.
+    /// Whether the `JumpIfFalse` at `pc` of a speculative region's fast
+    /// version tests the result of a compiled `for-in`'s liveness check
+    /// right before it, which nothing else reaches: the check's only way
+    /// on there is its `true` (its every other path leaves for the plain
+    /// copy, `compile_generic`), so the branch is never taken.
+    fn forin_true(&self, pc: usize) -> bool {
+        pc > 0
+            && self.in_spec(pc)
+            && self.same_region(pc - 1, pc)
+            && self.copy_label(pc - 1).is_some()
+            && self.sa(pc - 1) & SA_FORIN != 0
+            && !self.is_target.get(pc).copied().unwrap_or(true)
+            && matches!(
+                (self.bc(pc - 1), self.bc(pc)),
+                (Some(Op::Relational { dst, .. }), Some(Op::JumpIfFalse { cond, .. })) if dst == cond
+            )
+    }
+
     pub(super) fn same_region(&self, p: usize, q: usize) -> bool {
         self.region_at(p).is_some() && self.region_at(p) == self.region_at(q)
     }
@@ -3711,7 +3756,9 @@ impl NumGen {
                     // (the planner admits only unconditional back-edges).
                     return None;
                 }
-                self.branch_if_false(a, labels, pc, reg, cond, target);
+                if !self.forin_true(pc) {
+                    self.branch_if_false(a, labels, pc, reg, cond, target);
+                }
             }
             GenericOp::Jump { target } if reg.is_some() => {
                 let ri = reg?;
@@ -5994,11 +6041,12 @@ fn plan_regions_sa(
             && loops.is_empty()
             && (elem_cand
                 || !arms.is_empty()
+                || (head..=end).any(|pc| sa_at(sa, pc) & SA_FORIN != 0)
                 || (head..=end).any(|pc| int_math_op(&bytecode[pc]).is_some()))
             && (head..=end).all(|pc| {
                 in_arm(pc)
                     || !generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))
-                    || spec_int_op(&ops[pc], &bytecode[pc])
+                    || spec_int_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))
             })
             // (Nor a loop with an inlined `new` or `super(…)`: its fresh
             // adds take their values from the register file, which an
@@ -6025,6 +6073,13 @@ fn plan_regions_sa(
                     // (`NumGen::operand_xmm`).
                     let free = match (&ops[pc], &bytecode[pc]) {
                         (_, Op::GetKey { obj, key, .. }) if key != obj => [Some(*key), None],
+                        // (A compiled `for-in`'s key read: its index from
+                        // where the region keeps it, `forin::Idx`.)
+                        (GenericOp::ArrGet { .. }, Op::GetElem { arr, index, .. })
+                            if sa_at(sa, pc) & SA_FORIN != 0 && index != arr =>
+                        {
+                            [Some(*index), None]
+                        }
                         (
                             GenericOp::SetProp { .. },
                             Op::SetProp { obj, src, .. } | Op::SetPropStrict { obj, src, .. },

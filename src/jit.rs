@@ -7661,9 +7661,15 @@ impl JitFunction {
                         _ => None,
                     })
                     .collect(),
-                alloc_inline: spec_alloc_inline(ops, bytecode, n_regs, inline_closures, &|i| {
-                    interp_sites.get(i).copied().flatten().is_some()
-                }),
+                alloc_inline: forin::region_flags(
+                    forin_plan,
+                    ops,
+                    bytecode,
+                    n_regs,
+                    spec_alloc_inline(ops, bytecode, n_regs, inline_closures, &|i| {
+                        interp_sites.get(i).copied().flatten().is_some()
+                    }),
+                ),
             },
             osr_entries,
             &catch_targets,
@@ -8571,9 +8577,17 @@ impl JitFunction {
         };
         // (Their code keeps `rsi`/`rdi`: no chase, no fresh add, a
         // compiled-in layout, and every slow path leaving the fast version.)
+        // (So does a compiled `for-in`'s key read, its liveness check and
+        // its body's `o[k]` read through it, whose every path but the
+        // inline one leaves the fast version: `forin`.)
+        let fi_keeps = |i: usize| {
+            num.sa(i) & numeric::SA_FORIN != 0
+                || matches!(ops[i], GenericOp::GetElem { index, .. }
+                    if forin_plan.key_loop(index).is_some() && !typed::relied_on(&rc, i))
+        };
         num.set_keeps_si_di(
             (0..ops.len())
-                .map(|i| pproved[i] && num.in_spec(i))
+                .map(|i| (pproved[i] || fi_keeps(i)) && num.in_spec(i))
                 .collect(),
         );
         // Per op, the ways a call there keeps, re-validated after it
@@ -10233,35 +10247,77 @@ impl JitFunction {
                     let slow = a.new_label();
                     let done = a.new_label();
                     // A compiled `for-in`'s key (`forin`): from its key
-                    // table, with no walk of the array.
-                    if let Some((l, site)) = forin_plan
+                    // table, with no walk of the array. (In a promoted
+                    // loop the index is where the loop keeps it, and in a
+                    // speculative loop's fast version every miss leaves
+                    // for the plain copy.)
+                    let fi = forin_plan
                         .read_at
                         .get(op_idx)
                         .copied()
                         .flatten()
-                        .filter(|l| l.arr == arr && l.index == index && !num.in_region(op_idx))
-                        .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)))
-                    {
-                        let other = a.new_label();
-                        a.fi_key(site, l, disp, other);
+                        .filter(|l| l.arr == arr && l.index == index)
+                        .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)));
+                    let in_region = num.in_region(op_idx);
+                    if in_region && num.sa(op_idx) & numeric::SA_FORIN != 0 {
+                        let (l, site) = fi?;
+                        if num.result_xmm(op_idx, arr).is_some() {
+                            return None;
+                        }
+                        let bail = num.spec_bail(&mut a, op_idx);
+                        let mut idx = num.hidden_index(op_idx, index)?;
+                        if let (None, forin::Idx::Xmm(_)) = (bail, idx) {
+                            // (The other paths read the register file.)
+                            let _ = num.operand_xmm(&mut a, op_idx, index, false);
+                            idx = forin::Idx::File;
+                        }
+                        let other = bail.unwrap_or(slow);
+                        if bail.is_some() && typed::relied_on(&rc, op_idx) {
+                            // (A later site would take the way this one
+                            // fills as filled: the plain copy's.)
+                            a.jmp(other);
+                        }
+                        a.fi_key(site, l, idx, disp, other);
+                        match num.result_xmm(op_idx, dst) {
+                            Some(x) => {
+                                numeric::NumGen::set_xmm_from_rax(&mut a, x);
+                                let past = a.new_label();
+                                a.jmp(past);
+                                past_reload = Some(past);
+                            }
+                            None => {
+                                a.store_rax(disp(dst));
+                                a.jmp(done);
+                            }
+                        }
+                        if bail.is_none() {
+                            a.bind(slow);
+                            exec_op!(pc);
+                        }
+                        a.bind(done);
+                    } else {
+                        if let Some((l, site)) = fi.filter(|_| !in_region) {
+                            let other = a.new_label();
+                            a.fi_key(site, l, forin::Idx::File, disp, other);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                            a.bind(other);
+                        }
+                        recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
+                        int_index!(index, slow);
+                        a.p_arr_len_ptr(&layout);
+                        a.cmp_rax_r8();
+                        a.jae(slow);
+                        a.mov_rax_at_r11_rax8();
+                        a.movabs_r11(NanBox::hole().to_bits() as i64);
+                        a.cmp_rax_r11();
+                        a.je(slow);
                         a.store_rax(disp(dst));
                         a.jmp(done);
-                        a.bind(other);
+                        a.bind(slow);
+                        exec_op!(pc);
+                        a.bind(done);
                     }
-                    recv_slot!(op_idx, arr, slow, recv_cache::Family::Arr);
-                    int_index!(index, slow);
-                    a.p_arr_len_ptr(&layout);
-                    a.cmp_rax_r8();
-                    a.jae(slow);
-                    a.mov_rax_at_r11_rax8();
-                    a.movabs_r11(NanBox::hole().to_bits() as i64);
-                    a.cmp_rax_r11();
-                    a.je(slow);
-                    a.store_rax(disp(dst));
-                    a.jmp(done);
-                    a.bind(slow);
-                    exec_op!(pc);
-                    a.bind(done);
                 }
                 GenericOp::ArrSet {
                     arr,
@@ -11071,15 +11127,38 @@ impl JitFunction {
                             // `EnumKeys` left in the site (`forin`): `true`
                             // for an own key of the table's layout, with no
                             // call; else (out of line) the helper.
+                            // (In a promoted loop, `forin::region_flags`'
+                            // op: the key index where the loop keeps it,
+                            // and in a speculative loop's fast version
+                            // every other path leaves for the plain copy.)
+                            let in_region = num.in_region(op_idx);
+                            let flagged = in_region && num.sa(op_idx) & numeric::SA_FORIN != 0;
+                            if in_region && !flagged {
+                                return None;
+                            }
+                            let bail = if flagged {
+                                num.spec_bail(&mut a, op_idx)
+                            } else {
+                                None
+                            };
                             let fast = forin_plan
                                 .key_loop(*key)
                                 .filter(|l| {
                                     l.obj == *obj
                                         && ok(l.arr)
                                         && ok(l.index)
-                                        && !num.in_region(op_idx)
+                                        && num.result_xmm(op_idx, *key).is_none()
+                                        && num.result_xmm(op_idx, *obj).is_none()
+                                        && num.result_xmm(op_idx, l.arr).is_none()
                                 })
-                                .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)));
+                                .and_then(|l| {
+                                    let idx = if in_region {
+                                        num.hidden_index(op_idx, l.index)?
+                                    } else {
+                                        forin::Idx::File
+                                    };
+                                    Some((l, forin_plan.site_addr(l.site)?, idx))
+                                });
                             // Its `JumpIfFalse`, fused (`forin_fuse`): the
                             // fast path's `true` falls through it, the slow
                             // paths test their result here.
@@ -11094,9 +11173,31 @@ impl JitFunction {
                             };
                             let test = a.new_label();
                             let after = if fused.is_some() { test } else { done };
-                            let helper = a.new_label();
-                            let cold_helper = if let Some((l, site)) = fast {
+                            let helper = bail.unwrap_or_else(|| a.new_label());
+                            let mut cold_helper = if let Some((l, site, idx)) = fast {
                                 use call_seq::r as R;
+                                // (Straight after the loop's key read in a
+                                // fast version, whose misses all leave: the
+                                // key, array and index it proved need no
+                                // check, `forin::follows_read`.)
+                                let entries: Vec<usize> =
+                                    osr_entries.iter().chain(&catch_targets).copied().collect();
+                                let proven = bail.is_some()
+                                    && forin::follows_read(forin_plan, ops, op_idx, l, &entries)
+                                        .is_some_and(|r| {
+                                            num.same_region(r, op_idx)
+                                                && num.in_spec(r)
+                                                && num.sa(r) & numeric::SA_FORIN != 0
+                                        });
+                                macro_rules! fi_slot {
+                                    () => {{
+                                        if proven {
+                                            a.fi_slot_proven(&layout, site, l, idx, disp, helper);
+                                        } else {
+                                            a.fi_slot(&layout, site, l, *key, idx, disp, helper);
+                                        }
+                                    }};
+                                }
                                 // The receiver: the memo's (`forin::Memo`),
                                 // else walked and recorded there.
                                 let m = fi_memo(l.site);
@@ -11108,7 +11209,7 @@ impl JitFunction {
                                 a.g_jcc(call_seq::cc::NE, walk);
                                 a.g_load(R::RCX, R::RBP, m.cell);
                                 a.bind(walked);
-                                a.fi_slot(&layout, site, l, *key, disp, helper);
+                                fi_slot!();
                                 a.p_cmp32_imm(R::RAX, crate::realm::NO_SLOT as u32 as i32);
                                 a.g_jcc(call_seq::cc::E, helper);
                                 // The key's slot, for the body's `o[k]`.
@@ -11134,7 +11235,7 @@ impl JitFunction {
                                 a.store_empty(m.key);
                                 a.jmp(walked);
                                 a.bind(no_memo);
-                                a.fi_slot(&layout, site, l, *key, disp, helper);
+                                fi_slot!();
                                 a.p_cmp32_imm(R::RAX, crate::realm::NO_SLOT as u32 as i32);
                                 a.g_jcc(call_seq::cc::E, helper);
                                 a.jmp(found);
@@ -11142,37 +11243,47 @@ impl JitFunction {
                             } else {
                                 None
                             };
-                            a.bind(helper);
-                            a.mov_rdi_r15();
-                            a.load_argreg(1, disp(*key));
-                            a.load_argreg(2, disp(*obj));
-                            a.movabs_rax(has_prop_helper as i64);
-                            a.call_rax();
-                            a.movabs_r11(NanBox::undefined().to_bits() as i64);
-                            a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
-                            a.g_jcc(call_seq::cc::E, slow);
-                            a.store_rax(disp(*dst));
-                            let cold = match cold_helper {
-                                Some(c) => {
-                                    a.jmp(after);
-                                    c
+                            if let Some(b) = bail {
+                                // (Every miss went to the leave.)
+                                match cold_helper.take() {
+                                    Some(c) => a.cold_end(c),
+                                    None => a.jmp(b),
                                 }
-                                None => a.cold_begin(),
-                            };
-                            a.bind(slow);
-                            exec_op!(pc);
-                            a.jmp(after);
-                            if let Some(to) = fused {
-                                // (A boolean: the op's result.)
-                                a.bind(test);
-                                a.load_rax(disp(*dst));
-                                a.movabs_r11(NanBox::boolean(false).to_bits() as i64);
-                                a.cmp_rax_r11();
-                                a.je(to);
-                                a.jmp(done);
+                                a.bind(done);
                             }
-                            a.cold_end(cold);
-                            a.bind(done);
+                            if bail.is_none() {
+                                a.bind(helper);
+                                a.mov_rdi_r15();
+                                a.load_argreg(1, disp(*key));
+                                a.load_argreg(2, disp(*obj));
+                                a.movabs_rax(has_prop_helper as i64);
+                                a.call_rax();
+                                a.movabs_r11(NanBox::undefined().to_bits() as i64);
+                                a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
+                                a.g_jcc(call_seq::cc::E, slow);
+                                a.store_rax(disp(*dst));
+                                let cold = match cold_helper {
+                                    Some(c) => {
+                                        a.jmp(after);
+                                        c
+                                    }
+                                    None => a.cold_begin(),
+                                };
+                                a.bind(slow);
+                                exec_op!(pc);
+                                a.jmp(after);
+                                if let Some(to) = fused {
+                                    // (A boolean: the op's result.)
+                                    a.bind(test);
+                                    a.load_rax(disp(*dst));
+                                    a.movabs_r11(NanBox::boolean(false).to_bits() as i64);
+                                    a.cmp_rax_r11();
+                                    a.je(to);
+                                    a.jmp(done);
+                                }
+                                a.cold_end(cold);
+                                a.bind(done);
+                            }
                         }
                         // `key in obj` for a String key the String-key slot
                         // memo names in `obj`'s layout (`key_probe`):
@@ -12282,17 +12393,29 @@ impl JitFunction {
                     let got = a.new_label();
                     // `o[k]` in a compiled `for-in` over `o` (`forin`): the
                     // slot the loop's key table gives the key, with no call.
-                    if let Some((l, site)) = forin_plan
+                    // (In a promoted loop: the key index where the loop
+                    // keeps it, the other registers in the register file,
+                    // and in a fast version no later site relying on this
+                    // one's receiver-cache fill, which this path skips.)
+                    if let Some((l, site, idx)) = forin_plan
                         .key_loop(index)
                         .filter(|l| {
                             ok(l.obj)
                                 && ok(l.arr)
                                 && ok(l.index)
-                                && bail.is_none()
-                                && !num.in_region(op_idx)
-                                && num.result_xmm(op_idx, dst).is_none()
+                                && (bail.is_none() || !typed::relied_on(&rc, op_idx))
+                                && [obj, index, l.obj, l.arr]
+                                    .iter()
+                                    .all(|&r| num.result_xmm(op_idx, r).is_none())
                         })
-                        .and_then(|l| Some((l, forin_plan.site_addr(l.site)?)))
+                        .and_then(|l| {
+                            let idx = if num.in_region(op_idx) {
+                                num.hidden_index(op_idx, l.index)?
+                            } else {
+                                forin::Idx::File
+                            };
+                            Some((l, forin_plan.site_addr(l.site)?, idx))
+                        })
                     {
                         use call_seq::r as R;
                         let other = a.new_label();
@@ -12314,8 +12437,13 @@ impl JitFunction {
                         a.bind(slot);
                         a.p_obj_slot_load_inline(&layout, other, spill);
                         a.bind(have);
-                        a.store_rax(disp(dst));
-                        a.jmp(done);
+                        // (A promoted result: `got`'s code puts it there.)
+                        if num.result_xmm(op_idx, dst).is_some() {
+                            a.jmp(got);
+                        } else {
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                        }
                         let cold = a.cold_begin();
                         a.bind(spill);
                         a.p_obj_slot_load_spill(&layout, have);
@@ -12327,10 +12455,15 @@ impl JitFunction {
                         a.g_jcc(call_seq::cc::NE, other);
                         let cl = &helpers.call_layout;
                         a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
-                        a.fi_slot(&layout, site, l, index, disp, other);
+                        a.fi_slot(&layout, site, l, index, idx, disp, other);
                         a.jmp(slot);
                         a.cold_end(cold);
                         a.bind(other);
+                    }
+                    // (Code planned to keep `rsi`/`rdi` (`fi_keeps`): no
+                    // other path, the plain copy's.)
+                    if num.keeps_si_di(op_idx) {
+                        a.jmp(helper);
                     }
                     if bail.is_none()
                         && !num.is_number_at(op_idx, index)

@@ -129,6 +129,11 @@ impl IntPlan {
         self.ints.binary_search(&r).is_ok()
     }
 
+    /// Its int registers (`KATAAN_JIT_SPECALLOC=log`).
+    pub(super) fn regs(&self) -> Vec<u16> {
+        self.ints.clone()
+    }
+
     /// Where the integer version's in-region branches to the header land.
     pub(super) fn inner(&self) -> Option<Label> {
         self.inner
@@ -1924,6 +1929,33 @@ impl NumGen {
         }
     }
 
+    /// Where register `r` is for the generic emitter's code of region op
+    /// `pc` (a compiled `for-in`'s key index, which its key read, its
+    /// liveness check and its body's `o[k]` read: `super::super::forin`):
+    /// in the integer version an int register's value is in its save slot
+    /// (`int_save`, made before that code); else a promoted register is in
+    /// its SSE register, any other in the register file. (Code that keeps
+    /// `rsi` and `rdi`, `keeps_si_di`, saves nothing: then the GPR itself.)
+    /// `None`: an int register held as a constant, which the code does not
+    /// read.
+    pub(crate) fn hidden_index(&self, pc: usize, r: u16) -> Option<super::super::forin::Idx> {
+        use super::super::forin::Idx;
+        if self.is_int(r) {
+            let IK::Gpr(g) = self.ik(r)? else {
+                return None;
+            };
+            if !self.int_saved {
+                return (g == RSI || g == RDI).then_some(Idx::Gpr(g));
+            }
+            let i = GPRS.iter().position(|&q| q == g)?;
+            return Some(Idx::Saved(self.int_save_disp(i)));
+        }
+        Some(match self.result_xmm(pc, r) {
+            Some(x) => Idx::Xmm(x),
+            None => Idx::File,
+        })
+    }
+
     /// After the generic emitter's code for an op (any op): in a speculative
     /// region's integer version, the int registers it saved come back.
     pub(crate) fn after_generic_op(&mut self, a: &mut X64Assembler) {
@@ -2250,7 +2282,12 @@ impl NumGen {
         }
         // (An inlined call's guard reads only its callee, pinned; it stores
         // its int arguments into the register file itself: `guard_args`.)
-        if !matches!(ops[pc], GenericOp::InlineGuard { .. }) {
+        // (Nor does a compiled `for-in`'s key read or liveness check, whose
+        // fast path reads the key index where this version keeps it,
+        // `hidden_index`, and whose every other path leaves.)
+        let forin_leaves =
+            self.sa(pc) & super::SA_FORIN != 0 && self.in_spec(pc) && self.copy_label(pc).is_some();
+        if !matches!(ops[pc], GenericOp::InlineGuard { .. }) && !forin_leaves {
             self.ishadow_uses(a, pc)?;
         }
         if self.emit_dbl(a, labels, throw_exit, pc, ops, reg)? {
@@ -2275,7 +2312,12 @@ impl NumGen {
             GenericOp::InlineGuard { .. } => self.int_saved = true,
             // (A property op that keeps `rsi` and `rdi` when only they are
             // live: nothing to save, and its leaves find them in place.)
-            GenericOp::GetProp { .. } | GenericOp::SetProp { .. }
+            // (Likewise a compiled `for-in`'s ops, `forin`.)
+            GenericOp::GetProp { .. }
+            | GenericOp::SetProp { .. }
+            | GenericOp::ArrGet { .. }
+            | GenericOp::GetElem { .. }
+            | GenericOp::Interp { .. }
                 if self.keeps_si_di(pc)
                     && self
                         .live_int_gprs(pc)

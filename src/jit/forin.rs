@@ -204,6 +204,98 @@ pub(super) fn plan(ops: &[GenericOp], bytecode: &[Op], n_regs: usize) -> Plan {
     }
 }
 
+/// `sa` (`numeric::NumEnv::alloc_inline`) with [`super::numeric::SA_FORIN`]
+/// set on the ops of the plan's loops that a promoted loop region may
+/// contain: a loop's element read of its key array (`cur = arr[i]`) and its
+/// liveness check (`cur in obj`). Each is emitted inline in a region (its
+/// key index read from wherever the region keeps it: [`Idx`]), and every
+/// path but its inline one leaves a speculative version for the plain copy
+/// (`compile_generic`).
+pub(super) fn region_flags(
+    plan: &Plan,
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    n_regs: usize,
+    mut sa: Vec<u8>,
+) -> Vec<u8> {
+    let n = ops.len().min(bytecode.len());
+    let ok = |r: u16| (r as usize) < n_regs;
+    for pc in 0..n {
+        let flag = match (&ops[pc], &bytecode[pc]) {
+            (&GenericOp::ArrGet { arr, index, .. }, _) => plan
+                .read_at
+                .get(pc)
+                .copied()
+                .flatten()
+                .is_some_and(|l| l.arr == arr && l.index == index),
+            (
+                &GenericOp::Interp { pc: p },
+                &Op::Relational {
+                    dst,
+                    instanceof: false,
+                    a: key,
+                    b: obj,
+                },
+            ) => {
+                p as usize == pc
+                    && ok(dst)
+                    && ok(key)
+                    && ok(obj)
+                    && plan.key_loop(key).is_some_and(|l| {
+                        l.obj == obj && ok(l.arr) && ok(l.index) && dst != l.index && dst != l.arr
+                    })
+            }
+            _ => false,
+        };
+        if flag {
+            if sa.len() < n {
+                sa.resize(n, 0);
+            }
+            sa[pc] |= super::numeric::SA_FORIN;
+        }
+    }
+    sa
+}
+
+/// For the liveness check at `q` of loop `l`: the pc of the loop's key read
+/// when every way to `q` comes straight from it — only branches between
+/// them (no register written), no branch into that stretch from outside it
+/// and no entry (`entries`: OSR entries, catch entries) inside it. In a
+/// speculative loop's fast version, where the read's every miss leaves,
+/// the check then finds the key register still the table's key `i` of the
+/// table's array, `i` below its length ([`X64Assembler::fi_slot_proven`]).
+pub(super) fn follows_read(
+    plan: &Plan,
+    ops: &[GenericOp],
+    q: usize,
+    l: Loop,
+    entries: &[usize],
+) -> Option<usize> {
+    let r = (0..q)
+        .rev()
+        .find(|&p| plan.read_at.get(p).copied().flatten() == Some(l))?;
+    if !matches!(ops.get(r), Some(GenericOp::ArrGet { .. })) {
+        return None;
+    }
+    let between = r + 1..=q;
+    let quiet = (r + 1..q).all(|p| {
+        matches!(
+            ops[p],
+            GenericOp::Jump { .. } | GenericOp::JumpIfFalse { .. } | GenericOp::Nop
+        )
+    });
+    let inside = |p: usize| (r..q).contains(&p);
+    let from_outside = ops.iter().enumerate().any(|(p, op)| match *op {
+        GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => {
+            between.contains(&target) && !inside(p)
+        }
+        GenericOp::PushHandler { target, .. } => between.contains(&target),
+        GenericOp::InlineGuard { call, .. } => between.contains(&(call as usize)),
+        _ => false,
+    });
+    (quiet && !from_outside && !entries.iter().any(|e| between.contains(e))).then_some(r)
+}
+
 /// A [`KeyTable`] field's offset.
 macro_rules! table_off {
     ($f:ident) => {
@@ -211,13 +303,36 @@ macro_rules! table_off {
     };
 }
 
+/// Where a compiled loop's key index (register `l.index`) is when one of
+/// its ops reads it: the register file, the SSE register a promoted loop
+/// keeps it in, or the frame slot (`rbp`-relative) a speculative loop's
+/// integer version saved the int GPR holding it to before the op (an
+/// int32: see `numeric::int32`, `NumGen::int_save`), or that GPR itself
+/// (`rsi` / `rdi`, when the op's code keeps them and saved nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Idx {
+    File,
+    Xmm(u8),
+    Saved(i32),
+    Gpr(u8),
+}
+
 impl X64Assembler {
-    /// `rax` = the bits of key `i` (register `l.index`) of loop `l`'s key
-    /// table, when `l`'s array is the table's — what the array holds there
-    /// (see the module docs); else to `miss`. Clobbers `r9`, `r11`, `xmm0`.
-    pub(super) fn fi_key(&mut self, site: u64, lp: Loop, disp: impl Fn(u16) -> i32, miss: Label) {
+    /// `rax` = the bits of key `i` (the key index, at `idx`) of loop `l`'s
+    /// key table, when `l`'s array is the table's — what the array holds
+    /// there (see the module docs); else to `miss`. Clobbers `r9`, `r11`,
+    /// `xmm0`.
+    pub(super) fn fi_key(
+        &mut self,
+        site: u64,
+        lp: Loop,
+        idx: Idx,
+        disp: impl Fn(u16) -> i32,
+        miss: Label,
+    ) {
+        self.fi_index_rax(lp, idx, &disp);
         self.fi_table(site, lp, &disp, miss);
-        self.fi_index(lp, &disp, miss);
+        self.fi_bound(miss);
         self.g_load(r::R9, r::R11, table_off!(bits_ptr));
         self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
     }
@@ -233,42 +348,88 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
     }
 
-    /// `rax` = the key index (register `l.index`, a Number: its truncation,
-    /// a NaN's out of range) when it is below the table's (`r11`) length;
-    /// else to `miss`. Clobbers `xmm0`.
-    fn fi_index(&mut self, lp: Loop, disp: &impl Fn(u16) -> i32, miss: Label) {
-        self.g_load(r::RAX, r::RBX, disp(lp.index));
-        super::numeric::NumGen::set_xmm_from_rax(self, 0);
-        self.cvttsd2si_rax_xmm0();
+    /// `rax` = the key index (at `idx`; a Number: its truncation, a NaN's
+    /// out of range; an int32 sign-extended, a negative one out of range).
+    /// Clobbers `xmm0`.
+    fn fi_index_rax(&mut self, lp: Loop, idx: Idx, disp: &impl Fn(u16) -> i32) {
+        match idx {
+            Idx::Xmm(x) => super::numeric::NumGen::trunc_from_xmm(self, x),
+            // movsxd rax, dword [rbp + d]
+            Idx::Saved(d) => {
+                self.raw(&[0x48, 0x63, 0x85]);
+                self.raw(&d.to_le_bytes());
+            }
+            // movsxd rax, r32(g)
+            Idx::Gpr(g) => self.raw(&[0x48 | (g >> 3), 0x63, 0xc0 | (g & 7)]),
+            Idx::File => {
+                self.g_load(r::RAX, r::RBX, disp(lp.index));
+                super::numeric::NumGen::set_xmm_from_rax(self, 0);
+                self.cvttsd2si_rax_xmm0();
+            }
+        }
+    }
+
+    /// To `miss` unless the index in `rax` is below the table's (`r11`)
+    /// length.
+    fn fi_bound(&mut self, miss: Label) {
         self.g_cmp_mem(r::RAX, r::R11, table_off!(len));
         self.g_jcc(cc::AE, miss);
     }
 
     /// `rax` = the slot of the key in register `key` in loop `l`'s key table
-    /// (its index in `l.index`), for the receiver whose heap slot is `rcx`
-    /// (a shaped ordinary object: the caller checked) — when `l`'s array is
-    /// the table's, the receiver has the table's layout and the key is the
-    /// table's `i`-th (see the module docs); else to `miss`. The slot may be
-    /// [`crate::realm::NO_SLOT`]. Clobbers `r9`, `r11`, `xmm0`.
+    /// (its index at `idx`, see [`Self::fi_key`]), for the receiver whose
+    /// heap slot is `rcx` (a shaped ordinary object: the caller checked) —
+    /// when `l`'s array is the table's, the receiver has the table's layout
+    /// and the key is the table's `i`-th (see the module docs); else to
+    /// `miss`. The slot may be [`crate::realm::NO_SLOT`]. Clobbers `r9`,
+    /// `r11`, `xmm0`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn fi_slot(
         &mut self,
         l: &JitLayout,
         site: u64,
         lp: Loop,
         key: u16,
+        idx: Idx,
         disp: impl Fn(u16) -> i32,
         miss: Label,
     ) {
+        // (The index first: an int GPR holding it may be `r9`.)
+        self.fi_index_rax(lp, idx, &disp);
         self.fi_table(site, lp, &disp, miss);
         // The receiver's layout is the table's.
         self.g_load(r::R9, r::RCX, l.off_shape);
         self.g_cmp_mem(r::R9, r::R11, table_off!(shape_word));
         self.g_jcc(cc::NE, miss);
-        self.fi_index(lp, &disp, miss);
+        self.fi_bound(miss);
         // The key is the table's `i`-th.
         self.g_load(r::R9, r::R11, table_off!(bits_ptr));
         self.p_load_index8(r::R9, r::R9, r::RAX, 0);
         self.g_cmp_mem(r::R9, r::RBX, disp(key));
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::R9, r::R11, table_off!(slots_ptr));
+        self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
+    }
+
+    /// [`Self::fi_slot`] where the loop's key read has just proved `l`'s
+    /// array the table's, the index below its length and the key register
+    /// the table's key `i` ([`follows_read`]): the layout check and the
+    /// slot alone. Clobbers `r9`, `r11`, `xmm0`.
+    pub(super) fn fi_slot_proven(
+        &mut self,
+        l: &JitLayout,
+        site: u64,
+        lp: Loop,
+        idx: Idx,
+        disp: impl Fn(u16) -> i32,
+        miss: Label,
+    ) {
+        let site_table = i32::try_from(core::mem::offset_of!(ForInSite, table)).expect("offset");
+        self.fi_index_rax(lp, idx, &disp);
+        self.g_movabs(r::R11, site);
+        self.g_load(r::R11, r::R11, site_table);
+        self.g_load(r::R9, r::RCX, l.off_shape);
+        self.g_cmp_mem(r::R9, r::R11, table_off!(shape_word));
         self.g_jcc(cc::NE, miss);
         self.g_load(r::R9, r::R11, table_off!(slots_ptr));
         self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
