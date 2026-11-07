@@ -2378,6 +2378,12 @@ pub(crate) struct InlineEmit<'a> {
     /// identification, in the caller's cold region): its fused miss stays
     /// where it is (cold regions do not nest).
     pub in_cold: bool,
+    /// For a `new` with no `new_alloc` helper: where the allocation of
+    /// `this` goes when the heap's free list is empty (or marking runs),
+    /// instead of `miss` — a speculative loop's fast version leaves for the
+    /// guard in its plain copy there without counting a guard miss
+    /// (`SPEC_MISSES`: the callee was identified).
+    pub alloc_miss: Option<Label>,
     /// No code reads `dst`: only the guard and its fused test name it,
     /// and every version emits that test as nothing (nothing enters there),
     /// so neither the hit nor the miss stores it.
@@ -3163,7 +3169,7 @@ fn emit_inline_new_this_made(
         if e.new_alloc.is_some() {
             by_helper
         } else {
-            miss
+            e.alloc_miss.unwrap_or(miss)
         },
     );
     // (`rcx`: the fresh object's heap slot.)

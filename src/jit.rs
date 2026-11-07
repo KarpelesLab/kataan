@@ -3207,6 +3207,84 @@ fn drop_dead_stores(
     }
 }
 
+/// Per op of a generic body: an allocation (or a binding cell's write)
+/// whose emission (`compile_generic`) has a fast path that makes no call —
+/// a free-list allocation, header and fields written inline — and whose
+/// every other path becomes, in a speculative loop's fast version, a leave
+/// for the op in the loop's plain copy, taken before the op has changed
+/// anything (`numeric::NumEnv::alloc_inline`). All `false` under
+/// `KATAAN_JIT_SPECALLOC=0`.
+///
+/// Also a constructor's super constructor / "no instance fields" through
+/// its site's identity memo (whose miss leaves likewise), and — as a region
+/// op that is a call ([`numeric::SA_CALL`]) — an inlined `super(…)`'s call
+/// op, its guard's fallback arm.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn spec_alloc_inline(
+    ops: &[GenericOp],
+    bytecode: &[crate::nbvm::Op],
+    n_regs: usize,
+    inline_closures: &[bool],
+    has_site: &dyn Fn(usize) -> bool,
+) -> Vec<u8> {
+    use crate::nbvm::Op;
+    use numeric::{SA_CALL, SA_INLINE};
+    if !numeric::specalloc_enabled() {
+        return Vec::new();
+    }
+    let mut super_call = alloc::vec![false; ops.len()];
+    for op in ops {
+        if let GenericOp::InlineGuard { call, poly: 0, .. } = *op
+            && let Some(c) = super_call.get_mut(call as usize)
+        {
+            *c = matches!(bytecode.get(call as usize), Some(Op::SuperCallArgs { .. }))
+                && has_site(call as usize);
+        }
+    }
+    let flag = |b: bool| if b { SA_INLINE } else { 0 };
+    let ok = |r: u16| (r as usize) < n_regs;
+    let closure_ok = |i: usize| match bytecode.get(i) {
+        Some(Op::MakeClosure { dst, captures, .. }) => {
+            inline_closures.get(i).copied().unwrap_or(false)
+                && ok(*dst)
+                && captures.iter().all(|r| ok(*r))
+                && matches!(ops.get(i), Some(GenericOp::Interp { pc }) if *pc as usize == i)
+        }
+        _ => false,
+    };
+    (0..ops.len())
+        .map(|i| match (&ops[i], bytecode.get(i)) {
+            (GenericOp::CellSet { cell, src, .. }, _) => flag(ok(*cell) && ok(*src)),
+            (GenericOp::Interp { pc }, Some(b)) if *pc as usize == i => match b {
+                Op::NewObject { dst } | Op::NewBox { dst } => flag(ok(*dst)),
+                Op::NewObjectLit { dst, lit } => flag(
+                    ok(*dst)
+                        && lit.srcs.len() <= crate::object::INLINE_SLOTS
+                        && lit.srcs.iter().all(|r| ok(*r)),
+                ),
+                Op::NewArrayFrom { dst, elems } => flag(
+                    ok(*dst)
+                        && elems.len() <= crate::cell::ARRAY_INLINE_CAP
+                        && elems.iter().all(|r| ok(*r)),
+                ),
+                Op::MakeClosure { .. } => flag(closure_ok(i)),
+                // Fused into the inline closure before it (`owed_fused`).
+                Op::InitFnPrototype { f } => flag(
+                    i > 0
+                        && closure_ok(i - 1)
+                        && matches!(bytecode.get(i - 1), Some(Op::MakeClosure { dst, .. }) if dst == f),
+                ),
+                Op::SuperCtor { dst: a, f: b } | Op::InitFields { ctor: b, this: a } => {
+                    flag(ok(*a) && ok(*b) && has_site(i))
+                }
+                Op::SuperCallArgs { .. } if super_call[i] => SA_CALL,
+                _ => 0,
+            },
+            _ => 0,
+        })
+        .collect()
+}
+
 /// Why [`lower_nbvm_generic`] rejects `proto` — a human-readable diagnostic for
 /// the `KATAAN_JIT_LOG` knob (never consulted for a compile decision).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -7577,6 +7655,9 @@ impl JitFunction {
                         _ => None,
                     })
                     .collect(),
+                alloc_inline: spec_alloc_inline(ops, bytecode, n_regs, inline_closures, &|i| {
+                    interp_sites.get(i).copied().flatten().is_some()
+                }),
             },
             osr_entries,
             &catch_targets,
@@ -7612,6 +7693,7 @@ impl JitFunction {
             &gc_plan,
             |pc| num.in_region(pc),
             |pc| num.in_spec(pc),
+            |pc| num.cold_guard(pc),
             |pc| num.global_copy(pc),
             // A truthiness test this emitter makes (not one of a proven
             // Number or boolean, which `numeric` makes), or a promoted
@@ -9331,6 +9413,12 @@ impl JitFunction {
                         }
                         None => None,
                     };
+                    // A `new`'s allocation of `this` for want of a free
+                    // slot leaves uncounted (`numeric::StubKind::SpecBail`).
+                    let alloc_miss = match cold_miss {
+                        Some(_) if new_target.is_some() => num.spec_alloc_bail(&mut a, op_idx),
+                        _ => None,
+                    };
                     // (The arguments a promoted loop keeps in SSE registers,
                     // into the register file for the activation.)
                     if let crate::nbvm::Op::InlineGuard { args: gargs, .. } =
@@ -9434,6 +9522,7 @@ impl JitFunction {
                                 _ => None,
                             },
                             in_cold: run_cold.is_some(),
+                            alloc_miss,
                         },
                     )?;
                     if let Some((slot, cold)) = run_cold {
@@ -10260,7 +10349,12 @@ impl JitFunction {
                     a.g_store(call_seq::r::RCX, layout.props.off_box_val, call_seq::r::RDX);
                     a.jmp(done);
                     a.bind(slow);
-                    exec_op!(pc);
+                    // (A speculative loop's fast version leaves for its copy:
+                    // `spec_alloc_inline`.)
+                    match num.spec_bail(&mut a, op_idx) {
+                        Some(bail) => a.jmp(bail),
+                        None => exec_op!(pc),
+                    }
                     a.bind(done);
                 }
                 GenericOp::Interp { pc } => {
@@ -10467,12 +10561,17 @@ impl JitFunction {
                             let (_, site_ptr) = own_site?;
                             let slow = a.new_label();
                             let done = a.new_label();
-                            a.p_ident_hit(site_ptr, disp(*f), slow);
+                            // (A speculative loop's fast version leaves for
+                            // its copy: `spec_alloc_inline`.)
+                            let bail = num.spec_bail(&mut a, op_idx);
+                            a.p_ident_hit(site_ptr, disp(*f), bail.unwrap_or(slow));
                             a.g_load(call_seq::r::RAX, call_seq::r::R11, call_seq::IDENT_VALUE);
                             a.store_rax(disp(*dst));
                             a.jmp(done);
                             a.bind(slow);
-                            site_slow!(helpers.super_ctor, site_ptr);
+                            if bail.is_none() {
+                                site_slow!(helpers.super_ctor, site_ptr);
+                            }
                             a.bind(done);
                         }
                         crate::nbvm::Op::InitFields { ctor, this }
@@ -10481,10 +10580,13 @@ impl JitFunction {
                             let (_, site_ptr) = own_site?;
                             let slow = a.new_label();
                             let done = a.new_label();
-                            a.p_ident_hit(site_ptr, disp(*ctor), slow);
+                            let bail = num.spec_bail(&mut a, op_idx);
+                            a.p_ident_hit(site_ptr, disp(*ctor), bail.unwrap_or(slow));
                             a.jmp(done);
                             a.bind(slow);
-                            site_slow!(helpers.init_fields, site_ptr);
+                            if bail.is_none() {
+                                site_slow!(helpers.init_fields, site_ptr);
+                            }
                             a.bind(done);
                         }
                         // A step of an array iteration in by-index mode
@@ -10754,12 +10856,18 @@ impl JitFunction {
                                 call_seq::r::R9,
                                 layout.props.default_proto,
                             );
-                            a.p_alloc_object(&layout, realm_off, slow);
+                            // (In a speculative loop's fast version, which
+                            // makes no call, the miss leaves for the plain
+                            // copy: `spec_alloc_inline`.)
+                            let bail = num.spec_alloc_bail(&mut a, op_idx);
+                            a.p_alloc_object(&layout, realm_off, bail.unwrap_or(slow));
                             a.jmp(done);
                             a.bind(slow);
-                            a.mov_rdi_r15();
-                            a.movabs_rax(helpers.new_object as usize as i64);
-                            a.call_rax();
+                            if bail.is_none() {
+                                a.mov_rdi_r15();
+                                a.movabs_rax(helpers.new_object as usize as i64);
+                                a.call_rax();
+                            }
                             a.bind(done);
                             a.store_rax(disp(*dst));
                         }
@@ -10801,6 +10909,20 @@ impl JitFunction {
                                 a.g_cmp_imm(r::R11, -1); // `NO_PROTO`
                                 a.g_jcc(call_seq::cc::E, slow);
                             }
+                            // In a speculative loop's fast version (which
+                            // makes no call) every miss leaves for the plain
+                            // copy before anything is made: the owed list's
+                            // room is checked first (`spec_alloc_inline`).
+                            let bail = num.spec_alloc_bail(&mut a, op_idx);
+                            if let Some(bail) = bail
+                                && owe
+                            {
+                                use call_seq::r;
+                                let p = &layout.props;
+                                a.g_load(r::R11, r::R9, p.owed_len);
+                                a.g_cmp_mem(r::R11, r::R9, p.owed_cap);
+                                a.g_jcc(call_seq::cc::AE, bail);
+                            }
                             let caps: Vec<i32> = captures.iter().map(|r| disp(*r)).collect();
                             a.p_alloc_closure(&layout, cl.realm, *func, &caps, owe, slow);
                             a.store_rax(disp(*dst));
@@ -10820,21 +10942,29 @@ impl JitFunction {
                                 a.g_inc_mem(r::R9, p.owed_len);
                             }
                             let cold = a.cold_begin();
-                            if owe {
-                                // (Already owing: the helper lists it.)
+                            if let Some(bail) = bail {
+                                // (The owed list's room was checked: no push
+                                // takes the helper.)
                                 a.bind(push_slow);
-                                a.mov_rdi_r15();
-                                a.g_mov(call_seq::r::RSI, call_seq::r::RAX);
-                                a.movabs_rax(helpers.owe_fn_proto as usize as i64);
-                                a.call_rax();
+                                a.bind(slow);
+                                a.jmp(bail);
+                            } else {
+                                if owe {
+                                    // (Already owing: the helper lists it.)
+                                    a.bind(push_slow);
+                                    a.mov_rdi_r15();
+                                    a.g_mov(call_seq::r::RSI, call_seq::r::RAX);
+                                    a.movabs_rax(helpers.owe_fn_proto as usize as i64);
+                                    a.call_rax();
+                                    a.jmp(done);
+                                }
+                                a.bind(slow);
+                                exec_op!(pc);
+                                if owe {
+                                    exec_op!(pc + 1);
+                                }
                                 a.jmp(done);
                             }
-                            a.bind(slow);
-                            exec_op!(pc);
-                            if owe {
-                                exec_op!(pc + 1);
-                            }
-                            a.jmp(done);
                             a.cold_end(cold);
                             a.bind(done);
                         }
@@ -11085,13 +11215,18 @@ impl JitFunction {
                         crate::nbvm::Op::NewBox { dst } if ok(*dst) => {
                             let slow = a.new_label();
                             let done = a.new_label();
-                            a.p_alloc_box(&layout, helpers.call_layout.realm, slow);
+                            // (In a speculative loop's fast version the miss
+                            // leaves for the plain copy: `spec_alloc_inline`.)
+                            let bail = num.spec_alloc_bail(&mut a, op_idx);
+                            a.p_alloc_box(&layout, helpers.call_layout.realm, bail.unwrap_or(slow));
                             a.store_rax(disp(*dst));
-                            let cold = a.cold_begin();
-                            a.bind(slow);
-                            exec_op!(pc);
-                            a.jmp(done);
-                            a.cold_end(cold);
+                            if bail.is_none() {
+                                let cold = a.cold_begin();
+                                a.bind(slow);
+                                exec_op!(pc);
+                                a.jmp(done);
+                                a.cold_end(cold);
+                            }
                             a.bind(done);
                         }
                         // An object literal with a constant key set: inline
@@ -11111,19 +11246,24 @@ impl JitFunction {
                                 .iter()
                                 .map(|r| num.is_number_at(op_idx, *r))
                                 .collect();
+                            // (In a speculative loop's fast version the miss
+                            // leaves for the plain copy: `spec_alloc_inline`.)
+                            let bail = num.spec_alloc_bail(&mut a, op_idx);
                             a.p_alloc_object_lit(
                                 &layout,
                                 helpers.call_layout.realm,
                                 core::ptr::from_ref(&lit.cache) as u64,
                                 (&vals, &proven),
-                                slow,
+                                bail.unwrap_or(slow),
                             );
                             a.store_rax(disp(*dst));
-                            let cold = a.cold_begin();
-                            a.bind(slow);
-                            exec_op!(pc);
-                            a.jmp(done);
-                            a.cold_end(cold);
+                            if bail.is_none() {
+                                let cold = a.cold_begin();
+                                a.bind(slow);
+                                exec_op!(pc);
+                                a.jmp(done);
+                                a.cold_end(cold);
+                            }
                             a.bind(done);
                         }
                         // A template's substitution: a string as it is, a
@@ -11171,23 +11311,36 @@ impl JitFunction {
                             };
                             let done = a.new_label();
                             let mut cold = None;
-                            if let Some((dst, elems)) = &small {
+                            // (In a speculative loop's fast version a small
+                            // literal's miss leaves for the plain copy:
+                            // `spec_alloc_inline`.)
+                            let bail = small
+                                .as_ref()
+                                .and_then(|_| num.spec_alloc_bail(&mut a, op_idx));
+                            if let (Some((dst, elems)), Some(bail)) = (&small, bail) {
+                                a.p_alloc_array(&layout, helpers.call_layout.realm, elems, bail);
+                                a.store_rax(disp(*dst));
+                            } else if let Some((dst, elems)) = &small {
                                 let slow = a.new_label();
                                 a.p_alloc_array(&layout, helpers.call_layout.realm, elems, slow);
                                 a.store_rax(disp(*dst));
                                 cold = Some(a.cold_begin());
                                 a.bind(slow);
                             }
-                            a.mov_rdi_r15();
-                            a.mov_rsi_rbx();
-                            a.movabs_argreg(2, n_regs as i64);
-                            a.movabs_argreg(3, op_ptr as i64);
-                            a.movabs_rax(helpers.new_array as usize as i64);
-                            a.call_rax();
-                            throw_check!();
-                            if let Some(cold) = cold {
-                                a.jmp(done);
-                                a.cold_end(cold);
+                            if bail.is_some() {
+                                // (Nothing else in the fast version.)
+                            } else {
+                                a.mov_rdi_r15();
+                                a.mov_rsi_rbx();
+                                a.movabs_argreg(2, n_regs as i64);
+                                a.movabs_argreg(3, op_ptr as i64);
+                                a.movabs_rax(helpers.new_array as usize as i64);
+                                a.call_rax();
+                                throw_check!();
+                                if let Some(cold) = cold {
+                                    a.jmp(done);
+                                    a.cold_end(cold);
+                                }
                             }
                             a.bind(done);
                         }

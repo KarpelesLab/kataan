@@ -949,6 +949,42 @@ mod tests {
     }
 
     #[test]
+    fn young_objects_in_topped_up_slots_are_swept_by_a_minor_collection() {
+        // A table past the top-up floor whose free list runs out between
+        // collections: the allocations take vacant slots appended under the
+        // free list (`Heap::alloc`), which the next minor collection sweeps
+        // as it would pushed ones.
+        let mut heap: Heap<Node> = Heap::new();
+        let root = heap.alloc(Node::new(0));
+        let mut keep: Vec<Handle> = (1..3000).map(|t| heap.alloc(Node::new(t))).collect();
+        for &k in &keep {
+            heap.get_mut(root).unwrap().edges.push(k);
+        }
+        collect(&mut heap, &[root]);
+        let floor = heap.slot_capacity();
+        let young: Vec<Handle> = (0..2000).map(|t| heap.alloc(Node::new(t))).collect();
+        assert!(
+            heap.slot_capacity() >= floor + 2000,
+            "a batch of vacant slots"
+        );
+        for &y in young.iter().step_by(7) {
+            heap.get_mut(root).unwrap().edges.push(y);
+            keep.push(y);
+        }
+        assert_eq!(remembered_violation(&heap, |_, _| {}), None);
+        let stats = collect_minor(&mut heap, &[root]);
+        assert_eq!(stats.swept, 2000 - young.iter().step_by(7).count());
+        assert!(keep.iter().all(|&k| heap.is_live(k)));
+        assert_eq!(heap.len(), keep.len() + 1);
+        assert_eq!(remembered_violation(&heap, |_, _| {}), None);
+        // And the vacant slots left over are handed out next.
+        let cap = heap.slot_capacity();
+        let more: Vec<Handle> = (0..100).map(|t| heap.alloc(Node::new(t))).collect();
+        assert_eq!(heap.slot_capacity(), cap);
+        assert!(more.iter().all(|&m| heap.is_live(m)));
+    }
+
+    #[test]
     fn minor_collection_frees_young_when_no_barrier_recorded() {
         // Without the barrier, an old object's stale view doesn't keep young
         // garbage alive — the remembered set is the sole old-roots source.

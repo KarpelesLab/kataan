@@ -393,6 +393,11 @@ pub(crate) fn jit_heap_alloc_offsets() -> HeapAllocOffsets {
     }
 }
 
+/// The fewest and the most vacant slots [`Heap::alloc`] appends at once
+/// when the free list runs out.
+const FREE_TOP_UP_MIN: usize = 256;
+const FREE_TOP_UP_MAX: usize = 8192;
+
 /// A generational arena of `T`, addressed by [`Handle`].
 pub struct Heap<T> {
     slots: Vec<Slot<T>>,
@@ -630,11 +635,24 @@ impl<T> Heap<T> {
         if self.free_top != self.free.len() || self.young_floor != self.slots.len() {
             return;
         }
+        self.top_up_free(target.saturating_sub(self.free_top));
+    }
+
+    /// With no slot pushed since the last collection (`young_floor` the
+    /// table's length): puts `add` vacant slots, appended to the table, under
+    /// the free list's still-free entries — the next allocations after
+    /// those take them in the order (and with the generation, `0`) pushes
+    /// would have numbered them — and moves `young_floor` past them: they
+    /// are young once handed out through the free list, whose consumed
+    /// entries the next collection visits (as it would have visited them as
+    /// pushed slots).
+    fn top_up_free(&mut self, add: usize) {
+        if self.young_floor != self.slots.len() {
+            return;
+        }
         let start = self.slots.len();
         // (Slot index `u32::MAX` is never handed out, as in `alloc`.)
-        let add = target
-            .saturating_sub(self.free_top)
-            .min((u32::MAX as usize).saturating_sub(start + 1));
+        let add = add.min((u32::MAX as usize).saturating_sub(start + 1));
         if add == 0 {
             return;
         }
@@ -651,13 +669,24 @@ impl<T> Heap<T> {
         // Popped from the top: the last entry is handed out first.
         self.free
             .splice(0..0, (start..start + add).rev().map(|i| i as u32));
-        self.free_top = self.free.len();
+        self.free_top += add;
         self.young_floor = self.slots.len();
     }
 
     pub fn alloc(&mut self, value: T) -> Handle {
         // (Counted in `len` through `allocs_since_gc`.)
         self.allocs_since_gc += 1;
+        // The free list ran out before the next collection (a nursery
+        // larger than the free slots the last one left, or none yet): a
+        // batch of vacant slots for this and the next allocations, so
+        // compiled code's inline allocation, which only takes the free
+        // list (`X64Assembler::p_alloc_object`), finds them.
+        // (Only once a collection has run: until then every allocation
+        // pushes, which the first collection's sweep scans in one run.)
+        if self.free_top == 0 && self.young_floor == self.slots.len() && self.young_floor > 0 {
+            let add = (self.slots.len() / 8).clamp(FREE_TOP_UP_MIN, FREE_TOP_UP_MAX);
+            self.top_up_free(add);
+        }
         if self.free_top > 0 {
             self.free_top -= 1;
             let index = self.free[self.free_top];

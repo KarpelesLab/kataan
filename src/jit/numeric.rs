@@ -741,6 +741,7 @@ impl Region {
 fn guard_diamonds(
     r: &Region,
     ops: &[GenericOp],
+    bytecode: &[Op],
     entries: &[usize],
     catches: &[usize],
 ) -> Vec<(usize, usize, usize)> {
@@ -754,14 +755,24 @@ fn guard_diamonds(
         let dst = match *guard {
             GenericOp::PlainPrims { dst, .. } => dst,
             // An inlined call's (last) guard: its fallback arm is the call
-            // op alone. (Not a `new`'s or a `super(…)`'s, whose guard
-            // allocates.)
-            GenericOp::InlineGuard { dst, call, .. }
-                if call as usize == f
-                    && !matches!(
-                        ops.get(f),
-                        Some(GenericOp::Construct { .. } | GenericOp::Interp { .. })
-                    ) =>
+            // op alone. (Not a `super(…)`'s, whose guard allocates; nor a
+            // `new`'s, unless `KATAAN_JIT_SPECALLOC` lets a fast version
+            // allocate: a monomorphic `new`'s guard either makes `this`
+            // or misses having changed nothing — `call_seq::
+            // emit_inline_new_this` — so its miss may leave for the copy.)
+            GenericOp::InlineGuard {
+                dst, call, poly, ..
+            } if call as usize == f
+                && match ops.get(f) {
+                    Some(GenericOp::Construct { .. }) => poly == 0 && specalloc_enabled(),
+                    // (An inlined `super(…)`'s call op, `SA_CALL`.)
+                    Some(GenericOp::Interp { .. }) => {
+                        poly == 0
+                            && specalloc_enabled()
+                            && matches!(bytecode.get(f), Some(Op::SuperCallArgs { .. }))
+                    }
+                    _ => true,
+                } =>
             {
                 dst
             }
@@ -917,7 +928,24 @@ pub(super) struct NumEnv {
     /// Per pc: for an inlined call's guard, its call's `CallSite` (whose
     /// `spec_misses` count a guard diamond's misses in a fast version).
     pub(super) guard_sites: Vec<Option<u64>>,
+    /// Per pc: an allocating op (`allocating_region_op`) whose generic
+    /// emission has a fast path that makes no call, and whose every other
+    /// path the emitter turns into a leave for the plain copy in a fast
+    /// version (`KATAAN_JIT_SPECALLOC`): it does not keep its loop from
+    /// having a speculative version ([`region_call`]). Empty: none.
+    pub(super) alloc_inline: Vec<u8>,
 }
+
+/// [`NumEnv::alloc_inline`] at `pc`.
+fn sa_at(sa: &[u8], pc: usize) -> u8 {
+    sa.get(pc).copied().unwrap_or(0)
+}
+
+/// [`NumEnv::alloc_inline`]: the op's fast path makes no call.
+pub(super) const SA_INLINE: u8 = 1;
+/// [`NumEnv::alloc_inline`]: the op is a call (an inlined `super(…)`'s
+/// fallback arm), and a region op.
+pub(super) const SA_CALL: u8 = 2;
 
 /// A region truthiness test's receiver-cache way: its key and slot-address
 /// frame slots (`rbp`-relative), whether to compare the key first, and the
@@ -986,8 +1014,12 @@ enum StubKind {
     /// The integer version gives up at bytecode pc `pc` (see [`int32`]).
     Bail { pc: u32, store: bool },
     /// The speculative double version leaves for op `pc` in the plain copy
-    /// (see [`Spec`]).
-    SpecBail { pc: u32 },
+    /// (see [`Spec`]). `alloc`: an inline allocation's miss — when the
+    /// heap's free list is empty (a collection is due, or the nursery
+    /// outgrew the free slots a collection leaves), the leave is not
+    /// counted ([`SPEC_LEAVE_LIMIT`]) and the copy's next back-edge polls,
+    /// so a due collection runs there and refills the free list.
+    SpecBail { pc: u32, alloc: bool },
     /// A speculative region's integer version found the value an op wrote
     /// to int register `dst` not an int32: it leaves for op `pc` (the next
     /// one) in the plain copy, `dst` holding the value (`rax`).
@@ -1188,7 +1220,7 @@ pub(super) const SPEC_LEAVE_LIMIT: u64 = 1024;
 
 /// The ops a region may contain: each is emitted here, with calls only on slow
 /// paths.
-fn region_op_ok(op: &GenericOp, bc: &Op) -> bool {
+fn region_op_ok(op: &GenericOp, bc: &Op, sa: u8) -> bool {
     match op {
         GenericOp::Const { .. }
         | GenericOp::Move { .. }
@@ -1214,9 +1246,9 @@ fn region_op_ok(op: &GenericOp, bc: &Op) -> bool {
                     | Op::LoadGlobal { .. }
                     | Op::StoreGlobal { .. }
                     | Op::RequireObjectCoercible { .. }
-            ) || generic_region_op(op, bc)
+            ) || generic_region_op(op, bc, sa)
         }
-        _ => generic_region_op(op, bc),
+        _ => generic_region_op(op, bc, sa),
     }
 }
 
@@ -1231,7 +1263,7 @@ fn region_op_ok(op: &GenericOp, bc: &Op) -> bool {
 /// and writes object fields, or calls a function, keeps its arithmetic in SSE
 /// registers. (A callee reaches the caller's registers only through the
 /// register file: as the collector's roots, which a relocation may update.)
-fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
+pub(super) fn generic_region_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
     match op {
         GenericOp::GetProp { .. }
         | GenericOp::GetMethod { .. }
@@ -1257,9 +1289,9 @@ fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
                 bc,
                 Op::IterNext { iter, next, .. } if usize::from(*next) == usize::from(*iter) + 1
             ) || matches!(bc, Op::BindThis { .. })
-                || allocating_region_op(op, bc)
+                || allocating_region_op(op, bc, sa)
         }
-        _ => allocating_region_op(op, bc),
+        _ => allocating_region_op(op, bc, sa),
     }
 }
 
@@ -1271,18 +1303,25 @@ fn generic_region_op(op: &GenericOp, bc: &Op) -> bool {
 /// counts in a captured variable, still keeps its arithmetic in SSE
 /// registers. Its every call can run Rust code ([`region_call`]), so such a
 /// loop has no speculative version.
-fn allocating_region_op(op: &GenericOp, bc: &Op) -> bool {
+fn allocating_region_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
     match op {
         GenericOp::CellGet { .. } | GenericOp::CellSet { .. } | GenericOp::Construct { .. } => true,
-        GenericOp::Interp { .. } => matches!(
-            bc,
-            Op::NewObjectLit { .. }
-                | Op::NewObject { .. }
-                | Op::NewArray { .. }
-                | Op::NewArrayFrom { .. }
-                | Op::NewBox { .. }
-                | Op::MakeClosure { .. }
-        ),
+        GenericOp::Interp { .. } => {
+            matches!(
+                bc,
+                Op::NewObjectLit { .. }
+                    | Op::NewObject { .. }
+                    | Op::NewArray { .. }
+                    | Op::NewArrayFrom { .. }
+                    | Op::NewBox { .. }
+                    | Op::MakeClosure { .. }
+            ) || (sa & SA_INLINE != 0
+                && matches!(
+                    bc,
+                    Op::InitFnPrototype { .. } | Op::SuperCtor { .. } | Op::InitFields { .. }
+                ))
+                || sa & SA_CALL != 0
+        }
         _ => false,
     }
 }
@@ -1388,7 +1427,7 @@ fn const_int32_bits<'a>(
 
 /// Whether region op `op` may run arbitrary code (a call that is not an
 /// inline `Math` function): a speculative version needs a call-free body.
-fn region_call(op: &GenericOp, bc: &Op) -> bool {
+fn region_call(op: &GenericOp, bc: &Op, sa: u8) -> bool {
     match op {
         GenericOp::CallMethod { .. } => super::inline_math(bc).is_none(),
         // A `CallWithMethod` of a `Math` function computed inline
@@ -1400,7 +1439,9 @@ fn region_call(op: &GenericOp, bc: &Op) -> bool {
         // A captured binding's read: its fast path is loads, and its slow
         // path leaves a fast version for the plain copy (`spec_bail`).
         GenericOp::CellGet { .. } => false,
-        _ => allocating_region_op(op, bc),
+        // An allocation whose fast path makes no call, every other path of
+        // which leaves a fast version for the plain copy ([`NumEnv::alloc_inline`]).
+        _ => sa & SA_INLINE == 0 && allocating_region_op(op, bc, sa),
     }
 }
 
@@ -1442,14 +1483,22 @@ impl NumGen {
                 *t = true;
             }
         }
-        let mut regions = plan_regions(ops, bytecode, catches, env.n_regs);
+        let mut regions = plan_regions_sa(ops, bytecode, catches, env.n_regs, &env.alloc_inline);
         let mut skip = vec![false; n + 1];
         for r in &mut regions {
-            r.cold = guard_diamonds(r, ops, entries, catches);
+            r.cold = guard_diamonds(r, ops, bytecode, entries, catches);
             r.spec = if env.no_spec.contains(&r.head) {
                 None
             } else {
-                plan_spec(r, ops, bytecode, &types, env.n_regs, &env.fields)
+                plan_spec_sa(
+                    r,
+                    ops,
+                    bytecode,
+                    &types,
+                    env.n_regs,
+                    &env.fields,
+                    &env.alloc_inline,
+                )
             };
             match &r.spec {
                 // The fast version has no guard test and no fallback arm.
@@ -2212,6 +2261,23 @@ impl NumGen {
     /// Whether `pc` lies in a speculative promoted loop region, whichever
     /// version is being emitted: such an op is emitted more than once
     /// ([`Self::schedule`]), and its slow paths leave for another version.
+    /// [`NumEnv::alloc_inline`] at `pc`.
+    pub(super) fn sa(&self, pc: usize) -> u8 {
+        sa_at(&self.env.alloc_inline, pc)
+    }
+
+    /// Whether `pc` is an inlined call's guard whose test is a guard
+    /// diamond's ([`guard_diamonds`]) in a speculative region: in the fast
+    /// version its miss leaves for the plain copy.
+    pub(super) fn cold_guard(&self, pc: usize) -> bool {
+        self.region_of.get(pc).is_some_and(|&r| {
+            r != u32::MAX && {
+                let r = &self.regions[r as usize];
+                r.spec.is_some() && r.cold.iter().any(|c| c.0 == pc + 1)
+            }
+        })
+    }
+
     pub(super) fn in_any_spec(&self, pc: usize) -> bool {
         self.region_of
             .get(pc)
@@ -2820,7 +2886,15 @@ impl NumGen {
 
     /// A leave of speculative region `ri`'s fast version: counted. Clobbers
     /// `r11`.
-    fn count_leave(&self, a: &mut X64Assembler, ri: usize) {
+    /// (`KATAAN_JIT_SPECALLOC=log` also counts it per pc `pc`, reported at
+    /// exit.)
+    fn count_leave_at(&self, a: &mut X64Assembler, ri: usize, pc: usize) {
+        if specalloc_log() && pc < LEAVE_PCS {
+            LEAVE_REPORT.with(|_| {});
+            let at = core::ptr::from_ref(&LEAVES[pc]) as u64;
+            a.g_movabs(super::call_seq::r::R11, at);
+            a.g_inc_mem(super::call_seq::r::R11, 0);
+        }
         if self.counts_leaves(ri) {
             a.g_movabs(super::call_seq::r::R11, self.env.persist);
             a.g_inc_mem(
@@ -2948,6 +3022,16 @@ impl NumGen {
     /// slow paths take instead of their own code. Taken before the op has
     /// done anything, it is the op from scratch.
     pub(super) fn spec_bail(&mut self, a: &mut X64Assembler, pc: usize) -> Option<Label> {
+        self.spec_bail_kind(a, pc, false)
+    }
+
+    /// [`Self::spec_bail`] for an inline allocation's miss (see
+    /// [`StubKind::SpecBail`]'s `alloc`).
+    pub(super) fn spec_alloc_bail(&mut self, a: &mut X64Assembler, pc: usize) -> Option<Label> {
+        self.spec_bail_kind(a, pc, true)
+    }
+
+    fn spec_bail_kind(&mut self, a: &mut X64Assembler, pc: usize, alloc: bool) -> Option<Label> {
         if !self.in_spec(pc) || self.copy_label(pc).is_none() {
             return None;
         }
@@ -2959,6 +3043,7 @@ impl NumGen {
             pc,
             kind: StubKind::SpecBail {
                 pc: self.bail_pc(pc) as u32,
+                alloc,
             },
             branch: None,
             int: self.imode.is_some(),
@@ -3684,7 +3769,7 @@ impl NumGen {
                 self.copy_reg(a, reg, dst, src);
             }
             // The generic emitter's (see `generic_region_op`).
-            _ if reg.is_some() && generic_region_op(&op, bc) => return Some(false),
+            _ if reg.is_some() && generic_region_op(&op, bc, self.sa(pc)) => return Some(false),
             _ => {
                 if reg.is_some() {
                     // The planner admitted an op this emitter does not handle.
@@ -4075,6 +4160,7 @@ impl NumGen {
             {
                 StubKind::SpecBail {
                     pc: self.bail_pc(self.cur_pc) as u32,
+                    alloc: false,
                 }
             }
             k => k,
@@ -5043,14 +5129,35 @@ impl NumGen {
                         self.emit_post_bail(a, ri, pc as usize, dst);
                     }
                 }
-                StubKind::SpecBail { pc } => {
-                    // (A leave of the fast version itself: counted.)
+                StubKind::SpecBail { pc, alloc } => {
+                    // (A leave of the fast version itself: counted — but
+                    // an allocation's for want of a free slot, which
+                    // has the copy's next back-edge poll instead.)
+                    let counted = a.new_label();
+                    if alloc {
+                        use super::call_seq::r;
+                        if specalloc_log() && (pc as usize) < LEAVE_PCS {
+                            let at =
+                                core::ptr::from_ref(&LEAVES[LEAVE_PCS - 1 - pc as usize]) as u64;
+                            a.g_movabs(r::R11, at);
+                            a.g_inc_mem(r::R11, 0);
+                        }
+                        let count = a.new_label();
+                        a.g_load(r::R11, r::R15, self.env.realm);
+                        a.g_load(r::R11, r::R11, self.env.heap.props.free_len);
+                        a.g_test(r::R11);
+                        a.g_jcc(super::call_seq::cc::NE, count);
+                        a.g_store_imm32(r::RBP, i32::from(COUNTDOWN), 1);
+                        a.jmp(counted);
+                        a.bind(count);
+                    }
                     if !s.int
                         && !s.copy
                         && let Some(ri) = s.region
                     {
-                        self.count_leave(a, ri);
+                        self.count_leave_at(a, ri, pc as usize);
                     }
+                    a.bind(counted);
                     self.flush(a, s.region);
                     // Planned with every region pc's copy label.
                     if let Some(l) = self.copy_label(pc as usize) {
@@ -5658,11 +5765,23 @@ pub(super) fn liveness(ops: &[Op], n_regs: usize, catches: &[usize]) -> Option<(
 
 /// Picks the promoted loop regions of `ops` and allocates their SSE registers
 /// (see the module docs).
+#[cfg(test)]
 fn plan_regions(
     ops: &[GenericOp],
     bytecode: &[Op],
     catches: &[usize],
     n_regs: usize,
+) -> Vec<Region> {
+    plan_regions_sa(ops, bytecode, catches, n_regs, &[])
+}
+
+/// [`plan_regions`] with [`NumEnv::alloc_inline`] (`sa`).
+fn plan_regions_sa(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    catches: &[usize],
+    n_regs: usize,
+    sa: &[u8],
 ) -> Vec<Region> {
     let n = ops.len();
     let branch_target = |op: &GenericOp| match *op {
@@ -5683,9 +5802,20 @@ fn plan_regions(
         // Innermost and simple: every op emitted by this module, no other
         // backward branch inside, no catch entry inside.
         let ok = body.clone().all(|pc| {
-            region_op_ok(&ops[pc], &bytecode[pc])
+            region_op_ok(&ops[pc], &bytecode[pc], sa_at(sa, pc))
                 && (pc == end || branch_target(&ops[pc]).is_none_or(|t| t > pc))
         }) && !catches.iter().any(|c| body.contains(c));
+        if !ok && specalloc_log() {
+            for pc in body.clone() {
+                if !region_op_ok(&ops[pc], &bytecode[pc], sa_at(sa, pc)) {
+                    std::eprintln!(
+                        "[specalloc] loop {head}..={end}: op {pc} not a region op: {:?} / {:?}",
+                        ops[pc],
+                        bytecode[pc]
+                    );
+                }
+            }
+        }
         // No branch from outside the region into its body (past the header).
         if ok
             && !ops.iter().enumerate().any(|(pc, o)| {
@@ -5699,7 +5829,7 @@ fn plan_regions(
         return Vec::new();
     }
     // Loop nests around them (each with the inner back-edges it contains).
-    let cands = plan_nests(ops, bytecode, catches, cands);
+    let cands = plan_nests(ops, bytecode, catches, cands, sa);
     let Some((words, live)) = liveness(bytecode, n_regs, catches) else {
         return Vec::new();
     };
@@ -5733,7 +5863,7 @@ fn plan_regions(
             }
             // A generic op's fast path may leave its result in the SSE
             // register only (`NumGen::result_xmm`).
-            if generic_region_op(&ops[pc], &bytecode[pc]) {
+            if generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc)) {
                 let (mut d, mut u) = (Vec::new(), Vec::new());
                 def_use(&bytecode[pc], &mut d, &mut u);
                 for r in d {
@@ -5761,7 +5891,8 @@ fn plan_regions(
         }
         // The registers the generic emitter's ops read stay in the register
         // file (see `generic_region_op`).
-        let generic0 = (head..=end).any(|pc| generic_region_op(&ops[pc], &bytecode[pc]));
+        let generic0 =
+            (head..=end).any(|pc| generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc)));
         // A loop whose only generic ops are element and `.length` reads may
         // have an integer version (`int32::elems`), which shadows the slots
         // (so no SSE register is handed on); when it has none, its double
@@ -5771,7 +5902,7 @@ fn plan_regions(
             && (head..=end).all(|pc| match (&ops[pc], &bytecode[pc]) {
                 (GenericOp::GetElem { .. }, Op::GetKey { obj, key, .. }) => obj != key,
                 (GenericOp::ArrayLen { .. }, _) => true,
-                (op, bc) => !generic_region_op(op, bc),
+                (op, bc) => !generic_region_op(op, bc, sa_at(sa, pc)),
             });
         // A loop whose generic ops outside its guard diamonds' fallback
         // arms are all ones the integer version of a speculative region
@@ -5785,15 +5916,24 @@ fn plan_regions(
                 || (head..=end).any(|pc| int_math_op(&bytecode[pc]).is_some()))
             && (head..=end).all(|pc| {
                 in_arm(pc)
-                    || !generic_region_op(&ops[pc], &bytecode[pc])
+                    || !generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))
                     || spec_int_op(&ops[pc], &bytecode[pc])
+            })
+            // (Nor a loop with an inlined `new` or `super(…)`: its fresh
+            // adds take their values from the register file, which an
+            // integer version would store each one to first, as a double,
+            // and they make their adds one by one there.)
+            && !(head..=end).any(|pc| {
+                matches!(ops[pc], GenericOp::InlineGuard { call, .. }
+                    if matches!(ops.get(call as usize), Some(GenericOp::Construct { .. }))
+                        || sa_at(sa, call as usize) & SA_CALL != 0)
             });
         let mut generic = false;
         let mut pinned: Vec<u16> = Vec::new();
         {
             let (mut d, mut u) = (Vec::new(), Vec::new());
             for pc in head..=end {
-                if generic_region_op(&ops[pc], &bytecode[pc]) {
+                if generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc)) {
                     generic = true;
                     def_use(&bytecode[pc], &mut d, &mut u);
                     // An element read's index may stay promoted: the
@@ -5940,7 +6080,8 @@ fn plan_regions(
         // version goes with no speculative one, `plan_spec`). A call in a
         // guard diamond's fallback arm only ever runs in the plain copy.
         let gcarry = if generic
-            && !(head..=end).any(|pc| !in_arm(pc) && region_call(&ops[pc], &bytecode[pc]))
+            && !(head..=end)
+                .any(|pc| !in_arm(pc) && region_call(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
         {
             let target = |q: usize| {
                 ops.iter()
@@ -6364,6 +6505,45 @@ fn plan_run_proofs(
         });
     }
     out
+}
+
+/// Whether a loop that allocates may have a speculative version
+/// ([`NumEnv::alloc_inline`]): unless `KATAAN_JIT_SPECALLOC=0`. Read once per
+/// process.
+pub(super) fn specalloc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SPECALLOC").is_none_or(|v| v != "0"))
+}
+
+/// Whether `KATAAN_JIT_SPECALLOC=log`: report why loops get no region or no
+/// speculative version.
+pub(super) fn specalloc_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SPECALLOC").is_some_and(|v| v == "log"))
+}
+
+/// `KATAAN_JIT_SPECALLOC=log`: the fast versions' leaves per bytecode pc.
+const LEAVE_PCS: usize = 4096;
+static LEAVES: [core::sync::atomic::AtomicU64; LEAVE_PCS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; LEAVE_PCS];
+
+/// Reports [`LEAVES`] when the thread that compiled the bodies ends.
+struct LeaveReport;
+impl Drop for LeaveReport {
+    fn drop(&mut self) {
+        for (pc, n) in LEAVES.iter().enumerate() {
+            let n = n.load(core::sync::atomic::Ordering::Relaxed);
+            if n != 0 {
+                std::eprintln!(
+                    "[specalloc] leaves for pc {pc} (or alloc misses at {}): {n}",
+                    LEAVE_PCS - 1 - pc
+                );
+            }
+        }
+    }
+}
+std::thread_local! {
+    static LEAVE_REPORT: LeaveReport = const { LeaveReport };
 }
 
 /// Whether run-proved property sites ([`plan_site_proofs`]) are planned:
@@ -7296,6 +7476,7 @@ fn plan_nests(
     bytecode: &[Op],
     catches: &[usize],
     cands: Vec<(usize, usize)>,
+    sa: &[u8],
 ) -> Vec<(usize, usize, Vec<(usize, usize)>)> {
     // The back-edges of the body, innermost first.
     let mut backs: Vec<(usize, usize)> = ops
@@ -7325,15 +7506,17 @@ fn plan_nests(
         })
         .collect();
     let generic_loop = |h: usize, e: usize| {
-        (h..=e).any(|pc| generic_region_op(&ops[pc], &bytecode[pc]))
-            && !(h..=e).any(|pc| region_call(&ops[pc], &bytecode[pc]))
+        (h..=e).any(|pc| generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
+            && !(h..=e).any(|pc| region_call(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
     };
     // Per back-edge (as in `backs`): the inner back-edges of the nest it heads.
     let mut nest: Vec<Option<Vec<(usize, usize)>>> = vec![None; backs.len()];
     for i in 0..backs.len() {
         let (head, end) = backs[i];
         let body = head..=end;
-        if !body.clone().all(|pc| region_op_ok(&ops[pc], &bytecode[pc]))
+        if !body
+            .clone()
+            .all(|pc| region_op_ok(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
             || catches.iter().any(|c| body.contains(c))
             || branches
                 .iter()
@@ -7697,6 +7880,7 @@ fn spec_step(
 /// A loop-carried register an arithmetic op reads is assumed (and checked at
 /// entry) to be a Number when the static types do not prove it, unless the
 /// loop itself may leave a non-Number in it.
+#[cfg(test)]
 fn plan_spec(
     r: &Region,
     ops: &[GenericOp],
@@ -7704,6 +7888,19 @@ fn plan_spec(
     types: &Types,
     n_regs: usize,
     fields: &[Option<(u64, u32)>],
+) -> Option<Spec> {
+    plan_spec_sa(r, ops, bytecode, types, n_regs, fields, &[])
+}
+
+/// [`plan_spec`] with [`NumEnv::alloc_inline`] (`sa`).
+fn plan_spec_sa(
+    r: &Region,
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    types: &Types,
+    n_regs: usize,
+    fields: &[Option<(u64, u32)>],
+    sa: &[u8],
 ) -> Option<Spec> {
     let (head, end) = (r.head, r.end);
     if !r.generic || (r.int.is_some() && !r.spec_int) || end >= ops.len() || end >= bytecode.len() {
@@ -7721,7 +7918,13 @@ fn plan_spec(
         if r.is_cold(pc) {
             continue;
         }
-        if region_call(op, &bytecode[pc]) {
+        if region_call(op, &bytecode[pc], sa_at(sa, pc)) {
+            if specalloc_log() {
+                std::eprintln!(
+                    "[specalloc] region {head}..={end}: no spec, op {pc} calls: {op:?} / {:?}",
+                    bytecode[pc]
+                );
+            }
             return None;
         }
         let t = match *op {
@@ -8827,7 +9030,7 @@ mod tests {
         let mut regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
         assert_eq!(regions.len(), 1);
         let r = &mut regions[0];
-        r.cold = guard_diamonds(r, &ops, &[], &[]);
+        r.cold = guard_diamonds(r, &ops, &p.ops, &[], &[]);
         assert_eq!(r.cold.len(), 2, "both guards' diamonds");
         for &(test, fallback, join) in &r.cold {
             assert!(matches!(p.ops[test - 1], Op::InlineGuard { .. }));
@@ -8892,7 +9095,7 @@ mod tests {
             unreachable!()
         };
         assert!(plan.has_int(i));
-        r.cold = guard_diamonds(r, &ops, &[], &[]);
+        r.cold = guard_diamonds(r, &ops, &p.ops, &[], &[]);
         let mut cold = r.cold.clone();
         cold.sort_unstable();
         let mut arms = r.arms.clone();
@@ -9038,9 +9241,9 @@ mod tests {
                 .expect("a CallWithMethod")
         };
         let min = with("min");
-        assert!(!region_call(&ops[min], &p.ops[min]));
+        assert!(!region_call(&ops[min], &p.ops[min], 0));
         let g = with("g");
-        assert!(region_call(&ops[g], &p.ops[g]));
+        assert!(region_call(&ops[g], &p.ops[g], 0));
     }
 
     #[test]

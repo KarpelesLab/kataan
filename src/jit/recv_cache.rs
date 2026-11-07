@@ -670,6 +670,7 @@ pub(super) fn plan(
     globals: &GlobalPlan,
     in_region: impl Fn(usize) -> bool,
     in_spec: impl Fn(usize) -> bool,
+    cold_guard: impl Fn(usize) -> bool,
     global_copy: impl Fn(usize) -> Option<u16>,
     truthy_site: impl Fn(usize, u16) -> bool,
     reused: impl Fn(usize) -> Option<u16>,
@@ -677,6 +678,18 @@ pub(super) fn plan(
     catch_targets: &[usize],
 ) -> RecvPlan {
     let n = ops.len();
+    // An inlined `new`'s guard in a speculative loop whose miss leaves its
+    // fast version (`numeric::guard_diamonds`): it fills its way with the
+    // fresh `this` (for a base constructor; a derived one's fills nothing),
+    // which the fresh adds after it compare (`fresh_adds`) — but it is no
+    // later site's certain predecessor.
+    let cold_new = |i: usize| {
+        cold_guard(i)
+            && matches!(ops.get(i), Some(GenericOp::InlineGuard { call, poly: 0, .. })
+                if matches!(ops.get(*call as usize), Some(GenericOp::Construct { .. }))
+                    || (matches!(ops.get(*call as usize), Some(GenericOp::Interp { .. }))
+                        && is_super_call(bytecode, *call as usize)))
+    };
     // An op's receiver (a truthiness test's only where the generic
     // emitter makes it, `truthy_site`).
     let site_recv = |op: &GenericOp, i: usize| match *op {
@@ -684,8 +697,10 @@ pub(super) fn plan(
             truthy_site(i, r).then_some((r, Family::Obj))
         }
         // A read a promoted loop's fast version replaces by a register copy
-        // makes no way access there (`numeric::plan_reuse`).
-        GenericOp::GetProp { .. } if reused(i).is_some() => None,
+        // makes no way access there (`numeric::plan_reuse`): a property's,
+        // or a captured binding's (no later cell site may take its way as
+        // filled).
+        GenericOp::GetProp { .. } | GenericOp::CellGet { .. } if reused(i).is_some() => None,
         // A method read through the call site's memo (`GetMethodWay`).
         GenericOp::GetMethod { obj, .. } if !in_spec(i) => Some((obj, Family::Obj)),
         // An inlined method call's guard looks the method up on its
@@ -701,7 +716,7 @@ pub(super) fn plan(
             n_caps,
             poly,
             ..
-        } if !in_spec(i) && poly & 0xff == 0 => match ops.get(call as usize)? {
+        } if (!in_spec(i) || cold_new(i)) && poly & 0xff == 0 => match ops.get(call as usize)? {
             GenericOp::CallMethod { recv: r, .. }
             | GenericOp::GetProp { obj: r, .. }
             | GenericOp::SetProp { obj: r, .. } => Some((*r, Family::Obj)),
@@ -883,7 +898,12 @@ pub(super) fn plan(
             // A truthiness test fills its way only when the value is an
             // object (of the way's layout, if it has one): it is never a
             // later site's certain predecessor, nor a certain one itself.
-            let truthy = matches!(op, GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. });
+            // (Nor is an inlined `new`'s guard, see `cold_new`, nor a
+            // captured binding's site: its walk fills the way only for a
+            // binding cell, not for a captured parameter's array.)
+            let truthy = matches!(op, GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. })
+                || (in_spec(i) && cold_new(i))
+                || fam == Family::Cell;
             if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
                 check[i] = true;

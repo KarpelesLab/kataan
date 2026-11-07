@@ -2256,7 +2256,7 @@ impl NumGen {
         if self.emit_dbl(a, labels, throw_exit, pc, ops, reg)? {
             return Some(true);
         }
-        if !super::generic_region_op(&ops[pc], self.bc(pc)?) {
+        if !super::generic_region_op(&ops[pc], self.bc(pc)?, self.sa(pc)) {
             return None;
         }
         // An element or `.length` read into an int register: the generic
