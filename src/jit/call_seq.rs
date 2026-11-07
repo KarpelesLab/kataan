@@ -2596,6 +2596,9 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     if !keep_full {
         save(a);
     }
+    // (The full guard out of line, when no other region is: the proved
+    // callee then falls through to the body.)
+    let mut full_cold = None;
     if let (Some((bits, caps)), &CalleeSrc::Reg(c)) = (proved, &e.callee) {
         let full = a.new_label();
         a.g_load(r::RAX, r::RBX, reg(c));
@@ -2605,7 +2608,11 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         if !keep_full {
             a.g_load(r::R8, RBP, caps);
         }
-        a.jmp(proven);
+        if a.cold_binds.is_none() && e.poly_entry.is_none() {
+            full_cold = Some(a.cold_begin());
+        } else {
+            a.jmp(proven);
+        }
         a.bind(full);
         if keep_full {
             save(a);
@@ -2848,6 +2855,10 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.g_store(RBP, caps, r::R8);
         if keep_full {
             reload(a);
+        }
+        if let Some(cold) = full_cold {
+            a.jmp(proven);
+            a.cold_end(cold);
         }
         a.bind(proven);
     }
