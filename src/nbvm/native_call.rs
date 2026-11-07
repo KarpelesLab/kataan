@@ -1252,6 +1252,14 @@ fn run_op(
             crate::nbexec::dataview_fast(realm, recv, acc, arg(0), [arg(1), arg(2)])?
         }
         FastOp::StrFromCharCode => {
+            // One code unit given as itself (ToUint16 of `0 <= n < 2^16` is
+            // its truncation): the realm's interned one-unit string.
+            if let [r] = *args
+                && let Some(n) = regs[r as usize].as_number()
+                && (0.0..65536.0).contains(&n)
+            {
+                return Some(Ok(NanBox::handle(realm.unit_string(n as u16).to_raw())));
+            }
             // ToNumber of a Number runs no code; ToUint16 as the host does.
             let mut units = alloc::vec::Vec::with_capacity(args.len());
             for r in args {
@@ -1611,6 +1619,11 @@ fn run_op(
         }
         FastOp::ObjKeys | FastOp::ObjEntries | FastOp::ObjValues => {
             let o = arg(0).as_handle().map(Handle::from_raw)?;
+            if matches!(op, FastOp::ObjKeys)
+                && let Some(keys) = realm.plain_array_index_keys(o)
+            {
+                return Some(Ok(NanBox::handle(realm.new_array(keys).to_raw())));
+            }
             let strs = realm.plain_enumerable_key_strings(o)?;
             if matches!(op, FastOp::ObjKeys) {
                 return Some(Ok(NanBox::handle(realm.new_array(strs.to_vec()).to_raw())));

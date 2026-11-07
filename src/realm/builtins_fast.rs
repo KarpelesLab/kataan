@@ -683,6 +683,34 @@ impl Realm {
         false
     }
 
+    /// `Object.keys(a)` of an array that never had side-table state (so no
+    /// named property, no index accessor, no non-writable `length`) whose
+    /// length is its dense length: the indices of its present elements, in
+    /// ascending order (a hole is no own property), as fresh index Strings.
+    /// `None` for anything else.
+    pub(crate) fn plain_array_index_keys(&mut self, h: Handle) -> Option<alloc::vec::Vec<NanBox>> {
+        if self.is_host_exotic(h) {
+            return None;
+        }
+        let present: alloc::vec::Vec<usize> = match self.heap.get(h)? {
+            Cell::Array(a) if !a.has_side_state() => {
+                (0..a.len()).filter(|&i| !a[i].is_hole()).collect()
+            }
+            _ => return None,
+        };
+        if self.array_length(h) != self.array_elements(h).map(<[NanBox]>::len) {
+            return None;
+        }
+        Some(
+            present
+                .into_iter()
+                .map(|i| {
+                    NanBox::handle(self.new_primitive_string(NanBox::number(i as f64)).to_raw())
+                })
+                .collect(),
+        )
+    }
+
     /// [`has_own`](Self::has_own) for an ordinary object that is no
     /// primitive wrapper (whose own properties are exactly its data keys and
     /// accessors); `None` for any other cell.
