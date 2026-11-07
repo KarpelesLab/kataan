@@ -9149,7 +9149,11 @@ impl JitFunction {
             // A global binding read or write through the global binding
             // cache: the cached address, else (out of line) a fresh one from
             // `jit_helper_global_ref`, else the interpreter.
-            if let Some(k) = gc_plan.site.get(op_idx).copied().flatten() {
+            // (A promoted loop's own pass keeps its own addresses: only its
+            // plain copy, outside `in_region`, takes the cache.)
+            if let Some(k) = gc_plan.site.get(op_idx).copied().flatten()
+                && !num.in_region(op_idx)
+            {
                 let slot = gc_slot(k);
                 let fetch = a.new_label();
                 let back = a.new_label();

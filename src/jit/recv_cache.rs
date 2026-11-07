@@ -113,10 +113,12 @@ pub(super) struct GlobalPlan {
     pub(super) site: Vec<Option<usize>>,
 }
 
-/// Plans the global binding cache: the body's global reads and writes outside
-/// promoted loops (`in_region`, which keep their own), grouped by `(name,
-/// read | write)`; the (up to [`MAX_GLOBAL_SLOTS`]) most frequent pairs get a
-/// slot each. A slot keeps the address an access validated across calls and
+/// Plans the global binding cache: the body's global reads and writes,
+/// grouped by `(name, read | write)`; the (up to [`MAX_GLOBAL_SLOTS`]) most
+/// frequent pairs get a slot each, those outside promoted loops (`in_region`)
+/// first. A promoted loop's own accesses keep their own addresses
+/// (`numeric`), but the loop's plain copy (`NumGen::set_copy`) runs them as
+/// any other op of the body: through the cache, or a helper call each. A slot keeps the address an access validated across calls and
 /// loop iterations, for as long as the global binding epoch it was validated
 /// under is current (see `compile_generic`), so every access of a pair after
 /// the first in an activation reuses it. A write's validated address would
@@ -130,7 +132,7 @@ pub(super) fn plan_globals(
     let n = ops.len();
     let mut key = vec![None; n];
     for (pc, op) in ops.iter().enumerate() {
-        if matches!(op, GenericOp::Interp { .. }) && !in_region(pc) {
+        if matches!(op, GenericOp::Interp { .. }) {
             key[pc] = match bytecode.get(pc) {
                 Some(Op::LoadGlobal { name, .. }) => Some((name.as_str(), false)),
                 Some(Op::StoreGlobal { name, .. }) => Some((name.as_str(), true)),
@@ -138,11 +140,18 @@ pub(super) fn plan_globals(
             };
         }
     }
-    let mut groups: Vec<((&str, bool), usize)> = Vec::new();
-    for &k in key.iter().flatten() {
+    // Per pair: its accesses outside promoted loops, and all of them.
+    type Counts = (usize, usize);
+    let mut groups: Vec<((&str, bool), Counts)> = Vec::new();
+    for (pc, k) in key.iter().enumerate() {
+        let Some(k) = *k else { continue };
+        let outside = usize::from(!in_region(pc));
         match groups.iter_mut().find(|g| g.0 == k) {
-            Some(g) => g.1 += 1,
-            None => groups.push((k, 1)),
+            Some(g) => {
+                g.1.0 += outside;
+                g.1.1 += 1;
+            }
+            None => groups.push((k, (outside, 1))),
         }
     }
     groups.sort_by_key(|x| core::cmp::Reverse(x.1));

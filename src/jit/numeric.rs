@@ -5224,6 +5224,20 @@ impl NumGen {
                     {
                         self.count_leave_at(a, ri, pc as usize);
                     }
+                    // A leave of the integer version from a generic op's
+                    // slow path is one of its bails (`spec_int_bail`):
+                    // counted too, so a loop whose integer version keeps
+                    // leaving there (a String key's element read) stops
+                    // entering it.
+                    if s.int
+                        && !s.copy
+                        && let Some(ri) = s.region
+                        && self.regions[ri].spec_int
+                    {
+                        let r11 = super::call_seq::r::R11;
+                        a.g_movabs(r11, self.env.persist);
+                        a.g_inc_mem(r11, super::global_persist::counter_off(ri));
+                    }
                     a.bind(counted);
                     self.flush(a, s.region);
                     // Planned with every region pc's copy label.
