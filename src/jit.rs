@@ -13208,6 +13208,55 @@ impl JitFunction {
                             }
                         };
                     }
+                    // A String key naming an existing own data property in
+                    // the String-key slot memo (`key_probe`): the slot's
+                    // store in place, exactly the helper's first answer
+                    // (`Realm::own_data_set_by_string`) — an ordinary
+                    // shaped object without accessors, the exotic flag or
+                    // any flag that keeps stores out of line, the write
+                    // barrier with nothing to do and the layout's record
+                    // of Number-only slots kept (`fieldrep`). Anything
+                    // else is the helper's. (A Number key goes on at once.)
+                    if bail.is_none()
+                        && !num.is_number_at(op_idx, index)
+                        && index_x.is_none()
+                        && val_x.is_none()
+                        && num.result_xmm(op_idx, obj).is_none()
+                        && num.hoisted_array(op_idx, obj).is_none()
+                        && num.hoisted_view(op_idx, obj).is_none()
+                        && (op_idx == 0 || !num.sunk_load(op_idx - 1))
+                    {
+                        use call_seq::r as R;
+                        let string_key = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.load_rax(disp(index));
+                        a.p_cmp_handle_floor(R::RAX);
+                        a.g_jcc(call_seq::cc::AE, string_key);
+                        let cold = a.cold_begin();
+                        a.bind(string_key);
+                        walk_to_slot!(obj, helper);
+                        a.p_object_not_exotic(&layout, helper);
+                        a.p_test_byte_imm(
+                            R::RCX,
+                            layout.props.off_jit_flags,
+                            props::FLAGS_NO_INLINE_STORE,
+                        );
+                        a.jne(helper);
+                        a.fi_plain_read(&layout, (cl.realm, cl.str_special), helper);
+                        a.load_rax(disp(val));
+                        a.p_barrier_check(&layout, cl.realm, helper);
+                        a.p_arena(cl.realm, &layout.props);
+                        a.kp_slot(&layout, &key_probe, cl.realm, disp(index), helper);
+                        // rax = the slot; the value's representation, then
+                        // its store.
+                        a.g_load(R::R8, R::RBX, disp(val));
+                        a.g_load(R::R9, R::RCX, layout.off_shape);
+                        a.p_field_rep_dyn(&layout, (R::R8, R::R9, R::RAX, R::R11), helper);
+                        a.p_obj_slot_addr(&layout, R::R11, helper);
+                        a.g_store(R::R11, 0, R::R8);
+                        a.jmp(done);
+                        a.cold_end(cold);
+                    }
                     // A speculative loop's hoisted view of the receiver
                     // (`typed::ViewSlots`): the element written with no walk.
                     if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
