@@ -7099,6 +7099,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         strict_eq: jit_helper_strict_eq,
         has_prop: jit_helper_has_prop,
         enum_keys: jit_tier::jit_helper_enum_keys,
+        lit_string: jit_tier::jit_helper_lit_string,
         truthy: jit_helper_truthy,
         call_native: jit_helper_call_native,
         exec_op: jit_tier::jit_helper_exec_op,

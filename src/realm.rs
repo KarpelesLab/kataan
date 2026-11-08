@@ -37,8 +37,10 @@ pub use fn_chain::FnChain;
 pub(crate) use forin_cache::{ForInSite, KeyTable, NO_SLOT};
 mod gen_state;
 mod key_memo;
+mod lit_cells;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use key_memo::{KeyMemoLayout, jit_key_memo_layout};
+pub use lit_cells::LitCells;
 mod private_fast;
 pub use private_fast::PrivCache;
 pub(crate) mod hidden_layout;
@@ -401,6 +403,11 @@ pub struct Realm {
     /// (see `builtins_fast::new_literal_string`). The cells are GC roots and the
     /// memo is dropped by a moving [`compact`](Realm::compact).
     literal_ropes: alloc::vec::Vec<Option<(usize, Rope, Handle)>>,
+    /// Compiled code's string-literal words (see `lit_cells`), as weak
+    /// references: the handles of the live ones are GC roots.
+    lit_cells: Vec<alloc::rc::Weak<LitCells>>,
+    /// The registry length at which its dead entries are next dropped.
+    lit_cells_prune: usize,
     /// The key strings of the last plain-keyed shape `Object.keys` listed
     /// (see `builtins_fast::plain_enumerable_key_ropes`).
     key_ropes: core::cell::RefCell<Option<ShapeKeyRopes>>,
@@ -989,6 +996,8 @@ impl Realm {
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),
             literal_ropes: alloc::vec::Vec::new(),
+            lit_cells: Vec::new(),
+            lit_cells_prune: 16,
             key_ropes: core::cell::RefCell::new(None),
             key_strings: alloc::vec::Vec::new(),
             coll_iter_layout: None,
@@ -7978,6 +7987,7 @@ impl Realm {
         out.extend(self.unit_strings.iter().flatten().copied());
         out.extend(self.type_name_strings.iter().flatten().copied());
         out.extend(self.literal_ropes.iter().flatten().map(|(_, _, h)| *h));
+        self.lit_cell_roots(out);
         // Explicit prototype links for cells with no inline object part, and the
         // class prototypes: both are keyed by an identity the heap graph does not
         // reach, so their values are strong roots.
@@ -8670,6 +8680,7 @@ impl Realm {
         self.unit_strings.clear();
         self.type_name_strings.clear();
         self.literal_ropes.clear();
+        self.lit_cells_retire();
         self.key_strings.clear();
         self.for_in_cache_retire();
         self.vm_array_iter = VmArrayIterIntrinsics {

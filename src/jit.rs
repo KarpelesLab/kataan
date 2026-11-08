@@ -3411,6 +3411,10 @@ struct GenericSites {
     /// (`forin`).
     #[allow(dead_code)]
     forin: forin::Plan,
+    /// The string literals' words the code loads and its helper fills
+    /// (`crate::realm::LitCells`).
+    #[allow(dead_code)]
+    lits: alloc::rc::Rc<crate::realm::LitCells>,
     /// What the body's deoptimization exits tell their helper (`deopt`),
     /// when it has any.
     deopt: Option<alloc::boxed::Box<deopt::DeoptInfo>>,
@@ -3466,6 +3470,10 @@ pub struct GenericHelpers {
     /// A `for-in`'s `Op::EnumKeys` (`jit_helper_enum_keys(ctx, regs, n_regs,
     /// op, site, _)`, `site` its `ForInSite`): see `forin`.
     pub enum_keys: JitCallMethodHelper,
+    /// A string literal's first evaluation (`jit_helper_lit_string(ctx,
+    /// regs, n_regs, op, cells, index)`, `cells` the body's
+    /// `crate::realm::LitCells`) — never throws.
+    pub lit_string: JitCallMethodHelper,
     /// The truthiness helper (`jit_helper_truthy`), returning `0`/`1` — never throws.
     pub truthy: JitTruthyHelper,
     /// The interpreter-op helper (`jit_helper_exec_op`) — runs one bytecode op
@@ -4488,6 +4496,13 @@ impl JitProto {
                     .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler)),
             ))
         });
+        // One word per string literal (`crate::realm::LitCells`).
+        let lits = alloc::rc::Rc::new(crate::realm::LitCells::new(
+            bytecode
+                .iter()
+                .filter(|op| matches!(op, crate::nbvm::Op::NewString { .. }))
+                .count(),
+        ));
         let (func, native_entry, spec_heads) = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
@@ -4505,6 +4520,7 @@ impl JitProto {
             &forin_plan,
             deopt_info.as_deref(),
             &derived_keys,
+            &lits,
         )?;
         tier_up.spec_regions = spec_heads;
         Some(Self {
@@ -4522,6 +4538,7 @@ impl JitProto {
                 tier_up,
                 persist,
                 forin: forin_plan,
+                lits,
                 deopt: deopt_info,
             }),
             n_regs: proto.n_regs,
@@ -7477,6 +7494,7 @@ impl JitFunction {
         forin_plan: &forin::Plan,
         deopt_info: Option<&deopt::DeoptInfo>,
         derived_keys: &[u64],
+        lits: &alloc::rc::Rc<crate::realm::LitCells>,
     ) -> Option<GenericCompiled> {
         use crate::nanbox::NanBox;
         if ops.len() != bytecode.len() || n_regs > 0xffff {
@@ -7532,6 +7550,20 @@ impl JitFunction {
         let strict_eq_helper = helpers.strict_eq as usize as u64;
         let has_prop_helper = helpers.has_prop as usize as u64;
         let enum_keys_helper = helpers.enum_keys as usize as u64;
+        let lit_string_helper = helpers.lit_string as usize as u64;
+        // Each `Op::NewString`'s word in `lits`, by pc.
+        let lit_word: Vec<Option<usize>> = {
+            let mut n = 0;
+            bytecode
+                .iter()
+                .map(|op| {
+                    matches!(op, crate::nbvm::Op::NewString { .. }).then(|| {
+                        n += 1;
+                        n - 1
+                    })
+                })
+                .collect()
+        };
         let truthy_helper = helpers.truthy as usize as u64;
         let call_native_helper = helpers.call_native as usize as u64;
         let exec_op_helper = helpers.exec_op as usize as u64;
@@ -10666,6 +10698,36 @@ impl JitFunction {
                             a.movabs_r11(NanBox::jit_exit_bits() as i64);
                             a.cmp_rax_r11();
                             a.je(leave_exit);
+                        }
+                        // A string literal: the String its word in the
+                        // body's table holds (`crate::realm::LitCells`),
+                        // one load; the first evaluation fills the word out
+                        // of line (`jit_helper_lit_string`).
+                        crate::nbvm::Op::NewString { dst, .. }
+                            if ok(*dst)
+                                && lit_word.get(pc as usize).copied().flatten().is_some() =>
+                        {
+                            let w = lit_word.get(pc as usize).copied().flatten()?;
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            a.movabs_rax(i64::try_from(lits.word_addr(w)).ok()?);
+                            a.g_load(call_seq::r::RAX, call_seq::r::RAX, 0);
+                            a.test_rax_rax();
+                            a.je(slow);
+                            a.store_rax(disp(*dst));
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            a.mov_rdi_r15();
+                            a.mov_rsi_rbx();
+                            a.movabs_argreg(2, n_regs as i64);
+                            a.movabs_argreg(3, op_ptr as i64);
+                            a.movabs_argreg(4, alloc::rc::Rc::as_ptr(lits) as i64);
+                            a.movabs_argreg(5, w as i64);
+                            a.movabs_rax(lit_string_helper as i64);
+                            a.call_rax();
+                            a.jmp(done);
+                            a.cold_end(cold);
+                            a.bind(done);
                         }
                         // `super(…)`: the native call sequence, `new.target`
                         // passed on and `this` bound from the result.

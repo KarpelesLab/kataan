@@ -1550,6 +1550,43 @@ pub(crate) extern "C" fn jit_helper_iter_next(
     }
 }
 
+/// A compiled string literal's first evaluation (`Op::NewString`, see
+/// `crate::realm::LitCells`), with the exec-op ABI plus the body's literal
+/// table (`cells`) and the site's word in it (`index`): the literal's String,
+/// written to its register and kept in the word, which the code loads from
+/// then on. Never throws.
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]; `cells` must be `Rc::as_ptr` of the body's
+/// live `LitCells` (the body's `JitProto` holds it while its code runs).
+pub(crate) extern "C" fn jit_helper_lit_string(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cells: *mut core::ffi::c_void,
+    index: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: as `jit_helper_exec_op`; `cells` came from `Rc::as_ptr` of a
+    // table whose owner is alive, so taking one more strong count for the
+    // duration of this call is sound.
+    #[allow(unsafe_code)]
+    let (ctx, regs, op, cells) = unsafe {
+        let p = cells.cast_const().cast::<crate::realm::LitCells>();
+        Rc::increment_strong_count(p);
+        (
+            &mut *(ctx_raw as *mut Ctx),
+            core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs),
+            &*op_raw,
+            Rc::from_raw(p),
+        )
+    };
+    if let Op::NewString { dst, value } = op {
+        regs[*dst as usize] = ctx.realm.fill_lit_cell(&cells, index as usize, value);
+    }
+    0
+}
+
 /// A compiled `for-in` loop's `Op::EnumKeys` (`crate::jit::forin`), with the
 /// exec-op ABI plus its `ForInSite` (`site`): a memoized key list's array
 /// (its interpreter arm's first step), the site then holding the list's key
