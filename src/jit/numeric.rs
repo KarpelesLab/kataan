@@ -622,6 +622,20 @@ struct IProof {
     slot: u32,
 }
 
+/// A **run-proved answer** of a speculative region ([`plan_answer_proofs`]):
+/// the property read at `op` that found its key on no object of the
+/// receiver's chain (through its site's chain cache), or the `key in obj`
+/// at `op`, gives the same answer for the rest of a run of the fast version
+/// once it has given one.
+#[derive(Clone, Copy, Debug)]
+struct AProof {
+    op: usize,
+    /// Its native frame slot ([`NumGen::aproof_disp`]): the answer's bits
+    /// (`undefined`, or a boolean) in this run of the fast version, or `0`
+    /// (no answer's bits).
+    slot: u32,
+}
+
 /// A promoted loop: bytecode pcs `head..=end` (`end` the unconditional back-edge
 /// `Jump` to `head`) and its promoted registers.
 struct Region {
@@ -683,6 +697,8 @@ struct Region {
     pproof: Vec<PProof>,
     /// The run-proved ops ([`plan_op_proofs`]).
     iproof: Vec<IProof>,
+    /// The run-proved answers ([`plan_answer_proofs`]).
+    aproof: Vec<AProof>,
     /// For a body that branches inside itself: the registers live on entry
     /// to each of its ops (`live_words` words per pc from `head`), which
     /// [`Region::defined`] reads; empty otherwise.
@@ -1163,6 +1179,8 @@ pub(super) struct NumGen {
     n_pproof: usize,
     /// The run-proved ops' slots ([`IProof::slot`]), after those.
     n_iproof: usize,
+    /// The run-proved answers' slots ([`AProof::slot`]), after those.
+    n_aproof: usize,
     /// Per pc: its label in its region's integer version, for a
     /// speculative region's ([`Self::spec_int`]).
     int_labels: Vec<Option<Label>>,
@@ -1346,6 +1364,9 @@ pub(super) fn generic_region_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
                 // An equality against a short string literal: inline, its
                 // slow path the interpreter's op (in a fast version: a leave).
                 || matches!(bc, Op::StrEqConst { lit, .. } if lit.len() <= crate::rope::SMALL_CAP)
+                // `key in obj`: a memo's answer inline (`super::key_probe`),
+                // its slow path the helper (in a fast version: a leave).
+                || matches!(bc, Op::Relational { instanceof: false, .. })
                 || allocating_region_op(op, bc, sa)
         }
         _ => allocating_region_op(op, bc, sa),
@@ -1435,8 +1456,15 @@ fn spec_int_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
         GenericOp::CallMethod { .. } => super::inline_math(bc).is_some(),
         GenericOp::CallWithMethod { .. } => super::inline_math_got(bc).is_some(),
         GenericOp::Interp { .. } => {
-            matches!(bc, Op::BindThis { .. } | Op::NewString { .. })
-                || matches!(bc, Op::StrEqConst { lit, .. } if lit.len() <= crate::rope::SMALL_CAP)
+            matches!(
+                bc,
+                Op::BindThis { .. }
+                    | Op::NewString { .. }
+                    | Op::Relational {
+                        instanceof: false,
+                        ..
+                    }
+            ) || matches!(bc, Op::StrEqConst { lit, .. } if lit.len() <= crate::rope::SMALL_CAP)
         }
         _ => false,
     }
@@ -1700,6 +1728,19 @@ impl NumGen {
                 n_iproof += 1;
             }
         }
+        // The run-proved answers ([`plan_answer_proofs`]) of the same
+        // versions, each with its slot.
+        let mut n_aproof = 0usize;
+        for r in &mut regions {
+            let keep = r.spec.is_some() && r.arms.iter().all(|a| r.cold.contains(a));
+            if !keep {
+                r.aproof.clear();
+            }
+            for g in &mut r.aproof {
+                g.slot = n_aproof as u32;
+                n_aproof += 1;
+            }
+        }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
         {
@@ -1815,6 +1856,7 @@ impl NumGen {
             n_gproof,
             n_pproof,
             n_iproof,
+            n_aproof,
             int_labels: vec![None; n + 1],
             ilabels: Vec::new(),
             int_saved: false,
@@ -1949,6 +1991,7 @@ impl NumGen {
             + self.n_gproof
             + self.n_pproof
             + self.n_iproof
+            + self.n_aproof
     }
 
     /// The frame slot of carried field flag `k` ([`FCarry::flag`]), after
@@ -1976,6 +2019,29 @@ impl NumGen {
     /// after the run-proved property sites'.
     fn iproof_disp(&self, k: u32) -> i32 {
         self.pproof_disp(self.n_pproof as u32 + k)
+    }
+
+    /// The frame slot of run-proved answer `k` ([`AProof::slot`]), after
+    /// the run-proved ops'.
+    fn aproof_disp(&self, k: u32) -> i32 {
+        self.iproof_disp(self.n_iproof as u32 + k)
+    }
+
+    /// For the property read or `key in obj` at `pc` in a speculative
+    /// region's fast version (either one): its run proof's frame slot, when
+    /// it is a run-proved answer ([`plan_answer_proofs`]). The slot holds
+    /// the op's answer once it has given one that the receiver's layout and
+    /// chain decide (a key on no object of the chain, for a read) since the
+    /// fast version was entered, else `0`: while it holds one, that is the
+    /// answer, with no check.
+    pub(crate) fn answer_run_proof(&self, pc: usize) -> Option<i32> {
+        let ri = self.region_at(pc)?;
+        let r = &self.regions[ri];
+        if r.spec.is_none() || (self.imode.is_some() && !self.spec_int_mode()) {
+            return None;
+        }
+        let g = r.aproof.iter().find(|g| g.op == pc)?;
+        Some(self.aproof_disp(g.slot))
     }
 
     /// For the `Op::SuperCtor` / `Op::InitFields` / element store at `pc` in
@@ -3075,6 +3141,10 @@ impl NumGen {
         // (Nor has any run-proved op passed its checks.)
         for g in &self.regions[ri].iproof {
             a.mov_frame_all_ones(self.iproof_disp(g.slot));
+        }
+        // (Nor has any run-proved answer been given.)
+        for g in &self.regions[ri].aproof {
+            a.mov_frame_zero(self.aproof_disp(g.slot));
         }
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
@@ -6539,6 +6609,11 @@ fn plan_regions_sa(
         } else {
             Vec::new()
         };
+        let aproof: Vec<AProof> = if generic && loops.is_empty() && aproof_enabled() {
+            plan_answer_proofs(ops, bytecode, (head, end), &arms, &carried_r)
+        } else {
+            Vec::new()
+        };
         let in_gcarry =
             |r: u16| gcarry.iter().any(|g| g.1 == r) || fcarry.iter().any(|f| f.src == r);
         carried.extend(info.iter().filter(|x| in_gcarry(x.0)));
@@ -6761,6 +6836,7 @@ fn plan_regions_sa(
             gproof,
             pproof,
             iproof,
+            aproof,
         });
     }
     out
@@ -7036,6 +7112,144 @@ fn plan_op_proofs(
         })
         .map(|op| IProof { op, slot: u32::MAX })
         .collect()
+}
+
+/// Whether run-proved answers ([`plan_answer_proofs`]) are planned: unless
+/// `KATAAN_JIT_APROOF=0`. Read once per process.
+fn aproof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_APROOF").is_none_or(|v| v != "0"))
+}
+
+/// Whether `KATAAN_JIT_APROOF=log`: report each run-proved answer planned.
+fn aproof_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_APROOF").is_some_and(|v| v == "log"))
+}
+
+/// A loop's **run-proved answers**. A property read whose key is on no
+/// object of the receiver's chain (its site's chain cache: an absent
+/// entry, which holds while the receiver has the entry's layout and
+/// `[[Prototype]]` and the prototype epoch stands), and a `key in obj` (the
+/// memos of `super::key_probe`: the receiver's layout, and for a key absent
+/// from the chain its `[[Prototype]]` and the epoch), answer from facts
+/// that only Rust code changes, or an inline add, which in a speculative
+/// version's fast version leaves for the plain copy but for an object the
+/// iteration has just allocated (no receiver of these: it holds one value
+/// in every iteration, made before the loop; nor any prototype of one). So
+/// once such an op on a receiver that is the same object wherever it runs
+/// has answered so in a run of the fast version, it answers the same for
+/// the rest of that run, for the same key: its later runs, until the fast
+/// version is entered again (which empties its slot), take the answer from
+/// the frame.
+///
+/// A candidate: a `GetProp` (whose emitted code decides whether its answer
+/// came that way) or a `key in obj` whose key is a literal (a `NewString`
+/// right before it, the key register's one write in the loop) or holds one
+/// value wherever it runs, outside the fallback arms (`arms`) of a loop
+/// whose ops outside the arms all run no Rust code and change no shape but
+/// a fresh object's ([`shape_safe`]; an element store's inline paths store
+/// into existing elements and slots only), on a receiver that holds the
+/// same value wherever the op runs: one no op of the loop writes, or, when
+/// the loop's control runs straight but for the diamonds and exits, one
+/// [`invariant_at`] accepts.
+fn plan_answer_proofs(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    arms: &[(usize, usize, usize)],
+    carried_r: &dyn Fn(u16) -> bool,
+) -> Vec<AProof> {
+    let mut out = Vec::new();
+    if end >= ops.len() || end >= bytecode.len() || head >= end {
+        return out;
+    }
+    // (A body that branches inside itself: only registers no op of the
+    // loop writes hold one value wherever an op runs.)
+    let straight = straight_body(ops, (head, end), arms);
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    let safe = |q: usize| match (&ops[q], &bytecode[q]) {
+        (GenericOp::SetElem { .. }, _) => true,
+        (
+            GenericOp::Interp { .. },
+            Op::Relational {
+                instanceof: false, ..
+            },
+        ) => true,
+        // (A literal's word, a compare with a short literal: inline, every
+        // other path a leave.)
+        (GenericOp::Interp { .. }, Op::NewString { .. } | Op::StrEqConst { .. }) => true,
+        _ => shape_safe(ops, bytecode, q),
+    };
+    if let Some(q) = (head..=end).find(|&q| !in_arm(q) && !safe(q)) {
+        if aproof_log() {
+            std::eprintln!(
+                "[aproof] region {head}..={end}: op {q} {:?} / {:?}",
+                ops[q],
+                bytecode[q]
+            );
+        }
+        return out;
+    }
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    let same = |r: u16, at: usize, d: &mut Vec<u16>, u: &mut Vec<u16>| {
+        if straight {
+            invariant_at(bytecode, (head, end), &in_arm, carried_r, r, at, 4, d, u)
+        } else {
+            defs_in(bytecode, (head, end), r, d, u).is_empty()
+        }
+    };
+    for s in head..=end {
+        if in_arm(s) {
+            continue;
+        }
+        let (obj, key) = match (&ops[s], &bytecode[s]) {
+            (GenericOp::GetProp { .. }, Op::GetProp { obj, key, .. }) => {
+                if key == "__proto__" {
+                    continue;
+                }
+                (*obj, None)
+            }
+            (
+                GenericOp::Interp { .. },
+                &Op::Relational {
+                    instanceof: false,
+                    a: key,
+                    b: obj,
+                    ..
+                },
+            ) => (obj, Some(key)),
+            _ => continue,
+        };
+        if !same(obj, s, &mut d, &mut u) {
+            continue;
+        }
+        if let Some(k) = key {
+            // The key: one literal's String wherever the op runs (nothing
+            // jumps between its `NewString` and the op).
+            let lit = s > head
+                && !in_arm(s - 1)
+                && matches!(&bytecode[s - 1], Op::NewString { dst, .. } if *dst == k)
+                && defs_in(bytecode, (head, end), k, &mut d, &mut u) == [s - 1]
+                && !(head..=end).any(|q| match ops[q] {
+                    GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => {
+                        target == s
+                    }
+                    _ => false,
+                });
+            if k == obj || !(lit || same(k, s, &mut d, &mut u)) {
+                continue;
+            }
+        }
+        if aproof_log() {
+            std::eprintln!("[aproof] op {s}");
+        }
+        out.push(AProof {
+            op: s,
+            slot: u32::MAX,
+        });
+    }
+    out
 }
 
 /// Whether run-proved property sites ([`plan_site_proofs`]) are planned:

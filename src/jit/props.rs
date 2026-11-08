@@ -1338,6 +1338,18 @@ impl X64Assembler {
         self.g_load(r::RAX, r::R9, 0);
     }
 
+    /// After a [`p_method_lookup`](Self::p_method_lookup) hit (`r11` the
+    /// entry that hit): to `other` unless the entry is an absent one (the
+    /// key on no object of the chain, see `ABSENT_SLOT`). Changes no
+    /// register.
+    pub(crate) fn p_hit_absent_or(&mut self, other: Label) {
+        let slot = i32::try_from(core::mem::offset_of!(MethodEntry, slot)).expect("offset");
+        self.g_mem(false, &[0x81], 7, r::R11, slot); // cmp dword [r11 + slot], imm32
+        self.code
+            .extend_from_slice(&(ABSENT_SLOT as i32).to_le_bytes());
+        self.g_jcc(cc::NE, other);
+    }
+
     /// The method lookup of a [`MethodSite`] (see its docs), on the receiver
     /// value at `[recv_base + recv_disp]`: on a hit, the method value in
     /// `rax`; otherwise to `miss`. Reads only; clobbers `rax`, `rcx`, `rdx`,

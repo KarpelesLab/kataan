@@ -39,6 +39,8 @@ mod gen_state;
 mod key_memo;
 mod text_memo;
 pub(crate) use text_memo::TextHit;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use text_memo::{KeyTextLayout, jit_key_text_layout};
 mod lit_cells;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use key_memo::{KeyMemoLayout, jit_key_memo_layout};
@@ -393,6 +395,9 @@ pub struct Realm {
     key_memo_entries: core::cell::Cell<usize>,
     /// The String-key text memo (`text_memo`), made on first use.
     key_text: core::cell::OnceCell<alloc::boxed::Box<text_memo::KeyText>>,
+    /// The address of the text memo's entries once it is made, else `0`:
+    /// what compiled code probes (`text_memo::KeyTextLayout`).
+    key_text_entries: core::cell::Cell<usize>,
     /// Compiled programs by `(source, flags)`, most recently used last: every
     /// evaluation of a regex literal creates a new RegExp object (so a literal
     /// in a loop is a fresh object per iteration), but they share one compiled
@@ -997,6 +1002,7 @@ impl Realm {
             key_memo: core::cell::OnceCell::new(),
             key_memo_entries: core::cell::Cell::new(0),
             key_text: core::cell::OnceCell::new(),
+            key_text_entries: core::cell::Cell::new(0),
             #[cfg(feature = "regex")]
             regex_programs: core::cell::RefCell::new(alloc::vec::Vec::new()),
             number_ropes: core::cell::RefCell::new(alloc::vec::Vec::new()),

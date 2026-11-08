@@ -70,7 +70,9 @@ pub struct Rope(Rc<Node>);
 enum Node {
     /// A short contiguous run of WTF-8 bytes held inline: `buf[..len]`, with
     /// its UTF-16 length memoized in `u16` on first use (`SMALL_U16_UNKNOWN`
-    /// until then).
+    /// until then). The bytes past `len` are always zero (every constructor
+    /// starts from a zeroed buffer): compiled code reads a short key's text
+    /// as whole words of `buf` (`crate::jit::key_probe`).
     Small {
         len: u8,
         u16: core::cell::Cell<u8>,
@@ -1752,6 +1754,26 @@ mod tests {
         }
         assert_eq!(r.utf16_len(), 70_000);
         assert_eq!(r.materialize().len(), 70_000);
+    }
+
+    /// An inline node's bytes past its length are zero, however it was made
+    /// (compiled code reads them as a key's padded text).
+    #[test]
+    fn small_tails_are_zero() {
+        let check = |r: &Rope| {
+            let Node::Small { len, buf, .. } = &*r.0 else {
+                panic!("expected an inline node");
+            };
+            assert!(buf[usize::from(*len)..].iter().all(|&b| b == 0));
+        };
+        for n in 0..=SMALL_CAP {
+            check(&Rope::leaf(&"x".repeat(n)));
+            check(&Rope::from_bytes(&alloc::vec![b'q'; n]));
+            check(&Rope::small_with(n, |b| b.fill(b'z')).expect("short"));
+        }
+        for n in 0..SMALL_CAP {
+            check(&Rope::leaf(&"k".repeat(n)).concat(&Rope::leaf("1")));
+        }
     }
 
     #[test]

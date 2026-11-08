@@ -9172,6 +9172,20 @@ impl JitFunction {
         // The slow paths of a speculative loop's fast version that leave for
         // its plain copy instead: (slow path entry, the leave).
         let mut cold_bails: Vec<(Label, Label)> = Vec::new();
+        // A speculative loop's fast version's `GetProp` misses that try the
+        // site's chain cache (an inherited data property, or a key on no
+        // object of the chain) before leaving: `(entry, the leave, the
+        // site, receiver register, where the value goes on (else `dst` and
+        // `done`), and its run-proved answer's slot and entry.
+        #[allow(clippy::type_complexity)]
+        let mut cold_spec_gets: Vec<(
+            Label,
+            Label,
+            *const props::MethodSite,
+            u16,
+            (Option<Label>, u16, Label),
+            Option<(i32, Label)>,
+        )> = Vec::new();
         // The native-call entry (`call_seq::emit_native_entry`), falling
         // through into the body (the interpreter's entry above jumps over
         // it). Its poll countdown only matters to a body that polls, at a
@@ -11704,8 +11718,11 @@ impl JitFunction {
                             }
                         }
                         // `key in obj` for a String key the String-key slot
-                        // memo names in `obj`'s layout (`key_probe`):
-                        // `true`, with no call; else the interpreter's op.
+                        // memo names in `obj`'s layout, or one whose text
+                        // the text memo knows present or absent over `obj`'s
+                        // chain (`key_probe`): the answer with no call; else
+                        // the interpreter's op (in a speculative loop's fast
+                        // version, which makes no call: a leave).
                         crate::nbvm::Op::Relational {
                             dst,
                             instanceof: false,
@@ -11717,8 +11734,21 @@ impl JitFunction {
                             && num.result_xmm(op_idx, *key).is_none()
                             && num.result_xmm(op_idx, *obj).is_none() =>
                         {
-                            let slow = a.new_label();
+                            let bail = num.spec_bail(&mut a, op_idx);
+                            let slow = bail.unwrap_or_else(|| a.new_label());
                             let done = a.new_label();
+                            let (text, found, absent) =
+                                (a.new_label(), a.new_label(), a.new_label());
+                            let (got, have) = (a.new_label(), a.new_label());
+                            // A run-proved answer (`numeric::plan_answer_proofs`):
+                            // once given in this run of the fast version, the
+                            // same, from its frame slot.
+                            let proof = bail.and(num.answer_run_proof(op_idx));
+                            if let Some(ps) = proof {
+                                a.g_load(call_seq::r::RAX, call_seq::r::RBP, ps);
+                                a.g_test(call_seq::r::RAX);
+                                a.g_jcc(call_seq::cc::NE, have);
+                            }
                             a.load_rax(disp(*key));
                             a.p_cmp_handle_floor(call_seq::r::RAX);
                             a.g_jcc(call_seq::cc::B, slow);
@@ -11726,29 +11756,50 @@ impl JitFunction {
                             a.p_object_not_exotic(&layout, slow);
                             let cl = &helpers.call_layout;
                             a.fi_plain_read(&layout, (cl.realm, cl.str_special), slow);
-                            a.kp_slot(&layout, &key_probe, cl.realm, disp(*key), slow);
+                            a.kp_slot(&layout, &key_probe, cl.realm, disp(*key), text);
+                            a.jmp(found);
+                            a.bind(text);
+                            a.tp_probe(
+                                &layout,
+                                &key_probe,
+                                cl.realm,
+                                disp(*key),
+                                Some(absent),
+                                slow,
+                            );
+                            a.bind(found);
                             a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                            a.jmp(got);
+                            a.bind(absent);
+                            a.movabs_rax(NanBox::boolean(false).to_bits() as i64);
+                            a.bind(got);
+                            if let Some(ps) = proof {
+                                a.g_store(call_seq::r::RBP, ps, call_seq::r::RAX);
+                            }
+                            a.bind(have);
                             a.store_rax(disp(*dst));
-                            let cold = a.cold_begin();
-                            // What the heap alone decides (an element of a
-                            // plain array, an ordinary chain's String key:
-                            // `jit_helper_has_prop`), else the interpreter.
-                            let exec = a.new_label();
-                            a.bind(slow);
-                            a.mov_rdi_r15();
-                            a.load_argreg(1, disp(*key));
-                            a.load_argreg(2, disp(*obj));
-                            a.movabs_rax(has_prop_helper as i64);
-                            a.call_rax();
-                            a.movabs_r11(NanBox::undefined().to_bits() as i64);
-                            a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
-                            a.g_jcc(call_seq::cc::E, exec);
-                            a.store_rax(disp(*dst));
-                            a.jmp(done);
-                            a.bind(exec);
-                            exec_op!(pc);
-                            a.jmp(done);
-                            a.cold_end(cold);
+                            if bail.is_none() {
+                                let cold = a.cold_begin();
+                                // What the heap alone decides (an element of a
+                                // plain array, an ordinary chain's String key:
+                                // `jit_helper_has_prop`), else the interpreter.
+                                let exec = a.new_label();
+                                a.bind(slow);
+                                a.mov_rdi_r15();
+                                a.load_argreg(1, disp(*key));
+                                a.load_argreg(2, disp(*obj));
+                                a.movabs_rax(has_prop_helper as i64);
+                                a.call_rax();
+                                a.movabs_r11(NanBox::undefined().to_bits() as i64);
+                                a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
+                                a.g_jcc(call_seq::cc::E, exec);
+                                a.store_rax(disp(*dst));
+                                a.jmp(done);
+                                a.bind(exec);
+                                exec_op!(pc);
+                                a.jmp(done);
+                                a.cold_end(cold);
+                            }
                             a.bind(done);
                         }
                         // A compiled `for-in`'s `EnumKeys` (`forin`): the
@@ -11984,6 +12035,10 @@ impl JitFunction {
                     let s = sites.get(site as usize)?;
                     let helper = a.new_label();
                     let done = a.new_label();
+                    // Where a value in `rax` goes on as the op's result
+                    // (`None`: stored to `dst`, then `done`), for a fast
+                    // version's chain-cache read (below).
+                    let mut hit_back: Option<Label> = None;
                     // ===== inline monomorphic property-get fast path =====
                     // A pure sequence of reads at runtime-verified offsets: walk
                     // arena → slot → cell → object → shape, compare the object's
@@ -11998,6 +12053,27 @@ impl JitFunction {
                     // line (`cold_verifies`).
                     let known = s.baked.filter(|b| shape_known(op_idx, b.shape));
                     let verify = known.map(|_| a.new_label());
+                    // A speculative loop's fast version's miss may try the
+                    // site's chain cache (see the miss path, below), and a
+                    // key found on no object of the chain there is a
+                    // run-proved answer (`numeric::plan_answer_proofs`):
+                    // once found so in this run of the fast version,
+                    // `undefined` from its frame slot, with no walk (so
+                    // not for a site whose walk a later one relies on).
+                    let spec_chain = num.spec_bail(&mut a, op_idx).is_some()
+                        && !s.method_ptr.is_null()
+                        && s.baked.is_none()
+                        && !num.keeps_si_di(op_idx)
+                        && rc.sites[op_idx].is_none_or(|p| !shape_ways.contains(&p.way));
+                    let answer = num
+                        .answer_run_proof(op_idx)
+                        .filter(|_| spec_chain && !typed::relied_on(&rc, op_idx))
+                        .map(|ps| (ps, a.new_label()));
+                    if let Some((ps, proven)) = answer {
+                        a.g_load(call_seq::r::RAX, call_seq::r::RBP, ps);
+                        a.g_test(call_seq::r::RAX);
+                        a.g_jcc(call_seq::cc::NE, proven);
+                    }
                     // `while (q.link) q = q.link`: while the next object has
                     // the way's layout, hop straight to it (`chase`).
                     if chase_at[op_idx]
@@ -12126,6 +12202,7 @@ impl JitFunction {
                         // (`done`: no path of the fast version reaches it.)
                         let past = a.new_label();
                         let back = a.new_label();
+                        hit_back = Some(back);
                         let spill = a.new_label();
                         cold_reloads.push((spill, back, done, past, op_idx));
                         let mark = a.cold_begin();
@@ -12141,6 +12218,7 @@ impl JitFunction {
                         // (out of line, `cold_caches`).
                         let cached = a.new_label();
                         let back = a.new_label();
+                        hit_back = Some(back);
                         if let Some(verify) = verify {
                             let resume = a.new_label();
                             a.bind(resume);
@@ -12219,6 +12297,7 @@ impl JitFunction {
                         // reload are out of line (`cold_reloads`).
                         let spill = a.new_label();
                         let back = a.new_label();
+                        hit_back = Some(back);
                         let past = a.new_label();
                         a.p_obj_slot_load_inline(&layout, helper, spill);
                         a.bind(back);
@@ -12233,8 +12312,30 @@ impl JitFunction {
                     }
                     // The miss path is out of line (see `cold_gets`), or in
                     // a speculative loop's fast version leaves for its copy.
+                    // (There, an inherited property or a key on no object of
+                    // the chain, through the site's chain cache, which only
+                    // Rust code fills or restamps (a read: no Rust code runs
+                    // in a fast version), goes on as a hit, but for a way
+                    // that proves a layout to later sites (a full walk
+                    // fills it before the shape compare), code that must
+                    // keep `rsi`/`rdi`, or a compiled-in layout's site,
+                    // whose hit leaves the receiver's `extra` pointer in
+                    // the frame for later sites.)
                     if let Some(bail) = num.spec_bail(&mut a, op_idx) {
-                        cold_bails.push((helper, bail));
+                        if spec_chain {
+                            let miss = a.new_label();
+                            cold_bails.push((miss, bail));
+                            cold_spec_gets.push((
+                                helper,
+                                miss,
+                                s.method_ptr,
+                                obj,
+                                (hit_back, dst, done),
+                                answer,
+                            ));
+                        } else {
+                            cold_bails.push((helper, bail));
+                        }
                     } else {
                         cold_gets.push((
                             helper,
@@ -12973,21 +13074,29 @@ impl JitFunction {
                     if num.keeps_si_di(op_idx) {
                         a.jmp(helper);
                     }
-                    if bail.is_none()
+                    if (bail.is_none() || !typed::relied_on(&rc, op_idx))
                         && !num.is_number_at(op_idx, index)
                         && num.result_xmm(op_idx, index).is_none()
                         && num.result_xmm(op_idx, obj).is_none()
                         // (Both operands in the register file: no hoisted
-                        // receiver, no sunk load of it.)
-                        && num.hoisted_array(op_idx, obj).is_none()
+                        // view, no sunk load of the receiver. A hoisted
+                        // array's receiver is there; its path is tried
+                        // after this one.)
                         && num.hoisted_view(op_idx, obj).is_none()
                         && (op_idx == 0 || !num.sunk_load(op_idx - 1))
                     {
                         // A String key's slot from the String-key slot memo
+                        // or the text memo, or `undefined` for a key the
+                        // text memo knows absent from the receiver's chain
                         // (`key_probe`), with no call, on to `got` with the
-                        // value. (A Number key goes on at once.)
+                        // value. (A Number key goes on at once.) Only Rust
+                        // code fills a memo or moves the prototype epoch,
+                        // so a speculative loop's fast version reads them
+                        // too (if no later site relies on the receiver-
+                        // cache way this op would fill, see below).
                         let other = a.new_label();
                         let spill = a.new_label();
+                        let (text, slot, absent) = (a.new_label(), a.new_label(), a.new_label());
                         a.load_rax(disp(index));
                         a.p_cmp_handle_floor(call_seq::r::RAX);
                         a.g_jcc(call_seq::cc::B, other);
@@ -12995,10 +13104,24 @@ impl JitFunction {
                         a.p_object_not_exotic(&layout, other);
                         let cl = &helpers.call_layout;
                         a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
-                        a.kp_slot(&layout, &key_probe, cl.realm, disp(index), other);
+                        a.kp_slot(&layout, &key_probe, cl.realm, disp(index), text);
+                        a.bind(slot);
                         a.p_obj_slot_load_inline(&layout, other, spill);
                         a.jmp(got);
                         let cold = a.cold_begin();
+                        a.bind(text);
+                        a.tp_probe(
+                            &layout,
+                            &key_probe,
+                            cl.realm,
+                            disp(index),
+                            Some(absent),
+                            other,
+                        );
+                        a.jmp(slot);
+                        a.bind(absent);
+                        a.movabs_rax(NanBox::undefined().to_bits() as i64);
+                        a.jmp(got);
                         a.bind(spill);
                         a.p_obj_slot_load_spill(&layout, got);
                         a.cold_end(cold);
@@ -13217,10 +13340,15 @@ impl JitFunction {
                     // barrier with nothing to do and the layout's record
                     // of Number-only slots kept (`fieldrep`). Anything
                     // else is the helper's. (A Number key goes on at once.)
-                    if bail.is_none()
+                    // (Also in a speculative loop's fast version, where a
+                    // memo hit is no Rust code and any miss leaves, unless a
+                    // later site relies on the receiver-cache way the array
+                    // path would fill; there a promoted value is a Number,
+                    // which needs neither barrier nor representation check.)
+                    if (bail.is_none() || !typed::relied_on(&rc, op_idx))
                         && !num.is_number_at(op_idx, index)
                         && index_x.is_none()
-                        && val_x.is_none()
+                        && (val_x.is_none() || bail.is_some())
                         && num.result_xmm(op_idx, obj).is_none()
                         && num.hoisted_array(op_idx, obj).is_none()
                         && num.hoisted_view(op_idx, obj).is_none()
@@ -13228,6 +13356,7 @@ impl JitFunction {
                     {
                         use call_seq::r as R;
                         let string_key = a.new_label();
+                        let (text, slot) = (a.new_label(), a.new_label());
                         let cl = &helpers.call_layout;
                         a.load_rax(disp(index));
                         a.p_cmp_handle_floor(R::RAX);
@@ -13243,18 +13372,30 @@ impl JitFunction {
                         );
                         a.jne(helper);
                         a.fi_plain_read(&layout, (cl.realm, cl.str_special), helper);
-                        a.load_rax(disp(val));
-                        a.p_barrier_check(&layout, cl.realm, helper);
-                        a.p_arena(cl.realm, &layout.props);
-                        a.kp_slot(&layout, &key_probe, cl.realm, disp(index), helper);
+                        if val_x.is_none() {
+                            a.load_rax(disp(val));
+                            a.p_barrier_check(&layout, cl.realm, helper);
+                            a.p_arena(cl.realm, &layout.props);
+                        }
+                        a.kp_slot(&layout, &key_probe, cl.realm, disp(index), text);
                         // rax = the slot; the value's representation, then
                         // its store.
-                        a.g_load(R::R8, R::RBX, disp(val));
-                        a.g_load(R::R9, R::RCX, layout.off_shape);
-                        a.p_field_rep_dyn(&layout, (R::R8, R::R9, R::RAX, R::R11), helper);
+                        a.bind(slot);
+                        match val_x {
+                            Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, R::R8, x),
+                            None => {
+                                a.g_load(R::R8, R::RBX, disp(val));
+                                a.g_load(R::R9, R::RCX, layout.off_shape);
+                                a.p_field_rep_dyn(&layout, (R::R8, R::R9, R::RAX, R::R11), helper);
+                            }
+                        }
                         a.p_obj_slot_addr(&layout, R::R11, helper);
                         a.g_store(R::R11, 0, R::R8);
                         a.jmp(done);
+                        // A key of the same text (the text memo): its slot.
+                        a.bind(text);
+                        a.tp_probe(&layout, &key_probe, cl.realm, disp(index), None, helper);
+                        a.jmp(slot);
                         a.cold_end(cold);
                     }
                     // A speculative loop's hoisted view of the receiver
@@ -14361,6 +14502,38 @@ impl JitFunction {
             family_checks!(fam, miss);
             a.p_fill_way(rc_key(w), rc_cell(w), rc_delta(w, recv));
             a.jmp(back);
+        }
+        for (entry, miss, site, obj, (back, dst, done), answer) in
+            core::mem::take(&mut cold_spec_gets)
+        {
+            a.dbg_mark("x-chain");
+            a.bind(entry);
+            a.p_method_lookup(
+                &layout,
+                helpers.call_layout.realm,
+                (call_seq::r::RBX, disp(obj)),
+                site,
+                miss,
+                None,
+            );
+            // (An absent entry's `undefined`: the answer for the rest of
+            // this run.)
+            let deliver = a.new_label();
+            if let Some((ps, _)) = answer {
+                a.p_hit_absent_or(deliver);
+                a.g_store(call_seq::r::RBP, ps, call_seq::r::RAX);
+            }
+            a.bind(deliver);
+            if let Some((_, proven)) = answer {
+                a.bind(proven);
+            }
+            match back {
+                Some(back) => a.jmp(back),
+                None => {
+                    a.store_rax(disp(dst));
+                    a.jmp(done);
+                }
+            }
         }
         for (entry, bail) in core::mem::take(&mut cold_bails) {
             a.dbg_mark("x-bail");

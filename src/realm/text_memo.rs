@@ -102,15 +102,72 @@ impl Text {
         })
     }
 
-    /// The entry index of the text.
+    /// The entry index of the text. (Compiled code computes it the same
+    /// way, `crate::jit::key_probe`: keep the two in step.)
     #[inline]
     fn index(&self) -> usize {
         let h = (self.words[0]
-            ^ self.words[1].rotate_left(21)
-            ^ self.words[2].rotate_left(42)
+            ^ self.words[1].rotate_left(ROT1)
+            ^ self.words[2].rotate_left(ROT2)
             ^ u64::from(self.len))
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        .wrapping_mul(HASH_MUL);
         (h >> 32) as usize & (CAP - 1)
+    }
+}
+
+/// [`Text::index`]'s rotations of the second and third words.
+const ROT1: u32 = 21;
+const ROT2: u32 = 42;
+/// [`Text::index`]'s multiplier.
+const HASH_MUL: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Where compiled code finds an entry (`crate::jit::key_probe`): the
+/// realm's field holding the entries' address (`0` before the memo is
+/// made), the entry stride, the text's three words and length, and the
+/// entry's layout, slot, prototype and stamp fields; and how it computes an
+/// entry's index ([`Text::index`]): the rotations, the multiplier and the
+/// mask (`CAP - 1`). A key held in its rope node (`Node::Small`, whose bytes
+/// past its length are zero) has its text's words at its buffer's start.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeyTextLayout {
+    pub(crate) entries: i32,
+    pub(crate) size: i32,
+    pub(crate) words: i32,
+    pub(crate) len: i32,
+    pub(crate) shape: i32,
+    pub(crate) slot: i32,
+    pub(crate) proto: i32,
+    pub(crate) stamp: i32,
+    pub(crate) rot: (u8, u8),
+    pub(crate) mul: u64,
+    pub(crate) mask: i32,
+    /// The longest text recorded, in bytes.
+    pub(crate) text_max: u8,
+}
+
+/// Derives [`KeyTextLayout`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn jit_key_text_layout() -> KeyTextLayout {
+    use core::mem::{offset_of, size_of};
+    let i = |v: usize| i32::try_from(v).expect("text memo offset fits in i32");
+    const _: () = assert!(CAP.is_power_of_two() && TEXT_MAX <= 24);
+    // (A `Cell` is its value: the entry's fields are where their values are.)
+    let text = offset_of!(Entry, text);
+    KeyTextLayout {
+        entries: i(offset_of!(Realm, key_text_entries)),
+        size: i(size_of::<Entry>()),
+        words: i(text + offset_of!(Text, words)),
+        len: i(text + offset_of!(Text, len)),
+        shape: i(offset_of!(Entry, shape)),
+        slot: i(offset_of!(Entry, slot)),
+        proto: i(offset_of!(Entry, proto)),
+        stamp: i(offset_of!(Entry, stamp)),
+        rot: (ROT1 as u8, ROT2 as u8),
+        mul: HASH_MUL,
+        mask: i(CAP - 1),
+        text_max: TEXT_MAX as u8,
     }
 }
 
@@ -152,6 +209,17 @@ pub(crate) enum TextHit<'a> {
 }
 
 impl Realm {
+    /// The memo, made (and its entries' address published for compiled
+    /// code, `Realm::key_text_entries`) on first use.
+    #[inline]
+    fn key_text_memo(&self) -> &KeyText {
+        self.key_text.get_or_init(|| {
+            let m: Box<KeyText> = Box::default();
+            self.key_text_entries.set(m.entries.as_ptr() as usize);
+            m
+        })
+    }
+
     /// The text of the String key `key` when the memo may answer for it: a
     /// flat leaf short enough, with no auxiliary object (which may make it
     /// no plain String, see `string_key_in_place`).
@@ -220,7 +288,7 @@ impl Realm {
         let Some(t) = self.key_text_of(key) else {
             return;
         };
-        let memo = self.key_text.get_or_init(Box::default);
+        let memo = self.key_text_memo();
         let e = &memo.entries[t.index()];
         let p = Rc::as_ptr(shape) as usize;
         if e.text.get() == t && e.shape.get() == p && e.slot.get() == slot {
@@ -292,7 +360,7 @@ impl Realm {
                 p.watch();
             }
         }
-        let memo = self.key_text.get_or_init(Box::default);
+        let memo = self.key_text_memo();
         let e = &memo.entries[t.index()];
         e.text.set(t);
         e.slot.set(ABSENT);
