@@ -11660,9 +11660,9 @@ mod tests {
         let mut realm = Realm::new();
         let leaf = realm.new_string("hi");
         assert_eq!(realm.string_leaf_bytes(leaf), Some(&b"hi"[..]));
-        // A concatenated rope (one too long to be joined into a single leaf)
-        // has no single backing slice.
-        let tail = "!".repeat(80);
+        // A concatenated rope (one too long to be joined into a single leaf
+        // or copied into an append buffer) has no single backing slice.
+        let tail = "!".repeat(5000);
         let joined = {
             let r = realm.heap.get(leaf).unwrap().as_str().unwrap().clone();
             realm.heap.alloc(Cell::Str(r.concat(&Rope::leaf(&tail))))

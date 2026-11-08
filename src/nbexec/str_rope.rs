@@ -161,15 +161,15 @@ pub(crate) fn repeat_rope(s: &Rope, n: usize) -> Option<Rope> {
     let mut pow = block;
     while q > 0 {
         if q & 1 == 1 {
-            out = out.try_concat(&pow)?;
+            out = out.try_concat_shared(&pow)?;
         }
         q >>= 1;
         if q > 0 {
-            pow = pow.try_concat(&pow)?;
+            pow = pow.try_concat_shared(&pow)?;
         }
     }
     for _ in 0..r {
-        out = out.try_concat(s)?;
+        out = out.try_concat_shared(s)?;
     }
     Some(out)
 }

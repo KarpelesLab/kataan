@@ -201,6 +201,11 @@ impl BuildBuf {
 /// `Concat` instead, so `big + x` made over and over never copies `big`).
 const BUILD_SEED_MAX: usize = 1024;
 
+/// The longest right side that starts a [`Node::Build`] chain (with a left
+/// side of at most [`BUILD_SEED_MAX`]): a new chain is a guess that more
+/// appends follow, so what it copies up front stays small.
+const BUILD_SEED_RIGHT_MAX: usize = 256;
+
 /// Right sides up to this long are always copied into an append buffer; a
 /// longer one only when it is no longer than the left side (so the copy is
 /// amortized by the doubling, not a duplicate of a huge shared string).
@@ -654,17 +659,42 @@ impl Rope {
     /// when the result would overflow `usize` or exceed the cap — the caller
     /// turns that into a `RangeError("Invalid string length")` rather than
     /// corrupting the cached length or OOM-ing on materialization.
+    ///
+    /// The concatenation of a program's `+`: a short right side may be
+    /// copied into an append buffer (see [`BuildBuf`]), which a growing
+    /// chain of such steps amortizes. Code assembling a new string from
+    /// pieces of existing ones (a slice of a tree, `repeat`) uses
+    /// [`try_concat_shared`](Self::try_concat_shared), which never copies.
     #[must_use]
     pub fn try_concat(&self, other: &Rope) -> Option<Rope> {
+        self.concat_with(other, true)
+    }
+
+    /// [`try_concat`](Self::try_concat) without append buffers: long sides
+    /// are always shared by a `Concat`, so building a string from `k`
+    /// pieces costs O(k) however long they are (`try_concat` could copy a
+    /// right side up to the left's length into the left's buffer, which a
+    /// one-off assembly repeated per step, `s = s.slice(1)` over a tree,
+    /// would pay in full every time).
+    #[must_use]
+    pub fn try_concat_shared(&self, other: &Rope) -> Option<Rope> {
+        self.concat_with(other, false)
+    }
+
+    /// [`try_concat`](Self::try_concat), through an append buffer when
+    /// `build`.
+    #[inline]
+    fn concat_with(&self, other: &Rope, build: bool) -> Option<Rope> {
         // The step of a `s += x` loop: `self` the last string of its append
         // buffer and `other` a short flat string that fits behind it and does
         // not begin with a surrogate (which could pair at the seam), so the
         // general checks below all pass and `build_append` writes in place.
-        if let Node::Build {
-            buf,
-            len: at,
-            u16_len: lu,
-        } = &*self.0
+        if build
+            && let Node::Build {
+                buf,
+                len: at,
+                u16_len: lu,
+            } = &*self.0
             && let Some(b) = other.0.flat_bytes()
             && let [first, ..] = *b
             && first != 0xED
@@ -745,7 +775,7 @@ impl Rope {
                 core::cell::Cell::new(u16_len.unwrap_or(U16_LEN_UNKNOWN)),
             ))));
         }
-        if let Some(r) = self.build_append(other, len, u16_len) {
+        if build && let Some(r) = self.build_append(other, len, u16_len) {
             return Some(r);
         }
         Some(Rope(Rc::new(Node::Concat {
@@ -797,7 +827,8 @@ impl Rope {
             }
             Node::Small { .. } | Node::Leaf(..) | Node::Slice { .. } => {
                 let a = self.0.flat_bytes()?;
-                (a.len() <= BUILD_SEED_MAX).then(|| fresh(a, u16_len))
+                (a.len() <= BUILD_SEED_MAX && b.len() <= BUILD_SEED_RIGHT_MAX)
+                    .then(|| fresh(a, u16_len))
             }
             Node::Concat {
                 left,
@@ -960,7 +991,7 @@ impl Rope {
                 }
                 _ => n.slice_units(a, b)?,
             };
-            out = out.try_concat(&piece)?;
+            out = out.try_concat_shared(&piece)?;
         }
         Some(out)
     }
@@ -1122,9 +1153,10 @@ impl Rope {
         // surrogate beside the whole characters (the concatenation keeps the
         // canonical form; nothing here can pair).
         let lone = |u: Option<u16>| u.map(|u| Rope::from_wtf8(wtf8::from_utf16(&[u])));
-        let mut out = lone(r.lead).unwrap_or_default().concat(&mid);
+        let join = |a: &Rope, b: &Rope| a.try_concat_shared(b).unwrap_or_else(|| a.clone());
+        let mut out = join(&lone(r.lead).unwrap_or_default(), &mid);
         if let Some(t) = lone(r.trail) {
-            out = out.concat(&t);
+            out = join(&out, &t);
         }
         Some((out, at))
     }
