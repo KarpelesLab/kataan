@@ -3125,7 +3125,8 @@ impl X64Assembler {
     }
 
     /// From a string's slot in `rcx`: `rcx` = its bytes, `rdx` = its byte
-    /// length, when it is a leaf or an append buffer's string whose UTF-16
+    /// length, when it is a leaf, a short string held in its node or an
+    /// append buffer's string whose UTF-16
     /// length is known and equal to that (so every byte is one ASCII unit);
     /// else to `miss`. Clobbers `r11`.
     pub(crate) fn p_flat_ascii(&mut self, l: &JitLayout, miss: Label) {
@@ -3140,6 +3141,18 @@ impl X64Assembler {
         self.g_load(r::RCX, r::RCX, l.rope.leaf_ptr);
         self.jmp(have);
         self.bind(not_leaf);
+        // A short string held in its node: its bytes are inline, and its
+        // UTF-16 length memo (a byte, never a length while unknown) equals
+        // its byte length exactly when it is all ASCII.
+        let not_small = self.new_label();
+        self.g_cmp_byte_imm(r::RCX, l.rope.tag, l.rope.small_tag);
+        self.g_jcc(cc::NE, not_small);
+        self.p_load_u8_rdx(r::RCX, l.rope.small_len);
+        self.g_mem(false, &[0x3a], r::RDX, r::RCX, l.rope.small_u16); // cmp dl, [rcx + u16]
+        self.g_jcc(cc::NE, miss);
+        self.g_lea(r::RCX, r::RCX, l.rope.small_buf);
+        self.jmp(have);
+        self.bind(not_small);
         self.g_cmp_byte_imm(r::RCX, l.rope.tag, l.rope.build_tag);
         self.g_jcc(cc::NE, miss);
         self.g_load(r::RDX, r::RCX, l.rope.build_len);
