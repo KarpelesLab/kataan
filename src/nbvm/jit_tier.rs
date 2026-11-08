@@ -1845,7 +1845,7 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             b,
         } => ctx
             .realm
-            .has_property_by_string(regs[*a as usize], regs[*b as usize])
+            .has_property_by_string_noting(regs[*a as usize], regs[*b as usize])
             .map(|r| {
                 regs[*dst as usize] = NanBox::boolean(r);
                 Ok(())

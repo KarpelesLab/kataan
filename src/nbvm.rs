@@ -6942,8 +6942,24 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
     // The rest of `own_data_by_string` (for a key that is not a Number,
     // `vm_get_elem`'s first answer), which then need not run again.
     let own_done = !key.is_number();
-    if own_done && let Some(v) = ctx.realm.own_data_missed(recv, key) {
-        return v.to_bits();
+    if own_done {
+        // A key of a memoized text (`realm::text_memo`): an own data slot,
+        // or a key on no object of an ordinary chain (`undefined`).
+        match ctx.realm.key_text_probe(recv, key) {
+            Some(crate::realm::TextHit::Slot(o, slot)) => {
+                if let Some(v) = o.slot(slot) {
+                    return v.to_bits();
+                }
+            }
+            Some(crate::realm::TextHit::Absent) => return NanBox::undefined().to_bits(),
+            None => {}
+        }
+        if let Some(v) = ctx.realm.own_data_lookup(recv, key) {
+            return v.to_bits();
+        }
+        if ctx.realm.key_text_note_absent(recv, key) {
+            return NanBox::undefined().to_bits();
+        }
     }
     // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
     #[allow(unsafe_code)]
@@ -9419,8 +9435,9 @@ fn run_frame_at_ic(
                     instance_of_fast(&mut ctx.realm, x, y)
                 } else {
                     // `key in obj` over an ordinary chain (a `for-in`'s
-                    // per-key liveness check among others).
-                    ctx.realm.has_property_by_string(x, y)
+                    // per-key liveness check among others); an absent key
+                    // is memoized for the next ask.
+                    ctx.realm.has_property_by_string_noting(x, y)
                 } {
                     regs[*dst as usize] = NanBox::boolean(r);
                     continue;

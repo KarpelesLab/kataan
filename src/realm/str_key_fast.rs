@@ -138,6 +138,14 @@ impl Realm {
     /// the memo missed (noted for the next write or read).
     #[inline(never)]
     fn own_data_set_missed(&self, obj: NanBox, key: NanBox) -> Option<u32> {
+        // A key of the same text, memoized (`text_memo`); this String's
+        // own slot memo entry is noted as a lookup's would be.
+        if let Some(super::TextHit::Slot(o, slot)) = self.key_text_probe(obj, key) {
+            if let Some(shape) = o.shaped_shape() {
+                self.key_memo_note(key, shape, slot);
+            }
+            return o.plain_slot_store_ok().then_some(slot);
+        }
         let k = self.string_key_in_place(key)?;
         // (A mapped `arguments` object's index write aliases a parameter.)
         let o = self.ordinary_props(Handle::from_raw(obj.as_handle()?), true)?;
@@ -147,6 +155,9 @@ impl Realm {
         let shape = o.shaped_shape()?;
         let slot = shape.lookup(k)?;
         self.key_memo_note(key, shape, slot);
+        if o.has_no_accessors() {
+            self.key_text_note(key, shape, slot);
+        }
         Some(slot)
     }
 
@@ -166,6 +177,21 @@ impl Realm {
     #[must_use]
     #[inline(never)]
     pub(crate) fn own_data_missed(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
+        // A key of the same text, memoized (`text_memo`).
+        if let Some(super::TextHit::Slot(o, slot)) = self.key_text_probe(obj, key) {
+            if let Some(shape) = o.shaped_shape() {
+                self.key_memo_note(key, shape, slot);
+            }
+            return o.slot(slot);
+        }
+        self.own_data_lookup(obj, key)
+    }
+
+    /// [`own_data_missed`](Self::own_data_missed) once the text memo
+    /// missed too.
+    #[must_use]
+    #[inline(never)]
+    pub(crate) fn own_data_lookup(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
         let k = self.string_key_in_place(key)?;
         let o = self.ordinary_props(Handle::from_raw(obj.as_handle()?), true)?;
         if o.accessor(k).is_some() {
@@ -178,6 +204,7 @@ impl Realm {
             let slot = shape.lookup(k)?;
             if o.has_no_accessors() {
                 self.key_memo_note(key, shape, slot);
+                self.key_text_note(key, shape, slot);
             }
             return o.slot(slot);
         }
@@ -247,6 +274,17 @@ impl Realm {
         if self.key_memo_probe(obj, key).is_some() {
             return Some(true);
         }
+        // A key of the same text, memoized (`text_memo`), present or absent.
+        match self.key_text_probe(obj, key) {
+            Some(super::TextHit::Slot(o, slot)) => {
+                if let Some(shape) = o.shaped_shape() {
+                    self.key_memo_note(key, shape, slot);
+                }
+                return Some(true);
+            }
+            Some(super::TextHit::Absent) => return Some(false),
+            None => {}
+        }
         let k = self.string_key_in_place(key)?;
         let h = Handle::from_raw(obj.as_handle()?);
         // The receiver itself (`has_property_named`'s first link): an own
@@ -259,6 +297,7 @@ impl Realm {
             if let Some(slot) = shape.lookup(k) {
                 if o.has_no_accessors() && !shape.is_wrapper() && !self.has_argument_map_marker(h) {
                     self.key_memo_note(key, shape, slot);
+                    self.key_text_note(key, shape, slot);
                 }
                 return Some(true);
             }
@@ -274,6 +313,25 @@ impl Realm {
         }
     }
 
+    /// [`has_property_by_string`](Self::has_property_by_string), whose
+    /// answer that the key is absent is memoized for the next ask
+    /// (`text_memo`) unless the memo gave it.
+    #[must_use]
+    pub(crate) fn has_property_by_string_noting(
+        &mut self,
+        key: NanBox,
+        obj: NanBox,
+    ) -> Option<bool> {
+        if matches!(self.key_text_probe(obj, key), Some(super::TextHit::Absent)) {
+            return Some(false);
+        }
+        let r = self.has_property_by_string(key, obj);
+        if r == Some(false) {
+            self.key_text_note_absent(obj, key);
+        }
+        r
+    }
+
     /// [`has_property_by_string`](Self::has_property_by_string) where the
     /// key is likely a `for-in`'s (the loop's per-key liveness check): a key
     /// String of its list on an object of the list's layout is an own key
@@ -283,12 +341,12 @@ impl Realm {
         not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
         allow(dead_code)
     )]
-    pub(crate) fn has_property_by_for_in_key(&self, key: NanBox, obj: NanBox) -> Option<bool> {
+    pub(crate) fn has_property_by_for_in_key(&mut self, key: NanBox, obj: NanBox) -> Option<bool> {
         if self.for_in_key_slot(obj, key).is_some() || self.for_in_dict_own_key(obj, key).is_some()
         {
             return Some(true);
         }
-        self.has_property_by_string(key, obj)
+        self.has_property_by_string_noting(key, obj)
     }
 
     /// `HasProperty(h, key)` for a storage key `key`, when every object on
