@@ -5049,13 +5049,19 @@ pub struct X64Assembler {
         not(all(target_os = "linux", target_arch = "x86_64")),
         allow(dead_code)
     )]
+    /// Nested lazily pending activations (an inner level's inside its
+    /// enclosing one's body), outermost first; each with its inner level's
+    /// `save` slot (`call_seq::LazyPend`).
     #[allow(clippy::type_complexity)]
-    lazy_pend: Option<(Label, i32, Option<(i32, i32)>)>,
-    /// With `lazy_pend`: the activation's arguments still held in SSE
-    /// registers, as `(xmm, register-file disp)`, which a call in its body
-    /// stores first (`numeric::NumGen::guard_args`).
+    lazy_pend: Vec<(Label, i32, Option<(i32, i32)>, Option<i32>)>,
+    /// With `lazy_pend`: the activations' arguments still held in SSE
+    /// registers, as `(xmm, register-file disp)`, which a call in their
+    /// bodies stores first (`numeric::NumGen::guard_args`).
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     lazy_args: Vec<(u8, i32)>,
+    /// Per entry of `lazy_pend`, how many of `lazy_args` are its.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    lazy_args_at: Vec<usize>,
 }
 
 /// A `rel32` fixup: its operand's offset, its target label, and, for a
@@ -7910,24 +7916,52 @@ impl JitFunction {
         // Per outermost inlined call's guard, the pc of its `InlineLeave`
         // when its body is a straight-forward window a speculative loop's
         // fast version may keep its activation's pending marker out of
-        // memory in (`NumGen::lazy_pend`): no other guard, no backward
-        // branch (no back-edge poll, no loop header), no entry or catch.
+        // memory in (`NumGen::lazy_pend`): no backward branch (no back-edge
+        // poll, no loop header), no entry or catch, and no other guard but
+        // monomorphic ones of inner levels nested whole in it (the outer
+        // guard monomorphic too). Those inner guards get their own leave's
+        // pc: their activations are lazily pending where their enclosing
+        // one is.
         let lazy_leave: Vec<Option<usize>> = {
             let mut out = alloc::vec![None; ops.len()];
             let levels = inline_levels(ops);
+            // (Each guard's own `InlineLeave`, by nesting.)
+            let mut leave_of = alloc::vec![None; ops.len()];
+            let mut open: Vec<usize> = Vec::new();
+            for (p, op) in ops.iter().enumerate() {
+                match *op {
+                    GenericOp::InlineGuard { .. } => open.push(p),
+                    GenericOp::InlineLeave => {
+                        if let Some(g) = open.pop() {
+                            leave_of[g] = Some(p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             for g in 0..ops.len() {
                 if !matches!(ops[g], GenericOp::InlineGuard { .. }) || levels[g] != 1 {
                     continue;
                 }
                 let mut leave = None;
+                let mut inner: Vec<usize> = Vec::new();
                 for (p, op) in ops.iter().enumerate().skip(g + 1) {
                     if osr_entries.contains(&p) || catch_targets.binary_search(&p).is_ok() {
                         break;
                     }
                     match *op {
-                        GenericOp::InlineLeave => {
+                        GenericOp::InlineLeave
+                            if inner.iter().all(|&i| leave_of[i].is_some_and(|q| q < p)) =>
+                        {
                             leave = Some(p);
                             break;
+                        }
+                        GenericOp::InlineLeave => {}
+                        GenericOp::InlineGuard { poly: 0, .. }
+                            if leave_of[p].is_some()
+                                && matches!(ops[g], GenericOp::InlineGuard { poly: 0, .. }) =>
+                        {
+                            inner.push(p);
                         }
                         GenericOp::InlineGuard { .. }
                         | GenericOp::PushHandler { .. }
@@ -7940,7 +7974,13 @@ impl JitFunction {
                         _ => {}
                     }
                 }
-                out[g] = leave;
+                let Some(l) = leave.filter(|&l| leave_of[g] == Some(l)) else {
+                    continue;
+                };
+                out[g] = Some(l);
+                for i in inner {
+                    out[i] = leave_of[i];
+                }
             }
             out
         };
@@ -9179,9 +9219,9 @@ impl JitFunction {
         // (After the copy's labels: `NumGen::roc_folded` needs them.)
         num.plan_math_proofs(&provable);
         let sched = num.schedule(ops.len());
-        // The lazily pending activation whose body is being emitted:
-        // `(its guard, its leave, the pass)`.
-        let mut lazy_open: Option<(usize, usize, u8)> = None;
+        // The lazily pending activations whose bodies are being emitted,
+        // outermost first: `(its guard, its leave, the pass)`.
+        let mut lazy_open: Vec<(usize, usize, u8)> = Vec::new();
         for (si, &(op_idx, pass)) in sched.iter().enumerate() {
             let op = &ops[op_idx];
             // The op after a fused add run: where the run's fast path
@@ -9199,11 +9239,12 @@ impl JitFunction {
             a.dbg_op = Some(op_idx);
             // (A lazily pending activation's window is its body's ops in
             // the pass that emitted its guard.)
-            if let Some((g, l, p)) = lazy_open
-                && !(g < op_idx && op_idx <= l && p == pass)
+            if let Some(k) = lazy_open
+                .iter()
+                .position(|&(g, l, p)| !(g < op_idx && op_idx <= l && p == pass))
             {
-                lazy_open = None;
-                a.set_lazy_pend(None);
+                lazy_open.truncate(k);
+                a.truncate_lazy_pend(k);
             }
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
             a.set_recv_survive(survive.get(op_idx).cloned().unwrap_or_default(), layout);
@@ -9522,8 +9563,20 @@ impl JitFunction {
                     // leave for the plain copy inside the body sets it
                     // (`NumGen::lazy_pend`).
                     let slots0 = inl_slots.level(inl_level[op_idx])?;
+                    // (An inner level's guard, only inside its enclosing
+                    // level's lazily pending body, emitted in this pass.)
+                    let outermost = slots0.save.is_none();
                     let lazy = lazy_leave[op_idx].filter(|&l| {
-                        slots0.save.is_none() && num.in_spec(op_idx) && num.same_region(op_idx, l)
+                        num.in_spec(op_idx)
+                            && num.same_region(op_idx, l)
+                            && if outermost {
+                                lazy_open.is_empty()
+                            } else {
+                                lazy_open
+                                    .last()
+                                    .is_some_and(|&(g, gl, p)| g < op_idx && l < gl && p == pass)
+                                    && lazy_open.len() + 1 == usize::from(inl_level[op_idx])
+                            }
                     });
                     // (The arguments a promoted loop keeps in SSE registers,
                     // into the register file for the activation: a lazily
@@ -9557,9 +9610,9 @@ impl JitFunction {
                     // marker is left unset and it loads no captures.) The
                     // guard's own code, which runs once per run, goes out
                     // of line.
-                    let run_proof = num
-                        .guard_run_proof(op_idx)
-                        .filter(|_| cold_miss.is_some() && lazy.is_some() && n_caps == 0);
+                    let run_proof = num.guard_run_proof(op_idx).filter(|_| {
+                        cold_miss.is_some() && lazy.is_some() && outermost && n_caps == 0
+                    });
                     let run_proven = a.new_label();
                     let run_cold = match run_proof {
                         Some(slot) => {
@@ -9652,10 +9705,11 @@ impl JitFunction {
                         // slot as it was: a leave or a call in the body sets
                         // it from the proof's.)
                         let copy = run_proof.map(|slot| (slot, slots0.callee));
-                        num.note_lazy(op_idx, l, stub, slots0.pend, copy);
-                        a.set_lazy_pend(Some((stub, slots0.pend, copy)));
-                        a.set_lazy_args(lazy_args.iter().map(|&(x, r)| (x, disp(r))).collect());
-                        lazy_open = Some((op_idx, l, pass));
+                        num.note_lazy(op_idx, l, stub, slots0.pend, copy, slots0.save);
+                        let args: Vec<(u8, i32)> =
+                            lazy_args.iter().map(|&(x, r)| (x, disp(r))).collect();
+                        a.push_lazy_pend((stub, slots0.pend, copy, slots0.save), &args);
+                        lazy_open.push((op_idx, l, pass));
                     }
                     inline_stubs.push((
                         stub,
@@ -9672,9 +9726,12 @@ impl JitFunction {
                         // (A lazily pending one's marker was never set: a
                         // leave sets it on its way out, a call in the
                         // body first, and materializing empties it.)
-                        if lazy_open.is_some_and(|(_, l, p)| l == op_idx && p == pass) {
-                            lazy_open = None;
-                            a.set_lazy_pend(None);
+                        if lazy_open
+                            .last()
+                            .is_some_and(|&(_, l, p)| l == op_idx && p == pass)
+                        {
+                            lazy_open.pop();
+                            a.truncate_lazy_pend(lazy_open.len());
                         } else {
                             call_seq::emit_inline_leave_pending(&mut a, &s);
                         }
@@ -13907,7 +13964,7 @@ impl JitFunction {
             return None;
         }
         // (No inlined body's window reaches the out-of-line code.)
-        a.set_lazy_pend(None);
+        a.truncate_lazy_pend(0);
         // (The out-of-line code below keeps no way across its calls.)
         a.set_recv_survive(Vec::new(), layout);
         num.set_copy(false);

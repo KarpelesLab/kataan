@@ -2509,9 +2509,11 @@ impl InlineEmit<'_> {
 /// (`X64Assembler::lazy_pend_store`).
 pub(crate) type CalleeCopy = Option<(i32, i32)>;
 
-/// A lazily pending activation (`X64Assembler::set_lazy_pend`): its
-/// materialization stub, its marker's slot and its callee copy.
-pub(crate) type LazyPend = (Label, i32, CalleeCopy);
+/// A lazily pending activation (`X64Assembler::push_lazy_pend`): its
+/// materialization stub, its marker's slot, its callee copy and, for an
+/// inner level, its `save` slot (which, made pending, holds the enclosing
+/// level's stub: [`InlineSlots::save`]).
+pub(crate) type LazyPend = (Label, i32, CalleeCopy, Option<i32>);
 
 /// A method guard's proof (`InlineEmit::mproved`, `rbp`-relative slots):
 /// the receiver value whose lookup its memo answered (`bits`, one of the
@@ -2950,7 +2952,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     // 5. Pending, its captures in the inlined body's registers. (An inner
     //    level's activation keeps what `pend` held: the outer one's stub,
     //    or `0` when that one is materialized.)
-    if let Some(save) = e.slots.save {
+    if let Some(save) = e.slots.save.filter(|_| !e.lazy_pend) {
         let keep = a.new_label();
         a.g_load(r::RAX, RBP, e.slots.pend);
         a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
@@ -3417,13 +3419,14 @@ impl X64Assembler {
     /// empty { call [rbp + pend] }` (see [`emit_inline_guard`]). Changes no
     /// register.
     pub(crate) fn inline_frame_hook(&mut self) {
-        // (A lazily pending activation is pending from here: its marker
-        // first, `rax` kept.)
-        if let Some((stub, d, copy)) = self.lazy_pend {
+        // (Lazily pending activations are pending from here: their
+        // markers first, outermost first, `rax` kept.)
+        if !self.lazy_pend.is_empty() {
             for (x, d) in self.lazy_args.clone() {
                 self.movsd_mem_x(d, x);
             }
-            self.lazy_pend_store(stub, d, copy);
+            let levels: alloc::vec::Vec<LazyPend> = self.lazy_pend.clone();
+            self.lazy_pend_store(&levels);
         }
         if let Some(d) = self.inline_pend {
             // cmp qword [rbp+d], -1 ; je +7 ; call qword [rbp+d] (7 bytes)
@@ -3434,32 +3437,50 @@ impl X64Assembler {
         }
     }
 
-    /// Sets the lazily pending activation of the code emitted next (see
-    /// the `lazy_pend` field).
-    pub(crate) fn set_lazy_pend(&mut self, p: Option<LazyPend>) {
-        self.lazy_pend = p;
-        self.lazy_args.clear();
+    /// Makes the code emitted next lie in one more (inner) lazily pending
+    /// activation (see the `lazy_pend` field), with its arguments still in
+    /// SSE registers (`(xmm, register-file disp)`, see the `lazy_args`
+    /// field).
+    pub(crate) fn push_lazy_pend(&mut self, p: LazyPend, args: &[(u8, i32)]) {
+        self.lazy_pend.push(p);
+        self.lazy_args.extend_from_slice(args);
+        self.lazy_args_at.push(args.len());
     }
 
-    /// Sets the lazily pending activation's arguments still in SSE
-    /// registers (see the `lazy_args` field), after [`set_lazy_pend`](Self::set_lazy_pend).
-    pub(crate) fn set_lazy_args(&mut self, args: alloc::vec::Vec<(u8, i32)>) {
-        self.lazy_args = args;
+    /// Keeps only the outermost `n` lazily pending activations of the code
+    /// emitted next (`0`: none).
+    pub(crate) fn truncate_lazy_pend(&mut self, n: usize) {
+        while self.lazy_pend.len() > n {
+            self.lazy_pend.pop();
+            let k = self.lazy_args_at.pop().unwrap_or(0);
+            let len = self.lazy_args.len().saturating_sub(k);
+            self.lazy_args.truncate(len);
+        }
     }
 
-    /// `[rbp + d] = &stub`, every register and the flags kept (`push rax;
-    /// lea rax, [rip + stub]; mov [rbp + d], rax; pop rax`): a lazily
-    /// pending activation's marker, set. With `copy` (`(from, to)`), the
+    /// Per lazily pending activation of `levels` (outermost first), as its
+    /// guard would have left it made pending: `[rbp + d] = &stub`, an inner
+    /// level's `save` first set to the enclosing level's stub — every
+    /// register and the flags kept (`push rax; lea rax, [rip + stub]; mov
+    /// [rbp + d], rax; pop rax`). With `copy` (`(from, to)`), the
     /// activation's callee value first, from a run-proved guard's slot into
     /// the callee slot (`numeric::plan_run_proofs`).
-    pub(crate) fn lazy_pend_store(&mut self, stub: Label, d: i32, copy: CalleeCopy) {
+    pub(crate) fn lazy_pend_store(&mut self, levels: &[LazyPend]) {
         self.code.push(0x50);
-        if let Some((from, to)) = copy {
-            self.g_load(r::RAX, RBP, from);
-            self.g_store(RBP, to, r::RAX);
+        let mut outer: Option<Label> = None;
+        for &(stub, d, copy, save) in levels {
+            if let Some((from, to)) = copy {
+                self.g_load(r::RAX, RBP, from);
+                self.g_store(RBP, to, r::RAX);
+            }
+            if let (Some(save), Some(o)) = (save, outer) {
+                self.g_lea_label(r::RAX, o);
+                self.g_store(RBP, save, r::RAX);
+            }
+            self.g_lea_label(r::RAX, stub);
+            self.g_store(RBP, d, r::RAX);
+            outer = Some(stub);
         }
-        self.g_lea_label(r::RAX, stub);
-        self.g_store(RBP, d, r::RAX);
         self.code.push(0x58);
     }
 

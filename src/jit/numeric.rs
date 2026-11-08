@@ -1097,8 +1097,18 @@ pub(super) struct NumGen {
     stubs: Vec<Stub>,
     /// The lazily pending activations ([`NumGen::note_lazy`]): `(guard pc,
     /// leave pc, in the integer version, materialization stub, marker
-    /// slot)`.
-    lazy: Vec<(usize, usize, bool, Label, i32, super::call_seq::CalleeCopy)>,
+    /// slot, callee copy, an inner level's `save` slot)`, an enclosing
+    /// level's before its inner levels'.
+    #[allow(clippy::type_complexity)]
+    lazy: Vec<(
+        usize,
+        usize,
+        bool,
+        Label,
+        i32,
+        super::call_seq::CalleeCopy,
+        Option<i32>,
+    )>,
     /// The lazily pending activations' arguments left in SSE registers
     /// ([`NumGen::guard_args`]): `(guard pc, leave pc, in the integer
     /// version, (xmm, register) each)`.
@@ -3221,9 +3231,10 @@ impl NumGen {
         stub: Label,
         pend: i32,
         copy: super::call_seq::CalleeCopy,
+        save: Option<i32>,
     ) {
         let int = self.imode.is_some();
-        self.lazy.push((g, l, int, stub, pend, copy));
+        self.lazy.push((g, l, int, stub, pend, copy, save));
     }
 
     /// Before a leave of a fast version (`int`: the integer one) for op `pc`
@@ -3231,13 +3242,19 @@ impl NumGen {
     /// ([`note_lazy`](Self::note_lazy)) whose body `pc` lies in. Changes no
     /// register.
     pub(super) fn lazy_pend(&self, a: &mut X64Assembler, pc: usize, int: bool) {
-        if let Some(&(_, _, _, stub, d, copy)) = self
+        // (Nested ones, outermost first: their guards' order.)
+        let mut levels: Vec<(usize, super::call_seq::LazyPend)> = self
             .lazy
             .iter()
-            .find(|w| w.0 < pc && pc <= w.1 && w.2 == int)
-        {
-            a.lazy_pend_store(stub, d, copy);
+            .filter(|w| w.0 < pc && pc <= w.1 && w.2 == int)
+            .map(|&(g, _, _, stub, d, copy, save)| (g, (stub, d, copy, save)))
+            .collect();
+        if levels.is_empty() {
+            return;
         }
+        levels.sort_by_key(|w| w.0);
+        let levels: Vec<super::call_seq::LazyPend> = levels.into_iter().map(|w| w.1).collect();
+        a.lazy_pend_store(&levels);
     }
 
     pub(super) fn in_spec(&self, pc: usize) -> bool {
