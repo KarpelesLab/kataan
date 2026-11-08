@@ -3072,31 +3072,54 @@ impl X64Assembler {
         self.g_jcc(cc::E, slow);
         self.jmp(got);
         // A concatenation whose total is memoized.
+        let not_concat = self.new_label();
         self.bind(not_small);
         self.g_cmp_byte_imm(r::R11, l.rope.tag, l.rope.concat_tag);
-        self.g_jcc(cc::NE, slow);
+        self.g_jcc(cc::NE, not_concat);
         self.g_load(r::RAX, r::R11, l.rope.concat_u16);
+        self.code.extend_from_slice(&[0x48, 0x83, 0xf8, 0xff]);
+        self.g_jcc(cc::E, slow);
+        self.jmp(got);
+        // An append buffer's string whose length is memoized.
+        self.bind(not_concat);
+        self.g_cmp_byte_imm(r::R11, l.rope.tag, l.rope.build_tag);
+        self.g_jcc(cc::NE, slow);
+        self.g_load(r::RAX, r::R11, l.rope.build_u16);
         self.code.extend_from_slice(&[0x48, 0x83, 0xf8, 0xff]);
         self.g_jcc(cc::E, slow);
         self.jmp(got);
         self.bind(other);
     }
 
-    /// From a string's slot in `rcx`: `rcx` = its rope's node, `rdx` = its byte
-    /// length, when it is a leaf whose UTF-16 length is known and equal to that
-    /// (so every byte is one ASCII unit); else to `miss`.
+    /// From a string's slot in `rcx`: `rcx` = its bytes, `rdx` = its byte
+    /// length, when it is a leaf or an append buffer's string whose UTF-16
+    /// length is known and equal to that (so every byte is one ASCII unit);
+    /// else to `miss`. Clobbers `r11`.
     pub(crate) fn p_flat_ascii(&mut self, l: &JitLayout, miss: Label) {
+        let not_leaf = self.new_label();
+        let have = self.new_label();
         self.g_load(r::RCX, r::RCX, l.off_str_rope);
         self.g_cmp_byte_imm(r::RCX, l.rope.tag, l.rope.leaf_tag);
-        self.g_jcc(cc::NE, miss);
+        self.g_jcc(cc::NE, not_leaf);
         self.g_load(r::RDX, r::RCX, l.rope.leaf_len);
         self.g_cmp_mem(r::RDX, r::RCX, l.rope.leaf_u16);
         self.g_jcc(cc::NE, miss);
+        self.g_load(r::RCX, r::RCX, l.rope.leaf_ptr);
+        self.jmp(have);
+        self.bind(not_leaf);
+        self.g_cmp_byte_imm(r::RCX, l.rope.tag, l.rope.build_tag);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RDX, r::RCX, l.rope.build_len);
+        self.g_cmp_mem(r::RDX, r::RCX, l.rope.build_u16);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::R11, r::RCX, l.rope.build_buf);
+        self.g_load(r::RCX, r::R11, l.rope.build_data);
+        self.bind(have);
     }
 
-    /// `eax` = the byte at index `rax` of the leaf node in `rcx`.
-    pub(crate) fn p_byte_at(&mut self, l: &JitLayout) {
-        self.g_load(r::RCX, r::RCX, l.rope.leaf_ptr);
+    /// `eax` = the byte at index `rax` of the bytes at `rcx`
+    /// ([`p_flat_ascii`](Self::p_flat_ascii)'s).
+    pub(crate) fn p_byte_at(&mut self, _l: &JitLayout) {
         self.code.extend_from_slice(&[0x0f, 0xb6, 0x04, 0x01]); // movzx eax, byte [rcx + rax]
     }
 

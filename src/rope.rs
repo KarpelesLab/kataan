@@ -81,8 +81,8 @@ enum Node {
     Leaf(Box<[u8]>, core::cell::Cell<usize>),
     /// A contiguous run of another string's bytes: `base`'s bytes
     /// `[start, start + len)`, shared rather than copied (see
-    /// [`Rope::slice_units`]). `base` is always a `Leaf`, so a slice of a
-    /// slice points at the original buffer and reads stay one hop. The
+    /// [`Rope::slice_units`]). `base` is always a `Leaf` or a `Build`, so a
+    /// slice of a slice points at the original buffer and reads stay one hop. The
     /// UTF-16 length is memoized like a leaf's.
     Slice {
         base: Rope,
@@ -98,7 +98,116 @@ enum Node {
         len: usize,
         u16_len: core::cell::Cell<usize>,
     },
+    /// The first `len` bytes of a shared append buffer (see [`BuildBuf`]):
+    /// a flat string that a `s += x` loop extends in place, with its UTF-16
+    /// length memoized like a leaf's.
+    Build {
+        buf: Rc<BuildBuf>,
+        len: usize,
+        u16_len: core::cell::Cell<usize>,
+    },
 }
+
+/// The append-only byte buffer behind [`Node::Build`] ropes.
+///
+/// `s += x` in a loop makes each new string by appending to the last one. A
+/// tree of `Concat` nodes makes that O(1) per step, but the result is a long
+/// left spine that every later read walks and that has to be flattened (a
+/// full copy) before most uses. Here the strings of such a chain share one
+/// buffer instead: each holds a prefix of it (`len` bytes), and appending to
+/// the string that ends where the buffer's written part ends (`used`) writes
+/// the new bytes into the spare capacity behind it and makes a string of the
+/// longer prefix. Bytes below `used` are never written again, so every
+/// string's text is fixed; an append to any other string (an older prefix)
+/// or one that does not fit goes elsewhere (a fresh, larger buffer or a
+/// `Concat`). Growth doubles the capacity, so a loop's copying is amortized
+/// O(1) per appended byte, and every string of the chain is flat: its
+/// length, indexed reads and slices need no walk and no flattening.
+pub(crate) struct BuildBuf {
+    /// How many leading bytes of `data` are written (and immutable).
+    used: core::cell::Cell<usize>,
+    /// The buffer; `data.len()` is its capacity.
+    data: Box<[core::cell::UnsafeCell<u8>]>,
+}
+
+impl BuildBuf {
+    /// A buffer of capacity `cap` holding `a` then `b` (`a.len() + b.len()
+    /// <= cap`).
+    fn with(cap: usize, a: &[u8], b: &[u8]) -> Rc<BuildBuf> {
+        let used = a.len() + b.len();
+        debug_assert!(used <= cap);
+        let mut v: Vec<u8> = Vec::with_capacity(cap);
+        v.extend_from_slice(a);
+        v.extend_from_slice(b);
+        v.resize(cap, 0);
+        let raw = Box::into_raw(v.into_boxed_slice()) as *mut [core::cell::UnsafeCell<u8>];
+        // SAFETY: `UnsafeCell<u8>` is `repr(transparent)` over `u8`, so the
+        // boxed slice's layout (and its allocation's) is unchanged.
+        #[allow(unsafe_code)]
+        let data = unsafe { Box::from_raw(raw) };
+        Rc::new(BuildBuf {
+            used: core::cell::Cell::new(used),
+            data,
+        })
+    }
+
+    /// The first `len` bytes (`len <= used`).
+    #[inline]
+    fn bytes(&self, len: usize) -> &[u8] {
+        let len = len.min(self.used.get());
+        // SAFETY: `UnsafeCell<u8>` is `repr(transparent)` over `u8`, and the
+        // bytes below `used` are never written again (`append_at` writes only
+        // at and past `used`), so nothing mutates what this borrow covers.
+        #[allow(unsafe_code)]
+        unsafe {
+            core::slice::from_raw_parts(
+                core::cell::UnsafeCell::raw_get(self.data.as_ptr()).cast_const(),
+                len,
+            )
+        }
+    }
+
+    /// Appends `parts` at `at` when `at` is where the written part ends and
+    /// they fit the spare capacity: `true` then (`used` moves past them).
+    #[inline]
+    fn append_at(&self, at: usize, parts: &[&[u8]]) -> bool {
+        let n: usize = parts.iter().map(|p| p.len()).sum();
+        if at != self.used.get() || self.data.len() - at < n {
+            return false;
+        }
+        let mut to = at;
+        for p in parts {
+            // SAFETY: `[to, to + p.len())` is inside `data` (checked above)
+            // and at or past `used`, which no borrow from `bytes` reaches; `p`
+            // is some string's bytes, which lie below its own buffer's `used`
+            // (or in another allocation), so the ranges are disjoint.
+            #[allow(unsafe_code)]
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    p.as_ptr(),
+                    core::cell::UnsafeCell::raw_get(self.data.as_ptr().add(to)),
+                    p.len(),
+                );
+            }
+            to += p.len();
+        }
+        self.used.set(to);
+        true
+    }
+}
+
+/// The longest flat left side [`Rope::try_concat`] copies into a new append
+/// buffer to start a [`Node::Build`] chain (a longer one is shared by a
+/// `Concat` instead, so `big + x` made over and over never copies `big`).
+const BUILD_SEED_MAX: usize = 1024;
+
+/// Right sides up to this long are always copied into an append buffer; a
+/// longer one only when it is no longer than the left side (so the copy is
+/// amortized by the doubling, not a duplicate of a huge shared string).
+const BUILD_APPEND_MIN: usize = 4096;
+
+/// The smallest capacity of a new append buffer.
+const BUILD_MIN_CAP: usize = 128;
 
 /// Byte offsets within a rope's node, from the pointer a [`Rope`] holds, for
 /// compiled code reading a flat string (`jit::props`). Probed on live nodes.
@@ -122,6 +231,15 @@ pub(crate) struct RopeLayout {
     /// ([`U16_LEN_UNKNOWN`] until first asked).
     pub(crate) concat_tag: u8,
     pub(crate) concat_u16: i32,
+    /// The tag byte of a [`Node::Build`], its byte length, its memoized
+    /// UTF-16 length ([`U16_LEN_UNKNOWN`] until first asked) and its buffer's
+    /// pointer word (an `Rc`'s, as the node holds it).
+    pub(crate) build_tag: u8,
+    pub(crate) build_len: i32,
+    pub(crate) build_u16: i32,
+    pub(crate) build_buf: i32,
+    /// The buffer's byte pointer, from that pointer word's value.
+    pub(crate) build_data: i32,
 }
 
 /// Derives [`RopeLayout`].
@@ -130,7 +248,8 @@ pub(crate) struct RopeLayout {
 pub(crate) fn jit_rope_layout() -> RopeLayout {
     let long = [b'x'; SMALL_CAP + 9];
     let leaf = Rope::from_bytes(&long);
-    let other = Rope::from_bytes(&[b'y'; SMALL_CAP + 40]);
+    // (Longer than an append buffer copies, so the two make a `Concat`.)
+    let other = Rope::from_bytes(&[b'y'; BUILD_APPEND_MIN + 1]);
     let small = Rope::from_bytes(b"s");
     let concat = leaf.concat(&other);
     let value = Rc::as_ptr(&leaf.0) as usize;
@@ -187,6 +306,41 @@ pub(crate) fn jit_rope_layout() -> RopeLayout {
     let small_tag = tag_of(&small);
     let concat_tag = tag_of(&concat);
     assert!(small_tag != concat_tag, "distinct rope node tags");
+    // An append buffer's string: a short leaf and more.
+    let build = Rope::from_bytes(&[b'z'; SMALL_JOIN + 1]).concat(&small);
+    let Node::Build {
+        buf,
+        len: build_len,
+        u16_len: build_memo,
+    } = &*build.0
+    else {
+        unreachable!("a short leaf and more start an append buffer")
+    };
+    let build_tag = tag_of(&build);
+    assert!(
+        build_tag != leaf_tag && build_tag != small_tag && build_tag != concat_tag,
+        "distinct rope node tags"
+    );
+    let buf_word = core::ptr::addr_of!(*buf) as usize;
+    // SAFETY: the live `Rc`'s one word, in bounds of the node.
+    #[allow(unsafe_code)]
+    let buf_raw = unsafe { *(buf_word as *const usize) };
+    let data = core::ptr::addr_of!(buf.data) as usize;
+    let data_ptr = buf.bytes(0).as_ptr() as usize;
+    // SAFETY: the two words of the live boxed slice, in bounds.
+    #[allow(unsafe_code)]
+    let (d0, d1) = unsafe {
+        (
+            *(data as *const usize),
+            *((data + core::mem::size_of::<usize>()) as *const usize),
+        )
+    };
+    let data_at = if d0 == data_ptr {
+        data
+    } else {
+        assert!(d1 == data_ptr && d0 == buf.data.len());
+        data + core::mem::size_of::<usize>()
+    };
     RopeLayout {
         tag: base,
         leaf_tag,
@@ -197,6 +351,11 @@ pub(crate) fn jit_rope_layout() -> RopeLayout {
         small_u16: field_off(&small, core::ptr::addr_of!(*small_memo) as usize),
         concat_tag,
         concat_u16: field_off(&concat, core::ptr::addr_of!(*concat_memo) as usize),
+        build_tag,
+        build_len: field_off(&build, core::ptr::addr_of!(*build_len) as usize),
+        build_u16: field_off(&build, core::ptr::addr_of!(*build_memo) as usize),
+        build_buf: field_off(&build, buf_word),
+        build_data: i32::try_from(data_at - buf_raw).expect("an Rc's field offset"),
     }
 }
 
@@ -236,8 +395,10 @@ impl Node {
                 base, start, len, ..
             } => match &*base.0 {
                 Node::Leaf(s, _) => s.get(*start..*start + *len),
+                Node::Build { buf, len: blen, .. } => buf.bytes(*blen).get(*start..*start + *len),
                 _ => None,
             },
+            Node::Build { buf, len, .. } => Some(buf.bytes(*len)),
             Node::Concat { .. } => None,
         }
     }
@@ -352,7 +513,7 @@ impl Rope {
         match &*self.0 {
             Node::Small { len, .. } => usize::from(*len),
             Node::Leaf(s, _) => s.len(),
-            Node::Slice { len, .. } | Node::Concat { len, .. } => *len,
+            Node::Slice { len, .. } | Node::Concat { len, .. } | Node::Build { len, .. } => *len,
         }
     }
 
@@ -400,7 +561,7 @@ impl Rope {
                 cell.set(n);
                 return n;
             }
-            Node::Slice { u16_len, .. } => {
+            Node::Slice { u16_len, .. } | Node::Build { u16_len, .. } => {
                 let cached = u16_len.get();
                 if cached != U16_LEN_UNKNOWN {
                     return cached;
@@ -434,7 +595,7 @@ impl Rope {
                     cell.set(n);
                     total += n;
                 }
-                Node::Slice { .. } => total += node.utf16_len(),
+                Node::Slice { .. } | Node::Build { .. } => total += node.utf16_len(),
                 Node::Concat { left, right, .. } => {
                     stack.push(right);
                     stack.push(left);
@@ -463,9 +624,10 @@ impl Rope {
     fn u16_len_cell(&self) -> Option<&core::cell::Cell<usize>> {
         match &*self.0 {
             Node::Small { .. } => None,
-            Node::Leaf(_, u16_len) | Node::Slice { u16_len, .. } | Node::Concat { u16_len, .. } => {
-                Some(u16_len)
-            }
+            Node::Leaf(_, u16_len)
+            | Node::Slice { u16_len, .. }
+            | Node::Concat { u16_len, .. }
+            | Node::Build { u16_len, .. } => Some(u16_len),
         }
     }
 
@@ -476,6 +638,33 @@ impl Rope {
     /// corrupting the cached length or OOM-ing on materialization.
     #[must_use]
     pub fn try_concat(&self, other: &Rope) -> Option<Rope> {
+        // The step of a `s += x` loop: `self` the last string of its append
+        // buffer and `other` a short flat string that fits behind it and does
+        // not begin with a surrogate (which could pair at the seam), so the
+        // general checks below all pass and `build_append` writes in place.
+        if let Node::Build {
+            buf,
+            len: at,
+            u16_len: lu,
+        } = &*self.0
+            && let Some(b) = other.0.flat_bytes()
+            && let [first, ..] = *b
+            && first != 0xED
+            && b.len() <= BUILD_APPEND_MIN
+            && *at + b.len() <= MAX_STRING_LEN
+            && buf.append_at(*at, &[b])
+        {
+            let known = lu.get();
+            let u16_len = match other.utf16_len_if_cheap() {
+                Some(n) if known != U16_LEN_UNKNOWN => known + n,
+                _ => U16_LEN_UNKNOWN,
+            };
+            return Some(Rope(Rc::new(Node::Build {
+                buf: Rc::clone(buf),
+                len: *at + b.len(),
+                u16_len: core::cell::Cell::new(u16_len),
+            })));
+        }
         // Concatenating with empty just shares the non-empty side.
         if self.is_empty() {
             return Some(other.clone());
@@ -538,12 +727,87 @@ impl Rope {
                 core::cell::Cell::new(u16_len.unwrap_or(U16_LEN_UNKNOWN)),
             ))));
         }
+        if let Some(r) = self.build_append(other, len, u16_len) {
+            return Some(r);
+        }
         Some(Rope(Rc::new(Node::Concat {
             left: self.clone(),
             right: other.clone(),
             len,
             u16_len: core::cell::Cell::new(u16_len.unwrap_or(U16_LEN_UNKNOWN)),
         })))
+    }
+
+    /// `self + other` (`len` bytes, past [`SMALL_JOIN`], no surrogate pair
+    /// at the seam, UTF-16 length `u16_len` when known) through an append
+    /// buffer (see [`BuildBuf`]): in place behind `self` when it ends the
+    /// written part of its buffer and `other` fits, in a fresh buffer of
+    /// twice the length when `self` is that last string but the buffer is
+    /// full or `self` is a short flat string, and as a `Concat` whose right
+    /// side is so extended when `self` is a `Concat` ending in such a
+    /// string. `None` (a plain `Concat`) otherwise, or when `other` is not
+    /// flat or is long (see [`BUILD_APPEND_MIN`]).
+    fn build_append(&self, other: &Rope, len: usize, u16_len: Option<usize>) -> Option<Rope> {
+        let b = other.0.flat_bytes()?;
+        if b.len() > BUILD_APPEND_MIN.max(self.len()) {
+            return None;
+        }
+        let u16_len = core::cell::Cell::new(u16_len.unwrap_or(U16_LEN_UNKNOWN));
+        let fresh = |a: &[u8], u16_len| {
+            let cap = len
+                .saturating_mul(2)
+                .max(BUILD_MIN_CAP)
+                .min(MAX_STRING_LEN.max(len));
+            Rope(Rc::new(Node::Build {
+                buf: BuildBuf::with(cap, a, b),
+                len,
+                u16_len,
+            }))
+        };
+        match &*self.0 {
+            Node::Build { buf, len: at, .. } => {
+                if buf.append_at(*at, &[b]) {
+                    return Some(Rope(Rc::new(Node::Build {
+                        buf: Rc::clone(buf),
+                        len,
+                        u16_len,
+                    })));
+                }
+                // The last string of a full buffer: a bigger one. (An older
+                // prefix is shared by a `Concat`.)
+                (*at == buf.used.get()).then(|| fresh(buf.bytes(*at), u16_len))
+            }
+            Node::Small { .. } | Node::Leaf(..) | Node::Slice { .. } => {
+                let a = self.0.flat_bytes()?;
+                (a.len() <= BUILD_SEED_MAX).then(|| fresh(a, u16_len))
+            }
+            Node::Concat {
+                left,
+                right,
+                u16_len: _,
+                len: _,
+            } => {
+                // (`right` + `other` cannot pair surrogates: `self` + `other`
+                // did not.)
+                let rlen = right.len() + b.len();
+                let ru16 = right
+                    .utf16_len_if_cheap()
+                    .and_then(|x| Some(x + other.utf16_len_if_cheap()?));
+                let joined = match &*right.0 {
+                    Node::Build { .. } => right.build_append(other, rlen, ru16)?,
+                    Node::Small { .. } | Node::Leaf(..) if right.len() <= BUILD_SEED_MAX => {
+                        right.build_append(other, rlen, ru16)?
+                    }
+                    _ => return None,
+                };
+                Some(Rope(Rc::new(Node::Concat {
+                    left: left.clone(),
+                    right: joined,
+                    len,
+                    u16_len,
+                })))
+            }
+        }
     }
 
     /// The UTF-16 length when it costs (nearly) nothing: memoized already, or
@@ -856,7 +1120,7 @@ impl Rope {
         }
         let (base, base_start) = match &*self.0 {
             Node::Slice { base, start, .. } => (base, *start),
-            Node::Leaf(..) => (self, 0),
+            Node::Leaf(..) | Node::Build { .. } => (self, 0),
             _ => return Rope::from_bytes(&bytes[b0..b1]),
         };
         if len < SLICE_SHARE_MIN || len.saturating_mul(SLICE_SHARE_RATIO) < base.len() {
@@ -1075,6 +1339,17 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
 
+    /// `a` and `b` joined by a `Concat` node whatever their lengths (what
+    /// `concat` makes of long or non-flat sides), for tests of tree walks.
+    fn cat(a: &Rope, b: &Rope) -> Rope {
+        Rope(Rc::new(Node::Concat {
+            left: a.clone(),
+            right: b.clone(),
+            len: a.len() + b.len(),
+            u16_len: core::cell::Cell::new(U16_LEN_UNKNOWN),
+        }))
+    }
+
     #[test]
     fn slices_share_long_results_and_stay_exact() {
         let base = Rope::leaf(&"0123456789".repeat(20));
@@ -1104,7 +1379,7 @@ mod tests {
         ));
         // A whole-range slice is the receiver itself; a Concat has no slice.
         assert!(base.slice_units(0, 999).unwrap().ptr_eq(&base));
-        assert!(base.concat(&base).slice_units(0, 1).is_none());
+        assert!(cat(&base, &base).slice_units(0, 1).is_none());
         // Non-ASCII and split astral pairs.
         let s = Rope::from_wtf8(crate::wtf8::from_utf16(
             &"a\u{e9}\u{1F600}b"
@@ -1139,7 +1414,7 @@ mod tests {
         // flattens that subtree).
         let hi = Rope::from_wtf8(crate::wtf8::from_utf16(&[0xD83D]));
         let lo = Rope::from_wtf8(crate::wtf8::from_utf16(&[0xDE01]));
-        let r = a.concat(&b).concat(&a.concat(&hi).concat(&lo.concat(&b)));
+        let r = cat(&cat(&a, &b), &a.concat(&hi).concat(&lo.concat(&b)));
         let flat = r.materialize_bytes();
         let units: Vec<u16> = crate::wtf8::utf16_units(&flat).collect();
         assert_eq!(r.utf16_len(), units.len());
@@ -1172,7 +1447,7 @@ mod tests {
         assert!(a.slice_units_tree(0, 3).is_none());
         let mut deep = Rope::leaf(&"x".repeat(100));
         for _ in 0..200 {
-            deep = deep.concat(&Rope::leaf(&"y".repeat(100)));
+            deep = cat(&deep, &Rope::leaf(&"y".repeat(100)));
         }
         assert!(deep.slice_units_tree(0, 3).is_none());
         assert_eq!(
@@ -1181,6 +1456,69 @@ mod tests {
                 .materialize(),
             "y".repeat(110)
         );
+    }
+
+    #[test]
+    fn append_buffers_extend_in_place_and_keep_every_prefix() {
+        // A `+=` loop: every step flat, the buffer shared, older strings fixed.
+        let mut s = Rope::new();
+        let mut kept = Vec::new();
+        let mut want = String::new();
+        for i in 0..2000 {
+            let piece = alloc::format!("{i},");
+            s = s.concat(&Rope::leaf(&piece));
+            want.push_str(&piece);
+            assert_eq!(s.len(), want.len());
+            if i % 97 == 0 {
+                kept.push((s.clone(), want.clone()));
+            }
+        }
+        assert!(s.as_leaf_bytes().is_some());
+        assert!(matches!(*s.0, Node::Build { .. }));
+        assert_eq!(s.materialize(), want);
+        assert_eq!(s.utf16_len(), want.len());
+        // Appending to an older prefix leaves the newer strings alone.
+        for (k, w) in &kept {
+            assert_eq!(k.materialize(), *w);
+            let forked = k.concat(&Rope::leaf("FORK"));
+            assert_eq!(forked.materialize(), alloc::format!("{w}FORK"));
+            assert_eq!(k.materialize(), *w);
+        }
+        assert_eq!(s.materialize(), want);
+        // The newest string's buffer, appended to twice: the second shares.
+        let a = s.concat(&Rope::leaf("A"));
+        let b = s.concat(&Rope::leaf("B"));
+        assert_eq!(a.materialize(), alloc::format!("{want}A"));
+        assert_eq!(b.materialize(), alloc::format!("{want}B"));
+        // Self-append (of the newest string, `a`) and slices of a buffer's
+        // string.
+        let d = a.concat(&a);
+        let dd = alloc::format!("{want}A{want}A");
+        assert_eq!(d.materialize(), dd);
+        assert!(matches!(*d.0, Node::Build { .. }));
+        let sl = d.slice_units(3, d.len() - 3).unwrap();
+        assert_eq!(sl.materialize(), dd[3..d.len() - 3]);
+        assert!(matches!(*sl.0, Node::Slice { .. }));
+        // A long prefix shared by a `Concat` whose right side is extended.
+        let long = Rope::leaf(&"L".repeat(5000));
+        let mut t = long.concat(&Rope::leaf("x"));
+        for _ in 0..500 {
+            t = t.concat(&Rope::leaf("yz"));
+        }
+        assert!(t.is_concat());
+        let Node::Concat { left, right, .. } = &*t.0 else {
+            unreachable!()
+        };
+        assert!(left.ptr_eq(&long) && matches!(*right.0, Node::Build { .. }));
+        assert_eq!(
+            t.materialize(),
+            alloc::format!("{}x{}", "L".repeat(5000), "yz".repeat(500))
+        );
+        // Surrogates pair at a buffer's seam.
+        let hi = s.concat(&Rope::from_wtf8(crate::wtf8::from_utf16(&[0xD83D])));
+        let paired = hi.concat(&Rope::from_wtf8(crate::wtf8::from_utf16(&[0xDE00])));
+        assert_eq!(paired.utf16_len(), want.len() + 2);
+        assert!(paired.materialize().ends_with('\u{1F600}'));
     }
 
     #[test]
@@ -1323,8 +1661,15 @@ mod tests {
         // Two short leaves join into one leaf…
         let small = Rope::leaf("foo").concat(&Rope::leaf("bar"));
         assert_eq!(small.as_leaf_bytes(), Some(&b"foobar"[..]));
-        // …but a longer concatenation has no single backing slice.
+        // …a short one and more share an append buffer, still one slice…
         let (a, b) = ("f".repeat(40), "b".repeat(40));
+        let built = Rope::leaf(&a).concat(&Rope::leaf(&b));
+        assert_eq!(
+            built.as_leaf_bytes(),
+            Some(alloc::format!("{a}{b}").as_bytes())
+        );
+        // …but a long concatenation has no single backing slice.
+        let b = "b".repeat(BUILD_APPEND_MIN + 1);
         let joined = Rope::leaf(&a).concat(&Rope::leaf(&b));
         assert_eq!(joined.as_leaf_bytes(), None);
         // …though its materialized bytes still agree with the borrow-or-copy path.
