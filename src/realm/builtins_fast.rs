@@ -1465,9 +1465,16 @@ pub(crate) fn push_number_bytes(out: &mut alloc::vec::Vec<u8>, n: f64) {
 /// `ToString(n)` as a fresh rope, built from the text without an
 /// intermediate `String`.
 fn number_rope_uncached(n: f64) -> crate::rope::Rope {
+    // An integer below 2^53 in magnitude prints as its plain digits (`-0`
+    // as `0`): written straight into an inline rope.
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+    if n > -LIMIT && n < LIMIT && (n as i64) as f64 == n {
+        return crate::rope::Rope::from_int(n as i64);
+    }
     let mut buf = [0u8; super::ryu::NUMBER_TEXT_MAX];
     let len = super::ryu::write_js_number(n, &mut buf);
-    crate::rope::Rope::from_bytes(&buf[..len])
+    // (A number's text is all ASCII: its UTF-16 length is its length.)
+    crate::rope::Rope::from_ascii_bytes(&buf[..len])
 }
 
 /// How many small non-negative integers keep a shared string rope.

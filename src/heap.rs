@@ -459,6 +459,11 @@ pub struct Heap<T> {
     /// Swept objects' reusable `extra` parts (see
     /// [`ExtraPool`](crate::object::ExtraPool)), refilled by the sweeps.
     extra_pool: crate::object::ExtraPool,
+    /// Bumped whenever a handle may stop naming the value it named (a
+    /// sweep, a compaction, a free, a swap): a memo of handles taken under
+    /// one epoch holds no stale handle while the epoch is unchanged
+    /// (`Realm::add_str_int`'s result memo).
+    epoch: u32,
 }
 
 /// The bookkeeping behind [`Heap`]'s GC-verification mode (see `Heap::poison`).
@@ -495,7 +500,22 @@ impl<T> Heap<T> {
             allocs_since_gc: 0,
             poison: None,
             extra_pool: crate::object::ExtraPool::default(),
+            epoch: 0,
         }
+    }
+
+    /// The current handle epoch (see `Heap::epoch`): unchanged since a
+    /// handle was taken means it still names the same live value.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Ends the current handle epoch.
+    #[inline]
+    const fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Objects allocated since the last [`reset_alloc_pressure`](Heap::reset_alloc_pressure).
@@ -885,6 +905,7 @@ impl<T> Heap<T> {
     /// `extends` a native builds the real cell from the `super(...)` arguments,
     /// then moves it into the already-threaded `this` handle).
     pub fn swap(&mut self, a: Handle, b: Handle) {
+        self.bump_epoch();
         if a.index == b.index {
             return;
         }
@@ -970,6 +991,7 @@ impl<T> Heap<T> {
     where
         T: crate::gc::Trace,
     {
+        self.bump_epoch();
         self.fold_allocs();
         let Self {
             slots,
@@ -1086,6 +1108,7 @@ impl<T> Heap<T> {
     where
         T: crate::gc::Trace,
     {
+        self.bump_epoch();
         self.fold_allocs();
         let Self {
             slots,
@@ -1288,6 +1311,7 @@ impl<T> Heap<T> {
     /// moving collector uses it to fix up references. Ages (generations
     /// survived) are preserved; the free list and remembered set are cleared.
     pub fn compact_to(&mut self, keep: &crate::gc::MarkSet) -> Vec<(Handle, Handle)> {
+        self.bump_epoch();
         // A fresh high-range generation for this compaction's slots, disjoint
         // from any old handle's generation.
         let new_gen = self.compact_gen;
@@ -1343,6 +1367,7 @@ impl<T> Heap<T> {
     /// generation is bumped so existing handles to it become stale. A stale or
     /// out-of-range handle frees nothing and returns `None`.
     pub fn free(&mut self, handle: Handle) -> Option<T> {
+        self.bump_epoch();
         // GC-verification mode keeps the object alive and only records the
         // intent, so a root-set gap shows up as a counted *use* of a collected
         // handle instead of as silent corruption.

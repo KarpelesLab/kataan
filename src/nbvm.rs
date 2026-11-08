@@ -5960,12 +5960,9 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         return Ok(NanBox::number(x + y));
     }
-    // `'k' + i`: built in one small string (`Realm::add_str_int`).
-    if let Some(v) = ctx.realm.add_str_int(a, b) {
-        return Ok(v);
-    }
-    // Two strings: one rope concatenation (`Realm::add_str_str`).
-    if let Some(v) = ctx.realm.add_str_str(a, b) {
+    // Two strings (one rope concatenation), or `'k' + i` (built in one
+    // small string): `Realm::add_fast`.
+    if let Some(v) = ctx.realm.add_fast(a, b) {
         return Ok(v);
     }
     // A string with a string or a number: no host operand, ToPrimitive is the
@@ -7386,6 +7383,13 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
     // the same pattern as an ordinary recursive interpreter call.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let av = NanBox::from_bits(a);
+    let bv = NanBox::from_bits(b);
+    // Two strings, or a string and an integer (compiled code adds Numbers
+    // itself): `vm_add`'s first case, before anything else is looked up.
+    if let Some(v) = ctx.realm.add_fast(av, bv) {
+        return v.to_bits();
+    }
     // SAFETY: `jit_funcs` points at the function table for the whole program run,
     // which outlives this call (it is borrowed down the entire call tree).
     #[allow(unsafe_code)]
@@ -7394,8 +7398,6 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    let av = NanBox::from_bits(a);
-    let bv = NanBox::from_bits(b);
     match vm_add(ctx, funcs, av, bv) {
         Ok(v) => v.to_bits(),
         Err(VmError::Thrown(val)) => {

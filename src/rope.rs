@@ -196,6 +196,45 @@ impl BuildBuf {
         self.used.set(to);
         true
     }
+
+    /// [`append_at`](Self::append_at) of one short inline string, `buf[..n]`
+    /// of a [`Node::Small`]'s buffer: when the spare capacity holds the whole
+    /// buffer it is copied as one fixed-size block (no length-dependent copy
+    /// call for a two-byte append). The bytes past the appended `n` land in
+    /// spare capacity, which nothing reads (`bytes` stops at `used`).
+    #[inline]
+    fn append_small(&self, at: usize, buf: &[u8; SMALL_CAP], n: usize) -> bool {
+        let cap = self.data.len();
+        if at != self.used.get() || cap - at < n {
+            return false;
+        }
+        if cap - at >= SMALL_CAP {
+            // SAFETY: `[at, at + SMALL_CAP)` is inside `data` (checked) and at
+            // or past `used`, which no borrow from `bytes` reaches; `buf` is
+            // another node's inline array, so the ranges are disjoint. (A
+            // whole-array store: a fixed-size copy, which the compiler inlines.)
+            #[allow(unsafe_code)]
+            unsafe {
+                core::ptr::write_unaligned(
+                    core::cell::UnsafeCell::raw_get(self.data.as_ptr().add(at))
+                        .cast::<[u8; SMALL_CAP]>(),
+                    *buf,
+                );
+            }
+            self.used.set(at + n);
+            return true;
+        }
+        self.append_tail(at, &buf[..n])
+    }
+
+    /// [`append_small`](Self::append_small) near the end of the buffer: an
+    /// exact copy. (Out of line, so that the fixed-size copy above is not
+    /// merged with this one into a call.)
+    #[cold]
+    #[inline(never)]
+    fn append_tail(&self, at: usize, b: &[u8]) -> bool {
+        self.append_at(at, &[b])
+    }
 }
 
 /// The longest flat left side [`Rope::try_concat`] copies into a new append
@@ -381,6 +420,67 @@ pub const SMALL_CAP: usize = 37;
 /// `Node::Small`'s "UTF-16 length not computed yet" marker (a real one is at
 /// most [`SMALL_CAP`]).
 const SMALL_U16_UNKNOWN: u8 = u8::MAX;
+
+/// `"00" "01" … "99"`: the two decimal digits of each value below 100.
+const DIGIT_PAIRS: [u8; 200] = {
+    let mut t = [0u8; 200];
+    let mut i = 0;
+    while i < 100 {
+        t[2 * i] = b'0' + (i / 10) as u8;
+        t[2 * i + 1] = b'0' + (i % 10) as u8;
+        i += 1;
+    }
+    t
+};
+
+/// `DIGIT_PAIRS` as little-endian words: the text of `i` (below 100) as
+/// its two bytes in memory order.
+const DIGIT_WORDS: [u16; 100] = {
+    let mut t = [0u16; 100];
+    let mut i = 0;
+    while i < 100 {
+        t[i] = DIGIT_PAIRS[2 * i] as u16 | (DIGIT_PAIRS[2 * i + 1] as u16) << 8;
+        i += 1;
+    }
+    t
+};
+
+/// The decimal digits of `u` (below 10^16) packed into a word in memory
+/// order (the first digit in the lowest byte, zero past the last), and
+/// their count. Built from the right, two digits per division, in a
+/// register: stored with one 16-byte write.
+#[inline]
+fn digits_le(mut u: u64) -> (u128, usize) {
+    debug_assert!(u < 10_000_000_000_000_000);
+    let mut acc: u128 = 0;
+    let mut n = 0;
+    while u >= 100 {
+        acc = (acc << 16) | u128::from(DIGIT_WORDS[(u % 100) as usize]);
+        u /= 100;
+        n += 2;
+    }
+    if u >= 10 {
+        acc = (acc << 16) | u128::from(DIGIT_WORDS[u as usize]);
+        n += 2;
+    } else {
+        acc = (acc << 8) | u128::from(b'0' + u as u8);
+        n += 1;
+    }
+    (acc, n)
+}
+
+/// Writes the decimal text of `i` (magnitude below 2^53; `n` digits packed
+/// in `acc` by [`digits_le`]) at `out[at..]`, which has room for 17 bytes
+/// past `at`; the bytes after the text that the write covers become zero.
+#[inline]
+fn put_int(out: &mut [u8], at: usize, i: i64, acc: u128) {
+    let mut at = at;
+    if i < 0 {
+        out[at] = b'-';
+        at += 1;
+    }
+    out[at..at + 16].copy_from_slice(&acc.to_le_bytes());
+}
 
 impl Node {
     /// A flat node holding a copy of `bytes`: inline when short.
@@ -687,6 +787,42 @@ impl Rope {
     /// `build`.
     #[inline]
     fn concat_with(&self, other: &Rope, build: bool) -> Option<Rope> {
+        // The commonest step of a `s += x` loop, `x` a short inline string
+        // (a literal, a character, a number's digits): as the general one
+        // below, with the inline buffer copied as one fixed-size block and
+        // its UTF-16 length read from its memo.
+        if build
+            && let Node::Build {
+                buf,
+                len: at,
+                u16_len: lu,
+            } = &*self.0
+            && let Node::Small {
+                len: n,
+                u16: nu,
+                buf: sb,
+            } = &*other.0
+            && *n > 0
+            && sb[0] != 0xED
+            && *at + usize::from(*n) <= MAX_STRING_LEN
+            && buf.append_small(*at, sb, usize::from(*n))
+        {
+            let n = usize::from(*n);
+            let known = lu.get();
+            let u16_len = if known == U16_LEN_UNKNOWN {
+                U16_LEN_UNKNOWN
+            } else {
+                match nu.get() {
+                    SMALL_U16_UNKNOWN => known + other.utf16_len(),
+                    m => known + usize::from(m),
+                }
+            };
+            return Some(Rope(Rc::new(Node::Build {
+                buf: Rc::clone(buf),
+                len: *at + n,
+                u16_len: core::cell::Cell::new(u16_len),
+            })));
+        }
         // The step of a `s += x` loop: `self` the last string of its append
         // buffer and `other` a short flat string that fits behind it and does
         // not begin with a surrogate (which could pair at the seam), so the
@@ -756,6 +892,42 @@ impl Rope {
         // Two short leaves (`'item' + i`, a template's pieces) join into one
         // leaf: copying a few bytes costs less than a `Concat` node that every
         // later read has to walk and that eventually has to be flattened anyway.
+        if len <= SMALL_CAP
+            && let (
+                Node::Small {
+                    len: la, buf: ba, ..
+                },
+                Node::Small { buf: bb, .. },
+            ) = (&*self.0, &*other.0)
+        {
+            // Two inline buffers, each copied whole as one fixed-size block
+            // (their bytes past their lengths are zero, so the result's are).
+            let la = usize::from(*la);
+            let memo = core::cell::Cell::new(u16_len.map_or(SMALL_U16_UNKNOWN, |n| n as u8));
+            if len - la <= 16 && la + 16 <= SMALL_CAP {
+                // A right side of one word: written in the new node itself
+                // (see `small_with_int`).
+                let mut rc = Rc::new(Node::Small {
+                    len: len as u8,
+                    u16: memo,
+                    buf: *ba,
+                });
+                if let Some(Node::Small { buf: out, .. }) = Rc::get_mut(&mut rc) {
+                    out[la..la + 16].copy_from_slice(&bb[..16]);
+                }
+                return Some(Rope(rc));
+            }
+            let mut tmp = [0u8; 2 * SMALL_CAP];
+            tmp[..SMALL_CAP].copy_from_slice(ba);
+            tmp[la..la + SMALL_CAP].copy_from_slice(bb);
+            let mut buf = [0u8; SMALL_CAP];
+            buf.copy_from_slice(&tmp[..SMALL_CAP]);
+            return Some(Rope(Rc::new(Node::Small {
+                len: len as u8,
+                u16: memo,
+                buf,
+            })));
+        }
         if len <= SMALL_JOIN
             && let (Some(a), Some(b)) = (self.0.flat_bytes(), other.0.flat_bytes())
         {
@@ -861,12 +1033,92 @@ impl Rope {
         }
     }
 
+    /// The decimal text of an integer `i` of magnitude below 2^53 (`-0`
+    /// passed as `0`), as `Number::toString` prints it, held inline with its
+    /// UTF-16 length known.
+    #[must_use]
+    #[inline]
+    pub fn from_int(i: i64) -> Rope {
+        let (acc, n) = digits_le(i.unsigned_abs());
+        let len = n + usize::from(i < 0);
+        let mut buf = [0u8; SMALL_CAP];
+        put_int(&mut buf, 0, i, acc);
+        Rope(Rc::new(Node::Small {
+            len: len as u8,
+            u16: core::cell::Cell::new(len as u8),
+            buf,
+        }))
+    }
+
+    /// `self + i` (or `i + self` when `number_first`) for an inline string
+    /// `self` and an integer `i` of magnitude below 2^53 (which prints as
+    /// plain decimal digits; `-0` is passed as `0`), when the result fits
+    /// inline too: that string, built in one step with no digit string of
+    /// its own. `None` for a longer result or a string not held inline.
+    #[must_use]
+    #[inline]
+    pub fn small_with_int(&self, i: i64, number_first: bool) -> Option<Rope> {
+        let Node::Small { len, u16, buf } = &*self.0 else {
+            return None;
+        };
+        let la = usize::from(*len);
+        let (acc, n) = digits_le(i.unsigned_abs());
+        let digits = n + usize::from(i < 0);
+        let total = la + digits;
+        if total > SMALL_CAP {
+            return None;
+        }
+        // Digits are one UTF-16 unit each. (The text's own count is taken
+        // once, and memoized on it: usually a literal, met again.)
+        let units = match u16.get() {
+            SMALL_U16_UNKNOWN => self.utf16_len() as u8,
+            m => m,
+        };
+        let memo = units + digits as u8;
+        // From fixed-size pieces: the text's whole inline buffer (its bytes
+        // past its length are zero, so the result's are) and the digits'
+        // word (zero past the digits), the later write over the earlier's
+        // zeros. Text first, with room for the word: written in the new
+        // node itself (bytes assembled in a scratch buffer by overlapping
+        // writes and then read back as a whole stall the processor).
+        if !number_first && la + 17 <= SMALL_CAP {
+            let mut rc = Rc::new(Node::Small {
+                len: total as u8,
+                u16: core::cell::Cell::new(memo),
+                buf: *buf,
+            });
+            if let Some(Node::Small { buf: out, .. }) = Rc::get_mut(&mut rc) {
+                put_int(out, la, i, acc);
+            }
+            return Some(Rope(rc));
+        }
+        let mut tmp = [0u8; SMALL_CAP + 17];
+        if number_first {
+            put_int(&mut tmp, 0, i, acc);
+            tmp[digits..digits + SMALL_CAP].copy_from_slice(buf);
+        } else {
+            tmp[..SMALL_CAP].copy_from_slice(buf);
+            put_int(&mut tmp, la, i, acc);
+        }
+        let mut out = [0u8; SMALL_CAP];
+        out.copy_from_slice(&tmp[..SMALL_CAP]);
+        Some(Rope(Rc::new(Node::Small {
+            len: total as u8,
+            u16: core::cell::Cell::new(memo),
+            buf: out,
+        })))
+    }
+
     /// The UTF-16 length when it costs (nearly) nothing: memoized already, or
     /// an inline run counted now (at most [`SMALL_CAP`] bytes). `None`
     /// otherwise.
+    #[inline]
     fn utf16_len_if_cheap(&self) -> Option<usize> {
-        if let Node::Small { .. } = &*self.0 {
-            return Some(self.utf16_len());
+        if let Node::Small { u16, .. } = &*self.0 {
+            return Some(match u16.get() {
+                SMALL_U16_UNKNOWN => self.utf16_len(),
+                m => usize::from(m),
+            });
         }
         let n = self.u16_len_cell()?.get();
         (n != U16_LEN_UNKNOWN).then_some(n)
@@ -1786,6 +2038,93 @@ mod tests {
         for n in 0..SMALL_CAP {
             check(&Rope::leaf(&"k".repeat(n)).concat(&Rope::leaf("1")));
         }
+        for i in [0i64, 7, -7, 12345, -9_007_199_254_740_991] {
+            check(&Rope::from_int(i));
+            for n in 0..SMALL_CAP {
+                for first in [false, true] {
+                    if let Some(r) = Rope::leaf(&"k".repeat(n)).small_with_int(i, first) {
+                        check(&r);
+                    }
+                }
+            }
+        }
+        for a in 0..SMALL_CAP {
+            for b in 0..=SMALL_CAP - a {
+                check(&Rope::leaf(&"a".repeat(a)).concat(&Rope::leaf(&"b".repeat(b))));
+            }
+        }
+    }
+
+    #[test]
+    fn integers_print_as_their_decimal_text() {
+        let vals = [
+            0i64,
+            1,
+            -1,
+            9,
+            10,
+            99,
+            100,
+            -100,
+            12_345,
+            2_147_483_647,
+            -2_147_483_648,
+            999_999_999_999_999,
+            1_000_000_000_000_000,
+            9_007_199_254_740_991,
+            -9_007_199_254_740_991,
+        ];
+        for i in vals {
+            let text = alloc::format!("{i}");
+            let r = Rope::from_int(i);
+            assert_eq!(r.materialize(), text);
+            assert_eq!(r.utf16_len(), text.len());
+            for pre in [
+                "",
+                "k",
+                "é",
+                "a_prefix_of_twenty_b",
+                "a_prefix_of_exactly_thirty_bytes__",
+            ] {
+                let p = Rope::leaf(pre);
+                match p.small_with_int(i, false) {
+                    Some(r) => {
+                        assert_eq!(r.materialize(), alloc::format!("{pre}{i}"));
+                        assert_eq!(r.utf16_len(), pre.chars().count() + text.len());
+                    }
+                    None => assert!(pre.len() + text.len() > SMALL_CAP),
+                }
+                match p.small_with_int(i, true) {
+                    Some(r) => assert_eq!(r.materialize(), alloc::format!("{i}{pre}")),
+                    None => assert!(pre.len() + text.len() > SMALL_CAP),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_appends_to_an_append_buffer_keep_every_prefix() {
+        let mut s = Rope::from_bytes(&[b'z'; SMALL_JOIN + 1]).concat(&Rope::leaf("é"));
+        let mut kept = alloc::vec::Vec::new();
+        for i in 0..2000 {
+            let piece = match i % 4 {
+                0 => "ab",
+                1 => "é",
+                2 => "thirty-seven-bytes-of-plain-ascii-txt",
+                _ => "中",
+            };
+            let next = s.concat(&Rope::leaf(piece));
+            assert_eq!(next.len(), s.len() + piece.len());
+            if i % 97 == 0 {
+                kept.push((s.clone(), s.materialize()));
+            }
+            s = next;
+        }
+        for (r, text) in &kept {
+            assert_eq!(&r.materialize(), text);
+            assert_eq!(r.utf16_len(), text.encode_utf16().count());
+        }
+        assert_eq!(s.utf16_len(), s.materialize().encode_utf16().count());
     }
 
     #[test]

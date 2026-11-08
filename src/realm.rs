@@ -625,6 +625,9 @@ pub struct Realm {
     /// string's method lookup may not simply start at `%String.prototype%`
     /// (`plain_recv_lookup_start`). Never cleared.
     pub str_special: bool,
+    /// Recent `'k' + i` results (`Realm::add_str_int`), allocated on first
+    /// use.
+    pub(crate) str_int_memo: Option<alloc::boxed::Box<concat_fast::StrIntMemo>>,
     /// The callee of each active bytecode-VM activation (`undefined` when the
     /// call site did not know it), innermost last — across nested VM runs, so
     /// eval code and host callbacks see the enclosing activations (the legacy
@@ -948,6 +951,7 @@ impl Realm {
             agents_active: false,
             multi_realm: false,
             str_special: false,
+            str_int_memo: None,
             vm_callee_stack: Vec::new(),
             vm_args_buf: Vec::new(),
             vm_callee_args: Vec::new(),
@@ -1584,6 +1588,7 @@ impl Realm {
         crate::object::bump_proto_epoch();
         if matches!(self.heap.get(handle), Some(Cell::Str(_))) {
             self.str_special = true;
+            self.str_int_memo = None;
         }
         self.host_exotic.insert(handle.to_raw());
         self.add_jit_flags(
@@ -1876,6 +1881,9 @@ impl Realm {
         self.cell_link_changed(handle);
         if matches!(self.heap.get(handle), Some(Cell::Str(_))) {
             self.str_special = true;
+            // (A memoized result may be this very cell, which is no longer
+            // a plain string.)
+            self.str_int_memo = None;
         }
         // An own property on a typed array (maybe a `length`).
         if matches!(self.heap.get(handle), Some(Cell::TypedArray { .. })) {
