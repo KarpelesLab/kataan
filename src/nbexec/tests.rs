@@ -5374,6 +5374,19 @@ fn map_set_clear_and_assign_getters() {
         "1,2"
     );
     assert_eq!(run("Object.assign({}, {x:1}, {y:2}, {x:9}).x"), "9");
+    // Its Set throws on any failure, also an inherited read-only property or
+    // getter-only accessor, though the caller is sloppy.
+    assert_eq!(
+        run(
+            "Object.defineProperty(Object.prototype,'ro',{value:0,writable:false,configurable:true});
+             let r; try { Object.assign({}, {ro:1}); r='none'; } catch (e) { r=e.constructor.name; }
+             delete Object.prototype.ro;
+             Object.defineProperty(Object.prototype,'go',{get(){return 0},configurable:true});
+             try { Object.assign({}, {go:1}); r+=',none'; } catch (e) { r+=','+e.constructor.name; }
+             delete Object.prototype.go; let o={}; o.ro=1; r + ',' + o.ro"
+        ),
+        "TypeError,TypeError,1"
+    );
 }
 
 #[test]

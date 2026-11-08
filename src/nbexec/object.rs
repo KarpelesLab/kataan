@@ -3088,7 +3088,14 @@ impl Interp {
             };
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         }
-        self.assign_member_value(target, key_box, value)
+        // The rest of OrdinarySet's failures (an inherited read-only data
+        // property, an inherited getter-only accessor) are reported by
+        // `[[Set]]` as a strict-mode throw: `Throw` is true here whatever the
+        // caller's strictness, so run it as strict.
+        let was_strict = core::mem::replace(&mut self.strict, true);
+        let r = self.assign_member_value(target, key_box, value);
+        self.strict = was_strict;
+        r
     }
 
     pub(crate) fn can_write_property(&self, handle: crate::heap::Handle, key: &str) -> bool {
