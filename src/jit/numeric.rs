@@ -2510,6 +2510,39 @@ impl NumGen {
         }
     }
 
+    /// After a slow path's call: drops the region's validated global
+    /// binding addresses only when the global binding epoch is no longer the
+    /// one the region noted (then noting it), as every call the generic
+    /// emitter makes in such a region does (`recheck_globals_after_call`):
+    /// Rust code that may move a binding or change what its address means
+    /// bumps the epoch, so the addresses stay valid exactly as long as it does
+    /// not change. Dropping them unconditionally made a loop whose every
+    /// iteration takes some slow path (a `===` of two objects, a truthiness
+    /// test of one) validate each of its globals afresh every iteration
+    /// (`jit_helper_global_ref`). A speculative region's still are dropped.
+    /// Clobbers `r11` and the flags.
+    fn recheck_globals(&self, a: &mut X64Assembler, reg: Option<usize>) {
+        let Some(ri) = reg else { return };
+        if self.region_gslots[ri].is_empty() {
+            return;
+        }
+        if self.regions[ri].spec.is_some() {
+            self.zero_globals(a, reg);
+            return;
+        }
+        let noted = self.gslot_disp((self.n_gslots + ri) as u32);
+        let keep = a.new_label();
+        a.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
+        a.raw(&[0x4d, 0x8b, 0x1b]); // mov r11, [r11]
+        a.raw(&[0x4c, 0x3b, 0x9d]); // cmp r11, [rbp + noted]
+        a.raw(&noted.to_le_bytes());
+        a.jcc(CC_E, keep);
+        a.raw(&[0x4c, 0x89, 0x9d]); // mov [rbp + noted], r11
+        a.raw(&noted.to_le_bytes());
+        self.zero_globals(a, reg);
+        a.bind(keep);
+    }
+
     /// Keeps region `ri`'s validated global binding addresses across a
     /// region entry or a back-edge poll while the global binding epoch they
     /// were validated under is current, else drops them (and notes the
@@ -5593,7 +5626,7 @@ impl NumGen {
                     }
                     a.store_rax(disp(dst));
                     self.reload(a, s.region);
-                    self.zero_globals(a, s.region);
+                    self.recheck_globals(a, s.region);
                     self.after_slow(a, labels, s);
                 }
                 StubKind::GlobalRef { pc, retry } => {
@@ -5640,7 +5673,7 @@ impl NumGen {
                     a.cmp_rax_r11();
                     a.je(throw_exit);
                     self.reload(a, s.region);
-                    self.zero_globals(a, s.region);
+                    self.recheck_globals(a, s.region);
                     a.jmp(s.resume);
                 }
                 StubKind::Mirror { pc, src } => {
@@ -5669,7 +5702,7 @@ impl NumGen {
                     a.cmp_rax_r11();
                     a.je(throw_exit);
                     self.reload(a, s.region);
-                    self.zero_globals(a, s.region);
+                    self.recheck_globals(a, s.region);
                     self.after_slow(a, labels, s);
                 }
                 StubKind::Exec { pc } => {
@@ -5685,7 +5718,7 @@ impl NumGen {
                     a.cmp_rax_r11();
                     a.je(throw_exit);
                     self.reload(a, s.region);
-                    self.zero_globals(a, s.region);
+                    self.recheck_globals(a, s.region);
                     self.after_slow(a, labels, s);
                 }
                 StubKind::Truthy { cond, target } => {
@@ -5695,7 +5728,7 @@ impl NumGen {
                     a.movabs_rax(self.env.truthy as i64);
                     a.call_rax();
                     self.reload(a, s.region);
-                    self.zero_globals(a, s.region);
+                    self.recheck_globals(a, s.region);
                     a.test_rax_rax();
                     // Truthy → resume; falsy → the target (already flushed).
                     a.jcc(CC_NE, s.resume);

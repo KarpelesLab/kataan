@@ -102,7 +102,7 @@ pub(super) fn walk_regs(bytecode: &[Op]) -> Vec<bool> {
 
 /// The most global binding addresses a body caches (each costs a frame slot
 /// and a store in the prologue).
-const MAX_GLOBAL_SLOTS: usize = 8;
+const MAX_GLOBAL_SLOTS: usize = 32;
 
 /// A body's global binding cache plan: the slots it uses and, per op, the slot
 /// of a `LoadGlobal` / `StoreGlobal` that uses one.
