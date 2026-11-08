@@ -513,7 +513,18 @@ struct NativeOwn {
     /// watched set, so a site that sees ever new receivers — a fresh match
     /// array's `index` — stops recording).
     fills: u32,
+    /// How many times a direct built-in call site asked for the memo and its
+    /// proof (`MethodSite::fill_direct`; capped at [`DIRECT_TRIES`]).
+    tries: u32,
+    /// A direct built-in call site's proof (`super::direct_call`): the bits
+    /// of the method value at `value` when it was proved, under this memo's
+    /// stamp, to be the built-in the site's key names; `0` (no handle's
+    /// bits): none. Every refill of the memo empties it.
+    direct: u64,
 }
+
+/// See [`NativeOwn::tries`].
+pub(crate) const DIRECT_TRIES: u32 = 64;
 
 /// See [`NativeOwn::fills`].
 const NATIVE_OWN_FILLS: u32 = 4;
@@ -590,6 +601,8 @@ impl MethodSite {
                 stamp: u64::MAX,
                 value: 0,
                 fills: 0,
+                tries: 0,
+                direct: 0,
             },
         }
     }
@@ -652,7 +665,59 @@ impl MethodSite {
             stamp,
             value: ptr as u64,
             fills,
+            tries: self.native_own.tries,
+            direct: 0,
         };
+    }
+
+    /// For a direct built-in call site (`super::direct_call`) on `recv`:
+    /// refills the [`NativeOwn`] memo when it is not current for `recv`
+    /// ([`fill_native_own`](Self::fill_native_own)), then records the
+    /// method value its slot holds as the site's proof when `proves` says
+    /// it is the site's built-in. Counted: after [`DIRECT_TRIES`] calls the
+    /// compiled code stops asking.
+    pub(crate) fn fill_direct(
+        &mut self,
+        realm: &mut crate::realm::Realm,
+        recv: crate::heap::Handle,
+        proves: impl FnOnce(&crate::realm::Realm, crate::nanbox::NanBox) -> bool,
+    ) {
+        self.native_own.tries = self.native_own.tries.saturating_add(1);
+        let bits = crate::nanbox::NanBox::handle(recv.to_raw()).to_bits();
+        let epoch = crate::object::proto_epoch();
+        if self.native_own.recv != bits || self.native_own.stamp != epoch {
+            self.fill_native_own(realm, recv);
+        }
+        if self.native_own.recv != bits
+            || self.native_own.stamp != crate::object::proto_epoch()
+            || realm.multi_realm
+        {
+            return;
+        }
+        // (The value the memo's slot holds, as the fill found it.)
+        let key = self.key();
+        let Some(v) = realm
+            .jit_aux_of(recv)
+            .and_then(|aux| realm.jit_object(aux))
+            .and_then(|o| o.slot(o.shaped_shape()?.lookup(key)?))
+        else {
+            return;
+        };
+        if v.as_handle().is_some() && proves(realm, v) {
+            self.native_own.direct = v.to_bits();
+        }
+    }
+
+    /// The offsets, from a site, of its [`NativeOwn`] memo's `direct` proof
+    /// and `tries` count (`super::direct_call`).
+    pub(crate) fn direct_offsets() -> (i32, i32) {
+        use core::mem::offset_of;
+        let own = offset_of!(MethodSite, native_own);
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        (
+            i(own + offset_of!(NativeOwn, direct)),
+            i(own + offset_of!(NativeOwn, tries)),
+        )
     }
 
     /// The site's key.

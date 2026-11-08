@@ -2390,6 +2390,34 @@ impl Realm {
         h
     }
 
+    /// [`unit_string`](Self::unit_string) when it allocates nothing: the
+    /// interned string of a unit below 256 that is still the table's (as that
+    /// function revalidates it). `None` otherwise.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn interned_unit_string(&self, unit: u16) -> Option<Handle> {
+        let i = usize::from(unit);
+        if i >= 256 {
+            return None;
+        }
+        let mut buf = [unit as u8, 0];
+        let n = if i < 0x80 {
+            1
+        } else {
+            char::from(unit as u8).encode_utf8(&mut buf).len()
+        };
+        let h = (*self.unit_strings.get(i)?)?;
+        (self
+            .heap
+            .get(h)
+            .and_then(Cell::as_str)
+            .and_then(Rope::as_leaf_bytes)
+            == Some(&buf[..n]))
+        .then_some(h)
+    }
+
     /// The string holding the single UTF-16 code unit `unit`. Units below 256
     /// come from the realm's interned table (see `unit_strings`), so a
     /// character loop allocates nothing after its first sight of each unit;

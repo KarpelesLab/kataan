@@ -30,6 +30,8 @@ mod chase;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod deopt;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod direct_call;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fieldrep;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod forin;
@@ -3575,6 +3577,12 @@ pub struct GenericHelpers {
     /// `jit_helper_str_proof(ctx, recv, site, _) -> 0`: proves
     /// `String.prototype`'s method for a `s.charCodeAt(i)` site.
     pub str_proof: JitBinHelper,
+    /// `jit_helper_direct_fill(ctx, recv, site, kind) -> 0`: refills and
+    /// proves a direct built-in call site's memo (`direct_call`).
+    pub direct_fill: JitBinHelper,
+    /// `jit_helper_direct_call(ctx, kind, a0, a1) -> bits | throw sentinel`:
+    /// a direct built-in call's narrow entry (`direct_call`).
+    pub direct_call: JitBinHelper,
     /// `jit_helper_to_str(ctx, value, lazy, _) -> bits`: `Op::ToStr` /
     /// `Op::ToStrLazy` without user code, else `0` (the op itself runs).
     pub to_str: JitBinHelper,
@@ -6301,6 +6309,19 @@ impl X64Assembler {
         self.reload_after_call();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.recheck_body_globals();
+    }
+
+    /// `call rax` to a helper that runs no JavaScript, allocates nothing and
+    /// moves, frees or retypes no heap cell, reads no register file and
+    /// changes no binding (`direct_call`'s narrow entry): the receiver-cache
+    /// keys and the global binding caches stay valid across it, and no
+    /// pending inlined activation needs materializing for it. Only the
+    /// promoted SSE registers (caller-saved) are spilled and reloaded.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn call_rax_pure(&mut self) {
+        self.spill_before_call();
+        self.code.extend_from_slice(&[0xff, 0xd0]);
+        self.reload_after_call();
     }
 
     /// `mov <argreg[i]>, [rbp+disp]` — load a frame slot into System V integer
@@ -10186,6 +10207,43 @@ impl JitFunction {
                         a.cold_end(cold);
                         a.bind(general);
                     }
+                    // A static built-in the site proves (`Array.isArray(x)`,
+                    // `Object.hasOwn(o, k)`, …): computed directly.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && let Some(kind) = direct_call::kind_of(key, margs.len())
+                        && ok(dst)
+                        && ok(recv)
+                        && margs.iter().all(|&m| ok(m))
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                    {
+                        // (A promoted argument is read from the register
+                        // file; a promoted result is reloaded from it after
+                        // the op, `NumGen::after_generic`.)
+                        for &m in margs.iter() {
+                            num.operand_xmm(&mut a, op_idx, m, false);
+                        }
+                        let cl = &helpers.call_layout;
+                        direct_call::emit(
+                            &mut a,
+                            &direct_call::DirectEmit {
+                                kind,
+                                dst,
+                                recv,
+                                args: margs,
+                                site: si.method_ptr,
+                                hosted: cl.hosted,
+                                realm: cl.realm,
+                                multi_realm: cl.multi_realm,
+                                fill: helpers.direct_fill as usize as u64,
+                                call: helpers.direct_call as usize as u64,
+                                layout: &layout,
+                                done,
+                            },
+                        );
+                    }
                     // The native call sequence, when the site has one.
                     let native = call_args
                         .get(args as usize)
@@ -13614,6 +13672,37 @@ impl JitFunction {
                         if bail.is_none() {
                             a.bind(call);
                         }
+                    }
+                    // A static built-in the site's helper last served
+                    // (`Array.isArray(a[i])`, …): computed directly.
+                    if got.is_none()
+                        && let crate::nbvm::Op::CallWithMethod { key, .. } = bytecode.get(op_idx)?
+                        && let Some(kind) = direct_call::kind_of(key, args.len())
+                        && !num.in_any_spec(op_idx)
+                    {
+                        for &m in args.iter() {
+                            num.operand_xmm(&mut a, op_idx, m, false);
+                        }
+                        let cl = &helpers.call_layout;
+                        direct_call::emit_got(
+                            &mut a,
+                            &direct_call::DirectEmit {
+                                kind,
+                                dst,
+                                recv,
+                                args,
+                                site: core::ptr::null(),
+                                hosted: cl.hosted,
+                                realm: cl.realm,
+                                multi_realm: cl.multi_realm,
+                                fill: helpers.direct_fill as usize as u64,
+                                call: helpers.direct_call as usize as u64,
+                                layout: &layout,
+                                done,
+                            },
+                            callee,
+                            site_ptr,
+                        );
                     }
                     if bail.is_some() {
                         a.bind(done);

@@ -1272,6 +1272,63 @@ pub(crate) extern "C" fn jit_helper_site_fill(
     0
 }
 
+/// A direct built-in call site's miss (`crate::jit::direct_call`): refills
+/// the site's memo of the receiver `recv`'s own method and proves it the
+/// built-in of kind `kind` (`MethodSite::fill_direct`). Returns `0`; runs no
+/// code and allocates nothing.
+///
+/// # Safety
+/// As [`jit_helper_site_fill`].
+pub(crate) extern "C" fn jit_helper_direct_fill(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    site: u64,
+    kind: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_site_fill`.
+    #[allow(unsafe_code)]
+    let (ctx, site) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            &mut *(site as usize as *mut crate::jit::MethodSite),
+        )
+    };
+    if ctx.host.is_some()
+        && let Some(h) = NanBox::from_bits(recv).as_handle()
+    {
+        site.fill_direct(&mut ctx.realm, Handle::from_raw(h), |realm, v| {
+            super::native_call::direct_proves(realm, v, kind as u8)
+        });
+    }
+    0
+}
+
+/// A direct built-in call (`crate::jit::direct_call`) of kind `kind` on the
+/// argument values `a0`, `a1`, at a site that proved its method that
+/// built-in: the result's bits, or the throw sentinel (which it never
+/// returns otherwise) when the general call must make it — having done
+/// nothing. Runs no code, allocates nothing and never throws.
+///
+/// # Safety
+/// As [`jit_helper_site_fill`].
+pub(crate) extern "C" fn jit_helper_direct_call(
+    ctx: *mut core::ffi::c_void,
+    kind: u64,
+    a0: u64,
+    a1: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_site_fill`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    super::native_call::direct_run(
+        &mut ctx.realm,
+        kind as u8,
+        NanBox::from_bits(a0),
+        NanBox::from_bits(a1),
+    )
+    .map_or(NanBox::jit_throw_bits(), NanBox::to_bits)
+}
+
 /// `Op::ToStr` (`lazy` zero) or `Op::ToStrLazy` of `v` when that runs no code:
 /// a string is itself, and a primitive is its text (`ToStr`) or itself
 /// (`ToStrLazy`, whose `Concat` makes the text). `0`, having done nothing, for
@@ -2725,13 +2782,18 @@ pub(crate) extern "C" fn jit_helper_call_with_method(
             // Which built-in it is (its id + 1, `0` for none): compiled code
             // computes `Math.imul` / `Math.clz32` of that very function
             // itself (`JitProto::compile_generic`'s `CallWithMethod`).
-            site.ident.value = if served.is_some() {
+            // (One of the built-ins compiled code calls directly is that
+            // instead: `direct_call::got_value`.)
+            let direct = super::native_call::direct_kind(&ctx.realm, method);
+            site.ident.value = if served.is_none() {
+                0
+            } else if direct != 0 {
+                crate::jit::direct_call::got_value(direct)
+            } else {
                 method
                     .as_handle()
                     .and_then(|h| ctx.realm.native_at(Handle::from_raw(h)))
                     .map_or(0, |id| u64::from(id) + 1)
-            } else {
-                0
             };
             // The same memo is an inlined guard's of this call
             // (`call_seq::emit_inline_guard`), which takes a key at the

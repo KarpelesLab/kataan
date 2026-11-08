@@ -850,6 +850,66 @@ fn run_op_out_of_line(
     run_op(ctx, funcs, op, method, recv, h, false, regs, args)
 }
 
+/// `Object.prototype.hasOwnProperty` on the receiver `h` for the key value
+/// `k` ([`FastOp::ObjHasOwn`]) when that runs no code; `None`, having done
+/// nothing observable, otherwise.
+fn obj_has_own_fast(realm: &mut Realm, h: Handle, k: NanBox) -> Option<bool> {
+    // An ordinary object receiver (ToObject is the identity), and a key
+    // whose ToPropertyKey runs no code: a string or another primitive
+    // that is not a Symbol. (A host-exotic receiver — a module
+    // namespace, whose [[GetOwnProperty]] may throw for a binding
+    // still in its TDZ, which `.call` and `Object.hasOwn` reach —
+    // is the general path's.)
+    realm.object_key_epoch(h)?;
+    if realm.is_host_exotic(h) {
+        return None;
+    }
+    // A key String whose own slot in the receiver's layout is
+    // memoized (a `for-in` key of its list, a key the String-key slot
+    // memo names): an own data property.
+    let o = NanBox::handle(h.to_raw());
+    if realm.for_in_key_slot(o, k).is_some() || realm.key_memo_probe(o, k).is_some() {
+        return Some(true);
+    }
+    let leaf;
+    let owned;
+    let key: &str = match k.as_handle().map(Handle::from_raw) {
+        // A flat, well-formed string is its own key, borrowed (one that
+        // starts with NUL is escaped, see `realm::is_internal_key`).
+        Some(kh)
+            if let Some(b) = realm.string_leaf_bytes(kh)
+                && b.first() != Some(&0)
+                && let Ok(t) = core::str::from_utf8(b) =>
+        {
+            leaf = t;
+            leaf
+        }
+        Some(kh) if realm.is_string_handle(kh) => {
+            owned = realm.display_key(k);
+            &owned
+        }
+        Some(_) => return None,
+        None => match k.unpack() {
+            Unpacked::Number(_) | Unpacked::Bool(_) | Unpacked::Undefined | Unpacked::Null => {
+                owned = realm.to_display_string(k);
+                &owned
+            }
+            _ => return None,
+        },
+    };
+    // (A plain ordinary object's own keys are its own; `has_own`'s
+    // String-wrapper and function-metadata checks are for others.)
+    let own = realm
+        .ordinary_has_own(h, key)
+        .unwrap_or_else(|| realm.has_own(h, key));
+    // An own data key String: noted in the String-key slot memo, so
+    // the next ask is its probe above (`key_memo_note`'s rules).
+    if own && k.as_handle().is_some() {
+        let _ = realm.own_data_missed(o, k);
+    }
+    Some(own)
+}
+
 /// The rest of [`try_call`] / [`try_call_got`] once the site knows its
 /// built-in `op` (the function cell `method`).
 #[allow(clippy::too_many_arguments)]
@@ -1118,66 +1178,7 @@ fn run_op(
                 _ => NanBox::boolean(realm.collection_has(h, arg(0))),
             }
         }
-        FastOp::ObjHasOwn => {
-            // An ordinary object receiver (ToObject is the identity), and a key
-            // whose ToPropertyKey runs no code: a string or another primitive
-            // that is not a Symbol. (A host-exotic receiver — a module
-            // namespace, whose [[GetOwnProperty]] may throw for a binding
-            // still in its TDZ, which `.call` and `Object.hasOwn` reach —
-            // is the general path's.)
-            realm.object_key_epoch(h)?;
-            if realm.is_host_exotic(h) {
-                return None;
-            }
-            let k = arg(0);
-            // A key String whose own slot in the receiver's layout is
-            // memoized (a `for-in` key of its list, a key the String-key slot
-            // memo names): an own data property.
-            let o = NanBox::handle(h.to_raw());
-            if realm.for_in_key_slot(o, k).is_some() || realm.key_memo_probe(o, k).is_some() {
-                return Some(Ok(NanBox::boolean(true)));
-            }
-            let leaf;
-            let owned;
-            let key: &str = match k.as_handle().map(Handle::from_raw) {
-                // A flat, well-formed string is its own key, borrowed (one that
-                // starts with NUL is escaped, see `realm::is_internal_key`).
-                Some(kh)
-                    if let Some(b) = realm.string_leaf_bytes(kh)
-                        && b.first() != Some(&0)
-                        && let Ok(t) = core::str::from_utf8(b) =>
-                {
-                    leaf = t;
-                    leaf
-                }
-                Some(kh) if realm.is_string_handle(kh) => {
-                    owned = realm.display_key(k);
-                    &owned
-                }
-                Some(_) => return None,
-                None => match k.unpack() {
-                    Unpacked::Number(_)
-                    | Unpacked::Bool(_)
-                    | Unpacked::Undefined
-                    | Unpacked::Null => {
-                        owned = realm.to_display_string(k);
-                        &owned
-                    }
-                    _ => return None,
-                },
-            };
-            // (A plain ordinary object's own keys are its own; `has_own`'s
-            // String-wrapper and function-metadata checks are for others.)
-            let own = realm
-                .ordinary_has_own(h, key)
-                .unwrap_or_else(|| realm.has_own(h, key));
-            // An own data key String: noted in the String-key slot memo, so
-            // the next ask is its probe above (`key_memo_note`'s rules).
-            if own && k.as_handle().is_some() {
-                let _ = realm.own_data_missed(o, k);
-            }
-            NanBox::boolean(own)
-        }
+        FastOp::ObjHasOwn => NanBox::boolean(obj_has_own_fast(realm, h, arg(0))?),
         FastOp::StrSlice | FastOp::StrSubstring => {
             // A `Concat` is sliced by walking its tree when that is cheap (see
             // `Rope::slice_units_tree`), and flattened only otherwise.
@@ -1804,4 +1805,95 @@ pub(super) fn try_call_value(realm: &mut Realm, f: NanBox, args: &[NanBox]) -> O
         }
         _ => return None,
     })
+}
+
+/// Whether the method value `v` is the built-in a direct call site of kind
+/// `kind` (`crate::jit::direct_call`) serves: what its proof
+/// (`MethodSite::fill_direct`) records.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn direct_proves(realm: &Realm, v: NanBox, kind: u8) -> bool {
+    kind != 0 && direct_kind(realm, v) == kind
+}
+
+/// The direct kind (`crate::jit::direct_call`) of the function value `v`,
+/// or `0` when it is none of those built-ins.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn direct_kind(realm: &Realm, v: NanBox) -> u8 {
+    use crate::jit::direct_call as d;
+    match classify(realm, v) {
+        FastOp::ArrayIsArray => d::K_IS_ARRAY,
+        FastOp::NumPred(NumPred::Integer) => d::K_IS_INTEGER,
+        FastOp::NumPred(NumPred::SafeInteger) => d::K_IS_SAFE_INTEGER,
+        FastOp::NumPred(NumPred::Finite) => d::K_IS_FINITE,
+        FastOp::NumPred(NumPred::NaN) => d::K_IS_NAN,
+        FastOp::ObjStaticHasOwn => d::K_HAS_OWN,
+        FastOp::StrFromCharCode => d::K_FROM_CHAR_CODE,
+        FastOp::HostDirect => match v
+            .as_handle()
+            .and_then(|f| realm.native_at(Handle::from_raw(f)))
+        {
+            Some(crate::nbexec::N_OBJECT_GET_PROTO) => d::K_GET_PROTO,
+            Some(crate::nbexec::N_OBJECT_IS) => d::K_OBJECT_IS,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// A direct built-in call (`crate::jit::direct_call`) of kind `kind` on the
+/// arguments `a0`, `a1` (`undefined` for a missing one): its result when the
+/// built-in's answer for them runs no code, allocates nothing and cannot
+/// throw; `None`, having done nothing, for anything else (the site's general
+/// call then makes it).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn direct_run(realm: &mut Realm, kind: u8, a0: NanBox, a1: NanBox) -> Option<NanBox> {
+    use crate::jit::direct_call as d;
+    match kind {
+        d::K_IS_ARRAY => {
+            let a = Handle::from_raw(a0.as_handle()?);
+            // A proxy is unwrapped (and may be revoked): the general path's.
+            if realm.proxy_at(a).is_some() {
+                return None;
+            }
+            Some(NanBox::boolean(
+                realm.is_array(a) && !realm.is_vm_function(a),
+            ))
+        }
+        d::K_IS_INTEGER => Some(NanBox::boolean(NumPred::Integer.test(a0))),
+        d::K_IS_SAFE_INTEGER => Some(NanBox::boolean(NumPred::SafeInteger.test(a0))),
+        d::K_IS_FINITE => Some(NanBox::boolean(NumPred::Finite.test(a0))),
+        d::K_IS_NAN => Some(NanBox::boolean(NumPred::NaN.test(a0))),
+        d::K_HAS_OWN => {
+            let o = Handle::from_raw(a0.as_handle()?);
+            Some(NanBox::boolean(obj_has_own_fast(realm, o, a1)?))
+        }
+        d::K_FROM_CHAR_CODE => {
+            // One code unit given as itself whose interned string exists
+            // (`Realm::unit_string`, which then allocates nothing).
+            let n = a0.as_number()?;
+            if !(0.0..256.0).contains(&n) {
+                return None;
+            }
+            Some(NanBox::handle(
+                realm.interned_unit_string(n as u16)?.to_raw(),
+            ))
+        }
+        // (SameValue reads values only: a String's or BigInt's contents.)
+        d::K_OBJECT_IS => Some(NanBox::boolean(realm.same_value(a0, a1))),
+        d::K_GET_PROTO => {
+            // An ordinary object (not host-exotic) or an array: its
+            // `[[Prototype]]` link (ToObject is the identity, and no trap
+            // runs).
+            let o = Handle::from_raw(a0.as_handle()?);
+            if !(realm.jit_object(o).is_some() || realm.is_array(o)) || realm.is_host_exotic(o) {
+                return None;
+            }
+            Some(
+                realm
+                    .object_proto(o)
+                    .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw())),
+            )
+        }
+        _ => None,
+    }
 }
