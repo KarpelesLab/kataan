@@ -3416,6 +3416,13 @@ fn object_hasown_static_accessors_replaceall_fn() {
         "true:false"
     );
     assert_eq!(run("Object.hasOwn(Object.create({x:1}),'x')"), "false");
+    // A hole inside an array's length is not an own property.
+    assert_eq!(
+        run("var a=[1,,3], b=new Array(2), c=[1,2]; delete c[0];\
+             [Object.hasOwn(a,1), Object.hasOwn(a,2), Object.hasOwn(b,0), Object.hasOwn(c,0),\
+              Object.hasOwn(c,1)].join()"),
+        "false,true,false,false,true"
+    );
     // Static field write-back and static getter.
     assert_eq!(
         run(

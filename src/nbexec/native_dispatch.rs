@@ -1411,14 +1411,9 @@ impl Interp {
                     let d = self.descriptor_of(target, &key)?;
                     return Ok(NanBox::boolean(!matches!(d.unpack(), Unpacked::Undefined)));
                 }
-                let owned = Some(target).is_some_and(|h| {
-                    self.realm.has_own(h, &key)
-                        || self
-                            .realm
-                            .array_length(h)
-                            .is_some_and(|len| key.parse::<usize>().is_ok_and(|i| i < len))
-                });
-                NanBox::boolean(owned)
+                // `has_own` already answers array indices (a hole is not an own
+                // property), exactly as `hasOwnProperty` does.
+                NanBox::boolean(self.realm.has_own(target, &key))
             }
             // `Object.groupBy(items, cb)` — groups each item by `cb(item, i)` into
             // an object of arrays keyed by the (stringified) group.
