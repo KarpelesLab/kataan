@@ -11053,6 +11053,17 @@ fn vm_get_elem_from(
     if !own_done && let Some(v) = ctx.realm.own_data_by_string(recv, key) {
         return Ok(v);
     }
+    // A String key on no object of an ordinary chain (`realm::text_memo`,
+    // which `jit_get_elem_general` asks before calling here).
+    if !own_done
+        && !key.is_number()
+        && (matches!(
+            ctx.realm.key_text_probe(recv, key),
+            Some(crate::realm::TextHit::Absent)
+        ) || ctx.realm.key_text_note_absent(recv, key))
+    {
+        return Ok(NanBox::undefined());
+    }
     if read_needs_host(ctx, recv)
         || (ctx.host.is_some() && is_mapped_arguments(&ctx.realm, recv))
         || (ctx.host.is_some() && is_string_wrapper(&ctx.realm, recv))
