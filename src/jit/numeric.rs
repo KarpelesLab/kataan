@@ -6988,7 +6988,13 @@ fn iproof_enabled() -> bool {
 /// Rust code; once a store found them sparing every store into it the write
 /// barrier's work, later stores into the same container (by its heap slot's
 /// address, which no other object takes while none is freed) skip those
-/// checks (`X64Assembler::p_barrier_check_proving`).
+/// checks (`X64Assembler::p_barrier_check_proving`). And the first add of
+/// a fresh object's chain (`recv_cache::fresh_adds`): its checks of the
+/// world outside the object (`X64Assembler::p_add_fresh_prelude`: the
+/// dictionary threshold, the prototype epoch and the chain's prototype,
+/// which is the allocation's — its construct record's, which only Rust code
+/// changes) pass for every later run once they have passed (the slot then
+/// holds `0`).
 ///
 /// A candidate: such an op outside the fallback arms (`arms`) of the loop
 /// (whose ops a fast version leaves out). The operand is compared every
@@ -7001,6 +7007,9 @@ fn plan_op_proofs(
     arms: &[(usize, usize, usize)],
 ) -> Vec<IProof> {
     let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    // (Without the entries and catch targets, which only end chains: every
+    // chain's first add is one of these.)
+    let fresh = super::recv_cache::fresh_adds(ops, bytecode, &[], &[]);
     (head..=end.min(ops.len().saturating_sub(1)))
         .filter(|&pc| {
             !in_arm(pc)
@@ -7010,6 +7019,9 @@ fn plan_op_proofs(
                         Some(Op::SuperCtor { .. } | Op::InitFields { .. })
                     ),
                     GenericOp::SetElem { .. } => true,
+                    GenericOp::SetProp { .. } => {
+                        fresh.get(pc).copied().flatten().is_some_and(|f| f.k == 0)
+                    }
                     _ => false,
                 }
         })

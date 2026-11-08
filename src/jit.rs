@@ -12275,6 +12275,15 @@ impl JitFunction {
                                 chain_sites.push(si_q.method_ptr.cast_const());
                                 max_slot = max_slot.max(add_of(q)?.slot);
                             }
+                            // (Run-proved in a speculative loop's fast
+                            // version, `numeric::plan_op_proofs`: once they
+                            // have passed in this run, they pass.)
+                            let ps = num.op_run_proof(op_idx);
+                            let passed = a.new_label();
+                            if let Some(ps) = ps {
+                                a.cmp_frame_imm8(ps, 0);
+                                a.g_jcc(call_seq::cc::E, passed);
+                            }
                             a.p_add_fresh_prelude(
                                 &layout,
                                 helpers.call_layout.realm,
@@ -12282,6 +12291,10 @@ impl JitFunction {
                                 max_slot,
                                 regular,
                             );
+                            if let Some(ps) = ps {
+                                a.g_store_imm32(call_seq::r::RBP, ps, 0);
+                            }
+                            a.bind(passed);
                         }
                         let proven = if first {
                             chain.is_some()
