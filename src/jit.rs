@@ -10777,6 +10777,98 @@ impl JitFunction {
                             a.cmp_rax_r11();
                             a.je(leave_exit);
                         }
+                        // `v === 'lit'` (`!==`, `==`, `!=`) for a literal a
+                        // short String could equal: a String held in its
+                        // node compared byte by byte (WTF-8 is canonical, so
+                        // bytes decide), a String of another byte length
+                        // unequal, and for `===` anything not a String
+                        // unequal, with no call; anything else the
+                        // interpreter's op (in a speculative loop's fast
+                        // version, which makes no call: a leave).
+                        crate::nbvm::Op::StrEqConst {
+                            dst,
+                            src,
+                            lit,
+                            kind,
+                        } if ok(*dst) && ok(*src) && lit.len() <= crate::rope::SMALL_CAP => {
+                            use call_seq::r as R;
+                            let bail = num.spec_bail(&mut a, op_idx);
+                            let slow = bail.unwrap_or_else(|| a.new_label());
+                            let done = a.new_label();
+                            let (eq, ne) = (a.new_label(), a.new_label());
+                            let not_str = a.new_label();
+                            let (not_small, not_leaf) = (a.new_label(), a.new_label());
+                            let neg = kind & crate::nbvm::STR_EQ_NEGATE != 0;
+                            let loose = kind & crate::nbvm::STR_EQ_LOOSE != 0;
+                            let rl = layout.rope;
+                            let n = lit.len() as u8;
+                            a.load_rax(disp(*src));
+                            a.p_cmp_handle_floor(R::RAX);
+                            a.g_jcc(call_seq::cc::B, if loose { slow } else { ne });
+                            walk_to_slot!(*src, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_str_disc);
+                            a.jne(not_str);
+                            a.g_load(R::R11, R::RCX, layout.off_str_rope);
+                            a.g_cmp_byte_imm(R::R11, rl.tag, rl.small_tag);
+                            a.g_jcc(call_seq::cc::NE, not_small);
+                            a.g_cmp_byte_imm(R::R11, rl.small_len, n);
+                            a.g_jcc(call_seq::cc::NE, ne);
+                            // The bytes: eight, four, then one at a time.
+                            let mut at = 0usize;
+                            while at < lit.len() {
+                                let d = rl.small_buf + at as i32;
+                                let rest = lit.len() - at;
+                                if rest >= 8 {
+                                    let w = u64::from_le_bytes(lit[at..at + 8].try_into().ok()?);
+                                    a.g_movabs(R::R8, w);
+                                    a.g_cmp_mem(R::R8, R::R11, d);
+                                    at += 8;
+                                } else if rest >= 4 {
+                                    let w = u32::from_le_bytes(lit[at..at + 4].try_into().ok()?);
+                                    a.g_mem(false, &[0x81], 7, R::R11, d); // cmp dword [r11+d], imm32
+                                    a.code.extend_from_slice(&w.to_le_bytes());
+                                    at += 4;
+                                } else {
+                                    a.g_cmp_byte_imm(R::R11, d, lit[at]);
+                                    at += 1;
+                                }
+                                a.g_jcc(call_seq::cc::NE, ne);
+                            }
+                            a.jmp(eq);
+                            // A longer flat String: unequal by its length,
+                            // else (never in practice) the general compare.
+                            a.bind(not_small);
+                            a.g_cmp_byte_imm(R::R11, rl.tag, rl.leaf_tag);
+                            a.g_jcc(call_seq::cc::NE, not_leaf);
+                            a.g_mem(true, &[0x81], 7, R::R11, rl.leaf_len); // cmp qword, imm32
+                            a.code.extend_from_slice(&u32::from(n).to_le_bytes());
+                            a.g_jcc(call_seq::cc::NE, ne);
+                            a.jmp(slow);
+                            a.bind(not_leaf);
+                            a.g_cmp_byte_imm(R::R11, rl.tag, rl.build_tag);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            a.g_mem(true, &[0x81], 7, R::R11, rl.build_len);
+                            a.code.extend_from_slice(&u32::from(n).to_le_bytes());
+                            a.g_jcc(call_seq::cc::NE, ne);
+                            a.jmp(slow);
+                            // Not a String: `===` is false; `==` compares
+                            // the literal with its primitive (the op's).
+                            a.bind(not_str);
+                            a.jmp(if loose { slow } else { ne });
+                            a.bind(eq);
+                            a.movabs_rax(NanBox::boolean(!neg).to_bits() as i64);
+                            a.store_rax(disp(*dst));
+                            a.jmp(done);
+                            a.bind(ne);
+                            a.movabs_rax(NanBox::boolean(neg).to_bits() as i64);
+                            a.store_rax(disp(*dst));
+                            if bail.is_none() {
+                                a.jmp(done);
+                                a.bind(slow);
+                                exec_op!(pc);
+                            }
+                            a.bind(done);
+                        }
                         // A string literal: the String its word in the
                         // body's table holds (`crate::realm::LitCells`),
                         // one load; the first evaluation fills the word out
@@ -10786,25 +10878,32 @@ impl JitFunction {
                                 && lit_word.get(pc as usize).copied().flatten().is_some() =>
                         {
                             let w = lit_word.get(pc as usize).copied().flatten()?;
-                            let slow = a.new_label();
+                            // (A promoted or speculative loop may hold one:
+                            // the load is its fast path, and in a fast
+                            // version, which makes no call, an empty word
+                            // leaves for the plain copy.)
+                            let bail = num.spec_bail(&mut a, op_idx);
+                            let slow = bail.unwrap_or_else(|| a.new_label());
                             let done = a.new_label();
                             a.movabs_rax(i64::try_from(lits.word_addr(w)).ok()?);
                             a.g_load(call_seq::r::RAX, call_seq::r::RAX, 0);
                             a.test_rax_rax();
                             a.je(slow);
                             a.store_rax(disp(*dst));
-                            let cold = a.cold_begin();
-                            a.bind(slow);
-                            a.mov_rdi_r15();
-                            a.mov_rsi_rbx();
-                            a.movabs_argreg(2, n_regs as i64);
-                            a.movabs_argreg(3, op_ptr as i64);
-                            a.movabs_argreg(4, alloc::rc::Rc::as_ptr(lits) as i64);
-                            a.movabs_argreg(5, w as i64);
-                            a.movabs_rax(lit_string_helper as i64);
-                            a.call_rax();
-                            a.jmp(done);
-                            a.cold_end(cold);
+                            if bail.is_none() {
+                                let cold = a.cold_begin();
+                                a.bind(slow);
+                                a.mov_rdi_r15();
+                                a.mov_rsi_rbx();
+                                a.movabs_argreg(2, n_regs as i64);
+                                a.movabs_argreg(3, op_ptr as i64);
+                                a.movabs_argreg(4, alloc::rc::Rc::as_ptr(lits) as i64);
+                                a.movabs_argreg(5, w as i64);
+                                a.movabs_rax(lit_string_helper as i64);
+                                a.call_rax();
+                                a.jmp(done);
+                                a.cold_end(cold);
+                            }
                             a.bind(done);
                         }
                         // `super(…)`: the native call sequence, `new.target`

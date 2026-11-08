@@ -1340,6 +1340,12 @@ pub(super) fn generic_region_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
                 bc,
                 Op::IterNext { iter, next, .. } if usize::from(*next) == usize::from(*iter) + 1
             ) || matches!(bc, Op::BindThis { .. })
+                // A string literal: a load of its word (`realm::LitCells`),
+                // a call only the first time (in a fast version: a leave).
+                || matches!(bc, Op::NewString { .. })
+                // An equality against a short string literal: inline, its
+                // slow path the interpreter's op (in a fast version: a leave).
+                || matches!(bc, Op::StrEqConst { lit, .. } if lit.len() <= crate::rope::SMALL_CAP)
                 || allocating_region_op(op, bc, sa)
         }
         _ => allocating_region_op(op, bc, sa),
@@ -1428,7 +1434,10 @@ fn spec_int_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
         | GenericOp::CellGet { .. } => true,
         GenericOp::CallMethod { .. } => super::inline_math(bc).is_some(),
         GenericOp::CallWithMethod { .. } => super::inline_math_got(bc).is_some(),
-        GenericOp::Interp { .. } => matches!(bc, Op::BindThis { .. }),
+        GenericOp::Interp { .. } => {
+            matches!(bc, Op::BindThis { .. } | Op::NewString { .. })
+                || matches!(bc, Op::StrEqConst { lit, .. } if lit.len() <= crate::rope::SMALL_CAP)
+        }
         _ => false,
     }
 }

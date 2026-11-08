@@ -6167,9 +6167,9 @@ fn str_eq_kind(op: BinaryOp) -> Option<u8> {
 }
 
 /// [`Op::StrEqConst`]'s `kind` bit: the negated form (`!==` / `!=`).
-const STR_EQ_NEGATE: u8 = 1;
+pub(crate) const STR_EQ_NEGATE: u8 = 1;
 /// [`Op::StrEqConst`]'s `kind` bit: loose equality (`==` / `!=`).
-const STR_EQ_LOOSE: u8 = 2;
+pub(crate) const STR_EQ_LOOSE: u8 = 2;
 
 /// [`Op::StrEqConst`]: `v` compared with the string literal `lit` (WTF-8).
 /// A string compares by contents; for `===` anything else is unequal; for

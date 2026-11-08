@@ -227,6 +227,9 @@ pub(crate) struct RopeLayout {
     /// byte, [`SMALL_U16_UNKNOWN`] until first asked).
     pub(crate) small_tag: u8,
     pub(crate) small_u16: i32,
+    /// A [`Node::Small`]'s byte length (a byte) and its inline bytes.
+    pub(crate) small_len: i32,
+    pub(crate) small_buf: i32,
     /// The tag byte of a [`Node::Concat`], and its memoized UTF-16 length
     /// ([`U16_LEN_UNKNOWN`] until first asked).
     pub(crate) concat_tag: u8,
@@ -291,7 +294,9 @@ pub(crate) fn jit_rope_layout() -> RopeLayout {
         base + i32::try_from(a - Rc::as_ptr(&r.0) as usize).expect("a node field's offset")
     };
     let Node::Small {
-        u16: small_memo, ..
+        u16: small_memo,
+        len: small_len,
+        buf: small_buf,
     } = &*small.0
     else {
         unreachable!("shorter than SMALL_CAP")
@@ -349,6 +354,8 @@ pub(crate) fn jit_rope_layout() -> RopeLayout {
         leaf_len: off(len_at),
         small_tag,
         small_u16: field_off(&small, core::ptr::addr_of!(*small_memo) as usize),
+        small_len: field_off(&small, core::ptr::addr_of!(*small_len) as usize),
+        small_buf: field_off(&small, core::ptr::addr_of!(*small_buf) as usize),
         concat_tag,
         concat_u16: field_off(&concat, core::ptr::addr_of!(*concat_memo) as usize),
         build_tag,
@@ -385,9 +392,20 @@ impl Node {
         }
     }
 
-    /// The bytes of a flat node (`Small` or `Leaf`), or `None` for a `Concat`.
+    /// The bytes of a flat node (any but a `Concat`), or `None` for a
+    /// `Concat`. (The two commonest kinds inline, the others out of line.)
     #[inline]
     fn flat_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Node::Small { len, buf, .. } => Some(&buf[..usize::from(*len)]),
+            Node::Leaf(s, _) => Some(s),
+            _ => self.flat_bytes_other(),
+        }
+    }
+
+    /// [`flat_bytes`](Self::flat_bytes) of a `Slice`, a `Build` or a `Concat`.
+    #[inline(never)]
+    fn flat_bytes_other(&self) -> Option<&[u8]> {
         match self {
             Node::Small { len, buf, .. } => Some(&buf[..usize::from(*len)]),
             Node::Leaf(s, _) => Some(s),
@@ -843,6 +861,7 @@ impl Rope {
     /// [`Rope::materialize_bytes`] allocates. Fall back to `materialize_bytes` when
     /// this returns `None`.
     #[must_use]
+    #[inline]
     pub fn as_leaf_bytes(&self) -> Option<&[u8]> {
         self.0.flat_bytes()
     }
