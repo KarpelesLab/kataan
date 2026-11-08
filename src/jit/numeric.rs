@@ -1219,6 +1219,20 @@ pub(super) struct NumGen {
     /// region's integer version writes: checked after the generic
     /// emitter's code ([`Self::after_generic_op`]).
     int_post: Option<u16>,
+    /// Where the inline fast path of a speculative region's integer
+    /// version's element or `.length` read on a hoisted array goes when it
+    /// has its value (past the generic emitter's code for the op, which is
+    /// its slow path): bound by [`Self::after_generic_op`].
+    int_skip: Option<Label>,
+    /// The int GPRs (bits by their index in `int32::GPRS`) whose save
+    /// slots hold their current values, so the next save may skip them
+    /// (`int32::NumGen::int_save`), and that set before the op being
+    /// emitted.
+    int_clean: (u8, u8),
+    /// Whether the op just emitted was the generic emitter's, its int GPRs
+    /// saved around it (the clean set then carries on to the next op,
+    /// unless a branch lands there).
+    int_clean_ok: bool,
     /// Per pc: a later site of the iteration takes the receiver-cache way
     /// this op fills as filled (`typed::relied_on`).
     rc_relied: Vec<bool>,
@@ -1473,6 +1487,8 @@ fn spec_int_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
         | GenericOp::GetElem { .. }
         | GenericOp::ArrayLen { .. }
         | GenericOp::CellGet { .. } => true,
+        // (`!x` of a boolean or Number inline, else the interpreter's op.)
+        GenericOp::Not { .. } => true,
         GenericOp::CallMethod { .. } => super::inline_math(bc).is_some(),
         GenericOp::CallWithMethod { .. } => super::inline_math_got(bc).is_some(),
         GenericOp::Interp { .. } => {
@@ -1884,6 +1900,9 @@ impl NumGen {
             int_reload: false,
             int_math: None,
             int_post: None,
+            int_skip: None,
+            int_clean: (0, 0),
+            int_clean_ok: false,
             rc_relied: Vec::new(),
             keeps_si_di: Vec::new(),
             math_proofs: Vec::new(),
@@ -2776,8 +2795,16 @@ impl NumGen {
                     return Some(true);
                 }
                 if let Some(src) = self.global_known(ri, pc) {
-                    self.copy_reg(a, reg, dst, src);
-                    return Some(true);
+                    // (In an integer version an int register's double
+                    // location is stale: its value converted, while it
+                    // still holds it; else the binding, below.)
+                    if !self.is_int(src) {
+                        self.copy_reg(a, reg, dst, src);
+                        return Some(true);
+                    }
+                    if self.int_copy_to(a, reg, dst, src).is_some() {
+                        return Some(true);
+                    }
                 }
                 a.load_rax(sd);
                 match self.xmm_of(reg, dst) {
@@ -6790,12 +6817,17 @@ fn plan_regions_sa(
         // runs (`spec_int_op`) may have one (`NumGen::emit_spec_int_op`).
         let arms = cold_arms(ops, head, end);
         let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+        // (One with none of an element loop's reads, guard diamonds, a
+        // compiled `for-in` or `Math.imul` is a *wide* candidate: an index
+        // or counter loop over property and element ops, which the plan
+        // only takes where nothing in it would keep bailing,
+        // `int32::plan`.)
+        let wide = !(elem_cand
+            || !arms.is_empty()
+            || (head..=end).any(|pc| sa_at(sa, pc) & SA_FORIN != 0)
+            || (head..=end).any(|pc| int_math_op(&bytecode[pc]).is_some()));
         let spec_int_cand = generic0
             && loops.is_empty()
-            && (elem_cand
-                || !arms.is_empty()
-                || (head..=end).any(|pc| sa_at(sa, pc) & SA_FORIN != 0)
-                || (head..=end).any(|pc| int_math_op(&bytecode[pc]).is_some()))
             && (head..=end).all(|pc| {
                 in_arm(pc)
                     || !generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))
@@ -6810,6 +6842,16 @@ fn plan_regions_sa(
                     if matches!(ops.get(call as usize), Some(GenericOp::Construct { .. }))
                         || sa_at(sa, call as usize) & SA_CALL != 0)
             });
+        if specalloc_log() && generic0 && !spec_int_cand {
+            for pc in head..=end {
+                if !in_arm(pc)
+                    && generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))
+                    && !spec_int_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))
+                {
+                    std::eprintln!("[int32] {head}..={end}: no spec int: op {pc} {:?}", ops[pc]);
+                }
+            }
+        }
         let mut generic = false;
         let mut pinned: Vec<u16> = Vec::new();
         {
@@ -6907,6 +6949,11 @@ fn plan_regions_sa(
         // a load of the other cannot take forwarded) on its every use,
         // while the register file in memory costs a store and a load the
         // processor forwards for free.
+        // (A speculative region's integer version may also keep the others
+        // as int registers, whose double-version location is then the
+        // register file: an element op's index, a counter copied into a
+        // `var`, read only by GPR code.)
+        let info_int = info.clone();
         if generic {
             let mut numeric: Vec<u16> = Vec::new();
             for pc in head..=end {
@@ -6938,6 +6985,12 @@ fn plan_regions_sa(
             }
             info.retain(|x| numeric.contains(&x.0));
         }
+        // (Those an int register only when some int op reads them.)
+        let extra_int: Vec<u16> = info_int
+            .iter()
+            .map(|x| x.0)
+            .filter(|&r| !info.iter().any(|x| x.0 == r))
+            .collect();
         // In a nest, a register live into an inner loop's header holds its
         // value around that loop's back-edge too: its interval covers the
         // whole inner loop (to a fixpoint, for loops nested deeper).
@@ -7155,7 +7208,7 @@ fn plan_regions_sa(
                     bytecode,
                     head,
                     end,
-                    &info,
+                    if spec { &info_int } else { &info },
                     if spec {
                         &carried_spec as &dyn Fn(u16) -> bool
                     } else {
@@ -7167,6 +7220,8 @@ fn plan_regions_sa(
                     spec.then_some(&arms[..]),
                     &is_live,
                     if spec { &gcarry[..] } else { &[] },
+                    if spec { &extra_int[..] } else { &[] },
+                    spec && wide,
                 )
             };
             let (sp, el) = if generic && !elem_cand && !(spec_int_cand && no_reuse) {
@@ -9889,11 +9944,13 @@ mod tests {
         let regions = plan_regions(&qops, &q.ops, &[], q.n_regs);
         assert_eq!(regions.len(), 1);
         let r = &regions[0];
-        assert!(r.generic && r.int.is_none());
+        assert!(r.generic);
         let get = pc_of(&q, |o| matches!(o, Op::GetProp { .. }));
         let Op::GetProp { dst, obj, .. } = q.ops[get] else {
             unreachable!()
         };
+        // (Its counter may have an integer version; the field never.)
+        assert!(r.int.as_ref().is_none_or(|p| !p.has_int(dst)));
         assert!(r.slots.iter().all(|s| s.reg != obj), "the object is pinned");
         assert!(
             r.slots.iter().any(|s| s.reg == dst && s.dirty),

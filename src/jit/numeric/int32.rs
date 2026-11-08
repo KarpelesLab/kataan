@@ -177,6 +177,8 @@ pub(super) fn plan(
     spec: Option<&[(usize, usize, usize)]>,
     live: &dyn Fn(usize, u16) -> bool,
     gcarry: &[(alloc::string::String, u16, usize)],
+    extra: &[u16],
+    wide: bool,
 ) -> Option<IntPlan> {
     // A speculative region's read of a binding its register carries
     // (`plan_carried_globals`) is a copy of that register: an int register
@@ -264,7 +266,7 @@ pub(super) fn plan(
     // index, or a move into a register read only that way. (A Float64
     // element summed up would only ever bail; a loop that only compares
     // elements keeps its speculative version, whose views are hoisted.)
-    let elem_reader_ok = |r: u16| {
+    let elem_reader_ok = |r: u16, inn: &dyn Fn(u16) -> bool, arith: bool| {
         let mut work = alloc::vec![r];
         let mut seen: Vec<u16> = Vec::new();
         let (mut d, mut u) = (Vec::new(), Vec::new());
@@ -285,6 +287,20 @@ pub(super) fn plan(
                     Op::ValueBin { op, .. } if (1..=VB_USHR).contains(op) => {}
                     Op::GetKey { key, obj, .. } if *key == x && *obj != x => {}
                     Op::Move { dst, .. } => work.push(*dst),
+                    // In a speculative region (whose bails are counted, so a
+                    // loop over doubles soon stops trying): checked int32
+                    // arithmetic and comparisons over int registers, as when
+                    // an int32 array is summed up or its elements compared.
+                    Op::Add { dst, a, b }
+                    | Op::AddValue { dst, a, b }
+                    | Op::Sub { dst, a, b }
+                    | Op::Mul { dst, a, b }
+                        if arith && inn(*dst) && inn(*a) && inn(*b) => {}
+                    // (Not `===`: elements compared by identity are most
+                    // likely objects, and two such reads would each look
+                    // like an int register if the other is.)
+                    Op::Lt { a, b, .. } if arith && inn(*a) && inn(*b) => {}
+                    Op::Compare { op, a, b, .. } if arith && *op <= 3 && inn(*a) && inn(*b) => {}
                     // (`Math.imul`, which takes its `ToInt32`.)
                     Op::CallMethod { .. } | Op::CallWithMethod { .. }
                         if spec && super::int_math_op(op).is_some() => {}
@@ -417,13 +433,34 @@ pub(super) fn plan(
                 }))
         })
     };
+    // (Likewise one set before the loop to an object, an array, a
+    // function or a string: a loop-invariant receiver compared by `===`
+    // would otherwise look like an int register, each of its readers being
+    // one if it is.)
+    let mk = |op: &Op, r: u16| match op {
+        Op::NewObjectLit { dst, .. }
+        | Op::NewObject { dst, .. }
+        | Op::NewArray { dst, .. }
+        | Op::NewArrayFrom { dst, .. }
+        | Op::NewArrayCtor { dst, .. }
+        | Op::NewString { dst, .. }
+        | Op::NewRegExp { dst, .. }
+        | Op::NewCollection { dst, .. }
+        | Op::LoadFunc { dst, .. }
+        | Op::MakeClosure { dst, .. }
+        | Op::Construct { dst, .. } => *dst == r,
+        _ => false,
+    };
+    let makes_nonnum = |r: u16| bytecode.iter().any(|op| mk(op, r));
     let starts_double = |r: u16| {
         bytecode.iter().enumerate().any(|(pc, op)| {
             outside(pc)
                 && match op {
                     Op::LoadConst { dst, .. } => *dst == r && dbl_const(r),
-                    Op::Move { dst, src } => *dst == r && dbl_const(*src),
-                    _ => false,
+                    Op::Move { dst, src } => {
+                        *dst == r && (dbl_const(*src) || (spec && makes_nonnum(*src)))
+                    }
+                    _ => spec && mk(op, r),
                 }
         })
     };
@@ -462,7 +499,12 @@ pub(super) fn plan(
                 }
                 // (In a speculative region's, checked after the generic
                 // emitter's read: `NumGen::int_post`.)
-                Op::GetKey { dst, .. } => (elems || spec) && elem_reader_ok(*dst),
+                Op::GetKey { dst, key, .. } => {
+                    // (Arithmetic readers only for a read by an int index,
+                    // whose read of a hoisted array is inline: a keyed
+                    // read's generic code would cost the GPRs' saves.)
+                    (elems || spec) && elem_reader_ok(*dst, &inn, spec && inn(*key))
+                }
                 Op::ArrayLen { .. } => elems || spec,
                 // A promoted global reads / writes its pseudo-register.
                 Op::LoadGlobal { name, .. } if spec => carrier(name).is_some_and(inn),
@@ -505,6 +547,10 @@ pub(super) fn plan(
                         Op::Compare { op, a, b, .. } => *op <= 3 && inn(*a) && inn(*b),
                         // An element read's index.
                         Op::GetKey { key, obj, .. } => (elems || spec) && *key == r && *obj != r,
+                        // An element store's index (`NumGen::ihoisted_arr_set`).
+                        Op::SetKey { key, obj, .. } | Op::SetKeyStrict { key, obj, .. } => {
+                            spec && *key == r && *obj != r
+                        }
                         Op::CallMethod { dst, .. } | Op::CallWithMethod { dst, .. }
                             if spec && super::int_math_op(op).is_some() =>
                         {
@@ -523,6 +569,7 @@ pub(super) fn plan(
                         return false;
                     }
                     let speculative = carried(r)
+                        || extra.contains(&r)
                         || ds.iter().any(|&pc| {
                             matches!(bytecode[pc], Op::LoadGlobal { .. } | Op::LoadConst { .. })
                                 || elem_def(&bytecode[pc])
@@ -530,6 +577,14 @@ pub(super) fn plan(
                     !speculative || useful(r, &mut du_d, &mut du_u)
                 })
                 .collect();
+            if super::specalloc_log() && next != cset {
+                std::eprintln!(
+                    "[int32] {head}..={end}: dropped {:?}",
+                    cset.iter()
+                        .filter(|r| !next.contains(r))
+                        .collect::<Vec<_>>()
+                );
+            }
             if next == cset {
                 break;
             }
@@ -639,6 +694,9 @@ pub(super) fn plan(
             }
         }
         if !failed.is_empty() {
+            if super::specalloc_log() {
+                std::eprintln!("[int32] {head}..={end}: no GPR for {failed:?}");
+            }
             cset.retain(|r| !failed.contains(r));
             continue;
         }
@@ -815,6 +873,29 @@ pub(super) fn plan(
                 continue;
             }
         }
+        if wide {
+            // A `===` the double emitter makes (operands not both int
+            // registers) decides two non-Numbers in its slow path, which
+            // in an integer version bails: unless against a constant
+            // (compared by its bits), a loop of `o === p` over objects
+            // would only bail. (The other candidates have their integer
+            // version for more than such a loop's counter.)
+            let konst = |r: u16| {
+                let ds = defs_of(r);
+                !ds.is_empty()
+                    && ds
+                        .iter()
+                        .all(|&pc| matches!(bytecode[pc], Op::LoadConst { .. }))
+            };
+            let bails = body.iter().enumerate().any(|(i, op)| {
+                arm_of(head + i).is_none()
+                    && matches!(op, Op::StrictEq { a, b, .. }
+                        if !(inn(*a) && inn(*b)) && !konst(*a) && !konst(*b))
+            });
+            if bails {
+                return None;
+            }
+        }
         if elems {
             // Every element / `.length` read's result, and every element
             // read's index, an int register: else the double versions.
@@ -887,6 +968,27 @@ impl NumGen {
             }
         }
         Some(())
+    }
+
+    /// `dst = (f64) int register src` into `dst`'s double-version location
+    /// (`dst` no int register), `None` (nothing emitted) when no GPR or
+    /// constant holds `src` here. Clobbers `xmm0` and `rax`.
+    pub(super) fn int_copy_to(
+        &self,
+        a: &mut X64Assembler,
+        reg: Option<usize>,
+        dst: u16,
+        src: u16,
+    ) -> Option<()> {
+        self.ik(src)?;
+        match self.xmm_of(reg, dst) {
+            Some(x) => self.icvt(a, x, src),
+            None => {
+                self.icvt(a, 0, src)?;
+                a.movsd_mem_x(disp(dst), 0);
+                Some(())
+            }
+        }
     }
 
     /// Converts int register `r` into its double-version location (its promoted
@@ -1921,9 +2023,12 @@ impl NumGen {
     /// Before the generic emitter's code for op `pc` of a speculative
     /// region's integer version: the int GPRs live there into their save
     /// slots.
-    fn int_save(&self, a: &mut X64Assembler, pc: usize) {
+    fn int_save(&mut self, a: &mut X64Assembler, pc: usize) {
         for (g, i) in self.live_int_gprs(pc) {
-            a.g_store(super::super::call_seq::r::RBP, self.int_save_disp(i), g);
+            if self.int_clean.0 & (1 << i) == 0 {
+                a.g_store(super::super::call_seq::r::RBP, self.int_save_disp(i), g);
+                self.int_clean.0 |= 1 << i;
+            }
         }
     }
 
@@ -1966,6 +2071,26 @@ impl NumGen {
     pub(crate) fn after_generic_op(&mut self, a: &mut X64Assembler) {
         self.int_saved = false;
         self.int_math = None;
+        // Save slots kept: those saved around this op's code, unless its
+        // inline fast path (`int_skip`), which saves nothing, joins it;
+        // never the GPR of the int register it writes.
+        let saved = self.int_reload;
+        if self.int_skip.is_some() {
+            self.int_clean.0 = self.int_clean.1;
+        }
+        let pc = self.cur_pc;
+        if let Some(op) = self.bc(pc) {
+            let (mut d, mut u) = (Vec::new(), Vec::new());
+            def_use(op, &mut d, &mut u);
+            for r in d {
+                if let Some(IK::Gpr(g)) = self.ik(r)
+                    && let Some(i) = GPRS.iter().position(|&q| q == g)
+                {
+                    self.int_clean.0 &= !(1 << i);
+                }
+            }
+        }
+        self.int_clean_ok = saved && self.spec_int_mode();
         self.fcarry_after(a);
         if core::mem::take(&mut self.int_reload) {
             // (Those it reads last need not, nor its result.)
@@ -1985,6 +2110,16 @@ impl NumGen {
                 a.g_load(g, super::super::call_seq::r::RBP, self.int_save_disp(i));
             }
         }
+        let skip = self.int_skip.take();
+        self.after_generic_post(a);
+        if let Some(l) = skip {
+            a.bind(l);
+        }
+    }
+
+    /// [`Self::after_generic_op`]'s check of an element or `.length` read's
+    /// value.
+    fn after_generic_post(&mut self, a: &mut X64Assembler) {
         if let Some(dst) = self.int_post.take() {
             // The value read, where the double version keeps it: an exact
             // int32 into its int register, else (the op done) the rest of
@@ -2241,6 +2376,13 @@ impl NumGen {
         ops: &[GenericOp],
         reg: Option<usize>,
     ) -> Option<bool> {
+        // (The save slots kept from the op before, `int_clean`.)
+        if !core::mem::take(&mut self.int_clean_ok)
+            || self.is_target.get(pc).copied().unwrap_or(true)
+        {
+            self.int_clean.0 = 0;
+        }
+        self.int_clean.1 = self.int_clean.0;
         if self.emit_int_op(a, labels, throw_exit, pc, ops)? {
             return Some(true);
         }
@@ -2265,6 +2407,44 @@ impl NumGen {
             {
                 self.ihoisted_len(a, dst, arr, v)?;
                 return Some(true);
+            }
+            _ => {}
+        }
+        // An element or `.length` read of a hoisted array into an int
+        // register: inline from the hoisted slots, any miss (not the held
+        // array, out of bounds, a hole, an element not an exact int32) the
+        // generic emitter's code below, which runs the op from the start.
+        match ops[pc] {
+            GenericOp::GetElem { dst, obj, index }
+                if self.is_int(dst)
+                    && self.is_int(index)
+                    && obj != index
+                    && let Some(s) = self.hoisted_array(pc, obj) =>
+            {
+                self.ihoisted_arr_get(a, dst, obj, index, s)?;
+            }
+            GenericOp::GetElem { dst, obj, index }
+                if !self.is_int(dst)
+                    && self.is_int(index)
+                    && obj != index
+                    && let Some(s) = self.hoisted_array(pc, obj) =>
+            {
+                self.ihoisted_arr_get_any(a, dst, obj, index, s)?;
+            }
+            GenericOp::ArrayLen { dst, arr }
+                if self.is_int(dst)
+                    && let Some(s) = self.hoisted_array(pc, arr) =>
+            {
+                self.ihoisted_arr_len(a, dst, arr, s)?;
+            }
+            GenericOp::SetElem {
+                obj, index, val, ..
+            } if self.is_int(index)
+                && obj != index
+                && obj != val
+                && let Some(s) = self.hoisted_array(pc, obj) =>
+            {
+                self.ihoisted_arr_set(a, obj, index, val, s)?;
             }
             _ => {}
         }
@@ -2666,6 +2846,112 @@ mod tests {
                 assert_eq!(q, n / u64::from(c), "n={n} c={c}");
             }
         }
+    }
+
+    /// The region of `name`'s one loop, planned.
+    fn region_of(src: &str, name: &str) -> (crate::nbvm::FnProto, super::super::Region) {
+        let p = proto_of(src, name);
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let mut regions = super::super::plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1, "{:#?}", p.ops);
+        (p, regions.remove(0))
+    }
+
+    #[test]
+    fn speculative_plan_sums_int_elements() {
+        // `s += a[i]` (an int index): the element and the sum are int
+        // registers, the element checked when read.
+        let (p, r) = region_of(
+            "function f(a){ let s = 0; for (let i = 0; i < a.length; i = i + 1) s += a[i]; return s; }",
+            "f",
+        );
+        assert!(r.spec_int, "a speculative integer version");
+        let ip = r.int.as_ref().expect("an integer version");
+        let get = p
+            .ops
+            .iter()
+            .find_map(|o| match o {
+                Op::GetKey { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .expect("a[i]");
+        assert!(ip.has_int(get), "the element is an int register");
+        // Summed by a read by a String key: not (its generic code would
+        // cost the int GPRs' saves for nothing).
+        let (q, r2) = region_of(
+            "function g(o){ let s = 0; for (let i = 0; i < 9; i = i + 1) s += o['k' + (i & 3)]; return s; }",
+            "g",
+        );
+        let get2 = q
+            .ops
+            .iter()
+            .find_map(|o| match o {
+                Op::GetKey { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .expect("o[ks]");
+        assert!(r2.int.as_ref().is_none_or(|ip| !ip.has_int(get2)));
+    }
+
+    #[test]
+    fn wide_plan_takes_index_loops_but_not_identity_loops() {
+        // A counter and its `& 3` index over a property read: an integer
+        // version, though no element, guard, `for-in` or `Math.imul` op.
+        let (_, r) = region_of(
+            "function f(r, n){ let s = 0; for (let i = 0; i < n; i = i + 1) s += r[i & 3].v; return s; }",
+            "f",
+        );
+        assert!(r.spec_int && r.int.is_some(), "an integer version");
+        // An identity test of an element against a loop-invariant object
+        // would bail in its slow path every time: none.
+        let (q, r) = region_of(
+            "function g(r, p, n){ let c = 0; for (let i = 0; i < n; i = i + 1) { if (r[i & 3].o === p) c = c + 1; } return c; }",
+            "g",
+        );
+        assert!(
+            r.int.is_none(),
+            "no integer version for an identity loop: {:?} {:#?}",
+            r.int.as_ref().map(IntPlan::regs),
+            q.ops
+        );
+        // Elements compared by `===` are no int registers (two reads would
+        // each look like one if the other is).
+        let (p, r) = region_of(
+            "function h(a, b, n){ let c = 0; for (let i = 0; i < n; i = i + 1) { if (a[i & 3] === b[i & 7]) c = c + 1 | 0; } return c; }",
+            "h",
+        );
+        if let Some(ip) = r.int.as_ref() {
+            for o in &p.ops {
+                if let Op::GetKey { dst, .. } = o {
+                    assert!(!ip.has_int(*dst), "an element compared by identity");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_copied_into_a_var_is_an_int_register() {
+        // `var x = j & 63` (a register only element ops read): an int
+        // register of the speculative version, its double location the
+        // register file.
+        let (p, r) = region_of(
+            "function f(a, n){ var c = 0; for (var j = 0; j < n; j = j + 1) { var x = j & 63, y = (j * 7) & 63; var t = a[x]; a[x] = a[y]; a[y] = t; if (a[x].k < a[y].k) c = c + 1; } return c; }",
+            "f",
+        );
+        let ip = r.int.as_ref().expect("an integer version");
+        let key = p
+            .ops
+            .iter()
+            .find_map(|o| match o {
+                Op::GetKey { key, .. } => Some(*key),
+                _ => None,
+            })
+            .expect("a[x]");
+        assert!(ip.has_int(key), "the index register is an int register");
+        assert!(
+            !r.slots.iter().any(|s| s.reg == key),
+            "and has no SSE register"
+        );
     }
 
     #[test]
