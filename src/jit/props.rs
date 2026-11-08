@@ -397,6 +397,17 @@ pub(crate) const CHAIN_MAX: usize = 4;
 /// `task.run()` over several task classes — keeps each of them).
 pub(crate) const METHOD_WAYS: usize = 8;
 
+/// [`MethodEntry::slot`] of a property read's **absent** entry: the key is
+/// on no object of the recorded chain, which ends (a `null`
+/// `[[Prototype]]`) at its last level, so the read is `undefined`. Its
+/// `value` is [`ABSENT_VALUE`]'s address, which compiled code loads as it
+/// would a holder's slot.
+const ABSENT_SLOT: u32 = u32::MAX;
+
+/// The word an absent entry's `value` points at: `undefined`'s bits
+/// (read only).
+static ABSENT_VALUE: u64 = crate::nanbox::NanBox::undefined().to_bits();
+
 /// How many times a [`MethodSite`] is (re)filled before it stops trying (a
 /// site whose receivers keep changing layout).
 const FILL_LIMIT: u32 = 32;
@@ -1038,6 +1049,21 @@ impl MethodSite {
                 return Some(entry);
             }
             cur = p.proto();
+            // The chain ends without the key: a read's absent entry (see
+            // `ABSENT_SLOT`). Every level is recorded, watched and
+            // validated as a found property's levels below its holder are;
+            // the last one's `null` link is part of its watched layout. (A
+            // numeric-looking key is left to the general path: elements and
+            // index-keyed exotic objects keep such keys outside the shape.)
+            if cur.is_none() {
+                if want != Want::Getter || key.bytes().next().is_none_or(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                entry.depth = d;
+                entry.holder = h.to_raw();
+                entry.slot = ABSENT_SLOT;
+                return Some(entry);
+            }
         }
         None
     }
@@ -1059,6 +1085,9 @@ enum Want {
 fn holder_value_addr(realm: &crate::realm::Realm, entry: &MethodEntry, setter: bool) -> u64 {
     if entry.depth == 0 {
         return 0;
+    }
+    if entry.slot == ABSENT_SLOT && entry.acc == 0 {
+        return core::ptr::addr_of!(ABSENT_VALUE) as u64;
     }
     let Some(o) = realm.jit_object(crate::heap::Handle::from_raw(entry.holder)) else {
         return 0;
@@ -1823,9 +1852,10 @@ impl X64Assembler {
     /// changed nothing. Clobbers `rax`, `rcx`, `rsi`, `r8`, `r9`, `r11`.
     ///
     /// `walked`: the object is already known to be an ordinary shaped,
-    /// non-exotic object, neither frozen nor carrying `jit_flags` (an
-    /// in-place store's guards passed before its shape missed), so only the
-    /// rest of the add guards are checked.
+    /// non-exotic object, neither frozen nor carrying `jit_flags` other
+    /// than the watched flag (an in-place store's guards passed before its
+    /// shape missed), so only the rest of the add guards are checked, and
+    /// that it is not watched.
     pub(crate) fn p_add_prop_inline(
         &mut self,
         l: &JitLayout,
@@ -1842,7 +1872,10 @@ impl X64Assembler {
         let to = i(add + offset_of!(AddEntry, to));
         self.g_movabs(r::R11, site as u64);
         if walked {
-            self.p_test_byte_imm(r::RCX, l.props.off_jit_flags, FLAGS_NO_ADD);
+            // (The store guards let a watched object through — a value is
+            // no part of its layout — but an add changes the layout, which
+            // only the helper's add reports: `Object::layout_changed`.)
+            self.p_test_byte_imm(r::RCX, l.props.off_jit_flags, FLAGS_NO_ADD | FLAG_WATCHED);
             self.jne(miss);
             self.p_add_room(l, realm_off, miss);
         } else {
