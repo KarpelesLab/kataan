@@ -186,8 +186,10 @@ fn transfer(op: &Op, s: &mut [u8]) {
         Op::Add { dst, a, b } | Op::AddValue { dst, a, b } => {
             (*dst, num_if(t(s, *a) == T_NUM && t(s, *b) == T_NUM))
         }
-        // (`in` and `instanceof` give a boolean, or throw.)
-        Op::Lt { dst, .. }
+        // (`in` and `instanceof` give a boolean, or throw; so does a loose
+        // equality with a string literal.)
+        Op::StrEqConst { dst, .. }
+        | Op::Lt { dst, .. }
         | Op::StrictEq { dst, .. }
         | Op::Not { dst, .. }
         | Op::Relational { dst, .. }
@@ -1077,9 +1079,10 @@ struct Stub {
     pc: usize,
     kind: StubKind,
     /// A fused comparison's branch, taken after the slow op instead of resuming:
-    /// `(cond, target)` — truthy `cond` continues at pc `pc + 2`, falsy at
-    /// `target`.
-    branch: Option<(u16, usize)>,
+    /// `(cond, target, neg)` — truthy `cond` continues at pc `pc + 2`, falsy
+    /// at `target` (the other way round when `neg`: a `Not` fused in, the
+    /// fall-through then pc `pc + 3`).
+    branch: Option<(u16, usize, bool)>,
     /// Emitted by a region's integer version (its flush / reload convert the
     /// int registers).
     int: bool,
@@ -1132,6 +1135,11 @@ pub(super) struct NumGen {
     /// Per pc: a `JumpIfFalse` folded into the comparison before it (emits
     /// nothing).
     skip: Vec<bool>,
+    /// Per pc: emitted already by the fused op before it in the version
+    /// being emitted ([`NumGen::skip_fused`]), one bit per version (the
+    /// body / a region's double version, a region's integer version): a
+    /// version that did not fuse there emits the op itself.
+    fused_skip: Vec<u8>,
     /// The pc being emitted (which promoted registers are live).
     cur_pc: usize,
     /// Per pc: the frame slot holding an in-region global op's validated
@@ -1834,6 +1842,7 @@ impl NumGen {
             stubs: Vec::new(),
             lazy: Vec::new(),
             lazy_args: Vec::new(),
+            fused_skip: vec![0; skip.len()],
             skip,
             cur_pc: 0,
             gslot,
@@ -3479,7 +3488,13 @@ impl NumGen {
     ) -> Option<bool> {
         let reg = self.region_at(pc);
         self.cur_pc = pc;
-        if !self.copy && self.skip.get(pc).copied().unwrap_or(false) {
+        if !self.copy
+            && (self.skip.get(pc).copied().unwrap_or(false)
+                || self
+                    .fused_skip
+                    .get(pc)
+                    .is_some_and(|b| b & self.version_bit() != 0))
+        {
             return Some(true);
         }
         if let Some(ri) = self.imode {
@@ -3708,6 +3723,13 @@ impl NumGen {
                 };
                 match vop {
                     0 => return Some(false),
+                    VB_LOOSE_EQ | VB_LOOSE_NEQ
+                        if self.imode.is_none() && self.nullish_operand(pc, x, y).is_some() =>
+                    {
+                        let v = self.nullish_operand(pc, x, y)?;
+                        let fused = self.fusable(pc, ops, dst).filter(|f| !f.store);
+                        self.nullish(a, labels, pc, reg, v, vop == VB_LOOSE_NEQ, dst, slow, fused)?;
+                    }
                     VB_LOOSE_EQ | VB_LOOSE_NEQ => {
                         let fused = self.fusable(pc, ops, dst);
                         self.compare(
@@ -3985,6 +4007,24 @@ impl NumGen {
                 self.store_xmm0(a, reg, dst);
                 a.bind(resume);
                 self.stub(stub, resume, reg, StubKind::Exec { pc: opc });
+            }
+            // `if (!x)` on a proven boolean or Number: the test branches on
+            // `x`'s truthiness itself, the not's boolean never stored.
+            GenericOp::Not { dst, a: x } if self.not_test(pc, ops, dst, x).is_some() => {
+                let target = self.not_test(pc, ops, dst, x)?;
+                if self.ty(pc, x) == T_BOOL {
+                    self.load_gpr(a, reg, RAX, x);
+                    a.movabs_r11(self.tag_true as i64);
+                    a.cmp_rax_r11();
+                    self.jcc_to(a, labels, reg, CC_E, target);
+                } else {
+                    // Truthy (to `target`) when neither zero nor NaN.
+                    let xr = self.xmm_src(a, reg, x, 0);
+                    a.sse_rr(0x66, 0x57, 1, 1); // xorpd xmm1, xmm1
+                    a.sse_rr(0x66, 0x2e, xr, 1); // ucomisd x, xmm1 (ZF: zero or NaN)
+                    self.jcc_to(a, labels, reg, CC_NE, target);
+                }
+                self.skip_op(pc + 1);
             }
             GenericOp::JumpIfFalse { cond, target } => {
                 let back = target <= pc;
@@ -4525,22 +4565,116 @@ impl NumGen {
     }
 
     /// Whether the comparison at `pc` writing `dst` can branch directly into the
-    /// `JumpIfFalse` that follows it: `Some((target, store))`, `store` false when
-    /// nothing else can read `dst` (the boolean need not be materialized).
-    fn fusable(&self, pc: usize, ops: &[GenericOp], dst: u16) -> Option<(usize, bool)> {
+    /// `JumpIfFalse` that follows it, or into one after a `Not` of it (`t =
+    /// !c; if (!t) …`, i.e. `if (c)` with the sense flipped: `!==`, `>=`,
+    /// `if (!(a < b))`), see [`Fused`]. Never in a speculative loop's plain
+    /// copy.
+    pub(super) fn fusable(&self, pc: usize, ops: &[GenericOp], dst: u16) -> Option<Fused> {
         if self.copy {
             return None;
         }
+        self.fuse_shape(pc, ops, dst)
+    }
+
+    /// A test the generic emitter's op at `pc` (one that writes a boolean
+    /// into `dst`, which its code tells apart by branches anyway) may take
+    /// over: the `JumpIfFalse` right after, with `dst` dead past it and
+    /// nothing else reaching it, in the same region (not through a `Not`;
+    /// not in a region's integer version or plain copy, whose labels are
+    /// their own). The op's branches then go to the test's target or on
+    /// past it ([`skip_fused`](Self::skip_fused)), as `jump_from(pc + 1,
+    /// …)` would take them.
+    pub(super) fn fused_branch(&self, pc: usize, ops: &[GenericOp], dst: u16) -> Option<Fused> {
+        if self.imode.is_some() {
+            return None;
+        }
+        self.fusable(pc, ops, dst).filter(|f| !f.store && !f.neg)
+    }
+
+    /// [`fusable`](Self::fusable)'s test of the ops themselves. Through a
+    /// `Not`, only when neither boolean is read by anything else (both dead
+    /// past the test) and nothing branches to the `Not` or the test.
+    fn fuse_shape(&self, pc: usize, ops: &[GenericOp], dst: u16) -> Option<Fused> {
+        let m = |r: u16| self.mentions.get(r as usize).copied().unwrap_or(u32::MAX);
+        let tgt = |q: usize| self.is_target.get(q).copied().unwrap_or(true);
         match ops.get(pc + 1) {
             Some(&GenericOp::JumpIfFalse { cond, target }) if cond == dst && target > pc + 1 => {
-                let others = self.mentions.get(dst as usize).copied().unwrap_or(u32::MAX);
-                let store = others > 2 || self.is_target.get(pc + 1).copied().unwrap_or(true);
+                let store = m(dst) > 2 || tgt(pc + 1);
                 // Fusing skips op `pc + 1`'s own code on the fast path, so that op
                 // must belong to the same region as `pc`.
-                (self.region_at(pc + 1) == self.region_at(pc)).then_some((target, store))
+                (self.region_at(pc + 1) == self.region_at(pc)).then_some(Fused {
+                    target,
+                    store,
+                    neg: false,
+                })
+            }
+            Some(&GenericOp::Not { dst: n, a }) if a == dst => {
+                let Some(&GenericOp::JumpIfFalse { cond, target }) = ops.get(pc + 2) else {
+                    return None;
+                };
+                // (`Not { dst: c, a: c }`: the compare, the not twice, the
+                // test.)
+                let dead = if n == dst {
+                    m(dst) == 4
+                } else {
+                    m(dst) == 2 && m(n) == 2
+                };
+                (cond == n
+                    && target > pc + 2
+                    && dead
+                    && !tgt(pc + 1)
+                    && !tgt(pc + 2)
+                    && self.region_at(pc + 1) == self.region_at(pc)
+                    && self.region_at(pc + 2) == self.region_at(pc))
+                .then_some(Fused {
+                    target,
+                    store: false,
+                    neg: true,
+                })
             }
             _ => None,
         }
+    }
+
+    /// For `t = !x; if (!t) goto target` at `pc` with `x` a proven boolean
+    /// or Number: `target`, when the test may branch on `x` itself (`t` read
+    /// by nothing else, nothing else reaching the test, both ops in one
+    /// region; not in a region's plain copy or integer version).
+    fn not_test(&self, pc: usize, ops: &[GenericOp], dst: u16, x: u16) -> Option<usize> {
+        let Some(&GenericOp::JumpIfFalse { cond, target }) = ops.get(pc + 1) else {
+            return None;
+        };
+        let t = self.ty(pc, x);
+        (!self.copy
+            && self.imode.is_none()
+            && cond == dst
+            && dst != x
+            && target > pc + 1
+            && (t == T_BOOL || t == T_NUM)
+            && self.mentions.get(dst as usize).copied() == Some(2)
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && self.region_at(pc + 1) == self.region_at(pc))
+        .then_some(target)
+    }
+
+    /// Whether op `pc` is a `Not` the comparison right before it may fuse
+    /// through ([`fusable`](Self::fusable)), its boolean then never stored:
+    /// the `Not`'s start is no point where the register file is complete
+    /// (`deopt`).
+    pub(super) fn not_fused_through(&self, pc: usize, ops: &[GenericOp]) -> bool {
+        let Some(q) = pc.checked_sub(1) else {
+            return false;
+        };
+        let dst = match ops.get(q) {
+            Some(
+                &(GenericOp::Lt { dst, .. }
+                | GenericOp::Compare { dst, .. }
+                | GenericOp::StrictEq { dst, .. }
+                | GenericOp::ValueBin { dst, .. }),
+            ) => dst,
+            _ => return false,
+        };
+        self.fuse_shape(q, ops, dst).is_some_and(|f| f.neg)
     }
 
     fn stub(&mut self, entry: Label, resume: Label, region: Option<usize>, kind: StubKind) {
@@ -5237,7 +5371,7 @@ impl NumGen {
 
     /// A comparison: `<`/`>`/`<=`/`>=` (`Rel`) or (loose/strict, same on two
     /// Numbers) equality (`Eq(negated)`), materialized as a boolean and/or fused
-    /// into the following `JumpIfFalse` (`fused` = `(target, store)`).
+    /// into the test after it (`fused`, see [`Fused`]).
     #[allow(clippy::too_many_arguments)]
     fn compare(
         &mut self,
@@ -5250,7 +5384,7 @@ impl NumGen {
         x: u16,
         y: u16,
         slow: StubKind,
-        fused: Option<(usize, bool)>,
+        fused: Option<Fused>,
     ) -> Option<()> {
         let stub = a.new_label();
         let bits = matches!(kind, CmpKind::Bits(..));
@@ -5288,7 +5422,7 @@ impl NumGen {
         if defer {
             a.jcc(CC_P, stub); // (leaves the flags for the branch below)
         }
-        let store = fused.is_none_or(|(_, s)| s);
+        let store = fused.is_none_or(|f| f.store);
         if store {
             // rax = the 0/1 result (ordered equality needs ZF && !PF).
             match kind {
@@ -5323,34 +5457,19 @@ impl NumGen {
                     self.stub(stub, resume, reg, slow);
                 }
             }
-            Some((target, _)) => {
-                // Falsy → `target`; truthy → past the `JumpIfFalse`.
-                let past = *labels.get(pc + 2)?;
+            Some(f) => {
+                // The test branches to `f.target` when the result is false
+                // (or, through a `Not`, true); else on past it.
+                let target = f.target;
+                let past = *labels.get(f.past(pc))?;
                 if store {
                     a.raw(&[0x48, 0x85, 0xd2]); // test rdx, rdx
-                    self.jcc_to(a, labels, reg, CC_E, target);
+                    self.jcc_to(a, labels, reg, if f.neg { CC_NE } else { CC_E }, target);
                 } else {
-                    match kind {
-                        CmpKind::Bits(..) => self.jcc_to(a, labels, reg, CC_NE, target),
-                        CmpKind::Eq(false) => {
-                            self.jcc_to(a, labels, reg, CC_NE, target);
-                            self.jcc_to(a, labels, reg, CC_P, target);
-                        }
-                        CmpKind::Eq(true) => {
-                            // `!=` is false exactly when ordered-equal.
-                            let not_eq = a.new_label();
-                            a.jcc(CC_NE, not_eq);
-                            a.jcc(CC_P, not_eq);
-                            self.jump(a, labels, reg, target);
-                            a.bind(not_eq);
-                        }
-                        CmpKind::Rel(_) => {
-                            let not_cc = if cc == CC_A { CC_BE } else { CC_B };
-                            self.jcc_to(a, labels, reg, not_cc, target);
-                        }
-                    }
+                    self.cmp_branch(a, labels, reg, kind, cc, f.neg, target);
                 }
-                let jif_reachable = self.is_target.get(pc + 1).copied().unwrap_or(true);
+                // (A `Not` fused in is reachable from here only.)
+                let jif_reachable = !f.neg && self.is_target.get(pc + 1).copied().unwrap_or(true);
                 if jif_reachable {
                     a.jmp(past);
                 }
@@ -5360,19 +5479,166 @@ impl NumGen {
                     // when that op is reachable otherwise, else by itself.
                     self.stub(stub, *labels.get(pc + 1)?, reg, slow);
                     if !jif_reachable && let Some(st) = self.stubs.last_mut() {
-                        st.branch = Some((dst, target));
+                        st.branch = Some((dst, target, f.neg));
                     }
                 }
                 if !jif_reachable {
-                    // Nothing else reaches the `JumpIfFalse`: the fast path falls
-                    // straight through to pc + 2.
-                    if let Some(k) = self.skip.get_mut(pc + 1) {
-                        *k = true;
-                    }
+                    // Nothing else reaches the test (nor the `Not`): the fast
+                    // path falls straight through past it.
+                    self.skip_fused(pc, f);
                 }
             }
         }
         Some(())
+    }
+
+    /// For `x == y` at `pc` where one side is the constant `null` or
+    /// `undefined` (the `LoadConst` right before), the other one.
+    fn nullish_operand(&self, pc: usize, x: u16, y: u16) -> Option<u16> {
+        let nullish = |r: u16| {
+            self.const_imm_bits_at(pc, r).is_some_and(|b| {
+                b == NanBox::null().to_bits() || b == NanBox::undefined().to_bits()
+            })
+        };
+        if x == y {
+            None
+        } else if nullish(y) {
+            Some(x)
+        } else if nullish(x) {
+            Some(y)
+        } else {
+            None
+        }
+    }
+
+    /// `v == null` (`neg`: `!=`; `undefined` alike): true exactly for
+    /// `undefined`, `null` and an `[[IsHTMLDDA]]` object (IsLooselyEqual
+    /// takes no other value to either, and runs no code for them). Decided
+    /// inline for those two words, any value that is no heap handle, and a
+    /// function, array or shaped ordinary object without the brand; any
+    /// other heap value (a String, a branded object, …) is the slow op's.
+    /// Materialized as a boolean, or (`fused`, never stored) branching
+    /// for the test after it.
+    #[allow(clippy::too_many_arguments)]
+    fn nullish(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        pc: usize,
+        reg: Option<usize>,
+        v: u16,
+        neg: bool,
+        dst: u16,
+        slow: StubKind,
+        fused: Option<Fused>,
+    ) -> Option<()> {
+        let stub = a.new_label();
+        let (yes, no) = (a.new_label(), a.new_label());
+        self.load_gpr(a, reg, RAX, v);
+        a.movabs_r11(NanBox::undefined().to_bits() as i64);
+        a.cmp_rax_r11();
+        a.jcc(CC_E, yes);
+        a.movabs_r11(NanBox::null().to_bits() as i64);
+        a.cmp_rax_r11();
+        a.jcc(CC_E, yes);
+        a.p_cmp_handle_floor(RAX);
+        a.jcc(CC_B, no);
+        a.p_not_dda_handle(self.env.realm, no, stub);
+        // `yes`: `v` is nullish; the result is `!neg`.
+        match fused {
+            Some(f) => {
+                // The test branches to `f.target` when the result is false
+                // (through a `Not`: true).
+                let past = *labels.get(f.past(pc))?;
+                let (to_target, to_past) = if neg != f.neg { (yes, no) } else { (no, yes) };
+                a.bind(to_target);
+                self.jump(a, labels, reg, f.target);
+                a.bind(to_past);
+                a.jmp(past);
+                self.stub(stub, past, reg, slow);
+                if let Some(st) = self.stubs.last_mut() {
+                    st.branch = Some((dst, f.target, f.neg));
+                }
+                self.skip_fused(pc, f);
+            }
+            None => {
+                let done = a.new_label();
+                a.bind(yes);
+                a.movabs_rax(NanBox::boolean(!neg).to_bits() as i64);
+                a.jmp(done);
+                a.bind(no);
+                a.movabs_rax(NanBox::boolean(neg).to_bits() as i64);
+                a.bind(done);
+                self.store_gpr(a, reg, RAX, dst);
+                let resume = a.new_label();
+                a.bind(resume);
+                self.stub(stub, resume, reg, slow);
+            }
+        }
+        Some(())
+    }
+
+    /// The branch of a fused comparison whose boolean is not materialized,
+    /// on the flags its compare left: to `target` when the result is false,
+    /// or true when `when_true` (a `Not` fused in).
+    #[allow(clippy::too_many_arguments)]
+    fn cmp_branch(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        reg: Option<usize>,
+        kind: CmpKind,
+        cc: u8,
+        when_true: bool,
+        target: usize,
+    ) {
+        // Ordered equality is ZF && !PF; `Bits` is ZF; `Rel` its `cc`
+        // (false when unordered).
+        match (kind, when_true) {
+            (CmpKind::Bits(..), false) => self.jcc_to(a, labels, reg, CC_NE, target),
+            (CmpKind::Bits(..), true) => self.jcc_to(a, labels, reg, CC_E, target),
+            (CmpKind::Eq(neg), w) if neg == w => {
+                // To `target` when not ordered-equal.
+                self.jcc_to(a, labels, reg, CC_NE, target);
+                self.jcc_to(a, labels, reg, CC_P, target);
+            }
+            (CmpKind::Eq(_), _) => {
+                // To `target` when ordered-equal.
+                let not_eq = a.new_label();
+                a.jcc(CC_NE, not_eq);
+                a.jcc(CC_P, not_eq);
+                self.jump(a, labels, reg, target);
+                a.bind(not_eq);
+            }
+            (CmpKind::Rel(_), true) => self.jcc_to(a, labels, reg, cc, target),
+            (CmpKind::Rel(_), false) => {
+                let not_cc = if cc == CC_A { CC_BE } else { CC_B };
+                self.jcc_to(a, labels, reg, not_cc, target);
+            }
+        }
+    }
+
+    /// The version being emitted, as its [`fused_skip`](Self::fused_skip)
+    /// bit.
+    fn version_bit(&self) -> u8 {
+        if self.imode.is_some() { 2 } else { 1 }
+    }
+
+    /// Marks op `pc` as emitted already, in the version being emitted, by
+    /// the fused code of an op before it.
+    pub(super) fn skip_op(&mut self, pc: usize) {
+        let bit = self.version_bit();
+        if let Some(k) = self.fused_skip.get_mut(pc) {
+            *k |= bit;
+        }
+    }
+
+    /// Marks the ops a fused comparison at `pc` took over (its test, and a
+    /// `Not` before it) as emitted, in the version being emitted.
+    pub(super) fn skip_fused(&mut self, pc: usize, f: Fused) {
+        for q in pc + 1..f.past(pc) {
+            self.skip_op(q);
+        }
     }
 
     /// `if !ToBoolean(register cond) goto target` for a branch from `pc`.
@@ -5707,6 +5973,39 @@ impl NumGen {
                     throws,
                 } => {
                     self.flush(a, s.region);
+                    // `===` past its compare (an unordered one, which the
+                    // double version's deferred check takes here: a NaN or a
+                    // value that is no Number): the words decide unless
+                    // both are distinct heap values (Strings and BigInts
+                    // compare by contents). Equal words are a non-Number's
+                    // `true`, or a NaN's `false`.
+                    let have = a.new_label();
+                    if helper == self.env.strict_eq && !s.int {
+                        use super::call_seq::{cc, r};
+                        const HANDLE_TOP: i32 = 0x3fff;
+                        let (same, call, no) = (a.new_label(), a.new_label(), a.new_label());
+                        a.load_argreg(1, disp(x));
+                        a.load_argreg(2, disp(y));
+                        a.g_cmp(r::RSI, r::RDX);
+                        a.g_jcc(cc::E, same);
+                        a.g_mov(r::RAX, r::RSI);
+                        a.g_and(r::RAX, r::RDX);
+                        a.g_shr_imm(r::RAX, 50);
+                        a.g_cmp_imm(r::RAX, HANDLE_TOP);
+                        a.g_jcc(cc::E, call);
+                        a.bind(no);
+                        a.movabs_rax(self.tag_false as i64);
+                        a.jmp(have);
+                        a.bind(same);
+                        a.g_mov(r::RAX, r::RSI);
+                        a.movabs_r11(QNAN as i64);
+                        a.and_rax_r11();
+                        a.cmp_rax_r11();
+                        a.jcc(CC_NE, no);
+                        a.movabs_rax(self.tag_true as i64);
+                        a.jmp(have);
+                        a.bind(call);
+                    }
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(x));
                     a.load_argreg(2, disp(y));
@@ -5720,6 +6019,7 @@ impl NumGen {
                         a.cmp_rax_r11();
                         a.je(throw_exit);
                     }
+                    a.bind(have);
                     a.store_rax(disp(dst));
                     self.reload(a, s.region);
                     self.recheck_globals(a, s.region);
@@ -5942,15 +6242,15 @@ impl NumGen {
     /// The tail of a slow-path stub: resume, or a fused comparison's branch on
     /// the boolean the slow op stored (in memory, which is up to date).
     fn after_slow(&self, a: &mut X64Assembler, labels: &[Label], s: &Stub) {
-        let Some((cond, target)) = s.branch else {
+        let Some((cond, target, neg)) = s.branch else {
             a.jmp(s.resume);
             return;
         };
         a.load_rax(disp(cond));
         a.movabs_r11(self.tag_true as i64);
         a.cmp_rax_r11();
-        if let Some(&past) = labels.get(s.pc + 2) {
-            a.jcc(CC_E, past);
+        if let Some(&past) = labels.get(s.pc + 2 + usize::from(neg)) {
+            a.jcc(if neg { CC_NE } else { CC_E }, past);
         }
         match self.in_region_target(labels, s.region, target) {
             Some(l) => a.jmp(l),
@@ -5960,6 +6260,24 @@ impl NumGen {
                 }
             }
         }
+    }
+}
+
+/// A comparison's fusion into the test after it ([`NumGen::fusable`]): the
+/// `JumpIfFalse`'s target, whether the boolean must still be stored (read
+/// elsewhere, or the test reachable otherwise), and whether a `Not` lies
+/// between (the branch then goes to `target` when the comparison is true).
+#[derive(Clone, Copy)]
+pub(super) struct Fused {
+    pub(super) target: usize,
+    pub(super) store: bool,
+    pub(super) neg: bool,
+}
+
+impl Fused {
+    /// The op the fall-through path goes on at: past the test.
+    pub(super) fn past(self, pc: usize) -> usize {
+        pc + 2 + usize::from(self.neg)
     }
 }
 

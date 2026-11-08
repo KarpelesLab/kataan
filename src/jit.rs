@@ -60,6 +60,8 @@ mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod typed;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod typeof_test;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, FnCallMemo, HDR_CONSTRUCT,
@@ -8119,6 +8121,18 @@ impl JitFunction {
             });
         // Per op: a `Not` emitted with its test (`not_branch`).
         let mut not_fused = alloc::vec![false; ops.len()];
+        // Per `TypeOf`, the `typeof v === 'lit'` it begins, tested as one
+        // (`typeof_test`; outside promoted loops, whose ops these are not).
+        let typeof_at: Vec<Option<typeof_test::TypeofTest>> = {
+            let target = recv_cache::branch_targets(ops, osr_entries, &catch_targets);
+            let mut t = typeof_test::typeof_tests(bytecode, &target);
+            for (i, x) in t.iter_mut().enumerate() {
+                if num.in_any_region(i) || num.in_any_region(i + 1) {
+                    *x = None;
+                }
+            }
+            t
+        };
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
         let rc_key = |w: usize| rc_base - 8 * (4 * w as i32 + 1);
         let rc_cell = |w: usize| rc_base - 8 * (4 * w as i32 + 2);
@@ -8484,7 +8498,13 @@ impl JitFunction {
             deopt::points(
                 ops,
                 &deopt_levels,
-                |pc| num.in_any_region(pc),
+                // (A `Not` a comparison fuses through starts with the
+                // comparison's boolean unwritten.)
+                |pc| {
+                    num.in_any_region(pc)
+                        || num.not_fused_through(pc, ops)
+                        || (pc > 0 && typeof_at[pc - 1].is_some())
+                },
                 |pc| fresh_add[pc].is_some() || fresh_init[pc],
                 |pc| deopt_info.and_then(|d| d.own_start(pc)),
             )
@@ -10791,6 +10811,136 @@ impl JitFunction {
                             a.cmp_rax_r11();
                             a.je(leave_exit);
                         }
+                        // `typeof v === 'lit'` (`typeof_test`): the word's
+                        // own answer, else both ops the interpreter's; the
+                        // compare's test, when only it reads the boolean,
+                        // taken over (`NumGen::fused_branch`).
+                        crate::nbvm::Op::TypeOf { .. }
+                            if typeof_at
+                                .get(op_idx)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|t| ok(t.v) && ok(t.d)) =>
+                        {
+                            use typeof_test::TypeLit as L;
+                            let t = typeof_at.get(op_idx).copied().flatten()?;
+                            let fz = num
+                                .fused_branch(op_idx + 1, ops, t.d)
+                                .filter(|f| f.target <= ops.len());
+                            let done = a.new_label();
+                            let (yes, no, slow) = (a.new_label(), a.new_label(), a.new_label());
+                            const QNAN: u64 = 0x7ffc_0000_0000_0000;
+                            a.load_rax(disp(t.v));
+                            let imm = |a: &mut X64Assembler, bits: u64, to: Label| {
+                                a.movabs_r11(bits as i64);
+                                a.cmp_rax_r11();
+                                a.je(to);
+                            };
+                            match t.lit {
+                                L::Number => {
+                                    // Every other value is a boxed word.
+                                    a.g_mov(call_seq::r::RDX, call_seq::r::RAX);
+                                    a.g_movabs(call_seq::r::R11, QNAN);
+                                    a.code.extend_from_slice(&[0x4c, 0x21, 0xda]); // and rdx, r11
+                                    a.code.extend_from_slice(&[0x4c, 0x39, 0xda]); // cmp rdx, r11
+                                    a.jne(yes);
+                                    a.jmp(no);
+                                }
+                                L::Boolean => {
+                                    imm(&mut a, tag_true, yes);
+                                    imm(&mut a, tag_false, yes);
+                                    a.jmp(no);
+                                }
+                                L::Undefined => {
+                                    imm(&mut a, NanBox::undefined().to_bits(), yes);
+                                    a.p_cmp_handle_floor(call_seq::r::RAX);
+                                    a.g_jcc(call_seq::cc::B, no);
+                                    // (Only an `[[IsHTMLDDA]]` object among
+                                    // heap values.)
+                                    a.p_not_dda_handle(helpers.call_layout.realm, no, slow);
+                                }
+                                L::Object | L::Function | L::String | L::OtherHeap => {
+                                    if t.lit == L::Object {
+                                        imm(&mut a, NanBox::null().to_bits(), yes);
+                                    }
+                                    a.p_cmp_handle_floor(call_seq::r::RAX);
+                                    a.g_jcc(call_seq::cc::B, no);
+                                    // A VM closure is a function, and a String
+                                    // a string while none has an auxiliary
+                                    // object (`Realm::str_special`, which
+                                    // `type_of_value` asks per String); any
+                                    // other heap value the interpreter's.
+                                    walk_to_slot!(t.v, slow);
+                                    let (vmfn, str_) = match t.lit {
+                                        L::Function => (yes, no),
+                                        L::String => (no, yes),
+                                        _ => (no, no),
+                                    };
+                                    let not_fn = a.new_label();
+                                    a.cmp_byte_at_rcx_imm(
+                                        layout.off_cell_tag,
+                                        layout.props.vmfn_disc,
+                                    );
+                                    a.jne(not_fn);
+                                    a.jmp(vmfn);
+                                    a.bind(not_fn);
+                                    a.cmp_byte_at_rcx_imm(
+                                        layout.off_cell_tag,
+                                        layout.cell_str_disc,
+                                    );
+                                    a.jne(slow);
+                                    let cl = &helpers.call_layout;
+                                    a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                                    a.g_cmp_byte_imm(call_seq::r::R9, cl.str_special, 0);
+                                    a.g_jcc(call_seq::cc::NE, slow);
+                                    a.jmp(str_);
+                                }
+                                L::Never => a.jmp(no),
+                            }
+                            // `yes`: `typeof v` is the literal; the result
+                            // is `!neg`.
+                            let (r_true, r_false) = if t.neg { (no, yes) } else { (yes, no) };
+                            match fz {
+                                Some(f) => {
+                                    let direct = num.direct_from(&labels, op_idx + 2, f.target);
+                                    let to = direct.unwrap_or_else(|| a.new_label());
+                                    a.bind(r_false);
+                                    a.jmp(to);
+                                    a.bind(r_true);
+                                    a.jmp(done);
+                                    a.bind(slow);
+                                    exec_op!(pc);
+                                    exec_op!(pc + 1);
+                                    a.load_rax(disp(t.d));
+                                    a.movabs_r11(tag_true as i64);
+                                    a.cmp_rax_r11();
+                                    a.jne(to);
+                                    a.jmp(done);
+                                    if direct.is_none() {
+                                        let cold = a.cold_begin();
+                                        a.bind(to);
+                                        num.jump_from(&mut a, &labels, op_idx + 2, f.target);
+                                        a.cold_end(cold);
+                                    }
+                                    num.skip_fused(op_idx + 1, f);
+                                }
+                                None => {
+                                    a.bind(r_true);
+                                    a.movabs_rax(tag_true as i64);
+                                    a.store_rax(disp(t.d));
+                                    a.jmp(done);
+                                    a.bind(r_false);
+                                    a.movabs_rax(tag_false as i64);
+                                    a.store_rax(disp(t.d));
+                                    a.jmp(done);
+                                    a.bind(slow);
+                                    exec_op!(pc);
+                                    exec_op!(pc + 1);
+                                }
+                            }
+                            num.skip_op(op_idx + 1);
+                            a.bind(done);
+                        }
                         // `v === 'lit'` (`!==`, `==`, `!=`) for a literal a
                         // short String could equal: a String held in its
                         // node compared byte by byte (WTF-8 is canonical, so
@@ -10809,11 +10959,26 @@ impl JitFunction {
                             let bail = num.spec_bail(&mut a, op_idx);
                             let slow = bail.unwrap_or_else(|| a.new_label());
                             let done = a.new_label();
-                            let (eq, ne) = (a.new_label(), a.new_label());
-                            let not_str = a.new_label();
-                            let (not_small, not_leaf) = (a.new_label(), a.new_label());
                             let neg = kind & crate::nbvm::STR_EQ_NEGATE != 0;
                             let loose = kind & crate::nbvm::STR_EQ_LOOSE != 0;
+                            // Tested only by the `JumpIfFalse` right after
+                            // (`NumGen::fused_branch`): the answers branch
+                            // there themselves, the boolean never stored (a
+                            // false one to the test's target, `to`; a true
+                            // one falls through past the test).
+                            let fz = num
+                                .fused_branch(op_idx, ops, *dst)
+                                .filter(|f| f.target <= ops.len());
+                            let fz_direct =
+                                fz.and_then(|f| num.direct_from(&labels, op_idx + 1, f.target));
+                            let fz_to = fz.map(|_| fz_direct.unwrap_or_else(|| a.new_label()));
+                            let (eq, ne) = match fz_to {
+                                Some(to) if neg => (to, done),
+                                Some(to) => (done, to),
+                                None => (a.new_label(), a.new_label()),
+                            };
+                            let not_str = a.new_label();
+                            let (not_small, not_leaf) = (a.new_label(), a.new_label());
                             let rl = layout.rope;
                             let n = lit.len() as u8;
                             a.load_rax(disp(*src));
@@ -10869,17 +11034,38 @@ impl JitFunction {
                             // the literal with its primitive (the op's).
                             a.bind(not_str);
                             a.jmp(if loose { slow } else { ne });
-                            a.bind(eq);
-                            a.movabs_rax(NanBox::boolean(!neg).to_bits() as i64);
-                            a.store_rax(disp(*dst));
-                            a.jmp(done);
-                            a.bind(ne);
-                            a.movabs_rax(NanBox::boolean(neg).to_bits() as i64);
-                            a.store_rax(disp(*dst));
-                            if bail.is_none() {
+                            if let (Some(f), Some(to)) = (fz, fz_to) {
+                                if bail.is_none() {
+                                    // The interpreter's op stores the
+                                    // boolean; the test's branch on it.
+                                    a.bind(slow);
+                                    exec_op!(pc);
+                                    a.load_rax(disp(*dst));
+                                    a.movabs_r11(tag_true as i64);
+                                    a.cmp_rax_r11();
+                                    a.jne(to);
+                                    a.jmp(done);
+                                }
+                                if fz_direct.is_none() {
+                                    let cold = a.cold_begin();
+                                    a.bind(to);
+                                    num.jump_from(&mut a, &labels, op_idx + 1, f.target);
+                                    a.cold_end(cold);
+                                }
+                                num.skip_fused(op_idx, f);
+                            } else {
+                                a.bind(eq);
+                                a.movabs_rax(NanBox::boolean(!neg).to_bits() as i64);
+                                a.store_rax(disp(*dst));
                                 a.jmp(done);
-                                a.bind(slow);
-                                exec_op!(pc);
+                                a.bind(ne);
+                                a.movabs_rax(NanBox::boolean(neg).to_bits() as i64);
+                                a.store_rax(disp(*dst));
+                                if bail.is_none() {
+                                    a.jmp(done);
+                                    a.bind(slow);
+                                    exec_op!(pc);
+                                }
                             }
                             a.bind(done);
                         }
@@ -11740,6 +11926,17 @@ impl JitFunction {
                             let (text, found, absent) =
                                 (a.new_label(), a.new_label(), a.new_label());
                             let (got, have) = (a.new_label(), a.new_label());
+                            // Tested only by the `JumpIfFalse` right after
+                            // (`NumGen::fused_branch`): the answer branches
+                            // there itself (`false` to the test's target,
+                            // `to`), never stored.
+                            let fz = num
+                                .fused_branch(op_idx, ops, *dst)
+                                .filter(|f| f.target <= ops.len())
+                                .filter(|_| forin_fuse.get(op_idx + 1) != Some(&true));
+                            let fz_direct =
+                                fz.and_then(|f| num.direct_from(&labels, op_idx + 1, f.target));
+                            let fz_to = fz.map(|_| fz_direct.unwrap_or_else(|| a.new_label()));
                             // A run-proved answer (`numeric::plan_answer_proofs`):
                             // once given in this run of the fast version, the
                             // same, from its frame slot.
@@ -11777,7 +11974,17 @@ impl JitFunction {
                                 a.g_store(call_seq::r::RBP, ps, call_seq::r::RAX);
                             }
                             a.bind(have);
-                            a.store_rax(disp(*dst));
+                            // (The slow paths come back here with the
+                            // boolean stored and in `rax`, when fused.)
+                            match fz_to {
+                                Some(to) => {
+                                    a.movabs_r11(tag_true as i64);
+                                    a.cmp_rax_r11();
+                                    a.jne(to);
+                                }
+                                None => a.store_rax(disp(*dst)),
+                            }
+                            let back = if fz.is_some() { have } else { done };
                             if bail.is_none() {
                                 let cold = a.cold_begin();
                                 // What the heap alone decides (an element of a
@@ -11794,11 +12001,23 @@ impl JitFunction {
                                 a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
                                 a.g_jcc(call_seq::cc::E, exec);
                                 a.store_rax(disp(*dst));
-                                a.jmp(done);
+                                a.jmp(back);
                                 a.bind(exec);
                                 exec_op!(pc);
-                                a.jmp(done);
+                                if fz.is_some() {
+                                    a.load_rax(disp(*dst));
+                                }
+                                a.jmp(back);
                                 a.cold_end(cold);
+                            }
+                            if let (Some(f), Some(to)) = (fz, fz_to) {
+                                if fz_direct.is_none() {
+                                    let cold = a.cold_begin();
+                                    a.bind(to);
+                                    num.jump_from(&mut a, &labels, op_idx + 1, f.target);
+                                    a.cold_end(cold);
+                                }
+                                num.skip_fused(op_idx, f);
                             }
                             a.bind(done);
                         }

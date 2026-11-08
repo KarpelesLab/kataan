@@ -2887,6 +2887,20 @@ impl X64Assembler {
     /// the `[[IsHTMLDDA]]` brand, to `truthy`; anything else to `other`.
     /// Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
     pub(crate) fn p_truthy_handle(&mut self, realm_off: i32, truthy: Label, other: Label) {
+        self.p_plain_handle(realm_off, truthy, other, false);
+    }
+
+    /// Whether the heap handle in `rax` is no `[[IsHTMLDDA]]` object, where
+    /// the walk alone decides it ([`p_truthy_handle`](Self::p_truthy_handle)'s
+    /// values, and a String): to `plain`; anything else to `other`. (What
+    /// `v == null` is false for.) Clobbers `rax`, `rcx`, `rdx`, `r8`–`r11`.
+    pub(crate) fn p_not_dda_handle(&mut self, realm_off: i32, plain: Label, other: Label) {
+        self.p_plain_handle(realm_off, plain, other, true);
+    }
+
+    /// [`p_truthy_handle`](Self::p_truthy_handle), and with `strings` a
+    /// String to `truthy` too.
+    fn p_plain_handle(&mut self, realm_off: i32, truthy: Label, other: Label, strings: bool) {
         let l = super::compute_jit_layout();
         if !self.pinned() {
             self.g_mov(r::R9, r::RAX);
@@ -2913,6 +2927,10 @@ impl X64Assembler {
         self.g_jcc(cc::E, truthy);
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
         self.g_jcc(cc::E, truthy);
+        if strings {
+            self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_str_disc);
+            self.g_jcc(cc::E, truthy);
+        }
         self.jmp(other);
     }
 

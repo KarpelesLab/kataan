@@ -1675,7 +1675,7 @@ impl NumGen {
         {
             return Some(false);
         }
-        let Some((target, false)) = self.fusable(pc, ops, dst) else {
+        let Some(f) = self.fusable(pc, ops, dst).filter(|f| !f.store) else {
             return Some(false);
         };
         match (self.ik(x)?, self.ik(y)?) {
@@ -1683,11 +1683,11 @@ impl NumGen {
             (IK::Gpr(g), IK::Gpr(h)) => a.test32_rr(g, h),
             (IK::Imm(_), IK::Imm(_)) => return Some(false),
         }
-        self.jcc_to(a, labels, self.imode, CC_E, target);
+        // (Through a `Not`: to the target when non-zero.)
+        let cc = if f.neg { CC_NE } else { CC_E };
+        self.jcc_to(a, labels, self.imode, cc, f.target);
         // (`fusable` without a store: nothing else reaches the test.)
-        if let Some(k) = self.skip.get_mut(pc + 1) {
-            *k = true;
-        }
+        self.skip_fused(pc, f);
         Some(true)
     }
 
@@ -1792,7 +1792,7 @@ impl NumGen {
     ) -> Option<()> {
         let reg = self.imode;
         let fused = self.fusable(pc, ops, dst);
-        let store = fused.is_none_or(|(_, s)| s);
+        let store = fused.is_none_or(|f| f.store);
         let gx = self.ival(a, x, RAX)?;
         match self.ik(y)? {
             IK::Imm(v) => a.cmp32_imm(gx, v),
@@ -1808,13 +1808,17 @@ impl NumGen {
             a.raw(&[0x84, 0xd2]); // test dl, dl
             branch_cc = CC_E;
         }
-        if let Some((target, _)) = fused {
-            self.jcc_to(a, labels, reg, branch_cc, target);
-            if self.is_target.get(pc + 1).copied().unwrap_or(true) {
+        if let Some(f) = fused {
+            // (Through a `Not`, never stored: to the target when true.)
+            if f.neg {
+                branch_cc = cc;
+            }
+            self.jcc_to(a, labels, reg, branch_cc, f.target);
+            if !f.neg && self.is_target.get(pc + 1).copied().unwrap_or(true) {
                 a.jmp(*labels.get(pc + 2)?);
-            } else if let Some(k) = self.skip.get_mut(pc + 1) {
-                // Nothing else reaches the `JumpIfFalse`: fall through past it.
-                *k = true;
+            } else {
+                // Nothing else reaches the test: fall through past it.
+                self.skip_fused(pc, f);
             }
         }
         Some(())
