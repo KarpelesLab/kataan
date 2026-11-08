@@ -680,7 +680,7 @@ struct Region {
     /// entry check finds the value)`.
     views: Vec<(u16, u32, ViewSrc)>,
     /// The speculative version's **hoisted arrays** ([`plain_views_ok`]):
-    /// `(register, first of its four frame slots, where its entry check
+    /// `(register, first of its five frame slots, where its entry check
     /// finds the value)`, see [`ArraySlots`].
     aviews: Vec<(u16, u32, ViewSrc)>,
     /// The region's **guard diamonds** ([`guard_diamonds`]), as `(test,
@@ -1022,6 +1022,18 @@ enum StubKind {
     },
     /// The interpreter runs bytecode op `pc`.
     Exec { pc: u32 },
+    /// `[dst] = [a] === [b]` past its compare (an unordered one: a NaN or
+    /// a value that is no Number), with no call where the words decide or
+    /// either of two distinct heap values is compared by identity
+    /// (`X64Assembler::p_identity_compared`); else `jit_helper_strict_eq`,
+    /// or in a speculative region's fast version (`bail`: the leave's pc)
+    /// the leave for the op in the plain copy.
+    StrictEq {
+        a: u16,
+        b: u16,
+        dst: u16,
+        bail: Option<u32>,
+    },
     /// The `StoreGlobal` at `pc` stored the heap handle in register `src`
     /// into its binding; its global-object mirror store (which needs the
     /// write barrier) goes through `jit_helper_global_mirror`, which runs no
@@ -1802,7 +1814,7 @@ impl NumGen {
                 }
             }
         }
-        // The hoisted arrays' slots (four each), after the views'.
+        // The hoisted arrays' slots (five each), after the views'.
         let first = n_gslots as usize + regions.len();
         for r in &mut regions {
             if r.spec.is_some() && plain_views_ok(r, ops, bytecode) {
@@ -1826,7 +1838,7 @@ impl NumGen {
                         Some(k) => r.aviews.push((v, k, src)),
                         None => {
                             r.aviews.push((v, (first + n_view_slots) as u32, src));
-                            n_view_slots += 4;
+                            n_view_slots += 5;
                         }
                     }
                 }
@@ -2164,6 +2176,7 @@ impl NumGen {
                 len: self.gslot_disp(k + 1),
                 base: self.gslot_disp(k + 2),
                 lend: self.gslot_disp(k + 3),
+                wb: self.gslot_disp(k + 4),
             };
             a.p_hoist_array(l, self.env.realm, from, s);
         }
@@ -2202,6 +2215,7 @@ impl NumGen {
             len: self.gslot_disp(k + 1),
             base: self.gslot_disp(k + 2),
             lend: self.gslot_disp(k + 3),
+            wb: self.gslot_disp(k + 4),
         })
     }
 
@@ -2459,7 +2473,7 @@ impl NumGen {
         let mut dropped = alloc::vec![false; rc.sites.len()];
         for (pc, op) in ops.iter().enumerate() {
             let recv = match (*op, self.bc(pc)) {
-                (GenericOp::GetElem { obj, .. }, _) => obj,
+                (GenericOp::GetElem { obj, .. } | GenericOp::SetElem { obj, .. }, _) => obj,
                 (GenericOp::ArrayLen { arr, .. }, _) => arr,
                 (GenericOp::Interp { .. }, Some(&Op::IterNext { next, .. }))
                     if self.iter_fast(pc).is_some() =>
@@ -3782,13 +3796,11 @@ impl NumGen {
                 )?;
             }
             GenericOp::StrictEq { dst, a: x, b: y } => {
-                let slow = StubKind::Helper {
-                    helper: self.env.strict_eq,
+                let slow = StubKind::StrictEq {
                     a: x,
                     b: y,
-                    extra: None,
                     dst,
-                    throws: false,
+                    bail: None,
                 };
                 let fused = self.fusable(pc, ops, dst);
                 // Against a constant: the bits alone (in a general-purpose
@@ -4682,6 +4694,7 @@ impl NumGen {
         // double version.
         let kind = match kind {
             StubKind::Helper { .. }
+            | StubKind::StrictEq { .. }
             | StubKind::Exec { .. }
             | StubKind::Mirror { .. }
             | StubKind::Truthy { .. }
@@ -4690,6 +4703,17 @@ impl NumGen {
                 StubKind::Bail {
                     pc: self.cur_pc as u32,
                     store: true,
+                }
+            }
+            // `===` decides most pairs with no call: only the rest leave.
+            StubKind::StrictEq { a, b, dst, .. }
+                if region.is_some_and(|ri| self.regions[ri].spec.is_some()) =>
+            {
+                StubKind::StrictEq {
+                    a,
+                    b,
+                    dst,
+                    bail: Some(self.bail_pc(self.cur_pc) as u32),
                 }
             }
             // In a speculative region every slow path that would run Rust
@@ -5830,6 +5854,149 @@ impl NumGen {
         }
     }
 
+    /// A [`StubKind::SpecBail`] leave of stub `s` for op `pc` in the plain
+    /// copy (see there).
+    fn emit_spec_bail(&self, a: &mut X64Assembler, s: &Stub, pc: u32, alloc: bool) {
+        // (A leave of the fast version itself: counted — but
+        // an allocation's for want of a free slot, which
+        // has the copy's next back-edge poll instead.)
+        let counted = a.new_label();
+        if alloc {
+            use super::call_seq::r;
+            if specalloc_log() && (pc as usize) < LEAVE_PCS {
+                let at = core::ptr::from_ref(&LEAVES[LEAVE_PCS - 1 - pc as usize]) as u64;
+                a.g_movabs(r::R11, at);
+                a.g_inc_mem(r::R11, 0);
+            }
+            let count = a.new_label();
+            a.g_load(r::R11, r::R15, self.env.realm);
+            a.g_load(r::R11, r::R11, self.env.heap.props.free_len);
+            a.g_test(r::R11);
+            a.g_jcc(super::call_seq::cc::NE, count);
+            a.g_store_imm32(r::RBP, i32::from(COUNTDOWN), 1);
+            a.jmp(counted);
+            a.bind(count);
+        }
+        if !s.int
+            && !s.copy
+            && let Some(ri) = s.region
+        {
+            self.count_leave_at(a, ri, pc as usize);
+        }
+        // A leave of the integer version from a generic op's
+        // slow path is one of its bails (`spec_int_bail`):
+        // counted too, so a loop whose integer version keeps
+        // leaving there (a String key's element read) stops
+        // entering it.
+        if s.int
+            && !s.copy
+            && let Some(ri) = s.region
+            && self.regions[ri].spec_int
+        {
+            let r11 = super::call_seq::r::R11;
+            a.g_movabs(r11, self.env.persist);
+            a.g_inc_mem(r11, super::global_persist::counter_off(ri));
+        }
+        a.bind(counted);
+        self.flush(a, s.region);
+        // Planned with every region pc's copy label.
+        if let Some(l) = self.copy_label(pc as usize) {
+            if !s.copy {
+                self.lazy_pend(a, pc as usize, s.int);
+            }
+            a.jmp(l);
+        }
+    }
+
+    /// The code of a [`StubKind::StrictEq`] stub `s`: the words decide,
+    /// unless both are distinct heap values (Strings and BigInts compare by
+    /// contents). Equal words are a non-Number's `true`, or a NaN's `false`
+    /// (no other Number reaches the stub: its compare was ordered). Two
+    /// distinct handles are unequal when either is compared by identity
+    /// (`p_identity_compared`); any other pair is the helper's, or the
+    /// leave's (`bail`). No promoted register is flushed on the way to an
+    /// answer (only `rax`, `rcx`, `rdx`, `r8`-`r11` are clobbered).
+    fn emit_strict_eq_stub(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        s: &Stub,
+        (x, y, dst): (u16, u16, u16),
+        bail: Option<u32>,
+    ) {
+        use super::call_seq::{cc, r};
+        const HANDLE_TOP: i32 = 0x3fff;
+        let (same, handles, no, have, slow) = (
+            a.new_label(),
+            a.new_label(),
+            a.new_label(),
+            a.new_label(),
+            a.new_label(),
+        );
+        self.load_gpr(a, s.region, r::RAX, x);
+        self.load_gpr(a, s.region, r::RCX, y);
+        a.g_cmp(r::RAX, r::RCX);
+        a.g_jcc(cc::E, same);
+        a.g_and(r::RCX, r::RAX);
+        a.g_shr_imm(r::RCX, 50);
+        a.g_cmp_imm(r::RCX, HANDLE_TOP);
+        a.g_jcc(cc::E, handles);
+        a.bind(no);
+        a.movabs_rax(self.tag_false as i64);
+        a.jmp(have);
+        a.bind(same);
+        a.movabs_r11(QNAN as i64);
+        a.and_rax_r11();
+        a.cmp_rax_r11();
+        a.jcc(CC_NE, no);
+        a.movabs_rax(self.tag_true as i64);
+        a.jmp(have);
+        a.bind(handles);
+        a.p_arena(self.env.realm, &self.env.heap.props);
+        self.load_gpr(a, s.region, r::RAX, x);
+        a.p_identity_compared(no, slow);
+        self.load_gpr(a, s.region, r::RAX, y);
+        a.p_identity_compared(no, slow);
+        a.jmp(slow);
+        // The answer in `rax`: into `dst`, then on (or the fused branch).
+        a.bind(have);
+        self.store_gpr(a, s.region, r::RAX, dst);
+        match s.branch {
+            None => a.jmp(s.resume),
+            Some((_, target, neg)) => {
+                a.movabs_r11(self.tag_true as i64);
+                a.cmp_rax_r11();
+                if let Some(&past) = labels.get(s.pc + 2 + usize::from(neg)) {
+                    a.jcc(if neg { CC_NE } else { CC_E }, past);
+                }
+                match self.in_region_target(labels, s.region, target) {
+                    Some(l) => a.jmp(l),
+                    None => {
+                        self.flush(a, s.region);
+                        if let Some(&l) = labels.get(target) {
+                            a.jmp(l);
+                        }
+                    }
+                }
+            }
+        }
+        a.bind(slow);
+        if let Some(pc) = bail {
+            self.emit_spec_bail(a, s, pc, false);
+            return;
+        }
+        self.flush(a, s.region);
+        a.mov_rdi_r15();
+        a.load_argreg(1, disp(x));
+        a.load_argreg(2, disp(y));
+        a.movabs_rax(self.env.strict_eq as i64);
+        a.call_rax();
+        a.store_rax(disp(dst));
+        self.reload(a, s.region);
+        self.recheck_globals(a, s.region);
+        self.after_slow(a, labels, s);
+    }
+
     /// Emits the out-of-line slow paths (after the body).
     pub(super) fn finish(&mut self, a: &mut X64Assembler, labels: &[Label], throw_exit: Label) {
         let stubs = core::mem::take(&mut self.stubs);
@@ -5856,58 +6023,13 @@ impl NumGen {
                         self.emit_post_bail(a, ri, pc as usize, dst);
                     }
                 }
-                StubKind::SpecBail { pc, alloc } => {
-                    // (A leave of the fast version itself: counted — but
-                    // an allocation's for want of a free slot, which
-                    // has the copy's next back-edge poll instead.)
-                    let counted = a.new_label();
-                    if alloc {
-                        use super::call_seq::r;
-                        if specalloc_log() && (pc as usize) < LEAVE_PCS {
-                            let at =
-                                core::ptr::from_ref(&LEAVES[LEAVE_PCS - 1 - pc as usize]) as u64;
-                            a.g_movabs(r::R11, at);
-                            a.g_inc_mem(r::R11, 0);
-                        }
-                        let count = a.new_label();
-                        a.g_load(r::R11, r::R15, self.env.realm);
-                        a.g_load(r::R11, r::R11, self.env.heap.props.free_len);
-                        a.g_test(r::R11);
-                        a.g_jcc(super::call_seq::cc::NE, count);
-                        a.g_store_imm32(r::RBP, i32::from(COUNTDOWN), 1);
-                        a.jmp(counted);
-                        a.bind(count);
-                    }
-                    if !s.int
-                        && !s.copy
-                        && let Some(ri) = s.region
-                    {
-                        self.count_leave_at(a, ri, pc as usize);
-                    }
-                    // A leave of the integer version from a generic op's
-                    // slow path is one of its bails (`spec_int_bail`):
-                    // counted too, so a loop whose integer version keeps
-                    // leaving there (a String key's element read) stops
-                    // entering it.
-                    if s.int
-                        && !s.copy
-                        && let Some(ri) = s.region
-                        && self.regions[ri].spec_int
-                    {
-                        let r11 = super::call_seq::r::R11;
-                        a.g_movabs(r11, self.env.persist);
-                        a.g_inc_mem(r11, super::global_persist::counter_off(ri));
-                    }
-                    a.bind(counted);
-                    self.flush(a, s.region);
-                    // Planned with every region pc's copy label.
-                    if let Some(l) = self.copy_label(pc as usize) {
-                        if !s.copy {
-                            self.lazy_pend(a, pc as usize, s.int);
-                        }
-                        a.jmp(l);
-                    }
-                }
+                StubKind::SpecBail { pc, alloc } => self.emit_spec_bail(a, s, pc, alloc),
+                StubKind::StrictEq {
+                    a: x,
+                    b: y,
+                    dst,
+                    bail,
+                } => self.emit_strict_eq_stub(a, labels, s, (x, y, dst), bail),
                 StubKind::CanonNan => {
                     a.movabs_rax(self.canonical_nan as i64);
                     a.movq_x_gpr(0, RAX);
@@ -5973,39 +6095,6 @@ impl NumGen {
                     throws,
                 } => {
                     self.flush(a, s.region);
-                    // `===` past its compare (an unordered one, which the
-                    // double version's deferred check takes here: a NaN or a
-                    // value that is no Number): the words decide unless
-                    // both are distinct heap values (Strings and BigInts
-                    // compare by contents). Equal words are a non-Number's
-                    // `true`, or a NaN's `false`.
-                    let have = a.new_label();
-                    if helper == self.env.strict_eq && !s.int {
-                        use super::call_seq::{cc, r};
-                        const HANDLE_TOP: i32 = 0x3fff;
-                        let (same, call, no) = (a.new_label(), a.new_label(), a.new_label());
-                        a.load_argreg(1, disp(x));
-                        a.load_argreg(2, disp(y));
-                        a.g_cmp(r::RSI, r::RDX);
-                        a.g_jcc(cc::E, same);
-                        a.g_mov(r::RAX, r::RSI);
-                        a.g_and(r::RAX, r::RDX);
-                        a.g_shr_imm(r::RAX, 50);
-                        a.g_cmp_imm(r::RAX, HANDLE_TOP);
-                        a.g_jcc(cc::E, call);
-                        a.bind(no);
-                        a.movabs_rax(self.tag_false as i64);
-                        a.jmp(have);
-                        a.bind(same);
-                        a.g_mov(r::RAX, r::RSI);
-                        a.movabs_r11(QNAN as i64);
-                        a.and_rax_r11();
-                        a.cmp_rax_r11();
-                        a.jcc(CC_NE, no);
-                        a.movabs_rax(self.tag_true as i64);
-                        a.jmp(have);
-                        a.bind(call);
-                    }
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(x));
                     a.load_argreg(2, disp(y));
@@ -6019,7 +6108,6 @@ impl NumGen {
                         a.cmp_rax_r11();
                         a.je(throw_exit);
                     }
-                    a.bind(have);
                     a.store_rax(disp(dst));
                     self.reload(a, s.region);
                     self.recheck_globals(a, s.region);
@@ -9062,6 +9150,13 @@ pub(crate) struct ArraySlots {
     pub(crate) base: i32,
     /// The element count as a Number (`f64` bits): `.length`'s value.
     pub(crate) lend: i32,
+    /// Nonzero when a store of any value into the array needs nothing of
+    /// the write barrier (no incremental marking runs, and the array is
+    /// young or due a whole rescan by its next minor collection): only
+    /// Rust code changes either, as for a run-proved store
+    /// (`X64Assembler::p_barrier_check_proving`), and none runs between
+    /// the entry check and the back-edge.
+    pub(crate) wb: i32,
 }
 
 /// Whether speculative region `r`'s fast version may keep hoisted arrays
@@ -9472,12 +9567,30 @@ impl X64Assembler {
         self.cvtsi2sd_x_gpr(0, r::R8);
         self.movq_gpr_x(r::RAX, 0);
         self.g_store(r::RBP, s.lend, r::RAX);
+        // Whether its stores need nothing of the write barrier (`wb`).
+        let spare = self.new_label();
+        let no_wb = self.new_label();
+        self.g_load(r::R11, r::R15, realm);
+        self.g_cmp_byte_imm(r::R11, l.props.marking, 0);
+        self.g_jcc(super::call_seq::cc::NE, no_wb);
+        self.g_cmp_byte_imm(r::RCX, l.props.off_slot_age, crate::gc::OLD_AGE);
+        self.g_jcc(super::call_seq::cc::B, spare);
+        self.p_test_byte_imm(r::RCX, l.props.off_slot_dirty, crate::heap::JIT_DIRTY_WHOLE);
+        self.g_jcc(super::call_seq::cc::NE, spare);
+        self.bind(no_wb);
+        self.g_movabs(r::RAX, 0);
+        self.g_store(r::RBP, s.wb, r::RAX);
+        self.jmp(done);
+        self.bind(spare);
+        self.g_movabs(r::RAX, 1);
+        self.g_store(r::RBP, s.wb, r::RAX);
         self.jmp(done);
         self.bind(none);
         self.g_movabs(r::RAX, super::RECV_CACHE_EMPTY as i64 as u64);
         self.g_store(r::RBP, s.held, r::RAX);
         self.g_movabs(r::RAX, 0);
         self.g_store(r::RBP, s.len, r::RAX);
+        self.g_store(r::RBP, s.wb, r::RAX);
         self.bind(done);
     }
 

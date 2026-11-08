@@ -1025,10 +1025,14 @@ impl X64Assembler {
     /// heap values (strings and BigInts compare by contents), `===` is the
     /// words' equality (`NanBox::strict_equals`; no NaN is involved, as not
     /// both are Numbers), and so is the same word between heap values.
-    /// Falls through, with nothing stored, for two distinct heap values: the
-    /// helper's case. Clobbers `rax`, `r11`, `rsi`, `rdx`.
+    /// Two distinct heap values where either is an object, function or
+    /// array (`p_identity_compared`) are unequal too (the realm at
+    /// `[r15 + realm_off]`). Falls through, with nothing stored, for two
+    /// distinct heap values neither of which is one: the helper's case.
+    /// Clobbers `rax`, `rcx`, `rdx`, `rsi`, `r8`-`r11`.
     pub(crate) fn p_strict_eq_identity(
         &mut self,
+        realm_off: i32,
         (a, b, dst): (i32, i32, i32),
         (t, f): (u64, u64),
         done: Label,
@@ -1038,6 +1042,8 @@ impl X64Assembler {
         const HANDLE_TOP: i32 = 0x3fff;
         let same = self.new_label();
         let helper = self.new_label();
+        let handles = self.new_label();
+        let unequal = self.new_label();
         self.load_argreg(1, a);
         self.load_argreg(2, b);
         self.g_cmp(r::RSI, r::RDX);
@@ -1046,7 +1052,8 @@ impl X64Assembler {
         self.g_and(r::RAX, r::RDX);
         self.g_shr_imm(r::RAX, 50);
         self.g_cmp_imm(r::RAX, HANDLE_TOP);
-        self.g_jcc(cc::E, helper);
+        self.g_jcc(cc::E, handles);
+        self.bind(unequal);
         self.g_movabs(r::RAX, f);
         self.store_rax(dst);
         self.jmp(done);
@@ -1054,6 +1061,18 @@ impl X64Assembler {
         self.g_movabs(r::RAX, t);
         self.store_rax(dst);
         self.jmp(done);
+        // Two distinct handles: unequal when either is compared by
+        // identity, else the helper's (two Strings, two BigInts, ...).
+        let cold = self.cold_begin();
+        self.bind(handles);
+        let l = super::compute_jit_layout();
+        self.p_arena(realm_off, &l.props);
+        self.load_rax(a);
+        self.p_identity_compared(unequal, helper);
+        self.load_rax(b);
+        self.p_identity_compared(unequal, helper);
+        self.jmp(helper);
+        self.cold_end(cold);
         self.bind(helper);
     }
 

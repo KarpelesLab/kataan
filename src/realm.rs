@@ -9697,32 +9697,24 @@ impl Realm {
                 if ha == hb {
                     return true; // same heap cell
                 }
-                let sa = self.heap.get(Handle::from_raw(ha)).and_then(Cell::as_str);
-                let sb = self.heap.get(Handle::from_raw(hb)).and_then(Cell::as_str);
-                match (sa, sb) {
+                // One lookup per cell: only two Strings or two BigInts compare
+                // by contents; distinct references of any other kind differ.
+                match (
+                    self.heap.get(Handle::from_raw(ha)),
+                    self.heap.get(Handle::from_raw(hb)),
+                ) {
                     // Compare the WTF-8 bytes directly: no `String` allocation, an
                     // O(1) length fast-reject, and — unlike the old lossy
                     // `materialize()` (which mapped every lone surrogate to U+FFFD,
                     // making `"\uD800" === "\uDC00"` wrongly true) — byte equality is
                     // exact.
-                    (Some(ra), Some(rb)) => {
+                    (Some(Cell::Str(ra)), Some(Cell::Str(rb))) => {
                         ra.len() == rb.len() && rope_bytes(ra) == rope_bytes(rb)
                     }
-                    _ => {
-                        // Two distinct BigInt cells are `===` iff their mathematical
-                        // values are equal (BigInts are value types, not references).
-                        match (
-                            self.heap
-                                .get(Handle::from_raw(ha))
-                                .and_then(Cell::as_bigint),
-                            self.heap
-                                .get(Handle::from_raw(hb))
-                                .and_then(Cell::as_bigint),
-                        ) {
-                            (Some(ba), Some(bb)) => ba == bb,
-                            _ => false, // distinct non-string/non-bigint references
-                        }
-                    }
+                    // Two distinct BigInt cells are `===` iff their mathematical
+                    // values are equal (BigInts are value types, not references).
+                    (Some(Cell::BigInt(ba)), Some(Cell::BigInt(bb))) => ba == bb,
+                    _ => false, // distinct non-string/non-bigint references
                 }
             }
             // At least one primitive: decided by the boxed value itself.

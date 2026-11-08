@@ -13533,6 +13533,14 @@ impl JitFunction {
                             match index_x {
                                 Some(x) if integral => numeric::NumGen::trunc_from_xmm(&mut a, x),
                                 Some(x) => numeric::NumGen::index_from_xmm(&mut a, x, false, $miss),
+                                // (An index proven integral: its truncation,
+                                // as `GetElem`'s `elem_index!`; the bounds
+                                // check rejects the "indefinite" integer.)
+                                None if integral => {
+                                    a.load_rax(disp(index));
+                                    numeric::NumGen::set_xmm_from_rax(&mut a, 0);
+                                    a.cvttsd2si_rax_xmm0();
+                                }
                                 None => int_index!(index, $miss, num.is_number_at(op_idx, index)),
                             }
                         };
@@ -13630,6 +13638,48 @@ impl JitFunction {
                         }
                         a.t_set(typed::typed_layout(), typed::Src::Hoisted(v), helper, done);
                         a.bind(not_view);
+                    }
+                    // A speculative loop's hoisted array
+                    // (`numeric::ArraySlots`): the receiver the very array
+                    // its entry check found, the element written in place
+                    // with no walk — an in-bounds index over no hole (the
+                    // entry check found no side-table state), a value that
+                    // needs nothing of the write barrier: a non-handle, or
+                    // any value while the entry found the array sparing
+                    // every store that work (`wb`). Any miss: the ordinary
+                    // path, below.
+                    if let Some(s) = num.hoisted_array(op_idx, obj) {
+                        use call_seq::r as R;
+                        let other = a.new_label();
+                        if !num.hoisted_array_known(op_idx, obj) {
+                            a.load_rax(disp(obj));
+                            a.g_cmp_mem(R::RAX, R::RBP, s.held);
+                            a.jne(other);
+                        }
+                        if val_x.is_none() {
+                            // (A promoted value is a Number.)
+                            let plain = a.new_label();
+                            a.load_rax(disp(val));
+                            a.p_cmp_handle_floor(R::RAX);
+                            a.g_jcc(call_seq::cc::B, plain);
+                            a.cmp_frame_imm8(s.wb, 0);
+                            a.je(other);
+                            a.bind(plain);
+                        }
+                        store_index!(other);
+                        a.g_cmp_mem(R::RAX, R::RBP, s.len);
+                        a.jae(other); // OOB / negative
+                        a.g_load(R::R11, R::RBP, s.base);
+                        a.movabs_argreg(2, NanBox::hole().to_bits() as i64);
+                        a.cmp_at_r11_rax8_rdx();
+                        a.je(other);
+                        match val_x {
+                            Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
+                            None => a.load_rdx(disp(val)),
+                        }
+                        a.mov_at_r11_rax8_rdx(); // elems[idx] = val
+                        a.jmp(done);
+                        a.bind(other);
                     }
                     // ===== inline dense-array element SET fast path =====
                     // In place only when identical to `vm_set_elem`: a store the
@@ -13990,6 +14040,7 @@ impl JitFunction {
                     // heap values (strings and BigInts compare by contents) or
                     // neither is (two immediates, a Number and an immediate).
                     a.p_strict_eq_identity(
+                        helpers.call_layout.realm,
                         (disp(ra), disp(rb), disp(dst)),
                         (tag_true, tag_false),
                         done,

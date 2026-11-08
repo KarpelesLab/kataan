@@ -2882,6 +2882,23 @@ impl X64Assembler {
         self.bind(other);
     }
 
+    /// Whether the heap handle in `rax` is an ordinary object, a VM function
+    /// or an array: a value `===` compares by identity alone (a distinct
+    /// other value, String, BigInt or object, is never `===` to it). Such a
+    /// handle goes to `yes`; any other falls through, and a walk miss goes
+    /// to `miss`. Needs the arena (`p_arena`); preserves `rax`; clobbers
+    /// `rcx` (and `r8` in audit mode).
+    pub(crate) fn p_identity_compared(&mut self, yes: Label, miss: Label) {
+        let l = super::compute_jit_layout();
+        self.p_slot_rooted(l, r::RCX, miss);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_object_disc);
+        self.g_jcc(cc::E, yes);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.props.vmfn_disc);
+        self.g_jcc(cc::E, yes);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
+        self.g_jcc(cc::E, yes);
+    }
+
     /// The truthiness of the heap handle in `rax`, where it is not the
     /// helper's to decide: a VM function, or a shaped ordinary object without
     /// the `[[IsHTMLDDA]]` brand, to `truthy`; anything else to `other`.
