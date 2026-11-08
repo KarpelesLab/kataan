@@ -1682,6 +1682,17 @@ impl Trace for Cell {
             }
             return;
         }
+        // A string: its rope released where it lies (moving the whole cell
+        // out to the out-of-line path cost a 64-byte copy and a call).
+        if let Some(Cell::Str(s)) = place {
+            pool.note_swept(s.len() / 8);
+            match place.take() {
+                Some(Cell::Str(s)) => drop(s),
+                // (Not reached: just tested.)
+                other => core::mem::forget(other),
+            }
+            return;
+        }
         match place {
             Some(Cell::Array(elems)) => {
                 // `ArrayElems` owns nothing else (and has no `Drop` of its own).
@@ -1718,9 +1729,6 @@ impl Trace for Cell {
             _ => {}
         }
         if let Some(other) = place.take() {
-            if let Cell::Str(s) = &other {
-                pool.note_swept(s.len() / 8);
-            }
             release_rest(other);
         }
     }

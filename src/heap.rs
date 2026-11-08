@@ -184,20 +184,27 @@ impl<T> Slot<T> {
         self.value.is_some()
     }
 
-    /// Empties the slot for the sweep, giving it `generation`, and
-    /// [`release`]s the value it held where it lies (see
-    /// [`Trace::release_in`](crate::gc::Trace::release_in)).
+    /// Empties the slot for the sweep: [`release`]s the value it held where
+    /// it lies (see [`Trace::release_in`](crate::gc::Trace::release_in)),
+    /// then bumps its generation. Returns whether the slot can be reused —
+    /// its new generation still below [`COMPACT_GEN_BASE`] (see
+    /// [`Heap::free`] for why one that is not is retired).
+    ///
+    /// (The release first: its rare paths make calls, and nothing of the
+    /// slot's has to live across them but the slot itself.)
     ///
     /// [`release`]: crate::gc::Trace::release
     #[inline(always)]
-    fn vacate_release(&mut self, generation: u16, pool: &mut crate::object::ExtraPool)
+    fn vacate_release(&mut self, pool: &mut crate::object::ExtraPool) -> bool
     where
         T: crate::gc::Trace,
     {
+        T::release_in(&mut self.value, pool);
+        let generation = self.generation.wrapping_add(1);
         self.occupied = 0;
         self.dirty = CLEAN;
         self.generation = generation;
-        T::release_in(&mut self.value, pool);
+        generation < COMPACT_GEN_BASE
     }
 }
 
@@ -627,10 +634,12 @@ impl<T> Heap<T> {
     /// all take the free-list path — the only one compiled code's inline
     /// allocation has (`X64Assembler::p_alloc_object`), which otherwise
     /// misses into a call for every allocation that would push a slot. The
-    /// appended slots go under the free list's existing entries, in
-    /// ascending order from its top: they are handed out after the freed
-    /// slots and in the order (with the generation, `0`) the pushes they
-    /// stand for would have numbered them. A no-op at any other time.
+    /// appended slots go on top of the free list, in ascending order from
+    /// its top: they are handed out first, in the order (with the
+    /// generation, `0`) the pushes they stand for would have numbered them.
+    /// (On top rather than under the existing entries, so topping up a list
+    /// a few survivors short does not move all of it.) A no-op at any
+    /// other time.
     pub fn reserve_free(&mut self, target: usize) {
         if self.free_top != self.free.len() || self.young_floor != self.slots.len() {
             return;
@@ -639,10 +648,11 @@ impl<T> Heap<T> {
     }
 
     /// With no slot pushed since the last collection (`young_floor` the
-    /// table's length): puts `add` vacant slots, appended to the table, under
-    /// the free list's still-free entries — the next allocations after
-    /// those take them in the order (and with the generation, `0`) pushes
-    /// would have numbered them — and moves `young_floor` past them: they
+    /// table's length): puts `add` vacant slots, appended to the table, on
+    /// top of the free list's still-free entries (`free[..free_top]`), under
+    /// the consumed ones — the next allocations take them in the order (and
+    /// with the generation, `0`) pushes would have numbered them — and moves
+    /// `young_floor` past them: they
     /// are young once handed out through the free list, whose consumed
     /// entries the next collection visits (as it would have visited them as
     /// pushed slots).
@@ -667,8 +677,9 @@ impl<T> Heap<T> {
             scan_hi: 0,
         }));
         // Popped from the top: the last entry is handed out first.
+        let at = self.free_top;
         self.free
-            .splice(0..0, (start..start + add).rev().map(|i| i as u32));
+            .splice(at..at, (start..start + add).rev().map(|i| i as u32));
         self.free_top += add;
         self.young_floor = self.slots.len();
     }
@@ -1005,9 +1016,7 @@ impl<T> Heap<T> {
             }
             // See `free` for why a slot leaving the low generation range is
             // retired rather than reused.
-            let next_gen = slot.generation.wrapping_add(1);
-            slot.vacate_release(next_gen, extra_pool);
-            if next_gen < COMPACT_GEN_BASE {
+            if slot.vacate_release(extra_pool) {
                 free.push(i as u32);
             }
             *live -= 1;
@@ -1405,96 +1414,104 @@ enum Fate {
 /// The per-object work is what bounds a minor collection of short-lived
 /// garbage, so the loops carry as little as they can: the count freed is
 /// worked out from the free list's growth afterwards (only a retired slot,
-/// which is rare, is counted as it happens), and an entry freed again is
-/// not written back one by one: it stays where it is, or moves down with
-/// the whole run of such entries it belongs to.
-fn sweep_young_fast<T: crate::gc::Trace>(
+/// which is rare, is counted as it happens), and an entry freed again stays
+/// where it is. An entry that leaves the list (a survivor, or the second
+/// listing of a slot) takes the last unvisited entry's place, so removing
+/// it costs O(1) whatever its position: survivors are mostly the latest
+/// allocations, which head the consumed part, and closing their holes by
+/// moving everything after them down cost a copy of the whole nursery's
+/// entries per collection. (Only the order in which the freed slots are
+/// handed out again changes.)
+fn sweep_young_fast<T: crate::gc::Trace, S: Fn(&T) -> bool>(
     slots: &mut Vec<Slot<T>>,
     free: &mut Vec<u32>,
     free_top: usize,
     floor: usize,
-    sticky: &impl Fn(&T) -> bool,
+    sticky: &S,
     remembered: &mut Vec<u32>,
     pool: &mut crate::object::ExtraPool,
 ) -> usize {
-    let mut retired = 0;
-    let n = free.len();
-    let gap = {
-        let slots = slots.as_mut_slice();
-        let free = free.as_mut_slice();
-        // The entries not freed again so far (`gap` of them) leave a hole
-        // the list closes: each run of entries freed again moves down by
-        // `gap` as one block once it ends. Survivors are rare in a nursery,
-        // so the runs are long and the per-entry loop writes nothing.
-        let mut gap = 0;
-        let mut r = free_top;
-        loop {
-            // A run of entries freed again: `free[run..r]`.
-            let run = r;
-            let mut fate = Fate::Freed;
-            while r < n {
-                let i = free[r];
-                fate = settle_young_fast(&mut slots[i as usize], i, sticky, remembered, pool);
-                if fate != Fate::Freed {
-                    break;
-                }
-                r += 1;
-            }
-            // (Survivors come in runs of their own — a structure the
-            // program keeps was allocated in one go — so an empty run, which
-            // would still cost a call, is the common one between them.)
-            if gap > 0 && r > run {
-                free.copy_within(run..r, run - gap);
-            }
-            if r == n {
-                break;
-            }
-            // `free[r]` leaves the list.
-            if fate == Fate::Retired {
-                retired += 1;
-            }
-            gap += 1;
-            r += 1;
-        }
-        gap
+    // Everything the per-slot work needs only off its common path, behind
+    // one pointer: the loops then keep their own state in registers.
+    let mut cx = SweepCx {
+        sticky,
+        remembered,
+        pool,
+        retired: 0,
     };
-    free.truncate(n - gap);
+    let kept = {
+        let slots = slots.as_mut_slice();
+        // The consumed entries: `list[..r]` visited and freed again,
+        // `list[r..]` not visited yet. An entry that leaves the list takes
+        // the last unvisited one's place, and the list shrinks by one.
+        let mut list: &mut [u32] = &mut free[free_top..];
+        let mut r = 0;
+        while let Some(&i) = list.get(r) {
+            let Some(slot) = slots.get_mut(i as usize) else {
+                unreachable!("free list entry {i} past the slot table");
+            };
+            if settle_young_fast(slot, i, &mut cx) == Fate::Freed {
+                r += 1;
+            } else {
+                let last = list.len() - 1;
+                list[r] = list[last];
+                list = &mut core::mem::take(&mut list)[..last];
+            }
+        }
+        free_top + list.len()
+    };
+    free.truncate(kept);
     for (i, slot) in slots.iter_mut().enumerate().skip(floor) {
-        match settle_young_fast(slot, i as u32, sticky, remembered, pool) {
-            Fate::Kept => {}
-            Fate::Freed => free.push(i as u32),
-            Fate::Retired => retired += 1,
+        if settle_young_fast(slot, i as u32, &mut cx) == Fate::Freed {
+            free.push(i as u32);
         }
     }
-    free.len() - free_top + retired
+    free.len() - free_top + cx.retired
 }
 
-/// [`settle_young`] outside GC-verification mode.
+/// What [`settle_young_fast`] needs besides the slot, off its common path.
+struct SweepCx<'a, S> {
+    sticky: &'a S,
+    remembered: &'a mut Vec<u32>,
+    pool: &'a mut crate::object::ExtraPool,
+    /// The slots freed and retired so far (rare: see [`Heap::free`]).
+    retired: usize,
+}
+
+/// [`settle_young`] outside GC-verification mode. A retired slot is also
+/// counted in `cx`.
 #[inline(always)]
-fn settle_young_fast<T: crate::gc::Trace>(
+fn settle_young_fast<T: crate::gc::Trace, S: Fn(&T) -> bool>(
     slot: &mut Slot<T>,
     i: u32,
-    sticky: &impl Fn(&T) -> bool,
-    remembered: &mut Vec<u32>,
-    pool: &mut crate::object::ExtraPool,
+    cx: &mut SweepCx<'_, S>,
 ) -> Fate {
-    let Some(value) = &slot.value else {
-        return Fate::Kept;
-    };
-    if slot.age >= crate::gc::OLD_AGE {
-        // Marked (promoted), or a slot listed twice.
-        if slot.dirty == CLEAN && sticky(value) {
-            slot.dirty = STICKY;
-            remembered.push(i);
-        }
+    if !slot.is_live() {
         return Fate::Kept;
     }
-    let next_gen = slot.generation.wrapping_add(1);
-    slot.vacate_release(next_gen, pool);
-    if next_gen < COMPACT_GEN_BASE {
+    if slot.age >= crate::gc::OLD_AGE {
+        settle_survivor(slot, i, cx);
+        return Fate::Kept;
+    }
+    if slot.vacate_release(cx.pool) {
         Fate::Freed
     } else {
+        cx.retired += 1;
         Fate::Retired
+    }
+}
+
+/// A marked (promoted) young object, or a slot listed twice, in
+/// [`settle_young_fast`]: enters the remembered set if its value is
+/// `sticky`. Out of line, keeping the sweep loop's common path small.
+#[inline(never)]
+fn settle_survivor<T, S: Fn(&T) -> bool>(slot: &mut Slot<T>, i: u32, cx: &mut SweepCx<'_, S>) {
+    if slot.dirty == CLEAN
+        && let Some(value) = &slot.value
+        && (cx.sticky)(value)
+    {
+        slot.dirty = STICKY;
+        cx.remembered.push(i);
     }
 }
 
@@ -1535,9 +1552,7 @@ fn settle_young<T: crate::gc::Trace>(
         return false;
     }
     *live -= 1;
-    let next_gen = slot.generation.wrapping_add(1);
-    slot.vacate_release(next_gen, pool);
-    next_gen < COMPACT_GEN_BASE
+    slot.vacate_release(pool)
 }
 
 #[cfg(test)]

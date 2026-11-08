@@ -694,6 +694,16 @@ static EMPTY_DICT: DictData = DictData {
     map: BTreeMap::new(),
 };
 
+/// [`Object::release`] of an object with an `extra` part or holding its
+/// shape's last reference — off the sweep's common path.
+#[inline(never)]
+fn release_rest(shape: Rc<Shape>, extra: Option<Box<ObjectExtra>>, pool: &mut ExtraPool) {
+    drop(shape);
+    if let Some(x) = extra {
+        pool.give(x);
+    }
+}
+
 /// Drops an object's `extra` part — off the sweep's common path.
 #[cold]
 #[inline(never)]
@@ -821,9 +831,13 @@ impl Object {
     #[inline(always)]
     pub(crate) fn release(self, pool: &mut ExtraPool) {
         let Self { shape, extra, .. } = self;
-        drop(shape);
-        if let Some(x) = extra {
-            pool.give(x);
+        // No `extra` part, and not the shape's last reference (by far the
+        // common case): the decrement cannot reach zero, so it compiles to
+        // no call at all, and the sweep loop keeps its state in registers.
+        if extra.is_none() && Rc::strong_count(&shape) > 1 {
+            drop(shape);
+        } else {
+            release_rest(shape, extra, pool);
         }
     }
 

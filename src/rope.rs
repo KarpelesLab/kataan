@@ -1310,6 +1310,10 @@ impl Drop for Node {
     /// drops the next…), overflowing the stack on platforms with a small default
     /// (e.g. Windows' 1 MB test threads) for the pathological left-/right-deep
     /// shape that O(1) concatenation builds.
+    ///
+    /// The test is inline (most dying nodes are not a `Concat`, and most
+    /// that are own no `Concat` child alone); the dismantling is out of line.
+    #[inline]
     fn drop(&mut self) {
         let Node::Concat { left, right, .. } = self else {
             return; // a leaf owns nothing recursive
@@ -1320,32 +1324,40 @@ impl Drop for Node {
         // iterative dismantling (and its allocations) is skipped.
         let continues =
             |r: &Rope| Rc::strong_count(&r.0) == 1 && matches!(*r.0, Node::Concat { .. });
-        if !continues(left) && !continues(right) {
-            return;
+        if continues(left) || continues(right) {
+            dismantle_concat(left, right);
         }
-        // A cheap leaf to swap into a child slot so we can take ownership of the
-        // real `Rc<Node>` without recursing through its `Drop`. One is shared by
-        // every slot (each swap is a refcount increment, not an allocation).
-        let empty = Rc::new(Node::Small {
-            len: 0,
-            u16: core::cell::Cell::new(0),
-            buf: [0; SMALL_CAP],
-        });
-        let sentinel = || Rc::clone(&empty);
-        let mut stack = alloc::vec![
-            core::mem::replace(&mut left.0, sentinel()),
-            core::mem::replace(&mut right.0, sentinel()),
-        ];
-        while let Some(rc) = stack.pop() {
-            // Only the last owner can free; otherwise just drop the `Rc` (a
-            // refcount decrement, no recursion).
-            if let Ok(mut node) = Rc::try_unwrap(rc)
-                && let Node::Concat { left, right, .. } = &mut node
-            {
-                stack.push(core::mem::replace(&mut left.0, sentinel()));
-                stack.push(core::mem::replace(&mut right.0, sentinel()));
-                // `node` now holds sentinel leaves, so its own drop is shallow.
-            }
+    }
+}
+
+/// The iterative part of a `Concat` node's [`Drop`]: takes its children
+/// `left` and `right` out (leaving shared empty leaves) and frees the chain
+/// below them without recursing.
+#[cold]
+#[inline(never)]
+fn dismantle_concat(left: &mut Rope, right: &mut Rope) {
+    // A cheap leaf to swap into a child slot so we can take ownership of the
+    // real `Rc<Node>` without recursing through its `Drop`. One is shared by
+    // every slot (each swap is a refcount increment, not an allocation).
+    let empty = Rc::new(Node::Small {
+        len: 0,
+        u16: core::cell::Cell::new(0),
+        buf: [0; SMALL_CAP],
+    });
+    let sentinel = || Rc::clone(&empty);
+    let mut stack = alloc::vec![
+        core::mem::replace(&mut left.0, sentinel()),
+        core::mem::replace(&mut right.0, sentinel()),
+    ];
+    while let Some(rc) = stack.pop() {
+        // Only the last owner can free; otherwise just drop the `Rc` (a
+        // refcount decrement, no recursion).
+        if let Ok(mut node) = Rc::try_unwrap(rc)
+            && let Node::Concat { left, right, .. } = &mut node
+        {
+            stack.push(core::mem::replace(&mut left.0, sentinel()));
+            stack.push(core::mem::replace(&mut right.0, sentinel()));
+            // `node` now holds sentinel leaves, so its own drop is shallow.
         }
     }
 }
