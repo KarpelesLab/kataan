@@ -7905,6 +7905,19 @@ impl JitFunction {
                 (n >= 2).then(|| c[..n].to_vec())
             })
             .collect();
+        // Per first add of a fresh chain, the adds of the chain that a
+        // speculative loop's fast version makes at once with it
+        // (`FreshCover`), when it covers more than a straight run does.
+        let fresh_cover: Vec<Option<recv_cache::FreshCover>> = (0..ops.len())
+            .map(|h| {
+                let c = recv_cache::fresh_cover_plan(ops, bytecode, fresh_chain[h].as_deref()?)?;
+                let run = fresh_run[h].as_ref().map_or(0, Vec::len);
+                (c.adds.len() > run).then_some(c)
+            })
+            .collect();
+        // The `(op, pass)` of the adds a fast version's first add of their
+        // chain made (`fresh_cover`): emitted as nothing.
+        let mut fresh_covered: Vec<(usize, u8)> = Vec::new();
         // A run being emitted: `(its first op, its last, the pass, where
         // its fused adds resume, how many of its later ops were emitted)`.
         let mut pending_run: Option<(usize, usize, u8, Label, usize)> = None;
@@ -9321,6 +9334,14 @@ impl JitFunction {
             // The test an inlined call's guard took over (outside promoted
             // loops: `numeric` would test the proven boolean again).
             if fused_test[op_idx] && !num.in_region(op_idx) {
+                continue;
+            }
+            // An add the first add of its fresh chain made, in a fast
+            // version (`fresh_cover`).
+            if fresh_covered.contains(&(op_idx, pass)) {
+                if let GenericOp::SetProp { site, .. } = *op {
+                    fresh_to[op_idx] = sites.get(site as usize).and_then(|s| s.add).map(|b| b.to);
+                }
                 continue;
             }
             if num.emit(&mut a, &labels, throw_exit, op_idx, ops)? {
@@ -12324,9 +12345,47 @@ impl JitFunction {
                                 })
                                 && sched.get(si + n) == Some(&(run[n - 1] + 1, pass))
                         });
-                        if let Some(run) = run {
-                            let mut items = Vec::with_capacity(run.len());
-                            for &q in run {
+                        // In a speculative loop's fast version, where the
+                        // code from here to the chain's later adds runs
+                        // straight: those `fresh_cover` holds, made here at
+                        // once (each later one then emitted as nothing),
+                        // after proving the `InitFields` between them do
+                        // nothing; else (having changed nothing) the fast
+                        // version leaves for this op in its plain copy, as
+                        // every miss of an add there does.
+                        let init_site = |k: usize| {
+                            interp_sites
+                                .get(k)
+                                .copied()
+                                .flatten()
+                                .and_then(|(_, site)| call_sites.get(site as usize).copied())
+                        };
+                        let cover = fresh_cover[op_idx].as_ref().filter(|c| {
+                            first
+                                && proven
+                                && pass != numeric::PASS_INT
+                                && pending_run.is_none()
+                                && num.op_run_proof(op_idx).is_some()
+                                && c.adds.iter().all(|&q| num.same_region(op_idx, q))
+                                && c.guards.iter().all(|&g| num.cold_guard(g))
+                                && c.inits.iter().all(|&(k, ctor)| {
+                                    num.op_run_proof(k).is_some()
+                                        && ok(ctor)
+                                        && init_site(k).is_some()
+                                })
+                        });
+                        let cover_bail = match cover {
+                            Some(_) => num.spec_bail(&mut a, op_idx),
+                            None => None,
+                        };
+                        if let (Some(c), Some(bail)) = (cover, cover_bail) {
+                            for &(k, ctor) in &c.inits {
+                                let ps = num.op_run_proof(k)?;
+                                a.p_ident_proved(init_site(k)?, disp(ctor), ps, bail, false);
+                            }
+                            let mut items = Vec::with_capacity(c.adds.len());
+                            let mut stored = alloc::vec![val];
+                            for &q in &c.adds {
                                 let GenericOp::SetProp {
                                     site: qs, val: qv, ..
                                 } = ops[q]
@@ -12334,27 +12393,54 @@ impl JitFunction {
                                     return None;
                                 };
                                 let si_q = sites.get(qs as usize)?;
-                                if q != op_idx {
-                                    let _ = num.operand_xmm(&mut a, q, qv, false);
+                                if !stored.contains(&qv) {
+                                    stored.push(qv);
+                                    let _ = num.operand_xmm(&mut a, op_idx, qv, false);
                                 }
-                                items.push((si_q.add?, disp(qv), num.is_number_at(q, qv)));
+                                items.push((si_q.add?, disp(qv), num.is_number_at(op_idx, qv)));
                             }
-                            let one = a.new_label();
-                            let end = a.new_label();
-                            a.p_add_fresh_run(&layout, &items, one);
-                            a.jmp(end);
-                            a.bind(one);
-                            pending_run = Some((op_idx, run[run.len() - 1], pass, end, 0));
+                            a.p_add_fresh_run(&layout, &items, bail);
+                            // (The `InitFields` between, proved here, do
+                            // nothing there either.)
+                            fresh_covered.extend(
+                                c.adds[1..]
+                                    .iter()
+                                    .chain(c.inits.iter().map(|(k, _)| k))
+                                    .map(|&q| (q, pass)),
+                            );
+                        } else {
+                            if let Some(run) = run {
+                                let mut items = Vec::with_capacity(run.len());
+                                for &q in run {
+                                    let GenericOp::SetProp {
+                                        site: qs, val: qv, ..
+                                    } = ops[q]
+                                    else {
+                                        return None;
+                                    };
+                                    let si_q = sites.get(qs as usize)?;
+                                    if q != op_idx {
+                                        let _ = num.operand_xmm(&mut a, q, qv, false);
+                                    }
+                                    items.push((si_q.add?, disp(qv), num.is_number_at(q, qv)));
+                                }
+                                let one = a.new_label();
+                                let end = a.new_label();
+                                a.p_add_fresh_run(&layout, &items, one);
+                                a.jmp(end);
+                                a.bind(one);
+                                pending_run = Some((op_idx, run[run.len() - 1], pass, end, 0));
+                            }
+                            a.p_add_fresh(
+                                &layout,
+                                helpers.call_layout.realm,
+                                s.method_ptr,
+                                b,
+                                (first, proven, k),
+                                (disp(val), num.is_number_at(op_idx, val)),
+                                regular,
+                            );
                         }
-                        a.p_add_fresh(
-                            &layout,
-                            helpers.call_layout.realm,
-                            s.method_ptr,
-                            b,
-                            (first, proven, k),
-                            (disp(val), num.is_number_at(op_idx, val)),
-                            regular,
-                        );
                         a.jmp(fresh_done);
                         a.bind(regular);
                         fresh_to[op_idx] = Some(b.to);

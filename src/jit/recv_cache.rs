@@ -375,6 +375,110 @@ pub(super) fn fresh_adds(
     out
 }
 
+/// The adds of a fresh chain that a speculative loop's fast version makes
+/// at once, at the chain's first add ([`fresh_cover_plan`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FreshCover {
+    /// The adds, the chain's first one first, in order.
+    pub(super) adds: Vec<usize>,
+    /// The `Op::InitFields` between them, with their constructor register:
+    /// the first add proves each one's identity memo hits (a constructor
+    /// without instance fields: the op does nothing) before it makes the
+    /// adds, and each is then emitted as nothing too.
+    pub(super) inits: Vec<(usize, u16)>,
+    /// The inlined calls' guards whose fallback call ops lie between them:
+    /// each a guard diamond's whose miss leaves the fast version, so those
+    /// ops never run there (`numeric::NumGen::cold_guard`).
+    pub(super) guards: Vec<usize>,
+}
+
+/// For a fresh chain's adds that take the fast path (`chain`, the first add
+/// first: `fresh_chain` in `jit.rs`), the longest prefix of two or more
+/// that a speculative loop's fast version can make at once at the first
+/// add, the later ones then emitted as nothing. There the code from the
+/// first add to the last runs straight (every miss and slow path leaves
+/// the fast version, an inlined call's fallback arm included), so the
+/// adds are made exactly when the first one is, provided nothing between
+/// can leave the fast version, run code or observe the object, and every
+/// later add stores the value its register holds at the first add: the
+/// ops between are copies (`Move`, none of a later add's value register),
+/// the `CheckTdz` of the next add's receiver (a register holding the
+/// object, never the TDZ sentinel), `InlineLeave`s, forward jumps that
+/// skip no add, `Nop`s, `InitFields` on a constructor register no copy
+/// overwrites (proved by the first add, see [`FreshCover::inits`]), and
+/// the fallback call ops of inlined calls' guards before the first add.
+pub(super) fn fresh_cover_plan(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    chain: &[usize],
+) -> Option<FreshCover> {
+    let (&h, rest) = chain.split_first()?;
+    if rest.is_empty() {
+        return None;
+    }
+    // (The fallback call op of each inlined call's guard before `h`.)
+    let fallback_of = |p: usize| {
+        (0..h).find(|&g| {
+            matches!(ops[g], GenericOp::InlineGuard { call, poly: 0, .. } if call as usize == p)
+        })
+    };
+    let mut written: Vec<u16> = Vec::new();
+    let mut out = FreshCover {
+        adds: vec![h],
+        inits: Vec::new(),
+        guards: Vec::new(),
+    };
+    let mut next = 0;
+    let mut p = h + 1;
+    while next < rest.len() && p < ops.len() {
+        let q = rest[next];
+        if p == q {
+            let GenericOp::SetProp { val, .. } = ops[p] else {
+                break;
+            };
+            if written.contains(&val) {
+                break;
+            }
+            out.adds.push(p);
+            next += 1;
+            p += 1;
+            continue;
+        }
+        match (ops[p], bytecode.get(p)) {
+            (GenericOp::Move { dst, .. }, _) => written.push(dst),
+            (GenericOp::Nop | GenericOp::InlineLeave, _) => {}
+            (GenericOp::CheckTdz { src, .. }, _) => {
+                let next_obj = match ops.get(p + 1) {
+                    Some(&GenericOp::SetProp { obj, .. }) if p + 1 == q => Some(obj),
+                    _ => None,
+                };
+                if next_obj != Some(src) {
+                    break;
+                }
+            }
+            (GenericOp::Jump { target }, _) if target > p && target <= q => {}
+            (GenericOp::Interp { .. }, Some(Op::InitFields { ctor, this }))
+                if !written.contains(ctor) && ctor != this =>
+            {
+                out.inits.push((p, *ctor));
+            }
+            _ => match fallback_of(p) {
+                Some(g) => out.guards.push(g),
+                None => break,
+            },
+        }
+        p += 1;
+    }
+    let last = *out.adds.last()?;
+    out.inits.retain(|&(k, _)| k < last);
+    // (A guard whose fallback op lies past the last add is no concern.)
+    out.guards.retain(|&g| match ops[g] {
+        GenericOp::InlineGuard { call, .. } => (call as usize) < last,
+        _ => false,
+    });
+    (out.adds.len() >= 2).then_some(out)
+}
+
 /// Which `JumpIfFalse`s an inlined call's guard just before takes over
 /// (`call_seq::InlineEmit::fused_miss`): the guard's own test of its result,
 /// branching forward, that nothing else reaches (no branch to it, not an
