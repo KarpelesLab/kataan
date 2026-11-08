@@ -2182,6 +2182,12 @@ fn vm_set_elem_mode(
     value: NanBox,
     strict: bool,
 ) -> Result<(), VmError> {
+    // `o[k] = v` with a String `k` naming an existing own data property of
+    // an ordinary object that nothing intercepts: the slot's store (what the
+    // static-key path below would reach), its slot from the key memo.
+    if !key.is_number() && ctx.realm.own_data_set_by_string(recv, key, value) {
+        return Ok(());
+    }
     // A store into a hole of a plain array (`new Array(n)` filled in): the
     // element store itself, when nothing on the chain can intercept it.
     if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())

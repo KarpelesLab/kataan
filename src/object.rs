@@ -1550,6 +1550,22 @@ impl Object {
         self.extra.as_deref().is_none_or(|e| e.accessors.is_empty())
     }
 
+    /// Whether a write to an existing own data slot of this shaped object is
+    /// just that slot's store: not host-exotic, no write the host must see
+    /// (a global object, a tracked built-in prototype), never a non-writable
+    /// property (by mark or by a function layout's implied attributes), not
+    /// frozen, and no accessors (one could shadow the slot's key).
+    #[inline]
+    #[must_use]
+    pub fn plain_slot_store_ok(&self) -> bool {
+        self.flags
+            & (JIT_FLAG_EXOTIC | JIT_FLAG_NO_INLINE_SET | JIT_FLAG_READONLY | OBJ_FLAG_FROZEN)
+            == 0
+            && !self.is_dict()
+            && !self.shape.has_implied_fn_attrs()
+            && self.has_no_accessors()
+    }
+
     /// Whether the object's own properties are exactly its shape's data keys,
     /// every one enumerable, in the shape's order: a shaped object with no
     /// accessors, no non-enumerable keys and no separate key-order log. Two

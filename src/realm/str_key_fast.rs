@@ -101,6 +101,55 @@ impl Realm {
         o.get(name)
     }
 
+    /// `obj[key] = value` for a String `key` naming an existing own data
+    /// property of the ordinary shaped object `obj` whose write is just its
+    /// slot's store (`Object::plain_slot_store_ok`: writable, no accessor,
+    /// nothing the host must see): that store, with its write barrier, and
+    /// `true`. `false`, having done nothing, otherwise (an add included).
+    /// The key's slot comes from the String-key slot memo, which a miss here
+    /// feeds as a read's does.
+    #[inline]
+    pub(crate) fn own_data_set_by_string(
+        &mut self,
+        obj: NanBox,
+        key: NanBox,
+        value: NanBox,
+    ) -> bool {
+        let slot = match self.key_memo_probe(obj, key) {
+            Some((o, slot)) => o.plain_slot_store_ok().then_some(slot),
+            None => self.own_data_set_missed(obj, key),
+        };
+        let (Some(slot), Some(raw)) = (slot, obj.as_handle()) else {
+            return false;
+        };
+        let h = Handle::from_raw(raw);
+        let wrote = self
+            .heap
+            .get_mut(h)
+            .and_then(Cell::as_object_mut)
+            .is_some_and(|o| o.set_slot(slot, value));
+        if wrote {
+            self.write_barrier(h, value);
+        }
+        wrote
+    }
+
+    /// [`own_data_set_by_string`](Self::own_data_set_by_string)'s slot once
+    /// the memo missed (noted for the next write or read).
+    #[inline(never)]
+    fn own_data_set_missed(&self, obj: NanBox, key: NanBox) -> Option<u32> {
+        let k = self.string_key_in_place(key)?;
+        // (A mapped `arguments` object's index write aliases a parameter.)
+        let o = self.ordinary_props(Handle::from_raw(obj.as_handle()?), true)?;
+        if !o.plain_slot_store_ok() {
+            return None;
+        }
+        let shape = o.shaped_shape()?;
+        let slot = shape.lookup(k)?;
+        self.key_memo_note(key, shape, slot);
+        Some(slot)
+    }
+
     /// `obj[key]` for a String `key` naming an own **data** property of the
     /// ordinary object `obj` (no like-named accessor): its value. `None`
     /// for anything else.
