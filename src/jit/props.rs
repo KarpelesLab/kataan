@@ -494,6 +494,27 @@ pub struct MethodSite {
     /// property (`Object.prototype`, `Number.MAX_SAFE_INTEGER`), which the
     /// entries (ordinary shaped receivers only) cannot record.
     native_own: NativeOwn,
+    /// A direct `Object.hasOwn(o, k)` site's memo of its last answer for an
+    /// ordinary shaped object (`super::direct_call`).
+    own_key: OwnKeyMemo,
+}
+
+/// See [`MethodSite::note_own_key`]: for an ordinary shaped object (not
+/// host-exotic, no primitive wrapper) of the shape whose word is `shape`
+/// and without accessors, whether the key String whose bits are `key` is
+/// an own property is `result` (a boolean's bits). The shape's keys fix
+/// that, and its `Rc` (`keep`) keeps its address from being reused; the
+/// key's bits carry its cell's generation, and a String's text never
+/// changes.
+#[repr(C)]
+struct OwnKeyMemo {
+    /// The shape word (`0`: empty).
+    shape: u64,
+    /// The key's bits.
+    key: u64,
+    /// The answer's bits.
+    result: u64,
+    keep: Option<Rc<Shape>>,
 }
 
 /// See [`MethodSite::fill_native_own`]: at the prototype epoch `stamp`, the
@@ -604,7 +625,65 @@ impl MethodSite {
                 tries: 0,
                 direct: 0,
             },
+            own_key: OwnKeyMemo {
+                shape: 0,
+                key: super::CallSite::EMPTY,
+                result: 0,
+                keep: None,
+            },
         }
+    }
+
+    /// After a direct `Object.hasOwn(o, k)` answered `result` without
+    /// running code: records it in the site's [`OwnKeyMemo`] when `o` is an
+    /// ordinary shaped object (not host-exotic, flagged exotic, or a
+    /// primitive wrapper) without accessors and `k` a String, for compiled
+    /// code's inline answer (`super::direct_call`).
+    pub(crate) fn note_own_key(
+        &mut self,
+        realm: &crate::realm::Realm,
+        o: crate::nanbox::NanBox,
+        k: crate::nanbox::NanBox,
+        result: crate::nanbox::NanBox,
+    ) {
+        let (Some(oh), Some(kh)) = (o.as_handle(), k.as_handle()) else {
+            return;
+        };
+        let (oh, kh) = (
+            crate::heap::Handle::from_raw(oh),
+            crate::heap::Handle::from_raw(kh),
+        );
+        if !realm.is_string_handle(kh) || !realm.typeof_is_string(kh) || realm.is_host_exotic(oh) {
+            return;
+        }
+        let Some(obj) = realm.jit_object(oh) else {
+            return;
+        };
+        if obj.is_prim_wrapper() || !obj.has_no_accessors() || obj.jit_flags() & FLAG_EXOTIC != 0 {
+            return;
+        }
+        let Some(shape) = obj.shaped_shape() else {
+            return;
+        };
+        self.own_key = OwnKeyMemo {
+            shape: shape_word(shape),
+            key: k.to_bits(),
+            result: result.to_bits(),
+            keep: Some(Rc::clone(shape)),
+        };
+    }
+
+    /// The offsets, from a site, of its [`OwnKeyMemo`]'s shape, key and
+    /// result words (`super::direct_call`).
+    pub(crate) fn own_key_offsets() -> (i32, i32, i32) {
+        use core::mem::offset_of;
+        let m = offset_of!(MethodSite, own_key);
+        let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
+        (
+            i(m + offset_of!(OwnKeyMemo, shape)),
+            i(m + offset_of!(OwnKeyMemo, key)),
+            i(m + offset_of!(OwnKeyMemo, result)),
+        )
     }
 
     /// After a property read of the site's key on `recv`: when `recv` is a
@@ -706,6 +785,18 @@ impl MethodSite {
         if v.as_handle().is_some() && proves(realm, v) {
             self.native_own.direct = v.to_bits();
         }
+    }
+
+    /// For a direct `o.hasOwnProperty(k)` site (`super::direct_call`): the
+    /// chain cache refilled from `recv` ([`fill`](Self::fill)), counted as
+    /// [`fill_direct`](Self::fill_direct) is.
+    pub(crate) fn fill_direct_chain(
+        &mut self,
+        realm: &mut crate::realm::Realm,
+        recv: crate::heap::Handle,
+    ) {
+        self.native_own.tries = self.native_own.tries.saturating_add(1);
+        self.fill(realm, recv);
     }
 
     /// The offsets, from a site, of its [`NativeOwn`] memo's `direct` proof

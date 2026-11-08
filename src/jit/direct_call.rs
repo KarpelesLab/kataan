@@ -15,10 +15,17 @@
 //! memo's stamp (so the receiver still owns the key as a data property in
 //! the same slot), one realm — and the method value in that slot is the very
 //! value the memo's proof (`MethodSite::fill_direct`) found to be the
-//! built-in. The call then is that built-in's, and it is computed here: in
-//! line when it is a test of the argument's bits (the `Number` predicates;
-//! `Array.isArray` of an array or an ordinary object), else through one
-//! narrow helper of fixed signature (`(ctx, kind, a0, a1) -> bits`,
+//! built-in. A prototype method (`o.hasOwnProperty(k)`) is found instead by
+//! the site's chain cache on an ordinary receiver and checked to be the
+//! built-in cell. The call then is that built-in's, and it is computed here:
+//! in line when it is a test of the argument's bits (the `Number`
+//! predicates; `Array.isArray` of an array or an ordinary object; `Object.is`
+//! of anything but two distinct heap values), a link read
+//! (`Object.getPrototypeOf` of an ordinary object) or the site's memo of its
+//! last answer (`Object.hasOwn` / `hasOwnProperty` for an object of that
+//! shape without accessors and that very key String,
+//! `MethodSite::note_own_key`), else through one narrow helper of fixed
+//! signature (`(ctx, kind, a0, a1) -> bits`,
 //! `nbvm::native_call::direct_run`), which declines — the throw sentinel,
 //! having done nothing — whatever input could run code, throw or allocate
 //! (a proxy, a key that is an object, a unit not yet interned, …). Every
@@ -56,6 +63,9 @@ pub(crate) const K_FROM_CHAR_CODE: u8 = 7;
 pub(crate) const K_GET_PROTO: u8 = 8;
 /// `Object.is(a, b)`.
 pub(crate) const K_OBJECT_IS: u8 = 9;
+/// `o.hasOwnProperty(k)` (`%Object.prototype.hasOwnProperty%` found on the
+/// receiver's prototype chain): computed as [`K_HAS_OWN`] of `(o, k)`.
+pub(crate) const K_PROTO_HAS_OWN: u8 = 10;
 
 /// The direct kind of a method call of `key` with `argc` arguments, when
 /// that names one of the built-ins served here (whether the site's method
@@ -71,19 +81,33 @@ pub(crate) fn kind_of(key: &str, argc: usize) -> Option<u8> {
         ("fromCharCode", 1) => K_FROM_CHAR_CODE,
         ("getPrototypeOf", 1..=2) => K_GET_PROTO,
         ("is", 2..=3) => K_OBJECT_IS,
+        ("hasOwnProperty", 1) => K_PROTO_HAS_OWN,
         _ => return None,
     })
 }
 
+/// The kind whose computation serves a call of kind `kind` (see
+/// [`DirectEmit::kind`]), and whether its arguments are the receiver and
+/// the call's own.
+pub(crate) fn body_kind(kind: u8) -> (u8, bool) {
+    match kind {
+        K_PROTO_HAS_OWN => (K_HAS_OWN, true),
+        k => (k, false),
+    }
+}
+
 /// What [`emit`] needs of the call op and the compiled body.
 pub(crate) struct DirectEmit<'a> {
-    /// The built-in ([`kind_of`]).
+    /// The built-in the call names ([`kind_of`]): what its guard proves.
+    pub guard: u8,
+    /// The computation ([`body_kind`] of `guard`), over `args`.
     pub kind: u8,
     /// The destination register.
     pub dst: u16,
     /// The receiver register.
     pub recv: u16,
-    /// The argument registers.
+    /// The computation's argument registers (for a prototype method, the
+    /// receiver's first).
     pub args: &'a [u16],
     /// The call op's method site (its `NativeOwn` memo and proof).
     pub site: *const MethodSite,
@@ -92,10 +116,12 @@ pub(crate) struct DirectEmit<'a> {
     pub hosted: i32,
     pub realm: i32,
     pub multi_realm: i32,
-    /// `jit_helper_direct_fill` / `jit_helper_direct_call`.
+    /// `jit_helper_direct_fill` / `jit_helper_direct_call` /
+    /// `jit_helper_direct_has_own`.
     pub fill: u64,
     pub call: u64,
-    /// The heap layout (the inline `Array.isArray`'s cell walk).
+    pub has_own: u64,
+    /// The heap layout (the inline cell walks).
     pub layout: &'a JitLayout,
     /// Where the op's code ends (the result stored).
     pub done: Label,
@@ -109,27 +135,49 @@ fn disp(r: u16) -> i32 {
 /// Emits the direct form of a call op: on a proved site and an input the
 /// built-in answers without running code, the result stored to `dst` and a
 /// jump to `done`; otherwise falls through past the emitted code with
-/// nothing done (the receiver-cache keys maybe emptied by a helper call) to
-/// the op's general call.
+/// nothing done to the op's general call.
 pub(crate) fn emit(a: &mut X64Assembler, e: &DirectEmit<'_>) {
     let general = a.new_label();
     let fill = a.new_label();
     let (direct_off, tries_off) = MethodSite::direct_offsets();
-    // The site's proof: hosted, the recorded receiver at the memo's epoch in
-    // one realm, its slot holding the proved built-in.
     a.g_cmp_byte_imm(r::R15, e.hosted, 0);
     a.g_jcc(cc::E, general);
-    a.p_native_own_hit(
-        (e.realm, e.multi_realm),
-        (r::RBX, disp(e.recv)),
-        e.site,
-        fill,
-    );
-    a.g_cmp_mem(r::RAX, r::R11, direct_off);
-    a.g_jcc(cc::NE, fill);
+    if e.guard == K_PROTO_HAS_OWN {
+        // A prototype method: the site's chain cache finds it on the
+        // receiver (an ordinary shaped object), and it is the built-in.
+        a.g_load(r::R9, r::R15, e.realm);
+        a.g_cmp_byte_imm(r::R9, e.multi_realm, 0);
+        a.g_jcc(cc::NE, general);
+        a.p_method_lookup(
+            e.layout,
+            e.realm,
+            (r::RBX, disp(e.recv)),
+            e.site,
+            fill,
+            None,
+        );
+        a.p_is_native(
+            e.layout,
+            e.realm,
+            crate::nbexec::N_OBJ_PROTO_HASOWN,
+            general,
+        );
+    } else {
+        // A static method: the recorded receiver at the memo's epoch in one
+        // realm, its slot holding the proved built-in.
+        a.p_native_own_hit(
+            (e.realm, e.multi_realm),
+            (r::RBX, disp(e.recv)),
+            e.site,
+            fill,
+        );
+        a.g_cmp_mem(r::RAX, r::R11, direct_off);
+        a.g_jcc(cc::NE, fill);
+    }
     emit_body(a, e, general);
-    // A miss: the memo refilled and proved (up to `DIRECT_TRIES` times),
-    // and this call made by the general path.
+    // A miss: the memo (a prototype method's: the chain cache) refilled and
+    // proved (up to `DIRECT_TRIES` times), and this call made by the
+    // general path.
     let cold = a.cold_begin();
     a.bind(fill);
     a.g_movabs(r::R11, e.site as u64);
@@ -138,7 +186,7 @@ pub(crate) fn emit(a: &mut X64Assembler, e: &DirectEmit<'_>) {
     a.mov_rdi_r15();
     a.load_argreg(1, disp(e.recv));
     a.movabs_argreg(2, e.site as i64);
-    a.movabs_argreg(3, i64::from(e.kind));
+    a.movabs_argreg(3, i64::from(e.guard));
     a.movabs_rax(e.fill as i64);
     a.call_rax();
     a.jmp(general);
@@ -160,8 +208,8 @@ pub(crate) const fn got_value(kind: u8) -> u64 {
 /// — the very value its helper last served, which it recorded with
 /// [`got_value`] of this kind (and the stamp `u64::MAX`, no epoch: a
 /// built-in function cell is what it is for life, and its bits carry its
-/// generation). The receiver plays no part: every built-in served here
-/// ignores its `this`.
+/// generation). The receiver plays no part (every static built-in served
+/// here ignores its `this`) but as a prototype method's first argument.
 pub(crate) fn emit_got(
     a: &mut X64Assembler,
     e: &DirectEmit<'_>,
@@ -184,7 +232,7 @@ pub(crate) fn emit_got(
     a.raw(&[0xff]); // cmp qword [..], -1 (u64::MAX)
     a.g_jcc(cc::NE, general);
     a.g_mem(true, &[0x81], 7, r::R11, IDENT_VALUE);
-    a.raw(&(got_value(e.kind) as i32).to_le_bytes()); // cmp qword [..], value
+    a.raw(&(got_value(e.guard) as i32).to_le_bytes()); // cmp qword [..], value
     a.g_jcc(cc::NE, general);
     emit_body(a, e, general);
     a.bind(general);
@@ -259,6 +307,58 @@ fn emit_body(a: &mut X64Assembler, e: &DirectEmit<'_>, general: Label) {
                 a.store_rax(disp(e.dst));
                 a.jmp(e.done);
             }
+            if let (K_HAS_OWN, &[o, k, ..], false) = (e.kind, e.args, e.site.is_null()) {
+                // The site's last answer for an object of this shape without
+                // accessors and this very key String
+                // (`MethodSite::note_own_key`).
+                let (m_shape, m_key, m_result) = MethodSite::own_key_offsets();
+                let l = e.layout;
+                let no_acc = a.new_label();
+                a.p_arena(e.realm, &l.props);
+                a.load_rax(disp(o));
+                a.p_is_handle(r::RCX, helper);
+                a.p_slot_rooted(l, r::RCX, helper);
+                a.p_object_not_exotic(l, helper);
+                a.g_load(r::R9, r::RCX, l.props.off_extra);
+                a.g_test(r::R9);
+                a.g_jcc(cc::E, no_acc);
+                a.g_load(r::R9, r::R9, l.props.extra_acc_len);
+                a.g_test(r::R9);
+                a.g_jcc(cc::NE, helper);
+                a.bind(no_acc);
+                a.g_movabs(r::R11, e.site as u64);
+                a.g_load(r::RAX, r::RCX, l.off_shape);
+                a.g_cmp_mem(r::RAX, r::R11, m_shape);
+                a.g_jcc(cc::NE, helper);
+                a.load_rax(disp(k));
+                a.g_cmp_mem(r::RAX, r::R11, m_key);
+                a.g_jcc(cc::NE, helper);
+                a.g_load(r::RAX, r::R11, m_result);
+                a.store_rax(disp(e.dst));
+                a.jmp(e.done);
+            }
+            if let (K_GET_PROTO, Some(x)) = (e.kind, x) {
+                // An ordinary shaped object's `[[Prototype]]` link (what the
+                // helper reads for one, `Realm::object_proto`).
+                let l = e.layout;
+                let null = a.new_label();
+                a.p_arena(e.realm, &l.props);
+                a.load_rax(disp(x));
+                a.p_is_handle(r::RCX, helper);
+                a.p_slot_rooted(l, r::RCX, helper);
+                a.p_object_not_exotic(l, helper);
+                a.g_load(r::RAX, r::RCX, l.props.off_proto);
+                const _: () = assert!(crate::object::NO_PROTO == u64::MAX);
+                a.g_cmp_imm(r::RAX, -1);
+                a.je(null);
+                a.p_or_handle_tag_rax();
+                a.store_rax(disp(e.dst));
+                a.jmp(e.done);
+                a.bind(null);
+                a.movabs_rax(NanBox::null().to_bits() as i64);
+                a.store_rax(disp(e.dst));
+                a.jmp(e.done);
+            }
             if let (K_IS_ARRAY, Some(x)) = (e.kind, x) {
                 // An array is one, a primitive or an ordinary object is
                 // not; any other cell (a proxy among them) is the
@@ -286,14 +386,22 @@ fn emit_body(a: &mut X64Assembler, e: &DirectEmit<'_>, general: Label) {
             a.bind(helper);
             let undef = NanBox::undefined().to_bits() as i64;
             a.mov_rdi_r15();
-            a.movabs_argreg(1, i64::from(e.kind));
-            for (i, reg) in [2usize, 3].into_iter().enumerate() {
+            // (`hasOwn` at a method site: its own helper, which notes the
+            // answer there.)
+            let (first, helper_fn) = if e.kind == K_HAS_OWN && !e.site.is_null() {
+                a.movabs_argreg(3, e.site as i64);
+                (1, e.has_own)
+            } else {
+                a.movabs_argreg(1, i64::from(e.kind));
+                (2, e.call)
+            };
+            for i in 0..2 {
                 match e.args.get(i) {
-                    Some(&m) => a.load_argreg(reg, disp(m)),
-                    None => a.movabs_argreg(reg, undef),
+                    Some(&m) => a.load_argreg(first + i, disp(m)),
+                    None => a.movabs_argreg(first + i, undef),
                 }
             }
-            a.movabs_rax(e.call as i64);
+            a.movabs_rax(helper_fn as i64);
             a.call_rax_pure();
             a.p_cmp_throw_rax();
             a.g_jcc(cc::E, general);

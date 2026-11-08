@@ -1827,6 +1827,7 @@ pub(super) fn direct_kind(realm: &Realm, v: NanBox) -> u8 {
         FastOp::NumPred(NumPred::Finite) => d::K_IS_FINITE,
         FastOp::NumPred(NumPred::NaN) => d::K_IS_NAN,
         FastOp::ObjStaticHasOwn => d::K_HAS_OWN,
+        FastOp::ObjHasOwn => d::K_PROTO_HAS_OWN,
         FastOp::StrFromCharCode => d::K_FROM_CHAR_CODE,
         FastOp::HostDirect => match v
             .as_handle()
@@ -1863,7 +1864,9 @@ pub(super) fn direct_run(realm: &mut Realm, kind: u8, a0: NanBox, a1: NanBox) ->
         d::K_IS_SAFE_INTEGER => Some(NanBox::boolean(NumPred::SafeInteger.test(a0))),
         d::K_IS_FINITE => Some(NanBox::boolean(NumPred::Finite.test(a0))),
         d::K_IS_NAN => Some(NanBox::boolean(NumPred::NaN.test(a0))),
-        d::K_HAS_OWN => {
+        // (`o.hasOwnProperty(k)`: ToPropertyKey before ToObject, which is
+        // unobservable when neither runs code or throws.)
+        d::K_HAS_OWN | d::K_PROTO_HAS_OWN => {
             let o = Handle::from_raw(a0.as_handle()?);
             Some(NanBox::boolean(obj_has_own_fast(realm, o, a1)?))
         }

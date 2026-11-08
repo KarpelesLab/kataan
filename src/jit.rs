@@ -3583,6 +3583,10 @@ pub struct GenericHelpers {
     /// `jit_helper_direct_call(ctx, kind, a0, a1) -> bits | throw sentinel`:
     /// a direct built-in call's narrow entry (`direct_call`).
     pub direct_call: JitBinHelper,
+    /// `jit_helper_direct_has_own(ctx, o, k, site) -> bits | throw
+    /// sentinel`: a direct `Object.hasOwn(o, k)` that also notes its answer
+    /// in the method site (`direct_call`).
+    pub direct_has_own: JitBinHelper,
     /// `jit_helper_to_str(ctx, value, lazy, _) -> bits`: `Op::ToStr` /
     /// `Op::ToStrLazy` without user code, else `0` (the op itself runs).
     pub to_str: JitBinHelper,
@@ -10222,23 +10226,31 @@ impl JitFunction {
                         // (A promoted argument is read from the register
                         // file; a promoted result is reloaded from it after
                         // the op, `NumGen::after_generic`.)
-                        for &m in margs.iter() {
+                        let (body, with_recv) = direct_call::body_kind(kind);
+                        let mut argv: Vec<u16> = Vec::with_capacity(margs.len() + 1);
+                        if with_recv {
+                            argv.push(recv);
+                        }
+                        argv.extend_from_slice(margs);
+                        for &m in argv.iter() {
                             num.operand_xmm(&mut a, op_idx, m, false);
                         }
                         let cl = &helpers.call_layout;
                         direct_call::emit(
                             &mut a,
                             &direct_call::DirectEmit {
-                                kind,
+                                guard: kind,
+                                kind: body,
                                 dst,
                                 recv,
-                                args: margs,
+                                args: &argv,
                                 site: si.method_ptr,
                                 hosted: cl.hosted,
                                 realm: cl.realm,
                                 multi_realm: cl.multi_realm,
                                 fill: helpers.direct_fill as usize as u64,
                                 call: helpers.direct_call as usize as u64,
+                                has_own: helpers.direct_has_own as usize as u64,
                                 layout: &layout,
                                 done,
                             },
@@ -13680,23 +13692,31 @@ impl JitFunction {
                         && let Some(kind) = direct_call::kind_of(key, args.len())
                         && !num.in_any_spec(op_idx)
                     {
-                        for &m in args.iter() {
+                        let (body, with_recv) = direct_call::body_kind(kind);
+                        let mut argv: Vec<u16> = Vec::with_capacity(args.len() + 1);
+                        if with_recv {
+                            argv.push(recv);
+                        }
+                        argv.extend_from_slice(args);
+                        for &m in argv.iter() {
                             num.operand_xmm(&mut a, op_idx, m, false);
                         }
                         let cl = &helpers.call_layout;
                         direct_call::emit_got(
                             &mut a,
                             &direct_call::DirectEmit {
-                                kind,
+                                guard: kind,
+                                kind: body,
                                 dst,
                                 recv,
-                                args,
+                                args: &argv,
                                 site: core::ptr::null(),
                                 hosted: cl.hosted,
                                 realm: cl.realm,
                                 multi_realm: cl.multi_realm,
                                 fill: helpers.direct_fill as usize as u64,
                                 call: helpers.direct_call as usize as u64,
+                                has_own: helpers.direct_has_own as usize as u64,
                                 layout: &layout,
                                 done,
                             },

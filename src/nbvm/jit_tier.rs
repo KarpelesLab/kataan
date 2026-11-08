@@ -1296,9 +1296,14 @@ pub(crate) extern "C" fn jit_helper_direct_fill(
     if ctx.host.is_some()
         && let Some(h) = NanBox::from_bits(recv).as_handle()
     {
-        site.fill_direct(&mut ctx.realm, Handle::from_raw(h), |realm, v| {
-            super::native_call::direct_proves(realm, v, kind as u8)
-        });
+        let h = Handle::from_raw(h);
+        if kind as u8 == crate::jit::direct_call::K_PROTO_HAS_OWN {
+            site.fill_direct_chain(&mut ctx.realm, h);
+        } else {
+            site.fill_direct(&mut ctx.realm, h, |realm, v| {
+                super::native_call::direct_proves(realm, v, kind as u8)
+            });
+        }
     }
     0
 }
@@ -1327,6 +1332,36 @@ pub(crate) extern "C" fn jit_helper_direct_call(
         NanBox::from_bits(a1),
     )
     .map_or(NanBox::jit_throw_bits(), NanBox::to_bits)
+}
+
+/// [`jit_helper_direct_call`] for a direct `Object.hasOwn(o, k)` at the
+/// method site `site`, which also notes an answer the site's compiled code
+/// can then give itself (`MethodSite::note_own_key`).
+///
+/// # Safety
+/// As [`jit_helper_site_fill`].
+pub(crate) extern "C" fn jit_helper_direct_has_own(
+    ctx: *mut core::ffi::c_void,
+    o: u64,
+    k: u64,
+    site: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_site_fill`.
+    #[allow(unsafe_code)]
+    let (ctx, site) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            &mut *(site as usize as *mut crate::jit::MethodSite),
+        )
+    };
+    let (o, k) = (NanBox::from_bits(o), NanBox::from_bits(k));
+    match super::native_call::direct_run(&mut ctx.realm, crate::jit::direct_call::K_HAS_OWN, o, k) {
+        Some(r) => {
+            site.note_own_key(&ctx.realm, o, k, r);
+            r.to_bits()
+        }
+        None => NanBox::jit_throw_bits(),
+    }
 }
 
 /// `Op::ToStr` (`lazy` zero) or `Op::ToStrLazy` of `v` when that runs no code:
