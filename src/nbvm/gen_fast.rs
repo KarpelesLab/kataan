@@ -424,6 +424,71 @@ pub(super) fn jit_for_of_step(
     Some(step)
 }
 
+/// `GetIterator(g)` for a sync VM generator `g` of `funcs` when it runs no
+/// code: `g[@@iterator]` is a data property (own or inherited, no accessor
+/// or proxy on the way) holding `%IteratorPrototype%[@@iterator]`, which
+/// returns its receiver, and `g.next` likewise is the intrinsic
+/// `%GeneratorPrototype%.next`. `Some(next)` — the iterator is `g` itself —
+/// or `None` (nothing done) for the general protocol.
+///
+/// A generator owning nothing but its state slot defers both lookups to its
+/// prototype, whose chain's outcome is memoized ([`OpenMemo`]).
+pub(super) fn open(ctx: &mut Ctx, funcs: &[FnProto], g: NanBox) -> Option<NanBox> {
+    direct_target(ctx, funcs, g)?;
+    let gh = Handle::from_raw(g.as_handle()?);
+    let Some(proto) = ctx.realm.generator_owns_only_state(gh) else {
+        let realm = &ctx.realm;
+        let key = realm.vm_array_iter().iter_key.as_deref()?;
+        let f = super::iter_fast::plain_lookup(realm, gh, key)??;
+        let n = super::iter_fast::plain_lookup(realm, gh, "next")??;
+        return open_fns_ok(ctx, f, n);
+    };
+    let epoch = crate::object::proto_epoch();
+    if let Some(m) = &ctx.gen_open_memo
+        && m.proto == proto.to_raw()
+        && m.stamp == epoch
+    {
+        let f = ctx.realm.stamped_slot(&m.iter_at)?;
+        let n = ctx.realm.stamped_slot(&m.next_at)?;
+        return open_fns_ok(ctx, f, n);
+    }
+    ctx.gen_open_memo = None;
+    let key: alloc::boxed::Box<str> = ctx.realm.vm_array_iter().iter_key.clone()?;
+    let iter_at = ctx.realm.watch_get_chain(proto, &key)??;
+    let next_at = ctx.realm.watch_get_chain(proto, "next")??;
+    let f = ctx.realm.stamped_slot(&iter_at)?;
+    let n = ctx.realm.stamped_slot(&next_at)?;
+    ctx.gen_open_memo = Some(OpenMemo {
+        proto: proto.to_raw(),
+        stamp: crate::object::proto_epoch(),
+        iter_at,
+        next_at,
+    });
+    open_fns_ok(ctx, f, n)
+}
+
+/// [`open`]'s test of what the lookups found: `f` (`@@iterator`) returns
+/// its receiver and `n` is the intrinsic `next`.
+fn open_fns_ok(ctx: &Ctx, f: NanBox, n: NanBox) -> Option<NanBox> {
+    let realm = &ctx.realm;
+    (realm.native_at(Handle::from_raw(f.as_handle()?))
+        == Some(crate::nbexec::N_ITERATOR_PROTO_SELF)
+        && realm.native_at(Handle::from_raw(n.as_handle()?)) == Some(crate::nbexec::N_GEN_NEXT))
+    .then_some(n)
+}
+
+/// [`open`]'s memo: where the chain from the generators' prototype `proto`
+/// holds `@@iterator` and `next`, found at prototype epoch `stamp`. While
+/// the epoch stands, no object on either (watched) chain changed its keys,
+/// layout or `[[Prototype]]`, so both are still data properties at those
+/// slots: only their values are re-read.
+pub(super) struct OpenMemo {
+    proto: u64,
+    stamp: u64,
+    iter_at: crate::realm::builtins_fast::StampedSlot,
+    next_at: crate::realm::builtins_fast::StampedSlot,
+}
+
 /// A finished frame's register file goes back to the pool, as an ordinary
 /// call's does.
 fn recycle(ctx: &mut Ctx, mut regs: Vec<NanBox>) {

@@ -40,7 +40,15 @@ impl Interp {
     /// safepoint whose descent is fully published (no delegated host call in
     /// flight).
     pub(crate) fn collect_with_roots(&mut self, extra: &[Handle]) -> bool {
-        if !self.gc_world_is_simple() {
+        self.collect_with_roots_in(extra, false)
+    }
+
+    /// [`collect_with_roots`](Self::collect_with_roots), where `jobs_rooted`
+    /// says the caller is the event loop between two jobs: pending jobs and
+    /// timers are then no reason to decline (they are rooted, see
+    /// [`gc_roots`](Self::gc_roots), and no job is half run).
+    fn collect_with_roots_in(&mut self, extra: &[Handle], jobs_rooted: bool) -> bool {
+        if !self.gc_world_is_simple(jobs_rooted) {
             return false;
         }
         let mut roots: Vec<Handle> = extra.to_vec();
@@ -82,11 +90,11 @@ impl Interp {
     /// enumerates. Each `false` case names a root source this pass does not trace;
     /// refusing to collect is the safe answer, and the memory is reclaimed later
     /// (or not at all) rather than incorrectly.
-    fn gc_world_is_simple(&self) -> bool {
-        // Pending jobs and timers hold handler/value pairs; extra realms hold a
+    fn gc_world_is_simple(&self, jobs_rooted: bool) -> bool {
+        // Pending jobs and timers hold handler/value pairs (rooted, but only
+        // the event loop knows no job is half run); extra realms hold a
         // whole second set of globals and intrinsics.
-        if !self.microtasks.is_empty()
-            || !self.macrotasks.is_empty()
+        if (!jobs_rooted && (!self.microtasks.is_empty() || !self.macrotasks.is_empty()))
             || !self.created_realms.is_empty()
         {
             return false;
@@ -120,6 +128,34 @@ impl Interp {
             return false;
         }
         true
+    }
+
+    /// The event loop's safepoint, between two jobs of the outermost loop of a
+    /// hosted script run (`run_event_loop_collecting`): no VM activation and
+    /// no job is in flight, so the live values are the interpreter's own
+    /// ([`gc_roots`](Self::gc_roots), pending jobs and timers included), the
+    /// suspended frames those reach, and `keep` (the script's completion
+    /// value). Without it nothing was ever collected once a job was pending,
+    /// and an async program's whole history stayed on the heap.
+    pub(crate) fn event_loop_safepoint(&mut self, keep: &[NanBox]) {
+        if self.realm.gc_pressure() < self.realm.gc_next_threshold() {
+            return;
+        }
+        let mut roots: Vec<Handle> = Vec::new();
+        for v in keep
+            .iter()
+            .chain(self.realm.vm_callee_stack.iter())
+            .chain(self.realm.vm_args_buf.iter())
+        {
+            if let Some(raw) = v.as_handle() {
+                roots.push(Handle::from_raw(raw));
+            }
+        }
+        // (As the VM's safepoint does: its bytecode constants.)
+        for t in self.vm_table.iter().chain(self.vm_newest_table().iter()) {
+            crate::nbvm::table_const_roots(t, &mut roots);
+        }
+        self.collect_with_roots_in(&roots, true);
     }
 
     /// Every [`Handle`] the interpreter itself keeps alive, for the safepoint's

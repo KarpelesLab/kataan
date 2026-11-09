@@ -131,6 +131,54 @@ impl Realm {
         self.object_get_cached(proto, "constructor", cache)
     }
 
+    /// The `[[Prototype]]` of the generator object `h` when it is an
+    /// ordinary shaped object owning nothing but its one hidden state slot
+    /// (so every named lookup on it continues at that prototype).
+    pub(crate) fn generator_owns_only_state(&self, h: Handle) -> Option<Handle> {
+        let o = self.heap.get(h)?.as_object()?;
+        if o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0
+            || self.is_host_exotic(h)
+            || o.shaped_shape()?.len() != 1
+        {
+            return None;
+        }
+        o.proto()
+    }
+
+    /// The `[[Prototype]]` of the promise `h` when it owns no property (so
+    /// a named lookup on it continues there).
+    pub(crate) fn plain_promise_lookup_start(&self, h: Handle) -> Option<Handle> {
+        if !matches!(self.heap.get(h), Some(Cell::Promise(_)))
+            || self.aux_props.get(&h.to_raw()).is_some()
+            || self.is_host_exotic(h)
+        {
+            return None;
+        }
+        self.object_proto(h)
+    }
+
+    /// `Get(promise, "then")` when it runs no code, as
+    /// [`plain_promise_constructor`](Self::plain_promise_constructor) proves
+    /// `constructor`'s: `h` is a promise with no own properties whose
+    /// `[[Prototype]]` is the intrinsic `%Promise.prototype%`, which owns
+    /// `then` as a data property — its value. `None` otherwise.
+    pub(crate) fn plain_promise_then(
+        &self,
+        h: Handle,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
+        if !matches!(self.heap.get(h), Some(Cell::Promise(_)))
+            || self.aux_props.get(&h.to_raw()).is_some()
+        {
+            return None;
+        }
+        let proto = self.promise_proto_intrinsic?;
+        if self.object_proto(h) != Some(proto) {
+            return None;
+        }
+        self.object_get_cached(proto, "then", cache)
+    }
+
     /// Whether `Get(h, "then")` is `undefined` without running any code,
     /// for an iterator-result object: `h` is an ordinary object whose own
     /// properties are exactly the data properties `value` and `done` (the

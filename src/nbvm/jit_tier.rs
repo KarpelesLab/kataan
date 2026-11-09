@@ -2046,6 +2046,15 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*iter as usize] = NanBox::number(0.0);
             Some(Ok(()))
         }
+        // A generator's open (the interpreter arm's first step).
+        Op::IterOpen { iter, next, src } => {
+            let v = regs[*src as usize];
+            super::gen_fast::open(ctx, funcs, v).map(|n| {
+                regs[*iter as usize] = v;
+                regs[*next as usize] = n;
+                Ok(())
+            })
+        }
         Op::IterNext {
             dst,
             done,

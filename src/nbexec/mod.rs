@@ -380,9 +380,20 @@ pub struct Interp {
     /// resumption jobs queued right behind it in its own context (see
     /// `VmHost::peek_batch_job`), as the drain would run them next.
     async_batch: bool,
+    /// Whether the running job is one of the collecting event loop's
+    /// (`run_event_loop_collecting`): a batch of resumptions (see
+    /// `async_batch`) then ends once a collection is due, so the loop can
+    /// make it between two jobs.
+    async_batch_gc: bool,
     /// The inline cache of `PromiseResolve`'s read of `%Promise.prototype%`'s
     /// `constructor` (see `Realm::plain_promise_constructor`).
     promise_ctor_ic: crate::ic::PropertyCache,
+    /// The inline cache of the read of `%Promise.prototype%`'s `then` (see
+    /// `Realm::plain_promise_then`).
+    promise_then_ic: crate::ic::PropertyCache,
+    /// The intrinsic `Promise` machinery captured at start-up, for the
+    /// promise fast paths (see `promise::PromiseIntrinsics`).
+    promise_intrinsics: Option<promise::PromiseIntrinsics>,
     /// Pending `setTimeout` callbacks (macrotasks), run after the microtask queue
     /// drains — ordered by absolute virtual fire-time `at`, then insertion (`seq`).
     macrotasks: TimerQueue,
@@ -1785,7 +1796,7 @@ const N_FINALIZATION_REGISTRY: u16 = 132;
 const N_ITERATOR: u16 = 236;
 const N_ITERATOR_FROM: u16 = 237;
 // `%IteratorPrototype%[Symbol.iterator]` — returns its `this` receiver.
-const N_ITERATOR_PROTO_SELF: u16 = 238;
+pub(crate) const N_ITERATOR_PROTO_SELF: u16 = 238;
 // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) bound native:
 // the method name rides in the bound target, the receiver is `this`.
 const N_ITERATOR_PROTO_FN: u16 = 239;
@@ -2932,14 +2943,17 @@ const RAW_JSON_BRAND: &str = "\u{0}rawjson";
 const PCAP_RESOLVE: &str = "\u{0}pcap_res";
 const PCAP_REJECT: &str = "\u{0}pcap_rej";
 
-// Hidden-property keys for combinator element state objects.
-const PCOMB_REMAINING: &str = "\u{0}pc_rem";
-const PCOMB_VALUES: &str = "\u{0}pc_vals";
-const PCOMB_CAP: &str = "\u{0}pc_cap";
-const PCOMB_RESOLVE: &str = "\u{0}pc_res";
-const PCOMB_REJECT: &str = "\u{0}pc_rej";
-const PCOMB_INDEX: &str = "\u{0}pc_idx";
-const PCOMB_CALLED: &str = "\u{0}pc_called";
+// The slots of a combinator element's state (an internal array, the
+// element functions' bound target): the shared remaining-count cell, the
+// values/result container, the capability, the element's index or key, and
+// whether one of its functions has run.
+const PCOMB_REMAINING: usize = 0;
+const PCOMB_VALUES: usize = 1;
+const PCOMB_CAP: usize = 2;
+const PCOMB_RESOLVE: usize = 3;
+const PCOMB_REJECT: usize = 4;
+const PCOMB_INDEX: usize = 5;
+const PCOMB_CALLED: usize = 6;
 
 mod agent;
 #[cfg(feature = "std")]
@@ -3077,7 +3091,10 @@ impl Interp {
             eval_param_names: None,
             microtasks: alloc::collections::VecDeque::new(),
             async_batch: false,
+            async_batch_gc: false,
             promise_ctor_ic: crate::ic::PropertyCache::default(),
+            promise_then_ic: crate::ic::PropertyCache::default(),
+            promise_intrinsics: None,
             macrotasks: TimerQueue::default(),
             timer_next_id: 1,
             timer_seq: 0,
@@ -5014,6 +5031,7 @@ impl Interp {
         // `P[Symbol.species] === P`), which is what `then`/combinators use as the
         // dependent-promise constructor (SpeciesConstructor).
         self.install_ctor_species("Promise");
+        self.capture_promise_intrinsics();
         // `get ArrayBuffer[Symbol.species]` → `this`, used by
         // `ArrayBuffer.prototype.slice` (SpeciesConstructor). TypedArrays inherit
         // theirs from the shared `%TypedArray%` intrinsic.
@@ -9731,6 +9749,11 @@ impl crate::nbvm::VmHost for Interp {
         self.run_event_loop().map_err(exec_to_host)
     }
 
+    fn run_jobs_collecting(&mut self, keep: NanBox) -> Result<(), crate::nbvm::HostError> {
+        self.run_event_loop_collecting(&[keep])
+            .map_err(exec_to_host)
+    }
+
     fn get_member(&mut self, recv: NanBox, key: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
         let target = match recv.as_handle().map(Handle::from_raw) {
             Some(h) if !self.realm.is_string_handle(h) && self.realm.symbol_at(h).is_none() => h,
@@ -10025,6 +10048,10 @@ impl crate::nbvm::VmHost for Interp {
         let job = self.microtasks.front()?;
         (job.thenable.is_none() && !job.finally && job.cap.is_none())
             .then_some((job.handler, job.value))
+    }
+
+    fn batch_yields_to_gc(&self) -> bool {
+        self.async_batch_gc
     }
 
     fn pop_job(&mut self) {

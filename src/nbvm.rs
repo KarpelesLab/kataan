@@ -1291,6 +1291,16 @@ pub trait VmHost {
     /// # Errors
     /// An uncaught error from a job, or a host fault.
     fn run_jobs(&mut self) -> Result<(), HostError>;
+    /// [`Self::run_jobs`] as the outermost event loop of a script run, whose
+    /// only live value outside the host is `keep` (the script's completion
+    /// value): the host may collect between jobs.
+    ///
+    /// # Errors
+    /// As [`Self::run_jobs`].
+    fn run_jobs_collecting(&mut self, keep: NanBox) -> Result<(), HostError> {
+        let _ = keep;
+        self.run_jobs()
+    }
     /// `GetValue` of the property reference `recv[key]` with the host's full
     /// `[[Get]]` — a primitive receiver is boxed to find the property, and
     /// proxies, typed arrays, string indices and inherited accessors all apply.
@@ -1518,6 +1528,12 @@ pub trait VmHost {
     /// # Errors
     /// The abrupt completion of PromiseResolve (thrown at the `await`).
     fn await_resume(&mut self, v: NanBox, fns: (NanBox, NanBox)) -> Result<(), HostError>;
+    /// Whether the running job is one of the host's collecting event loop
+    /// (see [`Self::run_jobs_collecting`]): a batch of resumptions then ends
+    /// once a collection is due.
+    fn batch_yields_to_gc(&self) -> bool {
+        false
+    }
     /// The next queued promise job's `(handler, value)`, when the running job
     /// belongs to a plain microtask drain whose function table is `table` and
     /// the next one is a plain reaction (no thenable, `finally` or foreign
@@ -1761,6 +1777,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         gen_ic: PropertyCache::new(),
+        gen_open_memo: None,
         agen_ic: PropertyCache::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
@@ -2400,6 +2417,8 @@ fn vm_method_of_cached(
     if native_call::is_native_site(cache) {
         return None;
     }
+    // (A promise owning no property: the lookup starts at its prototype.)
+    let h = ctx.realm.plain_promise_lookup_start(h).unwrap_or(h);
     match ctx.realm.chain_cached_get(h, key, cache) {
         Some(crate::realm::ChainHit::Data(v)) => v
             .as_handle()
@@ -2753,16 +2772,31 @@ fn make_generator(
     handlers: Vec<(usize, Reg)>,
 ) -> Result<NanBox, VmError> {
     let proto = match callee {
-        Some(c) => vm_get_prop(ctx, funcs, c, "prototype", &mut PropertyCache::default())?,
+        // A VM generator function's own `prototype` is a non-configurable
+        // data property: its `[[Get]]` is the own value.
+        Some(c) => match c.as_handle().map(Handle::from_raw).filter(|&h| {
+            ctx.realm.is_vm_function(h) && {
+                ctx.realm.materialize_fn_proto_for(h, "prototype");
+                ctx.realm.accessor(h, "prototype").is_none()
+            }
+        }) {
+            Some(h) => match ctx.realm.get_property(h, "prototype") {
+                Some(v) => v,
+                None => vm_get_prop(ctx, funcs, c, "prototype", &mut PropertyCache::default())?,
+            },
+            None => vm_get_prop(ctx, funcs, c, "prototype", &mut PropertyCache::default())?,
+        },
         None => NanBox::undefined(),
     };
     let is_async = funcs.get(id).is_some_and(|p| p.is_async);
-    let realm_default = callee
-        .and_then(|c| c.as_handle())
-        .and_then(|h| ctx.realm.get_property(Handle::from_raw(h), GEN_PROTO_KEY));
+    let realm_default = || {
+        callee
+            .and_then(|c| c.as_handle())
+            .and_then(|h| ctx.realm.get_property(Handle::from_raw(h), GEN_PROTO_KEY))
+    };
     let proto = if is_object_value(&ctx.realm, proto) {
         proto
-    } else if let Some(p) = realm_default {
+    } else if let Some(p) = realm_default() {
         p
     } else {
         with_host(ctx, |h| h.generator_intrinsics(is_async))
@@ -3095,6 +3129,13 @@ fn next_batch_resume(
     table: &alloc::rc::Rc<[FnProto]>,
 ) -> Option<(Handle, Option<Handle>, bool, NanBox)> {
     if ctx.realm.multi_realm || !ctx.microtasks.is_empty() {
+        return None;
+    }
+    // (The collecting event loop collects between jobs: a batch ends once a
+    // collection is due.)
+    if ctx.realm.gc_pressure() >= ctx.realm.gc_next_threshold()
+        && ctx.host.as_deref()?.batch_yields_to_gc()
+    {
         return None;
     }
     let (handler, value) = ctx.host.as_deref()?.peek_batch_job(table)?;
@@ -4649,6 +4690,8 @@ struct Ctx<'a> {
     gen_ic: PropertyCache,
     /// [`gen_ic`](Self::gen_ic) for an async generator's `VM_AGEN` slot.
     agen_ic: PropertyCache,
+    /// The memo of `gen_fast::open`'s lookups.
+    gen_open_memo: Option<gen_fast::OpenMemo>,
     /// An in-flight thrown value stashed by a generic-JIT runtime helper (see
     /// [`jit_helper_add`]). The helper returns the reserved throw sentinel and
     /// leaves the value here; [`call_generic`] takes it back out as
@@ -4945,6 +4988,7 @@ pub fn run_program(
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            gen_open_memo: None,
             agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
@@ -4995,6 +5039,7 @@ pub fn run_program_capturing(
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            gen_open_memo: None,
             agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
@@ -5068,9 +5113,19 @@ pub fn run_program_hosted(
             // Each may enqueue work on the other.
             loop {
                 drain_microtasks(&mut ctx, funcs)?;
-                with_host(&mut ctx, |h| h.run_jobs())
-                    .unwrap_or(Ok(()))
-                    .map_err(VmError::from)?;
+                // (With nothing of this run's own left in flight — its body has
+                // returned and its own queue is drained — the host's loop may
+                // collect between jobs, keeping the completion value.)
+                let idle = ctx.microtasks.is_empty();
+                with_host(&mut ctx, |h| {
+                    if idle {
+                        h.run_jobs_collecting(v)
+                    } else {
+                        h.run_jobs()
+                    }
+                })
+                .unwrap_or(Ok(()))
+                .map_err(VmError::from)?;
                 if ctx.microtasks.is_empty() {
                     return Ok(v);
                 }
@@ -5733,6 +5788,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            gen_open_memo: None,
             agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
@@ -8000,6 +8056,24 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
     ctx.realm.maybe_collect(&roots);
 }
 
+/// The handle-valued bytecode constants of `funcs` (and of their optimized
+/// bodies), as [`vm_safepoint`] roots them: for a collection the host makes
+/// outside any VM activation (the event loop's, `Interp::event_loop_safepoint`).
+pub(crate) fn table_const_roots(funcs: &[FnProto], roots: &mut Vec<Handle>) {
+    let bodies: Vec<_> = funcs.iter().filter_map(|f| f.tier.body()).collect();
+    for op in funcs
+        .iter()
+        .flat_map(|f| f.ops.iter())
+        .chain(bodies.iter().flat_map(|b| b.iter()))
+    {
+        if let Op::LoadConst { value, .. } = op
+            && let Some(raw) = value.as_handle()
+        {
+            roots.push(Handle::from_raw(raw));
+        }
+    }
+}
+
 /// Executes one function body (`program`) against the register file `regs`.
 /// Returns `Some(value)` on `Return`, `None` if control falls off the end.
 /// `Call` ops dispatch into `funcs` via [`call`] (a fresh register window per
@@ -8314,6 +8388,11 @@ fn run_frame_at_ic(
             }
             Op::IterOpen { iter, next, src } => {
                 let v = regs[*src as usize];
+                if let Some(n) = gen_fast::open(ctx, funcs, v) {
+                    regs[*iter as usize] = v;
+                    regs[*next as usize] = n;
+                    continue;
+                }
                 match with_host(ctx, |h| h.get_iterator(v)) {
                     Some(Ok((i, n))) => {
                         regs[*iter as usize] = i;
@@ -28304,6 +28383,7 @@ mod generic_jit_tests {
             output: String::new(),
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
+            gen_open_memo: None,
             agen_ic: PropertyCache::new(),
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

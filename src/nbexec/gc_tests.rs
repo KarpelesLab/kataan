@@ -109,6 +109,31 @@ fn a_suspended_generator_keeps_its_objects() {
 }
 
 #[test]
+fn the_event_loop_collects_between_jobs() {
+    // An async loop whose every `await` is a job of its own allocates far past
+    // the trigger; the event loop collects between jobs, so the garbage does
+    // not pile up, while the suspended frame, its result promise, the pending
+    // jobs and the script's completion value (an object) all survive.
+    let (v, live) = run_with_live(
+        "var log = [];
+         async function churn(n) {
+           var keep = { tag: 'kept' };
+           for (var i = 0; i < n; i++) { var o = await { k: i, s: [i] }; }
+           log.push(keep.tag);
+           return keep;
+         }
+         churn(150000).then(function (k) { log.push(k.tag + '!'); globalThis.res = log.join(); });
+         Promise.all([churn(1000), churn(2000)]).then(function (r) { log.push(r.length); });
+         ['completion', 'value']",
+    );
+    assert_eq!(v, "completion,value");
+    assert!(
+        verifying() || live < 200_000,
+        "the event loop retained its garbage: {live} live objects"
+    );
+}
+
+#[test]
 fn a_pending_promise_chain_settles_after_a_collection() {
     assert_eq!(
         run(&format!(

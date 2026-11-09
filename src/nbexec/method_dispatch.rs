@@ -2103,6 +2103,12 @@ impl Interp {
         // --- `Promise.resolve` / `Promise.reject` statics (on the constructor) ---
         if self.realm.native_at(handle) == Some(N_PROMISE) {
             match method {
+                // (With one realm, the receiver is `%Promise%` itself: the
+                // shared PromiseResolve, whose `constructor` read is cached.)
+                "resolve" if !self.realm.multi_realm && self.created_realms.is_empty() => {
+                    let p = self.promise_resolve_checked(arg(0))?;
+                    return Ok(Some(NanBox::handle(p.to_raw())));
+                }
                 "resolve" => {
                     // `PromiseResolve(%Promise%, x)` is idempotent on a promise only
                     // when `SameValue(x.constructor, %Promise%)`: if `x` is already a

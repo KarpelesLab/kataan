@@ -9,7 +9,169 @@ pub(crate) struct PromiseCapability {
     pub reject: NanBox,
 }
 
+/// The intrinsic `Promise` machinery as start-up made it, for the fast paths
+/// that skip a `[[Get]]` or a call whose outcome they prove (see
+/// [`Interp::promise_fast`]): each is taken only while the live value still
+/// is the captured one.
+pub(crate) struct PromiseIntrinsics {
+    /// `%Promise%`.
+    ctor: Handle,
+    /// `%Promise.prototype.then%`.
+    then_fn: Handle,
+    /// The getter of `%Promise%[@@species]` (returns its receiver).
+    species_get: Handle,
+    /// The property key of `@@species`.
+    species_key: alloc::rc::Rc<str>,
+}
+
 impl Interp {
+    /// Records [`PromiseIntrinsics`] (once `Promise`, its prototype methods
+    /// and `@@species` exist).
+    pub(crate) fn capture_promise_intrinsics(&mut self) {
+        let Some(ctor) = self
+            .current
+            .get("Promise")
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let Some(then_fn) = self
+            .realm
+            .promise_proto_intrinsic()
+            .and_then(|p| self.realm.plain_own_data(p, "then"))
+            .and_then(|v| v.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        let sym = self.well_known_symbol("species");
+        let species_key: alloc::rc::Rc<str> = self.member_key(sym).into();
+        let Some(species_get) = self
+            .realm
+            .accessor(ctor, &species_key)
+            .and_then(|(g, _)| g.as_handle())
+            .map(Handle::from_raw)
+        else {
+            return;
+        };
+        self.promise_intrinsics = Some(PromiseIntrinsics {
+            ctor,
+            then_fn,
+            species_get,
+            species_key,
+        });
+    }
+
+    /// The captured [`PromiseIntrinsics`], while only the main realm exists
+    /// (each realm has a `Promise` of its own).
+    fn promise_fast(&self) -> Option<&PromiseIntrinsics> {
+        if !self.created_realms.is_empty() || self.realm.multi_realm {
+            return None;
+        }
+        self.promise_intrinsics.as_ref()
+    }
+
+    /// Whether `c` is the intrinsic `%Promise%` (with only the main realm).
+    fn is_intrinsic_promise_ctor(&self, c: NanBox) -> bool {
+        self.promise_fast()
+            .is_some_and(|pi| c.as_handle() == Some(pi.ctor.to_raw()))
+    }
+
+    /// `SpeciesConstructor(o, %Promise%)` when it runs no code and is
+    /// `%Promise%`: `o` is a plain promise (see
+    /// `Realm::plain_promise_constructor`) whose `constructor` is
+    /// `%Promise%`, which still owns its intrinsic `@@species` accessor.
+    fn promise_species_fast(&mut self, o: Handle) -> Option<NanBox> {
+        let pi = self.promise_fast()?;
+        let (ctor, getter, key) = (
+            pi.ctor,
+            pi.species_get,
+            alloc::rc::Rc::clone(&pi.species_key),
+        );
+        let c = self
+            .realm
+            .plain_promise_constructor(o, &mut self.promise_ctor_ic)?;
+        if c.as_handle() != Some(ctor.to_raw()) {
+            return None;
+        }
+        let (g, _) = self.realm.accessor(ctor, &key)?;
+        (g.as_handle() == Some(getter.to_raw())).then_some(c)
+    }
+
+    /// Whether `Get(p, "then")` runs no code and is the intrinsic
+    /// `%Promise.prototype.then%` (see `Realm::plain_promise_then`).
+    pub(crate) fn has_intrinsic_then(&mut self, p: Handle) -> bool {
+        let Some(then_fn) = self.promise_fast().map(|pi| pi.then_fn) else {
+            return false;
+        };
+        self.realm
+            .plain_promise_then(p, &mut self.promise_then_ic)
+            .and_then(|v| v.as_handle())
+            == Some(then_fn.to_raw())
+    }
+
+    /// Whether `f` is the intrinsic `%Promise.prototype.then%` (with only the
+    /// main realm).
+    pub(crate) fn is_intrinsic_then(&self, f: NanBox) -> bool {
+        self.promise_fast()
+            .is_some_and(|pi| f.as_handle() == Some(pi.then_fn.to_raw()))
+    }
+
+    /// `%Promise.prototype.then%` called on the promise `h` with `args`.
+    pub(crate) fn promise_then_call(
+        &mut self,
+        h: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
+        self.perform_promise_then_method(h, arg(0), arg(1))
+    }
+
+    /// `Promise.resolve(x)` called with `this` = `%Promise%` when `callee`
+    /// is the intrinsic static: PromiseResolve(%Promise%, x) itself.
+    pub(crate) fn promise_resolve_call_fast(
+        &mut self,
+        callee: NanBox,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Option<Result<NanBox, ExecError>> {
+        if !self.is_intrinsic_promise_ctor(this_val) || !self.is_intrinsic_promise_resolve(callee) {
+            return None;
+        }
+        let x = args.first().copied().unwrap_or(NanBox::undefined());
+        Some(
+            self.promise_resolve_checked(x)
+                .map(|p| NanBox::handle(p.to_raw())),
+        )
+    }
+
+    /// Whether `f` is the intrinsic `Promise.resolve` (the static method of
+    /// `%Promise%`, with only the main realm).
+    fn is_intrinsic_promise_resolve(&self, f: NanBox) -> bool {
+        let Some(pi) = self.promise_fast() else {
+            return false;
+        };
+        let Some((id, target)) = f
+            .as_handle()
+            .and_then(|r| self.realm.bound_native_at(Handle::from_raw(r)))
+        else {
+            return false;
+        };
+        if id != N_STATIC_METHOD {
+            return false;
+        }
+        let Some(pair) = self.realm.array_elements(target) else {
+            return false;
+        };
+        pair.first().and_then(|c| c.as_handle()) == Some(pi.ctor.to_raw())
+            && pair
+                .get(1)
+                .and_then(|n| n.as_handle())
+                .and_then(|n| self.realm.string_leaf_bytes(Handle::from_raw(n)))
+                == Some(b"resolve".as_slice())
+    }
+
     /// Builds an iterator object over a generator's eagerly-collected `values`:
     /// a hidden buffer array plus a `next()` cursor, recognized by `for-of`,
     /// spread, and a `next()` method.
@@ -456,6 +618,11 @@ impl Interp {
         if !self.realm.is_promise(handle) {
             return Err(self.type_error("Promise.prototype.then called on a non-promise"));
         }
+        // (A plain promise of the intrinsic species: the reads run no code.)
+        if self.promise_species_fast(handle).is_some() {
+            let result = self.register_then(handle, on_f, on_r, false);
+            return Ok(NanBox::handle(result.to_raw()));
+        }
         let c = self.promise_species_constructor(handle)?;
         // Fast path: the species is the intrinsic Promise — use the cheap reaction
         // registration that returns a native promise directly.
@@ -557,11 +724,13 @@ impl Interp {
     /// reaction to completion.
     pub(crate) fn drain_microtasks(&mut self) -> Result<(), ExecError> {
         let outer = core::mem::replace(&mut self.async_batch, true);
+        let outer_gc = core::mem::replace(&mut self.async_batch_gc, false);
         let mut r = Ok(());
         while r.is_ok() && !self.microtasks.is_empty() {
             r = self.run_one_microtask();
         }
         self.async_batch = outer;
+        self.async_batch_gc = outer_gc;
         r
     }
 
@@ -665,8 +834,33 @@ impl Interp {
     /// earliest-due `setTimeout` macrotask (draining microtasks after each), until
     /// both queues are empty.
     pub(crate) fn run_event_loop(&mut self) -> Result<(), ExecError> {
+        self.event_loop(None)
+    }
+
+    /// [`Self::run_event_loop`] as the outermost loop of a hosted script run
+    /// (the only live value outside the interpreter being `keep`): it may
+    /// collect between jobs (see `event_loop_safepoint`).
+    pub(crate) fn run_event_loop_collecting(&mut self, keep: &[NanBox]) -> Result<(), ExecError> {
+        self.event_loop(Some(keep))
+    }
+
+    fn event_loop(&mut self, keep: Option<&[NanBox]>) -> Result<(), ExecError> {
         loop {
-            self.drain_microtasks()?;
+            match keep {
+                None => self.drain_microtasks()?,
+                Some(keep) => {
+                    let outer = core::mem::replace(&mut self.async_batch, true);
+                    let outer_gc = core::mem::replace(&mut self.async_batch_gc, true);
+                    let mut r = Ok(());
+                    while r.is_ok() && !self.microtasks.is_empty() {
+                        self.event_loop_safepoint(keep);
+                        r = self.run_one_microtask();
+                    }
+                    self.async_batch = outer;
+                    self.async_batch_gc = outer_gc;
+                    r?;
+                }
+            }
             // An `Atomics.waitAsync` promise another agent has notified settles
             // here, queueing the microtasks its `await`/`then` continuation runs.
             #[cfg(feature = "std")]
@@ -674,6 +868,9 @@ impl Interp {
                 continue;
             }
             if !self.macrotasks.is_empty() {
+                if let Some(keep) = keep {
+                    self.event_loop_safepoint(keep);
+                }
                 self.run_one_macrotask()?;
                 // A timer-driven poll loop (`$262.agent.getReportAsync`) must let
                 // the other agents run, or the report it waits for never arrives.
@@ -854,6 +1051,7 @@ impl Interp {
         // `await` / `Promise.all` on a timer-backed promise observes its value).
         // (Job by job: the wait ends as soon as the promise settles.)
         let outer = core::mem::replace(&mut self.async_batch, false);
+        let outer_gc = core::mem::replace(&mut self.async_batch_gc, false);
         let mut r = Ok(());
         while r.is_ok()
             && status(self) == Pending
@@ -866,6 +1064,7 @@ impl Interp {
             };
         }
         self.async_batch = outer;
+        self.async_batch_gc = outer_gc;
         r?;
         match self
             .realm
@@ -966,6 +1165,11 @@ impl Interp {
         let Some(h) = promise.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Promise.then called on a non-object"));
         };
+        // (`then` read without running code, and the intrinsic: its call.)
+        if self.has_intrinsic_then(h) {
+            self.perform_promise_then_method(h, on_f, on_r)?;
+            return Ok(());
+        }
         let then = self.read_member(h, "then")?;
         self.call_with_this(then, promise, &[on_f, on_r])?;
         Ok(())
@@ -997,21 +1201,24 @@ impl Interp {
         cap: &PromiseCapability,
         index: NanBox,
     ) -> Handle {
-        let state = self.realm.new_object();
+        // (Slots `PCOMB_*`.)
+        self.realm.new_array(alloc::vec![
+            NanBox::handle(remaining.to_raw()),
+            container,
+            cap.promise,
+            cap.resolve,
+            cap.reject,
+            index,
+            NanBox::boolean(false),
+        ])
+    }
+
+    /// Slot `i` (`PCOMB_*`) of an element state.
+    fn state_slot(&self, state: Handle, i: usize) -> NanBox {
         self.realm
-            .set_hidden_property(state, PCOMB_REMAINING, NanBox::handle(remaining.to_raw()));
-        self.realm
-            .set_hidden_property(state, PCOMB_VALUES, container);
-        self.realm
-            .set_hidden_property(state, PCOMB_CAP, cap.promise);
-        self.realm
-            .set_hidden_property(state, PCOMB_RESOLVE, cap.resolve);
-        self.realm
-            .set_hidden_property(state, PCOMB_REJECT, cap.reject);
-        self.realm.set_hidden_property(state, PCOMB_INDEX, index);
-        self.realm
-            .set_hidden_property(state, PCOMB_CALLED, NanBox::boolean(false));
-        state
+            .array_elements(state)
+            .and_then(|e| e.get(i).copied())
+            .unwrap_or(NanBox::undefined())
     }
 
     /// Builds a combinator resolve/reject element function (a bound native over the
@@ -1038,33 +1245,19 @@ impl Interp {
     /// Reads the shared parts of an element-state object.
     fn state_parts(&mut self, state: Handle) -> (Handle, NanBox, PromiseCapability, usize) {
         let remaining = self
-            .realm
-            .get_property(state, PCOMB_REMAINING)
-            .and_then(|v| v.as_handle())
+            .state_slot(state, PCOMB_REMAINING)
+            .as_handle()
             .map(Handle::from_raw)
             .expect("remaining cell");
-        let container = self
-            .realm
-            .get_property(state, PCOMB_VALUES)
-            .unwrap_or(NanBox::undefined());
+        let container = self.state_slot(state, PCOMB_VALUES);
         let cap = PromiseCapability {
-            promise: self
-                .realm
-                .get_property(state, PCOMB_CAP)
-                .unwrap_or(NanBox::undefined()),
-            resolve: self
-                .realm
-                .get_property(state, PCOMB_RESOLVE)
-                .unwrap_or(NanBox::undefined()),
-            reject: self
-                .realm
-                .get_property(state, PCOMB_REJECT)
-                .unwrap_or(NanBox::undefined()),
+            promise: self.state_slot(state, PCOMB_CAP),
+            resolve: self.state_slot(state, PCOMB_RESOLVE),
+            reject: self.state_slot(state, PCOMB_REJECT),
         };
         let index = self
-            .realm
-            .get_property(state, PCOMB_INDEX)
-            .and_then(|v| v.as_number())
+            .state_slot(state, PCOMB_INDEX)
+            .as_number()
             .unwrap_or(0.0) as usize;
         (remaining, container, cap, index)
     }
@@ -1072,15 +1265,11 @@ impl Interp {
     /// Whether the element closure at `state` has already been called (each
     /// resolve/reject element function runs its body at most once).
     fn element_already_called(&mut self, state: Handle) -> bool {
-        if self
-            .realm
-            .get_property(state, PCOMB_CALLED)
-            .is_some_and(|v| self.realm.truthy(v))
-        {
+        if self.state_slot(state, PCOMB_CALLED).as_boolean() == Some(true) {
             return true;
         }
         self.realm
-            .set_hidden_property(state, PCOMB_CALLED, NanBox::boolean(true));
+            .set_element(state, PCOMB_CALLED, NanBox::boolean(true));
         false
     }
 
@@ -1172,10 +1361,7 @@ impl Interp {
             return Ok(NanBox::undefined());
         }
         let (remaining, container, cap, _) = self.state_parts(state);
-        let key = self
-            .realm
-            .get_property(state, PCOMB_INDEX)
-            .unwrap_or(NanBox::undefined());
+        let key = self.state_slot(state, PCOMB_INDEX);
         if let Some(obj) = container.as_handle().map(Handle::from_raw) {
             let name = self.member_key(key);
             self.set_or_throw(obj, key, &name, value)?;
@@ -1200,10 +1386,7 @@ impl Interp {
             return Ok(NanBox::undefined());
         }
         let (remaining, container, cap, _) = self.state_parts(state);
-        let key = self
-            .realm
-            .get_property(state, PCOMB_INDEX)
-            .unwrap_or(NanBox::undefined());
+        let key = self.state_slot(state, PCOMB_INDEX);
         let record = self.realm.new_object();
         if fulfilled {
             let s = self.new_str("fulfilled");
@@ -1364,6 +1547,49 @@ impl Interp {
         let values = self.realm.new_array(alloc::vec![]);
         let values_box = NanBox::handle(values.to_raw());
         let remaining = self.count_cell(1.0);
+        // A plain array iterated by the built-in iterator: its steps by index
+        // (the iterator object is made only to close it).
+        if let Some(arr) = iterable.as_handle().map(Handle::from_raw)
+            && crate::nbvm::array_iteration_is_plain(&mut self.realm, iterable)
+        {
+            let mut i = 0usize;
+            while let Some(len) = self.realm.array_length(arr)
+                && i < len
+            {
+                let item = self.get_index(arr, i)?;
+                self.realm.set_element(values, i, NanBox::undefined());
+                let cur = self.cell_get(remaining);
+                self.cell_set(remaining, cur + 1.0);
+                let step = self.perform_promise_all_element(
+                    c,
+                    promise_resolve,
+                    item,
+                    remaining,
+                    values_box,
+                    cap,
+                    i,
+                    settled,
+                );
+                if let Err(e) = step {
+                    // IteratorClose of the iterator this stood in for, past
+                    // the element just taken.
+                    let it = self.make_live_array_iterator(arr, 1);
+                    if let Some(ih) = it.as_handle().map(Handle::from_raw) {
+                        self.realm
+                            .set_hidden_property(ih, GEN_IDX, NanBox::number((i + 1) as f64));
+                        let _ = self.iterator_close(ih);
+                    }
+                    return Err(e);
+                }
+                i += 1;
+            }
+            let n = self.cell_get(remaining) - 1.0;
+            self.cell_set(remaining, n);
+            if n == 0.0 {
+                self.capability_resolve(cap, values_box)?;
+            }
+            return Ok(cap.promise);
+        }
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
         let mut i = 0usize;
@@ -1412,7 +1638,14 @@ impl Interp {
         i: usize,
         settled: bool,
     ) -> Result<(), ExecError> {
-        let next = self.call_with_this(promise_resolve, c, &[item])?;
+        // (`%Promise%.resolve` of `%Promise%`: PromiseResolve itself.)
+        let next = if self.is_intrinsic_promise_ctor(c)
+            && self.is_intrinsic_promise_resolve(promise_resolve)
+        {
+            NanBox::handle(self.promise_resolve_checked(item)?.to_raw())
+        } else {
+            self.call_with_this(promise_resolve, c, &[item])?
+        };
         let state = self.combinator_state(remaining, values_box, cap, NanBox::number(i as f64));
         if settled {
             let on_f = self.make_element_fn(N_PROMISE_ALLSETTLED_FULFILL, state);

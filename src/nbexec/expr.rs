@@ -341,6 +341,14 @@ impl Interp {
         name: &str,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // `p.then(…)` on a plain promise whose `then` is the intrinsic (read
+        // without running code): its call.
+        if name == "then"
+            && let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.has_intrinsic_then(h)
+        {
+            return self.promise_then_call(h, args);
+        }
         let f = self.get_v(recv, name)?;
         self.call_got_named(f, recv, name, args)
     }
@@ -359,6 +367,13 @@ impl Interp {
             .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
         {
             return Err(self.type_error(&alloc::format!("{name} is not a function")));
+        }
+        // The intrinsic `then` on a promise: its call.
+        if let Some(h) = recv.as_handle().map(Handle::from_raw)
+            && self.is_intrinsic_then(f)
+            && self.realm.is_promise(h)
+        {
+            return self.promise_then_call(h, args);
         }
         self.call_with_this(f, recv, args)
     }

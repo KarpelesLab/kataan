@@ -188,6 +188,22 @@ impl Interp {
         {
             return Ok(step);
         }
+        // A live array iterator with the built-in `next`: its step without
+        // the result object, whose `done` and `value` are plain own data
+        // (unobservable reads).
+        if let Some(nh) = next.as_handle().map(Handle::from_raw)
+            && self.realm.native_at(nh) == Some(N_GEN_ITER_NEXT)
+            && self.get_function_realm(nh) == self.cur_realm
+            && self.realm.get_property(it, GEN_COLL).is_none()
+            && self.realm.get_property(it, GEN_TA).is_none()
+            && let Some(arr) = self
+                .realm
+                .get_property(it, GEN_ARR)
+                .and_then(|v| v.as_handle())
+                .map(Handle::from_raw)
+        {
+            return self.live_array_iter_step(it, arr);
+        }
         let Some(rh) = self.iter_step_result(it, next)? else {
             return Ok(None);
         };
@@ -430,11 +446,23 @@ impl Interp {
         h: Handle,
         arr: Handle,
     ) -> Result<NanBox, ExecError> {
+        Ok(match self.live_array_iter_step(h, arr)? {
+            Some(v) => self.iter_result(v, false),
+            None => self.iter_result(NanBox::undefined(), true),
+        })
+    }
+
+    /// [`Self::live_array_iter_next`]'s step: the value (`None` once done).
+    fn live_array_iter_step(
+        &mut self,
+        h: Handle,
+        arr: Handle,
+    ) -> Result<Option<NanBox>, ExecError> {
         // Once the cursor first reaches the (then-current) length, the underlying
         // generator completes; it stays done thereafter even if the array later
         // grows (a monotonic, latched cursor — matching `CreateArrayIterator`).
         if self.realm.get_property(h, GEN_DONE).is_some() {
-            return Ok(self.iter_result(NanBox::undefined(), true));
+            return Ok(None);
         }
         let kind = self
             .realm
@@ -457,7 +485,7 @@ impl Interp {
         if idx >= len {
             self.realm
                 .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
-            return Ok(self.iter_result(NanBox::undefined(), true));
+            return Ok(None);
         }
         self.realm
             .set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
@@ -470,7 +498,7 @@ impl Interp {
             }
             _ => self.get_index(arr, idx)?, // values
         };
-        Ok(self.iter_result(value, false))
+        Ok(Some(value))
     }
 
     /// The eager-generator iterator's `return(v)`: mark exhausted, report done.

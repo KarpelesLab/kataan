@@ -338,6 +338,10 @@ impl Interp {
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
         };
         let handle = Handle::from_raw(raw);
+        // `Promise.resolve(x)` on `%Promise%`.
+        if let Some(r) = self.promise_resolve_call_fast(callee, this_val, args) {
+            return r;
+        }
         // A plain built-in function — the common callee here — dispatches
         // directly. Of the cases below, only the `Array`/`Object` constructors
         // and `%Function.prototype%` can be one; every other one is a cell of

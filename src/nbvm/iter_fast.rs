@@ -42,7 +42,7 @@ use crate::realm::Realm;
 /// data property, `Some(None)` when no object on the chain has it, and `None`
 /// when that cannot be told without side effects (an accessor, a proxy, an
 /// exotic cell).
-fn plain_lookup(realm: &Realm, start: Handle, key: &str) -> Option<Option<NanBox>> {
+pub(super) fn plain_lookup(realm: &Realm, start: Handle, key: &str) -> Option<Option<NanBox>> {
     let mut cur = Some(start);
     // A prototype chain is acyclic, but stay bounded on a pathological one.
     for _ in 0..64 {
