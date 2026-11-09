@@ -2216,6 +2216,59 @@ fn wholesale_spread_rest_assign_of_plain_and_dictionary_objects() {
 }
 
 #[test]
+fn merging_spread_and_assign_into_non_empty_targets() {
+    // A non-empty target keeps its keys first (an overlapping key keeps its
+    // place and takes the source's value), then the source's new keys in
+    // order, for small (planned shaped) and big (dictionary) merges alike.
+    let src = "let S=Symbol('s'); let big={}; for (let i=0;i<200;i++) big['k'+i]=i; \
+               let small={a:1, 2:'two', b:2, [S]:'sym'};";
+    assert_eq!(
+        run(&alloc::format!(
+            "{src} let r=[]; for (let i=0;i<3;i++) {{ let o={{b:'old', z:0, ...small}}; \
+             r.push(Object.keys(o).join()+'/'+Object.values(o).join()+'/'+o[S]); }} r.join('|')"
+        )),
+        "2,b,z,a/two,2,0,1/sym|2,b,z,a/two,2,0,1/sym|2,b,z,a/two,2,0,1/sym"
+    );
+    assert_eq!(
+        run(&alloc::format!(
+            "{src} let o={{k5:'mine', x:1, ...big, y:2}}; \
+             [Object.keys(o).length, Object.keys(o).slice(0,3).join(), o.k5, Object.keys(o).at(-1), big.x].join()"
+        )),
+        "202,k5,x,k0,5,y,"
+    );
+    assert_eq!(
+        run(&alloc::format!(
+            "{src} let o=Object.assign({{k7:'m', q:1}}, small, big); \
+             [Object.keys(o).length, Object.keys(o).slice(0,4).join(), o.k7, o[S]].join()"
+        )),
+        "204,2,k7,q,a,7,sym"
+    );
+}
+
+#[test]
+fn object_keys_entries_of_plain_and_dictionary_objects() {
+    // Values and entries follow the key order (integer keys first), a
+    // dictionary's remembered keys follow its deletes and re-adds, and a
+    // returned array is the caller's own.
+    assert_eq!(
+        run(
+            "let o={b:1,2:'x',a:2,1:'y'}; let r=''; for (let i=0;i<3;i++) \
+             r=Object.entries(o).join(';')+'|'+Object.values(o).join(); r"
+        ),
+        "1,y;2,x;b,1;a,2|y,x,1,2"
+    );
+    assert_eq!(
+        run(
+            "let d={}; for (let i=0;i<200;i++) d['k'+i]=i; let a=Object.keys(d); a.length=1; \
+             delete d.k0; d.k0='back'; let b=Object.keys(d); \
+             [a.length, b.length, b[0], b.at(-1), Object.entries(d).at(-1).join(), \
+              Object.getOwnPropertyNames(d).length].join()"
+        ),
+        "1,200,k1,k0,k0,back,200"
+    );
+}
+
+#[test]
 fn custom_symbol_iterator() {
     // for-of and spread drive a user `[Symbol.iterator]`.
     let src = "let o = { [Symbol.iterator]() { let i = 0; return { next() { return i < 3 ? { value: i++, done: false } : { value: undefined, done: true }; } }; } };";

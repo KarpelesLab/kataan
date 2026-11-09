@@ -125,6 +125,14 @@ impl Realm {
         } else {
             copy
         };
+        // A non-empty plain target: the keys merged in one pass (by a plan
+        // remembered per pair of layouts when both are shaped).
+        if !target_empty && copy.shape().is_some() && self.merge_shaped_planned(target, src) {
+            return true;
+        }
+        let Err(copy) = self.merge_plain_into(target, copy) else {
+            return true;
+        };
         copy.for_each_entry(|k, v| {
             self.set_property(target, k, v);
         });

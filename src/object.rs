@@ -1254,7 +1254,7 @@ impl Object {
 
     /// Whether the object is in dictionary mode.
     #[inline]
-    fn is_dict(&self) -> bool {
+    pub(crate) fn is_dict(&self) -> bool {
         self.mode == Mode::Dict
     }
 
@@ -1658,6 +1658,19 @@ impl Object {
     /// other object.
     #[must_use]
     pub(crate) fn plain_enum_values(&self) -> Option<Vec<NanBox>> {
+        Some(
+            self.plain_enum_entries()?
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect(),
+        )
+    }
+
+    /// [`plain_enum_values`](Self::plain_enum_values) with each value's key
+    /// (its storage form, which for these keys is its text):
+    /// `EnumerableOwnProperties(self, key+value)` of such an object.
+    #[must_use]
+    pub(crate) fn plain_enum_entries<'a>(&'a self) -> Option<Vec<(&'a str, NanBox)>> {
         if self.flags & JIT_FLAG_EXOTIC != 0 || !self.has_no_accessors() {
             return None;
         }
@@ -1665,10 +1678,10 @@ impl Object {
         if x.key_order.is_some() || self.is_prim_wrapper() {
             return None;
         }
-        // `(index, value)` per enumerable String key, in insertion order.
-        let mut out: Vec<(Option<u32>, NanBox)> = Vec::with_capacity(self.len() as usize);
+        // `(index, key, value)` per enumerable String key, in insertion order.
+        let mut out: Vec<(Option<u32>, &'a str, NanBox)> = Vec::with_capacity(self.len() as usize);
         let mut any_index = false;
-        let mut visit = |k: &str, v: NanBox, hidden: bool| -> Option<()> {
+        let mut visit = |k: &'a str, v: NanBox, hidden: bool| -> Option<()> {
             let b = k.as_bytes();
             match b.first() {
                 Some(0) if k.starts_with(crate::shape::SYMBOL_KEY_PREFIX) => return Some(()),
@@ -1684,7 +1697,7 @@ impl Object {
                 None
             };
             any_index |= ix.is_some();
-            out.push((ix, v));
+            out.push((ix, k, v));
             Some(())
         };
         let check_hidden = !x.hidden.is_empty() || x.hidden_prefix != 0;
@@ -1706,9 +1719,9 @@ impl Object {
         }
         if any_index {
             // Stable: integer keys ascending, then the rest in their order.
-            out.sort_by_key(|(ix, _)| ix.map_or(u64::MAX, u64::from));
+            out.sort_by_key(|(ix, _, _)| ix.map_or(u64::MAX, u64::from));
         }
-        Some(out.into_iter().map(|(_, v)| v).collect())
+        Some(out.into_iter().map(|(_, k, v)| (k, v)).collect())
     }
 
     /// Makes this empty ordinary object hold the properties of `copy` as
@@ -1752,6 +1765,223 @@ impl Object {
                 Ok(())
             }
         }
+    }
+
+    /// Defines each property of `copy` on this object in turn as a plain data
+    /// property (`CreateDataProperty`, or `[[Set]]` when the prototype chain
+    /// has no setter or read-only key for it): an existing key keeps its
+    /// position and takes the new value, a new one is appended. `Err(copy)`,
+    /// having changed nothing, unless this is an extensible, unwatched
+    /// ordinary object holding only plain writable, enumerable, configurable
+    /// data properties. When the result reaches `threshold` keys it is a
+    /// dictionary (as adding the keys one by one would make it), so a large
+    /// copy is one ordered-map insert per key instead of a layout transition
+    /// and a layout search per key; a large dictionary copied into a smaller
+    /// object keeps the copy's map and takes the object's keys into it.
+    pub(crate) fn merge_plain(
+        &mut self,
+        copy: PlainCopy,
+        threshold: usize,
+    ) -> Result<(), PlainCopy> {
+        if !self.merge_target_ok() {
+            return Err(copy);
+        }
+        if copy.is_empty() {
+            return Ok(());
+        }
+        let have = self.len() as usize;
+        if !self.is_dict() {
+            let new = if have + copy.len() < threshold {
+                copy.len()
+            } else {
+                let mut n = 0;
+                copy.for_each_entry(|k, _| n += usize::from(self.shape.lookup(k).is_none()));
+                n
+            };
+            if have + new < threshold {
+                let mut added = 0u32;
+                copy.for_each_entry(|k, v| {
+                    if !self.write_existing(k, v) {
+                        self.add_new(k, v);
+                        added += 1;
+                    }
+                });
+                self.key_epoch = self.key_epoch.wrapping_add(added);
+                return Ok(());
+            }
+        }
+        match copy.0 {
+            PlainRepr::Dict(src) if have < src.map.len() => self.merge_into_dict_copy(src),
+            repr => {
+                self.convert_to_dict();
+                let mut added = 0u32;
+                let d = self.dict_mut();
+                let mut put = |k: DictKey, value: NanBox| match d.map.entry(k) {
+                    alloc::collections::btree_map::Entry::Occupied(mut e) => {
+                        e.get_mut().value = value
+                    }
+                    alloc::collections::btree_map::Entry::Vacant(e) => {
+                        let k = DictKey::clone(e.key());
+                        e.insert(DictSlot {
+                            value,
+                            pos: d.order.len(),
+                        });
+                        d.order.push(Some(k));
+                        added += 1;
+                    }
+                };
+                match &repr {
+                    PlainRepr::Shaped(shape, values) => {
+                        for (k, v) in shape.keys().into_iter().zip(values) {
+                            put(DictKey::from(k), *v);
+                        }
+                    }
+                    PlainRepr::Dict(src) => {
+                        for k in src.order.iter().flatten() {
+                            if let Some(s) = src.map.get(k) {
+                                put(DictKey::clone(k), s.value);
+                            }
+                        }
+                    }
+                }
+                self.key_epoch = self.key_epoch.wrapping_add(added);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether [`merge_plain`](Self::merge_plain) may add to this object: an
+    /// extensible, unwatched ordinary object holding only plain writable,
+    /// enumerable, configurable data properties.
+    #[inline]
+    pub(crate) fn merge_target_ok(&self) -> bool {
+        self.flags == 0
+            && !self.shape.has_implied_attrs()
+            && (self.is_plain_shaped() || self.is_plain_dict())
+            && self.ex().non_configurable.is_empty()
+            && self.ex().class_tag == NO_CLASS_TAG
+    }
+
+    /// The layout and slot values of this object when
+    /// [`plain_copy`](Self::plain_copy) would copy it as they are (shaped,
+    /// every own property an enumerable data property in layout order),
+    /// without checking its keys (a function of the layout, which the
+    /// caller has checked once for it).
+    #[must_use]
+    pub(crate) fn plain_shaped_values(&self) -> Option<(&Rc<Shape>, Vec<NanBox>)> {
+        if self.flags & JIT_FLAG_EXOTIC != 0
+            || self.is_dict()
+            || !self.keys_follow_shape()
+            || self.shape.is_wrapper()
+            || self.shape.len() != u32::from(self.len)
+        {
+            return None;
+        }
+        Some((
+            &self.shape,
+            (0..u32::from(self.len)).map(|i| self.slot_at(i)).collect(),
+        ))
+    }
+
+    /// [`merge_plain`](Self::merge_plain) of a shaped copy into this shaped
+    /// object as a remembered plan: `result` is the layout the merge leaves
+    /// (this object's, plus the copy's new keys in order) and `map[i]` the
+    /// slot of `result` that the copy's slot `i` lands in (an existing slot,
+    /// overwritten, or the next new one). The caller has checked
+    /// [`merge_target_ok`](Self::merge_target_ok) and that this object's
+    /// layout is the one the plan was made from.
+    pub(crate) fn merge_planned(&mut self, result: &Rc<Shape>, map: &[u32], values: &[NanBox]) {
+        let have = u32::from(self.len);
+        self.shape = Rc::clone(result);
+        for (&slot, &v) in map.iter().zip(values) {
+            if slot < have {
+                *self.slot_get_mut(slot).expect("slot index in range") = v;
+                self.note_slot(slot, v);
+            } else {
+                debug_assert_eq!(slot, u32::from(self.len));
+                self.slot_push(v);
+            }
+        }
+        self.key_epoch = self.key_epoch.wrapping_add(u32::from(self.len) - have);
+    }
+
+    /// [`merge_plain`](Self::merge_plain) of a dictionary `src` (without
+    /// tombstones: `plain_copy` drops them) larger than this object: `src`
+    /// becomes this object's dictionary, taking this object's keys first
+    /// (each one's value is `src`'s when both have it), then `src`'s other
+    /// keys in their order. The map is reused, so only this object's keys
+    /// are searched for in it.
+    fn merge_into_dict_copy(&mut self, mut src: Box<DictData>) {
+        /// Positions at or past this stand for this object's own keys while
+        /// the map is renumbered.
+        const MINE: usize = usize::MAX / 2;
+        let mine: Vec<(DictKey, NanBox)> = if self.is_dict() {
+            let d = self.dict();
+            d.order
+                .iter()
+                .flatten()
+                .filter_map(|k| d.map.get(k).map(|s| (DictKey::clone(k), s.value)))
+                .collect()
+        } else {
+            self.shape
+                .keys()
+                .into_iter()
+                .enumerate()
+                .map(|(i, k)| (DictKey::from(k), self.slot_at(i as u32)))
+                .collect()
+        };
+        debug_assert_eq!(src.order.len(), src.map.len());
+        for (i, (k, v)) in mine.iter().enumerate() {
+            match src.map.entry(DictKey::clone(k)) {
+                alloc::collections::btree_map::Entry::Occupied(mut e) => {
+                    let s = e.get_mut();
+                    src.order[s.pos] = None;
+                    s.pos = MINE + i;
+                }
+                alloc::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(DictSlot {
+                        value: *v,
+                        pos: MINE + i,
+                    });
+                }
+            }
+        }
+        let mut renumber: Vec<usize> = Vec::with_capacity(src.order.len());
+        let mut next = mine.len();
+        for k in &src.order {
+            renumber.push(next);
+            next += usize::from(k.is_some());
+        }
+        for s in src.map.values_mut() {
+            s.pos = if s.pos >= MINE {
+                s.pos - MINE
+            } else {
+                renumber[s.pos]
+            };
+        }
+        let added = (src.map.len() - mine.len()) as u32;
+        let mut order: Vec<Option<DictKey>> = Vec::with_capacity(src.map.len());
+        order.extend(mine.into_iter().map(|(k, _)| Some(k)));
+        order.extend(
+            core::mem::take(&mut src.order)
+                .into_iter()
+                .filter(Option::is_some),
+        );
+        src.order = order;
+        if self.is_dict() {
+            self.extra_mut().dict = Some(src);
+        } else {
+            // As `convert_to_dict` leaves a shaped object.
+            self.len = 0;
+            self.inline = [NanBox::undefined(); INLINE_SLOTS];
+            let x = self.extra_mut();
+            x.spill = Spill::EMPTY;
+            x.dict = Some(src);
+            self.layout_changed();
+            self.shape = Shape::root();
+            self.mode = Mode::Dict;
+        }
+        self.key_epoch = self.key_epoch.wrapping_add(added.max(1));
     }
 
     /// The position of the accessor named `name` in the object's accessor

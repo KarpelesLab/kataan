@@ -1162,6 +1162,13 @@ impl Rope {
             let n = usize::from(*a);
             return x[..n] == y[..n];
         }
+        self.same_bytes_slow(other)
+    }
+
+    /// [`same_bytes`](Self::same_bytes) of ropes not both inline (out of
+    /// its line).
+    #[inline(never)]
+    fn same_bytes_slow(&self, other: &Rope) -> bool {
         if self.len() != other.len() {
             return false;
         }

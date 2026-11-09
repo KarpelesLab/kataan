@@ -764,6 +764,19 @@ impl<T> Heap<T> {
             .get(handle.generation)
     }
 
+    /// [`get`](Heap::get) always in its caller's line, for the few lookups
+    /// on a hot path (a `Map`/`Set` call from compiled code).
+    #[must_use]
+    #[inline(always)]
+    pub fn get_hot(&self, handle: Handle) -> Option<&T> {
+        if self.poison.is_some() {
+            self.note_poison_use(handle);
+        }
+        self.slots
+            .get(handle.index as usize)?
+            .get(handle.generation)
+    }
+
     /// Like [`get`](Heap::get), but exempt from the GC-verification poison check.
     ///
     /// For code that *enumerates* the heap — [`live_handles`](Heap::live_handles)

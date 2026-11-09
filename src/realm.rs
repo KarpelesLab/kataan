@@ -130,9 +130,14 @@ pub fn typed_elem_size(kind: u8) -> usize {
 /// `builtins_fast::plain_enumerable_key_ropes`).
 type ShapeKeyRopes = (Rc<crate::shape::Shape>, Rc<[Rope]>);
 
-/// A shape and the key String cells `Object.keys` lists for it (see
-/// `builtins_fast::plain_enumerable_key_strings`).
-type ShapeKeyStrings = (Rc<crate::shape::Shape>, Rc<[NanBox]>);
+/// A shape, the key String cells `Object.keys` lists for it and each key's
+/// slot in the shape (see `builtins_fast::plain_enumerable_key_slots`).
+type ShapeKeyStrings = (Rc<crate::shape::Shape>, Rc<[NanBox]>, Rc<[u32]>);
+
+/// A dictionary-mode object (raw handle), its key epoch, and the key String
+/// cells `Object.keys` listed for it then (see
+/// `builtins_fast::dict_enumerable_key_strings`).
+type DictKeyStrings = (u64, u32, Rc<[NanBox]>);
 
 /// How many slices in a row of one string walk its rope (see
 /// [`Realm::new_string_slice_tree`]) before it is flattened instead.
@@ -426,6 +431,14 @@ pub struct Realm {
     /// are GC roots and the memo is dropped by a moving
     /// [`compact`](Realm::compact).
     key_strings: alloc::vec::Vec<Option<ShapeKeyStrings>>,
+    /// The key String cells `Object.keys` last handed out per plain
+    /// dictionary-mode object, valid while its key epoch is unchanged (see
+    /// `builtins_fast::dict_enumerable_key_strings`). GC roots, dropped by a
+    /// moving [`compact`](Realm::compact) as `key_strings` is.
+    dict_key_strings: alloc::vec::Vec<Option<DictKeyStrings>>,
+    /// Remembered shaped-into-shaped merges (`{ k: v, ...src }`), by the
+    /// target's and the source's layouts (see `spread_fast::MergePlan`).
+    merge_plans: alloc::vec::Vec<Option<spread_fast::MergePlan>>,
     /// The hidden-state layout of a live Set/Map iterator (see
     /// `hidden_layout`), learned from the first one the bytecode VM steps.
     pub(crate) coll_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
@@ -1025,6 +1038,8 @@ impl Realm {
             lit_cells_prune: 16,
             key_ropes: core::cell::RefCell::new(None),
             key_strings: alloc::vec::Vec::new(),
+            dict_key_strings: alloc::vec::Vec::new(),
+            merge_plans: alloc::vec::Vec::new(),
             coll_iter_layout: None,
             buf_iter_layout: None,
             str_iter_layout: None,
@@ -1243,9 +1258,26 @@ impl Realm {
         }
         self.cell_link_changed(handle);
         self.note_typed_proto(handle, Some(proto));
+        self.clear_collection_default_proto(handle);
         self.native_protos.insert(handle.to_raw(), proto);
         self.gc_side_log.push(handle.to_raw());
         self.mark_array_proto_set(handle);
+    }
+
+    /// An explicit `[[Prototype]]` link for the collection at `handle`
+    /// (no-op for any other cell): it no longer has the default one, so a
+    /// collection flagged `default_proto` has no `native_protos` entry and
+    /// no explicit `null` (`Realm::coll_site_call` relies on this). The
+    /// link itself, recorded next, takes precedence in `object_proto` as
+    /// it did before.
+    fn clear_collection_default_proto(&mut self, handle: Handle) {
+        if let Some(Cell::Collection {
+            default_proto: d @ true,
+            ..
+        }) = self.heap.get_mut(handle)
+        {
+            *d = false;
+        }
     }
 
     /// Records the `[[Prototype]]` `proto` a cell at `handle` is getting,
@@ -4064,13 +4096,18 @@ impl Realm {
             // `undefined`, `null`, a Boolean: equal only to its own bits.
             return Some(None);
         };
-        match self.heap.get(Handle::from_raw(kh)) {
-            Some(Cell::Str(r)) => Some(entries.iter().position(|(k, _)| {
-                k.as_handle().is_some_and(|h| {
-                    matches!(self.heap.get(Handle::from_raw(h)),
-                        Some(Cell::Str(e)) if r.same_bytes(e))
-                })
-            })),
+        match self.heap.get_hot(Handle::from_raw(kh)) {
+            Some(Cell::Str(r)) => {
+                for (i, (k, _)) in entries.iter().enumerate() {
+                    if let Some(h) = k.as_handle()
+                        && let Some(Cell::Str(e)) = self.heap.get_hot(Handle::from_raw(h))
+                        && r.same_bytes(e)
+                    {
+                        return Some(Some(i));
+                    }
+                }
+                Some(None)
+            }
             Some(Cell::BigInt(_)) => None,
             // Any other heap value (an object, a Symbol) is equal only to
             // itself: its very bits, which no entry has.
@@ -5476,6 +5513,7 @@ impl Realm {
             self.cell_link_changed(handle);
             self.mark_array_proto_set(handle);
             self.note_typed_proto(handle, proto);
+            self.clear_collection_default_proto(handle);
             match proto {
                 Some(p) => {
                     self.native_protos.insert(handle.to_raw(), p);
@@ -8189,7 +8227,13 @@ impl Realm {
             self.key_strings
                 .iter()
                 .flatten()
-                .flat_map(|(_, ks)| ks.iter())
+                .flat_map(|(_, ks, _)| ks.iter())
+                .chain(
+                    self.dict_key_strings
+                        .iter()
+                        .flatten()
+                        .flat_map(|(_, _, ks)| ks.iter()),
+                )
                 .filter_map(|k| k.as_handle().map(Handle::from_raw)),
         );
         out.extend(self.unit_strings.iter().flatten().copied());
@@ -8898,6 +8942,7 @@ impl Realm {
         self.literal_ropes.clear();
         self.lit_cells_retire();
         self.key_strings.clear();
+        self.dict_key_strings.clear();
         self.for_in_cache_retire();
         self.vm_array_iter = VmArrayIterIntrinsics {
             species_key,

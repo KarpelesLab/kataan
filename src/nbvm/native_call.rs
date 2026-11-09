@@ -772,6 +772,19 @@ pub(super) fn try_coll(
     args: &[Reg],
     cache: &mut PropertyCache,
 ) -> Option<NanBox> {
+    try_coll_inline(ctx, recv, regs, args, cache)
+}
+
+/// [`try_coll`] in its caller's line (compiled code's helper is nothing but
+/// this call).
+#[inline(always)]
+pub(super) fn try_coll_inline(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    regs: &[NanBox],
+    args: &[Reg],
+    cache: &mut PropertyCache,
+) -> Option<NanBox> {
     let site = cache.native.as_deref_mut()?;
     let op = site.op.coll_op()?;
     let h = Handle::from_raw(recv.as_handle()?);
@@ -1202,27 +1215,9 @@ fn run_op(
         | FastOp::SetAdd
         | FastOp::SetHas
         | FastOp::SetDelete => {
-            let want_set = matches!(op, FastOp::SetAdd | FastOp::SetHas | FastOp::SetDelete);
-            if realm.collection_is_set(h) != Some(want_set) || realm.collection_is_weak(h) {
-                return None;
-            }
-            match op {
-                FastOp::MapGet => realm
-                    .collection_get(h, arg(0))
-                    .unwrap_or(NanBox::undefined()),
-                FastOp::MapSet => {
-                    realm.collection_set(h, arg(0), arg(1));
-                    recv
-                }
-                FastOp::SetAdd => {
-                    realm.collection_set(h, arg(0), arg(0));
-                    recv
-                }
-                FastOp::MapDelete | FastOp::SetDelete => {
-                    NanBox::boolean(realm.collection_delete(h, arg(0)))
-                }
-                _ => NanBox::boolean(realm.collection_has(h, arg(0))),
-            }
+            // The method's lean form, on one read of the receiver's cell (a
+            // receiver of another kind, or a weak one, is a miss).
+            realm.coll_fast(h, op.coll_op()?, arg(0), arg(1))?
         }
         FastOp::ObjHasOwn => NanBox::boolean(obj_has_own_fast(realm, h, arg(0))?),
         FastOp::StrSlice | FastOp::StrSubstring => {
@@ -1695,8 +1690,13 @@ fn run_op(
             // enumerable data keys, none a Symbol or other internal key:
             // its own String keys are its `Object.keys` (the same shared
             // key Strings, see `plain_enumerable_key_strings`).
+            // So are those of a plain dictionary (no non-enumerable key).
             let o = arg(0).as_handle().map(Handle::from_raw)?;
-            let strs = realm.plain_enumerable_key_strings(o)?;
+            let strs = match realm.plain_enumerable_key_strings(o) {
+                Some(strs) => strs,
+                None if realm.is_plain_dict_object(o) => realm.dict_enumerable_key_strings(o)?,
+                None => return None,
+            };
             NanBox::handle(realm.new_array(strs.to_vec()).to_raw())
         }
         FastOp::ObjGetProto => {
@@ -1763,24 +1763,42 @@ fn run_op(
             {
                 return Some(Ok(NanBox::handle(realm.new_array(keys).to_raw())));
             }
-            let strs = realm.plain_enumerable_key_strings(o)?;
-            if matches!(op, FastOp::ObjKeys) {
-                return Some(Ok(NanBox::handle(realm.new_array(strs.to_vec()).to_raw())));
-            }
-            let keys = realm.plain_enumerable_key_ropes(o)?;
-            if matches!(op, FastOp::ObjValues) {
-                let mut out = alloc::vec::Vec::with_capacity(keys.len());
-                for k in keys.iter() {
-                    out.push(realm.get_property(o, k.as_leaf_str()?)?);
+            // A plain shaped object: its layout's remembered key Strings,
+            // and its values read from their slots. A plain dictionary:
+            // its remembered key Strings, its values in the same order.
+            let (strs, vals) = if let Some((strs, slots)) = realm.plain_enumerable_key_slots(o) {
+                let vals = match op {
+                    FastOp::ObjKeys => None,
+                    _ => Some(realm.object_slot_values(o, &slots)?),
+                };
+                (strs, vals)
+            } else if matches!(op, FastOp::ObjValues) {
+                // (No key String is needed for the values alone.)
+                if realm.is_host_exotic(o) {
+                    return None;
                 }
-                return Some(Ok(NanBox::handle(realm.new_array(out).to_raw())));
+                let vals = realm.plain_enum_values(o)?;
+                return Some(Ok(NanBox::handle(realm.new_array(vals).to_raw())));
+            } else {
+                let strs = realm.dict_enumerable_key_strings(o)?;
+                let vals = match op {
+                    FastOp::ObjKeys => None,
+                    _ => Some(realm.plain_enum_values(o)?),
+                };
+                (strs, vals)
+            };
+            match (op, vals) {
+                (FastOp::ObjValues, Some(vals)) => NanBox::handle(realm.new_array(vals).to_raw()),
+                (FastOp::ObjEntries, Some(vals)) if vals.len() == strs.len() => {
+                    let mut out = alloc::vec::Vec::with_capacity(vals.len());
+                    for (&k, v) in strs.iter().zip(vals) {
+                        out.push(NanBox::handle(realm.new_array(alloc::vec![k, v]).to_raw()));
+                    }
+                    NanBox::handle(realm.new_array(out).to_raw())
+                }
+                (FastOp::ObjKeys, _) => NanBox::handle(realm.new_array(strs.to_vec()).to_raw()),
+                _ => return None,
             }
-            let mut out = alloc::vec::Vec::with_capacity(keys.len());
-            for (k, &kv) in keys.iter().zip(strs.iter()) {
-                let v = realm.get_property(o, k.as_leaf_str()?)?;
-                out.push(NanBox::handle(realm.new_array(alloc::vec![kv, v]).to_raw()));
-            }
-            NanBox::handle(realm.new_array(out).to_raw())
         }
     };
     Some(Ok(v))

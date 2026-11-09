@@ -2867,7 +2867,7 @@ pub(crate) extern "C" fn jit_helper_coll_call(
     // SAFETY: the site's own cache (see the function contract).
     #[allow(unsafe_code)]
     let cache = unsafe { &mut *cache.cast::<crate::ic::PropertyCache>() };
-    match super::native_call::try_coll(ctx, regs[*recv as usize], regs, args, cache) {
+    match super::native_call::try_coll_inline(ctx, regs[*recv as usize], regs, args, cache) {
         Some(v) => {
             regs[*dst as usize] = v;
             0

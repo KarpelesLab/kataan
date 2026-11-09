@@ -6,6 +6,12 @@
 use super::{Cell, Handle, NanBox, Realm};
 use crate::shape::Shape;
 use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// A layout's `Object.keys` Strings and each key's slot (see
+/// [`Realm::plain_enumerable_key_slots`]).
+pub(crate) type KeySlots = (Rc<[NanBox]>, Rc<[u32]>);
 
 impl Realm {
     /// The shape of the object at `handle` when its own properties are exactly
@@ -84,25 +90,108 @@ impl Realm {
     /// key sees the same key String every time (which the String-key slot
     /// memo, `key_memo`, then remembers).
     pub fn plain_enumerable_key_strings(&mut self, handle: Handle) -> Option<Rc<[NanBox]>> {
+        self.plain_enumerable_key_slots(handle).map(|(ks, _)| ks)
+    }
+
+    /// [`plain_enumerable_key_strings`](Self::plain_enumerable_key_strings)
+    /// with each key's slot in the object's layout, remembered with them: so
+    /// `Object.values` / `Object.entries` of such an object read its slots
+    /// in key order (integer keys ascending first, then the rest in
+    /// insertion order), with no key lookup.
+    pub(crate) fn plain_enumerable_key_slots(&mut self, handle: Handle) -> Option<KeySlots> {
         /// The number of layouts remembered (a power of two).
         const WAYS: usize = 8;
         let shape = Rc::clone(self.plain_keyed_shape(handle)?);
         let way =
             ((Rc::as_ptr(&shape) as usize >> 4) ^ (Rc::as_ptr(&shape) as usize >> 10)) & (WAYS - 1);
-        if let Some(Some((s, ks))) = self.key_strings.get(way)
+        if let Some(Some((s, ks, slots))) = self.key_strings.get(way)
             && Rc::ptr_eq(s, &shape)
         {
-            return Some(Rc::clone(ks));
+            return Some((Rc::clone(ks), Rc::clone(slots)));
         }
-        let ropes = self.plain_enumerable_key_ropes(handle)?;
-        let ks: Rc<[NanBox]> = ropes
+        if self.is_function_proto_intrinsic(handle) {
+            return None;
+        }
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        if o.is_prim_wrapper() {
+            return None;
+        }
+        let names = self.object_keys(handle)?;
+        // An escaped user key (`"\0\0…"`, see `realm::is_internal_key`) is not
+        // its own text: leave such an object to the general path.
+        if names.iter().any(|k| k.starts_with('\0')) {
+            return None;
+        }
+        let slots: Rc<[u32]> = names
             .iter()
-            .map(|r| NanBox::handle(self.new_string_from_rope(r.clone()).to_raw()))
+            .map(|k| shape.lookup(k))
+            .collect::<Option<_>>()?;
+        let ks: Rc<[NanBox]> = names
+            .iter()
+            .map(|k| NanBox::handle(self.new_string(k).to_raw()))
             .collect();
         if self.key_strings.is_empty() {
             self.key_strings.resize(WAYS, None);
         }
-        self.key_strings[way] = Some((shape, Rc::clone(&ks)));
+        self.key_strings[way] = Some((shape, Rc::clone(&ks), Rc::clone(&slots)));
+        Some((ks, slots))
+    }
+
+    /// The values of slots `slots` of the object at `handle`, in that order:
+    /// with [`plain_enumerable_key_slots`](Self::plain_enumerable_key_slots)
+    /// just answered for it, its `Object.values`.
+    pub(crate) fn object_slot_values(&self, handle: Handle, slots: &[u32]) -> Option<Vec<NanBox>> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        slots.iter().map(|&s| o.slot(s)).collect()
+    }
+
+    /// Whether `h` is an ordinary dictionary-mode object holding only plain
+    /// writable, enumerable data properties
+    /// ([`Object::is_plain_dict`](crate::object::Object::is_plain_dict)).
+    #[must_use]
+    pub(crate) fn is_plain_dict_object(&self, h: Handle) -> bool {
+        matches!(self.heap.get(h), Some(Cell::Object(o)) if o.is_plain_dict())
+    }
+
+    /// `Object.keys(h)` of a plain dictionary-mode object (only data
+    /// properties, which keys are not engine-internal): its key Strings,
+    /// remembered per object while its key epoch is unchanged (no key added,
+    /// removed or made non-enumerable since), so listing a large dictionary's
+    /// keys again allocates only the result array. `None` for anything else.
+    pub(crate) fn dict_enumerable_key_strings(&mut self, handle: Handle) -> Option<Rc<[NanBox]>> {
+        /// The number of objects remembered (a power of two).
+        const WAYS: usize = 4;
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        if !o.is_dict() || self.is_host_exotic(handle) || self.is_function_proto_intrinsic(handle) {
+            return None;
+        }
+        let epoch = o.key_epoch();
+        let way = (handle.to_raw() as usize) & (WAYS - 1);
+        if let Some(Some((h, e, ks))) = self.dict_key_strings.get(way)
+            && *h == handle.to_raw()
+            && *e == epoch
+        {
+            return Some(Rc::clone(ks));
+        }
+        let names: Vec<String> = o
+            .plain_enum_entries()?
+            .into_iter()
+            .map(|(k, _)| String::from(k))
+            .collect();
+        let ks: Rc<[NanBox]> = names
+            .iter()
+            .map(|k| NanBox::handle(self.new_string(k).to_raw()))
+            .collect();
+        if self.dict_key_strings.is_empty() {
+            self.dict_key_strings.resize(WAYS, None);
+        }
+        self.dict_key_strings[way] = Some((handle.to_raw(), epoch, Rc::clone(&ks)));
         Some(ks)
     }
 
@@ -536,6 +625,18 @@ impl Realm {
             Cell::Array(a) if !a.has_side_state() && !a.has_proto_set() => {
                 Some(self.root_array_proto)
             }
+            // A Map/Set with its default `[[Prototype]]` (no explicit link
+            // since, see `Realm::clear_collection_default_proto`).
+            Cell::Collection {
+                default_proto: true,
+                is_set,
+                ..
+            } => {
+                if self.aux_obj(h).is_some_and(|o| o.has_own_key(key)) {
+                    return None;
+                }
+                Some(self.coll_default[usize::from(*is_set)].map(|(_, p)| p))
+            }
             Cell::Array(_)
             | Cell::RegExp { .. }
             | Cell::Collection { .. }
@@ -665,6 +766,7 @@ impl Realm {
     /// answered on the same read of the receiver's cell. `None`, having done
     /// nothing, for anything else (the caller's general path, which also
     /// rejects a receiver of the wrong kind).
+    #[inline]
     pub(crate) fn coll_site_call(
         &mut self,
         recv: Handle,
@@ -684,6 +786,17 @@ impl Realm {
         {
             return None;
         }
+        // The holder's own value (a store to an existing data property does
+        // not move the epoch): read under its recorded shape.
+        match self.heap.get_hot(Handle::from_raw(cache.holder_props)) {
+            Some(Cell::Object(o))
+                if o.shaped_shape()
+                    .zip(cache.holder_shape.as_ref())
+                    .is_some_and(|(s, m)| Rc::ptr_eq(s, m))
+                    && o.slot(cache.holder_slot)
+                        .is_some_and(|v| v.to_bits() == method) => {}
+            _ => return None,
+        }
         let Some(Cell::Collection {
             is_set,
             is_weak: false,
@@ -692,42 +805,31 @@ impl Realm {
             live,
             index,
             ..
-        }) = self.heap.get(recv)
+        }) = self.heap.get_hot(recv)
         else {
             return None;
         };
-        if *is_set != matches!(op, CollOp::SetAdd | CollOp::SetHas | CollOp::SetDelete) {
+        if *is_set != op.on_set() {
             return None;
         }
         let unnoted = cache.recv_memo != recv.to_raw() || cache.recv_stamp != epoch;
         if unnoted {
+            // No auxiliary object (no own named property), not host-exotic,
+            // and the first link as its `[[Prototype]]`: the default one
+            // (`default_proto` means no explicit link was made since) or
+            // another found the general way.
             let first = cache.links.first()?;
             if self.aux_props.contains_key(&recv.to_raw()) || self.is_host_exotic(recv) {
                 return None;
             }
-            // (`object_proto`'s answer, its commonest case first.)
-            let proto = if *default_proto
-                && !self.native_protos.contains_key(&recv.to_raw())
-                && !self.has_explicit_null_proto(recv)
-            {
+            let proto = if *default_proto {
                 self.coll_default[usize::from(*is_set)].map(|(_, p)| p)
             } else {
-                self.object_proto(recv)
+                self.coll_recv_proto(recv)
             };
             if proto.map(Handle::to_raw) != Some(first.0) {
                 return None;
             }
-        }
-        // The holder's own value (a store to an existing data property does
-        // not move the epoch): read under its recorded shape.
-        match self.heap.get(Handle::from_raw(cache.holder_props)) {
-            Some(Cell::Object(o))
-                if o.shaped_shape()
-                    .zip(cache.holder_shape.as_ref())
-                    .is_some_and(|(s, m)| Rc::ptr_eq(s, m))
-                    && o.slot(cache.holder_slot)
-                        .is_some_and(|v| v.to_bits() == method) => {}
-            _ => return None,
         }
         let lookup = matches!(op, CollOp::MapGet | CollOp::MapHas | CollOp::SetHas);
         // A lookup answered on this read of the cell: an empty collection,
@@ -762,22 +864,46 @@ impl Realm {
             cache.last_recv = recv.to_raw();
         }
         // (The receiver is a strong collection of the method's kind.)
-        Some(match (answer, op) {
-            (Some(v), _) => v,
-            (None, CollOp::MapSet) => {
+        match (answer, op) {
+            (Some(v), _) => Some(v),
+            _ => self.coll_site_update(recv, op, a, b),
+        }
+    }
+
+    /// [`object_proto`](Self::object_proto) of a collection without the
+    /// default `[[Prototype]]` (out of [`coll_site_call`](Self::coll_site_call)'s
+    /// line).
+    #[inline(never)]
+    fn coll_recv_proto(&self, recv: Handle) -> Option<Handle> {
+        self.object_proto(recv)
+    }
+
+    /// [`coll_site_call`](Self::coll_site_call)'s update, or lookup the
+    /// one read of the cell could not answer (out of its line).
+    #[inline(never)]
+    fn coll_site_update(
+        &mut self,
+        recv: Handle,
+        op: super::coll_fast::CollOp,
+        a: NanBox,
+        b: NanBox,
+    ) -> Option<NanBox> {
+        use super::coll_fast::CollOp;
+        Some(match op {
+            CollOp::MapSet => {
                 self.collection_set(recv, a, b);
                 NanBox::handle(recv.to_raw())
             }
-            (None, CollOp::SetAdd) => {
+            CollOp::SetAdd => {
                 self.collection_set(recv, a, a);
                 NanBox::handle(recv.to_raw())
             }
-            (None, CollOp::MapDelete | CollOp::SetDelete) => {
+            CollOp::MapDelete | CollOp::SetDelete => {
                 NanBox::boolean(self.collection_delete(recv, a))
             }
             // A lookup in a larger collection without an index (which
             // builds it).
-            (None, _) => return self.coll_fast(recv, op, a, b),
+            _ => return self.coll_fast(recv, op, a, b),
         })
     }
 

@@ -25,7 +25,8 @@ pub(crate) enum CollOp {
 
 impl CollOp {
     /// Whether the method is a `Set.prototype` one (its receiver must be a Set).
-    fn on_set(self) -> bool {
+    #[inline]
+    pub(crate) fn on_set(self) -> bool {
         matches!(self, CollOp::SetAdd | CollOp::SetHas | CollOp::SetDelete)
     }
 }

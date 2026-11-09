@@ -30,8 +30,24 @@
 //! ([`Realm::plain_enum_values`]).
 
 use super::{Cell, Handle, NanBox, Realm};
+use crate::shape::Shape;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+
+/// A remembered merge of a shaped source into a shaped target (see
+/// [`Realm::merge_shaped_planned`]): the two layouts (held, so their
+/// addresses are not reused), the layout the merge leaves, and per source
+/// slot the result slot it lands in.
+pub(crate) struct MergePlan {
+    target: Rc<Shape>,
+    source: Rc<Shape>,
+    result: Rc<Shape>,
+    map: Rc<[u32]>,
+}
+
+/// How many merge plans a realm remembers (a power of two).
+const MERGE_PLANS: usize = 16;
 
 impl Realm {
     /// `CopyDataProperties(target, src, excluded)` when it is a wholesale
@@ -51,6 +67,9 @@ impl Realm {
     ) -> bool {
         if self.is_host_exotic(src) || self.is_function_proto_intrinsic(src) {
             return false;
+        }
+        if excluded.is_empty() && self.merge_shaped_planned(target, src) {
+            return true;
         }
         let Some(Cell::Object(s)) = self.heap.get(src) else {
             return false;
@@ -74,13 +93,151 @@ impl Realm {
                 vals.push(v);
             }
         });
-        if t.adopt_plain(copy, threshold).is_err() {
+        match t.adopt_plain(copy, threshold) {
+            Ok(()) => {
+                for v in vals {
+                    self.write_barrier(target, v);
+                }
+                true
+            }
+            // A target that already has keys (`{ k: v, ...src }`,
+            // `{ ...a, ...b }`): merged in one pass. (Spread defines, so the
+            // target's prototype chain does not matter.)
+            Err(copy) => {
+                !self.is_function_proto_intrinsic(target)
+                    && self.merge_plain_into(target, copy).is_ok()
+            }
+        }
+    }
+
+    /// [`Object::merge_plain`](crate::object::Object::merge_plain) of the
+    /// shaped object `src` into the non-empty shaped object `target`, by a
+    /// plan remembered per pair of layouts: which slot of the result each
+    /// source slot lands in, and the result's layout (so the keys are looked
+    /// up once per pair, not once per merge). Performed, returning `true`;
+    /// `false`, having changed nothing, for any other pair (the caller's
+    /// general merge then decides). The caller has ruled out a host-exotic
+    /// source and the `Function.prototype` intrinsic.
+    pub(crate) fn merge_shaped_planned(&mut self, target: Handle, src: Handle) -> bool {
+        if target == src || self.is_host_exotic(target) || self.is_function_proto_intrinsic(target)
+        {
             return false;
         }
+        let Some(Cell::Object(s)) = self.heap.get(src) else {
+            return false;
+        };
+        if s.is_prim_wrapper() {
+            return false;
+        }
+        let Some((sshape, values)) = s.plain_shaped_values() else {
+            return false;
+        };
+        if values.is_empty() {
+            return false;
+        }
+        let sshape = Rc::clone(sshape);
+        let Some(Cell::Object(t)) = self.heap.get(target) else {
+            return false;
+        };
+        if t.is_empty() || t.is_prim_wrapper() || !t.merge_target_ok() {
+            return false;
+        }
+        let Some(tshape) = t.shaped_shape() else {
+            return false;
+        };
+        let way = ((Rc::as_ptr(tshape) as usize >> 4)
+            ^ (Rc::as_ptr(&sshape) as usize >> 6)
+            ^ (Rc::as_ptr(&sshape) as usize >> 12))
+            & (MERGE_PLANS - 1);
+        let plan = match self.merge_plans.get(way) {
+            Some(Some(p)) if Rc::ptr_eq(&p.target, tshape) && Rc::ptr_eq(&p.source, &sshape) => {
+                (Rc::clone(&p.result), Rc::clone(&p.map))
+            }
+            _ => {
+                let tshape = Rc::clone(tshape);
+                let Some(p) = self.merge_plan(&tshape, &sshape) else {
+                    return false;
+                };
+                if self.merge_plans.is_empty() {
+                    self.merge_plans.resize_with(MERGE_PLANS, || None);
+                }
+                let out = (Rc::clone(&p.result), Rc::clone(&p.map));
+                self.merge_plans[way] = Some(p);
+                out
+            }
+        };
+        let Some(Cell::Object(t)) = self.heap.get_mut(target) else {
+            return false;
+        };
+        t.merge_planned(&plan.0, &plan.1, &values);
+        for v in values {
+            if v.as_handle().is_some() {
+                self.write_barrier(target, v);
+            }
+        }
+        true
+    }
+
+    /// A [`MergePlan`] for merging objects of layout `source` into objects
+    /// of layout `target`, when every source key is copyable (a property
+    /// name or a Symbol) and the result stays below the dictionary
+    /// threshold.
+    fn merge_plan(&self, target: &Rc<Shape>, source: &Rc<Shape>) -> Option<MergePlan> {
+        let mut result = Rc::clone(target);
+        let mut map = Vec::with_capacity(source.len() as usize);
+        for k in source.keys() {
+            if k.as_bytes().first() == Some(&0) && !k.starts_with(crate::shape::SYMBOL_KEY_PREFIX) {
+                return None;
+            }
+            match result.lookup(k) {
+                Some(slot) => map.push(slot),
+                None => {
+                    map.push(result.len());
+                    result = result.add(k);
+                }
+            }
+        }
+        if result.len() as usize >= self.limits.object_dictionary_threshold {
+            return None;
+        }
+        Some(MergePlan {
+            target: Rc::clone(target),
+            source: Rc::clone(source),
+            result,
+            map: map.into(),
+        })
+    }
+
+    /// [`Object::merge_plain`](crate::object::Object::merge_plain) of `copy`
+    /// into the object at `target`, with the write barrier for each value
+    /// stored: `false`, having changed nothing, when `target` is not a plain
+    /// ordinary object (see there), a primitive wrapper or host-exotic.
+    pub(crate) fn merge_plain_into(
+        &mut self,
+        target: Handle,
+        copy: crate::object::PlainCopy,
+    ) -> Result<(), crate::object::PlainCopy> {
+        if self.is_host_exotic(target) {
+            return Err(copy);
+        }
+        let threshold = self.limits.object_dictionary_threshold;
+        let mut vals: Vec<NanBox> = Vec::new();
+        copy.for_each_value(|v| {
+            if v.as_handle().is_some() {
+                vals.push(v);
+            }
+        });
+        let Some(Cell::Object(t)) = self.heap.get_mut(target) else {
+            return Err(copy);
+        };
+        if t.is_prim_wrapper() {
+            return Err(copy);
+        }
+        t.merge_plain(copy, threshold)?;
         for v in vals {
             self.write_barrier(target, v);
         }
-        true
+        Ok(())
     }
 
     /// `Object.values(h)` when `h` is an ordinary object no step of whose
