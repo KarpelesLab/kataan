@@ -4415,3 +4415,77 @@ fn predicted_walks_of_every_layout() {
     "#;
     assert_eq!(run(src), "27450|23344800|190637778|400");
 }
+
+/// A method read and inlined method calls whose lookups the body proves
+/// once per call-free stretch (`jit::gelim`) see the method replaced
+/// between two calls of one activation: by an in-line store of the key on
+/// a prototype held in a variable (a property store, a computed-key store
+/// through the key memo) and by a store behind a call, on a fixed receiver
+/// and across a polymorphic dispatch.
+#[test]
+fn proved_method_lookups_see_inline_stores_of_their_key() {
+    let src = r#"
+        var out = [];
+        function Base() { this.n = 0; }
+        Base.prototype.route = function (a, b) { this.n += a + b; return a + b; };
+        function alt(a, b) { this.n += 1000; return a * b; }
+        var orig = Base.prototype.route;
+        function viaProto(iters) {
+          function P() { Base.call(this); }
+          P.prototype = Object.create(Base.prototype);
+          var s = new P(), pp = P.prototype, acc = 0;
+          for (var i = 0; i < iters; i++) {
+            acc += s.route(i & 7, (i & 3) + 1);
+            if (i > 100 && i % 7 === 0) pp.route = (i & 8) ? alt : orig;
+          }
+          return acc + ":" + s.n;
+        }
+        function viaKey(iters) {
+          function P() { Base.call(this); }
+          P.prototype = Object.create(Base.prototype);
+          var s = new P(), pp = P.prototype, k = "route", acc = 0;
+          for (var i = 0; i < iters; i++) {
+            acc += s.route(i & 7, (i & 3) + 1);
+            if (i > 100 && i % 7 === 0) pp[k] = (i & 8) ? alt : orig;
+          }
+          return acc + ":" + s.n;
+        }
+        function viaCall(iters) {
+          function P() { Base.call(this); }
+          P.prototype = Object.create(Base.prototype);
+          var s = new P(), pp = P.prototype, acc = 0;
+          for (var i = 0; i < iters; i++) {
+            acc += s.route(i & 7, (i & 3) + 1);
+            if (i > 100 && i % 7 === 0) Reflect.set(pp, "route", (i & 8) ? alt : orig);
+          }
+          return acc + ":" + s.n;
+        }
+        function A(id) { this.id = id; this.c = 0; }
+        A.prototype.run = function (k) { this.c++; return this.id + k; };
+        function B(id) { this.id = id; this.c = 0; }
+        B.prototype.run = function (k) { this.c += 2; return this.id - k; };
+        function C(id) { this.id = id; this.c = 0; }
+        C.prototype.run = function (k) { this.c += 3; return k * 2; };
+        function altRun(k) { return -k; }
+        function poly(iters) {
+          var ts = [], pa = A.prototype, origA = pa.run, acc = 0;
+          for (var j = 0; j < 9; j++) ts.push(j % 3 === 0 ? new A(j) : j % 3 === 1 ? new B(j) : new C(j));
+          for (var it = 0; it < iters; it++) {
+            for (var i = 0; i < ts.length; i++) {
+              acc += ts[i].run(i);
+              if (it > 50 && it % 3 === 0 && i === 4) pa.run = (it & 4) ? altRun : origA;
+            }
+          }
+          pa.run = origA;
+          var c = 0;
+          for (var j = 0; j < 9; j++) c += ts[j].c;
+          return acc + ":" + c;
+        }
+        out.push(viaProto(3000), viaKey(3000), viaCall(3000), poly(1000));
+        out.join("|")
+    "#;
+    assert_eq!(
+        run(src),
+        "23797:1458305|23797:1458305|23797:1458305|35184:16577"
+    );
+}

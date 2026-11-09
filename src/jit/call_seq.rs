@@ -1599,7 +1599,9 @@ fn emit_lookup_fill(a: &mut X64Assembler, base: u8, off: i32) {
 /// the call site `site`'s [`GetMethodMemo`]: a receiver of the memo's
 /// layout at the memo's epoch, without accessors, has the method at the
 /// memo's address. A lookup that hits at a prototype level refills the
-/// memo. Clobbers what the lookup does.
+/// memo. With `proof` (`super::gelim`'s `(bits, value)` slots), the same
+/// receiver as the last in-line hit's since the last call takes the value
+/// that hit found. Clobbers what the lookup does.
 pub(crate) fn emit_get_method(
     a: &mut X64Assembler,
     realm_off: i32,
@@ -1607,7 +1609,7 @@ pub(crate) fn emit_get_method(
     method: *const super::props::MethodSite,
     site: *const CallSite,
     miss: Label,
-    way: Option<super::recv_cache::GetMethodWay>,
+    (way, proof): (Option<super::recv_cache::GetMethodWay>, Option<(i32, i32)>),
 ) {
     use core::mem::offset_of;
     let jl = super::compute_jit_layout();
@@ -1615,6 +1617,19 @@ pub(crate) fn emit_get_method(
     let lk = |f: usize| m(offset_of!(GetMethodMemo, lookup) + f);
     let lookup = a.new_label();
     let have = a.new_label();
+    // The read's proof (`super::gelim`, `(bits, value)` slots): the same
+    // receiver value as the last in-line hit with no call since has the
+    // same method, as the body stores no property of the key in line.
+    let proven = a.new_label();
+    if let Some((bits, value)) = proof {
+        let full = a.new_label();
+        a.g_load(r::RAX, recv.0, recv.1);
+        a.g_cmp_mem(r::RAX, RBP, bits);
+        a.g_jcc(cc::NE, full);
+        a.g_load(r::RAX, RBP, value);
+        a.jmp(proven);
+        a.bind(full);
+    }
     // The receiver through its receiver-cache way (see `GetMethodWay`): a
     // hit takes the walked slot from it; a walk fills it.
     let walked = a.new_label();
@@ -1670,6 +1685,12 @@ pub(crate) fn emit_get_method(
     a.jmp(have);
     a.cold_end(cold);
     a.bind(have);
+    if let Some((bits, value)) = proof {
+        a.g_store(RBP, value, r::RAX);
+        a.g_load(r::R9, recv.0, recv.1);
+        a.g_store(RBP, bits, r::R9);
+    }
+    a.bind(proven);
 }
 
 /// A method call's memo check through the ways' [`CallMemo::lookup`]s,
@@ -2552,6 +2573,13 @@ pub(crate) struct InlineEmit<'a> {
     pub mproved: Option<MethodProof>,
     /// A monomorphic construct guard's **proof** slots ([`ConstructProof`]).
     pub cproved: Option<ConstructProof>,
+    /// Per way of the call site's memo, the way's **memo proof** slot
+    /// (`rbp`-relative, one of the receiver cache's keys; see
+    /// `super::gelim`), when the body stores no property of the guard's key
+    /// in line: while it is not empty, the way's `GuardMemo` was checked
+    /// at the current prototype epoch with its holder's value its callee,
+    /// and neither has changed since.
+    pub wproof: &'a [Option<i32>],
     /// Registers to keep, as `(register, rbp-relative save slot)`: the
     /// guard's code that may clobber them stores them first and reloads
     /// them after (a speculative region's integer version's int registers,
@@ -3161,6 +3189,26 @@ fn emit_guard_fast(
     for (w, &f) in found.iter().enumerate() {
         a.bind(f);
         a.dbg_mark("g-found");
+        // The way's memo proof (`gelim`): its stamp and its holder's value
+        // were checked since the last call, and nothing since can have
+        // changed them — the callee is the memo's.
+        let wproof = e.wproof.get(w).copied().flatten();
+        let mut proof_cold = None;
+        let proven = a.new_label();
+        if let Some(q) = wproof {
+            let check = a.new_label();
+            a.cmp_frame_imm8(q, -1);
+            a.g_jcc(cc::E, check);
+            if !e.after_hit {
+                emit_no_accessors(a, slow);
+            }
+            a.g_load(r::RAX, r::R11, g(w, offset_of!(GuardMemo, bits)));
+            a.jmp(proven);
+            if a.cold_binds.is_none() {
+                proof_cold = Some(a.cold_begin());
+            }
+            a.bind(check);
+        }
         load_proto_epoch(a, r::R9);
         a.g_cmp_mem(r::R9, r::R11, g(w, offset_of!(GuardMemo, stamp)));
         a.g_jcc(cc::NE, slow);
@@ -3176,6 +3224,14 @@ fn emit_guard_fast(
         a.g_load(r::RAX, r::R9, 0);
         a.g_cmp_mem(r::RAX, r::R11, g(w, offset_of!(GuardMemo, bits)));
         a.g_jcc(cc::NE, slow);
+        if let Some(q) = wproof {
+            a.g_store_imm32(RBP, q, 0);
+            a.jmp(proven);
+        }
+        if let Some(cold) = proof_cold {
+            a.cold_end(cold);
+        }
+        a.bind(proven);
         a.g_store(RBP, e.slots.callee, r::RAX);
         if w == own {
             // (The captures' pointer, for an inlined body that has some.)
@@ -3229,6 +3285,10 @@ fn emit_guard_fill(a: &mut X64Assembler, e: &InlineEmit<'_>, w: usize) {
     a.g_store(r::R11, g(offset_of!(GuardMemo, caps)), r::R8);
     load_proto_epoch(a, r::R9);
     a.g_store(r::R11, g(offset_of!(GuardMemo, stamp)), r::R9);
+    // (The way's memo proof, if any, is for the memo as it was: void.)
+    if let Some(q) = e.wproof.get(w).copied().flatten() {
+        a.store_empty(q);
+    }
     a.bind(skip);
 }
 

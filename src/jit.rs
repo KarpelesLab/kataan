@@ -38,6 +38,8 @@ mod forin;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod fused;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod gelim;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_mirror;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_persist;
@@ -6986,8 +6988,9 @@ impl X64Assembler {
     }
 
     /// `call rax` to a helper that runs no JavaScript, allocates nothing and
-    /// moves, frees or retypes no heap cell, reads no register file and
-    /// changes no binding (`direct_call`'s narrow entry): the receiver-cache
+    /// moves, frees or retypes no heap cell, reads no register file,
+    /// changes no binding and writes no property (`direct_call`'s narrow
+    /// entry; the proofs of `gelim` rely on the last): the receiver-cache
     /// keys and the global binding caches stay valid across it, and no
     /// pending inlined activation needs materializing for it. Only the
     /// promoted SSE registers (caller-saved) are spilled and reloaded.
@@ -9112,6 +9115,78 @@ impl JitFunction {
                 + 3 * n_mproved as i32
                 + 3 * n_cproved as i32);
         let fi_memo = |site: usize| forin::Memo::at(fi_base - 8 * forin::Memo::SLOTS * site as i32);
+        // Guard elimination across ops (`gelim`), under the `for-in` memos:
+        // the method reads in loops that prove their receiver's method for
+        // the next times (two slots each, the keys side by side), then the
+        // inlined method guards' memo way proofs (one slot per call site
+        // memo and way, shared by every guard of that memo) — each only for
+        // a key no op of the body stores in line.
+        let store_keys = gelim::StoreKeys::scan(ops, bytecode);
+        let mut n_gm = 0usize;
+        let gm_slot: Vec<Option<usize>> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, o)| match *o {
+                GenericOp::GetMethod { call, .. }
+                    if looped(i)
+                        && call_sites.get(call as usize).is_some_and(|p| !p.is_null())
+                        && matches!(bytecode.get(i), Some(crate::nbvm::Op::GetProp { key, .. })
+                            if !store_keys.may_store(key)) =>
+                {
+                    n_gm += 1;
+                    Some(n_gm - 1)
+                }
+                _ => None,
+            })
+            .collect();
+        let gm_base = fi_base - 8 * forin::Memo::SLOTS * n_forin as i32;
+        let gm_proof = |k: usize| {
+            let k = k as i32;
+            (gm_base - 8 * k - 8, gm_base - 8 * (n_gm as i32 + k) - 8)
+        };
+        let mut wp_memos: Vec<(usize, usize)> = Vec::new();
+        let wp_slot: Vec<Vec<Option<usize>>> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let GenericOp::InlineGuard { call, poly, .. } = *o else {
+                    return Vec::new();
+                };
+                // (Only in a loop: elsewhere a guard runs again only after a
+                // call, which empties its proof, so it would only cost.)
+                if !looped(i)
+                    || gelim::guard_key(ops, bytecode, i).is_none_or(|k| store_keys.may_store(k))
+                {
+                    return Vec::new();
+                }
+                let cache = match ops.get(call as usize) {
+                    Some(GenericOp::CallMethod { cache, .. }) => *cache as usize,
+                    Some(GenericOp::GetProp { call, .. } | GenericOp::SetProp { call, .. }) => {
+                        *call as usize
+                    }
+                    _ => return Vec::new(),
+                };
+                let Some(&memo) = call_sites.get(cache).filter(|p| !p.is_null()) else {
+                    return Vec::new();
+                };
+                (0..usize::from(poly >> 8).max(1))
+                    .map(|w| {
+                        let k = (memo as usize, w);
+                        Some(wp_memos.iter().position(|&m| m == k).unwrap_or_else(|| {
+                            wp_memos.push(k);
+                            wp_memos.len() - 1
+                        }))
+                    })
+                    .collect()
+            })
+            .collect();
+        let n_wp = wp_memos.len();
+        let wp_base = gm_base - 16 * n_gm as i32;
+        let wp_proof = |k: usize| wp_base - 8 * k as i32 - 8;
+        let wp_disps: Vec<Vec<Option<i32>>> = wp_slot
+            .iter()
+            .map(|v| v.iter().map(|s| s.map(wp_proof)).collect())
+            .collect();
         // Per compiled `for-in` loop, its `EnumKeys`' pc.
         let fi_enum: Vec<usize> = {
             let mut v = alloc::vec![usize::MAX; n_forin];
@@ -9247,7 +9322,9 @@ impl JitFunction {
                 + 2 * n_proved
                 + 3 * n_mproved
                 + 3 * n_cproved
-                + forin::Memo::SLOTS as usize * n_forin) as u32
+                + forin::Memo::SLOTS as usize * n_forin
+                + 2 * n_gm
+                + n_wp) as u32
                 * 8)
             + 15)
             & !15;
@@ -9493,6 +9570,8 @@ impl JitFunction {
                 .chain((0..n_mproved).map(|k| inl_mproved(k).bits))
                 .chain((0..n_cproved).map(|k| inl_cproved(k).ctor))
                 .chain((0..n_forin).map(|k| fi_memo(k).obj))
+                .chain((0..n_gm).map(|k| gm_proof(k).0))
+                .chain((0..n_wp).map(wp_proof))
                 .collect(),
         );
         // (Also the promoted loops' epoch slots: emptying them with the
@@ -10469,6 +10548,7 @@ impl JitFunction {
                             proved: proved_slot[op_idx].map(inl_proved),
                             mproved: mproof_slot[op_idx].map(inl_mproved),
                             cproved: cproof_slot[op_idx].map(inl_cproved),
+                            wproof: &wp_disps[op_idx],
                             keep: &num.guard_keep(op_idx),
                             // (In a promoted loop `numeric` emits the test
                             // itself, reading the boolean, but in a
@@ -13491,17 +13571,20 @@ impl JitFunction {
                             s.method_ptr,
                             call_site,
                             helper,
-                            rc.sites[op_idx]
-                                .filter(|p| {
-                                    p.family == recv_cache::Family::Obj && !num.in_spec(op_idx)
-                                })
-                                .map(|p| recv_cache::GetMethodWay {
-                                    key: rc_key(p.way),
-                                    cell: rc_cell(p.way),
-                                    check: p.check,
-                                    fill: p.fill,
-                                    layout: way_shape[p.way],
-                                }),
+                            (
+                                rc.sites[op_idx]
+                                    .filter(|p| {
+                                        p.family == recv_cache::Family::Obj && !num.in_spec(op_idx)
+                                    })
+                                    .map(|p| recv_cache::GetMethodWay {
+                                        key: rc_key(p.way),
+                                        cell: rc_cell(p.way),
+                                        check: p.check,
+                                        fill: p.fill,
+                                        layout: way_shape[p.way],
+                                    }),
+                                gm_slot[op_idx].map(gm_proof),
+                            ),
                         );
                     }
                     a.store_rax(disp(dst));

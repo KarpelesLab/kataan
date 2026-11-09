@@ -1241,6 +1241,13 @@ pub(super) fn plan(
         {
             fresh.retain(|x| x != dst);
         }
+        // An iteration's value (`for (const b of list)`) is usually another
+        // object than last time: its first site walks it at once rather
+        // than compare a way it would miss.
+        if let (GenericOp::Interp { .. }, Some(Op::IterNext { dst, .. })) = (op, bytecode.get(i)) {
+            fresh.retain(|x| x != dst);
+            fresh.push(*dst);
+        }
         // (Anything but a read, a copy or plain arithmetic may store a
         // property, or run code that does.)
         if !matches!(
