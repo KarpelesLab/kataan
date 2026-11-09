@@ -1139,6 +1139,38 @@ impl Rope {
         self.concat(&Rope::leaf(s))
     }
 
+    /// Whether the two ropes hold the same WTF-8 bytes (strict equality of
+    /// two strings): two short inline strings by their first word, else
+    /// their lengths then their bytes.
+    #[must_use]
+    #[inline]
+    pub fn same_bytes(&self, other: &Rope) -> bool {
+        if let (Node::Small { len: a, buf: x, .. }, Node::Small { len: b, buf: y, .. }) =
+            (&*self.0, &*other.0)
+        {
+            if a != b {
+                return false;
+            }
+            // The bytes past `len` are zero in both: one word decides a
+            // short string (most keys and names), with no `memcmp` call.
+            let word = |s: &[u8; SMALL_CAP]| {
+                u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+            };
+            if *a <= 8 {
+                return word(x) == word(y);
+            }
+            let n = usize::from(*a);
+            return x[..n] == y[..n];
+        }
+        if self.len() != other.len() {
+            return false;
+        }
+        match (self.as_leaf_bytes(), other.as_leaf_bytes()) {
+            (Some(p), Some(q)) => p == q,
+            _ => self.materialize_bytes() == other.materialize_bytes(),
+        }
+    }
+
     /// Borrows the rope's WTF-8 bytes directly when it is a single, unconcatenated
     /// `Leaf` (the common case — a string that has never been `+`-joined), returning
     /// `None` for a `Concat` tree. This is a zero-copy fast path: callers that only

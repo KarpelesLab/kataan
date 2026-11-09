@@ -644,6 +644,8 @@ pub enum Op {
         dst: Reg,
         src: Reg,
         table: Vec<(Vec<u8>, u32)>,
+        /// The last few discriminants' answers (`realm::SwitchMemo`).
+        memo: crate::realm::SwitchMemo,
     },
     /// `dst = src === lit` (or `!==`, `==`, `!=` by `kind`, see
     /// `STR_EQ_NEGATE` / `STR_EQ_LOOSE`): an equality against a string
@@ -4136,13 +4138,9 @@ fn vm_construct(
 /// throws for.
 fn instance_of_fast(realm: &mut Realm, x: NanBox, y: NanBox) -> Option<bool> {
     let f = Handle::from_raw(y.as_handle()?);
-    if !realm.inherits_default_has_instance(f) {
-        return None;
-    }
-    realm.materialize_fn_proto(f);
+    let p = realm.instance_of_target(f)?;
     let realm = &*realm;
-    let p = realm
-        .get_property(f, "prototype")
+    let p = p
         .filter(|p| is_object_value(realm, *p))?
         .as_handle()
         .map(Handle::from_raw)?;
@@ -7176,6 +7174,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         direct_call: jit_tier::jit_helper_direct_call,
         direct_has_own: jit_tier::jit_helper_direct_has_own,
         to_str: jit_tier::jit_helper_to_str,
+        switch_str: jit_tier::jit_helper_switch_str,
         new_object: jit_tier::jit_helper_new_object,
         owe_fn_proto: jit_tier::jit_helper_owe_fn_proto,
         new_array: jit_tier::jit_helper_new_array,
@@ -9440,6 +9439,11 @@ fn run_frame_at_ic(
                     }
                     continue;
                 }
+                // `new Map()` / `new Set()` of the default constructors.
+                if let Some(v) = ctx.realm.new_default_collection(c, &argv) {
+                    regs[*dst as usize] = v;
+                    continue;
+                }
                 match with_host(ctx, |h| h.construct(c, &argv)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -9625,8 +9629,15 @@ fn run_frame_at_ic(
                 let handle = ctx.realm.new_string_wtf8(bytes.clone());
                 regs[*dst as usize] = NanBox::handle(handle.to_raw());
             }
-            Op::SwitchStr { dst, src, table } => {
-                let i = ctx.realm.string_switch_index(regs[*src as usize], table);
+            Op::SwitchStr {
+                dst,
+                src,
+                table,
+                memo,
+            } => {
+                let i = ctx
+                    .realm
+                    .string_switch_index_memo(regs[*src as usize], table, memo);
                 regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
             }
             Op::StrEqConst {
@@ -18586,6 +18597,7 @@ impl Compiler {
                             dst: idx,
                             src: d,
                             table,
+                            memo: crate::realm::SwitchMemo::default(),
                         });
                         for i in picks {
                             let k = c.alloc();

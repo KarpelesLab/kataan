@@ -13,6 +13,41 @@ use super::{Cell, NanBox, Realm, rope_bytes};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+/// A string `switch` site's memo of its last few discriminants (see
+/// [`Realm::string_switch_index_memo`]): each the rope of a string it looked
+/// up, with the answer, direct-mapped by the rope's address. A rope is
+/// immutable and the memo keeps it alive, so a string cell holding that very
+/// rope (`Rope::ptr_eq`) has those contents and that answer. A program
+/// dispatches on a few literal strings (each literal site's evaluations share
+/// one cell), so the memo answers almost every lookup without comparing
+/// bytes. Only short strings are kept.
+#[derive(Default)]
+pub struct SwitchMemo {
+    ways: core::cell::RefCell<[(Option<crate::rope::Rope>, u32); SWITCH_MEMO_WAYS]>,
+}
+
+/// How many discriminants a [`SwitchMemo`] remembers.
+const SWITCH_MEMO_WAYS: usize = 16;
+
+/// The longest string a [`SwitchMemo`] keeps (bytes).
+const SWITCH_MEMO_MAX: usize = 64;
+
+/// "No case matched", as a memoized answer.
+const SWITCH_NONE: u32 = u32::MAX;
+
+impl Clone for SwitchMemo {
+    /// An empty memo: a copy of the op (inlining, splicing) starts afresh.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl core::fmt::Debug for SwitchMemo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SwitchMemo")
+    }
+}
+
 /// The order a string switch table is sorted in: by length, then bytes.
 #[must_use]
 pub fn switch_key_order(a: &[u8], b: &[u8]) -> Ordering {
@@ -30,6 +65,36 @@ impl Realm {
             .get(crate::heap::Handle::from_raw(h))
             .and_then(Cell::as_str)?;
         Some(r.len() == lit.len() && *rope_bytes(r) == *lit)
+    }
+
+    /// [`string_switch_index`](Self::string_switch_index), answered from the
+    /// site's `memo` when it holds `v`'s rope, else looked up and noted there.
+    #[must_use]
+    pub fn string_switch_index_memo(
+        &self,
+        v: NanBox,
+        table: &[(Vec<u8>, u32)],
+        memo: &SwitchMemo,
+    ) -> Option<u32> {
+        let h = v.as_handle()?;
+        let r = self
+            .heap
+            .get(crate::heap::Handle::from_raw(h))
+            .and_then(Cell::as_str)?;
+        // (Fibonacci hashing of the address: nodes allocated a fixed stride
+        // apart still spread over the ways.)
+        let way = ((r.addr() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize
+            % SWITCH_MEMO_WAYS;
+        if let (Some(k), i) = &memo.ways.borrow()[way]
+            && k.ptr_eq(r)
+        {
+            return (*i != SWITCH_NONE).then_some(*i);
+        }
+        let i = self.string_switch_index(v, table);
+        if r.len() <= SWITCH_MEMO_MAX {
+            memo.ways.borrow_mut()[way] = (Some(r.clone()), i.unwrap_or(SWITCH_NONE));
+        }
+        i
     }
 
     /// The index stored with the entry of `table` (sorted by
@@ -51,9 +116,28 @@ impl Realm {
             return None;
         }
         let bytes = rope_bytes(r);
+        if len <= 8 {
+            // A short key by one word, without a `memcmp` call per candidate.
+            let w = word8(&bytes);
+            return table[lo..hi]
+                .iter()
+                .find(|(k, _)| word8(k) == w)
+                .map(|(_, i)| *i);
+        }
         table[lo..hi]
             .iter()
             .find(|(k, _)| **k == *bytes)
             .map(|(_, i)| *i)
     }
+}
+
+/// The bytes of a string of at most 8 bytes as one zero-padded word (two
+/// such strings of one length are equal exactly when their words are).
+#[inline]
+fn word8(b: &[u8]) -> u64 {
+    let mut w = [0u8; 8];
+    for (d, s) in w.iter_mut().zip(b) {
+        *d = *s;
+    }
+    u64::from_le_bytes(w)
 }

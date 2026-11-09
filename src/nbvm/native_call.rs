@@ -760,8 +760,8 @@ fn try_str_unit(
 }
 
 /// `recv.key(args…)` when the site last called a `Map.prototype` /
-/// `Set.prototype` method on this very Map/Set and still proves it is that
-/// intrinsic (`Realm::method_site_memo_hit`): the method's lean form
+/// `Set.prototype` method and still proves that `recv[key]` is that
+/// intrinsic (`Realm::coll_site_call`): the method's lean form
 /// (`Realm::coll_fast`). `None`, having done nothing, otherwise. Never runs
 /// code and never throws (a receiver of the wrong kind is a miss).
 #[inline(never)]
@@ -770,22 +770,20 @@ pub(super) fn try_coll(
     recv: NanBox,
     regs: &[NanBox],
     args: &[Reg],
-    cache: &PropertyCache,
+    cache: &mut PropertyCache,
 ) -> Option<NanBox> {
-    let site = cache.native.as_deref()?;
+    let site = cache.native.as_deref_mut()?;
     let op = site.op.coll_op()?;
     let h = Handle::from_raw(recv.as_handle()?);
-    if ctx.host.is_none()
-        || ctx.realm.multi_realm
-        || !ctx.realm.method_site_memo_hit(h, &site.chain, site.method)
-    {
+    if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }
     let arg = |i: usize| {
         args.get(i)
             .map_or(NanBox::undefined(), |r| regs[*r as usize])
     };
-    ctx.realm.coll_fast(h, op, arg(0), arg(1))
+    ctx.realm
+        .coll_site_call(h, &mut site.chain, site.method, op, arg(0), arg(1))
 }
 
 /// `Call(method, recv, args…)` for a method value already read (EvaluateCall

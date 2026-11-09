@@ -66,11 +66,16 @@ impl Realm {
             }
             CollOp::MapGet | CollOp::MapHas | CollOp::SetHas => {}
         }
-        if !indexed {
-            self.collection_build_index(h);
-        }
-        let hash = self.collection_key_hash(a);
-        let pos = self.collection_find_hashed(h, a, hash);
+        let pos = match self.collection_find_ro(h, a) {
+            Some(pos) => pos,
+            None => {
+                if !indexed {
+                    self.collection_build_index(h);
+                }
+                let hash = self.collection_key_hash(a);
+                self.collection_find_hashed(h, a, hash)
+            }
+        };
         Some(match op {
             CollOp::MapGet => match (pos, self.heap.get(h)) {
                 (Some(i), Some(Cell::Collection { entries, .. })) => {

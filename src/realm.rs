@@ -48,6 +48,7 @@ pub use lit_cells::LitCells;
 mod private_fast;
 pub use private_fast::PrivCache;
 pub(crate) mod hidden_layout;
+mod inst_memo;
 pub(crate) mod json_fast;
 mod msg_text;
 mod pow5_tables;
@@ -59,7 +60,7 @@ mod str_key_fast;
 mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;
-pub use str_switch::switch_key_order;
+pub use str_switch::{SwitchMemo, switch_key_order};
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use typed_fast::typed_elems_seen;
 mod handle_map;
@@ -473,6 +474,15 @@ pub struct Realm {
     /// entry, as [`regexp_default_proto`](Realm::regexp_default_proto) is a
     /// RegExp's (see [`link_promise_proto`](Realm::link_promise_proto)).
     promise_default_proto: Option<Handle>,
+    /// The `Map` (index 0) and `Set` (index 1) constructor of a single-realm
+    /// run and its `prototype`, recorded by the first
+    /// [`link_collection_proto`](Realm::link_collection_proto): the
+    /// `[[Prototype]]` of every collection flagged `default_proto`, so that
+    /// `new Map()` inserts no side-table entry (and can be made without the
+    /// host, [`new_default_collection`](Realm::new_default_collection)).
+    coll_default: [Option<(Handle, Handle)>; 2],
+    /// The `instanceof` right-hand side memo (`realm::inst_memo`).
+    inst_memo: inst_memo::InstMemo,
     /// Class tags for *non-object* cells — a derived instance of a native base
     /// (`class S extends Map {}` → a real `Map` cell) records its class here, since
     /// the inline class tag lives only on plain-object cells. Read by
@@ -1026,6 +1036,8 @@ impl Realm {
             vm_fn_default_proto: None,
             regexp_default_proto: None,
             promise_default_proto: None,
+            coll_default: [None; 2],
+            inst_memo: inst_memo::InstMemo::default(),
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
@@ -1149,6 +1161,69 @@ impl Realm {
             }
         }
         self.set_native_proto(h, proto);
+    }
+
+    /// Links the new strong Map/Set cell `h`, made by the constructor `ctor`
+    /// with `new.target` the constructor itself, to `proto` (that
+    /// constructor's `prototype`): in a single-realm run the first such pair
+    /// per kind becomes the default ([`coll_default`](Realm::coll_default))
+    /// and the cell is flagged to report it, so no side-table entry is made;
+    /// any other link is recorded explicitly. (The constructor's `prototype`
+    /// is non-writable and non-configurable, so it is that very object for
+    /// the constructor's life.)
+    pub fn link_collection_proto(&mut self, h: Handle, ctor: Handle, proto: Handle) {
+        if !self.multi_realm
+            && let Some(Cell::Collection {
+                is_set,
+                is_weak: false,
+                ..
+            }) = self.heap.get(h)
+        {
+            let k = usize::from(*is_set);
+            let ok = match self.coll_default[k] {
+                None => {
+                    self.coll_default[k] = Some((ctor, proto));
+                    true
+                }
+                Some((c, p)) => c == ctor && p == proto,
+            };
+            if ok
+                && !self.native_protos.contains_key(&h.to_raw())
+                && let Some(Cell::Collection { default_proto, .. }) = self.heap.get_mut(h)
+            {
+                *default_proto = true;
+                return;
+            }
+        }
+        self.set_native_proto(h, proto);
+    }
+
+    /// `new C()` / `new C(undefined)` / `new C(null)` when `C` is the
+    /// recorded default `Map` or `Set` constructor
+    /// ([`link_collection_proto`](Realm::link_collection_proto)) and
+    /// `new.target` is `C` itself: a fresh empty collection linked to the
+    /// default — exactly what the constructor makes then (its
+    /// `OrdinaryCreateFromConstructor` reads `C.prototype`, which cannot
+    /// change, and an absent iterable adds nothing), without the host's
+    /// round trip. `None` for anything else.
+    pub fn new_default_collection(&mut self, ctor: NanBox, args: &[NanBox]) -> Option<NanBox> {
+        if self.multi_realm
+            || args
+                .first()
+                .is_some_and(|a| !a.is_undefined() && !a.is_null())
+        {
+            return None;
+        }
+        let c = Handle::from_raw(ctor.as_handle()?);
+        let k = self
+            .coll_default
+            .iter()
+            .position(|d| d.is_some_and(|(dc, _)| dc == c))?;
+        let h = self.new_collection(k == 1);
+        if let Some(Cell::Collection { default_proto, .. }) = self.heap.get_mut(h) {
+            *default_proto = true;
+        }
+        Some(NanBox::handle(h.to_raw()))
     }
 
     /// Records an explicit `[[Prototype]]` for a callable cell (native / bound
@@ -3846,6 +3921,7 @@ impl Realm {
         self.heap.alloc(Cell::Collection {
             is_set,
             is_weak: false,
+            default_proto: false,
             entries: Vec::new(),
             live: 0,
             iters: 0,
@@ -3922,9 +3998,84 @@ impl Realm {
     /// The index of the entry whose key is `SameValueZero`-equal to `key`, using
     /// (and building on demand) the collection's hash index. `None` if absent or
     /// `handle` is not a collection.
+    #[inline]
     fn collection_find(&mut self, handle: Handle, key: NanBox) -> Option<usize> {
+        if let Some(found) = self.collection_find_ro(handle, key) {
+            return found;
+        }
         let hash = self.collection_key_hash(key);
         self.collection_find_hashed(handle, key, hash)
+    }
+
+    /// [`collection_find`](Self::collection_find) on one read of the cell,
+    /// when that needs no new hash index: an empty collection is answered
+    /// at once, one with an index by its probe, and one without an index and
+    /// at most [`COLL_SCAN_MAX`] entries (most Maps a program makes stay that
+    /// small) by a scan comparing each live key with `key` by
+    /// `SameValueZero` (the bits first, then a Number's value, a String's
+    /// bytes). `None` when the index must be built first (a larger
+    /// collection, or a BigInt key, which compares by value: the index
+    /// path's equality).
+    fn collection_find_ro(&self, handle: Handle, key: NanBox) -> Option<Option<usize>> {
+        let Some(Cell::Collection {
+            entries,
+            live,
+            index,
+            ..
+        }) = self.heap.get(handle)
+        else {
+            return Some(None);
+        };
+        if *live == 0 {
+            return Some(None);
+        }
+        if let Some(map) = index {
+            let hash = self.collection_key_hash(key);
+            return Some(self.collection_probe(map, entries, key, hash));
+        }
+        if entries.len() > COLL_SCAN_MAX {
+            return None;
+        }
+        self.collection_scan(entries, key)
+    }
+
+    /// [`collection_find_ro`](Self::collection_find_ro)'s scan of the
+    /// entries of a collection (with at least one live entry).
+    #[inline]
+    pub(super) fn collection_scan(
+        &self,
+        entries: &[(NanBox, NanBox)],
+        key: NanBox,
+    ) -> Option<Option<usize>> {
+        let bits = key.to_bits();
+        if let Some(i) = entries.iter().position(|(k, _)| k.to_bits() == bits) {
+            // (A tombstone is a hole, which no key is.)
+            return Some((!key.is_hole()).then_some(i));
+        }
+        if let Some(n) = key.as_number() {
+            // `SameValueZero` of distinct Number bits: NaN with NaN, `+0`
+            // with `-0` (a stored key is never `-0`, the lookup's may be).
+            return Some(entries.iter().position(|(k, _)| {
+                k.as_number()
+                    .is_some_and(|m| m == n || (m.is_nan() && n.is_nan()))
+            }));
+        }
+        let Some(kh) = key.as_handle() else {
+            // `undefined`, `null`, a Boolean: equal only to its own bits.
+            return Some(None);
+        };
+        match self.heap.get(Handle::from_raw(kh)) {
+            Some(Cell::Str(r)) => Some(entries.iter().position(|(k, _)| {
+                k.as_handle().is_some_and(|h| {
+                    matches!(self.heap.get(Handle::from_raw(h)),
+                        Some(Cell::Str(e)) if r.same_bytes(e))
+                })
+            })),
+            Some(Cell::BigInt(_)) => None,
+            // Any other heap value (an object, a Symbol) is equal only to
+            // itself: its very bits, which no entry has.
+            _ => Some(None),
+        }
     }
 
     /// [`collection_find`](Self::collection_find) with the key's hash already
@@ -3941,6 +4092,19 @@ impl Realm {
         else {
             return None;
         };
+        self.collection_probe(map, entries, key, hash)
+    }
+
+    /// The probe of the index `map` of a collection with `entries` for `key`
+    /// (whose hash is `hash`).
+    #[inline]
+    fn collection_probe(
+        &self,
+        map: &coll_index::CollIndex,
+        entries: &[(NanBox, NanBox)],
+        key: NanBox,
+        hash: u64,
+    ) -> Option<usize> {
         // Fast equality for the common key kinds; anything else (strings,
         // BigInts by value) goes through `SameValueZero`.
         let key_num = key.as_number();
@@ -4034,8 +4198,9 @@ impl Realm {
     /// Sets `key → value` in the collection at `handle` (inserting or updating,
     /// by `SameValueZero` key match). Returns `false` if not a collection.
     pub fn collection_set(&mut self, handle: Handle, key: NanBox, value: NanBox) -> bool {
-        let Some((is_set, _)) = self.heap.get(handle).and_then(Cell::as_collection) else {
-            return false;
+        let (is_set, indexed) = match self.heap.get(handle) {
+            Some(Cell::Collection { is_set, index, .. }) => (*is_set, index.is_some()),
+            _ => return false,
         };
         // `Map.prototype.set` step 5 / `Set.prototype.add` step 4: a `-0` key is
         // normalized to `+0` before it is stored, so the key read back out of
@@ -4045,9 +4210,23 @@ impl Realm {
             _ => key,
         };
         let value = if is_set { key } else { value };
-        // Look the key up through the hash index (built on demand), then write.
-        let hash = self.collection_key_hash(key);
-        let pos = self.collection_find_hashed(handle, key, hash);
+        // Look the key up (a small collection without an index by a scan,
+        // else through the hash index, built on demand), then write.
+        // (An indexed one needs the hash anyway, to index a new entry.)
+        let small = if indexed {
+            None
+        } else {
+            self.collection_find_ro(handle, key)
+        };
+        let hash = if small.is_some() {
+            0
+        } else {
+            self.collection_key_hash(key)
+        };
+        let pos = match small {
+            Some(pos) => pos,
+            None => self.collection_find_hashed(handle, key, hash),
+        };
         if let Some(i) = pos {
             // `Set.prototype.add` of a key already there changes nothing.
             if is_set {
@@ -4074,7 +4253,8 @@ impl Realm {
         let i = entries.len();
         entries.push((key, value));
         *live += 1;
-        // (`collection_find_hashed` just built the index if it was missing.)
+        // (`collection_find_hashed` just built the index if it was missing;
+        // a small collection's scan found it had none, and it has none still.)
         if let Some(map) = index {
             map.insert(hash, i);
         }
@@ -5138,6 +5318,15 @@ impl Realm {
         // `null` (see `set_object_proto`).
         if self.has_explicit_null_proto(handle) {
             return None;
+        }
+        // A Map/Set made by its default constructor (see `coll_default`).
+        if let Some(Cell::Collection {
+            default_proto: true,
+            is_set,
+            ..
+        }) = cell
+        {
+            return self.coll_default[usize::from(*is_set)].map(|(_, p)| p);
         }
         // A RegExp with no explicit link (see `regexp_default_proto`).
         if let Some(p) = self.regexp_default_proto
@@ -8014,6 +8203,12 @@ impl Realm {
         out.extend(self.vm_fn_default_proto);
         out.extend(self.regexp_default_proto);
         out.extend(self.promise_default_proto);
+        out.extend(
+            self.coll_default
+                .iter()
+                .flatten()
+                .flat_map(|&(c, p)| [c, p]),
+        );
         out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
         out.extend(self.intl_protos.values().copied());
         // Host-pinned values and the JIT's spilled temporaries.
@@ -8690,6 +8885,8 @@ impl Realm {
         // set, keyed by handle; a cache re-watches on its next fill).
         crate::object::bump_proto_epoch();
         self.watched_cells = handle_map::HandleKeyedMap::new();
+        // Keyed by handle too.
+        self.inst_memo = inst_memo::InstMemo::default();
         // The VM's iteration intrinsics are a cache that the relocation below does
         // not forward: drop it (the VM then takes the protocol path). The
         // `@@species` key is a string, not a handle, so it survives.
@@ -8801,11 +8998,16 @@ impl Realm {
             host_native_state,
             typed_len_protos,
             owed_fn_protos,
+            coll_default,
             ..
         } = self;
         let stats = gc::compact_with(heap, &mut all, &mut |forward| {
             for h in owed_fn_protos.iter_mut() {
                 *h = forward(Handle::from_raw(*h)).to_raw();
+            }
+            for (c, p) in coll_default.iter_mut().flatten() {
+                *c = forward(*c);
+                *p = forward(*p);
             }
             // A live one moves with its cell; a dead one (no typed array
             // links it any more) only costs a needless validation.
@@ -9708,9 +9910,7 @@ impl Realm {
                     // `materialize()` (which mapped every lone surrogate to U+FFFD,
                     // making `"\uD800" === "\uDC00"` wrongly true) — byte equality is
                     // exact.
-                    (Some(Cell::Str(ra)), Some(Cell::Str(rb))) => {
-                        ra.len() == rb.len() && rope_bytes(ra) == rope_bytes(rb)
-                    }
+                    (Some(Cell::Str(ra)), Some(Cell::Str(rb))) => ra.same_bytes(rb),
                     // Two distinct BigInt cells are `===` iff their mathematical
                     // values are equal (BigInts are value types, not references).
                     (Some(Cell::BigInt(ba)), Some(Cell::BigInt(bb))) => ba == bb,
@@ -9722,6 +9922,10 @@ impl Realm {
         }
     }
 }
+
+/// The most entries a Map/Set without a hash index is searched by a plain
+/// scan (`Realm::collection_find_ro`) instead of building the index.
+pub(crate) const COLL_SCAN_MAX: usize = 8;
 
 /// [`Vec::retain`] of `list[from..]` alone: the entries before `from` all
 /// stay, unvisited.

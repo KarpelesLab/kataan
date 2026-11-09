@@ -3639,6 +3639,9 @@ pub struct GenericHelpers {
     /// `jit_helper_to_str(ctx, value, lazy, _) -> bits`: `Op::ToStr` /
     /// `Op::ToStrLazy` without user code, else `0` (the op itself runs).
     pub to_str: JitBinHelper,
+    /// `jit_helper_switch_str(ctx, value, op, _) -> bits`: `Op::SwitchStr`'s
+    /// case index (a Number; never throws, allocates nothing).
+    pub switch_str: JitBinHelper,
     /// `jit_helper_new_object(ctx, _) -> bits`: `Op::NewObject`'s fresh
     /// ordinary object (never throws).
     pub new_object: JitTruthyHelper,
@@ -10830,11 +10833,31 @@ impl JitFunction {
                     }
                     let slow = a.new_label();
                     let done = a.new_label();
-                    recv_slot!(op_idx, cell, slow, recv_cache::Family::Cell);
+                    let other = a.new_label();
+                    recv_slot!(op_idx, cell, other, recv_cache::Family::Cell);
                     a.load_rax(disp(src));
                     a.p_barrier_check(&layout, helpers.call_layout.realm, slow);
                     a.load_rdx(disp(src));
                     a.g_store(call_seq::r::RCX, layout.props.off_box_val, call_seq::r::RDX);
+                    a.jmp(done);
+                    // A one-element array cell (a captured parameter's, which
+                    // each activation makes): its present element 0, written
+                    // in place as `vm_cell_set` writes it when the write
+                    // barrier has nothing to do.
+                    a.bind(other);
+                    walk_to_slot!(cell, slow);
+                    family_checks!(recv_cache::Family::Arr, slow);
+                    a.load_rax(disp(src));
+                    a.p_barrier_check(&layout, helpers.call_layout.realm, slow);
+                    a.p_arr_len_ptr(&layout);
+                    a.g_test(call_seq::r::R8);
+                    a.g_jcc(call_seq::cc::E, slow);
+                    a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
+                    a.movabs_argreg(2, NanBox::hole().to_bits() as i64); // rdx
+                    a.g_cmp(call_seq::r::RAX, call_seq::r::RDX);
+                    a.je(slow);
+                    a.load_rdx(disp(src));
+                    a.g_store(call_seq::r::R11, 0, call_seq::r::RDX);
                     a.jmp(done);
                     a.bind(slow);
                     // (A speculative loop's fast version leaves for its copy:
@@ -12275,6 +12298,19 @@ impl JitFunction {
                             }
                             a.bind(done);
                         }
+                        // A string `switch`'s case lookup: its own leaf
+                        // helper, not the one-op interpreter.
+                        op @ crate::nbvm::Op::SwitchStr { dst, src, .. }
+                            if ok(*dst) && ok(*src) =>
+                        {
+                            let op_ptr: *const crate::nbvm::Op = op;
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(*src));
+                            a.movabs_argreg(2, op_ptr as i64);
+                            a.movabs_rax(helpers.switch_str as usize as i64);
+                            a.call_rax_pure();
+                            a.store_rax(disp(*dst));
+                        }
                         // A template's substitution: a string as it is, a
                         // primitive's text from its own helper, not the one-op
                         // interpreter; anything else is the op's.
@@ -12316,8 +12352,26 @@ impl JitFunction {
                                 {
                                     Some((*dst, elems.iter().map(|r| disp(*r)).collect::<Vec<_>>()))
                                 }
+                                // `NewArray` of a few `undefined`s (a captured
+                                // parameter's cell, made by every activation):
+                                // the literal of that many copies of the
+                                // destination, which first holds `undefined`
+                                // (the op overwrites it, and nothing reads it
+                                // before: a miss's helper makes the array anew).
+                                crate::nbvm::Op::NewArray { dst, len }
+                                    if ok(*dst)
+                                        && (1..=crate::cell::ARRAY_INLINE_CAP).contains(len) =>
+                                {
+                                    Some((*dst, alloc::vec![disp(*dst); *len]))
+                                }
                                 _ => None,
                             };
+                            if let (Some((dst, _)), crate::nbvm::Op::NewArray { .. }) =
+                                (&small, array_op)
+                            {
+                                a.movabs_rax(NanBox::undefined().to_bits() as i64);
+                                a.store_rax(disp(*dst));
+                            }
                             let done = a.new_label();
                             let mut cold = None;
                             // (In a speculative loop's fast version a small

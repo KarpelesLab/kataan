@@ -3503,7 +3503,16 @@ impl Interp {
             // in the realm's native-proto table (read by `object_proto`). A subclass
             // (`class S extends Map {}` / `Reflect.construct`) links to
             // `newTarget.prototype`.
-            self.realm.set_native_proto(handle, proto);
+            match callee.as_handle().map(Handle::from_raw) {
+                // `new Map()` itself: the realm's default link for its kind.
+                Some(c)
+                    if matches!(id, N_MAP | N_SET)
+                        && native_new_target.as_handle() == callee.as_handle() =>
+                {
+                    self.realm.link_collection_proto(handle, c, proto);
+                }
+                _ => self.realm.set_native_proto(handle, proto),
+            }
         }
         // A weak collection rejects primitive keys (its keys must be objects/symbols).
         if matches!(id, N_WEAKMAP | N_WEAKSET) {

@@ -646,41 +646,147 @@ impl Realm {
         self.site_links_get_stamping(cur, key, cache)
     }
 
-    /// The one-receiver fast form of [`method_site_get`](Self::method_site_get):
-    /// whether `cache` proves that `recv[key]` is the function cell `method`
-    /// because `recv` is the Map/Set it noted at the current prototype epoch
-    /// ([`method_site_note_recv`](Self::method_site_note_recv)), with every
-    /// link unchanged since and the holder's slot still `method`. `false`
-    /// sends the caller to the general check.
-    #[inline]
-    pub(crate) fn method_site_memo_hit(
-        &self,
+    /// `recv.key(a, b)` at a method site whose memo `cache` names the
+    /// `Map.prototype` / `Set.prototype` built-in `method` that `op` is, when
+    /// the site still proves that `recv[key]` is that very function: either
+    /// `recv` is the receiver the site noted at the current prototype epoch
+    /// ([`method_site_note_recv`](Self::method_site_note_recv)), or it is any
+    /// collection cell that owns no named property (it has no auxiliary
+    /// object, where a collection's named properties live) and is not
+    /// host-exotic, so the `[[Get]]` of the key continues at its
+    /// `[[Prototype]]`; that is the cache's first link, every link of which
+    /// is unchanged since it was validated with all of them watched (the
+    /// stamp is the current prototype epoch); and the holder's slot still
+    /// holds `method`. An interpreter that keeps making environments of fresh
+    /// Maps (`env.vars.get(name)` up a scope chain) calls each method on ever
+    /// new receivers, which a one-receiver memo never serves. Then the
+    /// method's lean form ([`coll_fast`](Self::coll_fast)); a lookup in a
+    /// collection without an index and at most `COLL_SCAN_MAX` entries is
+    /// answered on the same read of the receiver's cell. `None`, having done
+    /// nothing, for anything else (the caller's general path, which also
+    /// rejects a receiver of the wrong kind).
+    pub(crate) fn coll_site_call(
+        &mut self,
         recv: Handle,
-        cache: &MethodSiteCache,
+        cache: &mut MethodSiteCache,
         method: u64,
-    ) -> bool {
+        op: super::coll_fast::CollOp,
+        a: NanBox,
+        b: NanBox,
+    ) -> Option<NanBox> {
+        use super::coll_fast::CollOp;
         let epoch = crate::object::proto_epoch();
         if !cache.armed
             || cache.prim
             || cache.own
-            || cache.recv_memo != recv.to_raw()
-            || cache.recv_stamp != epoch
             || cache.stamp != epoch
             || cache.swaps != self.cell_swaps
         {
-            return false;
+            return None;
+        }
+        let Some(Cell::Collection {
+            is_set,
+            is_weak: false,
+            default_proto,
+            entries,
+            live,
+            index,
+            ..
+        }) = self.heap.get(recv)
+        else {
+            return None;
+        };
+        if *is_set != matches!(op, CollOp::SetAdd | CollOp::SetHas | CollOp::SetDelete) {
+            return None;
+        }
+        let unnoted = cache.recv_memo != recv.to_raw() || cache.recv_stamp != epoch;
+        if unnoted {
+            let first = cache.links.first()?;
+            if self.aux_props.contains_key(&recv.to_raw()) || self.is_host_exotic(recv) {
+                return None;
+            }
+            // (`object_proto`'s answer, its commonest case first.)
+            let proto = if *default_proto
+                && !self.native_protos.contains_key(&recv.to_raw())
+                && !self.has_explicit_null_proto(recv)
+            {
+                self.coll_default[usize::from(*is_set)].map(|(_, p)| p)
+            } else {
+                self.object_proto(recv)
+            };
+            if proto.map(Handle::to_raw) != Some(first.0) {
+                return None;
+            }
         }
         // The holder's own value (a store to an existing data property does
         // not move the epoch): read under its recorded shape.
-        if let Some(Cell::Object(o)) = self.heap.get(Handle::from_raw(cache.holder_props))
-            && let (Some(s), Some(m)) = (o.shaped_shape(), cache.holder_shape.as_ref())
-            && Rc::ptr_eq(s, m)
-        {
-            return o
-                .slot(cache.holder_slot)
-                .is_some_and(|v| v.to_bits() == method);
+        match self.heap.get(Handle::from_raw(cache.holder_props)) {
+            Some(Cell::Object(o))
+                if o.shaped_shape()
+                    .zip(cache.holder_shape.as_ref())
+                    .is_some_and(|(s, m)| Rc::ptr_eq(s, m))
+                    && o.slot(cache.holder_slot)
+                        .is_some_and(|v| v.to_bits() == method) => {}
+            _ => return None,
         }
-        false
+        let lookup = matches!(op, CollOp::MapGet | CollOp::MapHas | CollOp::SetHas);
+        // A lookup answered on this read of the cell: an empty collection,
+        // one with an index (its probe), or a small one (a scan).
+        let found = if !lookup {
+            None
+        } else if *live == 0 {
+            Some(None)
+        } else if let Some(map) = index {
+            let hash = self.collection_key_hash(a);
+            Some(self.collection_probe(map, entries, a, hash))
+        } else if entries.len() <= super::COLL_SCAN_MAX {
+            self.collection_scan(entries, a)
+        } else {
+            None
+        };
+        let answer = found.map(|pos| {
+            if op == CollOp::MapGet {
+                pos.and_then(|i| entries.get(i))
+                    .map_or(NanBox::undefined(), |e| e.1)
+            } else {
+                NanBox::boolean(pos.is_some())
+            }
+        });
+        if unnoted {
+            // A receiver proved twice in a row is noted, so the next calls
+            // on it skip its probe (one that keeps changing is not: noting
+            // watches it, a cost every receiver would pay).
+            if cache.last_recv == recv.to_raw() && cache.recv_notes < RECV_NOTES {
+                self.coll_site_note(recv, cache);
+            }
+            cache.last_recv = recv.to_raw();
+        }
+        // (The receiver is a strong collection of the method's kind.)
+        Some(match (answer, op) {
+            (Some(v), _) => v,
+            (None, CollOp::MapSet) => {
+                self.collection_set(recv, a, b);
+                NanBox::handle(recv.to_raw())
+            }
+            (None, CollOp::SetAdd) => {
+                self.collection_set(recv, a, a);
+                NanBox::handle(recv.to_raw())
+            }
+            (None, CollOp::MapDelete | CollOp::SetDelete) => {
+                NanBox::boolean(self.collection_delete(recv, a))
+            }
+            // A lookup in a larger collection without an index (which
+            // builds it).
+            (None, _) => return self.coll_fast(recv, op, a, b),
+        })
+    }
+
+    /// [`coll_site_call`](Self::coll_site_call)'s noting of a receiver
+    /// (out of its line).
+    #[cold]
+    #[inline(never)]
+    fn coll_site_note(&mut self, recv: Handle, cache: &mut MethodSiteCache) {
+        self.method_site_note_recv(recv, cache, false);
     }
 
     /// `Object.keys(a)` of an array that never had side-table state (so no
@@ -1385,6 +1491,9 @@ pub struct MethodSiteCache {
     /// [`Realm::method_site_note_recv`]).
     recv_memo: u64,
     recv_stamp: u64,
+    /// The last receiver [`Realm::coll_site_call`] proved without the memo
+    /// (raw handle), so that one met twice in a row gets noted.
+    last_recv: u64,
     /// How many receivers this site has watched for `recv_memo` (capped at
     /// [`RECV_NOTES`], so a site that sees ever new Maps adds a bounded
     /// number of entries to the realm's never-pruned watched set).

@@ -421,6 +421,12 @@ pub enum Cell {
         is_set: bool,
         /// Whether this is a `WeakMap`/`WeakSet` (keys must be objects/symbols).
         is_weak: bool,
+        /// Whether its `[[Prototype]]` is the realm's default for its kind
+        /// (`Realm::link_collection_proto`): the `Map`/`Set` constructor's
+        /// own `prototype`, recorded once instead of a side-table entry per
+        /// collection. An explicit link made later (`setPrototypeOf`) takes
+        /// precedence over it.
+        default_proto: bool,
         /// The entries, in insertion order, compared by `SameValueZero`-ish
         /// strict equality. A deleted entry stays in place as a tombstone
         /// (`(hole, hole)`), so a live iterator's index cursor stays valid; the

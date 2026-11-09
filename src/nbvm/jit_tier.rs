@@ -1428,6 +1428,33 @@ pub(crate) extern "C" fn jit_helper_to_str(
     }
 }
 
+/// `Op::SwitchStr` at `op` of the discriminant `v`: the index of the first
+/// case whose literal is `v`'s contents, `-1` for none, as a Number's bits
+/// (what its interpreter arm writes). Reads the heap only: no allocation, no
+/// throw, no JavaScript.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
+/// pointer into the bytecode the calling `JitProto` owns.
+pub(crate) extern "C" fn jit_helper_switch_str(
+    ctx: *mut core::ffi::c_void,
+    v: u64,
+    op: u64,
+    _unused: u64,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let (ctx, op) = unsafe { (&*(ctx as *const Ctx), &*(op as usize as *const Op)) };
+    let i = match op {
+        Op::SwitchStr { table, memo, .. } => {
+            ctx.realm
+                .string_switch_index_memo(NanBox::from_bits(v), table, memo)
+        }
+        _ => None,
+    };
+    NanBox::number(i.map_or(-1.0, f64::from)).to_bits()
+}
+
 /// Proves (or finds it cannot) what an inline `s.charCodeAt(i)` relies on:
 /// see [`MethodSite::set_str_proof`](crate::jit::MethodSite::set_str_proof).
 pub(crate) extern "C" fn jit_helper_str_proof(
@@ -1937,8 +1964,15 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             super::vm_str_eq_const(ctx, funcs, regs[*src as usize], lit, *kind)
                 .map(|v| regs[*dst as usize] = v),
         ),
-        Op::SwitchStr { dst, src, table } => {
-            let i = ctx.realm.string_switch_index(regs[*src as usize], table);
+        Op::SwitchStr {
+            dst,
+            src,
+            table,
+            memo,
+        } => {
+            let i = ctx
+                .realm
+                .string_switch_index_memo(regs[*src as usize], table, memo);
             regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
             Some(Ok(()))
         }
@@ -2808,7 +2842,7 @@ pub(crate) extern "C" fn jit_helper_coll_call(
     let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
     // SAFETY: the site's own cache (see the function contract).
     #[allow(unsafe_code)]
-    let cache = unsafe { &*cache.cast::<crate::ic::PropertyCache>() };
+    let cache = unsafe { &mut *cache.cast::<crate::ic::PropertyCache>() };
     match super::native_call::try_coll(ctx, regs[*recv as usize], regs, args, cache) {
         Some(v) => {
             regs[*dst as usize] = v;
@@ -3297,16 +3331,26 @@ pub(crate) extern "C" fn jit_helper_construct(
     // SAFETY: see the function contract (as `jit_helper_exec_op`).
     #[allow(unsafe_code)]
     let op = unsafe { &*op_raw };
-    if let Op::Construct { ctor, .. } = op {
+    if let Op::Construct { dst, ctor, args } = op {
         // SAFETY: see the function contract.
         #[allow(unsafe_code)]
-        let (ctx, ctor_val, site) = unsafe {
+        let (ctx, regs, site) = unsafe {
             (
                 &mut *(ctx_raw as *mut Ctx),
-                NanBox::from_bits(*regs_raw.add(*ctor as usize)),
+                core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs),
                 &mut *site.cast::<CallSite>(),
             )
         };
+        let ctor_val = regs[*ctor as usize];
+        // `new Map()` / `new Set()` of the default constructors (the
+        // interpreter arm's step for a built-in constructor).
+        if args.len() <= 1 {
+            let argv = super::ArgBuf::from_regs(regs, args);
+            if let Some(v) = ctx.realm.new_default_collection(ctor_val, &argv) {
+                regs[*dst as usize] = v;
+                return 0;
+            }
+        }
         fill_construct_site(ctx, ctor_val, site);
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)

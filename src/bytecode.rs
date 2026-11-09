@@ -1535,7 +1535,9 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_bytes(lit, out);
             w_u8(*kind, out);
         }
-        Op::SwitchStr { dst, src, table } => {
+        Op::SwitchStr {
+            dst, src, table, ..
+        } => {
             w_u8(195, out);
             w_reg(*dst, out);
             w_reg(*src, out);
@@ -2479,7 +2481,12 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             }
             // The lookup binary-searches: keep the order it relies on.
             table.sort_by(|a, b| crate::realm::switch_key_order(&a.0, &b.0));
-            Op::SwitchStr { dst, src, table }
+            Op::SwitchStr {
+                dst,
+                src,
+                table,
+                memo: crate::realm::SwitchMemo::default(),
+            }
         }
         196 => Op::StrEqConst {
             dst: r.reg()?,
