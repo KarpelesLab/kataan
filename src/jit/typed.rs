@@ -163,17 +163,17 @@ pub(crate) enum Src {
 
 /// The element kinds the fast path serves (`TYPED_ARRAY_KINDS` indices), in
 /// the order a site tests them, with their element size's log2.
-const INT8: u8 = 0;
-const UINT8: u8 = 1;
-const UINT8_CLAMPED: u8 = 2;
-const INT16: u8 = 3;
-const UINT16: u8 = 4;
-const INT32: u8 = 5;
-const UINT32: u8 = 6;
-const FLOAT32: u8 = 7;
-const FLOAT64: u8 = 8;
+pub(crate) const INT8: u8 = 0;
+pub(crate) const UINT8: u8 = 1;
+pub(crate) const UINT8_CLAMPED: u8 = 2;
+pub(crate) const INT16: u8 = 3;
+pub(crate) const UINT16: u8 = 4;
+pub(crate) const INT32: u8 = 5;
+pub(crate) const UINT32: u8 = 6;
+pub(crate) const FLOAT32: u8 = 7;
+pub(crate) const FLOAT64: u8 = 8;
 
-const fn size_log2(kind: u8) -> u8 {
+pub(crate) const fn size_log2(kind: u8) -> u8 {
     match kind {
         INT8 | UINT8 | UINT8_CLAMPED => 0,
         INT16 | UINT16 => 1,

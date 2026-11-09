@@ -194,7 +194,7 @@ impl X64Assembler {
     }
 
     /// Audit mode's check after a rooted walk: the slot at `dst` occupied
-    /// and of `rax`'s generation, or `ud2`. Clobbers `r8`.
+    /// and of `rax`'s generation, or `ud2`. Keeps every register.
     fn p_audit_live(&mut self, l: &JitLayout, dst: u8) {
         self.p_audit_live_of(l, r::RAX, dst);
     }
@@ -205,12 +205,16 @@ impl X64Assembler {
         let trap = self.new_label();
         self.g_cmp_byte_imm(dst, l.off_slot_occ, l.slot_occupied_disc);
         self.jne(trap);
+        // (`r8` kept: code that keeps the integer version's int GPRs, a
+        // truthiness test's walk, may audit too.)
+        self.code.extend_from_slice(&[0x41, 0x50]); // push r8
         self.g_mov(r::R8, h);
         self.shr_r8_imm(32);
         // cmp word [dst + disp32], r8w
         self.code
             .extend_from_slice(&[0x66, 0x44 | ((dst >> 3) & 1), 0x39, 0x80 | (dst & 7)]);
         self.code.extend_from_slice(&l.off_slot_gen.to_le_bytes());
+        self.code.extend_from_slice(&[0x41, 0x58]); // pop r8 (no flags)
         self.je(ok);
         self.bind(trap);
         self.code.extend_from_slice(&[0x0f, 0x0b]); // ud2

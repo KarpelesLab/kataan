@@ -43,7 +43,11 @@
 //! an inner header (on-stack replacement) loads the registers live there;
 //! in a speculative nest so does the plain copy's inner back-edge, so a
 //! leave for the copy inside an inner loop costs the rest of that inner
-//! iteration, not of the whole outer one.
+//! iteration, not of the whole outer one. A speculative nest may have an
+//! integer version over the whole nest (`int32`): its int registers hold
+//! their GPR or frame slot across the inner loops as the SSE registers do,
+//! its inner back-edges poll and go back to their headers in that version,
+//! and an entry at an inner header tries it first (`int32::int_inner_entry`).
 //!
 //! In a speculative region's fast version, the NaN check a guarded op makes
 //! (an operand not proven a Number shows as a NaN result) is **merged** into
@@ -1745,9 +1749,10 @@ impl NumGen {
         if specalloc_log() {
             for r in &regions {
                 std::eprintln!(
-                    "[specalloc] region {}..={}: spec {} int {} spec_int {} xmm {:?} ints {:?} globals {:?}",
+                    "[specalloc] region {}..={}: loops {:?} spec {} int {} spec_int {} xmm {:?} ints {:?} globals {:?}",
                     r.head,
                     r.end,
+                    r.loops,
                     r.spec.is_some(),
                     r.int.is_some(),
                     r.spec_int,
@@ -2085,6 +2090,12 @@ impl NumGen {
         }
     }
 
+    /// Op `pc`'s label in its speculative region's integer version
+    /// (`KATAAN_JIT_OPMAP`).
+    pub(super) fn int_label(&self, pc: usize) -> Option<Label> {
+        self.int_labels.get(pc).copied().flatten()
+    }
+
     /// Op `pc`'s label in its region's plain copy.
     pub(super) fn copy_label(&self, pc: usize) -> Option<Label> {
         self.copy_labels.get(pc).copied().flatten()
@@ -2250,14 +2261,18 @@ impl NumGen {
     /// int registers in around a generic op ([`Self::int_save`]): one per
     /// int GPR, after the hoisted views'.
     fn int_save_slots(&self) -> usize {
-        if self.regions.iter().any(|r| r.spec_int) {
-            int32::N_GPRS
-        } else {
-            0
-        }
+        // (Then the frame slots the int registers without a GPR live in.)
+        self.regions
+            .iter()
+            .filter(|r| r.spec_int)
+            .filter_map(|r| r.int.as_ref())
+            .map(|p| int32::N_GPRS + p.n_mem)
+            .max()
+            .unwrap_or(0)
     }
 
-    /// The frame slot int GPR number `i` is saved in.
+    /// The frame slot int GPR number `i` is saved in (from
+    /// [`int32::N_GPRS`] on: the int registers' frame slots).
     fn int_save_disp(&self, i: usize) -> i32 {
         self.gslot_disp((self.n_gslots + self.regions.len() + self.n_view_slots + i) as u32)
     }
@@ -6248,6 +6263,10 @@ impl NumGen {
                 }
                 StubKind::PostBail { pc, dst } => {
                     if let Some(ri) = s.region {
+                        if let Some(bit) = s.demote {
+                            // (Clobbers `r11` only: the value is in `rax`.)
+                            self.note_demote(a, ri, bit);
+                        }
                         self.emit_post_bail(a, ri, pc as usize, dst);
                     }
                 }
@@ -6548,6 +6567,10 @@ impl NumGen {
             }
             self.hoist_views(a, ri);
             self.load_carried_globals(a, ri);
+            // (A nest's integer version first, when it has one: an
+            // on-stack replacement at an inner header, or the copy after a
+            // bail of it, then runs the rest of the nest there.)
+            self.int_inner_entry(a, ri, h, &checks, copy);
             for s in &self.regions[ri].slots {
                 if s.start <= h && h <= s.end {
                     a.movsd_x_mem(s.xmm, disp(s.reg));
@@ -7031,7 +7054,7 @@ fn plan_regions_sa(
         let arms = cold_arms(ops, head, end);
         let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
         let spec_int_cand = generic0
-            && loops.is_empty()
+            && (loops.is_empty() || nestint_enabled())
             && (head..=end).all(|pc| {
                 in_arm(pc)
                     || !generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))
@@ -7306,7 +7329,18 @@ fn plan_regions_sa(
         let weights = spill_weights(bytecode, head, end, &loops, &reuse);
         let weight = |r: u16| weights.iter().find(|x| x.0 == r).map_or(0, |x| x.1);
         let mut no_reuse = elem_cand || spec_int_cand;
+        // (A speculative region's integer version, planned over slots
+        // without hand-ons, and its int registers: the slots are then
+        // allocated again with the hand-ons between two registers neither
+        // of which is one, whose SSE registers no shadow writes.)
+        let mut kept: Option<(int32::IntPlan, Vec<u16>)> = None;
         let (slots, int, spec_int, alt_int) = 'alloc: loop {
+            let may_reuse = |a: u16, b: u16| {
+                !no_reuse
+                    || kept
+                        .as_ref()
+                        .is_some_and(|k| !k.1.contains(&a) && !k.1.contains(&b))
+            };
             let mut slots: Vec<Slot> = Vec::new();
             let mut free: Vec<u8> = (FIRST_XMM..FIRST_XMM + MAX_PROMOTED as u8).rev().collect();
             // (interval end, xmm, register, interval start, carried)
@@ -7330,10 +7364,10 @@ fn plan_regions_sa(
                 // Generic regions only (no integer version shadows the slots).
                 let mut reuse = None;
                 if generic
-                    && !no_reuse
                     && !is_carried
                     && let Op::Move { dst, src } = bytecode[x.1]
                     && dst == x.0
+                    && may_reuse(dst, src)
                     && let Some(i) = active
                         .iter()
                         .position(|&(e, _, r, ..)| r == src && e == x.1)
@@ -7347,15 +7381,14 @@ fn plan_regions_sa(
                 // last, `NumGen::reload`), so the operand's value is intact
                 // wherever one stores it.
                 if generic
-                    && !no_reuse
                     && !is_carried
                     && reuse.is_none()
                     && let Some((p, q, commutes)) = float_bin_operands(&ops[x.1], x.0)
                 {
                     let ends = |r: u16| {
-                        active
-                            .iter()
-                            .position(|&(e, _, ar, ..)| ar == r && e == x.1 && r != x.0)
+                        active.iter().position(|&(e, _, ar, ..)| {
+                            ar == r && e == x.1 && r != x.0 && may_reuse(r, x.0)
+                        })
                     };
                     if let Some(i) = ends(p).or_else(|| if commutes { ends(q) } else { None }) {
                         reuse = Some(active.remove(i).1);
@@ -7441,13 +7474,14 @@ fn plan_regions_sa(
                     if spec { &gcarry[..] } else { &[] },
                     if spec { &extra_int[..] } else { &[] },
                     &demote,
+                    &loops,
                 )
             };
             let (sp, el) = if generic && !elem_cand && !(spec_int_cand && no_reuse) {
                 (None, None)
             } else {
                 (
-                    if spec_int_cand && no_reuse {
+                    if spec_int_cand && no_reuse && kept.is_none() {
                         plan(false, true)
                     } else {
                         None
@@ -7459,8 +7493,18 @@ fn plan_regions_sa(
                     },
                 )
             };
+            if let Some((p, _)) = kept.take() {
+                break (slots, Some(p), true, None);
+            }
             if no_reuse && sp.is_none() && el.is_none() {
                 no_reuse = false;
+                continue 'alloc;
+            }
+            if let (Some(p), None) = (&sp, &el)
+                && generic
+            {
+                let ints = p.regs();
+                kept = sp.map(|p| (p, ints));
                 continue 'alloc;
             }
             break match sp {
@@ -7522,6 +7566,14 @@ fn plan_regions_sa(
         });
     }
     out
+}
+
+/// Whether a speculative loop nest may have an integer version
+/// (`int32::plan` over the whole nest): unless `KATAAN_JIT_NESTINT=0`.
+/// Read once per process.
+fn nestint_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NESTINT").is_none_or(|v| v != "0"))
 }
 
 /// Whether entry-hoisted global reads ([`plan_hoisted_globals`]) are

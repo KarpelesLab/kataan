@@ -62,17 +62,12 @@ impl NumGen {
         obj: u16,
         index: u16,
     ) -> Option<()> {
-        let IK::Gpr(d) = self.ik(dst)? else {
-            return None;
-        };
+        self.iout(dst)?;
         let wrap = self.iplan()?.wrap_bits.contains(&self.cur_pc);
         let bail = self.ibail(a);
         let saves = self.walk_saves(dst);
         // The index, sign-extended, rides on the stack across the walk.
-        match self.ik(index)? {
-            IK::Gpr(g) => a.movsxd(RAX, g),
-            IK::Imm(v) => a.movabs_rax(i64::from(v)),
-        }
+        self.index_rax(a, index)?;
         for &g in &saves {
             a.raw(&[0x41, 0x50 + (g & 7)]); // push r8..r10
         }
@@ -106,7 +101,7 @@ impl NumGen {
         for &g in saves.iter().rev() {
             a.raw(&[0x41, 0x58 + (g & 7)]); // pop r8..r10
         }
-        a.mov32_rr(d, RAX);
+        self.iput(a, dst, RAX)?;
         let done = a.new_label();
         a.jmp(done);
         a.bind(miss);
@@ -145,14 +140,12 @@ impl NumGen {
         index: u16,
         s: crate::jit::numeric::ArraySlots,
     ) -> Option<()> {
-        let IK::Gpr(d) = self.ik(dst)? else {
-            return None;
-        };
+        self.iout(dst)?;
         let pc = self.cur_pc;
         let wrap = self.iplan()?.wrap_bits.contains(&pc);
         let rbp = crate::jit::call_seq::r::RBP;
         let slow = a.new_label();
-        let done = a.new_label();
+        let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
         // (A receiver known to be the held array whenever there is one: the
         // bounds check alone, the count `0` when the entry found none.)
         if !self.array_known_fast(pc, obj) {
@@ -160,10 +153,7 @@ impl NumGen {
             a.g_cmp_mem(RAX, rbp, s.held);
             a.jne(slow);
         }
-        match self.ik(index)? {
-            IK::Gpr(g) => a.movsxd(RAX, g),
-            IK::Imm(v) => a.movabs_rax(i64::from(v)),
-        }
+        self.index_rax(a, index)?;
         a.g_cmp_mem(RAX, rbp, s.len);
         a.jae(slow); // past the count, or negative
         a.g_load(R11, rbp, s.base);
@@ -179,7 +169,7 @@ impl NumGen {
             a.exact_i32_check(RCX);
         }
         a.jcc(CC_NE, slow);
-        a.mov32_rr(d, RCX);
+        self.iput(a, dst, RCX)?;
         a.jmp(done);
         a.bind(slow);
         self.int_skip = Some(done);
@@ -201,19 +191,16 @@ impl NumGen {
         s: crate::jit::numeric::ArraySlots,
     ) -> Option<()> {
         let pc = self.cur_pc;
-        let index_k = self.ik(index)?;
+        self.ik(index)?;
         let rbp = crate::jit::call_seq::r::RBP;
         let slow = a.new_label();
-        let done = a.new_label();
+        let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
         if !self.array_known_fast(pc, obj) {
             self.iload_operand(a, obj);
             a.g_cmp_mem(RAX, rbp, s.held);
             a.jne(slow);
         }
-        match index_k {
-            IK::Gpr(g) => a.movsxd(RAX, g),
-            IK::Imm(v) => a.movabs_rax(i64::from(v)),
-        }
+        self.index_rax(a, index)?;
         a.g_cmp_mem(RAX, rbp, s.len);
         a.jae(slow); // past the count, or negative
         a.g_load(R11, rbp, s.base);
@@ -249,14 +236,14 @@ impl NumGen {
     ) -> Option<()> {
         use crate::jit::call_seq::{cc, r::RBP};
         let pc = self.cur_pc;
-        let index_k = self.ik(index)?;
+        self.ik(index)?;
         let val_k = if self.is_int(val) {
             Some(self.ik(val)?)
         } else {
             None
         };
         let slow = a.new_label();
-        let done = a.new_label();
+        let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
         if !self.array_known_fast(pc, obj) {
             self.iload_operand(a, obj);
             a.g_cmp_mem(RAX, RBP, s.held);
@@ -272,10 +259,7 @@ impl NumGen {
             a.jcc(CC_E, slow);
             a.bind(plain);
         }
-        match index_k {
-            IK::Gpr(g) => a.movsxd(RAX, g),
-            IK::Imm(v) => a.movabs_rax(i64::from(v)),
-        }
+        self.index_rax(a, index)?;
         a.g_cmp_mem(RAX, RBP, s.len);
         a.jae(slow); // past the count, or negative
         a.g_load(R11, RBP, s.base);
@@ -288,6 +272,10 @@ impl NumGen {
                 a.movq_gpr_x(RDX, 0);
             }
             Some(IK::Imm(v)) => a.movabs_argreg(2, f64::from(v).to_bits() as i64),
+            Some(IK::Mem(d)) => {
+                a.cvtsi2sd32_mem(0, d);
+                a.movq_gpr_x(RDX, 0);
+            }
             None => match self.xmm_of(self.imode, val) {
                 Some(x) => a.movq_gpr_x(RDX, x),
                 None => a.load_rdx(disp(val)),
@@ -311,13 +299,11 @@ impl NumGen {
         arr: u16,
         s: crate::jit::numeric::ArraySlots,
     ) -> Option<()> {
-        let IK::Gpr(d) = self.ik(dst)? else {
-            return None;
-        };
+        self.iout(dst)?;
         let pc = self.cur_pc;
         let rbp = crate::jit::call_seq::r::RBP;
         let slow = a.new_label();
-        let done = a.new_label();
+        let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
         if self.array_known_fast(pc, arr) {
             a.cmp_frame_imm8(s.held, crate::jit::RECV_CACHE_EMPTY as i8);
             a.jcc(CC_E, slow);
@@ -330,7 +316,7 @@ impl NumGen {
         // cmp rax, 0x7fffffff; ja slow (a count past i32::MAX)
         a.raw(&[0x48, 0x3d, 0xff, 0xff, 0xff, 0x7f]);
         a.jcc(super::super::CC_A, slow);
-        a.mov32_rr(d, RAX);
+        self.iput(a, dst, RAX)?;
         a.jmp(done);
         a.bind(slow);
         self.int_skip = Some(done);
@@ -350,17 +336,15 @@ impl NumGen {
         index: u16,
         v: typed::ViewSlots,
     ) -> Option<()> {
-        let IK::Gpr(d) = self.ik(dst)? else {
-            return None;
-        };
+        self.iout(dst)?;
         let wrap = self.iplan()?.wrap_bits.contains(&self.cur_pc);
         let bail = self.ibail(a);
-        match self.ik(index)? {
-            IK::Gpr(g) => a.movsxd(RAX, g),
-            IK::Imm(v) => a.movabs_rax(i64::from(v)),
-        }
+        // (A float kind's element, say: the recompilation has `dst` a
+        // double.)
+        self.demote_last(dst);
+        self.index_rax(a, index)?;
         a.t_hoisted_get_i32(v, disp(obj), wrap, bail);
-        a.mov32_rr(d, RAX);
+        self.iput(a, dst, RAX)?;
         Some(())
     }
 
@@ -373,24 +357,20 @@ impl NumGen {
         obj: u16,
         v: typed::ViewSlots,
     ) -> Option<()> {
-        let IK::Gpr(d) = self.ik(dst)? else {
-            return None;
-        };
+        self.iout(dst)?;
         let bail = self.ibail(a);
         a.t_hoisted_len(v, disp(obj), bail);
         // cmp rax, 0x7fffffff; ja bail (an unsigned length past i32::MAX)
         a.raw(&[0x48, 0x3d, 0xff, 0xff, 0xff, 0x7f]);
         a.jcc(super::super::CC_A, bail);
-        a.mov32_rr(d, RAX);
+        self.iput(a, dst, RAX)?;
         Some(())
     }
 
     /// `dst = arr.length` in the integer version (`dst` an int register):
     /// a plain array's or a typed-array view's, at most `i32::MAX`.
     pub(super) fn iarray_len(&mut self, a: &mut X64Assembler, dst: u16, arr: u16) -> Option<()> {
-        let IK::Gpr(d) = self.ik(dst)? else {
-            return None;
-        };
+        self.iout(dst)?;
         let bail = self.ibail(a);
         let saves = self.walk_saves(dst);
         for &g in &saves {
@@ -416,7 +396,7 @@ impl NumGen {
         for &g in saves.iter().rev() {
             a.raw(&[0x41, 0x58 + (g & 7)]);
         }
-        a.mov32_rr(d, RAX);
+        self.iput(a, dst, RAX)?;
         let done = a.new_label();
         a.jmp(done);
         a.bind(miss);

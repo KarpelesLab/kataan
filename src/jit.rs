@@ -15392,6 +15392,7 @@ impl JitFunction {
         if opmap.is_some() {
             want.extend(labels.iter().take(ops.len()).copied());
             want.extend((0..ops.len()).filter_map(|i| num.copy_label(i)));
+            want.extend((0..ops.len()).filter_map(|i| num.int_label(i)));
             want.extend(a.dbg_marks.iter().map(|m| m.0));
         }
         want.push(exact.unwrap_or(entries.0));
@@ -15430,6 +15431,12 @@ impl JitFunction {
                 for i in 0..ops.len() {
                     if num.copy_label(i).is_some() {
                         s.push_str(&alloc::format!("C {} {}\n", i, at[k]));
+                        k += 1;
+                    }
+                }
+                for i in 0..ops.len() {
+                    if num.int_label(i).is_some() {
+                        s.push_str(&alloc::format!("I {} {}\n", i, at[k]));
                         k += 1;
                     }
                 }
