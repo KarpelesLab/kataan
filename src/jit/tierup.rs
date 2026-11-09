@@ -66,6 +66,16 @@ pub(super) struct TierUp {
     /// The function's own header pcs of the loops this body was compiled
     /// with no speculative version for (inherited by its recompilations).
     pub(super) spec_off: Vec<usize>,
+    /// `(header, end, region, sites)` of the loops whose integer version
+    /// has overflow bails (`numeric::NumGen::demote_heads`): one that took any
+    /// (its overflow-bail mask, in the persistent array, not empty) is
+    /// worth a recompilation in which the sites' results are doubles and
+    /// the rest of the loop stays integer.
+    pub(super) int_regions: Vec<super::numeric::DemoteRegion>,
+    /// The sites (the function's own pc, the register) whose values this
+    /// body was compiled to keep as doubles (inherited by its
+    /// recompilations).
+    pub(super) int_demote: Vec<(usize, u16)>,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
     pub(super) countdown: core::cell::Cell<u8>,
     /// Whether [`JitProto::wants_recompile_on_entry`] has said yes (it
@@ -154,6 +164,8 @@ impl TierUp {
             cold_calls: Vec::new(),
             spec_regions: Vec::new(),
             spec_off: Vec::new(),
+            int_regions: Vec::new(),
+            int_demote: Vec::new(),
             guard_calls: ops
                 .iter()
                 .enumerate()
@@ -230,6 +242,70 @@ impl JitProto {
         out
     }
 
+    /// The sites (the function's own pc, the register) whose values a
+    /// recompilation of this body should keep as doubles in its integer
+    /// versions: this body's own such sites, and those whose overflow bails
+    /// (or entry failures) it took. A site's pc must be the function's own,
+    /// and its register one some own op of the loop names (an inlined
+    /// callee's registers are numbered by the inlining, which a
+    /// recompilation may do otherwise).
+    #[must_use]
+    pub fn int_demote(&self) -> Vec<(usize, u16)> {
+        let Some(s) = self.sites.as_ref() else {
+            return Vec::new();
+        };
+        let t = &s.tier_up;
+        let mut out = t.int_demote.clone();
+        let last = super::numeric::DEMOTE_BITS - 1;
+        let ops = self.bytecode.as_deref().unwrap_or(&[]);
+        for (head, end, ri, sites) in &t.int_regions {
+            let mask = s.persist.demotes(*ri);
+            for (k, &(pc, r)) in sites.iter().enumerate() {
+                if mask & (1 << k.min(last)) == 0 {
+                    continue;
+                }
+                let own = self.orig_pc(pc);
+                let named = (*head..=*end).any(|q| {
+                    let hit = core::cell::Cell::new(false);
+                    if self.orig_pc(q) != usize::MAX
+                        && let Some(op) = ops.get(q)
+                    {
+                        crate::bytecode::op_for_each_reg(op, &|x| hit.set(hit.get() || x == r));
+                    }
+                    hit.get()
+                });
+                if own != usize::MAX && named && !out.contains(&(own, r)) {
+                    out.push((own, r));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether one of this body's integer versions found a value no int32
+    /// that a recompilation would demote (its loop's back-edge poll asks
+    /// [`JitProto::wants_recompile`] too), while the budget lasts.
+    #[must_use]
+    pub fn wants_demote(&self) -> bool {
+        let Some(s) = self.sites.as_ref() else {
+            return false;
+        };
+        let t = &s.tier_up;
+        t.generation < MAX_GENERATION
+            && t.int_regions
+                .iter()
+                .any(|(_, _, ri, _)| s.persist.demotes(*ri) != 0)
+    }
+
+    /// Whether this body's code runs bytecode `ops` (the stream its back-edge
+    /// polls name).
+    #[must_use]
+    pub fn runs(&self, ops: *const crate::nbvm::Op) -> bool {
+        self.bytecode
+            .as_deref()
+            .is_some_and(|b| core::ptr::eq(b.as_ptr(), ops))
+    }
+
     /// Marks this body as the `generation`th recompilation of its function.
     pub fn set_generation(&mut self, generation: u8) {
         if let Some(s) = self.sites.as_mut() {
@@ -250,6 +326,13 @@ impl JitProto {
         let t = &s.tier_up;
         if t.generation >= MAX_GENERATION {
             return false;
+        }
+        // A loop whose integer version found a result no int32.
+        if t.int_regions
+            .iter()
+            .any(|(h, _, ri, _)| *h == header && s.persist.demotes(*ri) != 0)
+        {
+            return true;
         }
         // A speculative loop whose fast version keeps leaving.
         if t.spec_regions

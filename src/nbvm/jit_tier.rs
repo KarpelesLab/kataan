@@ -108,6 +108,11 @@ pub(super) struct TierRuntime {
     left: Option<(usize, alloc::vec::Vec<(usize, Reg)>)>,
     /// What a back-edge poll returns to its loop: polls until the next one.
     poll_interval: u64,
+    /// Set by a compiled integer version's overflow bail (or entry
+    /// failure) that asked for a register's demotion: the next back-edge
+    /// poll calls [`jit_helper_backedge`], which has the polling body
+    /// recompiled ([`demote_poll`]).
+    demote: bool,
     /// A sync generator's compiled body that just suspended
     /// ([`jit_helper_suspend`]): the pc its resumption continues at (the
     /// function's own), the value it yields and the register a `next(v)`
@@ -133,6 +138,7 @@ impl Default for TierRuntime {
             resume: None,
             left: None,
             poll_interval: if exit_stress() { 1 } else { POLL_INTERVAL },
+            demote: false,
             suspended: None,
             deopt: None,
         }
@@ -961,6 +967,7 @@ fn recompile(
         },
         &|pc, _| inline_candidate(funcs, id, &hints, pc),
         &old.spec_off(),
+        &old.int_demote(),
     )?;
     new.note_cold_calls(&cold_call_pcs(proto, &hints));
     new.note_function(id);
@@ -3917,6 +3924,7 @@ fn poll_layout() -> crate::jit::PollLayout {
         threshold: i(threshold),
         exit_regs: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, exit_regs)),
         interval: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, poll_interval)),
+        demote: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, demote)),
     }
 }
 
@@ -4110,6 +4118,7 @@ pub(crate) extern "C" fn jit_helper_backedge(
     // short loop polls at its first back-edge on every call).
     if !ctx.realm.agents_active
         && regs_addr != ctx.jit_rt.exit_regs
+        && !ctx.jit_rt.demote
         && !super::vm_safepoint_due(ctx)
         && !ctx
             .realm
@@ -4155,7 +4164,31 @@ pub(crate) extern "C" fn jit_helper_backedge(
     if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, header) {
         return NanBox::jit_exit_bits();
     }
+    if core::mem::take(&mut ctx.jit_rt.demote) {
+        demote_poll(ctx, funcs, ops);
+    }
     ctx.jit_rt.poll_interval
+}
+
+/// A back-edge poll after an integer version asked for a register's
+/// demotion (`TierRuntime::demote`), in an activation that cannot leave to
+/// be recompiled (one a compiled caller called): the polling body's
+/// function, if its body `wants_demote`, is recompiled now — its later
+/// calls run the new code; this activation finishes in the old one.
+fn demote_poll(ctx: &mut Ctx, funcs: &[FnProto], ops: *const Op) {
+    let Some((id, jit)) = funcs
+        .iter()
+        .enumerate()
+        .find_map(|(id, p)| match p.tier.jit() {
+            Some(Some(j)) if j.runs(ops) => Some((id, j)),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    if jit.wants_demote() {
+        let _ = recompile(ctx, funcs, id, &jit, &[]);
+    }
 }
 
 /// `KATAAN_JIT_EXIT_STRESS` (a test knob, read once per process): every

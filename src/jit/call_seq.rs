@@ -859,6 +859,9 @@ pub struct PollLayout {
     pub threshold: i32,
     pub exit_regs: i32,
     pub interval: i32,
+    /// A byte an integer version's overflow bail sets (`numeric::int32`'s
+    /// demotion): the next poll then calls, to recompile the body.
+    pub demote: i32,
 }
 
 /// The back-edge poll's do-nothing test, inline: no agent scheduling, no
@@ -884,6 +887,8 @@ pub(crate) fn emit_quiet_poll(a: &mut X64Assembler, l: &CallLayout, countdown: i
     a.g_jcc(cc::AE, call);
     a.g_cmp_mem(r::RBX, r::R15, p.exit_regs);
     a.g_jcc(cc::E, call);
+    a.g_cmp_byte_imm(r::R15, p.demote, 0);
+    a.g_jcc(cc::NE, call);
     a.g_load(r::RAX, r::R15, p.interval);
     a.g_store(RBP, countdown, r::RAX);
     a.jmp(quiet);
@@ -978,6 +983,12 @@ impl X64Assembler {
     /// `cmp byte [base+disp], imm8`.
     pub(crate) fn g_cmp_byte_imm(&mut self, base: u8, disp: i32, imm: u8) {
         self.g_mem(false, &[0x80], 7, base, disp);
+        self.code.push(imm);
+    }
+
+    /// `mov byte [base+disp], imm8`.
+    pub(crate) fn g_store_byte_imm(&mut self, base: u8, disp: i32, imm: u8) {
+        self.g_mem(false, &[0xc6], 0, base, disp);
         self.code.push(imm);
     }
 

@@ -63,7 +63,13 @@
 use super::{GenericOp, Label, X64Assembler};
 use crate::nanbox::NanBox;
 
+mod ident;
 mod int32;
+pub(super) use int32::DEMOTE_BITS;
+
+/// A region's demotion sites (`NumGen::demote_heads`): `(header, end,
+/// region, (pc, register) per mask bit)`.
+pub(crate) type DemoteRegion = (usize, usize, usize, Vec<(usize, u16)>);
 use crate::nbvm::Op;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -953,6 +959,12 @@ pub(super) struct NumEnv {
     /// The header pcs of the loops to give no speculative version (an
     /// earlier body's kept leaving it: [`SPEC_LEAVE_LIMIT`]).
     pub(super) no_spec: Vec<usize>,
+    /// The first register no call fills (past the parameters, the
+    /// captures and `this`: `ident`).
+    pub(super) first_local: usize,
+    /// The pcs of ops an earlier body's integer versions found results of
+    /// no int32 (`int32::plan`'s `demote`).
+    pub(super) demote: Vec<(usize, u16)>,
     /// `Ctx`-relative offset of the realm pointer (the inline heap reads').
     pub(super) realm: i32,
     /// The call sequence's layout (the back-edge poll's inline test).
@@ -1095,6 +1107,14 @@ struct Stub {
     /// at `target` (the other way round when `neg`: a `Not` fused in, the
     /// fall-through then pc `pc + 3`).
     branch: Option<(u16, usize, bool)>,
+    /// With `branch`, in an integer version (whose labels are its own, not
+    /// the ones the stubs are emitted with): the label past the test, and
+    /// the target's label when it is in the region.
+    ibranch: Option<(Label, Option<Label>)>,
+    /// A [`StubKind::Bail`] of an integer version's op whose result was no
+    /// int32: the bit of the region's overflow-bail mask it sets
+    /// ([`NumGen::demote_sites`]).
+    demote: Option<u8>,
     /// Emitted by a region's integer version (its flush / reload convert the
     /// int registers).
     int: bool,
@@ -1115,6 +1135,14 @@ type LazyArgs = (usize, usize, bool, Vec<(u8, u16)>);
 /// The per-compilation state of the numeric emitter.
 pub(super) struct NumGen {
     types: Types,
+    /// Per register: never a Number, a String or a BigInt
+    /// ([`ident::identity_regs`]), so `===` with it compares words.
+    ident: Vec<bool>,
+    /// Per region: the pcs of its integer version's ops whose overflow
+    /// bails set a bit of its overflow-bail mask (site `k` bit
+    /// `min(k, DEMOTE_BITS - 1)`): a recompilation demotes their results
+    /// (`int32`'s demotion).
+    demote_sites: Vec<Vec<(usize, u16)>>,
     /// The integrality facts ([`infer_integral`]).
     ints: Ints,
     regions: Vec<Region>,
@@ -1610,7 +1638,14 @@ impl NumGen {
                 *t = true;
             }
         }
-        let mut regions = plan_regions_sa(ops, bytecode, catches, env.n_regs, &env.alloc_inline);
+        let mut regions = plan_regions_sa(
+            ops,
+            bytecode,
+            catches,
+            env.n_regs,
+            &env.alloc_inline,
+            &env.demote,
+        );
         let mut skip = vec![false; n + 1];
         for r in &mut regions {
             r.cold = guard_diamonds(r, ops, bytecode, entries, catches);
@@ -1861,6 +1896,8 @@ impl NumGen {
             }
         }
         Self {
+            ident: ident::identity_regs(bytecode, env.n_regs, env.first_local),
+            demote_sites: Vec::new(),
             types,
             ints,
             regions,
@@ -3421,6 +3458,8 @@ impl NumGen {
                 alloc,
             },
             branch: None,
+            ibranch: None,
+            demote: None,
             int: self.imode.is_some(),
             copy: self.copy,
             restore: self.int_saved,
@@ -3838,9 +3877,11 @@ impl NumGen {
                     self.const_num_bits_at(pc, r)
                         .or_else(|| self.const_imm_bits_at(pc, r))
                 };
+                let id = |r: u16| self.ident.get(r as usize).copied().unwrap_or(false);
                 let kind = match (konst(y), konst(x)) {
                     (Some(k), _) if x != y => CmpKind::Bits(x, k),
                     (_, Some(k)) if x != y => CmpKind::Bits(y, k),
+                    _ if x != y && (id(x) || id(y)) => CmpKind::Same(x, y),
                     _ => CmpKind::Eq(false),
                 };
                 self.compare(a, labels, pc, reg, kind, dst, x, y, slow, fused)?;
@@ -4720,8 +4761,15 @@ impl NumGen {
         // The integer version runs no slow path itself: it hands the op to the
         // double version.
         let kind = match kind {
+            // (`===` decides most pairs inline, the int GPRs kept: only
+            // the helper's pairs bail, `emit_strict_eq_stub`.)
+            StubKind::StrictEq { a, b, dst, .. } if self.imode.is_some() => StubKind::StrictEq {
+                a,
+                b,
+                dst,
+                bail: Some(self.cur_pc as u32),
+            },
             StubKind::Helper { .. }
-            | StubKind::StrictEq { .. }
             | StubKind::Exec { .. }
             | StubKind::Mirror { .. }
             | StubKind::Truthy { .. }
@@ -4766,6 +4814,8 @@ impl NumGen {
             pc: self.cur_pc,
             kind,
             branch: None,
+            ibranch: None,
+            demote: None,
             int: self.imode.is_some(),
             copy: self.copy,
             restore: self.int_saved,
@@ -5438,7 +5488,7 @@ impl NumGen {
         fused: Option<Fused>,
     ) -> Option<()> {
         let stub = a.new_label();
-        let bits = matches!(kind, CmpKind::Bits(..));
+        let bits = matches!(kind, CmpKind::Bits(..) | CmpKind::Same(..));
         let guarded = !bits && (self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM);
         // An operand not proven a Number is told apart by the compare
         // itself: anything but a Number reads as a NaN, so `ucomisd` comes
@@ -5454,9 +5504,14 @@ impl NumGen {
             CmpKind::Rel(1) => (x, y, CC_A),
             CmpKind::Rel(2) => (y, x, CC_AE),
             CmpKind::Rel(_) => (x, y, CC_AE),
-            CmpKind::Eq(_) | CmpKind::Bits(..) => (x, y, CC_E),
+            CmpKind::Eq(_) | CmpKind::Bits(..) | CmpKind::Same(..) => (x, y, CC_E),
         };
-        if let CmpKind::Bits(v, k) = kind {
+        if let CmpKind::Same(v, w) = kind {
+            // ZF = the words are equal.
+            self.load_gpr(a, reg, RAX, v);
+            self.load_gpr(a, reg, RCX, w);
+            a.raw(&[0x48, 0x39, 0xc8]); // cmp rax, rcx
+        } else if let CmpKind::Bits(v, k) = kind {
             // ZF = the register's bits are k's (either zero, for a zero k).
             self.load_gpr(a, reg, RAX, v);
             if k << 1 == 0 {
@@ -5477,7 +5532,7 @@ impl NumGen {
         if store {
             // rax = the 0/1 result (ordered equality needs ZF && !PF).
             match kind {
-                CmpKind::Bits(..) => {
+                CmpKind::Bits(..) | CmpKind::Same(..) => {
                     a.setcc_al(CC_E);
                     a.raw(&[0x0f, 0xb6, 0xc0]); // movzx eax, al
                 }
@@ -5529,8 +5584,11 @@ impl NumGen {
                     // it: through the `JumpIfFalse` emitted normally at pc + 1
                     // when that op is reachable otherwise, else by itself.
                     self.stub(stub, *labels.get(pc + 1)?, reg, slow);
+                    let ibranch = (!jif_reachable && self.imode.is_some())
+                        .then(|| (past, self.in_region_target(labels, reg, target)));
                     if !jif_reachable && let Some(st) = self.stubs.last_mut() {
                         st.branch = Some((dst, target, f.neg));
+                        st.ibranch = ibranch;
                     }
                 }
                 if !jif_reachable {
@@ -5646,8 +5704,12 @@ impl NumGen {
         // Ordered equality is ZF && !PF; `Bits` is ZF; `Rel` its `cc`
         // (false when unordered).
         match (kind, when_true) {
-            (CmpKind::Bits(..), false) => self.jcc_to(a, labels, reg, CC_NE, target),
-            (CmpKind::Bits(..), true) => self.jcc_to(a, labels, reg, CC_E, target),
+            (CmpKind::Bits(..) | CmpKind::Same(..), false) => {
+                self.jcc_to(a, labels, reg, CC_NE, target);
+            }
+            (CmpKind::Bits(..) | CmpKind::Same(..), true) => {
+                self.jcc_to(a, labels, reg, CC_E, target);
+            }
             (CmpKind::Eq(neg), w) if neg == w => {
                 // To `target` when not ordered-equal.
                 self.jcc_to(a, labels, reg, CC_NE, target);
@@ -5979,12 +6041,28 @@ impl NumGen {
         a.movabs_rax(self.tag_true as i64);
         a.jmp(have);
         a.bind(handles);
+        // (An integer version's int GPRs `r8` and `r10`, which the walk
+        // may clobber, kept on the stack meanwhile: no call is made.)
+        let (no_w, slow_w) = if s.int {
+            a.raw(&[0x41, 0x50, 0x41, 0x52]); // push r8; push r10
+            (a.new_label(), a.new_label())
+        } else {
+            (no, slow)
+        };
         a.p_arena(self.env.realm, &self.env.heap.props);
         self.load_gpr(a, s.region, r::RAX, x);
-        a.p_identity_compared(no, slow);
+        a.p_identity_compared(no_w, slow_w);
         self.load_gpr(a, s.region, r::RAX, y);
-        a.p_identity_compared(no, slow);
-        a.jmp(slow);
+        a.p_identity_compared(no_w, slow_w);
+        a.jmp(slow_w);
+        if s.int {
+            a.bind(no_w);
+            a.raw(&[0x41, 0x5a, 0x41, 0x58]); // pop r10; pop r8
+            a.jmp(no);
+            a.bind(slow_w);
+            a.raw(&[0x41, 0x5a, 0x41, 0x58]); // pop r10; pop r8
+            a.jmp(slow);
+        }
         // The answer in `rax`: into `dst`, then on (or the fused branch).
         a.bind(have);
         self.store_gpr(a, s.region, r::RAX, dst);
@@ -5993,10 +6071,17 @@ impl NumGen {
             Some((_, target, neg)) => {
                 a.movabs_r11(self.tag_true as i64);
                 a.cmp_rax_r11();
-                if let Some(&past) = labels.get(s.pc + 2 + usize::from(neg)) {
+                let (past, to) = match s.ibranch {
+                    Some((past, to)) => (Some(past), to),
+                    None => (
+                        labels.get(s.pc + 2 + usize::from(neg)).copied(),
+                        self.in_region_target(labels, s.region, target),
+                    ),
+                };
+                if let Some(past) = past {
                     a.jcc(if neg { CC_NE } else { CC_E }, past);
                 }
-                match self.in_region_target(labels, s.region, target) {
+                match to {
                     Some(l) => a.jmp(l),
                     None => {
                         self.flush(a, s.region);
@@ -6008,6 +6093,17 @@ impl NumGen {
             }
         }
         a.bind(slow);
+        // An integer version's: a bail at the op.
+        if s.int
+            && let Some(ri) = s.region
+        {
+            if self.regions[ri].spec_int {
+                self.spec_int_bail(a, ri, s.pc);
+            } else {
+                self.emit_bail(a, labels, ri, s.pc, true);
+            }
+            return;
+        }
         if let Some(pc) = bail {
             self.emit_spec_bail(a, s, pc, false);
             return;
@@ -6038,6 +6134,9 @@ impl NumGen {
             match s.kind {
                 StubKind::Bail { pc, store } => {
                     if let Some(ri) = s.region {
+                        if let Some(bit) = s.demote {
+                            self.note_demote(a, ri, bit);
+                        }
                         if self.regions[ri].spec_int {
                             self.spec_int_bail(a, ri, pc as usize);
                         } else {
@@ -6407,6 +6506,9 @@ enum CmpKind {
     /// the sign bit left out for a zero `k`, so `-0 === 0`), whatever the
     /// register holds, since no other value's bits are a non-NaN Number's.
     Bits(u16, u64),
+    /// `x === y` where one of the registers never holds a Number, a String
+    /// or a BigInt ([`ident`]): exactly a compare of their words.
+    Same(u16, u16),
 }
 
 /// Register `r`'s displacement in the register file.
@@ -6680,16 +6782,18 @@ fn plan_regions(
     catches: &[usize],
     n_regs: usize,
 ) -> Vec<Region> {
-    plan_regions_sa(ops, bytecode, catches, n_regs, &[])
+    plan_regions_sa(ops, bytecode, catches, n_regs, &[], &[])
 }
 
-/// [`plan_regions`] with [`NumEnv::alloc_inline`] (`sa`).
+/// [`plan_regions`] with [`NumEnv::alloc_inline`] (`sa`) and
+/// [`NumEnv::demote`].
 fn plan_regions_sa(
     ops: &[GenericOp],
     bytecode: &[Op],
     catches: &[usize],
     n_regs: usize,
     sa: &[u8],
+    demote_pcs: &[(usize, u16)],
 ) -> Vec<Region> {
     let n = ops.len();
     let branch_target = |op: &GenericOp| match *op {
@@ -6817,15 +6921,6 @@ fn plan_regions_sa(
         // runs (`spec_int_op`) may have one (`NumGen::emit_spec_int_op`).
         let arms = cold_arms(ops, head, end);
         let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
-        // (One with none of an element loop's reads, guard diamonds, a
-        // compiled `for-in` or `Math.imul` is a *wide* candidate: an index
-        // or counter loop over property and element ops, which the plan
-        // only takes where nothing in it would keep bailing,
-        // `int32::plan`.)
-        let wide = !(elem_cand
-            || !arms.is_empty()
-            || (head..=end).any(|pc| sa_at(sa, pc) & SA_FORIN != 0)
-            || (head..=end).any(|pc| int_math_op(&bytecode[pc]).is_some()));
         let spec_int_cand = generic0
             && loops.is_empty()
             && (head..=end).all(|pc| {
@@ -7203,6 +7298,13 @@ fn plan_regions_sa(
             // (Not the carried fields': their registers need not hold the
             // field on entry, `FCarry::flag`.)
             let carried_spec = |r: u16| carried_r(r) || gcarry.iter().any(|g| g.1 == r);
+            // (The results an earlier body's integer version found no
+            // int32: `int32::plan`'s `demote`.)
+            let demote: Vec<u16> = demote_pcs
+                .iter()
+                .filter(|&&(pc, _)| head <= pc && pc <= end)
+                .map(|&(_, r)| r)
+                .collect();
             let plan = |elems: bool, spec: bool| {
                 int32::plan(
                     bytecode,
@@ -7221,7 +7323,7 @@ fn plan_regions_sa(
                     &is_live,
                     if spec { &gcarry[..] } else { &[] },
                     if spec { &extra_int[..] } else { &[] },
-                    spec && wide,
+                    &demote,
                 )
             };
             let (sp, el) = if generic && !elem_cand && !(spec_int_cand && no_reuse) {

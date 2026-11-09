@@ -57,6 +57,17 @@ const GPRS: [u8; 5] = [6, 7, 8, 9, 10];
 /// iteration elsewhere (`NumGen::entry_retry`).
 const ENTRY_RETRIES: i32 = 8;
 
+/// How many entry failures in a row (`ENTRY_RETRIES`) before the next one
+/// asks for the failing loop-carried register to be demoted
+/// (`NumGen::entry_fail`). One retry is enough for a hash's or a CRC's
+/// uint32 start value, whose second entry, an iteration later, passes.
+const ENTRY_DEMOTE: i32 = 1;
+
+/// How many bits of a region's overflow-bail mask name one site each (the
+/// last stands for every site from it on): an `or` with a sign-extended
+/// 32-bit immediate sets them.
+pub(crate) const DEMOTE_BITS: usize = 31;
+
 /// How many int GPRs there are (their save slots, `NumGen::int_save`).
 pub(super) const N_GPRS: usize = GPRS.len();
 
@@ -164,6 +175,12 @@ fn const_i32(v: NanBox) -> Option<i32> {
 /// ([`IntPlan::wrap_bits`]); the plan is then only made when every such
 /// read's result and index are int registers (else the region keeps its
 /// double versions).
+///
+/// `demote`: registers an earlier body's integer version of the region
+/// found holding no int32 (an overflow bail's result, recorded in the
+/// region's overflow-bail mask, `NumGen::ibail_ovf`): no int registers,
+/// nor is any value moved into or computed from them alone, so only those
+/// values are doubles and the rest of the loop stays integer.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan(
     bytecode: &[Op],
@@ -178,7 +195,7 @@ pub(super) fn plan(
     live: &dyn Fn(usize, u16) -> bool,
     gcarry: &[(alloc::string::String, u16, usize)],
     extra: &[u16],
-    wide: bool,
+    demote: &[u16],
 ) -> Option<IntPlan> {
     // A speculative region's read of a binding its register carries
     // (`plan_carried_globals`) is a copy of that register: an int register
@@ -460,6 +477,16 @@ pub(super) fn plan(
                     Op::Move { dst, src } => {
                         *dst == r && (dbl_const(*src) || (spec && makes_nonnum(*src)))
                     }
+                    // (A boolean: a compiled `for-in`'s `o === undefined`
+                    // test, made before its loop and branched on in it,
+                    // would fail every entry check, then be demoted.)
+                    Op::StrictEq { dst, .. }
+                    | Op::Lt { dst, .. }
+                    | Op::Compare { dst, .. }
+                    | Op::Not { dst, .. } => *dst == r,
+                    Op::ValueBin { dst, op, .. } if *op == VB_LOOSE_EQ || *op == VB_LOOSE_NEQ => {
+                        *dst == r
+                    }
                     _ => spec && mk(op, r),
                 }
         })
@@ -467,7 +494,7 @@ pub(super) fn plan(
     let mut cset: Vec<u16> = info
         .iter()
         .map(|x| x.0)
-        .filter(|&r| !(carried(r) && starts_double(r)))
+        .filter(|&r| !(carried(r) && starts_double(r)) && !demote.contains(&r))
         .collect();
     cset.sort_unstable();
     cset.dedup();
@@ -873,29 +900,10 @@ pub(super) fn plan(
                 continue;
             }
         }
-        if wide {
-            // A `===` the double emitter makes (operands not both int
-            // registers) decides two non-Numbers in its slow path, which
-            // in an integer version bails: unless against a constant
-            // (compared by its bits), a loop of `o === p` over objects
-            // would only bail. (The other candidates have their integer
-            // version for more than such a loop's counter.)
-            let konst = |r: u16| {
-                let ds = defs_of(r);
-                !ds.is_empty()
-                    && ds
-                        .iter()
-                        .all(|&pc| matches!(bytecode[pc], Op::LoadConst { .. }))
-            };
-            let bails = body.iter().enumerate().any(|(i, op)| {
-                arm_of(head + i).is_none()
-                    && matches!(op, Op::StrictEq { a, b, .. }
-                        if !(inn(*a) && inn(*b)) && !konst(*a) && !konst(*b))
-            });
-            if bails {
-                return None;
-            }
-        }
+        // (A `===` the double emitter makes, operands not both int
+        // registers, decides two distinct objects inline in an integer
+        // version too: only Strings and BigInts bail,
+        // `NumGen::emit_strict_eq_stub`.)
         if elems {
             // Every element / `.length` read's result, and every element
             // read's index, an int register: else the double versions.
@@ -1219,6 +1227,144 @@ impl NumGen {
         entry
     }
 
+    /// A bail at the current pc of an op whose result is no int32 (an
+    /// overflow, a `-0`, a NaN): as [`Self::ibail`], and the bail sets the
+    /// op's bit in the region's overflow-bail mask, so a recompilation
+    /// demotes its result (see [`plan`]'s `demote`).
+    fn ibail_ovf(&mut self, a: &mut X64Assembler) -> Label {
+        let entry = self.ibail(a);
+        let (Some(ri), pc) = (self.imode, self.cur_pc) else {
+            return entry;
+        };
+        if self.env.persist == 0 || ri >= super::super::global_persist::COUNTERS {
+            return entry;
+        }
+        if self.demote_sites.len() <= ri {
+            self.demote_sites.resize(ri + 1, Vec::new());
+        }
+        let Some(r) = self.bc(pc).and_then(super::written_reg) else {
+            return entry;
+        };
+        let bit = self.demote_bit(ri, pc, r);
+        if let Some(s) = self.stubs.last_mut() {
+            s.demote = Some(bit);
+        }
+        entry
+    }
+
+    /// The bit of region `ri`'s overflow-bail mask for site `(pc, r)`.
+    fn demote_bit(&mut self, ri: usize, pc: usize, r: u16) -> u8 {
+        if self.demote_sites.len() <= ri {
+            self.demote_sites.resize(ri + 1, Vec::new());
+        }
+        let sites = &mut self.demote_sites[ri];
+        let k = match sites.iter().position(|&q| q == (pc, r)) {
+            Some(k) => k,
+            None => {
+                sites.push((pc, r));
+                sites.len() - 1
+            }
+        };
+        k.min(DEMOTE_BITS - 1) as u8
+    }
+
+    /// Where region `ri`'s integer version's entry check of loop-carried int
+    /// register `r` goes when the value is no int32: to `efail` (counted,
+    /// `entry_retry`), the last time before the version is turned off
+    /// ([`ENTRY_RETRIES`] in a row) first setting `r`'s bit in the region's
+    /// overflow-bail mask (its site the header), so a recompilation demotes
+    /// `r` (a counter `for (let c = 2147483000; …; c += 3)` already past
+    /// 2^31 when on-stack replacement enters the loop). The code goes into
+    /// `fails`, emitted after the checks.
+    fn entry_fail(
+        &mut self,
+        a: &mut X64Assembler,
+        ri: usize,
+        r: u16,
+        efail: Label,
+        fails: &mut Vec<(Label, u8)>,
+    ) -> Label {
+        if self.env.persist == 0 || ri >= super::super::global_persist::COUNTERS {
+            return efail;
+        }
+        let head = self.regions[ri].head;
+        let bit = self.demote_bit(ri, head, r);
+        let l = a.new_label();
+        fails.push((l, bit));
+        l
+    }
+
+    /// The code of [`Self::entry_fail`]'s labels.
+    fn emit_entry_fails(
+        &self,
+        a: &mut X64Assembler,
+        ri: usize,
+        efail: Label,
+        fails: &[(Label, u8)],
+    ) {
+        let r11 = super::super::call_seq::r::R11;
+        for &(l, bit) in fails {
+            a.bind(l);
+            a.g_movabs(r11, self.env.persist);
+            a.g_mem(
+                true,
+                &[0x81],
+                7,
+                r11,
+                super::super::global_persist::entry_off(ri),
+            );
+            a.raw(&ENTRY_DEMOTE.to_le_bytes()); // cmp qword [r11 + off], imm32
+            a.jcc(CC_L, efail);
+            self.note_demote(a, ri, bit);
+            a.jmp(efail);
+        }
+    }
+
+    /// In an overflow bail's stub: sets bit `bit` of region `ri`'s
+    /// overflow-bail mask and, the first time, asks the next back-edge poll
+    /// to have the body recompiled. Clobbers `r11` (and the flags).
+    pub(super) fn note_demote(&self, a: &mut X64Assembler, ri: usize, bit: u8) {
+        let r11 = super::super::call_seq::r::R11;
+        let done = a.new_label();
+        a.g_movabs(r11, self.env.persist);
+        a.g_mem(
+            true,
+            &[0xf7],
+            0,
+            r11,
+            super::super::global_persist::demote_off(ri),
+        );
+        a.raw(&(1i32 << bit).to_le_bytes()); // test qword [r11 + off], 1 << bit
+        a.jcc(CC_NE, done);
+        a.g_mem(
+            true,
+            &[0x81],
+            1,
+            r11,
+            super::super::global_persist::demote_off(ri),
+        );
+        a.raw(&(1i32 << bit).to_le_bytes()); // or qword [r11 + off], 1 << bit
+        // (The next back-edge poll calls, to have the body recompiled.)
+        a.g_store_byte_imm(
+            super::super::call_seq::r::R15,
+            self.env.layout.poll.demote,
+            1,
+        );
+        a.bind(done);
+    }
+
+    /// `(header, end, region, sites)` of the regions whose integer
+    /// versions have overflow bails that set their mask's bits (`tierup`):
+    /// site `k`, `(pc, register)`, sets bit `min(k, DEMOTE_BITS - 1)`.
+    pub(crate) fn demote_heads(&self) -> Vec<super::DemoteRegion> {
+        self.demote_sites
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(ri, s)| (self.regions[ri].head, self.regions[ri].end, ri, s.clone()))
+            .collect()
+    }
+
     /// A bail's body (in `finish`): materialize the int registers live at `pc`
     /// into the double version's locations and (`store`) write the promoted
     /// globals back to their bindings, then continue in its code for `pc`.
@@ -1284,14 +1430,27 @@ impl NumGen {
         // loaded: these are calls), every carried int register must be an exact
         // int32 now.
         self.gvalidate(a, p, dbl_entry);
-        for s in &p.slots {
-            if s.carried && !self.is_greg(s.reg) {
-                a.load_rax(disp(s.reg));
-                a.exact_i32_check(RCX);
-                a.jcc(CC_NE, efail);
-                a.mov32_rr(s.gpr, RCX);
-            }
+        let carried: Vec<(u16, u8)> = p
+            .slots
+            .iter()
+            .filter(|s| s.carried && !self.is_greg(s.reg))
+            .map(|s| (s.reg, s.gpr))
+            .collect();
+        let mut fails = Vec::new();
+        for (r, gpr) in carried {
+            a.load_rax(disp(r));
+            a.exact_i32_check(RCX);
+            let f = self.entry_fail(a, ri, r, efail, &mut fails);
+            a.jcc(CC_NE, f);
+            a.mov32_rr(gpr, RCX);
         }
+        if !fails.is_empty() {
+            let past = a.new_label();
+            a.jmp(past);
+            self.emit_entry_fails(a, ri, efail, &fails);
+            a.bind(past);
+        }
+        let p = self.regions[ri].int.as_ref()?;
         for s in &self.regions[ri].slots {
             if s.carried && p.ints.binary_search(&s.reg).is_err() {
                 a.movsd_x_mem(s.xmm, disp(s.reg));
@@ -1379,7 +1538,7 @@ impl NumGen {
                 let t = if d != s { d } else { RAX };
                 a.mov32_rr(t, s);
                 a.add32_imm8(t, if dec { -1 } else { 1 });
-                let bail = self.ibail(a);
+                let bail = self.ibail_ovf(a);
                 a.jcc(CC_O, bail);
                 a.mov32_rr(d, t);
             }
@@ -1543,7 +1702,7 @@ impl NumGen {
                     };
                     let s = self.ival(a, src, RAX)?;
                     a.mov32_rr(RAX, s);
-                    let bail = self.ibail(a);
+                    let bail = self.ibail_ovf(a);
                     a.test32_rr(RAX, RAX);
                     a.jcc(CC_E, bail); // -0
                     a.grp3_32(3, RAX); // neg eax
@@ -1645,7 +1804,7 @@ impl NumGen {
         a.mov32_rr(t, gx);
         a.alu32_rr(opc, t, gy);
         if !wrap {
-            let bail = self.ibail(a);
+            let bail = self.ibail_ovf(a);
             a.jcc(CC_O, bail);
         }
         a.mov32_rr(d, t);
@@ -1670,7 +1829,7 @@ impl NumGen {
         }
         a.mov32_rr(RAX, gx);
         a.imul32_rr(RAX, gy);
-        let bail = self.ibail(a);
+        let bail = self.ibail_ovf(a);
         a.jcc(CC_O, bail);
         let ok = a.new_label();
         a.test32_rr(RAX, RAX);
@@ -1699,7 +1858,7 @@ impl NumGen {
         a.movsxd(RAX, gx);
         let gy = self.ival(a, y, RCX)?;
         a.movsxd(RCX, gy);
-        let bail = self.ibail(a);
+        let bail = self.ibail_ovf(a);
         a.test32_rr(RCX, RCX);
         a.jcc(CC_E, bail);
         a.raw(&[0x49, 0x89, 0xc3]); // mov r11, rax (the dividend)
@@ -1727,7 +1886,7 @@ impl NumGen {
     fn imod_const(&mut self, a: &mut X64Assembler, d: u8, x: u16, c: u32) -> Option<()> {
         let l = 32 - (c - 1).leading_zeros(); // ceil(log2 c); 0 for c = 1
         let m: u64 = (1u64 << (31 + l)) / u64::from(c) + 1;
-        let bail = self.ibail(a);
+        let bail = self.ibail_ovf(a);
         let gx = self.ival(a, x, RAX)?;
         a.mov32_rr(RAX, gx);
         a.raw(&[0x3d]); // cmp eax, imm32
@@ -2347,13 +2506,25 @@ impl NumGen {
             }
         }
         let p = self.regions[ri].int.as_ref()?;
-        for s in &p.slots {
-            if s.carried {
-                a.load_rax(disp(s.reg));
-                a.exact_i32_check(RCX);
-                a.jcc(CC_NE, efail);
-                a.mov32_rr(s.gpr, RCX);
-            }
+        let carried: Vec<(u16, u8)> = p
+            .slots
+            .iter()
+            .filter(|s| s.carried)
+            .map(|s| (s.reg, s.gpr))
+            .collect();
+        let mut fails = Vec::new();
+        for (r, gpr) in carried {
+            a.load_rax(disp(r));
+            a.exact_i32_check(RCX);
+            let f = self.entry_fail(a, ri, r, efail, &mut fails);
+            a.jcc(CC_NE, f);
+            a.mov32_rr(gpr, RCX);
+        }
+        if !fails.is_empty() {
+            let past = a.new_label();
+            a.jmp(past);
+            self.emit_entry_fails(a, ri, efail, &fails);
+            a.bind(past);
         }
         self.entry_ok(a, ri);
         let inner = a.new_label();
@@ -2894,7 +3065,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_plan_takes_index_loops_but_not_identity_loops() {
+    fn wide_plan_takes_index_and_identity_loops() {
         // A counter and its `& 3` index over a property read: an integer
         // version, though no element, guard, `for-in` or `Math.imul` op.
         let (_, r) = region_of(
@@ -2903,15 +3074,14 @@ mod tests {
         );
         assert!(r.spec_int && r.int.is_some(), "an integer version");
         // An identity test of an element against a loop-invariant object
-        // would bail in its slow path every time: none.
+        // decides two distinct objects inline: an integer version too.
         let (q, r) = region_of(
             "function g(r, p, n){ let c = 0; for (let i = 0; i < n; i = i + 1) { if (r[i & 3].o === p) c = c + 1; } return c; }",
             "g",
         );
         assert!(
-            r.int.is_none(),
-            "no integer version for an identity loop: {:?} {:#?}",
-            r.int.as_ref().map(IntPlan::regs),
+            r.int.is_some(),
+            "an integer version for an identity loop: {:#?}",
             q.ops
         );
         // Elements compared by `===` are no int registers (two reads would

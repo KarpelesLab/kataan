@@ -51,7 +51,9 @@ pub(super) const BODY_WORDS: usize = 1 + 8;
 /// (`LEN + COUNTERS + region`): see `numeric::int32`; and how often (lately:
 /// halved at each of its back-edge polls) a speculative region's fast
 /// version left for its plain copy (`LEN + 2 * COUNTERS + region`): see
-/// `numeric::Spec`.
+/// `numeric::Spec`; and which of a region's integer version's overflow
+/// bails have been taken (`LEN + 3 * COUNTERS + region`, a bit per site):
+/// see `numeric::int32`'s demotion.
 pub(super) const COUNTERS: usize = 16;
 
 /// Byte offset of region `ri`'s bail counter.
@@ -69,6 +71,11 @@ pub(super) fn leave_off(ri: usize) -> i32 {
     off(LEN + 2 * COUNTERS + ri)
 }
 
+/// Byte offset of region `ri`'s overflow-bail mask.
+pub(super) fn demote_off(ri: usize) -> i32 {
+    off(LEN + 3 * COUNTERS + ri)
+}
+
 /// A body's persistent cache array (owned by its `JitProto`; the code holds
 /// its address).
 pub(super) struct Persist {
@@ -79,7 +86,7 @@ impl Persist {
     /// A fresh array, every entry and epoch empty.
     pub(super) fn new() -> Self {
         Self {
-            words: (0..LEN + 3 * COUNTERS)
+            words: (0..LEN + 4 * COUNTERS)
                 .map(|w| core::cell::UnsafeCell::new(if w < LEN { EMPTY } else { 0 }))
                 .collect(),
         }
@@ -87,7 +94,22 @@ impl Persist {
 
     /// Region `ri`'s speculative-leave count ([`leave_off`]).
     pub(super) fn leaves(&self, ri: usize) -> u64 {
-        self.words.get(LEN + 2 * COUNTERS + ri).map_or(0, |w| {
+        if ri >= COUNTERS {
+            return 0;
+        }
+        self.word(LEN + 2 * COUNTERS + ri)
+    }
+
+    /// Region `ri`'s overflow-bail mask ([`demote_off`]).
+    pub(super) fn demotes(&self, ri: usize) -> u64 {
+        if ri >= COUNTERS {
+            return 0;
+        }
+        self.word(LEN + 3 * COUNTERS + ri)
+    }
+
+    fn word(&self, i: usize) -> u64 {
+        self.words.get(i).map_or(0, |w| {
             // SAFETY: the compiled code writes the word only while it runs,
             // on this thread, which is not running it now (a back-edge poll
             // or a call out of it reads it here).

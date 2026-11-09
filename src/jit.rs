@@ -3309,10 +3309,15 @@ pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::Str
 }
 
 /// A generic-tier body as compiled: its code, its native-call entries'
-/// offsets, and its speculative loops' `(header, region)`
-/// (`tierup::TierUp::spec_regions`).
+/// offsets, its speculative loops' `(header, region)`
+/// (`tierup::TierUp::spec_regions`) and its integer versions' overflow
+/// bail sites (`tierup::TierUp::int_regions`).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-type GenericCompiled = (JitFunction, NativeEntries, Vec<(usize, usize)>);
+type GenericCompiled = (
+    JitFunction,
+    NativeEntries,
+    (Vec<(usize, usize)>, Vec<numeric::DemoteRegion>),
+);
 
 /// A generic body's native-call entries (`call_seq::emit_native_entry`), as
 /// byte offsets into its code.
@@ -4199,7 +4204,7 @@ impl JitProto {
         plain: &dyn Fn(u32) -> bool,
         pick: &dyn Fn(usize, &crate::nbvm::Op) -> Vec<inline::Candidate<'a>>,
     ) -> Option<Self> {
-        Self::compile_generic_respec(proto, helpers, warm, plain, pick, &[])
+        Self::compile_generic_respec(proto, helpers, warm, plain, pick, &[], &[])
     }
 
     /// [`compile_generic_inlining`](Self::compile_generic_inlining), with no
@@ -4214,6 +4219,7 @@ impl JitProto {
         plain: &dyn Fn(u32) -> bool,
         pick: &dyn Fn(usize, &crate::nbvm::Op) -> Vec<inline::Candidate<'a>>,
         no_spec: &[usize],
+        demote: &[(usize, u16)],
     ) -> Option<Self> {
         // The register `call_with_inner` puts `new.target` in, if any (a
         // native-call entry fills it from the call header; one at or below the
@@ -4486,6 +4492,16 @@ impl JitProto {
             })
             .collect();
         tier_up.spec_off = no_spec.to_vec();
+        // (Likewise the ops whose results an earlier body's integer
+        // versions found no int32: `TierUp::int_demote`.)
+        let demote_body: Vec<(usize, u16)> = demote
+            .iter()
+            .filter_map(|&(pc, r)| match &pc_map {
+                Some(m) => m.0.get(pc).map(|&p| (p as usize, r)),
+                None => Some((pc, r)),
+            })
+            .collect();
+        tier_up.int_demote = demote.to_vec();
         // The `for-in` loops' sites (`forin`), owned with the code.
         let forin_plan = forin::plan(&ops, &bytecode, proto.n_regs);
         let deopt_info = can_deopt.then(|| {
@@ -4505,7 +4521,7 @@ impl JitProto {
                 .filter(|op| matches!(op, crate::nbvm::Op::NewString { .. }))
                 .count(),
         ));
-        let (func, native_entry, spec_heads) = JitFunction::compile_generic(
+        let (func, native_entry, (spec_heads, demote_heads)) = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
             &ops,
@@ -4519,12 +4535,14 @@ impl JitProto {
             &inline_closures,
             pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
             &no_spec_body,
+            &demote_body,
             &forin_plan,
             deopt_info.as_deref(),
             &derived_keys,
             &lits,
         )?;
         tier_up.spec_regions = spec_heads;
+        tier_up.int_regions = demote_heads;
         Some(Self {
             func,
             n_params: proto.n_params,
@@ -7499,6 +7517,7 @@ impl JitFunction {
         inline_closures: &[bool],
         pc_orig: &[u32],
         no_spec: &[usize],
+        demote: &[(usize, u16)],
         forin_plan: &forin::Plan,
         deopt_info: Option<&deopt::DeoptInfo>,
         derived_keys: &[u64],
@@ -7689,6 +7708,8 @@ impl JitFunction {
                 math1: helpers.math1 as usize as u64,
                 persist,
                 no_spec: no_spec.to_vec(),
+                first_local: n_params + n_caps + 1,
+                demote: demote.to_vec(),
                 realm: helpers.call_layout.realm,
                 layout: helpers.call_layout,
                 heap: layout,
@@ -15050,7 +15071,7 @@ impl JitFunction {
                 let _ = std::fs::write(bin, &code);
             }
         }
-        let spec_heads = num.spec_heads();
+        let spec_heads = (num.spec_heads(), num.demote_heads());
         let n = at.len();
         let entries = NativeEntries {
             general: at[0],
