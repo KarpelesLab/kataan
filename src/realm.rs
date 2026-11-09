@@ -439,6 +439,16 @@ pub struct Realm {
     /// Remembered shaped-into-shaped merges (`{ k: v, ...src }`), by the
     /// target's and the source's layouts (see `spread_fast::MergePlan`).
     merge_plans: alloc::vec::Vec<Option<spread_fast::MergePlan>>,
+    /// `Object.assign`'s plain-copy proofs, kept from one call to the next
+    /// (see `assign_fast`), for the host's built-in and the VM's fast call
+    /// alike.
+    assign_memo: assign_fast::AssignMemo,
+    /// The property cache of the VM's `.length` read (`Op::ArrayLen`, which
+    /// has no cache of its own) on an ordinary object: a `get length()`
+    /// accessor of a class, a plain `{ length }` record. Shared by every
+    /// such read (a cache validates its receiver and chain on each hit), and
+    /// taken out for the length of one.
+    pub(crate) len_cache: Option<alloc::boxed::Box<crate::ic::PropertyCache>>,
     /// The hidden-state layout of a live Set/Map iterator (see
     /// `hidden_layout`), learned from the first one the bytecode VM steps.
     pub(crate) coll_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
@@ -1040,6 +1050,8 @@ impl Realm {
             key_strings: alloc::vec::Vec::new(),
             dict_key_strings: alloc::vec::Vec::new(),
             merge_plans: alloc::vec::Vec::new(),
+            assign_memo: assign_fast::AssignMemo::default(),
+            len_cache: None,
             coll_iter_layout: None,
             buf_iter_layout: None,
             str_iter_layout: None,
@@ -7644,6 +7656,21 @@ impl Realm {
         {
             o.clear_accessor(key);
         }
+    }
+
+    /// `CreateDataProperty(handle, key, value)` on an extensible object whose
+    /// own `key`, if any, is configurable (object spread's and object rest's
+    /// own fresh object): an own accessor under `key` is replaced by the data
+    /// property (keeping the key's place in the own-key order), else it is
+    /// [`set_property`](Self::set_property).
+    pub(crate) fn create_data_over_accessor(&mut self, handle: Handle, key: &str, value: NanBox) {
+        if self
+            .props_object(handle)
+            .is_some_and(|o| o.accessor(key).is_some())
+        {
+            self.clear_accessor(handle, key);
+        }
+        self.set_property(handle, key, value);
     }
 
     /// Removes the stored data slot for `key` on `handle` (without the

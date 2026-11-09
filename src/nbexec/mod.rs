@@ -271,9 +271,6 @@ pub struct Interp {
     /// kept from one call to the next (see `json_parse::JsonParseMemo`);
     /// taken out for the length of a parse.
     json_parse_memo: Option<alloc::boxed::Box<json_parse::JsonParseMemo>>,
-    /// `Object.assign`'s plain-copy proofs, kept from one call to the next
-    /// (see `realm::assign_fast`).
-    assign_memo: crate::realm::assign_fast::AssignMemo,
     /// When a *generic* array-like receiver is materialized for an iteration
     /// method (`map`/`filter`/`forEach`/`reduce`/…), this records which indices
     /// were actually *present* (`HasProperty`) on the source object, so those
@@ -3067,7 +3064,6 @@ impl Interp {
             json_proofs: [(0, 0); 4],
             json_out_hint: 64,
             json_parse_memo: None,
-            assign_memo: Default::default(),
             array_like_present: None,
             wasm_states: alloc::collections::BTreeMap::new(),
             wasm_modules: alloc::collections::BTreeMap::new(),

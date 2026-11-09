@@ -62,12 +62,7 @@ impl Realm {
     /// plain copy (see the module docs): performed, returning `true`.
     /// `false`, having changed nothing, for any other pair. The caller rules
     /// out a mapped `arguments` object on either side.
-    pub(crate) fn assign_plain(
-        &mut self,
-        target: Handle,
-        src: Handle,
-        memo: &mut AssignMemo,
-    ) -> bool {
+    pub(crate) fn assign_plain(&mut self, target: Handle, src: Handle) -> bool {
         if self.is_host_exotic(src)
             || self.is_host_exotic(target)
             || self.is_function_proto_intrinsic(src)
@@ -75,28 +70,48 @@ impl Realm {
         {
             return false;
         }
+        let shaped = match self.heap.get(src) {
+            Some(Cell::Object(s)) if !s.is_prim_wrapper() => s
+                .plain_shaped_shape()
+                .filter(|sh| !sh.is_empty())
+                .map(Rc::clone),
+            _ => return false,
+        };
+        let (proto, target_empty, target_shaped) = match self.heap.get(target) {
+            Some(Cell::Object(t))
+                if (t.is_plain_shaped() || t.is_plain_dict()) && !t.is_prim_wrapper() =>
+            {
+                (t.proto(), t.is_empty(), t.shaped_shape().is_some())
+            }
+            _ => return false,
+        };
+        // A shaped source onto a shaped target that has keys: the merge by
+        // its remembered plan, which reads the source's values itself (no
+        // copy of them, nor of the source's keys, first): what the copy
+        // below ends in for this pair. The proof checks every key of the
+        // layout copyable, as the copy does.
+        if !target_empty
+            && target_shaped
+            && let Some(shape) = &shaped
+        {
+            if !self.assign_chain_proven(shape, proto) {
+                return false;
+            }
+            if self.merge_shaped_planned(target, src) {
+                return true;
+            }
+        }
         let Some(Cell::Object(s)) = self.heap.get(src) else {
             return false;
         };
-        if s.is_prim_wrapper() {
-            return false;
-        }
         let Some(copy) = s.plain_copy(&[]) else {
             return false;
         };
-        let Some(Cell::Object(t)) = self.heap.get(target) else {
-            return false;
-        };
-        if !(t.is_plain_shaped() || t.is_plain_dict()) || t.is_prim_wrapper() {
-            return false;
-        }
-        let proto = t.proto();
-        let target_empty = t.is_empty();
         if copy.is_empty() {
             return true;
         }
         let proven = match copy.shape() {
-            Some(shape) => self.assign_chain_proven(shape, proto, memo),
+            Some(shape) => self.assign_chain_proven(shape, proto),
             None => self.assign_chain_clear(&copy, proto),
         };
         if !proven {
@@ -177,15 +192,11 @@ impl Realm {
     /// `shape` and every key of `shape` is a copyable one (a property name or
     /// a Symbol, no other engine-internal key): from `memo` while its proof
     /// is current, else shown now (watching every link) and remembered.
-    fn assign_chain_proven(
-        &mut self,
-        shape: &Rc<Shape>,
-        proto: Option<Handle>,
-        memo: &mut AssignMemo,
-    ) -> bool {
+    fn assign_chain_proven(&mut self, shape: &Rc<Shape>, proto: Option<Handle>) -> bool {
         let raw = proto.map_or(u64::MAX, Handle::to_raw);
         let epoch = crate::object::proto_epoch();
-        if memo
+        if self
+            .assign_memo
             .ways
             .iter()
             .flatten()
@@ -225,6 +236,7 @@ impl Realm {
         {
             return false;
         }
+        let memo = &mut self.assign_memo;
         let way = memo.next % ASSIGN_WAYS;
         memo.next = memo.next.wrapping_add(1);
         memo.ways[way] = Some(AssignProof {

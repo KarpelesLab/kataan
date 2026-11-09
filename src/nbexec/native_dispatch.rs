@@ -2158,13 +2158,9 @@ impl Interp {
                         if let Some(sh) = src.as_handle().map(Handle::from_raw)
                             && !self.is_mapped_arguments(sh)
                             && !self.is_mapped_arguments(t)
+                            && self.realm.assign_plain(t, sh)
                         {
-                            let mut memo = core::mem::take(&mut self.assign_memo);
-                            let done = self.realm.assign_plain(t, sh, &mut memo);
-                            self.assign_memo = memo;
-                            if done {
-                                continue;
-                            }
+                            continue;
                         }
                         // A primitive string source contributes its character indices.
                         if let Some(s) = src

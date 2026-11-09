@@ -2172,6 +2172,34 @@ fn object_spread_invokes_getters() {
 }
 
 #[test]
+fn object_spread_replaces_an_own_accessor_with_data() {
+    // CopyDataProperties defines: an accessor of the literal under the same
+    // key becomes a data property, in the accessor's place in key order.
+    let desc = "let d=Object.getOwnPropertyDescriptor(o,'a'); \
+                [d.value, d.writable, d.enumerable, d.configurable, 'get' in d, 'set' in d, \
+                 Object.keys(o).join('')].join(',')";
+    for lit in [
+        "{get a(){return 0}, ...{a:1}}",
+        "{set a(v){}, ...{a:1}}",
+        "{x:0, get a(){return 0}, set a(v){}, y:0, ...{a:1}}",
+    ] {
+        let keys = if lit.starts_with("{x") { "xay" } else { "a" };
+        assert_eq!(
+            run(&alloc::format!("let o={lit}; {desc}")),
+            alloc::format!("1,true,true,true,false,false,{keys}"),
+            "{lit}"
+        );
+    }
+    // Written afterwards as data, not through the former setter.
+    assert_eq!(
+        run("let n=0; let o={set a(v){n++}, ...{a:1}}; o.a=2; o.a+':'+n"),
+        "2:0"
+    );
+    // An accessor after the spread still wins.
+    assert_eq!(run("let o={...{a:1}, get a(){return 'g'}}; o.a"), "g");
+}
+
+#[test]
 fn wholesale_spread_rest_assign_of_plain_and_dictionary_objects() {
     // Big (dictionary-mode) and small sources, with deletes, integer keys,
     // Symbols and non-enumerable keys: copies are whole, ordered and

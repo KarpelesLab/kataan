@@ -1869,6 +1869,18 @@ impl Object {
     /// caller has checked once for it).
     #[must_use]
     pub(crate) fn plain_shaped_values(&self) -> Option<(&Rc<Shape>, Vec<NanBox>)> {
+        let shape = self.plain_shaped_shape()?;
+        Some((
+            shape,
+            (0..u32::from(self.len)).map(|i| self.slot_at(i)).collect(),
+        ))
+    }
+
+    /// The layout [`plain_shaped_values`](Self::plain_shaped_values) answers
+    /// with, without reading the values.
+    #[inline]
+    #[must_use]
+    pub(crate) fn plain_shaped_shape(&self) -> Option<&Rc<Shape>> {
         if self.flags & JIT_FLAG_EXOTIC != 0
             || self.is_dict()
             || !self.keys_follow_shape()
@@ -1877,10 +1889,7 @@ impl Object {
         {
             return None;
         }
-        Some((
-            &self.shape,
-            (0..u32::from(self.len)).map(|i| self.slot_at(i)).collect(),
-        ))
+        Some(&self.shape)
     }
 
     /// [`merge_plain`](Self::merge_plain) of a shaped copy into this shaped

@@ -3074,8 +3074,13 @@ pub(crate) extern "C" fn jit_helper_get_method_site(
         // SAFETY: as above.
         #[allow(unsafe_code)]
         let cache = unsafe { &mut *site_ref.cache.cast::<crate::ic::PropertyCache>() };
+        // A Map/Set method on a default collection: no inline chain cache
+        // can serve a collection receiver, so there is nothing to fill.
+        if let Some(v) = super::native_call::try_get_coll(ctx, NanBox::from_bits(obj), cache) {
+            return v.to_bits();
+        }
         if let Some(v) =
-            super::native_call::try_get(ctx, NanBox::from_bits(obj), site_ref.key(), cache)
+            super::native_call::try_get_general(ctx, NanBox::from_bits(obj), site_ref.key(), cache)
         {
             // (And where the site's inline chain cache finds it, so the
             // compiled read hits inline next time: `Math.min` read for a

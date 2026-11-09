@@ -870,6 +870,62 @@ impl Realm {
         }
     }
 
+    /// Whether `recv[key]` is still `method` at a method site whose memo
+    /// `cache` names that `Map.prototype` / `Set.prototype` built-in, for a
+    /// Map/Set receiver with its default `[[Prototype]]`: the proof of
+    /// [`coll_site_call`](Self::coll_site_call) (the holder's slot still
+    /// holds `method`, every link unchanged since it was validated with all
+    /// of them watched, and `recv` owns no named property and continues at
+    /// the first link), without the call. A compiled `m.get(k)` reads its
+    /// method on its own (`Op::GetMethod`, before the arguments) on ever new
+    /// receivers (`dist.get(…)` on each call's fresh Map), which the general
+    /// [`method_site_get`](Self::method_site_get) serves only after a
+    /// receiver walk. `false` for anything else (the caller's general path).
+    #[inline]
+    pub(crate) fn coll_site_method_hit(
+        &self,
+        recv: Handle,
+        cache: &MethodSiteCache,
+        method: u64,
+    ) -> bool {
+        let epoch = crate::object::proto_epoch();
+        if !cache.armed
+            || cache.prim
+            || cache.own
+            || cache.stamp != epoch
+            || cache.swaps != self.cell_swaps
+        {
+            return false;
+        }
+        match self.heap.get_hot(Handle::from_raw(cache.holder_props)) {
+            Some(Cell::Object(o))
+                if o.shaped_shape()
+                    .zip(cache.holder_shape.as_ref())
+                    .is_some_and(|(s, m)| Rc::ptr_eq(s, m))
+                    && o.slot(cache.holder_slot)
+                        .is_some_and(|v| v.to_bits() == method) => {}
+            _ => return false,
+        }
+        let Some(Cell::Collection {
+            is_set,
+            is_weak: false,
+            default_proto: true,
+            ..
+        }) = self.heap.get_hot(recv)
+        else {
+            return false;
+        };
+        if cache.recv_memo == recv.to_raw() && cache.recv_stamp == epoch {
+            return true;
+        }
+        let Some(first) = cache.links.first() else {
+            return false;
+        };
+        !self.aux_props.contains_key(&recv.to_raw())
+            && !self.is_host_exotic(recv)
+            && self.coll_default[usize::from(*is_set)].map(|(_, p)| p.to_raw()) == Some(first.0)
+    }
+
     /// [`object_proto`](Self::object_proto) of a collection without the
     /// default `[[Prototype]]` (out of [`coll_site_call`](Self::coll_site_call)'s
     /// line).

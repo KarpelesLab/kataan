@@ -2967,7 +2967,7 @@ impl Interp {
         if !namespace && let Some(entries) = self.realm.plain_data_entries(source) {
             for (name, v) in entries {
                 if !excluded.contains(&name) {
-                    self.realm.set_property(target, &name, v);
+                    self.realm.create_data_over_accessor(target, &name, v);
                 }
             }
             return Ok(());
@@ -2990,7 +2990,7 @@ impl Interp {
                 continue;
             }
             let v = self.read_member(source, &name)?;
-            self.realm.set_property(target, &name, v);
+            self.realm.create_data_over_accessor(target, &name, v);
         }
         Ok(())
     }

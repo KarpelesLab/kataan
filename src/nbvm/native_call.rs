@@ -160,6 +160,10 @@ enum FastOp {
     ObjStaticHasOwn,
     /// `Object.create(proto)` (no property descriptors).
     ObjCreate,
+    /// `Object.assign(target, …sources)`: plain copies done in the VM
+    /// ([`obj_assign_fast`]), anything else through the host directly (as
+    /// [`FastOp::HostDirect`]).
+    ObjAssign,
     /// A built-in `Math` function (its native id), computed by
     /// `math_fast::compute` on Number arguments.
     #[cfg(feature = "std")]
@@ -170,10 +174,10 @@ enum FastOp {
     /// `%GeneratorPrototype%.next` / `throw` / `return` (the resumption
     /// mode, 0 / 1 / 2) on a VM generator: resumed in the VM (`gen_fast`).
     GenResume(u8),
-    /// A built-in whose implementation is the host's (`Object.assign`,
-    /// `JSON.stringify`, `JSON.parse`, and every built-in not served
-    /// otherwise): the resolved function is called through the host
-    /// directly, with no by-name re-resolution.
+    /// A built-in whose implementation is the host's (`JSON.stringify`,
+    /// `JSON.parse`, and every built-in not served otherwise): the resolved
+    /// function is called through the host directly, with no by-name
+    /// re-resolution.
     HostDirect,
 }
 
@@ -319,7 +323,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_OBJECT_VALUES) => return FastOp::ObjValues,
         Some(N_OBJECT_HAS_OWN) => return FastOp::ObjStaticHasOwn,
         Some(N_OBJECT_CREATE) => return FastOp::ObjCreate,
-        Some(N_OBJECT_ASSIGN | N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
+        Some(N_OBJECT_ASSIGN) => return FastOp::ObjAssign,
+        Some(N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
         Some(N_GEN_NEXT) => return FastOp::GenResume(0),
         Some(N_GEN_THROW) => return FastOp::GenResume(1),
         Some(N_GEN_RETURN) => return FastOp::GenResume(2),
@@ -836,6 +841,19 @@ pub(super) fn try_call_got(
         return None;
     }
     let (op, method) = (site.op, site.method);
+    // A Map/Set method (the method value is already read): its lean form
+    // straight away, as `run_op` ends up doing (a receiver of the wrong
+    // kind is a miss, the general path's `TypeError`).
+    if let Some(cop) = op.coll_op() {
+        if prim {
+            return None;
+        }
+        let arg = |i: usize| {
+            args.get(i)
+                .map_or(NanBox::undefined(), |r| regs[*r as usize])
+        };
+        return ctx.realm.coll_fast(h, cop, arg(0), arg(1)).map(Ok);
+    }
     run_op(ctx, funcs, op, method, recv, h, prim, regs, args)
 }
 
@@ -844,6 +862,37 @@ pub(super) fn try_call_got(
 /// docs): that very function cell, read without running code. `None` to take
 /// the ordinary `[[Get]]`.
 pub(super) fn try_get(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    key: &str,
+    cache: &mut PropertyCache,
+) -> Option<NanBox> {
+    if let Some(v) = try_get_coll(ctx, recv, cache) {
+        return Some(v);
+    }
+    try_get_general(ctx, recv, key, cache)
+}
+
+/// [`try_get`] at a site that last read a `Map.prototype` /
+/// `Set.prototype` method, for a Map/Set receiver with its default
+/// `[[Prototype]]` (`Realm::coll_site_method_hit`): the method, proved in a
+/// few compares whichever collection the receiver is. `None`, having done
+/// nothing, otherwise.
+#[inline]
+pub(super) fn try_get_coll(ctx: &Ctx, recv: NanBox, cache: &PropertyCache) -> Option<NanBox> {
+    let site = cache.native.as_deref()?;
+    site.op.coll_op()?;
+    let h = Handle::from_raw(recv.as_handle()?);
+    if ctx.host.is_none() || ctx.realm.multi_realm {
+        return None;
+    }
+    ctx.realm
+        .coll_site_method_hit(h, &site.chain, site.method)
+        .then(|| NanBox::from_bits(site.method))
+}
+
+/// [`try_get`] without its collection shortcut ([`try_get_coll`]).
+pub(super) fn try_get_general(
     ctx: &mut Ctx,
     recv: NanBox,
     key: &str,
@@ -889,6 +938,36 @@ pub(super) fn try_get(
         }
     }
     Some(NanBox::from_bits(site.method))
+}
+
+/// `Object.assign(target, …sources)` (the arguments are registers `args` of
+/// `regs`) when every source is `null`, `undefined` or a plain copy onto the
+/// plain object `target` (`Realm::assign_plain`, which runs no code and
+/// cannot throw): `target`. `None` otherwise, possibly after copying some
+/// leading sources: the caller then makes the whole call the general way,
+/// whose repeat of those copies stores the same values under keys the
+/// target already owns as plain data properties, which nothing observes.
+fn obj_assign_fast(realm: &mut Realm, regs: &[NanBox], args: &[Reg]) -> Option<NanBox> {
+    let (first, sources) = args.split_first()?;
+    let target = regs[*first as usize];
+    let t = Handle::from_raw(target.as_handle()?);
+    // An ordinary object cell (ToObject is the identity; a primitive String,
+    // Symbol or BigInt target is boxed, the host's).
+    realm.object_key_epoch(t)?;
+    if realm.has_argument_map_marker(t) {
+        return None;
+    }
+    for r in sources {
+        let s = regs[*r as usize];
+        if s.is_undefined() || s.is_null() {
+            continue;
+        }
+        let s = Handle::from_raw(s.as_handle()?);
+        if realm.has_argument_map_marker(s) || !realm.assign_plain(t, s) {
+            return None;
+        }
+    }
+    Some(target)
 }
 
 /// [`run_op`] for an object receiver, not inlined: the `F.call(t, …)` form
@@ -1080,9 +1159,22 @@ fn run_op(
             );
         }
     }
+    if matches!(op, FastOp::ObjAssign) {
+        if let Some(v) = obj_assign_fast(&mut ctx.realm, regs, args) {
+            return Some(Ok(v));
+        }
+        let method = NanBox::from_bits(method);
+        let argv = super::ArgBuf::from_regs(regs, args);
+        return Some(
+            with_host(ctx, |host| host.call(method, recv, &argv))
+                .unwrap_or(Err(super::HostError::Fault))
+                .map_err(VmError::from),
+        );
+    }
     let realm = &mut ctx.realm;
     let v = match op {
         FastOp::None
+        | FastOp::ObjAssign
         | FastOp::ArrayHof(_)
         | FastOp::StrReplaceAll
         | FastOp::GenResume(_)

@@ -11444,7 +11444,15 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
         if is_string_wrapper(&ctx.realm, recv) {
             return host_get_str(ctx, recv, "length");
         }
-        return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+        // An ordinary object's through the realm's shared `.length` cache (a
+        // nested read, from a getter, makes its own).
+        if ctx.realm.object_key_epoch(handle).is_none() {
+            return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+        }
+        let mut cache = ctx.realm.len_cache.take().unwrap_or_default();
+        let r = vm_get_prop(ctx, funcs, recv, "length", &mut cache);
+        ctx.realm.len_cache = Some(cache);
+        return r;
     }
     // A VM function (a tagged closure array) reports its parameter count from the
     // proto, not the backing array's length.
