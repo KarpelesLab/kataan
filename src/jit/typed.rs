@@ -273,57 +273,92 @@ impl X64Assembler {
         self.code.push(scale << 6);
     }
 
+    /// `[pfx] [REX] 0F opc /r` over two registers (`reg`, `rm`: register
+    /// numbers, `w`: REX.W).
+    fn t_rr(&mut self, pfx: u8, w: bool, opc: u8, reg: u8, rm: u8) {
+        if pfx != 0 {
+            self.code.push(pfx);
+        }
+        let rex = 0x40 | (u8::from(w) << 3) | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code
+            .extend_from_slice(&[0x0f, opc, 0xc0 | ((reg & 7) << 3) | (rm & 7)]);
+    }
+
     /// The element read: with `rax` an integer index (and, for
     /// [`Src::View`], `rcx` / `r9` from [`t_view`](Self::t_view)), `rax` =
     /// the element (a `NanBox` Number's bits) and on to `got`, else to
-    /// `miss`. Clobbers `r8`, `r11`, `xmm0`.
-    pub(crate) fn t_get(&mut self, t: &TypedLayout, src: Src, miss: Label, got: Label) {
+    /// `miss`. With `to = Some((x, past))` (`x` an SSE register other than
+    /// `xmm0`), an element whose Number is no NaN goes into `xmm x` and on
+    /// to `past` instead, skipping the round trip through `rax` that
+    /// `got`'s code (`xmm x = rax`, then `past`) would make; a NaN still
+    /// goes through `got`. Clobbers `r8`, `r11`, `xmm0`.
+    pub(crate) fn t_get(
+        &mut self,
+        t: &TypedLayout,
+        src: Src,
+        miss: Label,
+        got: Label,
+        to: Option<(u8, Label)>,
+    ) {
         self.t_index(t, src, miss);
+        // (The kind slot is loop-invariant for a hoisted view: the chain's
+        // branches are predicted; the float kinds after the commonest
+        // integer ones.)
         for kind in [
             UINT8,
             INT32,
             FLOAT64,
+            FLOAT32,
             UINT16,
             INT16,
             INT8,
             UINT32,
-            FLOAT32,
             UINT8_CLAMPED,
         ] {
             let next = self.new_label();
             self.t_kind(t, src, kind, next, miss);
             let s = size_log2(kind);
+            // Where the Number goes: `xmm x`, or `xmm0` (then `rax`).
+            let x = to.map_or(0, |(x, _)| x);
             match kind {
                 INT8 => self.t_elem(None, false, &[0x0f, 0xbe], r::RAX, s), // movsx eax, byte
                 UINT8 | UINT8_CLAMPED => self.t_elem(None, false, &[0x0f, 0xb6], r::RAX, s),
                 INT16 => self.t_elem(None, false, &[0x0f, 0xbf], r::RAX, s), // movsx eax, word
                 UINT16 => self.t_elem(None, false, &[0x0f, 0xb7], r::RAX, s), // movzx eax, word
                 INT32 | UINT32 => self.t_elem(None, false, &[0x8b], r::RAX, s), // mov eax, dword
-                FLOAT32 => self.t_elem(Some(0xf3), false, &[0x0f, 0x5a], 0, s), // cvtss2sd xmm0
-                _ => self.t_elem(Some(0xf2), false, &[0x0f, 0x10], 0, s),    // movsd xmm0
+                FLOAT32 => self.t_elem(Some(0xf3), false, &[0x0f, 0x5a], x, s), // cvtss2sd xmm x
+                _ => self.t_elem(Some(0xf2), false, &[0x0f, 0x10], x, s),    // movsd xmm x
             }
             if !matches!(kind, FLOAT32 | FLOAT64) {
                 // (`cvtsi2sd` writes only the low lane: without this, each
-                // conversion would wait for the last write of `xmm0`.)
-                self.raw(&[0x0f, 0x57, 0xc0]); // xorps xmm0, xmm0
+                // conversion would wait for the last write of `xmm x`.)
+                self.t_rr(0, false, 0x57, x, x); // xorps xmm x, xmm x
             }
             match kind {
-                // cvtsi2sd xmm0, rax (the zero-extended `u32`).
-                UINT32 => self.raw(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0]),
+                // cvtsi2sd xmm x, rax (the zero-extended `u32`).
+                UINT32 => self.t_rr(0xf2, true, 0x2a, x, r::RAX),
                 FLOAT32 | FLOAT64 => {
                     // A NaN is the canonical one.
                     let num = self.new_label();
-                    self.raw(&[0x66, 0x0f, 0x2e, 0xc0]); // ucomisd xmm0, xmm0
+                    self.t_rr(0x66, false, 0x2e, x, x); // ucomisd xmm x, xmm x
                     self.g_jcc(CC_NP, num);
                     self.g_movabs(r::RAX, crate::nanbox::NanBox::number(f64::NAN).to_bits());
                     self.jmp(got);
                     self.bind(num);
                 }
-                // cvtsi2sd xmm0, eax (the sign- or zero-extended value).
-                _ => self.raw(&[0xf2, 0x0f, 0x2a, 0xc0]),
+                // cvtsi2sd xmm x, eax (the sign- or zero-extended value).
+                _ => self.t_rr(0xf2, false, 0x2a, x, r::RAX),
             }
-            self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
-            self.jmp(got);
+            match to {
+                Some((_, past)) => self.jmp(past),
+                None => {
+                    self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+                    self.jmp(got);
+                }
+            }
             self.bind(next);
         }
         self.jmp(miss);
@@ -560,69 +595,91 @@ impl X64Assembler {
     /// written) to `miss`. Clobbers `rdx`, `r8`, `r11`, `xmm1`.
     pub(crate) fn t_set(&mut self, t: &TypedLayout, src: Src, miss: Label, done: Label) {
         self.t_index(t, src, miss);
+        // The view's kind byte compared with `imm`.
+        macro_rules! cmp_kind {
+            ($imm:expr) => {
+                match src {
+                    Src::View => self.g_cmp_byte_imm(r::RCX, t.off_kind, $imm),
+                    Src::Hoisted(v) => self.g_cmp_byte_imm(r::RBP, v.kind, $imm),
+                }
+            };
+        }
+        // (A walked view's whole extent in its store's bytes, for an
+        // element of size `1 << s`; a hoisted view's entry check proved it.)
+        macro_rules! extent {
+            ($s:expr) => {
+                if let Src::View = src {
+                    self.t_extent(t, $s, miss);
+                }
+            };
+        }
+        // The kinds told apart by ranges, the integer ones first (with no
+        // kind past Float64, [`NO_VIEW`] included, ever stored):
+        // Int8 / Uint8 (0, 1) store a byte, Int16 / Uint16 (3, 4) a word,
+        // Int32 / Uint32 (5, 6) a dword — the truncation's low bits, the
+        // same for both signs — and Uint8Clamped (2) its clamped byte.
+        let floats = self.new_label();
+        let clamped = self.new_label();
+        cmp_kind!(UINT32);
+        self.g_jcc(cc::A, floats);
+        cmp_kind!(UINT8_CLAMPED);
+        self.g_jcc(cc::E, clamped);
+        // `ToInt8` .. `ToUint32` of a Number is its truncation's low bits,
+        // which `cvttsd2si` makes for any one below 2^63 in magnitude; a
+        // NaN, an infinity or a larger Number gives the "integer
+        // indefinite" `i64::MIN` (as does -2^63 itself), the only value
+        // `cmp rdx, 1` overflows on.
+        self.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd0]); // cvttsd2si rdx, xmm0
+        self.raw(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx, 1
+        self.g_jcc(CC_O, miss);
+        let (byte, dword) = (self.new_label(), self.new_label());
+        cmp_kind!(UINT8);
+        self.g_jcc(cc::BE, byte);
+        cmp_kind!(INT32);
+        self.g_jcc(cc::AE, dword);
+        extent!(1);
+        self.t_elem(Some(0x66), false, &[0x89], r::RDX, 1); // mov word [..], dx
+        self.jmp(done);
+        self.bind(dword);
+        extent!(2);
+        self.t_elem(None, false, &[0x89], r::RDX, 2); // mov dword [..], edx
+        self.jmp(done);
+        // Uint8Clamped's rounds half to even (`ToUint8Clamp`), as
+        // `cvtsd2si` does in the default rounding mode, before the clamp
+        // (the same indefinite integer for the same Numbers).
+        self.bind(clamped);
+        self.raw(&[0xf2, 0x48, 0x0f, 0x2d, 0xd0]); // cvtsd2si rdx, xmm0
+        self.raw(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx, 1
+        self.g_jcc(CC_O, miss);
+        let low = self.new_label();
+        let high = self.new_label();
+        self.raw(&[0x48, 0x85, 0xd2]); // test rdx, rdx
+        self.g_jcc(CC_NS, low);
+        self.raw(&[0x31, 0xd2]); // xor edx, edx
+        self.bind(low);
+        self.raw(&[0x48, 0x81, 0xfa, 0xff, 0, 0, 0]); // cmp rdx, 255
+        self.g_jcc(CC_LE, high);
+        self.raw(&[0xba, 0xff, 0, 0, 0]); // mov edx, 255
+        self.bind(high);
+        self.bind(byte);
+        extent!(0);
+        self.t_elem(None, false, &[0x88], r::RDX, 0); // mov byte [..], dl
+        self.jmp(done);
         // The float kinds store any Number.
+        self.bind(floats);
         let not64 = self.new_label();
-        self.t_kind(t, src, FLOAT64, not64, miss);
+        cmp_kind!(FLOAT64);
+        self.g_jcc(cc::NE, not64);
+        extent!(3);
         self.t_elem(Some(0xf2), false, &[0x0f, 0x11], 0, 3); // movsd [..], xmm0
         self.jmp(done);
         self.bind(not64);
-        let not32 = self.new_label();
-        self.t_kind(t, src, FLOAT32, not32, miss);
+        cmp_kind!(FLOAT32);
+        self.g_jcc(cc::NE, miss);
+        extent!(2);
         self.raw(&[0xf2, 0x0f, 0x5a, 0xc8]); // cvtsd2ss xmm1, xmm0
         self.t_elem(Some(0xf3), false, &[0x0f, 0x11], 1, 2); // movss [..], xmm1
         self.jmp(done);
-        self.bind(not32);
-        // The integer kinds (0..=6): `ToInt8` .. `ToUint32` of a Number is
-        // its truncation's low bits, which `cvttsd2si` makes for any one
-        // below 2^63 in magnitude; Uint8Clamped's rounds half to even
-        // (`ToUint8Clamp`), as `cvtsd2si` does in the default rounding
-        // mode, before the clamp. A NaN, an infinity or a larger Number
-        // gives the "integer indefinite" `i64::MIN` (as does -2^63 itself),
-        // the only value `cmp rdx, 1` overflows on.
-        match src {
-            Src::View => self.g_cmp_byte_imm(r::RCX, t.off_kind, UINT32),
-            Src::Hoisted(v) => self.g_cmp_byte_imm(r::RBP, v.kind, UINT32),
-        }
-        self.g_jcc(cc::A, miss);
-        let trunc = self.new_label();
-        let conv = self.new_label();
-        match src {
-            Src::View => self.g_cmp_byte_imm(r::RCX, t.off_kind, UINT8_CLAMPED),
-            Src::Hoisted(v) => self.g_cmp_byte_imm(r::RBP, v.kind, UINT8_CLAMPED),
-        }
-        self.g_jcc(cc::NE, trunc);
-        self.raw(&[0xf2, 0x48, 0x0f, 0x2d, 0xd0]); // cvtsd2si rdx, xmm0
-        self.jmp(conv);
-        self.bind(trunc);
-        self.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd0]); // cvttsd2si rdx, xmm0
-        self.bind(conv);
-        self.raw(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx, 1
-        self.g_jcc(CC_O, miss);
-        for kind in [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED] {
-            let next = self.new_label();
-            self.t_kind(t, src, kind, next, miss);
-            let s = size_log2(kind);
-            if kind == UINT8_CLAMPED {
-                let low = self.new_label();
-                let high = self.new_label();
-                self.raw(&[0x48, 0x85, 0xd2]); // test rdx, rdx
-                self.g_jcc(CC_NS, low);
-                self.raw(&[0x31, 0xd2]); // xor edx, edx
-                self.bind(low);
-                self.raw(&[0x48, 0x81, 0xfa, 0xff, 0, 0, 0]); // cmp rdx, 255
-                self.g_jcc(CC_LE, high);
-                self.raw(&[0xba, 0xff, 0, 0, 0]); // mov edx, 255
-                self.bind(high);
-            }
-            match s {
-                0 => self.t_elem(None, false, &[0x88], r::RDX, 0), // mov byte [..], dl
-                1 => self.t_elem(Some(0x66), false, &[0x89], r::RDX, 1), // mov word [..], dx
-                _ => self.t_elem(None, false, &[0x89], r::RDX, 2), // mov dword [..], edx
-            }
-            self.jmp(done);
-            self.bind(next);
-        }
-        self.jmp(miss);
     }
 }
 

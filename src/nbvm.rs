@@ -19097,16 +19097,15 @@ impl Compiler {
                 alternate,
                 ..
             } => {
-                let cond = self.expr(test)?;
-                let jf = self.emit_jump_if_false(cond);
+                let jf = self.emit_test_false(test)?;
                 self.if_branch(consequent)?;
                 if let Some(alt) = alternate {
                     let jend = self.emit_jump();
-                    self.patch(jf);
+                    jf.into_iter().for_each(|j| self.patch(j));
                     self.if_branch(alt)?;
                     self.patch(jend);
                 } else {
-                    self.patch(jf);
+                    jf.into_iter().for_each(|j| self.patch(j));
                 }
                 Ok(None)
             }
@@ -19214,12 +19213,11 @@ impl Compiler {
             }
             Stmt::While { test, body, .. } => {
                 let top = self.ops.len();
-                let cond = self.expr(test)?;
-                let jf = self.emit_jump_if_false(cond);
+                let jf = self.emit_test_false(test)?;
                 self.enter_loop();
                 self.stmt(body)?;
                 self.ops.push(Op::Jump { target: top });
-                self.patch(jf);
+                jf.into_iter().for_each(|j| self.patch(j));
                 self.exit_loop(top); // `continue` re-tests
                 Ok(None)
             }
@@ -19489,11 +19487,8 @@ impl Compiler {
                 }
                 let top = self.ops.len();
                 let exit = match test {
-                    Some(t) => {
-                        let cond = self.expr(t)?;
-                        Some(self.emit_jump_if_false(cond))
-                    }
-                    None => None,
+                    Some(t) => self.emit_test_false(t)?,
+                    None => Vec::new(),
                 };
                 self.enter_loop();
                 self.stmt(body)?;
@@ -19519,9 +19514,7 @@ impl Compiler {
                     self.expr(u)?;
                 }
                 self.ops.push(Op::Jump { target: top });
-                if let Some(jf) = exit {
-                    self.patch(jf);
-                }
+                exit.into_iter().for_each(|j| self.patch(j));
                 self.exit_loop(cont);
                 self.scopes.pop();
                 Ok(None)
@@ -19562,10 +19555,9 @@ impl Compiler {
                 ..
             } = e
             {
-                let cond = self.expr(test)?;
-                let jf = self.emit_jump_if_false(cond);
+                let jf = self.emit_test_false(test)?;
                 self.compile_tail_return(consequent)?; // terminal
-                self.patch(jf);
+                jf.into_iter().for_each(|j| self.patch(j));
                 return self.compile_tail_return(alternate); // terminal
             }
             let src = self.expr(e)?;
@@ -19660,10 +19652,9 @@ impl Compiler {
                 alternate,
                 ..
             } => {
-                let cond = self.expr(test)?;
-                let jf = self.emit_jump_if_false(cond);
+                let jf = self.emit_test_false(test)?;
                 self.compile_tail_return(consequent)?; // terminal
-                self.patch(jf);
+                jf.into_iter().for_each(|j| self.patch(j));
                 self.compile_tail_return(alternate)?; // terminal
                 Ok(())
             }
@@ -20300,13 +20291,12 @@ impl Compiler {
                 alternate,
                 ..
             } => {
-                let cond = self.expr(test)?;
+                let jf = self.emit_test_false(test)?;
                 let dst = self.alloc();
-                let jf = self.emit_jump_if_false(cond);
                 let c = self.expr(consequent)?;
                 self.ops.push(Op::Move { dst, src: c });
                 let jend = self.emit_jump();
-                self.patch(jf);
+                jf.into_iter().for_each(|j| self.patch(j));
                 let a = self.expr(alternate)?;
                 self.ops.push(Op::Move { dst, src: a });
                 self.patch(jend);
@@ -24787,6 +24777,67 @@ impl Compiler {
         let this = self.this_reg;
         self.ops.push(Op::DerivedResult { dst, src, this });
         self.ops.push(Op::Return { src: dst });
+    }
+
+    /// Compiles `test` for its truthiness alone (an `if`'s, a loop's or a
+    /// conditional's test): the `JumpIfFalse` sites to patch to where a
+    /// falsy test goes, a truthy one falling through. See
+    /// [`test_jumps`](Self::test_jumps).
+    fn emit_test_false(&mut self, test: &Expr) -> Result<Vec<usize>, CompileError> {
+        self.test_jumps(test, false, 0)
+    }
+
+    /// Branches on `e`'s truthiness: the placeholder jumps taken when it is
+    /// `when`, the other case falling through. A test position observes a
+    /// `&&` / `||` / `!` only through that truthiness, which the operands
+    /// decide in turn, evaluated in the same order with the same short-
+    /// circuits; so each operand branches by itself, with no join register
+    /// (its `Move`s, the boolean it would make) and no re-test of it at the
+    /// join. (A chain nested deeper than a few dozen levels is tested as a
+    /// value.)
+    fn test_jumps(&mut self, e: &Expr, when: bool, depth: u32) -> Result<Vec<usize>, CompileError> {
+        if depth < 32 {
+            match e {
+                Expr::Logical {
+                    op: op @ (LogicalOp::And | LogicalOp::Or),
+                    left,
+                    right,
+                    ..
+                } => {
+                    // `&&` is decided by a falsy operand, `||` by a truthy one.
+                    let decides = matches!(op, LogicalOp::Or);
+                    if when == decides {
+                        // Either operand deciding takes the jump.
+                        let mut j = self.test_jumps(left, when, depth + 1)?;
+                        j.extend(self.test_jumps(right, when, depth + 1)?);
+                        return Ok(j);
+                    }
+                    // A deciding left operand is the other case: past the
+                    // right operand, which then decides alone.
+                    let skip = self.test_jumps(left, decides, depth + 1)?;
+                    let j = self.test_jumps(right, when, depth + 1)?;
+                    for s in skip {
+                        self.patch(s);
+                    }
+                    return Ok(j);
+                }
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    argument,
+                    ..
+                } => return self.test_jumps(argument, !when, depth + 1),
+                _ => {}
+            }
+        }
+        let r = self.expr(e)?;
+        let cond = if when {
+            let n = self.alloc();
+            self.ops.push(Op::Not { dst: n, a: r });
+            n
+        } else {
+            r
+        };
+        Ok(alloc::vec![self.emit_jump_if_false(cond)])
     }
 
     /// Emits a `JumpIfFalse` with a placeholder target; returns its index.

@@ -13603,6 +13603,38 @@ impl JitFunction {
                             }
                         };
                     }
+                    // A promoted result's register and the label past the
+                    // op's reload: a typed-array element read puts its
+                    // Number there itself (`typed::X64Assembler::t_get`),
+                    // as `got`'s code below would from `rax`.
+                    let xmm_past = num.result_xmm(op_idx, dst).map(|x| (x, a.new_label()));
+                    // A speculative loop's hoisted view of the receiver
+                    // (`typed::ViewSlots`): its element with no walk. Tried
+                    // before a hoisted array of the same register (a view
+                    // there fails one compare, where the array's path would
+                    // first make the index), except where that register is
+                    // a sunk load that the array path alone reads in place.
+                    let view_first = op_idx == 0 || !num.sunk_load(op_idx - 1);
+                    macro_rules! hoisted_view_get {
+                        () => {
+                            if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
+                                let not_view = a.new_label();
+                                a.t_hoisted(v, disp(obj), not_view);
+                                elem_index!(helper);
+                                a.t_get(
+                                    typed::typed_layout(),
+                                    typed::Src::Hoisted(v),
+                                    helper,
+                                    got,
+                                    xmm_past,
+                                );
+                                a.bind(not_view);
+                            }
+                        };
+                    }
+                    if view_first {
+                        hoisted_view_get!();
+                    }
                     // A speculative loop's hoisted array
                     // (`numeric::ArraySlots`): the receiver the very array
                     // its entry check found, its element with no walk (any
@@ -13628,14 +13660,8 @@ impl JitFunction {
                         // (A sunk load's register, for the other paths.)
                         num.materialize_sunk(&mut a, op_idx);
                     }
-                    // A speculative loop's hoisted view of the receiver
-                    // (`typed::ViewSlots`): its element with no walk.
-                    if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
-                        let not_view = a.new_label();
-                        a.t_hoisted(v, disp(obj), not_view);
-                        elem_index!(helper);
-                        a.t_get(typed::typed_layout(), typed::Src::Hoisted(v), helper, got);
-                        a.bind(not_view);
+                    if !view_first {
+                        hoisted_view_get!();
                     }
                     // ===== inline dense-array element GET fast path =====
                     // Receiver cell tag == Array, index an exact non-negative
@@ -13659,8 +13685,7 @@ impl JitFunction {
                     a.cmp_rax_r11();
                     a.je(arr_miss);
                     a.bind(got);
-                    if let Some(x) = num.result_xmm(op_idx, dst) {
-                        let past = a.new_label();
+                    if let Some((x, past)) = xmm_past {
                         numeric::NumGen::set_xmm_from_rax(&mut a, x);
                         if bail.is_some() {
                             // No slow path rejoins: nothing to reload.
@@ -13689,7 +13714,7 @@ impl JitFunction {
                         a.bind(walked);
                         a.t_view(&layout, tl, helper);
                         elem_index!(helper);
-                        a.t_get(tl, typed::Src::View, helper, got);
+                        a.t_get(tl, typed::Src::View, helper, got, xmm_past);
                     }
                     // jit_helper_get_elem(ctx, recv, key).
                     if bail.is_none() {
