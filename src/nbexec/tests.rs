@@ -2172,6 +2172,50 @@ fn object_spread_invokes_getters() {
 }
 
 #[test]
+fn wholesale_spread_rest_assign_of_plain_and_dictionary_objects() {
+    // Big (dictionary-mode) and small sources, with deletes, integer keys,
+    // Symbols and non-enumerable keys: copies are whole, ordered and
+    // independent of their source.
+    let src = "let S=Symbol('s'); let d={}; for (let i=0;i<200;i++) d['k'+i]=i; \
+               for (let i=0;i<200;i+=5) delete d['k'+i]; d[7]='seven'; d[S]='sym'; \
+               Object.defineProperty(d,'ne',{value:1,enumerable:false});";
+    assert_eq!(
+        run(&alloc::format!(
+            "{src} let c={{...d, x:1}}; c.k1='c'; delete c.k2; \
+             [Object.keys(c).length, Object.keys(c)[0], c[S], 'ne' in c, d.k1, d.k2, Object.keys(c).at(-1)].join()"
+        )),
+        "161,7,sym,false,1,2,x"
+    );
+    assert_eq!(
+        run(&alloc::format!(
+            "{src} let {{k1, [S]: s, ...r}}=d; [Object.keys(r).length, 'k1' in r, s, r.k3].join()"
+        )),
+        "160,false,sym,3"
+    );
+    assert_eq!(
+        run(&alloc::format!(
+            "{src} let a=Object.assign({{}}, d, {{z:1}}); [Object.keys(a).length, a[S], a.z, a.k4].join()"
+        )),
+        "162,sym,1,4"
+    );
+    // Object.assign runs a setter the target's prototype chain holds for a
+    // copied key; spread defines an own property instead.
+    assert_eq!(
+        run(&alloc::format!(
+            "{src} let hit=0; let p={{set k3(v){{hit++;}}}}; let a=Object.assign(Object.create(p), d); \
+             let s={{__proto__:p, ...d}}; [hit, a.hasOwnProperty('k3'), s.hasOwnProperty('k3')].join()"
+        )),
+        "1,false,true"
+    );
+    assert_eq!(
+        run(
+            "let o={b:1,2:'x',a:2,1:'y'}; Object.values({...o}).join() + '|' + Object.values(o).join()"
+        ),
+        "y,x,1,2|y,x,1,2"
+    );
+}
+
+#[test]
 fn custom_symbol_iterator() {
     // for-of and spread drive a user `[Symbol.iterator]`.
     let src = "let o = { [Symbol.iterator]() { let i = 0; return { next() { return i < 3 ? { value: i++, done: false } : { value: undefined, done: true }; } }; } };";

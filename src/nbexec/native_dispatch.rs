@@ -2070,6 +2070,13 @@ impl Interp {
                 if matches!(arg(0).unpack(), Unpacked::Null | Unpacked::Undefined) {
                     return Err(self.type_error("Object.values called on null or undefined"));
                 }
+                // A plain data object: its values straight from the slots.
+                if let Some(h) = arg(0).as_handle().map(Handle::from_raw)
+                    && !self.realm.is_host_exotic(h)
+                    && let Some(vals) = self.realm.plain_enum_values(h)
+                {
+                    return Ok(NanBox::handle(self.realm.new_array(vals).to_raw()));
+                }
                 // A proxy: per-key `[[GetOwnProperty]]` (descriptor trap) interleaved
                 // with the enumerable key's `[[Get]]` (get trap), in spec order.
                 if let Some(raw) = arg(0).as_handle()

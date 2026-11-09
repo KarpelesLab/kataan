@@ -2952,6 +2952,10 @@ impl Interp {
         source: crate::heap::Handle,
         excluded: &[String],
     ) -> Result<(), ExecError> {
+        // A plain source into an empty target: a wholesale copy.
+        if self.realm.spread_plain(target, source, excluded) {
+            return Ok(());
+        }
         // A plain data-only object (not a module namespace, whose reads are
         // live bindings): no step below can run code, so copy its enumerable
         // own data properties straight from the slots.

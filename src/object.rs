@@ -77,10 +77,15 @@ enum Mode {
 /// new". Enumeration skips tombstones without consulting the map, and
 /// `compact_order` drops them once they outnumber the live keys.
 #[derive(Default)]
-struct DictData {
-    order: Vec<Option<Box<str>>>,
-    map: BTreeMap<Box<str>, DictSlot>,
+pub(crate) struct DictData {
+    order: Vec<Option<DictKey>>,
+    map: BTreeMap<DictKey, DictSlot>,
 }
+
+/// A dictionary key, shared by its map entry and its `order` entry (and by
+/// a copy of the dictionary: `{ ...big }` clones the map without copying a
+/// single key). `Arc` rather than `Rc` only so the empty statics are `Sync`.
+type DictKey = alloc::sync::Arc<str>;
 
 /// How many property values an object stores inline, in its own cell, before
 /// spilling to a separate allocation. Most objects are small (a point, a
@@ -107,6 +112,80 @@ const MAX_SHAPED_LEN: usize = u16::MAX as usize;
 struct DictSlot {
     value: NanBox,
     pos: usize,
+}
+
+/// An object's own properties taken out of it whole by
+/// [`Object::plain_copy`], for [`Object::adopt_plain`] to give to an empty
+/// object: a layout and its slot values, or a dictionary.
+pub(crate) struct PlainCopy(PlainRepr);
+
+enum PlainRepr {
+    Shaped(Rc<Shape>, Vec<NanBox>),
+    Dict(Box<DictData>),
+}
+
+impl PlainCopy {
+    /// Whether there is no property.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        match &self.0 {
+            PlainRepr::Shaped(_, v) => v.is_empty(),
+            PlainRepr::Dict(d) => d.map.is_empty(),
+        }
+    }
+
+    /// How many properties there are.
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        match &self.0 {
+            PlainRepr::Shaped(_, v) => v.len(),
+            PlainRepr::Dict(d) => d.map.len(),
+        }
+    }
+
+    /// Whether there is a property `key`.
+    #[must_use]
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        match &self.0 {
+            PlainRepr::Shaped(s, _) => s.contains(key),
+            PlainRepr::Dict(d) => d.map.contains_key(key),
+        }
+    }
+
+    /// The layout of a shaped copy (`None` for a dictionary).
+    #[must_use]
+    pub(crate) fn shape(&self) -> Option<&Rc<Shape>> {
+        match &self.0 {
+            PlainRepr::Shaped(s, _) => Some(s),
+            PlainRepr::Dict(_) => None,
+        }
+    }
+
+    /// Calls `f` with each value (in no particular order).
+    pub(crate) fn for_each_value(&self, mut f: impl FnMut(NanBox)) {
+        match &self.0 {
+            PlainRepr::Shaped(_, v) => v.iter().copied().for_each(f),
+            PlainRepr::Dict(d) => d.map.values().for_each(|s| f(s.value)),
+        }
+    }
+
+    /// Calls `f` with each `(key, value)` in insertion order.
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(&str, NanBox)) {
+        match &self.0 {
+            PlainRepr::Shaped(shape, v) => {
+                for (k, v) in shape.keys().into_iter().zip(v) {
+                    f(k, *v);
+                }
+            }
+            PlainRepr::Dict(d) => {
+                for k in d.order.iter().flatten() {
+                    if let Some(s) = d.map.get(k) {
+                        f(k, s.value);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `ObjectExtra`'s `class_tag` for "no class".
@@ -1116,6 +1195,22 @@ impl Object {
             && self.shape.len() as usize == self.len as usize
     }
 
+    /// Whether this is an ordinary extensible dictionary-mode object holding
+    /// only plain writable, enumerable data properties (the dictionary
+    /// alone describes it).
+    #[must_use]
+    pub fn is_plain_dict(&self) -> bool {
+        self.is_dict()
+            && self.flags == 0
+            && self.extra.as_deref().is_some_and(|x| {
+                x.readonly.is_empty()
+                    && x.accessors.is_empty()
+                    && x.hidden.is_empty()
+                    && x.hidden_prefix == 0
+                    && x.key_order.is_none()
+            })
+    }
+
     /// A counter that changes whenever this object's set of own keys (data or
     /// accessor), or which of them are enumerable, may have changed: equal
     /// values at two moments mean the same own keys. (A `u32` that would need 2³² key changes between two reads to
@@ -1276,14 +1371,15 @@ impl Object {
         }
         if self.is_dict() {
             let d = self.dict_mut();
+            let key: DictKey = DictKey::from(key);
             d.map.insert(
-                Box::from(key),
+                DictKey::clone(&key),
                 DictSlot {
                     value,
                     pos: d.order.len(),
                 },
             );
-            d.order.push(Some(Box::from(key)));
+            d.order.push(Some(key));
         } else {
             self.shape = self.shape.add(key);
             self.slot_push(value);
@@ -1447,6 +1543,215 @@ impl Object {
         o.key_epoch = self.key_epoch.wrapping_add(values.len() as u32);
         *self = o;
         true
+    }
+
+    /// This object's own properties as a [`PlainCopy`], when every one is an
+    /// enumerable data property under a copyable key (a property name or a
+    /// Symbol, no other engine-internal key) and the object is ordinary (not
+    /// host-exotic): exactly what `CopyDataProperties(target, self,
+    /// excluded)` would read, in the same order, with no code run. The keys
+    /// in `excluded` (internal key form) are left out. `None` for any other
+    /// object.
+    #[must_use]
+    pub(crate) fn plain_copy(&self, excluded: &[alloc::string::String]) -> Option<PlainCopy> {
+        if self.flags & JIT_FLAG_EXOTIC != 0 {
+            return None;
+        }
+        let copyable = |k: &str| {
+            k.as_bytes().first() != Some(&0) || k.starts_with(crate::shape::SYMBOL_KEY_PREFIX)
+        };
+        if self.is_dict() {
+            let x = self.ex();
+            if !x.accessors.is_empty()
+                || !x.hidden.is_empty()
+                || x.hidden_prefix != 0
+                || x.key_order.is_some()
+            {
+                return None;
+            }
+            let src = self.dict();
+            // Internal keys start with `\0`, which sorts first.
+            if !src
+                .map
+                .keys()
+                .take_while(|k| k.as_bytes().first() == Some(&0))
+                .all(|k| copyable(k))
+            {
+                return None;
+            }
+            let mut dict = DictData {
+                order: src.order.clone(),
+                map: src.map.clone(),
+            };
+            for k in excluded {
+                if let Some(d) = dict.map.remove(k.as_str()) {
+                    dict.order[d.pos] = None;
+                }
+            }
+            if dict.order.len() != dict.map.len() {
+                // Leave the tombstones behind (renumbering, no key lookups).
+                let mut renumber: Vec<usize> = Vec::with_capacity(dict.order.len());
+                let mut next = 0;
+                for k in &dict.order {
+                    renumber.push(next);
+                    if k.is_some() {
+                        next += 1;
+                    }
+                }
+                dict.order.retain(Option::is_some);
+                for d in dict.map.values_mut() {
+                    d.pos = renumber[d.pos];
+                }
+            }
+            return Some(PlainCopy(PlainRepr::Dict(Box::new(dict))));
+        }
+        if !self.keys_follow_shape() || self.shape.is_wrapper() {
+            return None;
+        }
+        let n = self.len as usize;
+        if self.shape.len() as usize != n {
+            return None;
+        }
+        let keys = self.shape.keys();
+        if !keys.iter().all(|k| copyable(k)) {
+            return None;
+        }
+        let mut values: Vec<NanBox> = (0..n as u32).map(|i| self.slot_at(i)).collect();
+        let mut shape = Rc::clone(&self.shape);
+        if !excluded.is_empty() {
+            let gone: Vec<usize> = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| excluded.iter().any(|e| e == *k))
+                .map(|(i, _)| i)
+                .collect();
+            if let Some(&first) = gone.first() {
+                // The layout up to the first excluded key, then the kept keys
+                // after it in turn (all distinct, so each is an add).
+                let mut node = &self.shape;
+                while node.len() as usize > first {
+                    node = node.parent()?;
+                }
+                let mut layout = Rc::clone(node);
+                for (i, k) in keys.iter().enumerate().skip(first + 1) {
+                    if !gone.contains(&i) {
+                        layout = layout.add(k);
+                    }
+                }
+                let mut i = 0;
+                values.retain(|_| {
+                    i += 1;
+                    !gone.contains(&(i - 1))
+                });
+                shape = layout;
+            }
+        }
+        Some(PlainCopy(PlainRepr::Shaped(shape, values)))
+    }
+
+    /// `EnumerableOwnProperties(self, value)` (`Object.values`) when no step
+    /// of it can run code or see a change: an ordinary object (not
+    /// host-exotic, not a wrapper) with no accessor properties, whose keys
+    /// are property names or Symbols (no other engine-internal key). The
+    /// values of its enumerable String-keyed properties, integer keys
+    /// ascending first, then the rest in insertion order. `None` for any
+    /// other object.
+    #[must_use]
+    pub(crate) fn plain_enum_values(&self) -> Option<Vec<NanBox>> {
+        if self.flags & JIT_FLAG_EXOTIC != 0 || !self.has_no_accessors() {
+            return None;
+        }
+        let x = self.ex();
+        if x.key_order.is_some() || self.is_prim_wrapper() {
+            return None;
+        }
+        // `(index, value)` per enumerable String key, in insertion order.
+        let mut out: Vec<(Option<u32>, NanBox)> = Vec::with_capacity(self.len() as usize);
+        let mut any_index = false;
+        let mut visit = |k: &str, v: NanBox, hidden: bool| -> Option<()> {
+            let b = k.as_bytes();
+            match b.first() {
+                Some(0) if k.starts_with(crate::shape::SYMBOL_KEY_PREFIX) => return Some(()),
+                Some(0) => return None,
+                _ => {}
+            }
+            if hidden {
+                return Some(());
+            }
+            let ix = if b.first().is_some_and(u8::is_ascii_digit) {
+                array_index(k)
+            } else {
+                None
+            };
+            any_index |= ix.is_some();
+            out.push((ix, v));
+            Some(())
+        };
+        let check_hidden = !x.hidden.is_empty() || x.hidden_prefix != 0;
+        if self.is_dict() {
+            let d = self.dict();
+            for k in d.order.iter().flatten() {
+                let v = d.map.get(k)?.value;
+                visit(k, v, check_hidden && self.is_hidden(k))?;
+            }
+        } else {
+            if self.shape.has_implied_attrs() {
+                return None;
+            }
+            for (i, k) in self.shape.keys().into_iter().enumerate() {
+                let hidden =
+                    check_hidden && ((i as u32) < x.hidden_prefix || x.has_mark(Mark::Hidden, k));
+                visit(k, self.slot_at(i as u32), hidden)?;
+            }
+        }
+        if any_index {
+            // Stable: integer keys ascending, then the rest in their order.
+            out.sort_by_key(|(ix, _)| ix.map_or(u64::MAX, u64::from));
+        }
+        Some(out.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Makes this empty ordinary object hold the properties of `copy` as
+    /// plain data properties, keeping its `[[Prototype]]`: what defining each
+    /// of them in turn leaves. `false`, having changed nothing, when the
+    /// object is not an empty, extensible, unwatched ordinary object, or a
+    /// shaped copy would be a dictionary here (`threshold` keys or more).
+    pub(crate) fn adopt_plain(
+        &mut self,
+        copy: PlainCopy,
+        threshold: usize,
+    ) -> Result<(), PlainCopy> {
+        if self.is_dict()
+            || self.len != 0
+            || self.flags != 0
+            || self.extra.is_some()
+            || !self.shape.is_empty()
+            || self.shape.has_implied_attrs()
+        {
+            return Err(copy);
+        }
+        match copy.0 {
+            PlainRepr::Shaped(shape, values) => {
+                if values.len() < threshold && self.adopt_data(Rc::clone(&shape), &values) {
+                    Ok(())
+                } else {
+                    Err(PlainCopy(PlainRepr::Shaped(shape, values)))
+                }
+            }
+            PlainRepr::Dict(dict) => {
+                let n = dict.map.len();
+                let extra = ObjectExtra {
+                    dict: Some(dict),
+                    ..ObjectExtra::default()
+                };
+                self.extra = Some(Box::new(extra));
+                self.inline = [NanBox::undefined(); INLINE_SLOTS];
+                self.shape = Shape::root();
+                self.mode = Mode::Dict;
+                self.key_epoch = self.key_epoch.wrapping_add(n as u32);
+                Ok(())
+            }
+        }
     }
 
     /// The position of the accessor named `name` in the object's accessor
@@ -1891,19 +2196,20 @@ impl Object {
         self.materialize_implied_attrs();
         self.write_out_hidden_prefix();
         let keys = self.shape.keys();
-        let mut order: Vec<Option<Box<str>>> = Vec::with_capacity(keys.len());
-        let mut map: BTreeMap<Box<str>, DictSlot> = BTreeMap::new();
-        for k in keys {
-            let slot = self.shape.lookup(k).expect("shape key resolves");
-            let value = self.slot_at(slot);
+        let mut order: Vec<Option<DictKey>> = Vec::with_capacity(keys.len());
+        let mut map: BTreeMap<DictKey, DictSlot> = BTreeMap::new();
+        // `keys` is in slot order.
+        for (slot, k) in keys.into_iter().enumerate() {
+            let value = self.slot_at(slot as u32);
+            let k: DictKey = DictKey::from(k);
             map.insert(
-                Box::from(k),
+                DictKey::clone(&k),
                 DictSlot {
                     value,
                     pos: order.len(),
                 },
             );
-            order.push(Some(Box::from(k)));
+            order.push(Some(k));
         }
         self.len = 0;
         self.inline = [NanBox::undefined(); INLINE_SLOTS];

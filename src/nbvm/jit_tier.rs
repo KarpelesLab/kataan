@@ -1873,6 +1873,19 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_box().to_raw());
             Some(Ok(()))
         }
+        // Object spread / rest of a plain object into an empty one (the
+        // interpreter arm's first step); anything else takes the one-op frame.
+        Op::ObjectSpread { dst, src } => {
+            super::spread_plain_vm(ctx, regs[*dst as usize], regs[*src as usize], &[])
+                .then_some(Ok(()))
+        }
+        Op::ObjectRest { dst, src, exclude } => {
+            let t = NanBox::handle(ctx.realm.new_object().to_raw());
+            super::spread_plain_vm(ctx, t, regs[*src as usize], exclude).then(|| {
+                regs[*dst as usize] = t;
+                Ok(())
+            })
+        }
         // A class field's define: its interpreter arm.
         Op::DefineData {
             obj,

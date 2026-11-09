@@ -9074,6 +9074,10 @@ fn run_frame_at_ic(
                 }
                 let v = regs[*src as usize];
                 let t = NanBox::handle(ctx.realm.new_object().to_raw());
+                if spread_plain_vm(ctx, t, v, &ex) {
+                    regs[*dst as usize] = t;
+                    continue;
+                }
                 match with_host(ctx, |h| h.copy_data_properties(t, v, &ex)) {
                     Some(Ok(())) => regs[*dst as usize] = t,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -9966,6 +9970,9 @@ fn run_frame_at_ic(
             }
             Op::ObjectSpread { dst, src } if ctx.host.is_some() => {
                 let (t, v) = (regs[*dst as usize], regs[*src as usize]);
+                if spread_plain_vm(ctx, t, v, &[]) {
+                    continue;
+                }
                 match with_host(ctx, |h| h.copy_data_properties(t, v, &[])) {
                     Some(Ok(())) => {}
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -9975,6 +9982,10 @@ fn run_frame_at_ic(
             Op::ObjectRest { dst, src, exclude } if ctx.host.is_some() => {
                 let v = regs[*src as usize];
                 let t = NanBox::handle(ctx.realm.new_object().to_raw());
+                if spread_plain_vm(ctx, t, v, exclude) {
+                    regs[*dst as usize] = t;
+                    continue;
+                }
                 match with_host(ctx, |h| h.copy_data_properties(t, v, exclude)) {
                     Some(Ok(())) => regs[*dst as usize] = t,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -11020,6 +11031,20 @@ fn vm_array_index_get(
         cur = ctx.realm.object_proto(p);
     }
     Ok(NanBox::undefined())
+}
+
+/// `CopyDataProperties(target, src, excluded)` (object spread and rest) when
+/// it is a wholesale copy of a plain object into an empty one
+/// ([`Realm::spread_plain`]): done, returning `true`, without the host.
+/// `false`, having changed nothing, otherwise.
+fn spread_plain_vm(ctx: &mut Ctx, target: NanBox, src: NanBox, excluded: &[String]) -> bool {
+    match (target.as_handle(), src.as_handle()) {
+        (Some(t), Some(s)) => {
+            ctx.realm
+                .spread_plain(Handle::from_raw(t), Handle::from_raw(s), excluded)
+        }
+        _ => false,
+    }
 }
 
 /// `ToPropertyKey(key)` as the VM's internal storage-key string. A primitive

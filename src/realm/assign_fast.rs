@@ -20,6 +20,12 @@
 //! the source's own order, which `[[OwnPropertyKeys]]` re-sorts the same way
 //! for both). An empty target simply takes the source's layout and values.
 //!
+//! A dictionary-mode source (past the realm's dictionary threshold) with only
+//! enumerable data properties copies the same way, onto a plain shaped or
+//! dictionary target; an empty target takes a copy of its dictionary whole
+//! (keys are shared, not copied). It has no layout to remember a chain proof
+//! by, so each call checks the chain, from whichever side is smaller.
+//!
 //! The chain proof is remembered per (source layout, target prototype) while
 //! the prototype epoch it was shown at is current: every link is watched, so
 //! any change to a link's keys or prototype moves the epoch.
@@ -62,32 +68,6 @@ impl Realm {
         src: Handle,
         memo: &mut AssignMemo,
     ) -> bool {
-        let Some(Cell::Object(s)) = self.heap.get(src) else {
-            return false;
-        };
-        if !s.keys_follow_shape() || s.is_prim_wrapper() {
-            return false;
-        }
-        let Some(shape) = s.shaped_shape() else {
-            return false;
-        };
-        let n = shape.len() as usize;
-        let mut vals: Vec<NanBox> = Vec::with_capacity(n);
-        for i in 0..n as u32 {
-            match s.slot(i) {
-                Some(v) => vals.push(v),
-                None => return false,
-            }
-        }
-        let shape = Rc::clone(shape);
-        let Some(Cell::Object(t)) = self.heap.get(target) else {
-            return false;
-        };
-        if !t.is_plain_shaped() || t.is_prim_wrapper() {
-            return false;
-        }
-        let proto = t.proto();
-        let target_empty = t.is_empty();
         if self.is_host_exotic(src)
             || self.is_host_exotic(target)
             || self.is_function_proto_intrinsic(src)
@@ -95,25 +75,92 @@ impl Realm {
         {
             return false;
         }
-        if n == 0 {
-            return true;
-        }
-        if !self.assign_chain_proven(&shape, proto, memo) {
+        let Some(Cell::Object(s)) = self.heap.get(src) else {
+            return false;
+        };
+        if s.is_prim_wrapper() {
             return false;
         }
-        if target_empty && n < self.limits.object_dictionary_threshold {
+        let Some(copy) = s.plain_copy(&[]) else {
+            return false;
+        };
+        let Some(Cell::Object(t)) = self.heap.get(target) else {
+            return false;
+        };
+        if !(t.is_plain_shaped() || t.is_plain_dict()) || t.is_prim_wrapper() {
+            return false;
+        }
+        let proto = t.proto();
+        let target_empty = t.is_empty();
+        if copy.is_empty() {
+            return true;
+        }
+        let proven = match copy.shape() {
+            Some(shape) => self.assign_chain_proven(shape, proto, memo),
+            None => self.assign_chain_clear(&copy, proto),
+        };
+        if !proven {
+            return false;
+        }
+        let copy = if target_empty {
+            let mut vals: Vec<NanBox> = Vec::new();
+            copy.for_each_value(|v| {
+                if v.as_handle().is_some() {
+                    vals.push(v);
+                }
+            });
+            let threshold = self.limits.object_dictionary_threshold;
             let Some(Cell::Object(t)) = self.heap.get_mut(target) else {
                 return false;
             };
-            if t.adopt_data(Rc::clone(&shape), &vals) {
-                for v in &vals {
-                    self.write_barrier(target, *v);
+            match t.adopt_plain(copy, threshold) {
+                Ok(()) => {
+                    for v in vals {
+                        self.write_barrier(target, v);
+                    }
+                    return true;
                 }
-                return true;
+                Err(copy) => copy,
             }
-        }
-        for (k, v) in shape.keys().into_iter().zip(vals) {
+        } else {
+            copy
+        };
+        copy.for_each_entry(|k, v| {
             self.set_property(target, k, v);
+        });
+        true
+    }
+
+    /// Whether no object on the prototype chain from `proto` owns a key of
+    /// the dictionary `copy` (whose keys are all copyable), checked key by
+    /// key: a dictionary has no layout to remember the proof by.
+    fn assign_chain_clear(&self, copy: &crate::object::PlainCopy, proto: Option<Handle>) -> bool {
+        let mut cur = proto;
+        let mut depth = 0;
+        while let Some(h) = cur {
+            depth += 1;
+            if depth > 8 {
+                return false;
+            }
+            let Some((_, _, next)) = self.key_link(h) else {
+                return false;
+            };
+            let clear = match self.heap.get(h) {
+                // An ordinary object (Object.prototype, say) with fewer keys
+                // than the copy: look its keys up in the copy instead.
+                Some(Cell::Object(o)) if !o.is_prim_wrapper() && o.slot_count() < copy.len() => {
+                    !o.all_keys().into_iter().any(|k| copy.contains(k))
+                }
+                _ => {
+                    let mut clear = true;
+                    copy.for_each_entry(|k, _| clear = clear && !self.has_own(h, k));
+                    clear
+                }
+            };
+            if !clear {
+                return false;
+            }
+            cur = next;
         }
         true
     }
