@@ -8461,7 +8461,7 @@ impl JitFunction {
                 caps: cproof_base - 24 * k - 24,
             }
         };
-        // Per compiled `for-in` loop, its memo (`forin::Memo`), four slots
+        // Per compiled `for-in` loop, its memo (`forin::Memo`), six slots
         // under those.
         let n_forin = forin_plan.sites.len();
         // (As the frame counts the slots above: the inlined calls' four
@@ -8473,7 +8473,32 @@ impl JitFunction {
                 + 2 * n_proved as i32
                 + 3 * n_mproved as i32
                 + 3 * n_cproved as i32);
-        let fi_memo = |site: usize| forin::Memo::at(fi_base - 32 * site as i32);
+        let fi_memo = |site: usize| forin::Memo::at(fi_base - 8 * forin::Memo::SLOTS * site as i32);
+        // Per compiled `for-in` loop, its `EnumKeys`' pc.
+        let fi_enum: Vec<usize> = {
+            let mut v = alloc::vec![usize::MAX; n_forin];
+            for (e, s) in forin_plan.site_at.iter().enumerate() {
+                if let Some(&s) = s.as_ref()
+                    && let Some(x) = v.get_mut(s)
+                {
+                    *x = e;
+                }
+            }
+            v
+        };
+        // Its run proofs' slots, emptied by every entry into a fast version
+        // (`numeric::NumGen::forin_run_proof`), per key read.
+        num.set_forin_zero(
+            forin_plan
+                .read_at
+                .iter()
+                .enumerate()
+                .filter_map(|(pc, l)| {
+                    let m = fi_memo(l.as_ref()?.site);
+                    Some((pc, [m.table, m.held]))
+                })
+                .collect(),
+        );
         // Per op, the inlined activations enclosing it, outer first, as a
         // call sequence there pushes them (`call_seq::InlineCtx`): each its
         // guard's callee slot and its call's arguments, as its stub's.
@@ -8584,7 +8609,7 @@ impl JitFunction {
                 + 2 * n_proved
                 + 3 * n_mproved
                 + 3 * n_cproved
-                + 4 * n_forin) as u32
+                + forin::Memo::SLOTS as usize * n_forin) as u32
                 * 8)
             + 15)
             & !15;
@@ -10656,7 +10681,14 @@ impl JitFunction {
                             // fills as filled: the plain copy's.)
                             a.jmp(other);
                         }
-                        a.fi_key(site, l, idx, disp, other);
+                        // (Its run proof of the table, in a fast version
+                        // that keeps the loop's proofs.)
+                        match fi_enum.get(l.site) {
+                            Some(&e) if bail.is_some() && num.forin_run_proof(op_idx, e) => {
+                                a.fi_key_proving(site, l, idx, disp, fi_memo(l.site).table, other);
+                            }
+                            _ => a.fi_key(site, l, idx, disp, other),
+                        }
                         match num.result_xmm(op_idx, dst) {
                             Some(x) => {
                                 numeric::NumGen::set_xmm_from_rax(&mut a, x);
@@ -11900,17 +11932,34 @@ impl JitFunction {
                                 // check, `forin::follows_read`.)
                                 let entries: Vec<usize> =
                                     osr_entries.iter().chain(&catch_targets).copied().collect();
-                                let proven = bail.is_some()
-                                    && forin::follows_read(forin_plan, ops, op_idx, l, &entries)
-                                        .is_some_and(|r| {
+                                let read =
+                                    forin::follows_read(forin_plan, ops, op_idx, l, &entries)
+                                        .filter(|&r| {
                                             num.same_region(r, op_idx)
                                                 && num.in_spec(r)
                                                 && num.sa(r) & numeric::SA_FORIN != 0
                                         });
+                                let proven = bail.is_some() && read.is_some();
+                                // (The loop's run proofs, when its key read
+                                // keeps them too: `forin::Memo::held`.)
+                                let m = fi_memo(l.site);
+                                let held = match (read, fi_enum.get(l.site)) {
+                                    (Some(r), Some(&e))
+                                        if proven
+                                            && num.forin_run_proof(r, e)
+                                            && num.forin_run_proof(op_idx, e) =>
+                                    {
+                                        Some(m.held)
+                                    }
+                                    _ => None,
+                                };
                                 macro_rules! fi_slot {
-                                    () => {{
+                                    () => {{ fi_slot!(None) }};
+                                    ($held:expr) => {{
                                         if proven {
-                                            a.fi_slot_proven(&layout, site, l, idx, disp, helper);
+                                            a.fi_slot_proven(
+                                                &layout, site, l, idx, disp, $held, helper,
+                                            );
                                         } else {
                                             a.fi_slot(&layout, site, l, *key, idx, disp, helper);
                                         }
@@ -11918,16 +11967,28 @@ impl JitFunction {
                                 }
                                 // The receiver: the memo's (`forin::Memo`),
                                 // else walked and recorded there.
-                                let m = fi_memo(l.site);
                                 let walk = a.new_label();
                                 let walked = a.new_label();
                                 let found = a.new_label();
+                                let slotted = a.new_label();
+                                if let Some(h) = held {
+                                    // The object proved of the table's
+                                    // layout in this run: the key's slot.
+                                    let unproved = a.new_label();
+                                    a.g_load(R::RCX, R::RBP, h);
+                                    a.g_test(R::RCX);
+                                    a.g_jcc(call_seq::cc::E, unproved);
+                                    a.fi_slot_held(l, idx, disp, m.table);
+                                    a.jmp(slotted);
+                                    a.bind(unproved);
+                                }
                                 a.load_rax(disp(*obj));
                                 a.g_cmp_mem(R::RAX, R::RBP, m.obj);
                                 a.g_jcc(call_seq::cc::NE, walk);
                                 a.g_load(R::RCX, R::RBP, m.cell);
                                 a.bind(walked);
-                                fi_slot!();
+                                fi_slot!(held);
+                                a.bind(slotted);
                                 a.p_cmp32_imm(R::RAX, crate::realm::NO_SLOT as u32 as i32);
                                 a.g_jcc(call_seq::cc::E, helper);
                                 // The key's slot, for the body's `o[k]`.

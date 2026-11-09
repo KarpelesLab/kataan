@@ -67,22 +67,38 @@ pub(super) struct Loop {
 /// writes values. So with `obj` equal to a receiver's bits, `cell` is its
 /// heap slot, and with `key` equal to a key's bits too, `r[k]` is the value
 /// at `slot`, read now.
+///
+/// Two more slots hold the loop's **run proofs** in a speculative region's
+/// fast version (`numeric::NumGen::forin_run_proof`), both emptied by every
+/// entry into that version: `table`, the key table its key read found the
+/// key array's (no Rust code runs there, and only Rust code replaces a
+/// site's table; the array register is written only before the region),
+/// and `held`, the heap slot of the object its liveness check found of
+/// that table's layout (no op there changes a shape but a fresh object's,
+/// and the object register too is written only before the region).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Memo {
     pub(super) obj: i32,
     pub(super) cell: i32,
     pub(super) key: i32,
     pub(super) slot: i32,
+    pub(super) table: i32,
+    pub(super) held: i32,
 }
 
 impl Memo {
-    /// The memo whose slots are the four frame slots under `base`.
+    /// Frame slots per memo.
+    pub(super) const SLOTS: i32 = 6;
+
+    /// The memo whose slots are the [`Self::SLOTS`] frame slots under `base`.
     pub(super) fn at(base: i32) -> Self {
         Self {
             obj: base - 8,
             cell: base - 16,
             key: base - 24,
             slot: base - 32,
+            table: base - 40,
+            held: base - 48,
         }
     }
 }
@@ -337,6 +353,53 @@ impl X64Assembler {
         self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
     }
 
+    /// [`Self::fi_key`] with the loop's run proof of its table
+    /// ([`Memo::table`], frame slot `proof`): once it holds the table, the
+    /// table with no check of the site or the array; else the full check,
+    /// which records it there. Clobbers `r9`, `r11`, `xmm0`.
+    pub(super) fn fi_key_proving(
+        &mut self,
+        site: u64,
+        lp: Loop,
+        idx: Idx,
+        disp: impl Fn(u16) -> i32,
+        proof: i32,
+        miss: Label,
+    ) {
+        let have = self.new_label();
+        self.fi_index_rax(lp, idx, &disp);
+        self.g_load(r::R11, r::RBP, proof);
+        self.g_test(r::R11);
+        self.g_jcc(cc::NE, have);
+        self.fi_table(site, lp, &disp, miss);
+        // (Never `0`: a site holds its empty table when it has none, whose
+        // array, `0`, no key array is.)
+        self.g_store(r::RBP, proof, r::R11);
+        self.bind(have);
+        self.fi_bound(miss);
+        self.g_load(r::R9, r::R11, table_off!(bits_ptr));
+        self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
+    }
+
+    /// The slot of loop `l`'s key `i` (its index at `idx`) in the proved
+    /// table ([`Memo::table`], frame slot `table`): `rax` = it (maybe
+    /// [`crate::realm::NO_SLOT`]). For a liveness check right after the
+    /// loop's key read ([`follows_read`]) whose object's run proof
+    /// ([`Memo::held`]) holds: the read proved the table, and the object
+    /// has the table's layout. Clobbers `r9`, `r11`, `xmm0`.
+    pub(super) fn fi_slot_held(
+        &mut self,
+        lp: Loop,
+        idx: Idx,
+        disp: impl Fn(u16) -> i32,
+        table: i32,
+    ) {
+        self.fi_index_rax(lp, idx, &disp);
+        self.g_load(r::R11, r::RBP, table);
+        self.g_load(r::R9, r::R11, table_off!(slots_ptr));
+        self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
+    }
+
     /// `r11` = loop `l`'s key table, when `l`'s array is the table's (`0`,
     /// never a handle, when there is none); else to `miss`. Clobbers `r9`.
     fn fi_table(&mut self, site: u64, lp: Loop, disp: &impl Fn(u16) -> i32, miss: Label) {
@@ -414,7 +477,10 @@ impl X64Assembler {
     /// [`Self::fi_slot`] where the loop's key read has just proved `l`'s
     /// array the table's, the index below its length and the key register
     /// the table's key `i` ([`follows_read`]): the layout check and the
-    /// slot alone. Clobbers `r9`, `r11`, `xmm0`.
+    /// slot alone. With `held` (the object's run proof, [`Memo::held`]):
+    /// the object's heap slot recorded there once its layout is the
+    /// table's. Clobbers `r9`, `r11`, `xmm0`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn fi_slot_proven(
         &mut self,
         l: &JitLayout,
@@ -422,6 +488,7 @@ impl X64Assembler {
         lp: Loop,
         idx: Idx,
         disp: impl Fn(u16) -> i32,
+        held: Option<i32>,
         miss: Label,
     ) {
         let site_table = i32::try_from(core::mem::offset_of!(ForInSite, table)).expect("offset");
@@ -431,6 +498,9 @@ impl X64Assembler {
         self.g_load(r::R9, r::RCX, l.off_shape);
         self.g_cmp_mem(r::R9, r::R11, table_off!(shape_word));
         self.g_jcc(cc::NE, miss);
+        if let Some(held) = held {
+            self.g_store(r::RBP, held, r::RCX);
+        }
         self.g_load(r::R9, r::R11, table_off!(slots_ptr));
         self.p_load_index8(r::RAX, r::R9, r::RAX, 0);
     }

@@ -707,6 +707,15 @@ struct Region {
     iproof: Vec<IProof>,
     /// The run-proved answers ([`plan_answer_proofs`]).
     aproof: Vec<AProof>,
+    /// Whether no op of a fast version of it (outside the fallback arms)
+    /// changes the shape of an object it did not just allocate
+    /// ([`shape_quiet`]): what a compiled `for-in`'s run proofs need
+    /// ([`NumGen::forin_run_proof`]).
+    quiet: bool,
+    /// The **entry-hoisted global reads** ([`plan_hoisted_globals`]): the
+    /// `LoadGlobal`s its fast version leaves out, their registers loaded
+    /// from the bindings on every entry into it ([`NumGen::hoist_views`]).
+    ghoist: Vec<usize>,
     /// For a body that branches inside itself: the registers live on entry
     /// to each of its ops (`live_words` words per pc from `head`), which
     /// [`Region::defined`] reads; empty otherwise.
@@ -1229,6 +1238,9 @@ pub(super) struct NumGen {
     n_iproof: usize,
     /// The run-proved answers' slots ([`AProof::slot`]), after those.
     n_aproof: usize,
+    /// The compiled `for-in` run proofs' frame slots
+    /// ([`NumGen::set_forin_zero`]).
+    forin_zero: Vec<(usize, [i32; 2])>,
     /// Per pc: its label in its region's integer version, for a
     /// speculative region's ([`Self::spec_int`]).
     int_labels: Vec<Option<Label>>,
@@ -1709,6 +1721,27 @@ impl NumGen {
             }
             r.alt_int = None;
         }
+        // The entry-hoisted global reads ([`plan_hoisted_globals`]) of the
+        // speculative versions, into registers neither version promotes.
+        for r in &mut regions {
+            if r.spec.is_none() || (r.int.is_some() && !r.spec_int) {
+                r.ghoist.clear();
+                continue;
+            }
+            let slots = &r.slots;
+            let int = r.int.as_ref();
+            r.ghoist.retain(|&pc| match bytecode.get(pc) {
+                Some(&Op::LoadGlobal { dst, .. }) => {
+                    !slots.iter().any(|s| s.reg == dst) && !int.is_some_and(|p| p.has_int(dst))
+                }
+                _ => false,
+            });
+            if ghoist_log() {
+                for &pc in &r.ghoist {
+                    std::eprintln!("[ghoist] region {}..={}: read {pc}", r.head, r.end);
+                }
+            }
+        }
         if specalloc_log() {
             for r in &regions {
                 std::eprintln!(
@@ -1931,6 +1964,7 @@ impl NumGen {
             n_pproof,
             n_iproof,
             n_aproof,
+            forin_zero: Vec::new(),
             int_labels: vec![None; n + 1],
             ilabels: Vec::new(),
             int_saved: false,
@@ -2156,6 +2190,39 @@ impl NumGen {
         Some(self.pproof_disp(g.slot))
     }
 
+    /// For a compiled `for-in`'s key read or liveness check at `pc`
+    /// (`super::forin`), whose loop's `EnumKeys` is at `enum_pc`: whether it
+    /// is emitted with the loop's **run proofs** — the fast version of a
+    /// speculative region that holds it, the `EnumKeys` before the region
+    /// (so the loop's key array and object are registers no op of the
+    /// region writes, `forin::plan`), and no op of the region changing the
+    /// shape of an object it did not just allocate ([`Region::quiet`]).
+    /// Then the key table its site holds (which only Rust code replaces),
+    /// once a key read found it the key array's, is that array's for the
+    /// rest of the run, and the object, once a liveness check found it of
+    /// the table's layout, keeps that layout and its heap slot: the read
+    /// takes the table from its frame slot, the check the object's slot
+    /// from its own (both emptied by every entry into the fast version,
+    /// [`Self::set_forin_zero`]), with no check of either.
+    pub(crate) fn forin_run_proof(&self, pc: usize, enum_pc: usize) -> bool {
+        let Some(ri) = self.region_at(pc) else {
+            return false;
+        };
+        let r = &self.regions[ri];
+        fproof_enabled()
+            && r.spec.is_some()
+            && !(self.imode.is_some() && !self.spec_int_mode())
+            && r.quiet
+            && enum_pc < r.head
+    }
+
+    /// The frame slots of the compiled `for-in` run proofs
+    /// ([`Self::forin_run_proof`]): per key read's pc, the slots to empty
+    /// at every entry into its region's fast version.
+    pub(crate) fn set_forin_zero(&mut self, z: Vec<(usize, [i32; 2])>) {
+        self.forin_zero = z;
+    }
+
     /// Whether the property site at `pc` is a planned run-proved site
     /// ([`plan_site_proofs`]), whichever version is being emitted.
     pub(crate) fn site_proof_planned(&self, pc: usize) -> bool {
@@ -2211,6 +2278,25 @@ impl NumGen {
     /// live and the register file is up to date. Clobbers `rax`, `rcx`,
     /// `rdx`, `r8`..`r11`.
     fn hoist_views(&self, a: &mut X64Assembler, ri: usize) {
+        // The entry-hoisted global reads ([`plan_hoisted_globals`]): their
+        // registers from the bindings (`spec_globals_ready` just proved
+        // the addresses filled). Not one the fast version leaves out anyway
+        // (`spec_global`), when it has no integer version, whose own
+        // reads may differ. Clobbers `rax`.
+        for &pc in &self.regions[ri].ghoist {
+            if self.regions[ri].int.is_none()
+                && (self.math_load_dead(pc) || self.sunk_load(pc) || self.callee_load_sunk(pc))
+            {
+                continue;
+            }
+            if let (Some(&Op::LoadGlobal { dst, .. }), Some(&k)) = (self.bc(pc), self.gslot.get(pc))
+                && k != u32::MAX
+            {
+                a.load_rax(self.gslot_disp(k));
+                a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+                a.store_rax(disp(dst));
+            }
+        }
         let l = super::compute_jit_layout();
         let av = &self.regions[ri].aviews;
         for (i, &(r, k, src)) in av.iter().enumerate() {
@@ -2827,6 +2913,14 @@ impl NumGen {
                 {
                     return Some(true);
                 }
+                // Read at every entry into the fast version instead
+                // ([`plan_hoisted_globals`]).
+                if !self.copy
+                    && (self.imode.is_none() || self.spec_int_mode())
+                    && self.regions[ri].ghoist.contains(&pc)
+                {
+                    return Some(true);
+                }
                 if let Some(src) = self.carried_global(ri, pc) {
                     self.copy_reg(a, reg, dst, src);
                     return Some(true);
@@ -3232,6 +3326,14 @@ impl NumGen {
         // (Nor has any run-proved answer been given.)
         for g in &self.regions[ri].aproof {
             a.mov_frame_zero(self.aproof_disp(g.slot));
+        }
+        // (Nor has any compiled `for-in` proved its table or object.)
+        for &(pc, slots) in &self.forin_zero {
+            if self.region_of.get(pc) == Some(&(ri as u32)) {
+                for d in slots {
+                    a.mov_frame_zero(d);
+                }
+            }
         }
         for &k in &self.region_gslots[ri] {
             a.cmp_frame_imm8(self.gslot_disp(k), 0);
@@ -6424,6 +6526,13 @@ impl NumGen {
                     ok = false;
                 }
             }
+            // (And the carried bindings' registers assumed Numbers, which
+            // the entry loads from the bindings afresh: `plan_spec_sa`.)
+            for g in &self.regions[ri].gcarry {
+                if sp.checks.contains(&g.1) && !checks.contains(&g.1) {
+                    checks.push(g.1);
+                }
+            }
             if !ok {
                 a.jmp(copy);
                 continue;
@@ -7168,6 +7277,14 @@ fn plan_regions_sa(
         } else {
             Vec::new()
         };
+        let quiet = generic
+            && loops.is_empty()
+            && (head..=end).all(|q| in_arm(q) || shape_quiet(ops, bytecode, sa_at(sa, q), q));
+        let ghoist: Vec<usize> = if generic && ghoist_enabled() {
+            plan_hoisted_globals(ops, bytecode, (head, end), &arms, &carried_r, &gcarry)
+        } else {
+            Vec::new()
+        };
         let in_gcarry =
             |r: u16| gcarry.iter().any(|g| g.1 == r) || fcarry.iter().any(|f| f.src == r);
         carried.extend(info.iter().filter(|x| in_gcarry(x.0)));
@@ -7400,7 +7517,83 @@ fn plan_regions_sa(
             pproof,
             iproof,
             aproof,
+            quiet,
+            ghoist,
         });
+    }
+    out
+}
+
+/// Whether entry-hoisted global reads ([`plan_hoisted_globals`]) are
+/// planned: unless `KATAAN_JIT_GHOIST=0`. Read once per process.
+fn ghoist_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GHOIST").is_none_or(|v| v != "0"))
+}
+
+/// Whether `KATAAN_JIT_GHOIST=log`: report each entry-hoisted read kept.
+fn ghoist_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GHOIST").is_some_and(|v| v == "log"))
+}
+
+/// A loop's **entry-hoisted global reads**. A top-level loop reads the
+/// bindings it uses (`const o = …; for (…) o[k] …`) every iteration. In a
+/// speculative version's fast version no Rust code runs, so a binding
+/// changes only by the region's own stores of it: a global object's own
+/// data property (a `var`'s binding) is never stored in place by compiled
+/// code (its flags byte has `JIT_FLAG_GLOBAL`, one of the
+/// `props::FLAGS_NO_INLINE_STORE` bits every in-place property or element
+/// store tests), and a declarative binding is no object's. With no store
+/// of the name in the loop, a read finds the same value every iteration of
+/// a run. And a register
+/// that only that read writes in the loop, and that is dead where the loop
+/// is entered and left (so the iteration's ops before the read never look
+/// at it), holds that value from the run's entry on just as well: the read
+/// is left out of the fast version, and every entry into it loads the
+/// register from the binding instead (after validating the binding
+/// addresses, `NumGen::spec_globals_ready`, as for the hoisted views). The
+/// plain copy reads the binding op by op.
+///
+/// A candidate: a `LoadGlobal` outside the fallback arms (`arms`) of a
+/// loop (or nest: an inner header's entry from the plain copy loads the
+/// registers too), of a binding the loop never stores (by name, nor a carried one,
+/// `gcarry`), its register written by no other op of the loop
+/// ([`defs_in`]) and not one of `carried_r`.
+/// `NumGen::new` keeps those whose register its versions keep in the
+/// register file.
+fn plan_hoisted_globals(
+    ops: &[GenericOp],
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    arms: &[(usize, usize, usize)],
+    carried_r: &dyn Fn(u16) -> bool,
+    gcarry: &[(alloc::string::String, u16, usize)],
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    if end >= ops.len() || end >= bytecode.len() || head >= end {
+        return out;
+    }
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    for pc in head..=end {
+        if in_arm(pc) {
+            continue;
+        }
+        let Op::LoadGlobal { dst, name, .. } = &bytecode[pc] else {
+            continue;
+        };
+        if name.starts_with('\u{1}') || gcarry.iter().any(|g| &g.0 == name) || carried_r(*dst) {
+            continue;
+        }
+        let stored = (head..=end).any(|q| match &bytecode[q] {
+            Op::StoreGlobal { name: n, .. } | Op::InitGlobal { name: n, .. } => n == name,
+            _ => false,
+        });
+        if stored || defs_in(bytecode, (head, end), *dst, &mut d, &mut u) != [pc] {
+            continue;
+        }
+        out.push(pc);
     }
     out
 }
@@ -7989,6 +8182,66 @@ fn shape_safe(ops: &[GenericOp], bytecode: &[Op], pc: usize) -> bool {
     }
 }
 
+/// [`shape_safe`], or one more op that changes no object's shape or flags
+/// in a speculative region's fast version (`f`: its [`NumEnv::alloc_inline`]
+/// flags): a method's lookup and a captured binding's read (loads, every
+/// miss a leave), a captured binding's write (a box's value), an element
+/// store (whose inline paths store into existing elements and own data
+/// slots in place, or append to a plain array; every other path a leave),
+/// a compiled `for-in`'s key read and liveness check, `key in obj`, a
+/// string literal's word, a compare with a short literal, and an
+/// allocation whose fast path makes no call ([`SA_INLINE`]: a fresh
+/// object, box or closure, or a constructor's memo reads).
+fn shape_quiet(ops: &[GenericOp], bytecode: &[Op], f: u8, pc: usize) -> bool {
+    if shape_safe(ops, bytecode, pc) {
+        return true;
+    }
+    match (&ops[pc], &bytecode[pc]) {
+        (_, Op::SetProp { .. } | Op::SetPropStrict { .. }) => false,
+        (GenericOp::GetMethod { .. }, Op::GetProp { .. })
+        | (GenericOp::CellGet { .. }, Op::CellGet { .. })
+        | (GenericOp::CellSet { .. }, Op::CellSet { .. })
+        | (GenericOp::SetElem { .. }, _) => true,
+        (GenericOp::ArrGet { .. } | GenericOp::Interp { .. }, _) if f & SA_FORIN != 0 => true,
+        (
+            GenericOp::Interp { .. },
+            Op::Relational {
+                instanceof: false, ..
+            }
+            | Op::NewString { .. }
+            | Op::StrEqConst { .. },
+        ) => true,
+        (
+            GenericOp::Interp { .. },
+            Op::NewObjectLit { .. }
+            | Op::NewObject { .. }
+            | Op::NewArray { .. }
+            | Op::NewArrayFrom { .. }
+            | Op::NewBox { .. }
+            | Op::MakeClosure { .. }
+            | Op::InitFnPrototype { .. }
+            | Op::SuperCtor { .. }
+            | Op::InitFields { .. },
+        ) => f & SA_INLINE != 0 && f & SA_CALL == 0,
+        _ => false,
+    }
+}
+
+/// Whether a carried binding's register is assumed a Number at a
+/// speculative version's entry (see [`plan_spec_sa`]): unless
+/// `KATAAN_JIT_GTYPES=0`. Read once per process.
+fn gcarry_types_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GTYPES").is_none_or(|v| v != "0"))
+}
+
+/// Whether compiled `for-in` run proofs ([`NumGen::forin_run_proof`]) are
+/// made: unless `KATAAN_JIT_FPROOF=0`. Read once per process.
+fn fproof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FPROOF").is_none_or(|v| v != "0"))
+}
+
 /// Whether carried fields ([`plan_carried_fields`]) are planned: unless
 /// `KATAAN_JIT_FCARRY=0`. Read once per process.
 fn fcarry_enabled() -> bool {
@@ -8037,7 +8290,7 @@ fn straight_body(
     true
 }
 
-/// The pcs of region `head..=end` that write register `r`.
+/// The pcs of region `head..=end` that write register `r` ([`defs_exact`]).
 fn defs_in(
     bytecode: &[Op],
     (head, end): (usize, usize),
@@ -8047,10 +8300,86 @@ fn defs_in(
 ) -> Vec<usize> {
     (head..=end)
         .filter(|&pc| {
-            def_use(&bytecode[pc], d, u);
+            defs_exact(&bytecode[pc], d, u);
             d.contains(&r)
         })
         .collect()
+}
+
+/// [`def_use`] with writes that are never missed: the registers an op
+/// [`def_use`] does not model may all be written (every one it names), so
+/// that a register no op of a loop writes by this account truly holds one
+/// value there. (A few more ops are modelled exactly here: an element
+/// read, `in` / `instanceof`, a compare with a string literal, a
+/// constructor's `[[Prototype]]` read, and ops that write no register.)
+fn defs_exact(op: &Op, d: &mut Vec<u16>, u: &mut Vec<u16>) {
+    def_use(op, d, u);
+    match op {
+        Op::GetElem { dst, .. }
+        | Op::Relational { dst, .. }
+        | Op::StrEqConst { dst, .. }
+        | Op::SuperCtor { dst, .. } => {
+            d.clear();
+            d.push(*dst);
+        }
+        Op::InitFields { .. }
+        | Op::InitFnPrototype { .. }
+        | Op::SetKey { .. }
+        | Op::SetKeyStrict { .. }
+        | Op::SetElem { .. } => d.clear(),
+        Op::LoadConst { .. }
+        | Op::Move { .. }
+        | Op::ToNumeric { .. }
+        | Op::Step { .. }
+        | Op::Neg { .. }
+        | Op::BitNot { .. }
+        | Op::Not { .. }
+        | Op::Add { .. }
+        | Op::AddValue { .. }
+        | Op::Sub { .. }
+        | Op::Mul { .. }
+        | Op::Div { .. }
+        | Op::Mod { .. }
+        | Op::Lt { .. }
+        | Op::StrictEq { .. }
+        | Op::ValueBin { .. }
+        | Op::Compare { .. }
+        | Op::JumpIfFalse { .. }
+        | Op::PlainPrims { .. }
+        | Op::LoadGlobal { .. }
+        | Op::NewBox { .. }
+        | Op::NewObject { .. }
+        | Op::NewArray { .. }
+        | Op::NewString { .. }
+        | Op::NewObjectLit { .. }
+        | Op::NewArrayFrom { .. }
+        | Op::MakeClosure { .. }
+        | Op::Construct { .. }
+        | Op::CellGet { .. }
+        | Op::CellSet { .. }
+        | Op::Return { .. }
+        | Op::CheckTdz { .. }
+        | Op::StoreGlobal { .. }
+        | Op::RequireObjectCoercible { .. }
+        | Op::GetProp { .. }
+        | Op::GetMethod { .. }
+        | Op::ArrayLen { .. }
+        | Op::GetKey { .. }
+        | Op::SetProp { .. }
+        | Op::SetPropStrict { .. }
+        | Op::CallMethod { .. }
+        | Op::CallWithMethod { .. }
+        | Op::CallValue { .. }
+        | Op::Jump { .. }
+        | Op::InlineLeave
+        | Op::InlineGuard { .. }
+        | Op::BindThis { .. }
+        | Op::IterNext { .. } => {}
+        _ => {
+            d.clear();
+            d.extend(op_regs(op));
+        }
+    }
 }
 
 /// A receiver register's value class in region `head..=end`: `(true, r)`
@@ -9090,16 +9419,23 @@ fn spec_transfer(op: &Op, s: &mut [u8]) {
 ///   type guard.
 /// - A property read the fast version replaces by a copy ([`plan_reuse`])
 ///   yields the copied register's value, so it has that register's type.
-fn spec_step(
-    op: &Op,
-    pc: usize,
-    reuse: &[(usize, u16)],
-    fields: &[Option<(u64, u32)>],
-    s: &mut [u8],
-) {
+/// - A read of a carried binding ([`plan_carried_globals`]) yields what
+///   the register carrying it holds there (the fast version's every read
+///   of the binding finds it equal to that register, which its entry loads
+///   from the binding and its one store stores), so it has that register's
+///   type.
+fn spec_step(op: &Op, pc: usize, r: &Region, fields: &[Option<(u64, u32)>], s: &mut [u8]) {
     if let Op::GetProp { dst, .. } | Op::CellGet { dst, .. } = op
-        && let Some(&(_, src)) = reuse.iter().find(|x| x.0 == pc)
+        && let Some(&(_, src)) = r.reuse.iter().find(|x| x.0 == pc)
         && let Some(&t) = s.get(src as usize)
+        && let Some(x) = s.get_mut(*dst as usize)
+    {
+        *x = t;
+        return;
+    }
+    if let Op::LoadGlobal { dst, name, .. } = op
+        && let Some(g) = r.gcarry.iter().find(|g| &g.0 == name)
+        && let Some(&t) = s.get(g.1 as usize)
         && let Some(x) = s.get_mut(*dst as usize)
     {
         *x = t;
@@ -9237,6 +9573,22 @@ fn plan_spec_sa(
         .copied()
         .filter(|&x| num_read[x as usize] && types.get(head, x) != T_NUM)
         .collect();
+    // And a carried binding's register ([`plan_carried_globals`]) whose
+    // reads feed the arithmetic (`s += x` on a top-level `s`): checked once
+    // at the entry, which loads it from the binding, it is a Number at
+    // every read, so no read needs its own check (the back-edge's
+    // condition below holds it to coming back a Number).
+    if gcarry_types_enabled() {
+        for (name, src, _) in &r.gcarry {
+            let feeds = bytecode[head..=end].iter().any(|o| {
+                matches!(o, Op::LoadGlobal { name: n, dst, .. }
+                    if n == name && num_read.get(*dst as usize).copied().unwrap_or(false))
+            });
+            if feeds && types.get(head, *src) != T_NUM && !assumed.contains(src) {
+                assumed.push(*src);
+            }
+        }
+    }
     loop {
         let mut cur: Vec<u8> = (0..n_regs).map(|x| types.get(head, x as u16)).collect();
         for &x in &assumed {
@@ -9249,7 +9601,7 @@ fn plan_spec_sa(
                 // (The fast arm's jump skips the fallback arm: its join
                 // is reached with the fast arm's state.)
                 if !r.is_cold(head + i) {
-                    spec_step(op, head + i, &r.reuse, fields, &mut cur);
+                    spec_step(op, head + i, r, fields, &mut cur);
                 }
             }
         } else {
@@ -9545,7 +9897,7 @@ fn spec_nest_rows(
             if r.is_cold(pc) {
                 continue;
             }
-            spec_step(&bytecode[pc], pc, &r.reuse, fields, &mut cur);
+            spec_step(&bytecode[pc], pc, r, fields, &mut cur);
             let (falls, target) = match ops[pc] {
                 GenericOp::Jump { target } => (false, Some(target)),
                 GenericOp::JumpIfFalse { .. } if r.cold.iter().any(|c| c.0 == pc) => (true, None),
