@@ -2,6 +2,7 @@
 # Compare kataan against node on the clean-room microbenchmarks in bench/js.
 #
 #   bench/run.sh [N] [filter]     best-of-N wall clock per engine (default 3)
+#   BENCH_DIR=bench/js2 bench/run.sh ...   another program directory (see bench/run2.sh)
 #
 # Each benchmark prints a checksum; a mismatch with node is reported as WRONG
 # (a speedup that changes the answer does not count). Times are whole-process
@@ -10,6 +11,7 @@ set -u
 cd "$(dirname "$0")/.."
 N=${1:-3}
 FILTER=${2:-}
+BENCH_DIR=${BENCH_DIR:-bench/js}
 KATAAN=${KATAAN:-./target/release/kataan}
 NODE=${NODE:-node}
 
@@ -27,12 +29,12 @@ best() { # best-of-N milliseconds for "$@"
 
 echo 'void 0' > /tmp/kataan-bench-empty.js
 printf '| benchmark | kataan ms | node ms | ratio | output |\n|---|---:|---:|---:|---|\n'
-for f in /tmp/kataan-bench-empty.js bench/js/*.js; do
+for f in /tmp/kataan-bench-empty.js "$BENCH_DIR"/*.js; do
   name=$(basename "$f" .js)
   [ "$f" = /tmp/kataan-bench-empty.js ] && name=startup
   [ -n "$FILTER" ] && [[ "$name" != *$FILTER* ]] && continue
-  kout=$("$KATAAN" run "$f" 2>&1 | tail -1)
-  nout=$("$NODE" "$f" 2>&1 | tail -1)
+  kout=$("$KATAAN" run "$f" 2>&1 | tail -${OUT_LINES:-1})
+  nout=$("$NODE" "$f" 2>&1 | tail -${OUT_LINES:-1})
   ok=ok; [ "$kout" != "$nout" ] && ok="WRONG (kataan: ${kout:0:40} / node: ${nout:0:40})"
   k=$(best "$KATAAN" run "$f")
   n=$(best "$NODE" "$f")

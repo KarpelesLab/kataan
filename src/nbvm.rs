@@ -5350,8 +5350,8 @@ fn call_with_inner(
         };
         // Native fast path (`ROADMAP.md` §2.1): once a function is hot, compile it
         // to machine code and run that on this activation's register file (see
-        // `jit_tier`). A body with a tail call or a suspension point is never
-        // compiled, so this never intercepts the trampoline.
+        // `jit_tier`). A compiled body's proper tail call comes back as
+        // `FrameExit::Tail`, for this trampoline.
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         if jit_tier::call_is_hot(optimized.is_some())
             && let Some(outcome) = jit_tier::enter_on_call(
@@ -5372,7 +5372,26 @@ fn call_with_inner(
                 regs.clear();
                 ctx.realm.vm_reg_pool.push(regs);
             }
-            return outcome;
+            match outcome? {
+                FrameExit::Return(v) => return Ok(v.unwrap_or(NanBox::undefined())),
+                // A proper tail call the compiled body handed back: rebind
+                // the activation inputs and reuse this frame, as below.
+                FrameExit::Tail {
+                    id: tid,
+                    args: targs,
+                    captures: tcaps,
+                    this,
+                } => {
+                    id = tid;
+                    args = alloc::borrow::Cow::Owned(targs);
+                    captures = alloc::borrow::Cow::Owned(tcaps);
+                    this_val = this;
+                    callee = None;
+                    new_target = None;
+                    continue;
+                }
+                FrameExit::Yield { .. } => return Err(VmError::Unsupported),
+            }
         }
         // An `async` function: its synchronous body runs to completion, and its
         // result (or thrown value) settles a returned `Promise`. (No `await` yet —
@@ -7131,6 +7150,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call_method: jit_tier::jit_helper_call_method,
         coll_call: jit_tier::jit_helper_coll_call,
         call_value: jit_tier::jit_helper_call_value,
+        tail_call: jit_tier::jit_helper_tail_call,
         call_with_method: jit_tier::jit_helper_call_with_method,
         call_native_got: jit_tier::jit_helper_call_native_got,
         method_info: jit_tier::jit_method_info,

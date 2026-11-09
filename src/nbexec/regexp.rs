@@ -438,8 +438,10 @@ impl Interp {
     /// as the result's `.input`, plus its UTF-16 code units.
     ///
     /// When `value` is already a string cell it *is* the input — no re-allocation
-    /// — and its units are served from (or installed into) the one-entry
-    /// [`Interp::subject_units_cache`]. The raw handle encodes the heap slot's
+    /// — and its units are served from (or installed into) the two-entry
+    /// [`Interp::subject_units_cache`] (most recent first: a `/g` scan of a
+    /// long text that runs other regexps over each match between its
+    /// `exec`s keeps the text's units). The raw handle encodes the heap slot's
     /// generation, so a reused slot can never hit a stale entry, and string cells
     /// are immutable, so a hit is always still accurate. A non-string `value` is
     /// `ToString`ed and not cached (each coercion may observe a different result).
@@ -450,17 +452,26 @@ impl Interp {
         if let Some(raw) = value.as_handle()
             && self.realm.is_string_handle(Handle::from_raw(raw))
         {
-            if let Some((cached_raw, units)) = &self.subject_units_cache
+            if let Some((cached_raw, units)) = &self.subject_units_cache[0]
                 && *cached_raw == raw
             {
                 return Ok((value, units.clone()));
             }
+            if let Some((cached_raw, _)) = &self.subject_units_cache[1]
+                && *cached_raw == raw
+            {
+                self.subject_units_cache.swap(0, 1);
+                let units = self.subject_units_cache[0].as_ref().map(|(_, u)| u.clone());
+                if let Some(units) = units {
+                    return Ok((value, units));
+                }
+            }
             let h = Handle::from_raw(raw);
             self.realm.flatten_string(h);
-            // The previous subject's buffer, when nothing else holds it, is
+            // The older subject's buffer, when nothing else holds it, is
             // refilled in place rather than freed and reallocated: a `test` or
             // `exec` over many short strings would otherwise pay both per call.
-            let mut units = match self.subject_units_cache.take() {
+            let mut units = match self.subject_units_cache[1].take() {
                 Some((_, rc)) => alloc::rc::Rc::try_unwrap(rc).unwrap_or_default(),
                 None => Vec::new(),
             };
@@ -477,7 +488,8 @@ impl Interp {
                 }
             }
             let units = alloc::rc::Rc::new(units);
-            self.subject_units_cache = Some((raw, units.clone()));
+            self.subject_units_cache[1] = self.subject_units_cache[0].take();
+            self.subject_units_cache[0] = Some((raw, units.clone()));
             return Ok((value, units));
         }
         let bytes = self.coerce_to_string_bytes(value)?;

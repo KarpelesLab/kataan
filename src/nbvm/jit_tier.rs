@@ -122,6 +122,29 @@ pub(super) struct TierRuntime {
     /// exit (`crate::jit::deopt`, [`jit_helper_deopt`]): the function's own
     /// pc the interpreter continues it at and its handler stack there.
     deopt: Option<(usize, alloc::vec::Vec<(usize, Reg)>)>,
+    /// A proper tail call the activation that just left its compiled body
+    /// handed to the trampoline ([`jit_helper_tail_call`]).
+    tail: Option<TailCall>,
+}
+
+/// A proper tail call handed back to `call_with_inner`'s trampoline: what
+/// `FrameExit::Tail` carries.
+pub(super) struct TailCall {
+    id: usize,
+    args: alloc::vec::Vec<NanBox>,
+    captures: alloc::vec::Vec<NanBox>,
+    this: NanBox,
+}
+
+impl TailCall {
+    fn into_exit(self) -> FrameExit {
+        FrameExit::Tail {
+            id: self.id,
+            args: self.args,
+            captures: self.captures,
+            this: self.this,
+        }
+    }
 }
 
 impl Default for TierRuntime {
@@ -141,6 +164,7 @@ impl Default for TierRuntime {
             demote: false,
             suspended: None,
             deopt: None,
+            tail: None,
         }
     }
 }
@@ -441,6 +465,10 @@ fn left_at(
     let handlers = ctx.jit_rt.handlers.split_off(base);
     ctx.jit_rt.base = outer_base;
     ctx.jit_funcs = saved;
+    // A proper tail call handed to the trampoline: the activation is over.
+    if let Some(t) = ctx.jit_rt.tail.take() {
+        return Ok(t.into_exit());
+    }
     // A sync generator's body suspended (the register file is up to date):
     // the interpreter's own suspension outcome.
     if let Some((pc, value, dst)) = ctx.jit_rt.suspended.take() {
@@ -495,7 +523,8 @@ fn finish_raw(ctx: &mut Ctx, raw: u64) -> Result<FrameExit, VmError> {
 /// The call-entry hook (`call_with_inner`, once function `id` is hot): compile
 /// it if it is eligible and run it on the activation's register file `regs`
 /// (already bound by the caller: parameters, captures, `this`). `None` means
-/// "not compiled — interpret it".
+/// "not compiled — interpret it"; the outcome is a return or a proper tail
+/// call (`FrameExit::Tail`, which the caller's trampoline makes).
 pub(super) fn enter_on_call(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -503,7 +532,7 @@ pub(super) fn enter_on_call(
     args: &[NanBox],
     regs: &mut [NanBox],
     ic: &[crate::ic::PropertyCache],
-) -> Option<Result<NanBox, VmError>> {
+) -> Option<Result<FrameExit, VmError>> {
     let proto = funcs.get(id)?;
     if proto.is_async || proto.is_generator {
         return None;
@@ -521,9 +550,9 @@ pub(super) fn enter_on_call(
             jit = new;
         }
         return match run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false, false)? {
-            Ok(FrameExit::Return(v)) => Some(Ok(v.unwrap_or(NanBox::undefined()))),
-            Ok(_) => Some(Err(VmError::Unsupported)),
-            Err(e) => Some(Err(e)),
+            Ok(FrameExit::Yield { .. }) => Some(Err(VmError::Unsupported)),
+            // A return, or a proper tail call the caller's trampoline makes.
+            r => Some(r),
         };
     }
     // The Int/Float tiers model only the parameters (no captures, no `this`, no
@@ -534,7 +563,8 @@ pub(super) fn enter_on_call(
     // Arguments past the parameters are unobservable to such a body (it has
     // no `arguments` object), so a callback a built-in passes `(value, index,
     // array)` still runs compiled.
-    jit.call_guarded(args.get(..proto.n_params)?).map(Ok)
+    jit.call_guarded(args.get(..proto.n_params)?)
+        .map(|v| Ok(FrameExit::Return(Some(v))))
 }
 
 /// [`enter_on_call`] for an async function (hosted): its body compiled (on
@@ -1170,17 +1200,13 @@ fn global_store_ref(
     name: &str,
     cache: &super::StoreGlobalCache,
 ) -> Option<*mut NanBox> {
-    let Some((p, g, lexical)) =
+    let Some((p, g)) =
         ctx.host
             .as_deref()?
             .global_scope_if_current()
             .and_then(|(scope, global)| {
                 let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
-                Some((
-                    p,
-                    Handle::from_raw(global.as_handle()?),
-                    scope.has_lexical(name),
-                ))
+                Some((p, Handle::from_raw(global.as_handle()?)))
             })
     else {
         // No plain global-scope binding: an existing writable data property
@@ -1197,7 +1223,16 @@ fn global_store_ref(
         return None;
     }
     // A global `let`/`const`/`class` is not the like-named property's binding.
-    if lexical || !super::global_owns_cached(&ctx.realm, g, name, cache) {
+    // (The lexical test, a search of the scope's lexical names, only matters
+    // for a name the global object owns: asked second, as most such writes
+    // are a script's `let` counter's, run once per activation.)
+    if !super::global_owns_cached(&ctx.realm, g, name, cache)
+        || ctx
+            .host
+            .as_deref()
+            .and_then(|h| h.global_scope_if_current())
+            .is_some_and(|(scope, _)| scope.has_lexical(name))
+    {
         cache.jit.set(0);
         return Some(p);
     }
@@ -3052,6 +3087,125 @@ pub(crate) extern "C" fn jit_helper_call_value(
         fill_call_site(ctx, NanBox::from_bits(callee_val), site);
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// A proper tail call (`Op::TailCall` / `Op::TailCallValue`) in compiled code
+/// (`crate::jit::GenericOp::CallValue::tail`): its slow path (`deep` null:
+/// the native call sequence could not make the ordinary call; `site`, when
+/// not null, is the op's `CallSite`, refilled as `Op::CallValue`'s helper
+/// does) and its deep path (`deep` non-null: the realm's call depth is half
+/// its limit or more). Returns what the activation returns.
+///
+/// On the deep path, an activation [`run_tiering`] entered (its window is
+/// `exit_regs`, and its caller is `call_with_inner`'s trampoline or an
+/// interpreter loop that returns the frame's outcome to one) hands the call
+/// to the trampoline exactly as the interpreter's arm of the op does — the
+/// exit sentinel, with the call in [`TierRuntime::tail`] — so a chain of tail
+/// calls runs in constant space. Anything else makes the ordinary call
+/// (nested once: its callee, which the trampoline enters, hands its own tail
+/// calls back).
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]; `site` is null or the op's `CallSite`, owned by
+/// the calling `JitProto` and not otherwise borrowed while this runs.
+pub(crate) extern "C" fn jit_helper_tail_call(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    site: *mut core::ffi::c_void,
+    deep: *mut core::ffi::c_void,
+) -> u64 {
+    let regs_addr = regs_raw as usize;
+    // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    // SAFETY: the activation's register file, live and unaliased for this call.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+    // SAFETY: `op` points into the `JitProto`'s owned bytecode.
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    let hand_back = !deep.is_null() && regs_addr == ctx.jit_rt.exit_regs;
+    let (callee, args, static_id) = match op {
+        Op::TailCall { func, args } => (NanBox::undefined(), args, Some(*func as usize)),
+        Op::TailCallValue { callee, args } => (regs[*callee as usize], args, None),
+        _ => {
+            ctx.jit_pending_fault = Some(VmError::Unsupported);
+            return NanBox::jit_throw_bits();
+        }
+    };
+    if static_id.is_none() && !site.is_null() {
+        // SAFETY: the site's own cache (see the function contract).
+        #[allow(unsafe_code)]
+        let site = unsafe { &mut *site.cast::<CallSite>() };
+        fill_call_site(ctx, callee, site);
+    }
+    let argv = super::ArgBuf::from_regs(regs, args);
+    if hand_back {
+        // The interpreter arm's tail call (`Op::TailCall` / `TailCallValue`).
+        let target = match static_id {
+            Some(id) => Some((id, alloc::vec::Vec::new())),
+            None => callee
+                .as_handle()
+                .map(Handle::from_raw)
+                .filter(|&h| ctx.realm.is_vm_function(h))
+                .and_then(|h| ctx.realm.vm_function(h))
+                .filter(|(f, _)| (*f as usize) < funcs.len())
+                .map(|(f, c)| (f as usize, c.to_vec()))
+                .filter(|_| !super::tail_call_changes_realm(ctx, callee)),
+        };
+        if let Some((id, captures)) = target {
+            ctx.jit_rt.tail = Some(TailCall {
+                id,
+                args: argv.to_vec(),
+                captures,
+                this: NanBox::undefined(),
+            });
+            return NanBox::jit_exit_bits();
+        }
+    }
+    // The ordinary call (the interpreter arm's fallback), the caller's
+    // registers published for the GC. A deep one goes through `call_with`,
+    // whose trampoline then takes the callee's own tail calls (a compiled
+    // callee entered natively would only nest again).
+    let compiled = match static_id {
+        None if deep.is_null() => {
+            call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined())
+        }
+        _ => None,
+    };
+    let r = match compiled {
+        Some(r) => r,
+        None => {
+            let pub_mark = ctx.frame_shadow.len();
+            if !on_register_stack(ctx, regs) {
+                ctx.frame_shadow.extend_from_slice(regs);
+            }
+            ctx.frames_published += 1;
+            let r = match static_id {
+                Some(id) => super::vm_call(ctx, funcs, id, NanBox::undefined(), &argv),
+                None => super::call_closure(ctx, funcs, callee, &argv, NanBox::undefined()),
+            };
+            ctx.frames_published -= 1;
+            ctx.frame_shadow.truncate(pub_mark);
+            r
+        }
+    };
+    match r {
+        Ok(v) => v.to_bits(),
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
 }
 
 /// Points `site` at `callee` if the native call sequence may enter it: a VM

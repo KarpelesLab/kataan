@@ -2240,6 +2240,14 @@ pub enum GenericOp {
         cache: u16,
         /// The bytecode pc of the op (its slow path).
         pc: u32,
+        /// `Op::TailCallValue` (a strict `return f(…)`; `dst` is its callee
+        /// register): the activation returns the call's value. While the
+        /// realm's call depth is under half its limit the call is this
+        /// ordinary one; deeper, `jit_helper_tail_call` hands it to the
+        /// trampoline (`FrameExit::Tail`) when the interpreter entered the
+        /// activation, so unbounded tail recursion still runs in bounded
+        /// space.
+        tail: bool,
     },
     /// `Op::CallWithMethod` (`callee(args)` with `this` the receiver, the
     /// method read before the arguments): the native call sequence into a
@@ -2569,8 +2577,8 @@ type GenericLowering = (
 /// a helper, or by handing the op to the interpreter). The refused ops are the
 /// ones whose meaning is tied to the interpreter's *frame* rather than to the
 /// register file: a suspension (`Yield`/`Await`/generator and async-iteration steps), a proper
-/// tail call (which replaces the frame), and direct `eval`/environment ops (which
-/// can reach the frame's scope by name).
+/// tail call through a `with` object's binding (which replaces the frame), and direct
+/// `eval`/environment ops (which can reach the frame's scope by name).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
     use crate::nbvm::Op;
@@ -2583,9 +2591,10 @@ fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
         | Op::AsyncDelegateCall { .. }
         | Op::AddAsyncDisposable { .. }
         | Op::AsyncDisposeStep { .. } => Some("suspension"),
-        Op::TailCall { .. } | Op::TailCallValue { .. } | Op::TailCallThis { .. } => {
-            Some("tail call")
-        }
+        // (`TailCall` / `TailCallValue` compile: an ordinary call while the
+        // call depth is shallow, else a hand-back to the trampoline, see
+        // `GenericOp::CallValue::tail`.)
+        Op::TailCallThis { .. } => Some("tail call"),
         Op::DirectEval { .. } | Op::Env { .. } => Some("direct eval / environment"),
         _ => None,
     }
@@ -2921,6 +2930,25 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                     site,
                     cache,
                     pc: pc32,
+                    tail: false,
+                }
+            }
+            Op::TailCallValue { callee, args } if args.len() <= 32 => {
+                let mut argregs: Vec<u16> = Vec::with_capacity(args.len());
+                for a in args {
+                    argregs.push(r(*a)?);
+                }
+                let site = u16::try_from(call_args.len()).ok()?;
+                call_args.push(argregs);
+                let cache = u16::try_from(n_calls).ok()?;
+                n_calls += 1;
+                GenericOp::CallValue {
+                    dst: r(*callee)?,
+                    callee: r(*callee)?,
+                    site,
+                    cache,
+                    pc: pc32,
+                    tail: true,
                 }
             }
             Op::PushHandler { target, reg } => GenericOp::PushHandler {
@@ -3560,6 +3588,12 @@ pub struct GenericHelpers {
     /// op, site)`, `site` the `CallSite`): the interpreter's call, which also
     /// refills the site's cache.
     pub call_value: JitCallMethodHelper,
+    /// A proper tail call's slow and deep paths (`jit_helper_tail_call(ctx,
+    /// regs, n_regs, op, site, deep)`, `op` the `TailCall`/`TailCallValue`,
+    /// `site` its `CallSite` or null): the value the activation returns —
+    /// the call's, or, from an interpreter-entered activation when `deep`,
+    /// the exit sentinel with the call handed to the trampoline.
+    pub tail_call: JitCallMethodHelper,
     /// `Op::CallWithMethod`'s slow path (`jit_helper_call_with_method(ctx,
     /// regs, n_regs, op, cache, site)`, `cache` the site's `PropertyCache`,
     /// `site` its `CallSite`): the interpreter's call half, refilling the
@@ -7602,6 +7636,7 @@ impl JitFunction {
         let call_method_helper = helpers.call_method as usize as u64;
         let coll_call_helper = helpers.coll_call as usize as u64;
         let call_value_helper = helpers.call_value as usize as u64;
+        let tail_call_helper = helpers.tail_call as usize as u64;
         let method_helper = helpers.method_info as usize as u64;
         let construct_helper = helpers.construct_info as usize as u64;
         let construct_result_helper = helpers.construct_result as usize as u64;
@@ -10778,11 +10813,55 @@ impl JitFunction {
                     }
                     a.bind(done);
                 }
-                GenericOp::Interp { pc } => {
+                GenericOp::Interp { pc } => 'interp: {
                     if pc as usize != op_idx {
                         return None;
                     }
                     let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    // A proper tail call the generic tier has no call
+                    // sequence for (a static `TailCall`): always the helper,
+                    // whose value the activation returns.
+                    if matches!(
+                        bytecode.get(pc as usize),
+                        Some(
+                            crate::nbvm::Op::TailCall { .. }
+                                | crate::nbvm::Op::TailCallValue { .. }
+                        )
+                    ) {
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, 0);
+                        a.movabs_argreg(5, 1);
+                        a.movabs_rax(tail_call_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                        a.frame_epilogue();
+                        break 'interp;
+                    }
+                    // `ToPropertyKey` of a computed key (`a[i] -= x`): a
+                    // primitive is the key as it is, inline for a Number;
+                    // anything else is the interpreter's.
+                    if let Some(&crate::nbvm::Op::ToKey { dst, src }) = bytecode.get(pc as usize)
+                        && ok(dst)
+                        && ok(src)
+                    {
+                        let slow = a.new_label();
+                        let done = a.new_label();
+                        a.movabs_r11(QNAN as i64);
+                        a.load_rax(disp(src));
+                        a.mov_rcx_rax();
+                        a.and_rcx_r11();
+                        a.cmp_rcx_r11();
+                        a.je(slow); // not a number
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        a.bind(slow);
+                        exec_op!(pc);
+                        a.bind(done);
+                        break 'interp;
+                    }
                     // A slow path through a site-filling helper with the
                     // exec-op ABI plus the site (`JitCallMethodHelper`).
                     macro_rules! site_slow {
@@ -14582,6 +14661,68 @@ impl JitFunction {
                     site,
                     cache,
                     pc,
+                    tail: true,
+                } => {
+                    // A proper tail call: the ordinary call while shallow,
+                    // then the activation returns its value (see
+                    // `GenericOp::CallValue::tail`).
+                    let args = call_args.get(site as usize)?;
+                    if dst != callee || !ok(callee) || args.iter().any(|&r| !ok(r)) {
+                        return None;
+                    }
+                    if pc as usize != op_idx {
+                        return None;
+                    }
+                    let site_ptr = *call_sites.get(cache as usize)?;
+                    let op_ptr: *const crate::nbvm::Op = bytecode.get(pc as usize)?;
+                    let slow = a.new_label();
+                    let deep = a.new_label();
+                    let done = a.new_label();
+                    call_seq::emit_tail_depth_check(&mut a, &helpers.call_layout, deep);
+                    call_seq::emit_call(
+                        &mut a,
+                        &call_seq::CallEmit {
+                            dst,
+                            callee: call_seq::CalleeSrc::Reg(callee),
+                            this: None,
+                            args,
+                            spread: None,
+                            site: site_ptr,
+                            layout: &helpers.call_layout,
+                            throw_exit,
+                            slow,
+                            done,
+                        },
+                    )?;
+                    let cold = a.cold_begin();
+                    // jit_helper_tail_call(ctx, regs, n_regs, op, site, deep):
+                    // the call's value (or the trampoline's hand-back
+                    // sentinel) is the activation's.
+                    for (label, deep_flag) in [(slow, 0), (deep, 1)] {
+                        a.bind(label);
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, site_ptr as i64);
+                        a.movabs_argreg(5, deep_flag);
+                        a.movabs_rax(tail_call_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                        a.frame_epilogue();
+                    }
+                    a.cold_end(cold);
+                    a.bind(done);
+                    a.load_rax(disp(dst));
+                    a.frame_epilogue();
+                }
+                GenericOp::CallValue {
+                    dst,
+                    callee,
+                    site,
+                    cache,
+                    pc,
+                    tail: false,
                 } => {
                     let args = call_args.get(site as usize)?;
                     if !ok(dst) || !ok(callee) || args.iter().any(|&r| !ok(r)) {

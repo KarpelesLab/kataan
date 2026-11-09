@@ -520,15 +520,17 @@ pub struct Interp {
     host_fns: Vec<Option<HostFn>>,
     /// Test262 `$262.agent` cooperative-scheduler state (see [`agent`]).
     agent: AgentState,
-    /// One-entry memo of the last regex subject's UTF-16 code units, keyed by the
-    /// string cell's raw handle. `RegExpBuiltinExec` needs the subject as `[u16]`,
-    /// and every `@@replace`/`@@match`/`@@split` — plus any user
-    /// `while ((m = re.exec(s)))` — re-execs against the *same* string, so
-    /// re-deriving the units per match made those operations quadratic in the
-    /// subject length. A raw handle encodes the slot generation, so a freed and
+    /// Two-entry memo of the last regex subjects' UTF-16 code units (most recent
+    /// first), keyed by the string cell's raw handle. `RegExpBuiltinExec` needs
+    /// the subject as `[u16]`, and every `@@replace`/`@@match`/`@@split` — plus
+    /// any user `while ((m = re.exec(s)))` — re-execs against the *same* string,
+    /// so re-deriving the units per match made those operations quadratic in the
+    /// subject length; the second entry keeps a long subject's units while the
+    /// loop body runs other regexps over each match (one entry was evicted every
+    /// iteration there). A raw handle encodes the slot generation, so a freed and
     /// reused slot never matches a stale entry; string cells are immutable, so a
     /// live match is always still valid.
-    subject_units_cache: Option<(u64, alloc::rc::Rc<Vec<u16>>)>,
+    subject_units_cache: [Option<(u64, alloc::rc::Rc<Vec<u16>>)>; 2],
     /// `RegExpExec`'s `Get(R, "exec")` memo (see `regexp_exec_method`).
     regexp_exec_lookup: crate::realm::builtins_fast::MethodSiteCache,
     /// The layout of a RegExp match array's `index`/`input`/`groups`.
@@ -3026,7 +3028,7 @@ impl Interp {
             json_lone_base: 0,
             realm: alloc::boxed::Box::new(Realm::with_limits(limits)),
             realm_spares: Vec::new(),
-            subject_units_cache: None,
+            subject_units_cache: [None, None],
             regexp_exec_lookup: Default::default(),
             #[cfg(feature = "regex")]
             match_array_shape: Default::default(),

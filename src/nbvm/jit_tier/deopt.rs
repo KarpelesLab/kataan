@@ -126,6 +126,18 @@ pub(crate) extern "C" fn jit_helper_deopt(
     match r {
         Some(Ok(FrameExit::Return(Some(v)))) => v.to_bits(),
         Some(Ok(FrameExit::Return(None))) => NanBox::jit_falloff_bits(),
+        // A proper tail call, with no trampoline below this native
+        // activation: the ordinary call (its callee's own tail calls go to
+        // the trampoline `call_with` enters it through).
+        Some(Ok(FrameExit::Tail {
+            id,
+            args,
+            captures,
+            this,
+        })) => match super::super::call_with(ctx, funcs, id, &args, &captures, this) {
+            Ok(v) => v.to_bits(),
+            Err(e) => throw(ctx, e),
+        },
         Some(Ok(_)) | None => throw(ctx, VmError::Unsupported),
         Some(Err(e)) => throw(ctx, e),
     }

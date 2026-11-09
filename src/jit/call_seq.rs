@@ -1519,6 +1519,17 @@ fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail
     a.g_load(r::R10, r::R15, l.stack);
 }
 
+/// A proper tail call's depth test (`GenericOp::CallValue::tail`): to
+/// `deep` once the realm's call depth is half its limit or more, where the
+/// call stops being an ordinary nested one. Clobbers `rax` and `r9`.
+pub(crate) fn emit_tail_depth_check(a: &mut X64Assembler, l: &CallLayout, deep: Label) {
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_load(r::RAX, r::R9, l.total_depth);
+    a.g_rr(0x01, r::RAX, r::RAX); // add rax, rax
+    a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
+    a.g_jcc(cc::AE, deep);
+}
+
 /// To `slow` unless the walked receiver (its heap slot in `rcx`) has no
 /// accessors: no `extra` part, or an empty accessor list (as the method
 /// lookup requires). Clobbers `r9`.

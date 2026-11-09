@@ -235,6 +235,58 @@ pub(crate) struct NativeSite {
     method: u64,
     op: FastOp,
     fills: u8,
+    /// [`try_call`]'s second way: the resolution this one replaced, for a
+    /// site whose receivers alternate between two prototype chains that both
+    /// reach a built-in served here (`gen.next()` over the generators of two
+    /// generator functions, each with its own `prototype`). A hit on it
+    /// swaps the two, so the fields above are always the latest hit's.
+    alt: Option<Box<AltWay>>,
+}
+
+/// A [`NativeSite`]'s other way.
+pub(crate) struct AltWay {
+    chain: MethodSiteCache,
+    method: u64,
+    op: FastOp,
+}
+
+impl NativeSite {
+    fn new() -> Self {
+        Self {
+            chain: MethodSiteCache::default(),
+            method: 0,
+            op: FastOp::None,
+            fills: 0,
+            alt: None,
+        }
+    }
+
+    /// Exchanges the site's resolution with its other way's.
+    fn swap_alt(&mut self) {
+        if let Some(alt) = self.alt.as_deref_mut() {
+            core::mem::swap(&mut self.chain, &mut alt.chain);
+            core::mem::swap(&mut self.method, &mut alt.method);
+            core::mem::swap(&mut self.op, &mut alt.op);
+        }
+    }
+
+    /// Keeps the current resolution (one that served a built-in) as the
+    /// other way, before a refill overwrites it.
+    fn keep_as_alt(&mut self) {
+        if matches!(self.op, FastOp::None) {
+            return;
+        }
+        let alt = self.alt.get_or_insert_with(|| {
+            Box::new(AltWay {
+                chain: MethodSiteCache::default(),
+                method: 0,
+                op: FastOp::None,
+            })
+        });
+        core::mem::swap(&mut self.chain, &mut alt.chain);
+        alt.method = self.method;
+        alt.op = self.op;
+    }
 }
 
 /// The bits of `%Function.prototype.call%` when the site `cache` resolved
@@ -568,21 +620,27 @@ pub(super) fn try_call(
         None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true, None),
         None => return None,
     };
-    let site = cache.native.get_or_insert_with(|| {
-        Box::new(NativeSite {
-            chain: MethodSiteCache::default(),
-            method: 0,
-            op: FastOp::None,
-            fills: 0,
-        })
-    });
-    if !site_hit(&ctx.realm, site, h, prim, key) {
+    let site = cache
+        .native
+        .get_or_insert_with(|| Box::new(NativeSite::new()));
+    let mut hit = site_hit(&ctx.realm, site, h, prim, key);
+    if !hit && site.alt.is_some() && site.fills < FILL_LIMIT {
+        // The other way (see `NativeSite::alt`).
+        site.swap_alt();
+        hit = site_hit(&ctx.realm, site, h, prim, key);
+        if !hit {
+            site.swap_alt();
+        }
+    }
+    if !hit {
         if site.fills >= FILL_LIMIT || !cacheable_key(key) {
             // Retired: a site that keeps changing its mind calls the general
             // path from now on.
             site.op = FastOp::None;
+            site.alt = None;
             return None;
         }
+        site.keep_as_alt();
         fill(&mut ctx.realm, site, h, prim, key);
         if matches!(site.op, FastOp::None) {
             return None;
@@ -751,14 +809,9 @@ pub(super) fn try_call_got(
         None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true),
         None => return None,
     };
-    let site = cache.native.get_or_insert_with(|| {
-        Box::new(NativeSite {
-            chain: MethodSiteCache::default(),
-            method: 0,
-            op: FastOp::None,
-            fills: 0,
-        })
-    });
+    let site = cache
+        .native
+        .get_or_insert_with(|| Box::new(NativeSite::new()));
     if site.method != method.to_bits() {
         if site.fills >= FILL_LIMIT {
             site.op = FastOp::None;
@@ -793,14 +846,9 @@ pub(super) fn try_get(
         None if recv.as_number().is_some() => (ctx.realm.primitive_proto(recv)?, true),
         None => return None,
     };
-    let site = cache.native.get_or_insert_with(|| {
-        Box::new(NativeSite {
-            chain: MethodSiteCache::default(),
-            method: 0,
-            op: FastOp::None,
-            fills: 0,
-        })
-    });
+    let site = cache
+        .native
+        .get_or_insert_with(|| Box::new(NativeSite::new()));
     // (The proof `site_hit` / `fill` make for `try_call`, written out here so
     // that those stay `try_call`'s alone: inlined into it as before.)
     let hit = !matches!(site.op, FastOp::None)
