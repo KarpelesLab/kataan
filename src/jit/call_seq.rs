@@ -918,19 +918,37 @@ impl X64Assembler {
     /// [`g_mem`](Self::g_mem)'s encoding (`mod=01` with a `disp8` when the
     /// displacement fits a byte).
     fn g_mem_raw(&mut self, w: bool, opcode: &[u8], reg: u8, base: u8, disp: i32) {
-        let rex = 0x40 | (u8::from(w) << 3) | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
-        self.code.push(rex);
-        self.code.extend_from_slice(opcode);
+        // (Built in a fixed buffer appended whole, then cut to its length:
+        // one store of constant size instead of a push per byte.)
+        debug_assert!(opcode.len() <= 4);
+        let mut b = [0u8; 16];
+        b[0] = 0x40 | (u8::from(w) << 3) | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
+        let mut n = 1;
+        for &o in opcode.iter().take(4) {
+            b[n] = o;
+            n += 1;
+        }
         let short = i8::try_from(disp).ok();
         let mode = if short.is_some() { 0x40 } else { 0x80 };
-        self.code.push(mode | ((reg & 7) << 3) | (base & 7));
+        b[n] = mode | ((reg & 7) << 3) | (base & 7);
+        n += 1;
         if base & 7 == 4 {
-            self.code.push(0x24); // SIB: base only (rsp / r12)
+            b[n] = 0x24; // SIB: base only (rsp / r12)
+            n += 1;
         }
         match short {
-            Some(d) => self.code.push(d.to_le_bytes()[0]),
-            None => self.code.extend_from_slice(&disp.to_le_bytes()),
+            Some(d) => {
+                b[n] = d.to_le_bytes()[0];
+                n += 1;
+            }
+            None => {
+                b[n..n + 4].copy_from_slice(&disp.to_le_bytes());
+                n += 4;
+            }
         }
+        let len = self.code.len();
+        self.code.extend_from_slice(&b);
+        self.code.truncate(len + n);
     }
 
     /// `op rm, reg` in register-direct form (`mod=11`), 64-bit.

@@ -1048,6 +1048,7 @@ pub fn expand<'a>(
     }
     let n_regs = base + window;
     let undefined = NanBox::undefined();
+    let mut windows = Windows(Vec::new());
     let mut ops: Vec<Op> = Vec::with_capacity(proto.ops.len() + added);
     let mut nwarm: Vec<Option<WarmEntry>> = Vec::with_capacity(proto.ops.len() + added);
     let mut orig_of: Vec<u32> = Vec::with_capacity(proto.ops.len() + added + 1);
@@ -1062,7 +1063,7 @@ pub fn expand<'a>(
             next += sites[si]
                 .1
                 .iter()
-                .map(|c| way_len(&c.proto, &proto.ops[pc]))
+                .map(|c| way_len(&c.proto, &proto.ops[pc], &mut windows))
                 .sum::<usize>()
                 + 1;
             if matches!(proto.ops[pc], Op::CallKey { .. }) {
@@ -1125,7 +1126,7 @@ pub fn expand<'a>(
                     };
                     let ways_len = site_ways
                         .iter()
-                        .map(|c| way_len(&c.proto, op))
+                        .map(|c| way_len(&c.proto, op, &mut windows))
                         .sum::<usize>();
                     let target = ops.len() + 2 + ways_len + 3;
                     for o in [pre, Op::JumpIfFalse { cond: flag, target }] {
@@ -1164,7 +1165,9 @@ pub fn expand<'a>(
             let fallback = ops.len()
                 + site_ways
                     .iter()
-                    .map(|c| block_len(&c.proto, op) + usize::from(spread_tail.is_some()))
+                    .map(|c| {
+                        block_len(&c.proto, op, &mut windows) + usize::from(spread_tail.is_some())
+                    })
                     .sum::<usize>();
             let end = if spread_tail.is_some() {
                 spread_end
@@ -1176,7 +1179,8 @@ pub fn expand<'a>(
                 let p: &FnProto = &c.proto;
                 let g = ops.len();
                 let tmp = rb(p.n_regs as Reg);
-                let next_way = g + block_len(p, op) + usize::from(spread_tail.is_some());
+                let next_way =
+                    g + block_len(p, op, &mut windows) + usize::from(spread_tail.is_some());
                 let leave = next_way - 2 - tail_move;
                 macro_rules! emit {
                     ($o:expr, $w:expr, $ops:expr $(,)?) => {{
@@ -1240,7 +1244,7 @@ pub fn expand<'a>(
                         .flatten()
                         .unwrap_or_else(|| rb(r))
                 };
-                for r in window_regs(p, construct) {
+                for &r in windows.get(p, construct) {
                     if (construct && r == this_slot) || shared[r].is_some() {
                         continue;
                     }
@@ -1469,12 +1473,13 @@ fn body_pc(p: &FnProto, t: usize, construct: bool) -> usize {
 /// guard, branch, window, body, fall-off, leave, a `super(…)`'s binding of
 /// `this`, jump. (A construct site's guard writes `this`, see
 /// [`construct_site`]; the site's shape is [`copied_param`]'s.)
-fn block_len(p: &FnProto, site: &Op) -> usize {
+fn block_len(p: &FnProto, site: &Op, windows: &mut Windows) -> usize {
     let (construct, shape) = (construct_site(site), site_shape(site));
     let this_slot = p.n_params + p.n_captures;
-    let window = window_regs(p, construct)
-        .into_iter()
-        .filter(|&r| !(construct && r == this_slot) && !copied_param(p, r, construct, shape))
+    let window = windows
+        .get(p, construct)
+        .iter()
+        .filter(|&&r| !(construct && r == this_slot) && !copied_param(p, r, construct, shape))
         .count();
     2 + window
         + body_pc(p, p.ops.len(), construct)
@@ -1485,10 +1490,29 @@ fn block_len(p: &FnProto, site: &Op) -> usize {
 
 /// The ops one way of an inlined site takes ([`block_len`]; a spread
 /// call's also sets its `ok`, see [`split_spread`]).
-fn way_len(p: &FnProto, site: &Op) -> usize {
+fn way_len(p: &FnProto, site: &Op, windows: &mut Windows) -> usize {
     match split_spread(site, p.n_params, 0) {
-        Some((_, call, _, _)) => block_len(p, &call) + 1,
-        None => block_len(p, site),
+        Some((_, call, _, _)) => block_len(p, &call, windows) + 1,
+        None => block_len(p, site, windows),
+    }
+}
+
+/// [`window_regs`] of the callees one [`expand`] splices, each computed
+/// once: by the callee's address (every one outlives the expansion) and
+/// whether its site is a construct.
+struct Windows(Vec<(*const FnProto, bool, Vec<usize>)>);
+
+impl Windows {
+    fn get(&mut self, p: &FnProto, construct: bool) -> &[usize] {
+        let key = core::ptr::from_ref(p);
+        let i = match self.0.iter().position(|e| e.0 == key && e.1 == construct) {
+            Some(i) => i,
+            None => {
+                self.0.push((key, construct, window_regs(p, construct)));
+                self.0.len() - 1
+            }
+        };
+        &self.0[i].2
     }
 }
 
@@ -1663,8 +1687,14 @@ fn window_regs(p: &FnProto, construct: bool) -> Vec<usize> {
     // Backward liveness over the spliced body: `live[j]`, the registers live
     // into callee op `j` (one pass when every branch goes forward; a loop's
     // back-edge takes more, until nothing changes).
+    // (With no back-edge every successor comes later, so the one backward
+    // pass is the fixpoint.)
     let mut live: Vec<Vec<bool>> = alloc::vec![alloc::vec![false; nr]; n + 1];
     let (mut defs, mut uses) = (Vec::new(), Vec::new());
+    let mut out = alloc::vec![false; nr];
+    let back = p.ops.iter().enumerate().any(
+        |(j, o)| matches!(o, Op::Jump { target } | Op::JumpIfFalse { target, .. } if *target <= j),
+    );
     let mut changed = true;
     while core::mem::take(&mut changed) {
         for j in (0..n).rev() {
@@ -1673,10 +1703,12 @@ fn window_regs(p: &FnProto, construct: bool) -> Vec<usize> {
                 j,
                 construct,
                 &mut live,
-                &mut defs,
-                &mut uses,
+                (&mut defs, &mut uses, &mut out),
                 &mut changed,
             );
+        }
+        if !back {
+            break;
         }
     }
     let caps = p.n_params..p.n_params + p.n_captures;
@@ -1692,12 +1724,10 @@ fn live_step(
     j: usize,
     construct: bool,
     live: &mut [Vec<bool>],
-    defs: &mut Vec<Reg>,
-    uses: &mut Vec<Reg>,
+    (defs, uses, out): (&mut Vec<Reg>, &mut Vec<Reg>, &mut [bool]),
     changed: &mut bool,
 ) {
     let n = p.ops.len();
-    let nr = p.n_regs;
     {
         let op = &p.ops[j];
         let succ: [Option<usize>; 2] = match op {
@@ -1709,7 +1739,7 @@ fn live_step(
             | Op::ThrowReferenceError { .. } => [None, None],
             _ => [Some(j + 1), None],
         };
-        let mut out = alloc::vec![false; nr];
+        out.fill(false);
         for s in succ.into_iter().flatten() {
             for (o, l) in out.iter_mut().zip(&live[s.min(n)]) {
                 *o |= *l;
@@ -1730,8 +1760,8 @@ fn live_step(
                 }
             }
         }
-        if live[j] != out {
-            live[j] = out;
+        if live[j] != *out {
+            live[j].copy_from_slice(out);
             *changed = true;
         }
     }

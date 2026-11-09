@@ -5232,89 +5232,143 @@ pub(crate) struct ColdMark {
 /// [`X64Assembler::finish`] has not placed yet.
 const LABEL_COLD: usize = usize::MAX - 1;
 
-/// **Jump threading** over finished code (`X64Assembler::finish_at`), which
-/// moves no instruction (every label and every reported offset keeps its
-/// place) and only rewrites branches:
+/// One `rel32` operand in [`finish_jumps`]' table.
+#[derive(Clone, Copy)]
+struct Jump {
+    /// The operand's offset.
+    at: u32,
+    /// Its target.
+    t: u32,
+    /// The label bound there (an index into the assembler's labels).
+    l: u32,
+    /// What it is: `J_*`.
+    kind: u8,
+    /// For a branch right after a store (`Fixup`), the store: an index into
+    /// the table's stores, or `u32::MAX`.
+    st: u32,
+    /// A relaxation candidate's run (an index into the runs), or
+    /// `u32::MAX`.
+    run: u32,
+}
+
+/// [`Jump::kind`]: a `call`'s or `rip`-relative operand.
+const J_OTHER: u8 = 0;
+/// [`Jump::kind`]: a `jmp rel32` (`E9`; its opcode's length).
+const J_JMP: u8 = 1;
+/// [`Jump::kind`]: a `jcc rel32` (`0F 8x`; its opcode's length).
+const J_JCC: u8 = 2;
+/// [`Jump::kind`]: a `jmp` threading dropped (all 5 bytes).
+const J_DEAD_JMP: u8 = 3;
+/// [`Jump::kind`]: a `jcc` threading dropped (all 6 bytes).
+const J_DEAD_JCC: u8 = 4;
+
+/// **Jump threading and branch relaxation** over finished code, in one
+/// pass over a table of its `rel32` operands (`fixups`, their targets read
+/// from `labels`), which writes each operand once, at the end.
+///
+/// Threading moves no instruction and only rewrites branches:
 ///
 /// - a branch to an unconditional `jmp` goes straight to where that `jmp`
 ///   goes (a few hops, so a cycle of jumps stays as it is);
-/// - `jcc A; jmp B; A:` becomes `j!cc B` and a 5-byte `nop`, when nothing
-///   else reaches the `jmp` (no branch targets it and no reported offset is
-///   it);
-/// - a `jmp` or `jcc` to the very next instruction becomes a `nop` of its
-///   length.
+/// - `jcc A; jmp B; A:` becomes `j!cc B` and the `jmp` is dropped, when
+///   nothing else reaches the `jmp` (no branch targets it and no entered
+///   offset is it);
+/// - a `jmp` or `jcc` to the very next instruction is dropped;
+/// - a load a store just before it served (`X64Assembler::note_load`),
+///   when no jump lands on it, becomes a register move (or nothing), and
+///   the rest of its bytes are dropped.
 ///
-/// `operands` are the offsets of every resolved `rel32` (`fixups`): a
-/// branch's is told apart by the opcode before it (`E9`, or `0F 8x`);
-/// every other `rel32` this assembler emits ends a `rip`-relative operand,
-/// whose ModRM byte (`00 reg 101`, at most `0x3D`) is neither, or a `call`
-/// (`E8`), which is left alone. `pinned` are the offsets reported to the
-/// caller (entries, labels), which keep their code.
+/// Relaxation then moves instructions: every `jmp rel32` / `jcc rel32`
+/// whose target ends up within a signed byte of it becomes its 2-byte
+/// `rel8` form, and the dropped bytes go. Code only ever shrinks, so a
+/// branch whose `rel32` already fits a byte stays in reach whatever else
+/// shrinks: those are short from the start, and each round then makes
+/// short every other branch now in reach (which only brings every target
+/// nearer), until none is. A branch more than 384 bytes from its target is
+/// never tried (a branch drops at most two thirds of itself; staying long
+/// is always correct).
 ///
-/// Returns the `nop`s it made, as `(start, length)`, which
-/// [`relax_jumps`] then drops.
-fn thread_jumps(
-    code: &mut [u8],
-    operands: &[(usize, Option<StoreFwd>)],
+/// A branch's operand is told apart by the opcode before it (`E9`, or
+/// `0F 8x`); every other `rel32` this assembler emits ends a
+/// `rip`-relative operand, whose ModRM byte (`00 reg 101`, at most `0x3D`)
+/// is neither, or a `call` (`E8`): those are only re-aimed at their moved
+/// targets. `pinned` are the offsets reported to the caller that it enters
+/// (they keep their code), `offsets` every reported offset (rewritten to
+/// where their code moved), and `consts`, when the code ends in constant
+/// words (`finish`), where the instructions end and where the 8-aligned
+/// words begin (kept 8-aligned). The code holds no other
+/// position-dependent encoding: every jump and `rip`-relative operand is a
+/// fixup (the one hand-made `rel8`, in `X64Assembler::inline_frame_hook`,
+/// spans a single `call`).
+fn finish_jumps(
+    code: &mut Vec<u8>,
+    fixups: &[Fixup],
+    labels: &[usize],
     pinned: &[usize],
     fwd: &[FwdLoad],
-) -> Vec<(usize, usize)> {
-    let mut nops: Vec<(usize, usize)> = Vec::new();
-    const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
-    const NOP6: [u8; 6] = [0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00];
+    offsets: &mut [usize],
+    consts: Option<(usize, usize)>,
+) {
+    #[inline(always)]
+    fn has(set: &[u64], i: usize) -> bool {
+        set.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0)
+    }
+    #[inline(always)]
+    fn put(set: &mut [u64], i: usize) {
+        if let Some(w) = set.get_mut(i / 64) {
+            *w |= 1u64 << (i % 64);
+        }
+    }
     let n = code.len();
-    let rel_at = |code: &[u8], at: usize| {
-        i32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+    // The code proper ends where the constants' padding begins.
+    let (code_end, consts) = match consts {
+        Some((e, c)) => (e, Some(c)),
+        None => (n, None),
     };
-    let target = |code: &[u8], at: usize| (at as i64 + 4 + i64::from(rel_at(code, at))) as usize;
-    let set_target = |code: &mut [u8], at: usize, t: usize| {
-        let rel = (t as i64 - (at as i64 + 4)) as i32;
-        code[at..at + 4].copy_from_slice(&rel.to_le_bytes());
-    };
-    let is_jmp = |code: &[u8], at: usize| at >= 1 && code[at - 1] == 0xe9;
-    let is_jcc =
-        |code: &[u8], at: usize| at >= 2 && code[at - 2] == 0x0f && (code[at - 1] & 0xf0) == 0x80;
-    // Per-byte bit sets over the code: `jmp` instruction starts, offsets
-    // still reached by address, and the `jmp`s made `nop`s (by start).
+    // The table, by operand offset (`fixups` come in that order but for
+    // the odd out-of-line stub), and a bit set over the code of the `jmp`
+    // instructions' starts.
     let words = n / 64 + 1;
-    let has = |set: &[u64], i: usize| i < n && set[i / 64] & (1u64 << (i % 64)) != 0;
-    let put = |set: &mut [u64], i: usize| {
-        if i < n {
-            set[i / 64] |= 1u64 << (i % 64);
-        }
-    };
     let mut jmps = alloc::vec![0u64; words];
-    let mut branches: Vec<usize> = Vec::new();
-    for &(at, _) in operands {
-        if at + 4 > n {
-            continue;
-        }
-        if is_jmp(code, at) {
+    let mut ops: Vec<Jump> = Vec::with_capacity(fixups.len());
+    let mut stores: Vec<StoreFwd> = Vec::new();
+    let mut sorted = true;
+    let mut last = 0usize;
+    for &(at, label, st) in fixups {
+        let t = labels[label];
+        debug_assert_ne!(t, usize::MAX, "unbound label in jump");
+        debug_assert!(at >= 1 && at + 4 <= code_end);
+        let kind = if code[at - 1] == 0xe9 {
             put(&mut jmps, at - 1);
-            branches.push(at);
-        } else if is_jcc(code, at) {
-            branches.push(at);
-        }
-    }
-    // Branches to a `jmp` go where it goes.
-    for &at in &branches {
-        let t0 = target(code, at);
-        let mut t = t0;
-        let mut hops = 0;
-        while has(&jmps, t) {
-            let next = target(code, t + 1);
-            if next == t || hops == 8 {
-                break;
+            J_JMP
+        } else if at >= 2 && code[at - 2] == 0x0f && (code[at - 1] & 0xf0) == 0x80 {
+            J_JCC
+        } else {
+            J_OTHER
+        };
+        sorted &= at >= last;
+        last = at;
+        let st = match st {
+            Some(s) => {
+                stores.push(s);
+                (stores.len() - 1) as u32
             }
-            t = next;
-            hops += 1;
-        }
-        if t != t0 {
-            set_target(code, at, t);
-        }
+            None => u32::MAX,
+        };
+        ops.push(Jump {
+            at: at as u32,
+            t: t as u32,
+            l: label as u32,
+            kind,
+            st,
+            run: u32::MAX,
+        });
     }
-    // What is still reached by address: every `rel32`'s target and the
-    // reported offsets.
+    if !sorted {
+        ops.sort_unstable_by_key(|j| j.at);
+    }
+    // Branches to a `jmp` go where it goes. Then what is still reached by
+    // address: every `rel32`'s target and the entered offsets.
     // (A branch right after a store reaches its target with the stored
     // word still in the store's source register: `via_store`.)
     let mut reached = alloc::vec![0u64; words];
@@ -5322,14 +5376,38 @@ fn thread_jumps(
     for &p in pinned {
         put(&mut reached, p);
     }
-    for &(at, st) in operands {
-        if at + 4 <= n {
-            match st {
-                Some(st) => via_store.push((target(code, at), st.base, st.disp, st.src)),
-                None => put(&mut reached, target(code, at)),
+    for i in 0..ops.len() {
+        if ops[i].kind != J_OTHER {
+            let t0 = ops[i].t as usize;
+            let mut t = t0;
+            let mut l = ops[i].l;
+            let mut hops = 0;
+            while has(&jmps, t) {
+                let Ok(j) = ops.binary_search_by_key(&(t as u32 + 1), |j| j.at) else {
+                    break;
+                };
+                let next = ops[j].t as usize;
+                if next == t || hops == 8 {
+                    break;
+                }
+                t = next;
+                l = ops[j].l;
+                hops += 1;
+            }
+            if t != t0 {
+                ops[i].t = t as u32;
+                ops[i].l = l;
             }
         }
+        let j = &ops[i];
+        if j.st == u32::MAX {
+            put(&mut reached, j.t as usize);
+        } else {
+            let st = stores[j.st as usize];
+            via_store.push((j.t as usize, st.base, st.disp, st.src));
+        }
     }
+    drop(jmps);
     via_store.sort_unstable();
     // Whether `p` is reached by a jump other than one right after a store
     // of `src` to `[base + disp]`.
@@ -5344,7 +5422,8 @@ fn thread_jumps(
             .any(|v| (v.1, v.2, v.3) != (base, disp, src))
     };
     // A load a store just before it served (`X64Assembler::note_load`),
-    // when no jump lands on it.
+    // when no jump lands on it; `nops`: the bytes it no longer needs.
+    let mut nops: Vec<(u32, u32)> = Vec::new();
     for &(start, len, base, disp, src, dst) in fwd {
         let (start, len) = (start, usize::from(len));
         if start + len > n || entered(start, base, disp, src) {
@@ -5358,160 +5437,98 @@ fn thread_jumps(
             code[k + 2] = 0xc0 | ((src & 7) << 3) | (dst & 7);
             k += 3;
         }
-        let pad: &[u8] = match start + len - k {
-            0 => &[],
-            1 => &[0x90],
-            2 => &[0x66, 0x90],
-            3 => &[0x0f, 0x1f, 0x00],
-            4 => &[0x0f, 0x1f, 0x40, 0x00],
-            5 => &[0x0f, 0x1f, 0x44, 0x00, 0x00],
-            7 => &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
-            _ => &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
-        };
-        code[k..start + len].copy_from_slice(pad);
         if start + len > k {
-            nops.push((k, start + len - k));
+            nops.push((k as u32, (start + len - k) as u32));
         }
     }
-    let mut dead = alloc::vec![0u64; words];
-    for &at in &branches {
-        if has(&dead, at - 1) || !is_jcc(code, at) {
-            continue;
-        }
-        // `jcc A; jmp B; A:` -> `j!cc B; nop5`.
-        let next = at + 4;
-        if target(code, at) == next + 5
-            && has(&jmps, next)
-            && !has(&dead, next)
-            && !has(&reached, next)
-        {
-            let b = target(code, next + 1);
-            code[at - 1] ^= 1;
-            set_target(code, at, b);
-            code[next..next + 5].copy_from_slice(&NOP5);
-            put(&mut dead, next);
-            nops.push((next, 5));
-        }
+    if !nops.is_sorted() {
+        nops.sort_unstable();
     }
-    // A branch to the next instruction is a `nop`.
-    for &at in &branches {
-        if has(&dead, at - 1) || rel_at(code, at) != 0 {
-            continue;
-        }
-        if is_jmp(code, at) {
-            code[at - 1..at + 4].copy_from_slice(&NOP5);
-            nops.push((at - 1, 5));
-        } else if is_jcc(code, at) {
-            code[at - 2..at + 4].copy_from_slice(&NOP6);
-            nops.push((at - 2, 6));
-        }
-    }
-    nops
-}
-
-/// **Branch relaxation** over threaded code ([`thread_jumps`]), which
-/// moves instructions: every `jmp rel32` / `jcc rel32` whose target ends up
-/// within a signed byte of it becomes its 2-byte `rel8` form, and the
-/// `nop`s threading made (`nops`) are dropped. Code only ever shrinks, so
-/// a branch whose `rel32` already fits a byte stays in reach whatever else
-/// shrinks: those are short from the start, and each round then makes
-/// short every other branch now in reach (which only brings every target
-/// nearer), until none is. A branch more than 384 bytes from its target
-/// is never tried.
-///
-/// `operands` are every resolved `rel32` operand (branches told apart as in
-/// [`thread_jumps`]; the others, `call`s and `rip`-relative operands, are
-/// re-aimed at their moved targets), `offsets` the offsets reported to the
-/// caller (rewritten to where their code moved), and `consts`, when the
-/// code ends in constant words (`finish`), where the instructions end and
-/// where the 8-aligned words begin (kept 8-aligned). The code holds no
-/// other position-dependent encoding: every jump and `rip`-relative
-/// operand is a fixup (the one hand-made `rel8`, in
-/// `X64Assembler::inline_frame_hook`, spans a single `call`).
-fn relax_jumps(
-    code: &mut Vec<u8>,
-    operands: &[usize],
-    nops: &mut [(usize, usize)],
-    offsets: &mut [usize],
-    consts: Option<(usize, usize)>,
-) {
-    let n = code.len();
-    // The code proper ends where the constants' padding begins.
-    let (code_end, consts) = match consts {
-        Some((e, c)) => (e, Some(c)),
-        None => (n, None),
-    };
-    nops.sort_unstable();
-    let in_nop = |p: usize| {
-        let i = nops.partition_point(|s| s.0 <= p);
-        i > 0 && p < nops[i - 1].0 + nops[i - 1].1
-    };
-    let rel_at = |code: &[u8], at: usize| {
-        i32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
-    };
-    // Branches that may be short: (instruction start, opcode length (1:
-    // `E9`, 2: `0F 8x`), old target, short already). Those never tried
-    // (their target too far to come within reach but for long runs of
-    // dropped `nop`s: a branch drops at most two thirds of itself; staying
-    // long is always correct) and the other operands: (operand offset, old
-    // target).
+    // In order: `jcc A; jmp B; A:` -> `j!cc B` (the `jmp`, the operand
+    // right after the `jcc`'s, dropped), and a branch to the next
+    // instruction dropped. Then every run of bytes that may be dropped, by
+    // start: each candidate branch's tail (its `rel32` -> `rel8`: 3 bytes
+    // of a `jmp`, 4 of a `jcc`, from its third byte on), dropped while it
+    // is short, and the dropped instructions and `nops`, always dropped.
+    // `dropped[i]`: what run `i` drops now.
     const FAR: i64 = 3 * 128;
-    let mut br: Vec<(usize, usize, usize, bool)> = Vec::new();
-    let mut long: Vec<(usize, usize)> = Vec::new();
-    let mut other: Vec<(usize, usize)> = Vec::new();
-    for &at in operands {
-        if at + 4 > code_end || at < 1 || (!nops.is_empty() && in_nop(at)) {
-            continue;
+    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(ops.len() + nops.len());
+    let mut dropped: Vec<u32> = Vec::with_capacity(ops.len() + nops.len());
+    // The candidates not short from the start (their index in `ops`).
+    let mut maybe: Vec<u32> = Vec::new();
+    let mut ni = 0;
+    for i in 0..ops.len() {
+        let at = ops[i].at as usize;
+        if ops[i].kind == J_JCC
+            && ops[i].t as usize == at + 9
+            && let Some(&k) = ops.get(i + 1)
+            && k.kind == J_JMP
+            && k.at as usize == at + 5
+            && !has(&reached, at + 4)
+        {
+            code[at - 1] ^= 1;
+            ops[i].t = k.t;
+            ops[i].l = k.l;
+            ops[i + 1].kind = J_DEAD_JMP;
         }
-        let r = i64::from(rel_at(code, at));
-        let t = (at as i64 + 4 + r) as usize;
-        let op = if code[at - 1] == 0xe9 {
-            1
-        } else if at >= 2 && code[at - 2] == 0x0f && (code[at - 1] & 0xf0) == 0x80 {
-            2
-        } else {
-            other.push((at, t));
-            continue;
-        };
-        if t > code_end || !(-FAR..FAR).contains(&r) {
-            long.push((at, t));
-            continue;
-        }
-        // Short for sure: the distance the `rel8` measures is the `rel32`'s
-        // less the bytes dropped between (forward), or more (backward,
-        // where it also spans its own instruction's 2 bytes).
-        let len = 4 + op as i64;
-        let sure = if r >= 0 {
-            r <= 127
-        } else {
-            r + len - 2 >= -128
-        };
-        br.push((at - op, op, t, sure));
-    }
-    br.sort_unstable();
-    // Every run of bytes that may be dropped, sorted by start: each
-    // candidate branch's tail (its `rel32` -> `rel8`: 3 bytes of a `jmp`,
-    // 4 of a `jcc`, from its third byte on), dropped while it is short,
-    // and the `nop`s, always dropped. `own[k]`: branch `k`'s run.
-    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(br.len() + nops.len());
-    let mut own: Vec<usize> = Vec::with_capacity(br.len());
-    let mut is_nop: Vec<bool> = Vec::with_capacity(br.len() + nops.len());
-    {
-        let (mut i, mut j) = (0, 0);
-        while i < br.len() || j < nops.len() {
-            if j == nops.len() || (i < br.len() && br[i].0 < nops[j].0) {
-                own.push(runs.len());
-                runs.push((br[i].0 + 2, if br[i].1 == 1 { 3 } else { 4 }));
-                is_nop.push(false);
-                i += 1;
+        let j = &mut ops[i];
+        if matches!(j.kind, J_JMP | J_JCC) && j.t as usize == at + 4 {
+            j.kind = if j.kind == J_JCC {
+                J_DEAD_JCC
             } else {
-                runs.push(nops[j]);
-                is_nop.push(true);
-                j += 1;
-            }
+                J_DEAD_JMP
+            };
         }
+        let (s, l, now) = match j.kind {
+            J_OTHER => continue,
+            J_DEAD_JMP => (at - 1, 5, true),
+            J_DEAD_JCC => (at - 2, 6, true),
+            kind => {
+                let r = j.t as i64 - (at as i64 + 4);
+                if j.t as usize > code_end || !(-FAR..FAR).contains(&r) {
+                    continue;
+                }
+                // Short for sure: the distance the `rel8` measures is the
+                // `rel32`'s less the bytes dropped between (forward), or
+                // more (backward, where it also spans its own
+                // instruction's 2 bytes).
+                let sure = if r >= 0 {
+                    r <= 127
+                } else {
+                    r + 2 + i64::from(kind) >= -128
+                };
+                if !sure {
+                    maybe.push(i as u32);
+                }
+                (at - usize::from(kind) + 2, 2 + u32::from(kind), sure)
+            }
+        };
+        while ni < nops.len() && (nops[ni].0 as usize) < s {
+            runs.push(nops[ni]);
+            dropped.push(nops[ni].1);
+            ni += 1;
+        }
+        if j.kind <= J_JCC {
+            j.run = runs.len() as u32;
+        }
+        runs.push((s as u32, l));
+        dropped.push(if now { l } else { 0 });
     }
+    for &r in &nops[ni..] {
+        runs.push(r);
+        dropped.push(r.1);
+    }
+    drop(reached);
+    // (Each operand's `rel32`, in place when nothing moves.)
+    let in_place = |code: &mut [u8], ops: &[Jump]| {
+        for j in ops {
+            let at = j.at as usize;
+            let d = (i64::from(j.t) - (at as i64 + 4)) as i32;
+            code[at..at + 4].copy_from_slice(&d.to_le_bytes());
+        }
+    };
     if runs.is_empty() {
+        in_place(code, &ops);
         return;
     }
     // `first[b]`: how many runs begin before byte `b * 32` (for `place`).
@@ -5521,7 +5538,7 @@ fn relax_jumps(
         let mut f = Vec::with_capacity(nb);
         let mut j = 0;
         for b in 0..nb {
-            while j < runs.len() && runs[j].0 < b * BUCKET {
+            while j < runs.len() && (runs[j].0 as usize) < b * BUCKET {
                 j += 1;
             }
             f.push(j as u32);
@@ -5531,64 +5548,61 @@ fn relax_jumps(
     // How many runs begin before old offset `p` (at most `code_end`).
     let place = |p: usize| {
         let mut i = first[p / BUCKET] as usize;
-        while i < runs.len() && runs[i].0 < p {
+        while i < runs.len() && (runs[i].0 as usize) < p {
             i += 1;
         }
         i
     };
-    let mut short: Vec<bool> = br.iter().map(|b| b.3).collect();
     // `pre[i]`: the bytes the first `i` runs drop.
-    let mut pre: Vec<usize> = alloc::vec![0; runs.len() + 1];
-    let fill = |pre: &mut [usize], short: &[bool]| {
-        let mut k = 0;
-        for (i, r) in runs.iter().enumerate() {
-            let l = if is_nop[i] {
-                r.1
-            } else {
-                k += 1;
-                if short[k - 1] { r.1 } else { 0 }
-            };
-            pre[i + 1] = pre[i] + l;
+    let mut pre: Vec<u32> = alloc::vec![0; runs.len() + 1];
+    let fill = |pre: &mut [u32], dropped: &[u32]| {
+        let mut s = 0;
+        for (p, &d) in pre[1..].iter_mut().zip(dropped) {
+            s += d;
+            *p = s;
         }
     };
     // Where old offset `p` moves, `i` its place: a dropped run's bytes
     // (only a dropped `nop` is ever a target) move to where it began.
-    let moved = |pre: &[usize], p: usize, i: usize| {
-        if i > 0 && pre[i] != pre[i - 1] && p < runs[i - 1].0 + runs[i - 1].1 {
-            runs[i - 1].0 - pre[i - 1]
+    let moved = |pre: &[u32], p: usize, i: usize| {
+        if i > 0 && pre[i] != pre[i - 1] && p < (runs[i - 1].0 + runs[i - 1].1) as usize {
+            (runs[i - 1].0 - pre[i - 1]) as usize
         } else {
-            p - pre[i]
+            p - pre[i] as usize
         }
     };
+    fill(&mut pre, &dropped);
     // The rest, from the sure ones: a branch whose target is now in reach
     // becomes short (which only brings every other target nearer, so each
     // round keeps every short branch in reach), until none does.
-    let maybe: Vec<(usize, usize)> = (0..br.len())
-        .filter(|&k| !short[k])
-        .map(|k| (k, place(br[k].2)))
-        .collect();
-    fill(&mut pre, &short);
     if !maybe.is_empty() {
+        let maybe: Vec<(u32, u32)> = maybe
+            .iter()
+            .map(|&i| (i, place(ops[i as usize].t as usize) as u32))
+            .collect();
         loop {
             let mut changed = false;
-            for &(k, ti) in &maybe {
-                if short[k] {
+            for &(i, ti) in &maybe {
+                let j = ops[i as usize];
+                let run = j.run as usize;
+                if dropped[run] != 0 {
                     continue;
                 }
-                let ns = br[k].0 - pre[own[k]];
-                let nt = moved(&pre, br[k].2, ti);
+                let ns = j.at as usize - usize::from(j.kind) - pre[run] as usize;
+                let nt = moved(&pre, j.t as usize, ti as usize);
                 if i8::try_from(nt as i64 - (ns as i64 + 2)).is_ok() {
-                    short[k] = true;
+                    dropped[run] = runs[run].1;
                     changed = true;
                 }
             }
             if !changed {
                 break;
             }
-            fill(&mut pre, &short);
+            fill(&mut pre, &dropped);
         }
     }
     if pre[runs.len()] == 0 {
+        in_place(code, &ops);
         return;
     }
     // The new code, in place (no fresh buffer to fault in): the old with
@@ -5598,11 +5612,12 @@ fn relax_jumps(
     // overwritten.
     let mut w = 0;
     let mut p = 0;
-    for (i, &(s, l)) in runs.iter().enumerate() {
-        if pre[i + 1] != pre[i] {
+    for (&(s, l), &d) in runs.iter().zip(&dropped) {
+        if d != 0 {
+            let s = s as usize;
             code.copy_within(p..s, w);
             w += s - p;
-            p = s + l;
+            p = s + l as usize;
         }
     }
     code.copy_within(p..code_end, w);
@@ -5623,11 +5638,31 @@ fn relax_jumps(
         _ if p >= code_end => new_end + (p - code_end),
         _ => moved(&pre, p, place(p)),
     };
-    for (k, &(s, op, t, _)) in br.iter().enumerate() {
-        let ns = s - pre[own[k]];
-        let nt = map(t) as i64;
-        if short[k] {
-            out[ns] = if op == 1 {
+    // Every operand at its new place. The operands are in order, and so
+    // are the runs: where one moved is a walk along both (an operand never
+    // lies in a dropped run). Where its target moved is that of its label
+    // (`to`, filled as they come up: most labels are some jumps' target).
+    let mut to: Vec<u32> = alloc::vec![u32::MAX; labels.len()];
+    let mut ri = 0;
+    for j in &ops {
+        let at = j.at as usize;
+        if j.kind >= J_DEAD_JMP {
+            continue;
+        }
+        while ri < runs.len() && (runs[ri].0 as usize) < at {
+            ri += 1;
+        }
+        let nt = match to[j.l as usize] {
+            u32::MAX => {
+                let nt = map(j.t as usize);
+                to[j.l as usize] = nt as u32;
+                nt
+            }
+            nt => nt as usize,
+        } as i64;
+        if j.run != u32::MAX && dropped[j.run as usize] != 0 {
+            let ns = at - usize::from(j.kind) - pre[j.run as usize] as usize;
+            out[ns] = if j.kind == J_JMP {
                 0xeb
             } else {
                 0x70 | (out[ns + 1] & 0x0f)
@@ -5635,17 +5670,10 @@ fn relax_jumps(
             let d = nt - (ns as i64 + 2);
             out[ns + 1] = (d as i8).to_le_bytes()[0];
         } else {
-            let at = ns + op;
-            let d = (nt - (at as i64 + 4)) as i32;
-            out[at..at + 4].copy_from_slice(&d.to_le_bytes());
+            let na = at - pre[ri] as usize;
+            let d = (nt - (na as i64 + 4)) as i32;
+            out[na..na + 4].copy_from_slice(&d.to_le_bytes());
         }
-    }
-    // (Every other `rel32`: a long branch's, a `call`'s, a `rip`-relative
-    // operand's.)
-    for &(at, t) in long.iter().chain(&other) {
-        let na = map(at);
-        let d = (map(t) as i64 - (na as i64 + 4)) as i32;
-        out[na..na + 4].copy_from_slice(&d.to_le_bytes());
     }
     for o in offsets.iter_mut() {
         *o = map(*o);
@@ -6055,7 +6083,7 @@ impl X64Assembler {
     /// [`finish_at`](Self::finish_at), where `report_only` (a range of
     /// indices into `labels`) are offsets the caller only reports (profiling marks),
     /// never enters: the code there may be rewritten like any other
-    /// (`thread_jumps`), so a profile sees the code that runs unprofiled.
+    /// (`finish_jumps`), so a profile sees the code that runs unprofiled.
     pub(crate) fn finish_reporting(
         mut self,
         labels: &[Label],
@@ -6089,16 +6117,7 @@ impl X64Assembler {
             }
         }
         let fixups = core::mem::take(&mut self.fixups);
-        for &(at, label, _) in &fixups {
-            let target = self.labels[label];
-            debug_assert_ne!(target, usize::MAX, "unbound label in jump");
-            // `rel32` is relative to the instruction *after* the 4-byte operand.
-            let rel = (target as i64) - (at as i64 + 4);
-            let bytes = (rel as i32).to_le_bytes();
-            self.code[at..at + 4].copy_from_slice(&bytes);
-        }
         let mut at: Vec<usize> = labels.iter().map(|l| self.labels[l.0]).collect();
-        let operands: Vec<(usize, Option<StoreFwd>)> = fixups.iter().map(|f| (f.0, f.2)).collect();
         let fwd = core::mem::take(&mut self.fwd_loads);
         let pinned: Vec<usize> = at
             .iter()
@@ -6106,12 +6125,12 @@ impl X64Assembler {
             .filter(|(i, _)| !report_only.contains(i))
             .map(|(_, &p)| p)
             .collect();
-        let mut nops = thread_jumps(&mut self.code, &operands, &pinned, &fwd);
-        let operands: Vec<usize> = fixups.iter().map(|f| f.0).collect();
-        relax_jumps(
+        finish_jumps(
             &mut self.code,
-            &operands,
-            &mut nops,
+            &fixups,
+            &self.labels,
+            &pinned,
+            &fwd,
             &mut at,
             consts_at.map(|c| (code_end, c)),
         );
@@ -9233,6 +9252,11 @@ impl JitFunction {
             + 15)
             & !15;
         let mut a = X64Assembler::new();
+        // (Room for the code and its jumps up front: inlined bodies make
+        // about a kilobyte of code per op, a `rel32` per 20 bytes of it, and
+        // growing a buffer that large copies it each time.)
+        a.code.reserve(ops.len() * 1024 + 4096);
+        a.fixups.reserve(ops.len() * 48 + 256);
         a.set_rbx_frame(true);
         // Per polymorphic method site's first way, its later ways' guards'
         // entries for a callee its memos identified (`call_seq::InlineEmit::
@@ -17930,6 +17954,51 @@ mod tests {
             if let Some(func) = JitFunction::from_code(&code) {
                 assert_eq!(func.call1(0), 0, "f = {f}");
                 assert_eq!(func.call1(5), 35, "f = {f}");
+            }
+        }
+    }
+
+    /// Threading sends a branch to a `jmp` where the `jmp` goes, then
+    /// inverts `jcc A; jmp B; A:` once nothing else reaches the `jmp` —
+    /// but keeps a `jmp` at an entered offset — and drops a branch to the
+    /// next instruction; relaxation keeps every target (run natively).
+    #[test]
+    fn finish_threads_through_and_keeps_entered_jumps() {
+        for pin in [false, true] {
+            let mut a = X64Assembler::new();
+            let (la, lb, ll, le) = (a.new_label(), a.new_label(), a.new_label(), a.new_label());
+            a.mov_rcx_rdi();
+            a.zero_rax();
+            a.test_rcx_rcx();
+            a.je(la); // over the `jmp`
+            a.bind(ll);
+            a.jmp(lb);
+            a.bind(la);
+            a.add_rax_imm(10);
+            a.cmp_rax_imm(10);
+            a.je(ll); // the first time here: threaded to `lb`
+            a.ret();
+            a.bind(lb);
+            a.add_rax_imm(100);
+            a.cmp_rax_imm(0);
+            a.je(le); // to the next instruction: dropped
+            a.bind(le);
+            a.ret();
+            let (code, at) = if pin {
+                a.finish_at(&[ll])
+            } else {
+                (a.finish(), Vec::new())
+            };
+            // Every branch short (2 bytes), the `je` to the next instruction
+            // gone, the `jmp` kept only when entered.
+            assert_eq!(code.len(), if pin { 41 } else { 39 }, "{code:02x?}");
+            assert_eq!(code[9], if pin { 0x74 } else { 0x75 });
+            if pin {
+                assert_eq!(code[at[0]], 0xeb);
+            }
+            if let Some(func) = JitFunction::from_code(&code) {
+                assert_eq!(func.call1(0), 110, "pin = {pin}");
+                assert_eq!(func.call1(1), 100, "pin = {pin}");
             }
         }
     }
