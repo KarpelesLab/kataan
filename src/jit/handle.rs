@@ -272,13 +272,10 @@ mod tests {
         // cmp rax, [rip + floor]; jb miss; ret; miss: ret; (int3 padding;)
         // the floor.
         assert_eq!(&code[..3], &[0x48, 0x3b, 0x05]);
-        assert_eq!(&code[7..9], &[0x0f, 0x82]);
-        assert_eq!(
-            i32::from_le_bytes([code[9], code[10], code[11], code[12]]),
-            1
-        );
-        assert_eq!(code[13], 0xc3);
-        assert_eq!(code[14], 0xc3);
+        // (Relaxed: the `jb` in its `rel8` form.)
+        assert_eq!(&code[7..9], &[0x72, 0x01]);
+        assert_eq!(code[9], 0xc3);
+        assert_eq!(code[10], 0xc3);
         let floor = code.len() - 8;
         assert!(floor.is_multiple_of(8));
         let rel = i32::from_le_bytes([code[3], code[4], code[5], code[6]]);

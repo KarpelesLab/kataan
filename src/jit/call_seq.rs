@@ -1016,7 +1016,10 @@ impl X64Assembler {
     pub(crate) fn g_call_mem_unhooked(&mut self, base: u8, disp: i32) {
         self.spill_before_call();
         self.g_mem(false, &[0xff], 2, base, disp);
-        self.clear_recv_cache();
+        if self.post_call_outlined(false) {
+            return;
+        }
+        self.clear_recv_cache(true);
         self.survive_reload();
         self.reload_after_call();
     }
@@ -1125,9 +1128,7 @@ impl X64Assembler {
 
     /// `movabs reg, imm64`.
     pub(crate) fn g_movabs(&mut self, reg: u8, imm: u64) {
-        self.code.push(0x48 | ((reg >> 3) & 1));
-        self.code.push(0xb8 + (reg & 7));
-        self.code.extend_from_slice(&imm.to_le_bytes());
+        self.mov_imm64(reg, imm);
     }
 
     /// `jcc label` (`cond` from [`cc`]).

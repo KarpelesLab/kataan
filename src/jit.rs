@@ -5152,6 +5152,30 @@ pub struct X64Assembler {
     /// Per entry of `lazy_pend`, how many of `lazy_args` are its.
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     lazy_args_at: Vec<usize>,
+    /// The body's shared **post-call stubs** (each once, with its label):
+    /// what a `call` would otherwise expand after it at every site
+    /// ([`X64Assembler::post_call_outlined`]), placed by
+    /// [`finish`](Self::finish) after the cold chunks.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    post_stubs: Vec<(PostCall, Label)>,
+    /// The latest 10-byte `movabs rax, imm64` (`mov_imm64`): where it
+    /// starts and its value ([`call_rax`](Self::call_rax)).
+    last_imm_rax: Option<(usize, u64)>,
+}
+
+/// One shared post-call stub's work, in order: empty the receiver-cache
+/// key slots `keys`, reload the pinned arena (`pin`), note it in the
+/// receiver cache's `seen` slot, re-check the body's global binding cache
+/// (`globals`, see `X64Assembler::recheck_body_globals`); then `ret`. It
+/// keeps `rax`/`rdx` (a call's results) and clobbers what the inline
+/// sequence would: `r11`, `r12`/`r13` (reloaded) and the flags.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, PartialEq)]
+struct PostCall {
+    keys: Vec<i32>,
+    pin: Option<pin::PinArena>,
+    seen: Option<i32>,
+    globals: Option<(i32, Label)>,
 }
 
 /// A `rel32` fixup: its operand's offset, its target label, and, for a
@@ -5226,12 +5250,16 @@ const LABEL_COLD: usize = usize::MAX - 1;
 /// whose ModRM byte (`00 reg 101`, at most `0x3D`) is neither, or a `call`
 /// (`E8`), which is left alone. `pinned` are the offsets reported to the
 /// caller (entries, labels), which keep their code.
+///
+/// Returns the `nop`s it made, as `(start, length)`, which
+/// [`relax_jumps`] then drops.
 fn thread_jumps(
     code: &mut [u8],
     operands: &[(usize, Option<StoreFwd>)],
     pinned: &[usize],
     fwd: &[FwdLoad],
-) {
+) -> Vec<(usize, usize)> {
+    let mut nops: Vec<(usize, usize)> = Vec::new();
     const NOP5: [u8; 5] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
     const NOP6: [u8; 6] = [0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00];
     let n = code.len();
@@ -5341,6 +5369,9 @@ fn thread_jumps(
             _ => &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
         };
         code[k..start + len].copy_from_slice(pad);
+        if start + len > k {
+            nops.push((k, start + len - k));
+        }
     }
     let mut dead = alloc::vec![0u64; words];
     for &at in &branches {
@@ -5359,6 +5390,7 @@ fn thread_jumps(
             set_target(code, at, b);
             code[next..next + 5].copy_from_slice(&NOP5);
             put(&mut dead, next);
+            nops.push((next, 5));
         }
     }
     // A branch to the next instruction is a `nop`.
@@ -5368,9 +5400,255 @@ fn thread_jumps(
         }
         if is_jmp(code, at) {
             code[at - 1..at + 4].copy_from_slice(&NOP5);
+            nops.push((at - 1, 5));
         } else if is_jcc(code, at) {
             code[at - 2..at + 4].copy_from_slice(&NOP6);
+            nops.push((at - 2, 6));
         }
+    }
+    nops
+}
+
+/// **Branch relaxation** over threaded code ([`thread_jumps`]), which
+/// moves instructions: every `jmp rel32` / `jcc rel32` whose target ends up
+/// within a signed byte of it becomes its 2-byte `rel8` form, and the
+/// `nop`s threading made (`nops`) are dropped. Code only ever shrinks, so
+/// a branch whose `rel32` already fits a byte stays in reach whatever else
+/// shrinks: those are short from the start, and each round then makes
+/// short every other branch now in reach (which only brings every target
+/// nearer), until none is. A branch more than 384 bytes from its target
+/// is never tried.
+///
+/// `operands` are every resolved `rel32` operand (branches told apart as in
+/// [`thread_jumps`]; the others, `call`s and `rip`-relative operands, are
+/// re-aimed at their moved targets), `offsets` the offsets reported to the
+/// caller (rewritten to where their code moved), and `consts`, when the
+/// code ends in constant words (`finish`), where the instructions end and
+/// where the 8-aligned words begin (kept 8-aligned). The code holds no
+/// other position-dependent encoding: every jump and `rip`-relative
+/// operand is a fixup (the one hand-made `rel8`, in
+/// `X64Assembler::inline_frame_hook`, spans a single `call`).
+fn relax_jumps(
+    code: &mut Vec<u8>,
+    operands: &[usize],
+    nops: &mut [(usize, usize)],
+    offsets: &mut [usize],
+    consts: Option<(usize, usize)>,
+) {
+    let n = code.len();
+    // The code proper ends where the constants' padding begins.
+    let (code_end, consts) = match consts {
+        Some((e, c)) => (e, Some(c)),
+        None => (n, None),
+    };
+    nops.sort_unstable();
+    let in_nop = |p: usize| {
+        let i = nops.partition_point(|s| s.0 <= p);
+        i > 0 && p < nops[i - 1].0 + nops[i - 1].1
+    };
+    let rel_at = |code: &[u8], at: usize| {
+        i32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+    };
+    // Branches that may be short: (instruction start, opcode length (1:
+    // `E9`, 2: `0F 8x`), old target, short already). Those never tried
+    // (their target too far to come within reach but for long runs of
+    // dropped `nop`s: a branch drops at most two thirds of itself; staying
+    // long is always correct) and the other operands: (operand offset, old
+    // target).
+    const FAR: i64 = 3 * 128;
+    let mut br: Vec<(usize, usize, usize, bool)> = Vec::new();
+    let mut long: Vec<(usize, usize)> = Vec::new();
+    let mut other: Vec<(usize, usize)> = Vec::new();
+    for &at in operands {
+        if at + 4 > code_end || at < 1 || (!nops.is_empty() && in_nop(at)) {
+            continue;
+        }
+        let r = i64::from(rel_at(code, at));
+        let t = (at as i64 + 4 + r) as usize;
+        let op = if code[at - 1] == 0xe9 {
+            1
+        } else if at >= 2 && code[at - 2] == 0x0f && (code[at - 1] & 0xf0) == 0x80 {
+            2
+        } else {
+            other.push((at, t));
+            continue;
+        };
+        if t > code_end || !(-FAR..FAR).contains(&r) {
+            long.push((at, t));
+            continue;
+        }
+        // Short for sure: the distance the `rel8` measures is the `rel32`'s
+        // less the bytes dropped between (forward), or more (backward,
+        // where it also spans its own instruction's 2 bytes).
+        let len = 4 + op as i64;
+        let sure = if r >= 0 {
+            r <= 127
+        } else {
+            r + len - 2 >= -128
+        };
+        br.push((at - op, op, t, sure));
+    }
+    br.sort_unstable();
+    // Every run of bytes that may be dropped, sorted by start: each
+    // candidate branch's tail (its `rel32` -> `rel8`: 3 bytes of a `jmp`,
+    // 4 of a `jcc`, from its third byte on), dropped while it is short,
+    // and the `nop`s, always dropped. `own[k]`: branch `k`'s run.
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(br.len() + nops.len());
+    let mut own: Vec<usize> = Vec::with_capacity(br.len());
+    let mut is_nop: Vec<bool> = Vec::with_capacity(br.len() + nops.len());
+    {
+        let (mut i, mut j) = (0, 0);
+        while i < br.len() || j < nops.len() {
+            if j == nops.len() || (i < br.len() && br[i].0 < nops[j].0) {
+                own.push(runs.len());
+                runs.push((br[i].0 + 2, if br[i].1 == 1 { 3 } else { 4 }));
+                is_nop.push(false);
+                i += 1;
+            } else {
+                runs.push(nops[j]);
+                is_nop.push(true);
+                j += 1;
+            }
+        }
+    }
+    if runs.is_empty() {
+        return;
+    }
+    // `first[b]`: how many runs begin before byte `b * 32` (for `place`).
+    const BUCKET: usize = 32;
+    let first: Vec<u32> = {
+        let nb = code_end / BUCKET + 2;
+        let mut f = Vec::with_capacity(nb);
+        let mut j = 0;
+        for b in 0..nb {
+            while j < runs.len() && runs[j].0 < b * BUCKET {
+                j += 1;
+            }
+            f.push(j as u32);
+        }
+        f
+    };
+    // How many runs begin before old offset `p` (at most `code_end`).
+    let place = |p: usize| {
+        let mut i = first[p / BUCKET] as usize;
+        while i < runs.len() && runs[i].0 < p {
+            i += 1;
+        }
+        i
+    };
+    let mut short: Vec<bool> = br.iter().map(|b| b.3).collect();
+    // `pre[i]`: the bytes the first `i` runs drop.
+    let mut pre: Vec<usize> = alloc::vec![0; runs.len() + 1];
+    let fill = |pre: &mut [usize], short: &[bool]| {
+        let mut k = 0;
+        for (i, r) in runs.iter().enumerate() {
+            let l = if is_nop[i] {
+                r.1
+            } else {
+                k += 1;
+                if short[k - 1] { r.1 } else { 0 }
+            };
+            pre[i + 1] = pre[i] + l;
+        }
+    };
+    // Where old offset `p` moves, `i` its place: a dropped run's bytes
+    // (only a dropped `nop` is ever a target) move to where it began.
+    let moved = |pre: &[usize], p: usize, i: usize| {
+        if i > 0 && pre[i] != pre[i - 1] && p < runs[i - 1].0 + runs[i - 1].1 {
+            runs[i - 1].0 - pre[i - 1]
+        } else {
+            p - pre[i]
+        }
+    };
+    // The rest, from the sure ones: a branch whose target is now in reach
+    // becomes short (which only brings every other target nearer, so each
+    // round keeps every short branch in reach), until none does.
+    let maybe: Vec<(usize, usize)> = (0..br.len())
+        .filter(|&k| !short[k])
+        .map(|k| (k, place(br[k].2)))
+        .collect();
+    fill(&mut pre, &short);
+    if !maybe.is_empty() {
+        loop {
+            let mut changed = false;
+            for &(k, ti) in &maybe {
+                if short[k] {
+                    continue;
+                }
+                let ns = br[k].0 - pre[own[k]];
+                let nt = moved(&pre, br[k].2, ti);
+                if i8::try_from(nt as i64 - (ns as i64 + 2)).is_ok() {
+                    short[k] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+            fill(&mut pre, &short);
+        }
+    }
+    if pre[runs.len()] == 0 {
+        return;
+    }
+    // The new code, in place (no fresh buffer to fault in): the old with
+    // the dropped runs left out (each short branch keeps its first two
+    // bytes, its jump's condition among them), then the constants
+    // re-aligned. Everything moves down, so each copy reads bytes not yet
+    // overwritten.
+    let mut w = 0;
+    let mut p = 0;
+    for (i, &(s, l)) in runs.iter().enumerate() {
+        if pre[i + 1] != pre[i] {
+            code.copy_within(p..s, w);
+            w += s - p;
+            p = s + l;
+        }
+    }
+    code.copy_within(p..code_end, w);
+    let new_end = w + (code_end - p);
+    let new_consts = consts.map(|c| {
+        let nc = new_end.next_multiple_of(8);
+        code[new_end..nc].fill(0xcc);
+        code.copy_within(c..n, nc);
+        (c, nc)
+    });
+    code.truncate(match new_consts {
+        Some((c, nc)) => nc + (n - c),
+        None => new_end + (n - code_end),
+    });
+    let out = code;
+    let map = |p: usize| match new_consts {
+        Some((c, nc)) if p >= c => nc + (p - c),
+        _ if p >= code_end => new_end + (p - code_end),
+        _ => moved(&pre, p, place(p)),
+    };
+    for (k, &(s, op, t, _)) in br.iter().enumerate() {
+        let ns = s - pre[own[k]];
+        let nt = map(t) as i64;
+        if short[k] {
+            out[ns] = if op == 1 {
+                0xeb
+            } else {
+                0x70 | (out[ns + 1] & 0x0f)
+            };
+            let d = nt - (ns as i64 + 2);
+            out[ns + 1] = (d as i8).to_le_bytes()[0];
+        } else {
+            let at = ns + op;
+            let d = (nt - (at as i64 + 4)) as i32;
+            out[at..at + 4].copy_from_slice(&d.to_le_bytes());
+        }
+    }
+    // (Every other `rel32`: a long branch's, a `call`'s, a `rip`-relative
+    // operand's.)
+    for &(at, t) in long.iter().chain(&other) {
+        let na = map(at);
+        let d = (map(t) as i64 - (na as i64 + 4)) as i32;
+        out[na..na + 4].copy_from_slice(&d.to_le_bytes());
+    }
+    for o in offsets.iter_mut() {
+        *o = map(*o);
     }
 }
 
@@ -5378,6 +5656,12 @@ fn thread_jumps(
 /// handle bits of slot index `u32::MAX`, which `Heap::alloc` never hands out,
 /// so no register ever holds them.
 const RECV_CACHE_EMPTY: i32 = -1;
+
+/// The least number of bytes (roughly) of in-line post-call code that a
+/// shared stub replaces (`X64Assembler::post_call_outlined`): below it the
+/// in-line sequence is about as short as the stub's `call`.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+const POST_CALL_MIN: usize = 32;
 
 /// Whether some op of `bytecode` can store property `key` without a call
 /// (an inline store or definition of it): an inline `Math.f(x)` site's
@@ -5622,24 +5906,84 @@ impl X64Assembler {
         self.entry_clear = slots;
     }
 
-    /// Empties every receiver-cache key slot (after a `call`, in the prologue).
-    fn clear_recv_cache(&mut self) {
-        for i in 0..self.recv_cache_keys.len() {
-            let d = self.recv_cache_keys[i];
-            // (A way the call keeps is re-validated after it instead:
-            // `survive_reload`.)
-            #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-            if self.recv_survive.iter().any(|w| w.key == d) {
-                continue;
+    /// Empties every receiver-cache key slot (after a `call`, in the
+    /// prologue). `after_call`: right after a `call` returns, when no SSE
+    /// register holds anything (they are caller-saved; promoted ones are
+    /// reloaded after this), so two side-by-side keys are emptied at once
+    /// through `xmm15` ([`clear_keys`](Self::clear_keys)).
+    fn clear_recv_cache(&mut self, after_call: bool) {
+        #[allow(unused_mut)]
+        let mut keys = core::mem::take(&mut self.recv_cache_keys);
+        // (A way the call keeps is re-validated after it instead:
+        // `survive_reload`.)
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        if !self.recv_survive.is_empty() {
+            let kept: Vec<i32> = keys
+                .iter()
+                .copied()
+                .filter(|&d| !self.recv_survive.iter().any(|w| w.key == d))
+                .collect();
+            self.clear_keys(&kept, after_call);
+            self.recv_cache_keys = keys;
+            return;
+        }
+        self.clear_keys(&keys, after_call);
+        self.recv_cache_keys = keys;
+    }
+
+    /// `mov qword [rbp+d], RECV_CACHE_EMPTY` for every `d` of `keys`; with
+    /// `sse` (`xmm15` free), each two slots side by side (`d`, `d + 8`) as
+    /// one 16-byte store of `xmm15` set to all ones (`RECV_CACHE_EMPTY`
+    /// twice).
+    fn clear_keys(&mut self, keys: &[i32], sse: bool) {
+        if !sse || keys.len() < 3 {
+            for &d in keys {
+                self.store_empty(d);
             }
-            self.store_empty(d);
+            return;
+        }
+        let mut ks = keys.to_vec();
+        ks.sort_unstable();
+        ks.dedup();
+        let mut ones = false;
+        let mut i = 0;
+        while i < ks.len() {
+            let d = ks[i];
+            if i + 1 < ks.len() && ks[i + 1] == d + 8 {
+                if !ones {
+                    // pcmpeqd xmm15, xmm15
+                    self.code.extend_from_slice(&[0x66, 0x45, 0x0f, 0x76, 0xff]);
+                    ones = true;
+                }
+                // movups [rbp + d], xmm15
+                self.code.extend_from_slice(&[0x44, 0x0f, 0x11]);
+                match i8::try_from(d) {
+                    Ok(d8) => self.code.extend_from_slice(&[0x7d, d8.to_le_bytes()[0]]),
+                    Err(_) => {
+                        self.code.push(0xbd);
+                        self.code.extend_from_slice(&d.to_le_bytes());
+                    }
+                }
+                i += 2;
+            } else {
+                self.store_empty(d);
+                i += 1;
+            }
         }
     }
 
-    /// `mov qword [rbp+d], RECV_CACHE_EMPTY` (sign-extended imm32).
+    /// `mov qword [rbp+d], RECV_CACHE_EMPTY` (sign-extended imm32; a `disp8`
+    /// when `d` fits a byte).
     fn store_empty(&mut self, d: i32) {
-        self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
-        self.code.extend_from_slice(&d.to_le_bytes());
+        match i8::try_from(d) {
+            Ok(d8) => self
+                .code
+                .extend_from_slice(&[0x48, 0xc7, 0x45, d8.to_le_bytes()[0]]),
+            Err(_) => {
+                self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
+                self.code.extend_from_slice(&d.to_le_bytes());
+            }
+        }
         self.code.extend_from_slice(&RECV_CACHE_EMPTY.to_le_bytes());
     }
 
@@ -5729,8 +6073,12 @@ impl X64Assembler {
                 self.fixups.push((base + at, label, st));
             }
         }
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        self.place_post_stubs();
         // The constant words (data, after the last instruction: nothing
         // falls through into them), 8-byte aligned within the code.
+        let code_end = self.code.len();
+        let consts_at = (!self.consts.is_empty()).then(|| code_end.next_multiple_of(8));
         if !self.consts.is_empty() {
             while !self.code.len().is_multiple_of(8) {
                 self.code.push(0xcc); // int3
@@ -5749,7 +6097,7 @@ impl X64Assembler {
             let bytes = (rel as i32).to_le_bytes();
             self.code[at..at + 4].copy_from_slice(&bytes);
         }
-        let at: Vec<usize> = labels.iter().map(|l| self.labels[l.0]).collect();
+        let mut at: Vec<usize> = labels.iter().map(|l| self.labels[l.0]).collect();
         let operands: Vec<(usize, Option<StoreFwd>)> = fixups.iter().map(|f| (f.0, f.2)).collect();
         let fwd = core::mem::take(&mut self.fwd_loads);
         let pinned: Vec<usize> = at
@@ -5758,7 +6106,15 @@ impl X64Assembler {
             .filter(|(i, _)| !report_only.contains(i))
             .map(|(_, &p)| p)
             .collect();
-        thread_jumps(&mut self.code, &operands, &pinned, &fwd);
+        let mut nops = thread_jumps(&mut self.code, &operands, &pinned, &fwd);
+        let operands: Vec<usize> = fixups.iter().map(|f| f.0).collect();
+        relax_jumps(
+            &mut self.code,
+            &operands,
+            &mut nops,
+            &mut at,
+            consts_at.map(|c| (code_end, c)),
+        );
         (self.code, at)
     }
 
@@ -5817,6 +6173,7 @@ impl X64Assembler {
     )]
     pub(crate) fn cold_end(&mut self, mark: ColdMark) {
         let (start, end) = (mark.start, self.code.len());
+        self.last_imm_rax = None;
         let code = self.code.split_off(start);
         // A label bound in the region, or just before it (at its first
         // instruction), moves with it — unless bound at its end.
@@ -6005,8 +6362,7 @@ impl X64Assembler {
     }
     /// `movabs rax, imm64`.
     pub fn movabs_rax(&mut self, imm: i64) {
-        self.code.extend_from_slice(&[0x48, 0xb8]);
-        self.code.extend_from_slice(&imm.to_le_bytes());
+        self.mov_imm64(0, imm as u64);
     }
     /// `sub rax, rcx`.
     pub fn sub_rax_rcx(&mut self) {
@@ -6133,13 +6489,11 @@ impl X64Assembler {
 
     /// `movabs r11, imm64` — load the upper safe-integer bound (`+2^53`).
     pub fn movabs_r11(&mut self, imm: i64) {
-        self.code.extend_from_slice(&[0x49, 0xbb]);
-        self.code.extend_from_slice(&imm.to_le_bytes());
+        self.mov_imm64(11, imm as u64);
     }
     /// `movabs r10, imm64` — load the lower safe-integer bound (`-2^53`).
     pub fn movabs_r10(&mut self, imm: i64) {
-        self.code.extend_from_slice(&[0x49, 0xba]);
-        self.code.extend_from_slice(&imm.to_le_bytes());
+        self.mov_imm64(10, imm as u64);
     }
     /// `cmp rax, r11`.
     pub fn cmp_rax_r11(&mut self) {
@@ -6448,18 +6802,168 @@ impl X64Assembler {
     /// `call rax` — an indirect native call through `rax` (holding the callee's
     /// code address). The System V ABI requires `rsp` 16-byte aligned here.
     pub fn call_rax(&mut self) {
+        // A callee address just loaded into `rax` (`mov_imm64`), with no
+        // label bound after it: `call [rip + c]` through a constant word
+        // instead (6 bytes, not a 10-byte load and a 2-byte `call`).
+        let n = self.code.len();
+        let direct = match self.last_imm_rax.take() {
+            Some((start, imm))
+                if n == start + 10
+                    && self.last_bind != n
+                    && self.fixups.last().is_none_or(|f| f.0 < start)
+                    && self.code[start..start + 2] == [0x48, 0xb8]
+                    && self.code[start + 2..n] == imm.to_le_bytes() =>
+            {
+                self.code.truncate(start);
+                Some(imm)
+            }
+            _ => None,
+        };
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.inline_frame_hook();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.spill_before_call();
-        self.code.extend_from_slice(&[0xff, 0xd0]);
-        self.clear_recv_cache();
+        match direct {
+            Some(imm) => {
+                let c = match self.consts.iter().find(|c| c.0 == imm) {
+                    Some(&(_, l)) => l,
+                    None => {
+                        let l = self.new_label();
+                        self.consts.push((imm, l));
+                        l
+                    }
+                };
+                self.code.extend_from_slice(&[0xff, 0x15]); // call [rip + c]
+                self.emit_rel32(c);
+            }
+            None => self.code.extend_from_slice(&[0xff, 0xd0]),
+        }
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        if self.post_call_outlined(true) {
+            return;
+        }
+        self.clear_recv_cache(true);
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.survive_reload();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.reload_after_call();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.recheck_body_globals();
+    }
+
+    /// After a `call` in out-of-line code (a cold region): the
+    /// receiver-cache emptying, the arena reload and its note (and, with
+    /// `globals`, when no promoted register or region binding needs
+    /// reloading in between, the global binding cache's re-check) as one
+    /// `call` of a shared stub ([`PostCall`]) instead of expanded here, when
+    /// that is worth it; then the rest in line. (A way the call keeps is
+    /// re-validated in line after a stub that empties only the others.)
+    /// Returns `false` (having emitted nothing) for the in-line sequence.
+    ///
+    /// Only out-of-line code calls stubs: on a hot path the stub's own
+    /// `call`/`ret` cost more than the bytes they save (measured: +2.5% on
+    /// an interpreter loop full of helper calls).
+    ///
+    /// (The stub's own `call` pushes its return address where the call just
+    /// made pushed its own, so it disturbs nothing the call did not.)
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn post_call_outlined(&mut self, globals: bool) -> bool {
+        if self.cold_binds.is_none() {
+            return false;
+        }
+        if !self.recv_survive.is_empty() {
+            // Ways the call keeps are re-validated in line after the stub
+            // empties the others.
+            let keys: Vec<i32> = self
+                .recv_cache_keys
+                .iter()
+                .copied()
+                .filter(|&k| !self.recv_survive.iter().any(|w| w.key == k))
+                .collect();
+            if keys.len() * 10 < POST_CALL_MIN {
+                return false;
+            }
+            let stub = self.post_stub(PostCall {
+                keys,
+                pin: None,
+                seen: None,
+                globals: None,
+            });
+            self.g_call_label(stub);
+            self.survive_reload();
+            self.reload_after_call();
+            if globals {
+                self.recheck_body_globals();
+            }
+            return true;
+        }
+        let pin = self.pin;
+        let seen = match (self.recv_seen, self.recv_survive_layout) {
+            (Some(s), Some(_)) if pin.is_some() => Some(s),
+            _ => None,
+        };
+        let tail = self.call_spill.is_empty() && self.call_globals.is_empty();
+        let g = if globals && tail { self.gc_body } else { None };
+        // (Roughly the bytes the in-line sequence takes.)
+        let est = self.recv_cache_keys.len() * 10
+            + pin.map_or(0, |_| 23)
+            + seen.map_or(0, |_| 7)
+            + g.map_or(0, |_| 31);
+        if est < POST_CALL_MIN {
+            return false;
+        }
+        let stub = self.post_stub(PostCall {
+            keys: self.recv_cache_keys.clone(),
+            pin,
+            seen,
+            globals: g,
+        });
+        self.g_call_label(stub);
+        if !tail {
+            self.reload_after_call();
+        }
+        if globals && g.is_none() {
+            self.recheck_body_globals();
+        }
+        true
+    }
+
+    /// The label of the body's stub doing `req` (made once).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    fn post_stub(&mut self, req: PostCall) -> Label {
+        match self.post_stubs.iter().find(|(p, _)| *p == req) {
+            Some(&(_, l)) => l,
+            None => {
+                let l = self.new_label();
+                self.post_stubs.push((req, l));
+                l
+            }
+        }
+    }
+
+    /// Places every post-call stub ([`PostCall`]) at the end of the code.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    fn place_post_stubs(&mut self) {
+        let stubs = core::mem::take(&mut self.post_stubs);
+        let (pin, gc_body) = (self.pin, self.gc_body);
+        for (p, label) in stubs {
+            self.labels[label.0] = self.code.len();
+            self.last_bind = self.code.len();
+            self.last_store = None;
+            self.clear_keys(&p.keys, true);
+            self.pin = p.pin;
+            self.pin_reload();
+            if let Some(s) = p.seen {
+                self.g_store(call_seq::r::RBP, s, pin::R12);
+            }
+            if p.globals.is_some() {
+                self.gc_body = p.globals;
+                self.recheck_body_globals();
+            }
+            self.code.push(0xc3); // ret
+            self.last_store = None;
+        }
+        (self.pin, self.gc_body) = (pin, gc_body);
     }
 
     /// `call rax` to a helper that runs no JavaScript, allocates nothing and
@@ -6496,18 +7000,43 @@ impl X64Assembler {
     /// argument register `i` (rdi, rsi, rdx, rcx, r8, r9), for a native call (e.g.
     /// a baked-in key pointer / length / inline-cache pointer).
     pub fn movabs_argreg(&mut self, i: usize, imm: i64) {
-        // REX.W (+ REX.B for r8/r9) + `B8+rd` opcode per argument register.
-        let (rex, op): (u8, u8) = match i {
-            0 => (0x48, 0xbf), // rdi
-            1 => (0x48, 0xbe), // rsi
-            2 => (0x48, 0xba), // rdx
-            3 => (0x48, 0xb9), // rcx
-            4 => (0x49, 0xb8), // r8
-            5 => (0x49, 0xb9), // r9
+        // rdi, rsi, rdx, rcx, r8, r9.
+        let reg: u8 = match i {
+            0 => 7,
+            1 => 6,
+            2 => 2,
+            3 => 1,
+            4 => 8,
+            5 => 9,
             _ => return,
         };
-        self.code.extend_from_slice(&[rex, op]);
-        self.code.extend_from_slice(&imm.to_le_bytes());
+        self.mov_imm64(reg, imm as u64);
+    }
+
+    /// `reg = imm` (any GPR), in the shortest form: `mov r32, imm32` (which
+    /// zero-extends) for a value under 2^32, `mov r64, simm32` for one a
+    /// sign-extended 32-bit immediate gives, else `movabs`. Like every
+    /// `mov`, it leaves the flags alone.
+    pub(crate) fn mov_imm64(&mut self, reg: u8, imm: u64) {
+        let b = (reg >> 3) & 1;
+        if let Ok(v) = u32::try_from(imm) {
+            if b != 0 {
+                self.code.push(0x41);
+            }
+            self.code.push(0xb8 + (reg & 7));
+            self.code.extend_from_slice(&v.to_le_bytes());
+        } else if let Ok(v) = i32::try_from(imm as i64) {
+            self.code
+                .extend_from_slice(&[0x48 | b, 0xc7, 0xc0 + (reg & 7)]);
+            self.code.extend_from_slice(&v.to_le_bytes());
+        } else {
+            if reg == 0 {
+                self.last_imm_rax = Some((self.code.len(), imm));
+            }
+            self.code.push(0x48 | b);
+            self.code.push(0xb8 + (reg & 7));
+            self.code.extend_from_slice(&imm.to_le_bytes());
+        }
     }
 
     /// `lea <argreg[i]>, [rbp+disp32]` — load the *address* of a frame slot into
@@ -6559,7 +7088,7 @@ impl X64Assembler {
                 self.store_empty(d);
             }
         }
-        self.clear_recv_cache();
+        self.clear_recv_cache(false);
         self.clear_entry_slots();
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         for i in 0..self.inline_clear.len() {
@@ -8260,11 +8789,15 @@ impl JitFunction {
             t
         };
         let rc_base = method_scratch - 8 * num.frame_slots() as i32;
-        let rc_key = |w: usize| rc_base - 8 * (4 * w as i32 + 1);
-        let rc_cell = |w: usize| rc_base - 8 * (4 * w as i32 + 2);
+        // (The ways' keys lie side by side, under them their other slots,
+        // three per way: a call empties the keys two at a time,
+        // `X64Assembler::clear_recv_cache`.)
+        let rc_ways = rc.ways as i32;
+        let rc_key = |w: usize| rc_base - 8 * (w as i32 + 1);
+        let rc_cell = |w: usize| rc_base - 8 * (rc_ways + 3 * w as i32 + 1);
         // Per way, its receiver's `extra` part pointer, as a speculative
         // loop's site last loaded it (see `extra_in_frame`).
-        let rc_extra = |w: usize| rc_base - 8 * (4 * w as i32 + 3);
+        let rc_extra = |w: usize| rc_base - 8 * (rc_ways + 3 * w as i32 + 2);
         // Per way, the distance between its last two fills' heap slots
         // (`X64Assembler::p_fill_way`'s prediction).
         // (Only a way filled with a walk register's object predicts.)
@@ -8274,7 +8807,7 @@ impl JitFunction {
                 .get(usize::from(recv))
                 .copied()
                 .unwrap_or(false)
-                .then_some(rc_base - 8 * (4 * w as i32 + 4))
+                .then_some(rc_base - 8 * (rc_ways + 3 * w as i32 + 3))
         };
         num.set_rc_relied((0..ops.len()).map(|pc| typed::relied_on(&rc, pc)).collect());
         // A promoted loop's truthiness tests on objects go through their
@@ -8327,7 +8860,16 @@ impl JitFunction {
             })
             .collect();
         let m_base = gc_base - 8 * gc_frame_slots as i32;
-        let m_slot = |site: usize, k: i32| m_base - 8 * (3 * site as i32 + k + 1);
+        // (Its two keys, slots `0` and `2`, side by side: see `rc_key`.)
+        let m_slot = |site: usize, k: i32| {
+            m_base
+                - 8 * (3 * site as i32
+                    + match k {
+                        0 => 1,
+                        2 => 2,
+                        _ => 3,
+                    })
+        };
         // The sites a speculative loop's entry check may prove: the cached
         // path's (a built-in method found, registers in range), whose key
         // no op of the body stores (else its proof is re-checked per call).
@@ -8450,9 +8992,14 @@ impl JitFunction {
         let n_proved = proof_keys.len();
         let proved_base =
             inl_base - 8 * (4 + 3 * i32::from(has_nested) + 3 * i32::from(has_nested2));
+        // (The keys side by side, the other slots under them: see
+        // `rc_key`. So too the method and construct proofs'.)
         let inl_proved = |k: usize| {
             let k = k as i32;
-            (proved_base - 16 * k - 8, proved_base - 16 * k - 16)
+            (
+                proved_base - 8 * k - 8,
+                proved_base - 8 * (n_proved as i32 + k) - 8,
+            )
         };
         // Whether op `i` is in a loop (a back-edge spans it): the guards
         // below keep a proof only there — elsewhere a guard runs again only
@@ -8496,10 +9043,11 @@ impl JitFunction {
         let mproof_base = proved_base - 16 * n_proved as i32;
         let inl_mproved = |k: usize| {
             let k = k as i32;
+            let rest = mproof_base - 8 * n_mproved as i32 - 16 * k;
             call_seq::MethodProof {
-                bits: mproof_base - 24 * k - 8,
-                slot: mproof_base - 24 * k - 16,
-                shape: mproof_base - 24 * k - 24,
+                bits: mproof_base - 8 * k - 8,
+                slot: rest - 8,
+                shape: rest - 16,
             }
         };
         // The monomorphic construct guards (a `new`'s, a `super(…)`'s)
@@ -8525,10 +9073,11 @@ impl JitFunction {
         let cproof_base = mproof_base - 24 * n_mproved as i32;
         let inl_cproved = |k: usize| {
             let k = k as i32;
+            let rest = cproof_base - 8 * n_cproved as i32 - 16 * k;
             call_seq::ConstructProof {
-                ctor: cproof_base - 24 * k - 8,
-                nt: cproof_base - 24 * k - 16,
-                caps: cproof_base - 24 * k - 24,
+                ctor: cproof_base - 8 * k - 8,
+                nt: rest - 8,
+                caps: rest - 16,
             }
         };
         // Per compiled `for-in` loop, its memo (`forin::Memo`), six slots
@@ -15841,14 +16390,13 @@ mod tests {
         a.bind(after);
         a.ret(); // 6
         let code = a.finish();
-        // [je cold][ret] then the region [xor rax, rax][jmp after].
-        assert_eq!(code.len(), 6 + 1 + 3 + 5);
-        assert_eq!(&code[0..2], &[0x0f, 0x84]);
-        assert_eq!(i32::from_le_bytes(code[2..6].try_into().unwrap()), 1);
-        assert_eq!(code[6], 0xc3);
-        assert_eq!(&code[7..10], &[0x48, 0x31, 0xc0]);
-        assert_eq!(code[10], 0xe9);
-        assert_eq!(i32::from_le_bytes(code[11..15].try_into().unwrap()), 6 - 15);
+        // [je cold][ret] then the region [xor rax, rax][jmp after], both
+        // jumps relaxed to their `rel8` forms.
+        assert_eq!(code.len(), 2 + 1 + 3 + 2);
+        assert_eq!(&code[0..2], &[0x74, 0x01]);
+        assert_eq!(code[2], 0xc3);
+        assert_eq!(&code[3..6], &[0x48, 0x31, 0xc0]);
+        assert_eq!(&code[6..8], &[0xeb, (2i8 - 8).to_le_bytes()[0]]);
     }
 
     #[test]
@@ -17303,12 +17851,11 @@ mod tests {
         a.bind(lc);
         a.ret(); // 18
         let code = a.finish();
-        // `je A; jmp B` became `jne C` (threaded through B's jmp) and a nop.
-        assert_eq!(&code[0..2], &[0x0f, 0x85]);
-        assert_eq!(i32::from_le_bytes(code[2..6].try_into().unwrap()), 18 - 6);
-        assert_eq!(&code[6..11], &[0x0f, 0x1f, 0x44, 0x00, 0x00]);
-        assert_eq!(code[11], 0xc3);
-        // store [rbx+8], rax; load rax, [rbx+8] (nothing jumps there): a nop.
+        // `je A; jmp B` became `jne C` (threaded through B's jmp) and a nop,
+        // which relaxation dropped (every branch short: `rel8`).
+        assert_eq!(code, [0x75, 0x04, 0xc3, 0xeb, 0x01, 0xc3, 0xc3]);
+        // store [rbx+8], rax; load rax, [rbx+8] (nothing jumps there): a nop
+        // (dropped).
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
         a.store_rax(8);
@@ -17318,28 +17865,73 @@ mod tests {
         let code = a.finish();
         // (`disp8` forms: four bytes each.)
         assert_eq!(&code[0..4], &[0x48, 0x89, 0x43, 0x08]);
-        assert_eq!(&code[4..8], &[0x0f, 0x1f, 0x40, 0x00]);
-        assert_eq!(&code[8..12], &[0x48, 0x8b, 0x4b, 0x08]);
+        assert_eq!(&code[4..8], &[0x48, 0x8b, 0x4b, 0x08]);
+        assert_eq!(code.len(), 9);
         // ...but kept when a jump without that store lands on the load, and
         // made `mov rcx, rax` when every jump there follows the same store.
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
         let (l, skip) = (a.new_label(), a.new_label());
-        a.je(l); // 0..6
-        a.store_rax(8); // 6..10
+        a.je(l); // 0..2 once relaxed
+        a.store_rax(8); // 2..6
         a.bind(l);
-        a.load_rax(8); // 10..14
-        a.store_rax(16); // 14..18
-        a.jmp(skip); // 18..23 (right after the store of rax to [rbx+16])
-        a.ret(); // 23
-        a.store_rax(16); // 24..28
+        a.load_rax(8); // 6..10
+        a.store_rax(16); // 10..14
+        a.jmp(skip); // 14..16 (right after the store of rax to [rbx+16])
+        a.ret(); // 16
+        a.store_rax(16); // 17..21
         a.bind(skip);
-        a.load_rcx(16); // 28..32
+        a.load_rcx(16); // 21..24 (its padding dropped)
         a.ret();
         let code = a.finish();
-        assert_eq!(&code[10..14], &[0x48, 0x8b, 0x43, 0x08]);
-        assert_eq!(&code[28..31], &[0x48, 0x89, 0xc1]);
-        assert_eq!(code[31], 0x90);
+        assert_eq!(&code[0..2], &[0x74, 0x04]);
+        assert_eq!(&code[6..10], &[0x48, 0x8b, 0x43, 0x08]);
+        assert_eq!(&code[14..16], &[0xeb, 0x05]);
+        assert_eq!(&code[21..24], &[0x48, 0x89, 0xc1]);
+        assert_eq!(code[24], 0xc3);
+    }
+
+    /// Branch relaxation around the `rel8` limit: forward and backward
+    /// branches over every filler length from short to long reach their
+    /// targets (run natively), take the short form exactly when in reach,
+    /// and the labels `finish_at` reports move with their code.
+    #[test]
+    fn relaxed_branches_reach_their_targets() {
+        for f in 15..30 {
+            // rcx = arg; rax = 0 (ZF set): je over `f` 6-byte adds of 1000,
+            // then a backward loop adding 7 `rcx` times.
+            let mut a = X64Assembler::new();
+            let (over, top, out, mark) =
+                (a.new_label(), a.new_label(), a.new_label(), a.new_label());
+            a.mov_rcx_rdi();
+            a.zero_rax();
+            a.je(over);
+            for _ in 0..f {
+                a.add_rax_imm(1000);
+            }
+            a.bind(over);
+            a.bind(top);
+            a.test_rcx_rcx();
+            a.je(out);
+            for _ in 0..f {
+                a.add_rax_imm(0);
+            }
+            a.add_rax_imm(7);
+            a.dec_rcx();
+            a.jmp(top);
+            a.bind(out);
+            a.bind(mark);
+            a.ret();
+            let (code, at) = a.finish_at(&[mark]);
+            assert_eq!(code[at[0]], 0xc3, "the reported label moved with its code");
+            // The forward `je` spans `6 * f` bytes: short up to 127.
+            let short = 6 * f <= 127;
+            assert_eq!(code[6] == 0x74, short, "f = {f}");
+            if let Some(func) = JitFunction::from_code(&code) {
+                assert_eq!(func.call1(0), 0, "f = {f}");
+                assert_eq!(func.call1(5), 35, "f = {f}");
+            }
+        }
     }
 
     #[test]

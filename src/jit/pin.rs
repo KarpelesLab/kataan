@@ -39,7 +39,7 @@ pub(crate) const R12: u8 = 12;
 pub(crate) const R13: u8 = 13;
 
 /// Where a pinned body finds the arena and keeps its caller's registers.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PinArena {
     /// `ctx`-relative offset of the realm pointer.
     pub(crate) realm: i32,
