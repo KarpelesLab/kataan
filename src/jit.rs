@@ -2517,6 +2517,26 @@ fn emit_got_math(
     Some(())
 }
 
+/// Per op of a body's (spliced) bytecode: whether it is an inlined call's
+/// own call op — the fallback of its guards (`Op::InlineGuard::call`) —
+/// right after the last way's jump past it (`inline::expand`), so only a
+/// guard's miss reaches it.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn fallback_ops(ops: &[crate::nbvm::Op]) -> Vec<bool> {
+    use crate::nbvm::Op;
+    let mut out = alloc::vec![false; ops.len()];
+    for o in ops {
+        if let Op::InlineGuard { call, .. } = *o
+            && call > 0
+            && matches!(ops.get(call - 1), Some(Op::Jump { target }) if *target == call + 1)
+            && let Some(f) = out.get_mut(call)
+        {
+            *f = true;
+        }
+    }
+    out
+}
+
 /// The built-in id and inline form of a `CallMethod` of one argument (for
 /// `max`/`min`, one to four) whose key names a `Math` function the generic
 /// tier computes inline.
@@ -4819,6 +4839,12 @@ impl JitProto {
         }
     }
 
+    /// The machine code's length in bytes (`KATAAN_JIT_LOG`).
+    #[must_use]
+    pub fn code_len(&self) -> usize {
+        self.func.code_len()
+    }
+
     /// Whether a generic-tier body can be entered at bytecode pc `pc` (`0`, or a
     /// loop header — an on-stack-replacement entry).
     #[must_use]
@@ -5072,6 +5098,13 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     cold_binds: Option<Vec<usize>>,
+    /// The enclosing cold regions' bound labels, outermost first, while a
+    /// region nested in them is open ([`cold_begin`](Self::cold_begin)).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    cold_outer: Vec<Vec<usize>>,
     /// A generic body's heap arena, pinned in `r12`/`r13` (`pin`).
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     pin: Option<pin::PinArena>,
@@ -5298,6 +5331,10 @@ fn thread_jumps(
             k += 3;
         }
         let pad: &[u8] = match start + len - k {
+            0 => &[],
+            1 => &[0x90],
+            2 => &[0x66, 0x90],
+            3 => &[0x0f, 0x1f, 0x00],
             4 => &[0x0f, 0x1f, 0x40, 0x00],
             5 => &[0x0f, 0x1f, 0x44, 0x00, 0x00],
             7 => &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
@@ -5461,18 +5498,26 @@ impl X64Assembler {
         self.rbx_frame = on;
     }
 
-    /// Emits the `disp32` of a `[rbp+disp32]` frame-slot operand whose ModRM byte
-    /// was just pushed, rewriting that ModRM's base from `rbp` (`101`) to `rbx`
-    /// (`011`) for a register-file slot in frame mode (both encode mod=10 with no
-    /// SIB byte, so only the r/m bits change).
+    /// Emits the displacement of a `[rbp+disp32]` frame-slot operand whose
+    /// ModRM byte (mod=10) was just pushed, rewriting that ModRM's base from
+    /// `rbp` (`101`) to `rbx` (`011`) for a register-file slot in frame mode
+    /// (neither needs a SIB byte, so only the r/m bits change) — and, for a
+    /// displacement that fits a byte, its mod to `01` with a `disp8` (three
+    /// bytes shorter).
     fn rbp_disp(&mut self, disp: i32) {
-        if self.rbx_frame
-            && disp >= 0
-            && let Some(m) = self.code.last_mut()
-        {
-            *m = (*m & !7) | 3;
+        let short = i8::try_from(disp).ok();
+        if let Some(m) = self.code.last_mut() {
+            if self.rbx_frame && disp >= 0 {
+                *m = (*m & !7) | 3;
+            }
+            if short.is_some() {
+                *m = (*m & 0x3f) | 0x40;
+            }
         }
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        match short {
+            Some(d) => self.code.push(d.to_le_bytes()[0]),
+            None => self.code.extend_from_slice(&disp.to_le_bytes()),
+        }
     }
 
     /// Sets the receiver-cache key slots (see the `recv_cache_keys` field).
@@ -5613,6 +5658,18 @@ impl X64Assembler {
         Label(self.labels.len() - 1)
     }
 
+    /// Whether the code emitted last is an unconditional `jmp` (the 5-byte
+    /// `E9 rel32` whose fixup is the last one): nothing falls through past
+    /// it.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn ends_in_jmp(&self) -> bool {
+        let n = self.code.len();
+        n >= 5 && self.code[n - 5] == 0xe9 && self.fixups.last().is_some_and(|f| f.0 == n - 4)
+    }
+
     /// Binds `label` to the current emission point.
     pub fn bind(&mut self, label: Label) {
         // A `jmp label` just before (the 5-byte `E9 rel32` whose fixup is the
@@ -5712,7 +5769,9 @@ impl X64Assembler {
     /// into the region (an unconditional jump or a return), and the region's
     /// own last instruction must not fall through out of it; its code is
     /// entered only by jumps to the labels bound in it. Labels bound at the
-    /// region's end belong to the code after it.
+    /// region's end belong to the code after it. Regions nest: one begun
+    /// inside another becomes a chunk of its own, and the enclosing region
+    /// goes on where it began.
     #[cfg_attr(
         not(all(target_os = "linux", target_arch = "x86_64")),
         allow(dead_code)
@@ -5729,7 +5788,9 @@ impl X64Assembler {
         // No `bind` in the region may drop the jump just before it (which
         // would then fall through to whatever follows the region).
         self.last_bind = start;
-        debug_assert!(self.cold_binds.is_none(), "cold regions do not nest");
+        if let Some(outer) = self.cold_binds.take() {
+            self.cold_outer.push(outer);
+        }
         self.cold_binds = Some(Vec::new());
         self.dbg_mark("cold");
         mark
@@ -5769,6 +5830,9 @@ impl X64Assembler {
         }
         let mut labels = Vec::new();
         let mut at_start = false;
+        // (A nested region's enclosing one goes on, with the labels bound
+        // at this one's end, which are its own code's.)
+        self.cold_binds = self.cold_outer.pop();
         for i in bound {
             let l = &mut self.labels[i];
             if *l >= start && *l < end {
@@ -5777,6 +5841,9 @@ impl X64Assembler {
             } else if *l == end {
                 *l = start;
                 at_start = true;
+                if let Some(outer) = self.cold_binds.as_mut() {
+                    outer.push(i);
+                }
             }
         }
         let fixups = self
@@ -5830,7 +5897,7 @@ impl X64Assembler {
             return;
         }
         let len = n - start;
-        if !(7..=8).contains(&len) {
+        if !(4..=8).contains(&len) {
             return;
         }
         // (Only the instruction right after the store: a second load's
@@ -9353,8 +9420,33 @@ impl JitFunction {
         // The lazily pending activations whose bodies are being emitted,
         // outermost first: `(its guard, its leave, the pass)`.
         let mut lazy_open: Vec<(usize, usize, u8)> = Vec::new();
+        // An inlined call's own call op, the guards' fallback (`inline`):
+        // reached only by a guard's miss (the op before it is the last
+        // way's jump past it), so its code goes out of line, in a cold
+        // region that ends with a jump to the op after it — the hot path
+        // runs from the inlined bodies straight on (`fallback_cold`).
+        let fallback_cold = fallback_ops(bytecode);
+        // The open region and the label of its jump's target, which the next
+        // op's start binds.
+        let mut fb_open: Option<(ColdMark, Label)> = None;
+        let mut fb_back: Option<Label> = None;
         for (si, &(op_idx, pass)) in sched.iter().enumerate() {
             let op = &ops[op_idx];
+            if let Some((mark, back)) = fb_open.take() {
+                a.jmp(back);
+                a.cold_end(mark);
+                fb_back = Some(back);
+            }
+            if fallback_cold.get(op_idx).copied().unwrap_or(false)
+                && pending_run.is_none()
+                && si > 0
+                && sched[si - 1] == (op_idx - 1, pass)
+                && sched.get(si + 1) == Some(&(op_idx + 1, pass))
+                && a.cold_binds.is_none()
+                && a.ends_in_jmp()
+            {
+                fb_open = Some((a.cold_begin(), a.new_label()));
+            }
             // The op after a fused add run: where the run's fast path
             // resumes, every later op of the run having been emitted (as a
             // `SetProp`, which emits nothing at its end in these passes).
@@ -9382,6 +9474,9 @@ impl JitFunction {
             // (The body, a speculative region's plain copy, or its integer
             // version: `numeric::NumGen::schedule`.)
             a.bind(num.begin_op(&labels, op_idx, pass)?);
+            if let Some(back) = fb_back.take() {
+                a.bind(back);
+            }
             // Under `KATAAN_JIT_DEOPT_STRESS`, every few eligible op
             // starts leave for the interpreter (`deopt`).
             if pass == numeric::PASS_MAIN
@@ -14920,7 +15015,7 @@ impl JitFunction {
             // back, `numeric::NumGen::int_save`.)
             num.after_generic_op(&mut a);
         }
-        if pending_run.is_some() {
+        if pending_run.is_some() || fb_open.is_some() || fb_back.is_some() {
             return None;
         }
         // (No inlined body's window reaches the out-of-line code.)
@@ -15504,6 +15599,19 @@ impl JitFunction {
         }
     }
 
+    /// The machine code's length in bytes.
+    #[must_use]
+    pub fn code_len(&self) -> usize {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            self.buf.code_len()
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            0
+        }
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn from_code(code: &[u8]) -> Option<Self> {
         exec::ExecBuffer::new(code).map(|buf| Self { buf })
@@ -15592,6 +15700,8 @@ mod exec {
         base: *mut u8,
         ptr: *mut u8,
         len: usize,
+        /// The code's own length in bytes.
+        code_len: usize,
     }
 
     /// The colour of the next buffer (see [`ExecBuffer`]).
@@ -15653,7 +15763,18 @@ mod exec {
                 }
                 return None;
             }
-            Some(Self { base, ptr, len })
+            Some(Self {
+                base,
+                ptr,
+                len,
+                code_len: code.len(),
+            })
+        }
+
+        /// The code's length in bytes.
+        #[must_use]
+        pub(super) fn code_len(&self) -> usize {
+            self.code_len
         }
 
         /// The executable code pointer.
@@ -17188,29 +17309,30 @@ mod tests {
         a.load_rcx(8); // (not right after the store: a load)
         a.ret();
         let code = a.finish();
-        assert_eq!(&code[0..3], &[0x48, 0x89, 0x83]);
-        assert_eq!(&code[7..14], &[0x0f, 0x1f, 0x80, 0, 0, 0, 0]);
-        assert_eq!(&code[14..17], &[0x48, 0x8b, 0x8b]);
+        // (`disp8` forms: four bytes each.)
+        assert_eq!(&code[0..4], &[0x48, 0x89, 0x43, 0x08]);
+        assert_eq!(&code[4..8], &[0x0f, 0x1f, 0x40, 0x00]);
+        assert_eq!(&code[8..12], &[0x48, 0x8b, 0x4b, 0x08]);
         // ...but kept when a jump without that store lands on the load, and
         // made `mov rcx, rax` when every jump there follows the same store.
         let mut a = X64Assembler::new();
         a.set_rbx_frame(true);
         let (l, skip) = (a.new_label(), a.new_label());
         a.je(l); // 0..6
-        a.store_rax(8); // 6..13
+        a.store_rax(8); // 6..10
         a.bind(l);
-        a.load_rax(8); // 13..20
-        a.store_rax(16); // 20..27
-        a.jmp(skip); // 27..32 (right after the store of rax to [rbx+16])
-        a.ret(); // 32
-        a.store_rax(16); // 33..40
+        a.load_rax(8); // 10..14
+        a.store_rax(16); // 14..18
+        a.jmp(skip); // 18..23 (right after the store of rax to [rbx+16])
+        a.ret(); // 23
+        a.store_rax(16); // 24..28
         a.bind(skip);
-        a.load_rcx(16); // 40..47
+        a.load_rcx(16); // 28..32
         a.ret();
         let code = a.finish();
-        assert_eq!(&code[13..16], &[0x48, 0x8b, 0x83]);
-        assert_eq!(&code[40..43], &[0x48, 0x89, 0xc1]);
-        assert_eq!(&code[43..47], &[0x0f, 0x1f, 0x40, 0x00]);
+        assert_eq!(&code[10..14], &[0x48, 0x8b, 0x43, 0x08]);
+        assert_eq!(&code[28..31], &[0x48, 0x89, 0xc1]);
+        assert_eq!(code[31], 0x90);
     }
 
     #[test]

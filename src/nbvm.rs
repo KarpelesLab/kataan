@@ -5710,12 +5710,13 @@ fn ensure_jit(
     if jit_tier::jit_log_enabled() {
         let what = match &compiled {
             Some(j) if j.inlined() > 0 => alloc::format!(
-                "compiled ({:?} tier, {} calls inlined: {:?})",
+                "compiled ({:?} tier, {} bytes, {} calls inlined: {:?})",
                 j.abi_kind(),
+                j.code_len(),
                 j.inlined(),
                 j.inlined_sites()
             ),
-            Some(j) => alloc::format!("compiled ({:?} tier)", j.abi_kind()),
+            Some(j) => alloc::format!("compiled ({:?} tier, {} bytes)", j.abi_kind(), j.code_len()),
             None => alloc::format!(
                 "rejected: {}",
                 crate::jit::generic_reject_reason(&funcs[id])

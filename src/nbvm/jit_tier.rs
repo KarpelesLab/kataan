@@ -1008,9 +1008,11 @@ fn recompile(
             id,
             proto,
             &alloc::format!(
-                "recompiled (generation {}, {} calls inlined)",
+                "recompiled (generation {}, {} bytes, {} calls inlined: {:?})",
                 new.generation(),
-                new.inlined()
+                new.code_len(),
+                new.inlined(),
+                new.inlined_sites()
             ),
         );
     }
@@ -3978,6 +3980,13 @@ fn fill_construct_fast(
         pbits: proto.map_or(0, |p| NanBox::handle(p.to_raw()).to_bits()),
         target,
         caps,
+        // (The constructor's own function: no forwarding constructor
+        // between it and the body the way enters.)
+        ident: if passed.is_empty() {
+            u64::from(fid) | ((n_caps as u64) << 32)
+        } else {
+            crate::jit::CallSite::EMPTY
+        },
     };
 }
 

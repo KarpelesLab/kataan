@@ -96,7 +96,9 @@ const fn limits(spliced: bool) -> (usize, usize) {
     }
 }
 
-/// The most ops inlining may add to one caller.
+/// The most inlining may add to one caller, as each way's ops and
+/// registers (a bound on its code size and compile time, which grow with
+/// both). Sites in loops take it first (see [`expand`]).
 const MAX_ADDED_OPS: usize = 600;
 /// The most callees one polymorphic site inlines (`Op::InlineGuard::poly`).
 const MAX_WAYS: usize = crate::ic::CalleeHint::POLY_MAX;
@@ -127,6 +129,32 @@ struct Site<'a> {
     /// The keys of the derived class constructors among it and the calls
     /// spliced into it ([`Expanded::derived`]).
     derived: Vec<u64>,
+}
+
+/// A way a site could inline ([`expand`]), before the caller's budget
+/// picks it.
+struct Way<'a> {
+    /// The body as spliced.
+    site: Site<'a>,
+    /// What it costs of the budget ([`MAX_ADDED_OPS`]).
+    cost: usize,
+    /// The registers its window needs above the caller's.
+    window: usize,
+}
+
+/// Per op of `p`: how many loops (backward branches' ranges) it is in.
+fn loop_depth(p: &FnProto) -> Vec<u8> {
+    let mut d = alloc::vec![0u8; p.ops.len()];
+    for (pc, o) in p.ops.iter().enumerate() {
+        if let Op::Jump { target } = o
+            && *target <= pc
+        {
+            for x in &mut d[*target..=pc] {
+                *x = x.saturating_add(1);
+            }
+        }
+    }
+    d
 }
 
 /// The third inlining level (`Candidate::nested`): the `super(…)` sites of
@@ -266,7 +294,7 @@ fn callee_ok_sized(proto: &FnProto, spliced: bool) -> bool {
         || proto.is_generator
         || proto.rest_from.is_some()
         || proto.ops.is_empty()
-        || proto.ops.len() > max_ops
+        || !size_ok(proto, max_ops)
         || proto.n_regs > max_regs
         || proto.n_params + proto.n_captures >= proto.n_regs
     {
@@ -286,6 +314,33 @@ fn callee_ok_sized(proto: &FnProto, spliced: bool) -> bool {
             remap(&mut o, &|r| r, &|t| t)
         }
     })
+}
+
+/// Whether an op costs next to nothing in compiled code, and so does not
+/// count towards an inlined body's size ([`weight`]): a constant or a copy
+/// (a `let`'s initialization to `undefined`, a temporary's move into its
+/// variable: a store or two), a jump, a receiver's coercibility check (one
+/// compare, usually proved away).
+fn free_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::LoadConst { .. }
+            | Op::Move { .. }
+            | Op::Jump { .. }
+            | Op::RequireObjectCoercible { .. }
+    )
+}
+
+/// An inlined body's size as it counts against the limits: its ops but the
+/// nearly free ones ([`free_op`]).
+fn weight(p: &FnProto) -> usize {
+    p.ops.iter().filter(|o| !free_op(o)).count()
+}
+
+/// Whether `p` fits a body limit of `max_ops`: its [`weight`], and (bounding
+/// the code a body of free ops still makes) twice that in ops.
+fn size_ok(p: &FnProto, max_ops: usize) -> bool {
+    p.ops.len() <= 2 * max_ops && weight(p) <= max_ops
 }
 
 /// Whether callee op `pc`, `Jump { target }`, is a branch the splice takes:
@@ -334,7 +389,7 @@ fn construct_ok_sized(proto: &FnProto, spliced: bool) -> bool {
         || proto.is_generator
         || proto.rest_from.is_some()
         || proto.ops.is_empty()
-        || proto.ops.len() > max_ops
+        || !size_ok(proto, max_ops)
         || proto.n_regs > max_regs
         || proto.n_params + proto.n_captures >= proto.n_regs
         || (proto.derived && !derived_ok(proto))
@@ -451,16 +506,20 @@ fn calls_only_inlined(p: &FnProto) -> bool {
         })
         .collect();
     p.ops.iter().enumerate().all(|(pc, o)| {
-        !matches!(
-            o,
-            Op::CallMethod { .. }
-                | Op::CallValue { .. }
-                | Op::CallWithMethod { .. }
-                | Op::CallKey { .. }
-                | Op::Construct { .. }
-                | Op::SuperCallArgs { .. }
-                | Op::SuperCall { .. }
-        ) || fallbacks.contains(&pc)
+        // (A `Math` function the tier computes in line calls nothing when it
+        // is the built-in: `super::inline_math`.)
+        super::inline_math(o).is_some()
+            || !matches!(
+                o,
+                Op::CallMethod { .. }
+                    | Op::CallValue { .. }
+                    | Op::CallWithMethod { .. }
+                    | Op::CallKey { .. }
+                    | Op::Construct { .. }
+                    | Op::SuperCallArgs { .. }
+                    | Op::SuperCall { .. }
+            )
+            || fallbacks.contains(&pc)
     })
 }
 
@@ -851,9 +910,9 @@ pub fn expand<'a>(
     pick: &dyn Fn(usize, &Op) -> Vec<Candidate<'a>>,
 ) -> Option<Expanded> {
     let base = proto.n_regs;
-    let mut sites: Vec<(usize, Vec<Site<'a>>)> = Vec::new();
-    let mut added = 0usize;
-    let mut window = 0usize;
+    // Each site's ways that can be inlined, with their costs (see
+    // `Way`), before the budget picks among them.
+    let mut cands_at: Vec<(usize, Vec<Way<'a>>)> = Vec::new();
     for (pc, op) in proto.ops.iter().enumerate() {
         // (A computed-key call's callee is its read's scratch register, above
         // the caller's: its receiver and key must be the caller's.)
@@ -903,7 +962,7 @@ pub fn expand<'a>(
         if cands.len() > 1 && !poly_ok {
             continue;
         }
-        let mut ways: Vec<Site<'a>> = Vec::new();
+        let mut ways: Vec<Way<'a>> = Vec::new();
         let poly = cands.len() > 1;
         for c in cands.into_iter().take(MAX_WAYS) {
             let c = site_body(c);
@@ -929,7 +988,7 @@ pub fn expand<'a>(
             };
             if !ok
                 || (c.key >> 32) as usize != c.proto.n_captures
-                || ways.iter().any(|w| w.key == c.key)
+                || ways.iter().any(|w| w.site.key == c.key)
             {
                 continue;
             }
@@ -941,20 +1000,49 @@ pub fn expand<'a>(
                 },
                 None => 0,
             };
-            let cost = c.proto.ops.len() + c.proto.n_regs + 6 + SPREAD_EXTRA;
-            if added + cost > MAX_ADDED_OPS {
-                continue;
-            }
-            added += cost;
-            window = window.max(
-                c.proto.n_regs + 1 + usize::from(split.is_some() || discards(op)) + spread_regs,
-            );
-            ways.push(c);
+            ways.push(Way {
+                cost: c.proto.ops.len() + c.proto.n_regs + 6 + SPREAD_EXTRA,
+                window: c.proto.n_regs
+                    + 1
+                    + usize::from(split.is_some() || discards(op))
+                    + spread_regs,
+                site: c,
+            });
         }
         if !ways.is_empty() {
-            sites.push((pc, ways));
+            cands_at.push((pc, ways));
         }
     }
+    // The budget: sites in loops first, the most deeply nested first, then
+    // in order — a site's ways in order — while what the caller adds stays
+    // within [`MAX_ADDED_OPS`].
+    let depth = loop_depth(proto);
+    let mut order: Vec<usize> = (0..cands_at.len()).collect();
+    order.sort_by_key(|&i| (core::cmp::Reverse(depth[cands_at[i].0]), cands_at[i].0));
+    let mut picked: Vec<Vec<Site<'a>>> = (0..cands_at.len()).map(|_| Vec::new()).collect();
+    let mut pending: Vec<Vec<Option<Way<'a>>>> = cands_at
+        .iter_mut()
+        .map(|(_, ws)| core::mem::take(ws).into_iter().map(Some).collect())
+        .collect();
+    let mut added = 0usize;
+    let mut window = 0usize;
+    for &i in &order {
+        for w in pending[i].iter_mut() {
+            let Some(way) = w.take() else { continue };
+            if added + way.cost > MAX_ADDED_OPS {
+                continue;
+            }
+            added += way.cost;
+            window = window.max(way.window);
+            picked[i].push(way.site);
+        }
+    }
+    let sites: Vec<(usize, Vec<Site<'a>>)> = cands_at
+        .into_iter()
+        .zip(picked)
+        .filter(|(_, ws)| !ws.is_empty())
+        .map(|((pc, _), ws)| (pc, ws))
+        .collect();
     if sites.is_empty() || base + window > 0xffff {
         return None;
     }

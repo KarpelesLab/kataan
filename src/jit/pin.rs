@@ -186,10 +186,10 @@ mod tests {
     }
 
     /// `mov r12, [r15+0x10]; mov r13, [r12+0x28]; mov r12, [r12+0x20]`.
-    const RELOAD: [u8; 23] = [
-        0x4d, 0x8b, 0xa7, 0x10, 0, 0, 0, // mov r12, [r15+0x10]
-        0x4d, 0x8b, 0xac, 0x24, 0x28, 0, 0, 0, // mov r13, [r12+0x28]
-        0x4d, 0x8b, 0xa4, 0x24, 0x20, 0, 0, 0, // mov r12, [r12+0x20]
+    const RELOAD: [u8; 14] = [
+        0x4d, 0x8b, 0x67, 0x10, // mov r12, [r15+0x10]
+        0x4d, 0x8b, 0x6c, 0x24, 0x28, // mov r13, [r12+0x28]
+        0x4d, 0x8b, 0x64, 0x24, 0x20, // mov r12, [r12+0x20]
     ];
 
     #[test]
@@ -228,14 +228,13 @@ mod tests {
         let mut a = pinned();
         a.pin_enter();
         assert_eq!(
-            &a.code()[..16],
+            &a.code()[..8],
             &[
-                0x4c, 0x89, 0xa5, 0xd0, 0xff, 0xff, 0xff, // mov [rbp-48], r12
-                0x4c, 0x89, 0xad, 0xd8, 0xff, 0xff, 0xff, // mov [rbp-40], r13
-                0x4d, 0x8b,
+                0x4c, 0x89, 0x65, 0xd0, // mov [rbp-48], r12
+                0x4c, 0x89, 0x6d, 0xd8, // mov [rbp-40], r13
             ]
         );
-        assert_eq!(&a.code()[14..], &RELOAD);
+        assert_eq!(&a.code()[8..], &RELOAD);
         // Every call reloads after it.
         let mut a = pinned();
         a.call_rax();
@@ -248,10 +247,10 @@ mod tests {
         let mut a = pinned();
         a.frame_epilogue();
         assert_eq!(
-            &a.code()[..14],
+            &a.code()[..8],
             &[
-                0x4c, 0x8b, 0xa5, 0xd0, 0xff, 0xff, 0xff, // mov r12, [rbp-48]
-                0x4c, 0x8b, 0xad, 0xd8, 0xff, 0xff, 0xff, // mov r13, [rbp-40]
+                0x4c, 0x8b, 0x65, 0xd0, // mov r12, [rbp-48]
+                0x4c, 0x8b, 0x6d, 0xd8, // mov r13, [rbp-40]
             ]
         );
         // Unpinned: none of it.

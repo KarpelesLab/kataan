@@ -430,6 +430,12 @@ pub struct ConstructFast {
     pub target: *const CallTarget,
     /// Its captured values.
     pub caps: *const u64,
+    /// The constructor's own callee key (`function id | capture count <<
+    /// 32`, the way's), when the construct enters its own body; else (it
+    /// forwards to a super constructor's) [`CallSite::EMPTY`], which no key
+    /// equals. An inlined construct's guard identifies its callee by this
+    /// record alone (`emit_inline_guard`).
+    pub ident: u64,
 }
 
 impl ConstructFast {
@@ -446,6 +452,7 @@ impl ConstructFast {
             pbits: 0,
             target: core::ptr::null(),
             caps: core::ptr::null(),
+            ident: CallSite::EMPTY,
         }
     }
 }
@@ -908,16 +915,22 @@ impl X64Assembler {
         }
     }
 
-    /// [`g_mem`](Self::g_mem)'s encoding.
+    /// [`g_mem`](Self::g_mem)'s encoding (`mod=01` with a `disp8` when the
+    /// displacement fits a byte).
     fn g_mem_raw(&mut self, w: bool, opcode: &[u8], reg: u8, base: u8, disp: i32) {
         let rex = 0x40 | (u8::from(w) << 3) | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
         self.code.push(rex);
         self.code.extend_from_slice(opcode);
-        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
+        let short = i8::try_from(disp).ok();
+        let mode = if short.is_some() { 0x40 } else { 0x80 };
+        self.code.push(mode | ((reg & 7) << 3) | (base & 7));
         if base & 7 == 4 {
             self.code.push(0x24); // SIB: base only (rsp / r12)
         }
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        match short {
+            Some(d) => self.code.push(d.to_le_bytes()[0]),
+            None => self.code.extend_from_slice(&disp.to_le_bytes()),
+        }
     }
 
     /// `op rm, reg` in register-direct form (`mod=11`), 64-bit.
@@ -2886,53 +2899,64 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     a.dbg_mark("g-ident");
     // 3. Its function: the memo (the same value at the same prototype
     //    epoch, see `CallMemo`), else the cell, memoized when it is `key`'s.
-    let decode = a.new_label();
-    a.g_movabs(r::R11, e.memo as u64);
-    a.g_cmp_mem(r::RAX, r::R11, memo_key);
-    a.g_jcc(cc::NE, decode);
-    load_proto_epoch(a, r::R9);
-    a.g_cmp_mem(r::R9, r::R11, memo_stamp);
-    a.g_jcc(cc::NE, decode);
-    a.g_load(r::R8, r::R11, memo_caps);
-    let looked_up = matches!(e.callee, CalleeSrc::Method { .. });
-    if looked_up {
-        emit_guard_fill(a, e, way);
-    }
-    a.jmp(identified);
-    a.bind(decode);
-    a.dbg_mark("g-decode");
-    // (A value a later way memoizes is that way's.)
-    for w in way + 1..ways {
-        let other = a.new_label();
-        let m = memo_of(w);
-        a.g_cmp_mem(r::RAX, r::R11, site_off(m + offset_of!(IdentMemo, key)));
-        a.g_jcc(cc::NE, other);
+    //    But a `new` (or `super(…)`) of a register's value is `key`'s
+    //    function when the call's `ConstructFast` record — which the guard
+    //    requires anyway — holds for this constructor (and `new.target`) at
+    //    this epoch and names `key` as the constructor's own
+    //    (`ConstructFast::ident`): one check, which also gives the captures
+    //    and leaves `this` to make (`emit_inline_new_this`, `checked`).
+    let by_record = e.new_target.is_some() && ways <= 1 && matches!(e.callee, CalleeSrc::Reg(_));
+    if let (true, Some(ctor)) = (by_record, e.new_target) {
+        emit_construct_record_check(a, e, ctor, miss);
+    } else {
+        let decode = a.new_label();
+        a.g_movabs(r::R11, e.memo as u64);
+        a.g_cmp_mem(r::RAX, r::R11, memo_key);
+        a.g_jcc(cc::NE, decode);
         load_proto_epoch(a, r::R9);
-        a.g_cmp_mem(r::R9, r::R11, site_off(m + offset_of!(IdentMemo, stamp)));
+        a.g_cmp_mem(r::R9, r::R11, memo_stamp);
+        a.g_jcc(cc::NE, decode);
+        a.g_load(r::R8, r::R11, memo_caps);
+        let looked_up = matches!(e.callee, CalleeSrc::Method { .. });
         if looked_up {
-            // (Way `w`'s memo, for the next time.)
-            a.g_jcc(cc::NE, other);
-            a.g_load(r::R8, r::R11, site_off(m + offset_of!(IdentMemo, value)));
-            emit_guard_fill(a, e, w);
-            a.jmp(miss);
-        } else {
-            a.g_jcc(cc::E, miss);
+            emit_guard_fill(a, e, way);
         }
-        a.bind(other);
-    }
-    a.p_callee_info(jl, l.realm);
-    a.g_movabs(r::R11, e.key);
-    a.g_cmp(r::RAX, r::R11);
-    a.g_jcc(cc::NE, miss);
-    a.g_mov(r::R8, r::RDX);
-    a.g_movabs(r::R11, e.memo as u64);
-    a.g_load(r::RAX, RBP, e.slots.callee);
-    a.g_store(r::R11, memo_key, r::RAX);
-    load_proto_epoch(a, r::R9);
-    a.g_store(r::R11, memo_stamp, r::R9);
-    a.g_store(r::R11, memo_caps, r::R8);
-    if looked_up {
-        emit_guard_fill(a, e, way);
+        a.jmp(identified);
+        a.bind(decode);
+        a.dbg_mark("g-decode");
+        // (A value a later way memoizes is that way's.)
+        for w in way + 1..ways {
+            let other = a.new_label();
+            let m = memo_of(w);
+            a.g_cmp_mem(r::RAX, r::R11, site_off(m + offset_of!(IdentMemo, key)));
+            a.g_jcc(cc::NE, other);
+            load_proto_epoch(a, r::R9);
+            a.g_cmp_mem(r::R9, r::R11, site_off(m + offset_of!(IdentMemo, stamp)));
+            if looked_up {
+                // (Way `w`'s memo, for the next time.)
+                a.g_jcc(cc::NE, other);
+                a.g_load(r::R8, r::R11, site_off(m + offset_of!(IdentMemo, value)));
+                emit_guard_fill(a, e, w);
+                a.jmp(miss);
+            } else {
+                a.g_jcc(cc::E, miss);
+            }
+            a.bind(other);
+        }
+        a.p_callee_info(jl, l.realm);
+        a.g_movabs(r::R11, e.key);
+        a.g_cmp(r::RAX, r::R11);
+        a.g_jcc(cc::NE, miss);
+        a.g_mov(r::R8, r::RDX);
+        a.g_movabs(r::R11, e.memo as u64);
+        a.g_load(r::RAX, RBP, e.slots.callee);
+        a.g_store(r::R11, memo_key, r::RAX);
+        load_proto_epoch(a, r::R9);
+        a.g_store(r::R11, memo_stamp, r::R9);
+        a.g_store(r::R11, memo_caps, r::R8);
+        if looked_up {
+            emit_guard_fill(a, e, way);
+        }
     }
     a.bind(identified);
     // (Where the first way's guard brings a callee its memos identified as
@@ -2974,7 +2998,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     }
     let this = e.caps.checked_add(n_caps)?;
     if let Some(ctor) = e.new_target {
-        emit_inline_new_this(a, e, ctor, this, miss, Ok(cproved))?;
+        emit_inline_new_this(a, e, ctor, this, miss, (by_record, cproved))?;
     }
     if let (Some(_), Some(ctor)) = (cproved, e.new_target) {
         let made = a.new_label();
@@ -2986,7 +3010,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
             a.g_cmp(r::RAX, r::R11);
             a.g_jcc(cc::NE, miss);
         }
-        emit_inline_new_this(a, e, ctor, this, miss, Err(()))?;
+        emit_inline_new_this(a, e, ctor, this, miss, (true, None))?;
         a.bind(made);
     }
     a.dbg_mark("g-pend");
@@ -3044,6 +3068,39 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         reload(a);
     }
     Some(())
+}
+
+/// Step 3 of [`emit_inline_guard`] for a construct (`e.new_target`, the
+/// constructor and `new.target` registers `(ctor, nt)`; the constructor's
+/// value in `rax`): the call's [`ConstructFast`] record holds — this
+/// constructor and `new.target`, the current prototype epoch — and names
+/// `e.key` as the constructor's own function (`ConstructFast::ident`).
+/// The constructor value is then `key`'s function, its captures at the
+/// record's `caps` (into `r8`), and the construct's `this` is the record's
+/// to make. Else to `miss`. Leaves the call site's address in `r11`.
+fn emit_construct_record_check(
+    a: &mut X64Assembler,
+    e: &InlineEmit<'_>,
+    (ctor, nt): (u16, u16),
+    miss: Label,
+) {
+    use core::mem::offset_of;
+    let f = |o: usize| site_off(offset_of!(CallSite, fast) + o);
+    a.g_movabs(r::R11, e.memo as u64);
+    a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ctor)));
+    a.g_jcc(cc::NE, miss);
+    if nt != ctor {
+        a.g_load(r::RAX, r::RBX, i32::from(nt) * 8);
+    }
+    a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, nt)));
+    a.g_jcc(cc::NE, miss);
+    load_proto_epoch(a, r::R9);
+    a.g_cmp_mem(r::R9, r::R11, f(offset_of!(ConstructFast, stamp)));
+    a.g_jcc(cc::NE, miss);
+    a.g_movabs(r::RAX, e.key);
+    a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ident)));
+    a.g_jcc(cc::NE, miss);
+    a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
 }
 
 /// The guard memos' check of an inlined method call's guard
@@ -3176,17 +3233,18 @@ fn emit_inline_new_this(
     (ctor, nt): (u16, u16),
     this: u16,
     miss: Label,
-    proof: Result<Option<ConstructProof>, ()>,
+    (checked, proof): (bool, Option<ConstructProof>),
 ) -> Option<()> {
     use core::mem::offset_of;
     let reg = |x: u16| i32::from(x) * 8;
     let fast = offset_of!(CallSite, fast);
     let f = |o: usize| site_off(fast + o);
-    // (`Err`: the proved path, see `ConstructProof` — the record's checks
-    // hold. `Ok(Some(p))`: the full checks, then the proof recorded when
-    // `this` is made without a call.)
+    // (`checked`: the record's checks hold — the proved path, see
+    // `ConstructProof`, or the guard's identification by the record,
+    // `emit_construct_record_check`, which left the site in `r11`. With
+    // `proof`, the proof is recorded when `this` is made without a call.)
     let record = |a: &mut X64Assembler| {
-        if let Ok(Some(p)) = proof {
+        if let Some(p) = proof {
             a.g_load(r::R9, r::RBX, reg(ctor));
             a.g_store(RBP, p.ctor, r::R9);
             a.g_load(r::R9, r::RBX, reg(nt));
@@ -3194,7 +3252,7 @@ fn emit_inline_new_this(
             a.g_store(RBP, p.caps, r::R8);
         }
     };
-    if proof.is_err() {
+    if checked {
         // (A derived constructor's needs nothing of the record.)
         if !e.derived {
             a.g_movabs(r::R11, e.memo as u64);
@@ -3300,11 +3358,7 @@ fn emit_inline_new_this_made(
         }
         a.bind(made);
         a.g_movabs(r::R11, e.memo as u64);
-        a.g_load(
-            r::R8,
-            r::R11,
-            site_off(offset_of!(CallSite, ident) + offset_of!(IdentMemo, value)),
-        );
+        a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
     }
     a.g_store(r::RBX, reg(this), r::RAX);
     Some(())
@@ -3470,11 +3524,14 @@ impl X64Assembler {
             self.lazy_pend_store(&levels);
         }
         if let Some(d) = self.inline_pend {
-            // cmp qword [rbp+d], -1 ; je +7 ; call qword [rbp+d] (7 bytes)
+            // cmp qword [rbp+d], -1 ; je past ; call qword [rbp+d] ; past:
             self.g_mem(true, &[0x83], 7, RBP, d);
             self.code.push(0xff);
-            self.code.extend_from_slice(&[0x74, 0x07]);
+            self.code.extend_from_slice(&[0x74, 0x00]);
+            let at = self.code.len();
             self.g_mem(false, &[0xff], 2, RBP, d);
+            // (The call's length: 4 or 7 bytes, by its displacement's.)
+            self.code[at - 1] = u8::try_from(self.code.len() - at).unwrap_or(0);
         }
     }
 
