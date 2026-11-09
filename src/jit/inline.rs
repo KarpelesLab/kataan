@@ -99,7 +99,7 @@ const fn limits(spliced: bool) -> (usize, usize) {
 /// The most ops inlining may add to one caller.
 const MAX_ADDED_OPS: usize = 600;
 /// The most callees one polymorphic site inlines (`Op::InlineGuard::poly`).
-const MAX_WAYS: usize = 3;
+const MAX_WAYS: usize = crate::ic::CalleeHint::POLY_MAX;
 
 /// A callee to inline at a call site, as the caller's compiler is told it.
 pub struct Candidate<'a> {

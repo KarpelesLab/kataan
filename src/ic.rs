@@ -62,10 +62,11 @@ pub enum CalleeHint {
     None,
     /// Always this key.
     One(u64),
-    /// Two or three VM functions, by function id in the order first seen
-    /// (unused entries [`CalleeHint::NO_FN`]); their keys' capture counts
-    /// are the functions' own (a guard compares the whole key anyway).
-    Poly([u32; 3]),
+    /// Two to [`CalleeHint::POLY_MAX`] VM functions, by function id in the
+    /// order first seen (unused entries [`CalleeHint::NO_FN`]); their keys'
+    /// capture counts are the functions' own (a guard compares the whole key
+    /// anyway).
+    Poly([u32; CalleeHint::POLY_MAX]),
     /// More than [`CalleeHint::Poly`] keeps, or not only VM functions.
     Mixed,
 }
@@ -73,6 +74,9 @@ pub enum CalleeHint {
 impl CalleeHint {
     /// An unused [`CalleeHint::Poly`] entry.
     pub const NO_FN: u32 = u32::MAX;
+
+    /// The most VM functions a [`CalleeHint::Poly`] names.
+    pub const POLY_MAX: usize = 6;
 
     /// The hint after the site also called the VM closure with key `key`.
     #[must_use]
@@ -84,7 +88,12 @@ impl CalleeHint {
             Self::One(k) if k as u32 == fid || fid == Self::NO_FN || k as u32 == Self::NO_FN => {
                 Self::Mixed
             }
-            Self::One(k) => Self::Poly([k as u32, fid, Self::NO_FN]),
+            Self::One(k) => {
+                let mut f = [Self::NO_FN; Self::POLY_MAX];
+                f[0] = k as u32;
+                f[1] = fid;
+                Self::Poly(f)
+            }
             Self::Poly(mut f) => {
                 if f.contains(&fid) {
                     return self;

@@ -2942,7 +2942,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                 // of the previous way's guard (of the same call) reaches it,
                 // so the callee value that guard found is the call's.
                 let (way, ways) = (*poly & 0xff, *poly >> 8);
-                if way >= ways.max(1) || ways > 3 {
+                if way >= ways.max(1) || ways > crate::ic::CalleeHint::POLY_MAX as u16 {
                     return None;
                 }
                 if way > 0 && !chained_guard_ok(&proto.ops, pc) {

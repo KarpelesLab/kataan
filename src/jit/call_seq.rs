@@ -187,10 +187,10 @@ pub struct CallSite {
     /// The identity memos of a polymorphic inlined site's later ways (its
     /// first way's is `ident`), as `ident` is for a monomorphic one (see
     /// `InlineEmit::memo`).
-    pub poly: [IdentMemo; 2],
+    pub poly: [IdentMemo; CallSite::POLY_MEMOS],
     /// An inlined method call's guard memos, one per way (see
     /// `GuardMemo`).
-    pub guard: [GuardMemo; 3],
+    pub guard: [GuardMemo; crate::ic::CalleeHint::POLY_MAX],
     /// A `GetMethod` op's memo of its last lookup (see
     /// `emit_get_method`), kept in the call site of the call it feeds.
     pub getm: GetMethodMemo,
@@ -485,7 +485,7 @@ impl CallSite {
     pub const WAYS: usize = 8;
     /// The later ways' identity memos of a polymorphic inlined site
     /// ([`CallSite::poly`]).
-    pub const POLY_MEMOS: usize = 2;
+    pub const POLY_MEMOS: usize = crate::ic::CalleeHint::POLY_MAX - 1;
 
     /// An empty cache.
     #[must_use]
@@ -503,8 +503,8 @@ impl CallSite {
             ident: IdentMemo::empty(),
             construct: super::props::ConstructCache::new(),
             fncall: FnCallMemo::empty(),
-            poly: [IdentMemo::empty(); 2],
-            guard: [GuardMemo::empty(); 3],
+            poly: [IdentMemo::empty(); Self::POLY_MEMOS],
+            guard: [GuardMemo::empty(); crate::ic::CalleeHint::POLY_MAX],
             getm: GetMethodMemo {
                 lookup: LookupMemo::empty(),
                 stamp: 0,
