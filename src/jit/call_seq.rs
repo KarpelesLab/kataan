@@ -3780,8 +3780,8 @@ impl X64Assembler {
             hdr_empty(self, levels[k].hdr);
             self.g_jcc(cc::NE, starts[k + 1]);
         }
-        for j in 0..n {
-            self.bind(starts[j]);
+        for (j, &start) in starts.iter().enumerate() {
+            self.bind(start);
             for k in j..n {
                 if let Some(save) = levels[k].save {
                     if k == j {

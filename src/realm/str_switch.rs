@@ -13,6 +13,9 @@ use super::{Cell, NanBox, Realm, rope_bytes};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+/// A [`SwitchMemo`]'s ways: each a rope it looked up, with the answer.
+type SwitchWays = [(Option<crate::rope::Rope>, u32); SWITCH_MEMO_WAYS];
+
 /// A string `switch` site's memo of its last few discriminants (see
 /// [`Realm::string_switch_index_memo`]): each the rope of a string it looked
 /// up, with the answer, at one of two ways chosen by the rope's address
@@ -27,9 +30,7 @@ use core::cmp::Ordering;
 /// (Boxed: the op that holds it stays small.)
 #[derive(Default)]
 pub struct SwitchMemo {
-    ways: alloc::boxed::Box<
-        core::cell::RefCell<[(Option<crate::rope::Rope>, u32); SWITCH_MEMO_WAYS]>,
-    >,
+    ways: alloc::boxed::Box<core::cell::RefCell<SwitchWays>>,
 }
 
 /// How many discriminants a [`SwitchMemo`] remembers.
