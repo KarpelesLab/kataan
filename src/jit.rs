@@ -10418,12 +10418,11 @@ impl JitFunction {
         // The out-of-line stubs (by their entry label) of ops in plainly
         // lazy windows, with those windows: a call such a stub makes sets
         // their markers first.
-        let mut plain_stubs: Vec<(Label, Vec<call_seq::PlainLazy>)> = Vec::new();
-        let plain_of = |v: &[(Label, Vec<call_seq::PlainLazy>)], l: Label| {
-            v.iter()
-                .find(|(x, _)| *x == l)
-                .map(|(_, p)| p.clone())
-                .unwrap_or_default()
+        let mut plain_stubs: alloc::collections::BTreeMap<usize, Vec<call_seq::PlainLazy>> =
+            alloc::collections::BTreeMap::new();
+        let plain_of = |v: &alloc::collections::BTreeMap<usize, Vec<call_seq::PlainLazy>>,
+                        l: Label| {
+            v.get(&l.0).cloned().unwrap_or_default()
         };
         // An inlined call's own call op, the guards' fallback (`inline`):
         // reached only by a guard's miss (the op before it is the last
@@ -10472,7 +10471,7 @@ impl JitFunction {
                     a.jmp(stub);
                     deopt_stubs.push((stub, op_idx, true));
                     if !a.plain_lazy_now().is_empty() {
-                        plain_stubs.push((stub, a.plain_lazy_now()));
+                        plain_stubs.insert(stub.0, a.plain_lazy_now());
                     }
                 } else {
                     a.jmp(back);
@@ -10487,7 +10486,7 @@ impl JitFunction {
                 a.jmp(stub);
                 deopt_stubs.push((stub, op_idx, true));
                 if !a.plain_lazy_now().is_empty() {
-                    plain_stubs.push((stub, a.plain_lazy_now()));
+                    plain_stubs.insert(stub.0, a.plain_lazy_now());
                 }
             } else if exit_after {
                 if let Some(x) = sink_x {
@@ -10558,7 +10557,7 @@ impl JitFunction {
                 a.g_jcc(call_seq::cc::E, stub);
                 deopt_stubs.push((stub, op_idx, false));
                 if !a.plain_lazy_now().is_empty() {
-                    plain_stubs.push((stub, a.plain_lazy_now()));
+                    plain_stubs.insert(stub.0, a.plain_lazy_now());
                 }
             }
             // A fallback call op that would read a sunk object: the
@@ -10582,7 +10581,7 @@ impl JitFunction {
                     a.jmp(stub);
                     deopt_stubs.push((stub, op_idx, false));
                     if !a.plain_lazy_now().is_empty() {
-                        plain_stubs.push((stub, a.plain_lazy_now()));
+                        plain_stubs.insert(stub.0, a.plain_lazy_now());
                     }
                 }
             }
@@ -10625,7 +10624,7 @@ impl JitFunction {
                             a.gm_store_gpr(cell, call_seq::r::R11, call_seq::r::RCX, h);
                             cold_mirrors.push((h, done, op_idx));
                             if !a.plain_lazy_now().is_empty() {
-                                plain_stubs.push((h, a.plain_lazy_now()));
+                                plain_stubs.insert(h.0, a.plain_lazy_now());
                             }
                         }
                     }
@@ -10634,7 +10633,7 @@ impl JitFunction {
                 a.bind(done);
                 cold_globals.push((fetch, back, done, op_idx, slot, k));
                 if !a.plain_lazy_now().is_empty() {
-                    plain_stubs.push((fetch, a.plain_lazy_now()));
+                    plain_stubs.insert(fetch.0, a.plain_lazy_now());
                 }
                 continue;
             }
@@ -14030,7 +14029,7 @@ impl JitFunction {
                             (a.call_spill_now(), a.call_globals_now()),
                         ));
                         if !a.plain_lazy_now().is_empty() {
-                            plain_stubs.push((helper, a.plain_lazy_now()));
+                            plain_stubs.insert(helper.0, a.plain_lazy_now());
                         }
                     }
                     if ool_past.is_none() {
@@ -14131,7 +14130,7 @@ impl JitFunction {
                         a.g_jcc(call_seq::cc::E, stub);
                         deopt_stubs.push((stub, op_idx, false));
                         if !a.plain_lazy_now().is_empty() {
-                            plain_stubs.push((stub, a.plain_lazy_now()));
+                            plain_stubs.insert(stub.0, a.plain_lazy_now());
                         }
                     }
                     a.store_rax(disp(dst));
