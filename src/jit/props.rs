@@ -511,6 +511,11 @@ pub struct MethodSite {
     /// An inline `Math.f(x)` site's proof that persists across activations
     /// ([`MethodSite::fill_math`]).
     math: MathMemo,
+    /// An inline `DataView` accessor site's memo of its last view
+    /// ([`MethodSite::fill_dv`], `super::dataview`).
+    pub(super) dv: super::dataview::DvMemo,
+    /// An inline `Map`/`Set` lookup site's proof (`super::coll`).
+    pub(super) coll: super::coll::CollProof,
 }
 
 /// See [`MethodSite::fill_math`]: while the prototype epoch is `stamp`,
@@ -670,6 +675,8 @@ impl MethodSite {
                 ptr: 0,
                 method: 0,
             },
+            dv: super::dataview::DvMemo::EMPTY,
+            coll: super::coll::CollProof::EMPTY,
         }
     }
 

@@ -1646,11 +1646,46 @@ pub(crate) extern "C" fn jit_helper_switch_str(
     NanBox::number(i.map_or(-1.0, f64::from)).to_bits()
 }
 
+/// An inline `Map`/`Set` lookup's out-of-line probe (`crate::jit::coll`):
+/// `Map.prototype.get` (`op` 0), `Map.prototype.has` (1) or
+/// `Set.prototype.has` (2) of `key` on the strong collection `recv`, whose
+/// method the compiled code proved that built-in and whose kind it checked
+/// (`Realm::coll_fast`, which may build the collection's hash index). The
+/// result's bits, or the hole's when it is not served here. Runs no code.
+pub(crate) extern "C" fn jit_helper_coll_lookup(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    key: u64,
+    op: u64,
+) -> u64 {
+    use crate::realm::coll_fast::CollOp;
+    // SAFETY: see `jit_helper_site_fill` — a live, otherwise-unborrowed `Ctx`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let op = match op {
+        0 => CollOp::MapGet,
+        1 => CollOp::MapHas,
+        _ => CollOp::SetHas,
+    };
+    NanBox::from_bits(recv)
+        .as_handle()
+        .and_then(|h| {
+            ctx.realm.coll_fast(
+                Handle::from_raw(h),
+                op,
+                NanBox::from_bits(key),
+                NanBox::undefined(),
+            )
+        })
+        .unwrap_or(NanBox::hole())
+        .to_bits()
+}
+
 /// Proves (or finds it cannot) what an inline `s.charCodeAt(i)` relies on:
 /// see [`MethodSite::set_str_proof`](crate::jit::MethodSite::set_str_proof).
 pub(crate) extern "C" fn jit_helper_str_proof(
     ctx: *mut core::ffi::c_void,
-    _recv: u64,
+    recv: u64,
     site: u64,
     _unused: u64,
 ) -> u64 {
@@ -1662,6 +1697,31 @@ pub(crate) extern "C" fn jit_helper_str_proof(
             &mut *(site as usize as *mut crate::jit::MethodSite),
         )
     };
+    if let Some(acc) = crate::nbexec::dv_access_for(site.key().as_bytes()) {
+        // An inline `DataView` accessor's memo (`crate::jit::dataview`):
+        // `1` when filled for `recv`, so the access is retried.
+        return u64::from(
+            ctx.host.is_some()
+                && NanBox::from_bits(recv).as_handle().is_some_and(|h| {
+                    super::native_call::prove_dataview(
+                        &mut ctx.realm,
+                        site,
+                        Handle::from_raw(h),
+                        acc,
+                    )
+                }),
+        );
+    }
+    if matches!(site.key(), "get" | "has") {
+        // An inline `Map`/`Set` lookup's proof (`crate::jit::coll`): `1`
+        // when made, so the lookup is retried.
+        return u64::from(
+            ctx.host.is_some()
+                && NanBox::from_bits(recv).as_handle().is_some_and(|h| {
+                    super::native_call::prove_coll(&mut ctx.realm, site, Handle::from_raw(h))
+                }),
+        );
+    }
     if site.key() == "push" {
         super::native_call::prove_array_push(&mut ctx.realm, site);
     } else if site.key() == "pop" {

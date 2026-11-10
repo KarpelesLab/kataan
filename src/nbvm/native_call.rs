@@ -730,6 +730,45 @@ pub(super) fn prove_array_push(realm: &mut Realm, site: &mut crate::jit::MethodS
     prove_proto_method(realm, site, start, "push", FastOp::ArrayPush);
 }
 
+/// What compiled code's inline `m.get(k)` / `m.has(k)` / `s.has(k)` relies
+/// on, for `site` and the collection `recv` (`crate::jit::coll`): the proof
+/// that a collection of `recv`'s kind with the default `[[Prototype]]`
+/// finds the built-in. Whether it was made.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prove_coll(
+    realm: &mut Realm,
+    site: &mut crate::jit::MethodSite,
+    recv: Handle,
+) -> bool {
+    let Some((is_set, start)) = realm.jit_coll_default(recv) else {
+        return false;
+    };
+    let want = match (site.key(), is_set) {
+        ("get", false) => FastOp::MapGet,
+        ("has", false) => FastOp::MapHas,
+        ("has", true) => FastOp::SetHas,
+        _ => return false,
+    };
+    site.fill_coll(realm, start, is_set, |realm, v| classify(realm, v) == want)
+}
+
+/// What compiled code's inline `DataView` accessor relies on, for `site`
+/// and the view `recv` (`crate::jit::dataview`): its memo of the view, whose
+/// method the lookup proves the built-in accessor `acc`. Whether it was
+/// filled.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prove_dataview(
+    realm: &mut Realm,
+    site: &mut crate::jit::MethodSite,
+    recv: Handle,
+    acc: crate::nbexec::DvAccess,
+) -> bool {
+    let facts = crate::nbexec::dv_view_facts(realm, recv, acc.set);
+    site.fill_dv(realm, recv, facts, |realm, v| {
+        classify(realm, v) == FastOp::DataView(acc)
+    })
+}
+
 /// What compiled code's inline `a.pop()` relies on, for `site`: as
 /// [`prove_array_push`], of the built-in `pop`.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

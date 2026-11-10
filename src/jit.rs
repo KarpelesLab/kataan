@@ -28,6 +28,10 @@ mod call_seq;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod chase;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod coll;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod dataview;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod deopt;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod direct_call;
@@ -3665,6 +3669,9 @@ pub struct GenericHelpers {
     /// inline `Math.f(x)` site's proof across activations
     /// (`MethodSite::fill_math`).
     pub math_memo: JitBinHelper,
+    /// `jit_helper_coll_lookup(ctx, recv, key, op) -> bits | hole`: an
+    /// inline `Map`/`Set` lookup's out-of-line probe (`coll`).
+    pub coll_lookup: JitBinHelper,
     /// `jit_helper_str_proof(ctx, recv, site, _) -> 0`: proves
     /// `String.prototype`'s method for a `s.charCodeAt(i)` site.
     pub str_proof: JitBinHelper,
@@ -4596,6 +4603,16 @@ impl JitProto {
             | GenericOp::GetProp { site, .. }
             | GenericOp::GetMethod { site, .. } = *op
                 && let Some(w) = wants.get_mut(site as usize)
+            {
+                *w = true;
+            }
+            // (A call of a method already read whose inline form keeps its
+            // proof or memo in the site: `dataview`, `coll`.)
+            if let GenericOp::CallWithMethod { ic, .. } = *op
+                && let Some(k) = keys.get(ic as usize)
+                && (matches!(&**k, "get" | "has")
+                    || crate::nbexec::dv_access_for(k.as_bytes()).is_some())
+                && let Some(w) = wants.get_mut(ic as usize)
             {
                 *w = true;
             }
@@ -11517,6 +11534,119 @@ impl JitFunction {
                     }
                     // `Math.f(x)` with the built-in `f` is computed directly.
                     num.math_call(&mut a, op_idx, done);
+                    // `view.getUint32(off, le)`, `view.setFloat64(off, v)`,
+                    // …: with no call, on the view the site's memo names
+                    // (`dataview`); a memo for another view is refilled
+                    // (and the access retried) by the fill helper.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && let Some(acc) = crate::nbexec::dv_access_for(key.as_bytes())
+                        && (if acc.set { 2..=3 } else { 1..=2 }).contains(&margs.len())
+                        && ok(dst)
+                        && ok(recv)
+                        && margs.iter().all(|&m| ok(m))
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                    {
+                        // (Promoted operands into the register file, which
+                        // the access reads.)
+                        for &r in core::iter::once(&recv).chain(margs.iter()) {
+                            num.operand_xmm(&mut a, op_idx, r, false);
+                        }
+                        let general = a.new_label();
+                        let fill = a.new_label();
+                        let retry = a.new_label();
+                        let cl = &helpers.call_layout;
+                        let n = usize::from(acc.set);
+                        let ops = dataview::DvOperands {
+                            callee: None,
+                            recv: disp(recv),
+                            off: disp(margs[0]),
+                            val: acc.set.then(|| disp(margs[1])),
+                            le: margs.get(n + 1).map(|&m| disp(m)),
+                            dst: disp(dst),
+                        };
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.bind(retry);
+                        a.dv_access(
+                            &layout,
+                            typed::typed_layout(),
+                            cl.realm,
+                            si.method_ptr,
+                            acc,
+                            ops,
+                            (fill, general, done),
+                        );
+                        let cold = a.cold_begin();
+                        a.bind(fill);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.jne(retry);
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
+                    // `m.get(k)`, `m.has(k)`, `s.has(k)` on a small
+                    // collection with the default `[[Prototype]]`: with no
+                    // call (`coll`), under the site's proof, which the fill
+                    // helper makes (and the lookup is retried).
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && matches!(key.as_str(), "get" | "has")
+                        && let [k] = margs[..]
+                        && ok(dst)
+                        && ok(recv)
+                        && ok(k)
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                    {
+                        // (Promoted operands into the register file, which
+                        // the lookup reads.)
+                        for r in [recv, k] {
+                            num.operand_xmm(&mut a, op_idx, r, false);
+                        }
+                        let slow = a.new_label();
+                        let fill = a.new_label();
+                        let retry = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, slow);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, slow);
+                        a.bind(retry);
+                        a.coll_lookup(
+                            &layout,
+                            cl.realm,
+                            si.method_ptr,
+                            key == "get",
+                            (None, disp(recv), disp(k), disp(dst)),
+                            (fill, slow, done),
+                            helpers.coll_lookup as usize as u64,
+                        );
+                        let cold = a.cold_begin();
+                        a.bind(fill);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.jne(retry);
+                        a.jmp(slow);
+                        a.cold_end(cold);
+                        a.bind(slow);
+                    }
                     // `m.get(k)`, `s.add(v)`, …: a site that last called the
                     // `Map`/`Set` method on this receiver serves it in one
                     // helper call (`jit_helper_coll_call`), else on to the call.
@@ -16142,6 +16272,77 @@ impl JitFunction {
                             callee,
                             site_ptr,
                         );
+                    }
+                    // `view.getUint32(f(i))`, `m.get(a[i])`, … (the method
+                    // read before the arguments): the inline accessor or
+                    // lookup of the `CallMethod` arm, for that very
+                    // built-in (`dataview`, `coll`).
+                    if got.is_none()
+                        && !num.in_any_spec(op_idx)
+                        && !si.method_ptr.is_null()
+                        && let crate::nbvm::Op::CallWithMethod { key, .. } = bytecode.get(op_idx)?
+                    {
+                        let dv = crate::nbexec::dv_access_for(key.as_bytes()).filter(|acc| {
+                            (if acc.set { 2..=3 } else { 1..=2 }).contains(&args.len())
+                        });
+                        let coll = matches!(key.as_str(), "get" | "has") && args.len() == 1;
+                        if dv.is_some() || coll {
+                            for &r in [callee, recv].iter().chain(args.iter()) {
+                                num.operand_xmm(&mut a, op_idx, r, false);
+                            }
+                            let general = a.new_label();
+                            let fill = a.new_label();
+                            let retry = a.new_label();
+                            let cl = &helpers.call_layout;
+                            a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                            a.g_jcc(call_seq::cc::E, general);
+                            a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                            a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                            a.g_jcc(call_seq::cc::NE, general);
+                            a.bind(retry);
+                            if let Some(acc) = dv {
+                                let n = usize::from(acc.set);
+                                let ops = dataview::DvOperands {
+                                    callee: Some(disp(callee)),
+                                    recv: disp(recv),
+                                    off: disp(args[0]),
+                                    val: acc.set.then(|| disp(args[1])),
+                                    le: args.get(n + 1).map(|&m| disp(m)),
+                                    dst: disp(dst),
+                                };
+                                a.dv_access(
+                                    &layout,
+                                    typed::typed_layout(),
+                                    cl.realm,
+                                    si.method_ptr,
+                                    acc,
+                                    ops,
+                                    (fill, general, done),
+                                );
+                            } else {
+                                a.coll_lookup(
+                                    &layout,
+                                    cl.realm,
+                                    si.method_ptr,
+                                    key == "get",
+                                    (Some(disp(callee)), disp(recv), disp(args[0]), disp(dst)),
+                                    (fill, general, done),
+                                    helpers.coll_lookup as usize as u64,
+                                );
+                            }
+                            let cold = a.cold_begin();
+                            a.bind(fill);
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(recv));
+                            a.movabs_argreg(2, si.method_ptr as i64);
+                            a.movabs_rax(helpers.str_proof as usize as i64);
+                            a.call_rax();
+                            a.test_rax_rax();
+                            a.jne(retry);
+                            a.jmp(general);
+                            a.cold_end(cold);
+                            a.bind(general);
+                        }
                     }
                     if bail.is_some() {
                         a.bind(done);

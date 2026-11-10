@@ -2990,6 +2990,8 @@ mod dataview_fast;
 mod json;
 mod json_parse;
 mod method_dispatch;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use dataview_fast::dv_view_facts;
 pub(crate) use dataview_fast::{DvAccess, dataview_fast, dv_access_for};
 #[cfg(all(feature = "module", feature = "std"))]
 pub mod module;

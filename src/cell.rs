@@ -429,7 +429,10 @@ pub enum Cell {
         /// (`Realm::link_collection_proto`): the `Map`/`Set` constructor's
         /// own `prototype`, recorded once instead of a side-table entry per
         /// collection. An explicit link made later (`setPrototypeOf`) takes
-        /// precedence over it.
+        /// precedence over it. A collection so flagged has no auxiliary
+        /// object (no own named property) and is not host-exotic: gaining
+        /// either turns the flag into an explicit link
+        /// (`Realm::coll_default_to_explicit`).
         default_proto: bool,
         /// The entries, in insertion order, compared by `SameValueZero`-ish
         /// strict equality. A deleted entry stays in place as a tombstone
@@ -1233,6 +1236,109 @@ pub(crate) fn jit_typed_layout() -> TypedCellLayout {
         owned_tag,
         data_ptr_off: off + 8 * ptr_word,
         data_len_off: off + 8 * len_word,
+    }
+}
+
+/// What compiled code's inline `Map`/`Set` lookup (`crate::jit::coll`)
+/// reads of a `Cell::Collection`, as offsets from the cell.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CollCellLayout {
+    /// The `Cell::Collection` discriminant byte.
+    pub disc: u8,
+    /// The `is_set`, `is_weak` and `default_proto` flags (`bool` bytes).
+    pub is_set_off: usize,
+    pub is_weak_off: usize,
+    pub default_proto_off: usize,
+    /// The entries `Vec`'s data pointer and length.
+    pub entries_ptr_off: usize,
+    pub entries_len_off: usize,
+    /// The `index` word (`Option<Box<_>>`: zero for `None`).
+    pub index_off: usize,
+    /// One entry's size, and its key's and value's offsets in it.
+    pub entry_size: usize,
+    pub entry_key_off: usize,
+    pub entry_val_off: usize,
+}
+
+/// Derives [`CollCellLayout`] from a real `Cell::Collection`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn jit_coll_layout() -> CollCellLayout {
+    let mut entries = Vec::with_capacity(16);
+    entries.push((NanBox::number(1.0), NanBox::number(2.0)));
+    entries.push((NanBox::number(3.0), NanBox::number(4.0)));
+    entries.push((NanBox::number(5.0), NanBox::number(6.0)));
+    let cell = Cell::Collection {
+        is_set: true,
+        is_weak: false,
+        default_proto: false,
+        entries,
+        live: 3,
+        iters: 0,
+        epoch: 0,
+        remaps: None,
+        index: Some(alloc::boxed::Box::new(
+            crate::realm::CollIndex::with_capacity(1),
+        )),
+    };
+    let base = core::ptr::addr_of!(cell) as usize;
+    // SAFETY: as `jit_cell_layout`'s: the live cell's tag byte.
+    #[allow(unsafe_code)]
+    let disc = unsafe { *(base as *const u8) };
+    let Cell::Collection {
+        is_set,
+        is_weak,
+        default_proto,
+        entries,
+        index,
+        ..
+    } = &cell
+    else {
+        unreachable!("just built a Cell::Collection")
+    };
+    let off = |p: usize| p - base;
+    let vec_base = core::ptr::addr_of!(*entries) as usize;
+    assert_eq!(core::mem::size_of::<Vec<(NanBox, NanBox)>>(), 24);
+    // SAFETY: a `Vec` is three initialized `usize` words (asserted).
+    #[allow(unsafe_code)]
+    let words: [usize; 3] = unsafe { core::ptr::read(vec_base as *const [usize; 3]) };
+    let ptr_word = words
+        .iter()
+        .position(|&w| w == entries.as_ptr() as usize)
+        .expect("a Vec holds its data pointer");
+    assert_ne!(entries.len(), entries.capacity());
+    let len_word = words
+        .iter()
+        .position(|&w| w == entries.len())
+        .expect("a Vec holds its length");
+    let index_at = core::ptr::addr_of!(*index) as usize;
+    assert_eq!(
+        core::mem::size_of::<Option<alloc::boxed::Box<crate::realm::CollIndex>>>(),
+        8
+    );
+    // SAFETY: the `Option<Box<_>>` is one initialized word (asserted).
+    #[allow(unsafe_code)]
+    let index_word = unsafe { *(index_at as *const usize) };
+    assert_eq!(
+        index_word,
+        index
+            .as_deref()
+            .map_or(0, |b| core::ptr::addr_of!(*b) as usize),
+        "an index's word is its box's address"
+    );
+    let e0 = &entries[0];
+    let ebase = core::ptr::addr_of!(*e0) as usize;
+    CollCellLayout {
+        disc,
+        is_set_off: off(core::ptr::addr_of!(*is_set) as usize),
+        is_weak_off: off(core::ptr::addr_of!(*is_weak) as usize),
+        default_proto_off: off(core::ptr::addr_of!(*default_proto) as usize),
+        entries_ptr_off: off(vec_base) + 8 * ptr_word,
+        entries_len_off: off(vec_base) + 8 * len_word,
+        index_off: off(index_at),
+        entry_size: core::mem::size_of::<(NanBox, NanBox)>(),
+        entry_key_off: core::ptr::addr_of!(e0.0) as usize - ebase,
+        entry_val_off: core::ptr::addr_of!(e0.1) as usize - ebase,
     }
 }
 

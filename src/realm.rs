@@ -1229,6 +1229,8 @@ impl Realm {
             };
             if ok
                 && !self.native_protos.contains_key(&h.to_raw())
+                && !self.aux_props.contains_key(&h.to_raw())
+                && !self.is_host_exotic(h)
                 && let Some(Cell::Collection { default_proto, .. }) = self.heap.get_mut(h)
             {
                 *default_proto = true;
@@ -1287,6 +1289,23 @@ impl Realm {
         self.native_protos.insert(handle.to_raw(), proto);
         self.gc_side_log.push(handle.to_raw());
         self.mark_array_proto_set(handle);
+    }
+
+    /// Keeps the invariant of a collection flagged `default_proto` (no
+    /// auxiliary object, not host-exotic: compiled code's inline lookup,
+    /// `crate::jit::coll`, reads the flag alone) when `handle` is about to
+    /// get either: its default `[[Prototype]]` becomes an explicit link to
+    /// that same object. A no-op for any other cell.
+    fn coll_default_to_explicit(&mut self, handle: Handle) {
+        if let Some(Cell::Collection {
+            is_set,
+            default_proto: true,
+            ..
+        }) = self.heap.get(handle)
+            && let Some((_, proto)) = self.coll_default[usize::from(*is_set)]
+        {
+            self.set_native_proto(handle, proto);
+        }
     }
 
     /// An explicit `[[Prototype]]` link for the collection at `handle`
@@ -1718,6 +1737,7 @@ impl Realm {
     /// [`Realm::is_host_exotic`]).
     pub fn mark_host_exotic(&mut self, handle: Handle) {
         crate::object::bump_proto_epoch();
+        self.coll_default_to_explicit(handle);
         if matches!(self.heap.get(handle), Some(Cell::Str(_))) {
             self.str_special = true;
             self.str_int_memo = None;
@@ -1748,6 +1768,36 @@ impl Realm {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.watch();
         }
+    }
+
+    /// The kind (`is_set`) of the strong collection at `handle`, and the
+    /// default `[[Prototype]]` of that kind (`coll_default`), for compiled
+    /// code's inline lookup proof (`crate::jit::coll`).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_coll_default(&self, handle: Handle) -> Option<(bool, Option<Handle>)> {
+        match self.heap.get(handle) {
+            Some(Cell::Collection {
+                is_set,
+                is_weak: false,
+                ..
+            }) => Some((
+                *is_set,
+                self.coll_default[usize::from(*is_set)].map(|(_, p)| p),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether `handle` is an engine-owned byte store (`ByteStore::Owned`),
+    /// the only kind compiled code reads in place.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_owned_bytes(&self, handle: Handle) -> bool {
+        matches!(
+            self.heap.get(handle),
+            Some(Cell::Bytes(crate::cell::ByteStore::Owned(_)))
+        )
     }
 
     /// The object at `handle`, if it is one (for the compiled tier's caches).
@@ -2011,6 +2061,7 @@ impl Realm {
         }
         let obj = self.new_object();
         self.cell_link_changed(handle);
+        self.coll_default_to_explicit(handle);
         if matches!(self.heap.get(handle), Some(Cell::Str(_))) {
             self.str_special = true;
             // (A memoized result may be this very cell, which is no longer

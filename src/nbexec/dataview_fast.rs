@@ -65,6 +65,55 @@ pub(crate) fn dv_access_for(name: &[u8]) -> Option<DvAccess> {
     })
 }
 
+/// What compiled code's inline accessor (`crate::jit::dataview`) keeps
+/// about the view `h` for the view's whole life: its `[[ViewedArrayBuffer]]`'s
+/// byte store (an `Owned` one, which a detach empties and a resize resizes
+/// in place, so its current length is read on every access), its
+/// `[[ByteOffset]]`, and the end of its extent (`[[ByteOffset]] +
+/// [[ByteLength]]`, or `u64::MAX` for a length-tracking view, whose extent
+/// ends with its buffer). The three internal slots never change once the view
+/// is made. `None` for anything else, a buffer detached now, or, for a
+/// `set*` (`set`), an immutable buffer (a buffer is made immutable only when
+/// it is made, before any view of it exists).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn dv_view_facts(realm: &Realm, h: Handle, set: bool) -> Option<(Handle, u64, u64)> {
+    let slot_handle = |realm: &Realm, h: Handle, key: &str| {
+        realm
+            .get_property(h, key)
+            .and_then(NanBox::as_handle)
+            .map(Handle::from_raw)
+    };
+    if realm.jit_object(h).is_none() || realm.is_host_exotic(h) {
+        return None;
+    }
+    let buf = slot_handle(realm, h, DATA_VIEW_BUF)?;
+    if realm.get_property(buf, ARRAY_BUFFER_DETACHED).is_some()
+        || (set && realm.get_property(buf, ARRAY_BUFFER_IMMUTABLE).is_some())
+    {
+        return None;
+    }
+    let bh = slot_handle(realm, buf, ARRAY_BUFFER_BYTES)?;
+    if !realm.jit_owned_bytes(bh) {
+        return None;
+    }
+    let num = |key: &str| {
+        realm
+            .get_property(h, key)
+            .and_then(NanBox::as_number)
+            .filter(|n| (0.0..9_007_199_254_740_992.0).contains(n) && n.fract() == 0.0)
+            .map(|n| n as u64)
+    };
+    let base = match realm.get_property(h, DATA_VIEW_OFF) {
+        None => 0,
+        Some(_) => num(DATA_VIEW_OFF)?,
+    };
+    let end = match realm.get_property(h, DATA_VIEW_LEN) {
+        None => u64::MAX,
+        Some(_) => base.checked_add(num(DATA_VIEW_LEN)?)?,
+    };
+    Some((bh, base, end))
+}
+
 /// `dv.<acc>(offset, …rest)` when no step of `GetViewValue` / `SetViewValue`
 /// can run code or throw (see the module docs); `None` means "take the general
 /// path", having changed nothing. `rest` is `[littleEndian]` for a get and
