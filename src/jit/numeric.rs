@@ -974,6 +974,9 @@ pub(super) struct NumEnv {
     /// `jit_helper_global_mirror` (`StubKind::Mirror`).
     pub(super) global_mirror: u64,
     pub(super) math1: u64,
+    /// `jit_helper_site_fill` (an entry-proved `Math` call's chain-cache
+    /// miss: [`NumGen::math_entry_checks`]).
+    pub(super) site_fill: u64,
     /// The body's persistent global binding cache (`super::global_persist`).
     pub(super) persist: u64,
     /// The header pcs of the loops to give no speculative version (an
@@ -3205,7 +3208,9 @@ impl NumGen {
     /// (after [`spec_globals_ready`](Self::spec_globals_ready)'s checks,
     /// which proved the binding addresses filled), to `copy` on a miss: the
     /// call's cached path for the binding's value, which fills the site's
-    /// cache. Clobbers `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`..`r11`.
+    /// cache (a chain-cache miss through `jit_helper_site_fill`, as the
+    /// call's own path does, then once more). Clobbers `rax`, `rcx`, `rdx`,
+    /// `rsi`, `rdi`, `r8`..`r11`.
     fn math_entry_checks(&self, a: &mut X64Assembler, ri: usize, copy: Label) {
         use super::call_seq::r;
         let l = super::compute_jit_layout();
@@ -3237,7 +3242,28 @@ impl NumGen {
             a.g_store(r::RBP, m.key, RAX);
             a.g_store(r::RBP, m.cell, r::RCX);
             a.bind(have);
+            // A chain-cache miss is filled here, from the binding's value
+            // (rooted), and the lookup tried once more: the copy's call
+            // fills it only when it runs, and a call on a path the
+            // iterations seldom take (`Math.sqrt` past a `disc < 0`
+            // return in a polymorphically inlined `intersect`) would
+            // otherwise keep every entry in the copy until one does.
+            let filled = a.new_label();
+            let got = a.new_label();
+            a.p_method_lookup_walked(l, realm, m.site as *const _, filled, None);
+            a.jmp(got);
+            a.bind(filled);
+            a.g_mov(r::RDI, r::R15);
+            binding(a);
+            a.g_mov(r::RSI, RAX);
+            a.g_movabs(r::RDX, m.site);
+            a.g_movabs(RAX, self.env.site_fill);
+            a.call_rax();
+            // (The receiver's slot, which the fill, allocating nothing,
+            // left where it was.)
+            a.g_load(r::RCX, r::RBP, m.cell);
             a.p_method_lookup_walked(l, realm, m.site as *const _, copy, None);
+            a.bind(got);
             a.g_cmp_mem(RAX, r::RBP, m.proof);
             a.jcc(CC_E, ok);
             a.g_mov(r::R9, RAX);

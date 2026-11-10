@@ -1025,20 +1025,23 @@ fn recompile(
     }
     // (And no speculative version for a loop whose fast version kept
     // leaving it.)
-    let mut new = crate::jit::JitProto::compile_generic_respec(
-        proto,
-        &super::jit_generic_helpers(),
-        &warm,
-        &|f| {
-            funcs
-                .get(f as usize)
-                .is_some_and(|p| !(p.is_async && !p.is_generator))
-        },
-        &|pc, _| inline_candidate(funcs, id, &hints, pc),
-        &old.spec_off(),
-        &old.int_demote(),
-    )?;
-    new.note_cold_calls(&cold_call_pcs(proto, &hints));
+    let cold = cold_call_pcs(proto, &hints);
+    let mut new = crate::jit::with_entry_poll(!cold.is_empty(), || {
+        crate::jit::JitProto::compile_generic_respec(
+            proto,
+            &super::jit_generic_helpers(),
+            &warm,
+            &|f| {
+                funcs
+                    .get(f as usize)
+                    .is_some_and(|p| !(p.is_async && !p.is_generator))
+            },
+            &|pc, _| inline_candidate(funcs, id, &hints, pc),
+            &old.spec_off(),
+            &old.int_demote(),
+        )
+    })?;
+    new.note_cold_calls(&cold);
     new.note_function(id);
     new.set_generation(old.generation() + 1);
     let new = Rc::new(new);
@@ -1066,7 +1069,89 @@ fn recompile(
         let prev = core::mem::replace(prev, Rc::clone(&new));
         ctx.jit_rt.direct_retired.push(prev);
     }
+    retarget(ctx, funcs, id, old, &new);
     Some(new)
+}
+
+/// Points the compiled call sites that enter function `id`'s body `old`
+/// at its recompilation `new` (`JitProto::retarget_calls`), when the call
+/// sequence may enter `new` (as [`fill_call_site`] tests): every body of
+/// the function table's functions, and the bodies [`direct_jit`] handed
+/// out.
+fn retarget(
+    ctx: &Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    old: &crate::jit::JitProto,
+    new: &crate::jit::JitProto,
+) {
+    let (Some(proto), Ok(fid)) = (funcs.get(id), u32::try_from(id)) else {
+        return;
+    };
+    if new.native_entry().is_none() || new.n_regs() < proto.n_regs {
+        return;
+    }
+    for f in funcs {
+        for b in f.tier.bodies() {
+            b.retarget_calls(fid, old, new);
+        }
+    }
+    for b in ctx.jit_rt.direct.iter().flatten() {
+        b.retarget_calls(fid, old, new);
+    }
+    for b in &ctx.jit_rt.direct_retired {
+        b.retarget_calls(fid, old, new);
+    }
+}
+
+/// The native-call entry's recompilation poll (`GenericHelpers::entry_poll`,
+/// `crate::jit::tierup`'s `ENTRY_POLL`): its countdown, the word at `word`,
+/// ran out. The function whose code polls is recompiled now if it asks
+/// for it (`JitProto::entry_poll`, which sets the next countdown); the
+/// activation that polled continues in the old code. Code that is no
+/// longer any function's stops polling. Runs no JavaScript, allocates
+/// nothing on the heap, never throws: returns `0`.
+///
+/// # Safety
+/// `ctx` the live `Ctx`; `word` the polling body's countdown word.
+pub(crate) extern "C" fn jit_helper_entry_poll(ctx: *mut core::ffi::c_void, word: u64) -> u64 {
+    // SAFETY: as `jit_helper_exec_op`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let found = funcs
+        .iter()
+        .enumerate()
+        .find_map(|(id, p)| match p.tier.jit() {
+            Some(Some(j)) if j.entry_poll_addr() == word => Some((id, j)),
+            _ => None,
+        });
+    let Some((id, jit)) = found else {
+        // SAFETY: the polling body's own countdown word, which only its
+        // code (suspended in this call) writes.
+        #[allow(unsafe_code)]
+        unsafe {
+            *(word as *mut u64) = u64::MAX;
+        }
+        return 0;
+    };
+    let yes = jit.entry_poll(u32::try_from(id).unwrap_or(u32::MAX));
+    if jit_log_enabled() {
+        jit_log(
+            id,
+            &funcs[id],
+            &alloc::format!("entry poll: {}", if yes { "recompile" } else { "not yet" }),
+        );
+    }
+    if yes {
+        let _ = recompile(ctx, funcs, id, &jit, &[]);
+    }
+    0
 }
 
 /// `Op::PushHandler` in compiled code: push `(target, reg)` onto the running
@@ -1517,6 +1602,8 @@ pub(crate) extern "C" fn jit_helper_str_proof(
     };
     if site.key() == "push" {
         super::native_call::prove_array_push(&mut ctx.realm, site);
+    } else if site.key() == "pop" {
+        super::native_call::prove_array_pop(&mut ctx.realm, site);
     } else {
         super::native_call::prove_char_code_at(&mut ctx.realm, site);
     }

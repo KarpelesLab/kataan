@@ -82,7 +82,7 @@ pub use props::MethodSite;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use props::shape_word;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-pub use tierup::MAX_GENERATION;
+pub use tierup::{MAX_GENERATION, with_entry_poll};
 
 /// `2^53` — the largest magnitude an `f64` represents every integer below
 /// exactly. The integer JIT keeps a value only while it stays within ±this; a
@@ -3552,6 +3552,9 @@ pub struct GenericHelpers {
     /// The loop back-edge poll (`jit_helper_backedge`) — host interrupt, agent
     /// scheduling and the GC safepoint; returns the next poll countdown.
     pub backedge: JitBackedgeHelper,
+    /// The native-call entry's recompilation poll (`jit_helper_entry_poll`,
+    /// see `tierup::ENTRY_POLL`): `(ctx, countdown word address) -> 0`.
+    pub entry_poll: JitEntryPollHelper,
     /// A sync generator's suspension point (`jit_helper_suspend`): a
     /// `yield` (or the start of the body, or a `yield*` step) leaves the
     /// compiled code for the generator's resumption, which re-enters it
@@ -4069,6 +4072,10 @@ pub type JitExecOpHelper =
 /// `header`, the branch's target). `ops`/`n_ops` is the running bytecode (the
 /// GC safepoint roots its constants).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+/// [`GenericHelpers::entry_poll`]'s signature.
+pub type JitEntryPollHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> u64;
+
+/// [`GenericHelpers::backedge`]'s signature.
 pub type JitBackedgeHelper = extern "C" fn(
     *mut core::ffi::c_void,
     *mut u64,
@@ -5195,6 +5202,53 @@ impl JitProto {
             e.general
         };
         Some((self.func.code_ptr() + off) as u64)
+    }
+
+    /// Whether `code` is one of this body's native-call entry addresses.
+    fn is_native_entry(&self, code: u64) -> bool {
+        let Some(e) = self.native_entry else {
+            return false;
+        };
+        let base = self.func.code_ptr() as u64;
+        [Some(e.general), Some(e.exact), e.exact_pinned]
+            .into_iter()
+            .flatten()
+            .any(|off| base + off as u64 == code)
+    }
+
+    /// Points every way of this body's call sites that enters function
+    /// `id`'s body `old` (at one of its native-call entries) at `new`'s
+    /// matching entry instead — `old` was just recompiled into `new`
+    /// (`jit_tier::recompile`), and a compiled caller's site would
+    /// otherwise keep entering the old code. `new` must be a body the call
+    /// sequence may enter (`jit_tier::fill_call_site`'s test). Only the
+    /// way's code and window size change: an activation the site entered
+    /// is popped by its header, not by the way, so a site whose call is in
+    /// flight may be pointed elsewhere.
+    pub fn retarget_calls(&self, id: u32, old: &JitProto, new: &JitProto) {
+        let Some(s) = self.sites.as_ref() else {
+            return;
+        };
+        for c in &*s.calls {
+            // SAFETY: the bodies that write these caches are suspended in
+            // the call that recompiled `old` (or not running), and no other
+            // borrow of them is live.
+            #[allow(unsafe_code)]
+            let c = unsafe { &mut *c.get() };
+            for w in 0..CallSite::WAYS {
+                let t = c.targets[w];
+                if t.key == CallSite::EMPTY
+                    || t.key & 0xffff_ffff != u64::from(id)
+                    || !old.is_native_entry(t.code)
+                {
+                    continue;
+                }
+                if let Some(code) = new.native_entry_for(c) {
+                    c.targets[w].code = code;
+                    c.targets[w].frame_bytes = new.native_frame_bytes();
+                }
+            }
+        }
     }
 
     /// The bytes a call sequence entering [`Self::native_entry`] lays out
@@ -8613,6 +8667,7 @@ impl JitFunction {
                 global_ref: helpers.global_ref as usize as u64,
                 global_mirror: helpers.global_mirror as usize as u64,
                 math1: helpers.math1 as usize as u64,
+                site_fill: helpers.site_fill as usize as u64,
                 persist,
                 no_spec: no_spec.to_vec(),
                 first_local: n_params + n_caps + 1,
@@ -10383,10 +10438,20 @@ impl JitFunction {
         } else {
             0
         };
+        // A body that may learn more while compiled callers alone call it
+        // polls for its recompilation at its native-call entry
+        // (`tierup::ENTRY_POLL`).
+        let entry_poll = tierup::ENTRY_POLL.with(core::cell::Cell::get).then(|| {
+            (
+                persist + (global_persist::ENTRY_POLL * 8) as u64,
+                helpers.entry_poll as usize as u64,
+            )
+        });
         call_seq::emit_native_entry(
             &mut a,
             frame,
             has_backedge.then_some(COUNTDOWN),
+            entry_poll,
             &fill,
             n_params,
             n_caps,
@@ -11615,6 +11680,43 @@ impl JitFunction {
                         a.g_mov(call_seq::r::RAX, call_seq::r::R8);
                         a.cvtsi2sd_xmm0_rax();
                         numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
+                    // `a.pop()` on an array without side-table state, with
+                    // no call (`arr_push`).
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && key == "pop"
+                        && margs.is_empty()
+                        && ok(dst)
+                        && ok(recv)
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                        && num.result_xmm(op_idx, dst).is_none()
+                    {
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.p_str_proof(si.method_ptr, prove, general);
+                        walk_to_slot!(recv, general);
+                        a.ap_pop(&layout, cl.realm, general);
                         a.store_rax(disp(dst));
                         a.jmp(done);
                         let cold = a.cold_begin();

@@ -56,6 +56,14 @@ pub(super) const BODY_WORDS: usize = 1 + 8;
 /// see `numeric::int32`'s demotion.
 pub(super) const COUNTERS: usize = 16;
 
+/// The word past the counters: the native-call entry's countdown to its
+/// next recompilation poll (`tierup::ENTRY_POLL`), in a body that polls
+/// there. It starts at [`ENTRY_FIRST`].
+pub(super) const ENTRY_POLL: usize = LEN + 4 * COUNTERS;
+
+/// The native-call entry's first countdown (see [`ENTRY_POLL`]).
+pub(super) const ENTRY_FIRST: u64 = 64;
+
 /// Byte offset of region `ri`'s bail counter.
 pub(super) fn counter_off(ri: usize) -> i32 {
     off(LEN + ri)
@@ -86,8 +94,14 @@ impl Persist {
     /// A fresh array, every entry and epoch empty.
     pub(super) fn new() -> Self {
         Self {
-            words: (0..LEN + 4 * COUNTERS)
-                .map(|w| core::cell::UnsafeCell::new(if w < LEN { EMPTY } else { 0 }))
+            words: (0..=ENTRY_POLL)
+                .map(|w| {
+                    core::cell::UnsafeCell::new(match w {
+                        _ if w < LEN => EMPTY,
+                        ENTRY_POLL => ENTRY_FIRST,
+                        _ => 0,
+                    })
+                })
                 .collect(),
         }
     }
@@ -106,6 +120,24 @@ impl Persist {
             return 0;
         }
         self.word(LEN + 3 * COUNTERS + ri)
+    }
+
+    /// The address of the native-call entry's poll countdown
+    /// ([`ENTRY_POLL`]).
+    pub(super) fn entry_poll_addr(&self) -> u64 {
+        self.addr() + (ENTRY_POLL * 8) as u64
+    }
+
+    /// Sets the native-call entry's poll countdown ([`ENTRY_POLL`]).
+    pub(super) fn set_entry_poll(&self, v: u64) {
+        if let Some(w) = self.words.get(ENTRY_POLL) {
+            // SAFETY: the body's code writes the word only while it runs on
+            // this thread, never during this call.
+            #[allow(unsafe_code)]
+            unsafe {
+                *w.get() = v;
+            }
+        }
     }
 
     fn word(&self, i: usize) -> u64 {

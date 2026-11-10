@@ -730,6 +730,19 @@ pub(super) fn prove_array_push(realm: &mut Realm, site: &mut crate::jit::MethodS
     prove_proto_method(realm, site, start, "push", FastOp::ArrayPush);
 }
 
+/// What compiled code's inline `a.pop()` relies on, for `site`: as
+/// [`prove_array_push`], of the built-in `pop`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prove_array_pop(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
+    let start = realm
+        .root_array_proto()
+        .and_then(|p| match realm.jit_object(p) {
+            Some(_) => Some(p),
+            None => realm.jit_aux_of(p),
+        });
+    prove_proto_method(realm, site, start, "pop", FastOp::ArrayPop);
+}
+
 /// The proof of [`prove_char_code_at`] / [`prove_array_push`]: `key` is a
 /// data property of the ordinary object `start` (watched), the built-in
 /// `want`.

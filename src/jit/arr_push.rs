@@ -1,4 +1,4 @@
-//! A compiled `a.push(x)`'s append with no call.
+//! A compiled `a.push(x)`'s append, and `a.pop()`'s removal, with no call.
 //!
 //! The site's method proof (`MethodSite::set_str_proof`, made by
 //! `native_call::prove_array_push`) says that the lookup of `push` on an
@@ -15,6 +15,14 @@
 //! (`p_barrier_check_appended`, with an append at or past an `APPENDED`
 //! container's scan position covered as `Heap::get_mut_append` covers it).
 //! Anything else is the call's.
+//!
+//! `pop()` likewise (its site's proof, by `native_call::prove_array_pop`, is
+//! of `pop`): on such an array it is exactly what `Realm::array_pop_plain`
+//! does — the last element removed and returned, `undefined` from an empty
+//! array — under the same guards, and declines a hole (whose read the
+//! prototype chain would answer). A removal records no new reference, so
+//! the write barrier has nothing to do; an inline element's vacated slot
+//! is reset to `undefined` (`ArrayElems::inline`'s invariant).
 
 use super::call_seq::{cc, r};
 use super::{JitLayout, Label, X64Assembler};
@@ -86,5 +94,57 @@ impl X64Assembler {
         self.jmp(checked);
         self.cold_end(cold);
         self.bind(past);
+    }
+
+    /// For the receiver whose live heap slot is `rcx`: removes its last
+    /// element as the module docs say, leaving it (or `undefined`) in
+    /// `rax`; else to `miss` with nothing done. Clobbers `rdx`, `r8`–`r11`;
+    /// preserves `rcx`.
+    pub(super) fn ap_pop(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_arr_side, 0);
+        self.jne(miss);
+        self.cmp_byte_at_rcx_imm(l.off_arr_proto_set, 0);
+        self.jne(miss);
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R11, l.props.proto_index_dirty, 0);
+        self.g_jcc(cc::NE, miss);
+        let empty = self.new_label();
+        let heap = self.new_label();
+        let out = self.new_label();
+        self.g_movabs(r::RDX, crate::nanbox::NanBox::undefined().to_bits());
+        self.p_load8(r::R9, r::RCX, l.off_arr_inline_len);
+        self.g_cmp_imm(r::R9, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_jcc(cc::E, heap);
+        // Inline: `r9` elements in the cell.
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, empty);
+        self.raw(&[0x49, 0xff, 0xc9]); // dec r9
+        self.p_load_index8(r::RAX, r::RCX, r::R9, l.off_arr_inline);
+        self.g_movabs(r::R11, crate::nanbox::NanBox::hole().to_bits());
+        self.g_cmp(r::RAX, r::R11);
+        self.g_jcc(cc::E, miss);
+        self.p_store_index8(r::RCX, r::R9, l.off_arr_inline, r::RDX);
+        // dec byte [rcx + disp32]
+        self.raw(&[0xfe, 0x89]);
+        self.raw(&l.off_arr_inline_len.to_le_bytes());
+        self.jmp(out);
+        // In the `Vec`: its length, less one.
+        self.bind(heap);
+        self.g_load(r::R8, r::RCX, l.off_arr_len);
+        self.g_test(r::R8);
+        self.g_jcc(cc::E, empty);
+        self.raw(&[0x49, 0xff, 0xc8]); // dec r8
+        self.g_load(r::R11, r::RCX, l.off_arr_ptr);
+        self.p_load_index8(r::RAX, r::R11, r::R8, 0);
+        self.g_movabs(r::R11, crate::nanbox::NanBox::hole().to_bits());
+        self.g_cmp(r::RAX, r::R11);
+        self.g_jcc(cc::E, miss);
+        self.g_store(r::RCX, l.off_arr_len, r::R8);
+        self.jmp(out);
+        self.bind(empty);
+        self.g_mov(r::RAX, r::RDX);
+        self.bind(out);
     }
 }

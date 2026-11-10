@@ -5099,6 +5099,24 @@ impl TierSlot {
         }
     }
 
+    /// Every generic body the function has had: its code, its twin and
+    /// the code recompilations replaced (all of which compiled callers may
+    /// still enter or be running).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    fn bodies(&self) -> Vec<alloc::rc::Rc<crate::jit::JitProto>> {
+        let Ok(t) = self.0.try_borrow() else {
+            return Vec::new();
+        };
+        let mut v: Vec<_> = t.retired_jit.clone();
+        if let Some(Some(j)) = &t.jit {
+            v.push(alloc::rc::Rc::clone(j));
+        }
+        if let Some(Some(j)) = &t.twin {
+            v.push(alloc::rc::Rc::clone(j));
+        }
+        v
+    }
+
     /// Makes `j` (a recompilation) the function's native code; the code it
     /// replaces is kept alive with the function, since compiled callers may
     /// hold its address (`jit_tier::recompile` bounds how many there are).
@@ -5841,19 +5859,22 @@ fn ensure_jit(
                 ),
                 None => (tier_warm(&funcs[id]), tier_hints(&funcs[id])),
             };
-            crate::jit::JitProto::compile_generic_inlining(
-                &funcs[id],
-                &jit_generic_helpers(),
-                &warm,
-                &|f| {
-                    funcs
-                        .get(f as usize)
-                        .is_some_and(|p| !(p.is_async && !p.is_generator))
-                },
-                &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
-            )
+            let cold = jit_tier::cold_call_pcs(&funcs[id], &hints);
+            crate::jit::with_entry_poll(!cold.is_empty(), || {
+                crate::jit::JitProto::compile_generic_inlining(
+                    &funcs[id],
+                    &jit_generic_helpers(),
+                    &warm,
+                    &|f| {
+                        funcs
+                            .get(f as usize)
+                            .is_some_and(|p| !(p.is_async && !p.is_generator))
+                    },
+                    &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
+                )
+            })
             .map(|mut j| {
-                j.note_cold_calls(&jit_tier::cold_call_pcs(&funcs[id], &hints));
+                j.note_cold_calls(&cold);
                 j.note_function(id);
                 j
             })
@@ -7391,6 +7412,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call_native: jit_helper_call_native,
         exec_op: jit_tier::jit_helper_exec_op,
         backedge: jit_tier::jit_helper_backedge,
+        entry_poll: jit_tier::jit_helper_entry_poll,
         suspend: jit_tier::jit_helper_suspend,
         arena: jit_arena,
         push_handler: jit_tier::jit_helper_push_handler,

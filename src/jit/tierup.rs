@@ -24,6 +24,43 @@ use crate::shape::Shape;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
+std::thread_local! {
+    /// Whether the generic body being compiled polls for its
+    /// recompilation at its native-call entry: it has call sites with no
+    /// callee to inline yet (`JitProto::note_cold_calls`). A body that
+    /// only compiled callers call never meets the interpreter's entry check
+    /// ([`JitProto::wants_recompile_on_entry`]) and, unless an on-stack
+    /// replacement entered it, never leaves at a back-edge to be
+    /// recompiled: a function compiled while its callers took only one
+    /// path (a ray tracer's `trace` over the first rows, all sky) would
+    /// keep that path's code. The entry counts calls down in the body's
+    /// persistent array (`global_persist::ENTRY_POLL`) and at zero asks
+    /// [`JitProto::entry_poll`].
+    pub(crate) static ENTRY_POLL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a generic compile) with `ENTRY_POLL` set to `on`.
+pub fn with_entry_poll<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = ENTRY_POLL.with(|e| e.replace(on));
+    let r = f();
+    ENTRY_POLL.with(|e| e.set(was));
+    r
+}
+
+/// How many times the native-call entry's polls double the wait while no
+/// cold call site has taken a callee (`ENTRY_FIRST << round` calls; then
+/// they stay that far apart).
+const ENTRY_ROUNDS: u8 = 10;
+
+/// The wait (in `ENTRY_FIRST`s of calls) before the poll that checks that
+/// the cold call sites that took a callee are still as many.
+const ENTRY_SETTLE: u64 = 8;
+
+/// The code size (bytes) up to which a body whose cold call sites all
+/// took callees no inliner could use is recompiled anyway, to drop its
+/// native-call entry's poll ([`JitProto::entry_poll`]).
+const ENTRY_RECOMPILE_SMALL: usize = 16 * 1024;
+
 /// How many times a function's generic body may be recompiled.
 pub const MAX_GENERATION: u8 = 3;
 
@@ -81,6 +118,11 @@ pub(super) struct TierUp {
     /// Whether [`JitProto::wants_recompile_on_entry`] has said yes (it
     /// does once).
     pub(super) entry_asked: core::cell::Cell<bool>,
+    /// How many cold call sites had taken a callee at the native-call
+    /// entry's last poll ([`JitProto::entry_poll`]).
+    pub(super) entry_seen: core::cell::Cell<u32>,
+    /// The native-call entry's polls so far.
+    pub(super) entry_round: core::cell::Cell<u8>,
 }
 
 /// The flag of a demotion site ([`JitProto::int_demote`]) inside an inlined
@@ -127,6 +169,26 @@ fn settled_call(s: &super::GenericSites, cache: u16) -> Option<u64> {
         .filter(|&k| k != super::call_seq::CallSite::EMPTY);
     let k = keys.next()?;
     keys.next().is_none().then_some(k)
+}
+
+/// Whether the call site whose cache is `cache` has taken a callee an
+/// inlining recompilation could use — one or a few, none of them function
+/// `own` (which never inlines itself) — if it has taken any.
+fn took_callee(s: &super::GenericSites, cache: u16, own: u32) -> Option<bool> {
+    let c = s.calls.get(cache as usize)?;
+    // SAFETY: as in `settled_call`.
+    #[allow(unsafe_code)]
+    let c = unsafe { &*c.get() };
+    let keys = || {
+        c.targets
+            .iter()
+            .map(|t| t.key)
+            .filter(|&k| k != super::call_seq::CallSite::EMPTY)
+    };
+    let n = keys().count();
+    (n > 0).then(|| {
+        n <= crate::ic::CalleeHint::POLY_MAX && keys().all(|k| k & 0xffff_ffff != u64::from(own))
+    })
 }
 
 impl TierUp {
@@ -205,6 +267,8 @@ impl TierUp {
             generation: 0,
             countdown: core::cell::Cell::new(1),
             entry_asked: core::cell::Cell::new(false),
+            entry_seen: core::cell::Cell::new(0),
+            entry_round: core::cell::Cell::new(0),
         }
     }
 }
@@ -502,6 +566,69 @@ impl JitProto {
         });
         t.entry_asked.set(yes);
         yes
+    }
+
+    /// The native-call entry's recompilation poll ([`ENTRY_POLL`]), its
+    /// countdown run out: whether function `own`'s body should be
+    /// recompiled now (for its later calls; this one continues in this
+    /// code). Yes once the cold call sites that took a callee the inliner
+    /// could use (one, or a few: not the function itself) are as many as
+    /// at the previous poll, and some: those sites have settled since this
+    /// body was compiled, and the rest are no longer being reached. While
+    /// none has, each poll waits twice as long as the one before (up to
+    /// [`ENTRY_ROUNDS`] doublings); once some have, the next poll comes
+    /// soon. All while the recompilation budget lasts.
+    #[must_use]
+    pub fn entry_poll(&self, own: u32) -> bool {
+        let Some(s) = self.sites.as_ref() else {
+            return false;
+        };
+        let t = &s.tier_up;
+        if t.generation >= MAX_GENERATION {
+            s.persist.set_entry_poll(u64::MAX);
+            return false;
+        }
+        let (mut learned, mut open) = (0u32, 0u32);
+        for &(_, cache) in &t.cold_calls {
+            match took_callee(s, cache, own) {
+                Some(true) => learned += 1,
+                Some(false) => {}
+                None => open += 1,
+            }
+        }
+        if learned > 0 && learned == t.entry_seen.get() {
+            s.persist.set_entry_poll(u64::MAX);
+            return true;
+        }
+        if learned == 0 && open == 0 {
+            // Every cold site took callees, none an inliner could use (the
+            // function itself, as a recursive `fib`'s second call; or too
+            // many): nothing more to learn. A small body is recompiled once
+            // more all the same — its recompilation has no cold sites,
+            // so no poll costing every call; a large one stops polling.
+            s.persist.set_entry_poll(u64::MAX);
+            return self.code_len() <= ENTRY_RECOMPILE_SMALL;
+        }
+        t.entry_seen.set(learned);
+        let first = super::global_persist::ENTRY_FIRST;
+        let next = if learned > 0 {
+            first * ENTRY_SETTLE
+        } else {
+            let round = t.entry_round.get().saturating_add(1).min(ENTRY_ROUNDS);
+            t.entry_round.set(round);
+            first << round
+        };
+        s.persist.set_entry_poll(next);
+        false
+    }
+
+    /// The address of this body's native-call entry poll countdown
+    /// ([`ENTRY_POLL`]), which the entry passes its helper.
+    #[must_use]
+    pub fn entry_poll_addr(&self) -> u64 {
+        self.sites
+            .as_ref()
+            .map_or(0, |s| s.persist.entry_poll_addr())
     }
 
     /// The memos this body's own property-site caches hold, by the

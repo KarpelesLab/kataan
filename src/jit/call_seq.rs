@@ -1195,6 +1195,7 @@ pub(crate) fn emit_native_entry(
     a: &mut X64Assembler,
     frame: u32,
     countdown: Option<i8>,
+    entry_poll: Option<(u64, u64)>,
     fill: &[bool],
     n_params: usize,
     n_caps: usize,
@@ -1376,6 +1377,28 @@ pub(crate) fn emit_native_entry(
         a.mov_frame8_imm32(countdown, 1); // poll at the first back-edge
     }
     a.g_store_imm32(RBP, ACT_OK, 0);
+    if let Some((word, helper)) = entry_poll {
+        // Count the call down; at zero, ask the helper (which may have the
+        // function recompiled for its later calls, and sets the next
+        // countdown). The window is laid out: the helper runs no JavaScript
+        // and allocates nothing on the heap.
+        let poll = a.new_label();
+        a.g_movabs(r::R11, word);
+        a.g_dec_mem(r::R11, 0);
+        a.g_jcc(cc::E, poll);
+        let back = a.new_label();
+        a.bind(back);
+        a.jmp(body);
+        let cold = a.cold_begin();
+        a.bind(poll);
+        a.g_mov(r::RDI, r::R15);
+        a.g_mov(r::RSI, r::R11);
+        a.g_movabs(r::RAX, helper);
+        a.call_rax();
+        a.jmp(back);
+        a.cold_end(cold);
+        return Some(());
+    }
     a.jmp(body);
     Some(())
 }
