@@ -85,6 +85,14 @@ pub(super) struct TierRuntime {
     /// set once the function passed its (static) eligibility test, compiled and
     /// got hot, none of which is ever undone.
     direct: alloc::vec::Vec<Option<Rc<crate::jit::JitProto>>>,
+    /// The bodies a recompilation replaced in `direct`, kept for the
+    /// context's life as `direct` keeps its own: compiled call sites filled
+    /// from `direct` hold their raw entry addresses. The function need not
+    /// keep a replaced body itself: `direct` is by function id, and a table
+    /// eval code extended holds a copy of each function with a tier slot of
+    /// its own, so the body can be an older copy's (whose table may be gone),
+    /// owned by nothing else.
+    direct_retired: alloc::vec::Vec<Rc<crate::jit::JitProto>>,
     /// This thread's register stack (see [`JitStack`]), set before any
     /// compiled body runs. The emitted call sequence reads it at a fixed offset.
     pub(super) stack: StackPtr,
@@ -153,6 +161,7 @@ impl Default for TierRuntime {
             handlers: alloc::vec::Vec::new(),
             base: 0,
             direct: alloc::vec::Vec::new(),
+            direct_retired: alloc::vec::Vec::new(),
             stack: StackPtr::default(),
             hosted: false,
             main_realm: true,
@@ -1020,9 +1029,12 @@ fn recompile(
     // its address.
     proto.tier.replace_jit(Rc::clone(&new));
     if let Some(d) = ctx.jit_rt.direct.get_mut(id)
-        && d.is_some()
+        && let Some(prev) = d.as_mut()
     {
-        *d = Some(Rc::clone(&new));
+        // (Compiled call sites may still enter the body it replaces: see
+        // `direct_retired`.)
+        let prev = core::mem::replace(prev, Rc::clone(&new));
+        ctx.jit_rt.direct_retired.push(prev);
     }
     Some(new)
 }
@@ -4763,6 +4775,88 @@ pub(crate) extern "C" fn jit_helper_get_prop_site(
         site.fill_native_own(&mut ctx.realm, h);
     }
     r
+}
+
+#[cfg(test)]
+mod direct_memo_tests {
+    use super::super::{Ctx, FnProto, PropertyCache, Realm, compile_program, jit_generic_helpers};
+    use super::{Rc, TierRuntime, recompile};
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    fn ctx() -> Ctx<'static> {
+        Ctx {
+            realm: Box::new(Realm::new()),
+            host: None,
+            output: String::new(),
+            microtasks: alloc::collections::VecDeque::new(),
+            gen_ic: PropertyCache::new(),
+            gen_open_memo: None,
+            agen_ic: PropertyCache::new(),
+            jit_pending: None,
+            jit_pending_fault: None,
+            jit_funcs: None,
+            jit_rt: TierRuntime::default(),
+            jit_shadow: Vec::new(),
+            call_depth: 0,
+            gc_enabled: false,
+            gc_lock: 0,
+            frame_shadow: Vec::new(),
+            frames_published: 0,
+            top_frame_roots: Vec::new(),
+            pending_callee: None,
+            pending_new_target: None,
+            exec_op_ic: Vec::new(),
+            exec_op_ics: alloc::collections::BTreeMap::new(),
+            in_realm: None,
+        }
+    }
+
+    /// A recompilation that replaces the direct-entry memo keeps the body it
+    /// replaces alive for the context's life, even when the function does
+    /// not own that body (the memo is by id, and the body can be an earlier
+    /// table copy's: compiled call sites still enter it), and it gives no
+    /// memo to a function that had none (a generator's body has no native
+    /// entry a call may take).
+    #[test]
+    fn recompile_keeps_replaced_direct_body() {
+        let program = crate::parser::Parser::parse_program(
+            "function f(o, k) { return o.a + k; }\nfunction g(o) { return o.b; }",
+        )
+        .expect("parse");
+        let funcs: Vec<FnProto> = compile_program(&program).expect("compile");
+        let f = funcs.iter().position(|p| p.name == "f").expect("f");
+        let g = funcs.iter().position(|p| p.name == "g").expect("g");
+        let h = jit_generic_helpers();
+        let compile = |id: usize| {
+            Rc::new(crate::jit::JitProto::compile_generic(&funcs[id], &h).expect("generic body"))
+        };
+        // The memo holds a body the function's own slot does not (an
+        // older copy's): the only owner of that body.
+        let foreign = compile(f);
+        let weak = Rc::downgrade(&foreign);
+        let own = compile(f);
+        funcs[f].tier.set_jit(Some(Rc::clone(&own)));
+        let mut cx = ctx();
+        cx.jit_rt.direct.resize(funcs.len(), None);
+        cx.jit_rt.direct[f] = Some(foreign);
+        let new = recompile(&mut cx, &funcs, f, &own, &[]).expect("recompiled");
+        assert!(
+            cx.jit_rt.direct[f]
+                .as_ref()
+                .is_some_and(|d| Rc::ptr_eq(d, &new))
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "the replaced direct body was freed"
+        );
+        // No memo: a recompilation does not make one.
+        let own_g = compile(g);
+        funcs[g].tier.set_jit(Some(Rc::clone(&own_g)));
+        let _ = recompile(&mut cx, &funcs, g, &own_g, &[]).expect("recompiled");
+        assert!(cx.jit_rt.direct[g].is_none());
+    }
 }
 
 #[cfg(test)]
