@@ -196,9 +196,10 @@ pub struct CallSite {
     pub getm: GetMethodMemo,
     /// How many times an inlined call's guard of this site missed in a
     /// speculative loop's fast version, leaving it for the plain copy (see
-    /// `numeric::guard_diamonds`): at `SPEC_MISS_LIMIT` the fast version
-    /// is no longer entered (the copy makes the call without leaving
-    /// anything first), and the body asks to be recompiled.
+    /// `numeric::guard_diamonds`): at `SPEC_MISS_LIMIT` the body asks to
+    /// be recompiled (which inlines what the site has seen since). Whether
+    /// the fast version is still entered is the leave count's to say
+    /// (`numeric::SPEC_LEAVE_LIMIT`).
     pub spec_misses: u64,
     /// The argument count every native call sequence emitted for this site
     /// passes ([`CallSite::ENTRY_UNSET`] before the first is emitted,

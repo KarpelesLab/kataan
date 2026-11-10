@@ -8606,26 +8606,6 @@ impl JitFunction {
                 realm: helpers.call_layout.realm,
                 layout: helpers.call_layout,
                 heap: layout,
-                // Per inlined call's guard, its call's cache (whose miss
-                // count turns a fast version off, `call_seq::SPEC_MISSES`).
-                guard_sites: ops
-                    .iter()
-                    .map(|op| match *op {
-                        GenericOp::InlineGuard { call, .. } => {
-                            let c = match ops.get(call as usize)? {
-                                GenericOp::CallMethod { cache, .. }
-                                | GenericOp::CallValue { cache, .. }
-                                | GenericOp::CallWithMethod { cache, .. }
-                                | GenericOp::Construct { cache, .. } => *cache,
-                                GenericOp::GetProp { call, .. }
-                                | GenericOp::SetProp { call, .. } => *call,
-                                _ => return None,
-                            };
-                            call_sites.get(c as usize).map(|p| *p as u64)
-                        }
-                        _ => None,
-                    })
-                    .collect(),
                 // A compiled-in read of a slot its layout had as Number-only
                 // (`numeric::Spec::fields`).
                 fields: ops
@@ -10780,8 +10760,8 @@ impl JitFunction {
                         Some(l) => Some(l?),
                         None => None,
                     };
-                    // (Counted: a guard that keeps missing turns the fast
-                    // version off, `call_seq::SPEC_MISS_LIMIT`.)
+                    // (Counted: a guard that keeps missing asks for a
+                    // recompilation, `call_seq::SPEC_MISS_LIMIT`.)
                     let cold_miss = match cold_miss {
                         Some(bail) => {
                             let count = a.new_label();

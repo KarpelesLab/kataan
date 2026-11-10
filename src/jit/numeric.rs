@@ -995,9 +995,6 @@ pub(super) struct NumEnv {
     /// layout had as a Number-only slot when compiled, the address of the
     /// layout's may-be-non-Number mask and the slot (see [`Spec::fields`]).
     pub(super) fields: Vec<Option<(u64, u32)>>,
-    /// Per pc: for an inlined call's guard, its call's `CallSite` (whose
-    /// `spec_misses` count a guard diamond's misses in a fast version).
-    pub(super) guard_sites: Vec<Option<u64>>,
     /// Per pc: an allocating op (`allocating_region_op`) whose generic
     /// emission has a fast path that makes no call, and whose every other
     /// path the emitter turns into a leave for the plain copy in a fast
@@ -3368,23 +3365,13 @@ impl NumGen {
             for &(addr, mask) in &sp.fields {
                 a.p_fields_still_numbers(addr, mask, copy);
             }
-            // No inlined call's guard of a diamond has missed too often
-            // (each miss leaves for the copy: `guard_diamonds`).
-            for &(test, _, _) in &self.regions[ri].cold {
-                let Some(&Some(site)) = self.env.guard_sites.get(test - 1) else {
-                    continue;
-                };
-                a.g_movabs(super::call_seq::r::R11, site);
-                a.g_mem(
-                    true,
-                    &[0x81],
-                    7,
-                    super::call_seq::r::R11,
-                    super::call_seq::SPEC_MISSES,
-                );
-                a.raw(&(super::call_seq::SPEC_MISS_LIMIT as i32).to_le_bytes());
-                a.jcc(CC_AE, copy);
-            }
+            // (An inlined call's guard of a diamond that keeps missing —
+            // each miss leaves for the copy, `guard_diamonds` — turns the
+            // fast version off through the leave count, which decays
+            // with the fast version's back-edges: a guard that misses
+            // once per activation, after the iterations its other ways
+            // served, keeps it on. Its own miss count only asks for a
+            // recompilation, `tierup`.)
         }
         self.math_entry_checks(a, ri, copy);
         self.iter_entry_checks(a, ri, copy);
@@ -4273,6 +4260,15 @@ impl NumGen {
                     let direct = self.regions[ri].int.is_none() && self.imode.is_none();
                     a.dec_frame8(COUNTDOWN);
                     a.jne(skip);
+                    let validate = self.regions[ri].spec.is_some();
+                    // (Every poll decays the leave count, the quiet ones
+                    // too: an activation's first back-edge polls, so a
+                    // loop that leaves once per activation after some
+                    // fast iterations — a polymorphic call's way it could
+                    // not inline, met last — keeps its fast version.)
+                    if validate {
+                        self.decay_leaves(a, ri);
+                    }
                     super::call_seq::emit_quiet_poll(
                         a,
                         &self.env.layout,
@@ -4297,9 +4293,7 @@ impl NumGen {
                     a.cmp_rax_r11();
                     a.je(self.leave_exit?);
                     a.store_rax_frame8(COUNTDOWN);
-                    let validate = self.regions[ri].spec.is_some();
                     if validate {
-                        self.decay_leaves(a, ri);
                         self.refresh_globals(a, ri, true);
                         self.spec_globals_ready(a, ri, target)?;
                         self.hoist_views(a, ri);
