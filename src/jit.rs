@@ -3691,6 +3691,10 @@ pub struct GenericHelpers {
     /// `jit_helper_switch_str(ctx, value, op, _) -> bits`: `Op::SwitchStr`'s
     /// case index (a Number; never throws, allocates nothing).
     pub switch_str: JitBinHelper,
+    /// `jit_helper_instance_of(ctx, x, f, _) -> bits`: `x instanceof f`
+    /// when its fast path decides it (a boolean; runs no JavaScript, never
+    /// throws), else `0` (the op itself runs).
+    pub instance_of: JitBinHelper,
     /// `jit_helper_new_object(ctx, _) -> bits`: `Op::NewObject`'s fresh
     /// ordinary object (never throws).
     pub new_object: JitTruthyHelper,
@@ -13390,6 +13394,38 @@ impl JitFunction {
                             }
                             a.bind(done);
                         }
+                        // `x instanceof F` that its fast path decides (a VM
+                        // closure with the default `[[HasInstance]]` over an
+                        // ordinary chain): its own helper, else the op.
+                        crate::nbvm::Op::Relational {
+                            dst,
+                            instanceof: true,
+                            a: x,
+                            b: f,
+                        } if ok(*dst)
+                            && ok(*x)
+                            && ok(*f)
+                            && !num.in_spec(op_idx)
+                            && num.result_xmm(op_idx, *x).is_none()
+                            && num.result_xmm(op_idx, *f).is_none() =>
+                        {
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(*x));
+                            a.load_argreg(2, disp(*f));
+                            a.movabs_rax(helpers.instance_of as usize as i64);
+                            a.call_rax();
+                            a.test_rax_rax();
+                            a.je(slow);
+                            a.store_rax(disp(*dst));
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.jmp(done);
+                            a.cold_end(cold);
+                            a.bind(done);
+                        }
                         // A `for-in`'s per-key liveness check `key in obj`
                         // (its key register one of `forin_keys`), decided
                         // from the heap alone, else the interpreter's op.
@@ -13810,15 +13846,30 @@ impl JitFunction {
                         }
                         // A string `switch`'s case lookup: its own leaf
                         // helper, not the one-op interpreter.
-                        op @ crate::nbvm::Op::SwitchStr { dst, src, .. }
+                        op @ crate::nbvm::Op::SwitchStr { dst, src, memo, .. }
                             if ok(*dst) && ok(*src) =>
                         {
                             let op_ptr: *const crate::nbvm::Op = op;
+                            // The memo's answer for the string's rope, read
+                            // inline (`SwitchMemo`'s compiled-code mirror),
+                            // else the helper (which fills it).
+                            let helper = a.new_label();
+                            let done = a.new_label();
+                            a.p_switch_memo(
+                                &layout,
+                                helpers.call_layout.realm,
+                                disp(*src),
+                                memo.jit_ways_addr() as u64,
+                                helper,
+                                done,
+                            );
+                            a.bind(helper);
                             a.mov_rdi_r15();
                             a.load_argreg(1, disp(*src));
                             a.movabs_argreg(2, op_ptr as i64);
                             a.movabs_rax(helpers.switch_str as usize as i64);
                             a.call_rax_pure();
+                            a.bind(done);
                             a.store_rax(disp(*dst));
                         }
                         // A template's substitution: a string as it is, a

@@ -60,7 +60,7 @@ mod str_key_fast;
 mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;
-pub use str_switch::{SwitchMemo, switch_key_order};
+pub use str_switch::{SWITCH_MEMO_HASH, SwitchMemo, switch_key_order};
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use typed_fast::typed_elems_seen;
 mod handle_map;
@@ -5564,6 +5564,17 @@ impl Realm {
         if self.has_explicit_null_proto(handle) {
             return None;
         }
+        // A VM closure with no explicit link (see `vm_fn_default_proto`):
+        // the commonest of these cells, tested first (none of the kinds
+        // below is one).
+        if let Some(p) = self.vm_fn_default_proto
+            && matches!(cell, Some(Cell::VmFunction { .. }))
+        {
+            if self.callable_null_protos.contains(&handle.to_raw()) {
+                return None;
+            }
+            return Some(p);
+        }
         // A Map/Set made by its default constructor (see `coll_default`).
         if let Some(Cell::Collection {
             default_proto: true,
@@ -5607,15 +5618,6 @@ impl Realm {
         // "BigInt", and `(1n).toString`/`valueOf` resolve).
         if matches!(cell, Some(Cell::BigInt(_))) {
             return self.bigint_proto_intrinsic;
-        }
-        // A VM closure with no explicit link (see `vm_fn_default_proto`).
-        if let Some(p) = self.vm_fn_default_proto
-            && matches!(cell, Some(Cell::VmFunction { .. }))
-        {
-            if self.callable_null_protos.contains(&handle.to_raw()) {
-                return None;
-            }
-            return Some(p);
         }
         // An ordinary/native callable with no explicit override and no inline
         // object part has `[[Prototype]] === %Function.prototype%` (unless it was

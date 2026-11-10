@@ -4508,11 +4508,35 @@ pub struct StoreGlobalCache {
     owned: core::cell::Cell<u8>,
     /// Compiled code's global-object mirror (`crate::jit::global_mirror`).
     pub(crate) jit: global_mirror::MirrorCache,
-    /// Compiled code's last validated write address for a binding the
-    /// global object has no like-named property for, and the global
-    /// binding epoch it was validated under (`jit_tier::global_store_ref`).
+    /// Compiled code's memo of its last write validation
+    /// (`jit_tier::global_store_ref`).
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-    pub(crate) wmemo: core::cell::Cell<(u64, u64)>,
+    pub(crate) jit_memo: StoreRefMemo,
+}
+
+/// What `jit_tier::global_store_ref` last validated for its `StoreGlobal`
+/// while the running scope was the global scope: the global binding epoch
+/// (`crate::env::global_binding_epoch`) and global object it was validated
+/// under, the binding's address and the mirror target it recorded (`u64::MAX`
+/// for a `let`/`const`/`class` or a name the global object does not own,
+/// whose mirror target is `0`). Every fact the validation reads is fixed while
+/// that epoch is current and the same global object and scope are running
+/// (the epoch is bumped whenever the global scope is swapped, its bindings
+/// change, or the global object's own keys may have changed). A clone starts
+/// empty (its op's mirror state does too).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Debug, Default)]
+pub(crate) struct StoreRefMemo {
+    /// `(epoch, global, binding address, mirror target)`; epoch `0` (never
+    /// current) when empty.
+    pub(crate) v: core::cell::Cell<(u64, u64, u64, u64)>,
+}
+
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+impl Clone for StoreRefMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// The fast path of `PutValue` for a global-environment name: when the
@@ -7464,6 +7488,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         direct_has_own: jit_tier::jit_helper_direct_has_own,
         to_str: jit_tier::jit_helper_to_str,
         switch_str: jit_tier::jit_helper_switch_str,
+        instance_of: jit_tier::jit_helper_instance_of,
         new_object: jit_tier::jit_helper_new_object,
         owe_fn_proto: jit_tier::jit_helper_owe_fn_proto,
         new_array: jit_tier::jit_helper_new_array,
@@ -14706,37 +14731,136 @@ fn declared_in_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
 
 /// Walks `s` collecting direct identifier references (`direct`) and the free
 /// variables of any nested function expression (`nested`).
+/// What a reference scan (`refs_*_w`) also records when asked: every name an
+/// assignment, update or `for-in`/`for-of` target may write, anywhere in the
+/// scanned code, nested functions included (so a name only a nested
+/// function's own binding shadows counts too: conservative).
+type Writes = Option<BTreeSet<String>>;
+
 fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
-    // Exhaustive on purpose (no `_` arm): a statement kind the scan skipped would
-    // silently drop the captures of every closure inside it.
-    let block = |b: &[Stmt], direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>| {
-        b.iter().for_each(|s| refs_stmt(s, direct, nested));
-    };
-    match s {
-        Stmt::Expr { expression, .. } => refs_expr(expression, direct, nested),
-        Stmt::Var(d) => refs_var_decl(d, direct, nested),
-        Stmt::Return { argument, .. } => {
-            if let Some(e) = argument {
-                refs_expr(e, direct, nested);
+    refs_stmt_w(s, direct, nested, &mut None);
+}
+
+fn refs_pattern(t: &BindingTarget, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    refs_pattern_w(t, direct, nested, &mut None);
+}
+
+fn refs_expr(e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+    refs_expr_w(e, direct, nested, &mut None);
+}
+
+/// For a scan that records writes: the writes of a nested function's
+/// parameters and body (the reference sets come from the memo).
+fn nested_writes(params: &[crate::ast::Param], body: &[Stmt], w: &mut Writes) {
+    if w.is_none() {
+        return;
+    }
+    let mut direct = BTreeSet::new();
+    let mut nested = BTreeSet::new();
+    for p in params {
+        refs_pattern_w(&p.target, &mut direct, &mut nested, w);
+        if let Some(d) = &p.default {
+            refs_expr_w(d, &mut direct, &mut nested, w);
+        }
+    }
+    for s in body {
+        refs_stmt_w(s, &mut direct, &mut nested, w);
+    }
+}
+
+/// For a scan that records writes: the names the assignment target `t`
+/// (an identifier, a destructuring pattern, a member) may write. A target of
+/// any other form records every name it references.
+fn note_target_writes(t: &Expr, w: &mut Writes) {
+    let Some(out) = w else { return };
+    fn collect(t: &Expr, out: &mut BTreeSet<String>) {
+        match t {
+            Expr::Ident(id) => {
+                out.insert(String::from(&*id.name));
+            }
+            Expr::Array { elements, .. } => {
+                for el in elements {
+                    if let ArrayElement::Item(e) | ArrayElement::Spread(e) = el {
+                        collect(e, out);
+                    }
+                }
+            }
+            Expr::Object { members, .. } => {
+                for m in members {
+                    match m {
+                        ObjectMember::Property { value, .. }
+                        | ObjectMember::Spread { value, .. } => {
+                            collect(value, out);
+                        }
+                        ObjectMember::Accessor { .. } => {}
+                    }
+                }
+            }
+            // A destructuring default: `[a = 1] = …`.
+            Expr::Assign { target, .. } => collect(target, out),
+            // A property write writes no binding (its parts are scanned as
+            // references, and any assignment inside them as such).
+            Expr::Member { .. } => {}
+            other => {
+                let mut direct = BTreeSet::new();
+                let mut nested = BTreeSet::new();
+                refs_expr(other, &mut direct, &mut nested);
+                out.extend(direct);
+                out.extend(nested);
             }
         }
-        Stmt::Throw { argument: e, .. } => refs_expr(e, direct, nested),
-        Stmt::Block { body, .. } => block(body, direct, nested),
+    }
+    collect(t, out);
+}
+
+/// The names code of a function with `params` and `body` may write through
+/// an assignment, update or `for-in`/`for-of` target, nested functions
+/// included (see [`Writes`]). Declarations are not writes here.
+fn written_names(params: &[crate::ast::Param], body: &[Stmt]) -> BTreeSet<String> {
+    let mut w: Writes = Some(BTreeSet::new());
+    nested_writes(params, body, &mut w);
+    w.unwrap_or_default()
+}
+
+fn refs_stmt_w(
+    s: &Stmt,
+    direct: &mut BTreeSet<String>,
+    nested: &mut BTreeSet<String>,
+    w: &mut Writes,
+) {
+    // Exhaustive on purpose (no `_` arm): a statement kind the scan skipped would
+    // silently drop the captures of every closure inside it.
+    let block = |b: &[Stmt],
+                 direct: &mut BTreeSet<String>,
+                 nested: &mut BTreeSet<String>,
+                 w: &mut Writes| {
+        b.iter().for_each(|s| refs_stmt_w(s, direct, nested, w));
+    };
+    match s {
+        Stmt::Expr { expression, .. } => refs_expr_w(expression, direct, nested, w),
+        Stmt::Var(d) => refs_var_decl_w(d, direct, nested, w),
+        Stmt::Return { argument, .. } => {
+            if let Some(e) = argument {
+                refs_expr_w(e, direct, nested, w);
+            }
+        }
+        Stmt::Throw { argument: e, .. } => refs_expr_w(e, direct, nested, w),
+        Stmt::Block { body, .. } => block(body, direct, nested, w),
         Stmt::If {
             test,
             consequent,
             alternate,
             ..
         } => {
-            refs_expr(test, direct, nested);
-            refs_stmt(consequent, direct, nested);
+            refs_expr_w(test, direct, nested, w);
+            refs_stmt_w(consequent, direct, nested, w);
             if let Some(a) = alternate {
-                refs_stmt(a, direct, nested);
+                refs_stmt_w(a, direct, nested, w);
             }
         }
         Stmt::While { test, body, .. } | Stmt::DoWhile { body, test, .. } => {
-            refs_expr(test, direct, nested);
-            refs_stmt(body, direct, nested);
+            refs_expr_w(test, direct, nested, w);
+            refs_stmt_w(body, direct, nested, w);
         }
         Stmt::For {
             init,
@@ -14746,17 +14870,17 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             ..
         } => {
             match init {
-                Some(ForInit::Var(d)) => refs_var_decl(d, direct, nested),
-                Some(ForInit::Expr(e)) => refs_expr(e, direct, nested),
+                Some(ForInit::Var(d)) => refs_var_decl_w(d, direct, nested, w),
+                Some(ForInit::Expr(e)) => refs_expr_w(e, direct, nested, w),
                 None => {}
             }
             if let Some(t) = test {
-                refs_expr(t, direct, nested);
+                refs_expr_w(t, direct, nested, w);
             }
             if let Some(u) = update {
-                refs_expr(u, direct, nested);
+                refs_expr_w(u, direct, nested, w);
             }
-            refs_stmt(body, direct, nested);
+            refs_stmt_w(body, direct, nested, w);
         }
         Stmt::ForOf {
             left, right, body, ..
@@ -14765,11 +14889,16 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             left, right, body, ..
         } => {
             match left {
-                crate::ast::ForLeft::Target(e) => refs_expr(e, direct, nested),
-                crate::ast::ForLeft::Decl { target, .. } => refs_pattern(target, direct, nested),
+                crate::ast::ForLeft::Target(e) => {
+                    note_target_writes(e, w);
+                    refs_expr_w(e, direct, nested, w);
+                }
+                crate::ast::ForLeft::Decl { target, .. } => {
+                    refs_pattern_w(target, direct, nested, w)
+                }
             }
-            refs_expr(right, direct, nested);
-            refs_stmt(body, direct, nested);
+            refs_expr_w(right, direct, nested, w);
+            refs_stmt_w(body, direct, nested, w);
         }
         Stmt::Try {
             block: b,
@@ -14777,15 +14906,15 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             finalizer,
             ..
         } => {
-            block(b, direct, nested);
+            block(b, direct, nested, w);
             if let Some(h) = handler {
                 if let Some(p) = &h.param {
-                    refs_pattern(p, direct, nested);
+                    refs_pattern_w(p, direct, nested, w);
                 }
-                block(&h.body, direct, nested);
+                block(&h.body, direct, nested, w);
             }
             if let Some(f) = finalizer {
-                block(f, direct, nested);
+                block(f, direct, nested, w);
             }
         }
         Stmt::Switch {
@@ -14793,25 +14922,28 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
             cases,
             ..
         } => {
-            refs_expr(discriminant, direct, nested);
+            refs_expr_w(discriminant, direct, nested, w);
             for c in cases {
                 if let Some(t) = &c.test {
-                    refs_expr(t, direct, nested);
+                    refs_expr_w(t, direct, nested, w);
                 }
-                block(&c.body, direct, nested);
+                block(&c.body, direct, nested, w);
             }
         }
-        Stmt::Labeled { body, .. } => refs_stmt(body, direct, nested),
+        Stmt::Labeled { body, .. } => refs_stmt_w(body, direct, nested, w),
         Stmt::With { object, body, .. } => {
             direct.insert(String::from(DYN_WITH));
-            refs_expr(object, direct, nested);
-            refs_stmt(body, direct, nested);
+            refs_expr_w(object, direct, nested, w);
+            refs_stmt_w(body, direct, nested, w);
         }
-        Stmt::Function(f) => nested.extend(free_of_nonarrow(&f.params, &f.body)),
-        Stmt::Class(c) => refs_class(c, direct, nested),
+        Stmt::Function(f) => {
+            nested.extend(free_of_nonarrow(&f.params, &f.body));
+            nested_writes(&f.params, &f.body, w);
+        }
+        Stmt::Class(c) => refs_class_w(c, direct, nested, w),
         Stmt::Export(crate::ast::ExportDecl::Decl { declaration, .. })
         | Stmt::Export(crate::ast::ExportDecl::Default { declaration, .. }) => {
-            refs_stmt(declaration, direct, nested);
+            refs_stmt_w(declaration, direct, nested, w);
         }
         Stmt::Export(_)
         | Stmt::Import(_)
@@ -14824,22 +14956,28 @@ fn refs_stmt(s: &Stmt, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<Stri
 
 /// [`refs_stmt`] for a `var`/`let`/`const` declaration: initializers and the
 /// defaults inside destructuring targets.
-fn refs_var_decl(
+fn refs_var_decl_w(
     d: &crate::ast::VarDecl,
     direct: &mut BTreeSet<String>,
     nested: &mut BTreeSet<String>,
+    w: &mut Writes,
 ) {
     for dr in &d.declarations {
-        refs_pattern(&dr.target, direct, nested);
+        refs_pattern_w(&dr.target, direct, nested, w);
         if let Some(e) = &dr.init {
-            refs_expr(e, direct, nested);
+            refs_expr_w(e, direct, nested, w);
         }
     }
 }
 
 /// The references inside a binding pattern: its `= default` expressions and
 /// computed keys (the bound names themselves are declarations, not references).
-fn refs_pattern(t: &BindingTarget, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+fn refs_pattern_w(
+    t: &BindingTarget,
+    direct: &mut BTreeSet<String>,
+    nested: &mut BTreeSet<String>,
+    w: &mut Writes,
+) {
     match t {
         BindingTarget::Ident(_) => {}
         BindingTarget::Array(pat) => {
@@ -14849,13 +14987,13 @@ fn refs_pattern(t: &BindingTarget, direct: &mut BTreeSet<String>, nested: &mut B
                     crate::ast::ArrayPatternElement::Item {
                         target, default, ..
                     } => {
-                        refs_pattern(target, direct, nested);
+                        refs_pattern_w(target, direct, nested, w);
                         if let Some(d) = default {
-                            refs_expr(d, direct, nested);
+                            refs_expr_w(d, direct, nested, w);
                         }
                     }
                     crate::ast::ArrayPatternElement::Rest { target, .. } => {
-                        refs_pattern(target, direct, nested);
+                        refs_pattern_w(target, direct, nested, w);
                     }
                 }
             }
@@ -14863,15 +15001,15 @@ fn refs_pattern(t: &BindingTarget, direct: &mut BTreeSet<String>, nested: &mut B
         BindingTarget::Object(pat) => {
             for prop in &pat.properties {
                 if let PropertyKey::Computed(e) = &prop.key {
-                    refs_expr(e, direct, nested);
+                    refs_expr_w(e, direct, nested, w);
                 }
-                refs_pattern(&prop.value, direct, nested);
+                refs_pattern_w(&prop.value, direct, nested, w);
                 if let Some(d) = &prop.default {
-                    refs_expr(d, direct, nested);
+                    refs_expr_w(d, direct, nested, w);
                 }
             }
             if let Some(r) = &pat.rest {
-                refs_pattern(r, direct, nested);
+                refs_pattern_w(r, direct, nested, w);
             }
         }
     }
@@ -14880,10 +15018,15 @@ fn refs_pattern(t: &BindingTarget, direct: &mut BTreeSet<String>, nested: &mut B
 /// [`refs_expr`] for a class: the heritage and computed keys are evaluated in
 /// the enclosing scope; method bodies, field initializers and static blocks are
 /// nested functions.
-fn refs_class(c: &crate::ast::Class, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+fn refs_class_w(
+    c: &crate::ast::Class,
+    direct: &mut BTreeSet<String>,
+    nested: &mut BTreeSet<String>,
+    w: &mut Writes,
+) {
     let mut d = BTreeSet::new();
     let mut n = BTreeSet::new();
-    refs_class_inner(c, &mut d, &mut n);
+    refs_class_inner_w(c, &mut d, &mut n, w);
     // A direct eval anywhere in a class body sees its private names and home
     // object (see `DYN_EVAL_CLASS`).
     if d.contains(DYN_EVAL) || n.contains(DYN_EVAL) {
@@ -14893,39 +15036,44 @@ fn refs_class(c: &crate::ast::Class, direct: &mut BTreeSet<String>, nested: &mut
     nested.extend(n);
 }
 
-fn refs_class_inner(
+fn refs_class_inner_w(
     c: &crate::ast::Class,
     direct: &mut BTreeSet<String>,
     nested: &mut BTreeSet<String>,
+    w: &mut Writes,
 ) {
     use crate::ast::ClassMember;
     if let Some(sup) = &c.super_class {
-        refs_expr(sup, direct, nested);
+        refs_expr_w(sup, direct, nested, w);
     }
     for m in &c.body {
         match m {
             ClassMember::Method(m) => {
                 if let PropertyKey::Computed(e) = &m.key {
-                    refs_expr(e, direct, nested);
+                    refs_expr_w(e, direct, nested, w);
                 }
                 nested.extend(free_of_nonarrow(&m.value.params, &m.value.body));
+                nested_writes(&m.value.params, &m.value.body, w);
             }
             ClassMember::Field(f) => {
                 if let PropertyKey::Computed(e) = &f.key {
-                    refs_expr(e, direct, nested);
+                    refs_expr_w(e, direct, nested, w);
                 }
                 if let Some(v) = &f.value {
                     // A field initializer's `this` is the instance.
                     let mut inner = BTreeSet::new();
                     let mut inner_nested = BTreeSet::new();
-                    refs_expr(v, &mut inner, &mut inner_nested);
+                    refs_expr_w(v, &mut inner, &mut inner_nested, w);
                     inner.extend(inner_nested);
                     inner.remove(THIS_NAME);
                     inner.remove(NT_NAME);
                     nested.extend(inner);
                 }
             }
-            ClassMember::StaticBlock { body, .. } => nested.extend(free_of_nonarrow(&[], body)),
+            ClassMember::StaticBlock { body, .. } => {
+                nested.extend(free_of_nonarrow(&[], body));
+                nested_writes(&[], body, w);
+            }
         }
     }
 }
@@ -14933,16 +15081,22 @@ fn refs_class_inner(
 /// Walks `e` collecting direct identifier references; for a nested function
 /// expression, collects *its* free variables into `nested` (without descending
 /// for direct refs).
-fn refs_expr(mut e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<String>) {
+fn refs_expr_w(
+    mut e: &Expr,
+    direct: &mut BTreeSet<String>,
+    nested: &mut BTreeSet<String>,
+    w: &mut Writes,
+) {
     // Exhaustive on purpose (no `_` arm): an expression kind the scan skipped
     // would silently drop the captures of every closure that references a name
     // only through it (`() => new C(x)`, `` () => `${x}` ``, `() => a?.b`).
     let args = |a: &[crate::ast::Argument],
                 direct: &mut BTreeSet<String>,
-                nested: &mut BTreeSet<String>| {
+                nested: &mut BTreeSet<String>,
+                w: &mut Writes| {
         for a in a {
             let (crate::ast::Argument::Item(e) | crate::ast::Argument::Spread(e)) = a;
-            refs_expr(e, direct, nested);
+            refs_expr_w(e, direct, nested, w);
         }
     };
     // The last child of each node is visited by looping rather than recursing,
@@ -14954,22 +15108,31 @@ fn refs_expr(mut e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<
             Expr::Ident(id) => {
                 direct.insert(String::from(&*id.name));
             }
-            Expr::Function(f) => nested.extend(free_of_nonarrow(&f.params, &f.body)),
-            Expr::Arrow(a) => nested.extend(free_of_function(&a.params, a.body.stmts())),
-            Expr::Class(c) => refs_class(c, direct, nested),
-            Expr::Unary { argument, .. }
-            | Expr::Update { argument, .. }
-            | Expr::Await { argument, .. } => {
+            Expr::Function(f) => {
+                nested.extend(free_of_nonarrow(&f.params, &f.body));
+                nested_writes(&f.params, &f.body, w);
+            }
+            Expr::Arrow(a) => {
+                nested.extend(free_of_function(&a.params, a.body.stmts()));
+                nested_writes(&a.params, a.body.stmts(), w);
+            }
+            Expr::Class(c) => refs_class_w(c, direct, nested, w),
+            Expr::Update { argument, .. } => {
+                note_target_writes(argument, w);
+                e = argument;
+                continue;
+            }
+            Expr::Unary { argument, .. } | Expr::Await { argument, .. } => {
                 e = argument;
                 continue;
             }
             Expr::Yield { argument, .. } => {
                 if let Some(a) = argument {
-                    refs_expr(a, direct, nested);
+                    refs_expr_w(a, direct, nested, w);
                 }
             }
             Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
-                refs_expr(right, direct, nested);
+                refs_expr_w(right, direct, nested, w);
                 e = left;
                 continue;
             }
@@ -14979,24 +15142,25 @@ fn refs_expr(mut e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<
                 alternate,
                 ..
             } => {
-                refs_expr(test, direct, nested);
-                refs_expr(consequent, direct, nested);
-                refs_expr(alternate, direct, nested);
+                refs_expr_w(test, direct, nested, w);
+                refs_expr_w(consequent, direct, nested, w);
+                refs_expr_w(alternate, direct, nested, w);
             }
             Expr::Assign { target, value, .. } => {
-                refs_expr(target, direct, nested);
-                refs_expr(value, direct, nested);
+                note_target_writes(target, w);
+                refs_expr_w(target, direct, nested, w);
+                refs_expr_w(value, direct, nested, w);
             }
             Expr::Sequence { expressions, .. } => {
                 for x in expressions {
-                    refs_expr(x, direct, nested);
+                    refs_expr_w(x, direct, nested, w);
                 }
             }
             Expr::Member {
                 object, property, ..
             } => {
                 match property {
-                    PropertyKey::Computed(k) => refs_expr(k, direct, nested),
+                    PropertyKey::Computed(k) => refs_expr_w(k, direct, nested, w),
                     PropertyKey::Private(n) => {
                         direct.insert(private_binding(n));
                     }
@@ -15023,26 +15187,26 @@ fn refs_expr(mut e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<
                 {
                     direct.insert(String::from(DYN_EVAL));
                 }
-                args(arguments, direct, nested);
+                args(arguments, direct, nested, w);
                 e = callee;
                 continue;
             }
             Expr::Template(t) => {
                 for x in &t.expressions {
-                    refs_expr(x, direct, nested);
+                    refs_expr_w(x, direct, nested, w);
                 }
             }
             Expr::TaggedTemplate { tag, quasi, .. } => {
-                refs_expr(tag, direct, nested);
+                refs_expr_w(tag, direct, nested, w);
                 for x in &quasi.expressions {
-                    refs_expr(x, direct, nested);
+                    refs_expr_w(x, direct, nested, w);
                 }
             }
             Expr::Array { elements, .. } => {
                 for el in elements {
                     match el {
                         ArrayElement::Item(e) | ArrayElement::Spread(e) => {
-                            refs_expr(e, direct, nested)
+                            refs_expr_w(e, direct, nested, w)
                         }
                         ArrayElement::Hole => {}
                     }
@@ -15053,16 +15217,17 @@ fn refs_expr(mut e: &Expr, direct: &mut BTreeSet<String>, nested: &mut BTreeSet<
                     match m {
                         ObjectMember::Property { key, value, .. } => {
                             if let PropertyKey::Computed(e) = key {
-                                refs_expr(e, direct, nested);
+                                refs_expr_w(e, direct, nested, w);
                             }
-                            refs_expr(value, direct, nested);
+                            refs_expr_w(value, direct, nested, w);
                         }
-                        ObjectMember::Spread { value, .. } => refs_expr(value, direct, nested),
+                        ObjectMember::Spread { value, .. } => refs_expr_w(value, direct, nested, w),
                         ObjectMember::Accessor { key, value, .. } => {
                             if let PropertyKey::Computed(e) = key {
-                                refs_expr(e, direct, nested);
+                                refs_expr_w(e, direct, nested, w);
                             }
                             nested.extend(free_of_nonarrow(&value.params, &value.body));
+                            nested_writes(&value.params, &value.body, w);
                         }
                     }
                 }
@@ -15769,6 +15934,11 @@ struct Compiler {
     /// Names in *this* function that are captured by a nested function and so
     /// must be stored as cells.
     cell_names: alloc::collections::BTreeSet<String>,
+    /// The argument registers of captured parameters that no code ever
+    /// writes (see `compile_fn_inner_impl`): bound as plain registers, each
+    /// closure capturing one gets a fresh cell holding its value (no code can
+    /// tell the cells apart: none is ever written).
+    value_captures: alloc::collections::BTreeSet<Reg>,
     /// The register holding `this` (seeded by the caller at `n_params +
     /// n_captures`).
     this_reg: Reg,
@@ -16340,6 +16510,38 @@ impl Compiler {
             c.ops.push(Op::LoadNewTarget { dst });
             dst
         });
+        // A captured parameter that no code ever writes — none of this
+        // function's or its nested functions' assignments, updates or loop
+        // heads targets its name, no declaration of the body rebinds it, and
+        // neither `arguments` nor a direct `eval`/`with` can reach it — holds
+        // its argument for the whole activation: it stays in its register,
+        // and only a closure that captures it gets a cell (`value_captures`).
+        // So an activation that makes no such closure allocates none.
+        let value_params: BTreeSet<String> = if dyn_fn
+            || uses_arguments
+            || param_tdz
+            || param_exprs
+            || is_generator
+            || is_async
+            || is_main
+        {
+            BTreeSet::new()
+        } else {
+            let mut cands = BTreeSet::new();
+            for p in params {
+                if let BindingTarget::Ident(Ident { name, .. }) = &p.target
+                    && c.cell_names.contains(&**name)
+                {
+                    cands.insert(String::from(&**name));
+                }
+            }
+            if !cands.is_empty() {
+                let declared = bound_names(&[], body);
+                let written = written_names(params, body);
+                cands.retain(|n| !declared.contains(n) && !written.contains(n));
+            }
+            cands
+        };
         // …then bind. A captured parameter is boxed into a fresh cell (preserving
         // the incoming argument value); a captured local that's a parameter must
         // share the cell so mutations are visible.
@@ -16354,7 +16556,10 @@ impl Compiler {
                     }
                 }
                 BindingTarget::Ident(Ident { name, .. }) => {
-                    let b = if c.cell_names.contains(&**name) {
+                    if value_params.contains(&**name) {
+                        c.value_captures.insert(arg_regs[i]);
+                    }
+                    let b = if c.cell_names.contains(&**name) && !value_params.contains(&**name) {
                         let cell = c.alloc();
                         c.ops.push(Op::NewArray { dst: cell, len: 1 });
                         let bind = Binding {
@@ -22639,6 +22844,15 @@ impl Compiler {
                 capture_regs.push(cell);
             } else {
                 let b = self.lookup(n).expect("captured binding");
+                // A parameter no code writes (`value_captures`): a fresh cell
+                // of its value, which no code writes either.
+                if !b.cell && b.global.is_none() && self.value_captures.contains(&b.reg) {
+                    let cell = self.alloc();
+                    self.ops.push(Op::NewArray { dst: cell, len: 1 });
+                    self.ops.push(Op::CellSet { cell, src: b.reg });
+                    capture_regs.push(cell);
+                    continue;
+                }
                 // The callee reads every capture as a cell; a plain register
                 // binding here is a missed cell analysis — refuse, never alias.
                 if !b.cell {

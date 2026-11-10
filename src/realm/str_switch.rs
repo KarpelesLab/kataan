@@ -28,9 +28,39 @@ type SwitchWays = [(Option<crate::rope::Rope>, u32); SWITCH_MEMO_WAYS];
 /// one cell), so the memo answers almost every lookup without comparing
 /// bytes. Only short strings are kept.
 /// (Boxed: the op that holds it stays small.)
+///
+/// Compiled code reads the memo through `jit`, a plain mirror of the ways:
+/// way `w` holds the address of `ways[w]`'s rope (`Rope::addr`, `0` while
+/// empty) and its answer as the helper returns it (a Number's bits, `-1`
+/// for none), written together with the way, so an address there is always
+/// that of a rope the memo keeps alive.
 #[derive(Default)]
 pub struct SwitchMemo {
     ways: alloc::boxed::Box<core::cell::RefCell<SwitchWays>>,
+    jit: alloc::boxed::Box<[SwitchJitWay; SWITCH_MEMO_WAYS]>,
+}
+
+/// One way of [`SwitchMemo`]'s compiled-code mirror (see there).
+#[repr(C)]
+#[derive(Default)]
+pub(super) struct SwitchJitWay {
+    addr: core::cell::Cell<u64>,
+    bits: core::cell::Cell<u64>,
+}
+
+/// How compiled code finds a rope's ways in a [`SwitchMemo`]: the address
+/// times this, its top five bits the first way and the next five the second
+/// (see [`Realm::string_switch_index_memo`]).
+pub const SWITCH_MEMO_HASH: u64 = 0x9E37_79B9_7F4A_7C15;
+
+impl SwitchMemo {
+    /// The address of the compiled-code mirror's first way (see
+    /// [`SwitchJitWay`]: 16 bytes each, the rope address then the answer's
+    /// bits).
+    #[must_use]
+    pub fn jit_ways_addr(&self) -> usize {
+        self.jit.as_ptr() as usize
+    }
 }
 
 /// How many discriminants a [`SwitchMemo`] remembers.
@@ -91,7 +121,11 @@ impl Realm {
         // (Fibonacci hashing of the address: nodes allocated a fixed stride
         // apart still spread over the ways. Its top bits pick one way,
         // the next ones the other.)
-        let h = (r.addr() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let h = (r.addr() as u64).wrapping_mul(SWITCH_MEMO_HASH);
+        const _: () = assert!(
+            SWITCH_MEMO_WAYS == 32,
+            "compiled code takes five bits a way"
+        );
         let w1 = (h >> 59) as usize % SWITCH_MEMO_WAYS;
         let w2 = (h >> 54) as usize % SWITCH_MEMO_WAYS;
         {
@@ -115,6 +149,10 @@ impl Realm {
                 w1
             };
             ways[w] = (Some(r.clone()), i.unwrap_or(SWITCH_NONE));
+            let j = &memo.jit[w];
+            j.addr.set(r.addr() as u64);
+            j.bits
+                .set(NanBox::number(i.map_or(-1.0, f64::from)).to_bits());
         }
         i
     }

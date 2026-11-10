@@ -58,6 +58,59 @@ impl KeyProbe {
 }
 
 impl X64Assembler {
+    /// A string `switch`'s memo, inline (`crate::realm::SwitchMemo`'s
+    /// compiled-code mirror at `ways`, 16 bytes a way): when the register at
+    /// `src_disp` holds a String whose rope one of its two ways records,
+    /// `rax` = that way's answer and on to `done`; else to `miss`. A way's
+    /// rope address is that of a rope the memo keeps alive, so a match is
+    /// exact. Clobbers `rax`, `rcx`, `rdx`, `r9`–`r11` (what a helper call
+    /// may).
+    pub(super) fn p_switch_memo(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        src_disp: i32,
+        ways: u64,
+        miss: Label,
+        done: Label,
+    ) {
+        // The value's heap slot (a register's handle is live), a String's.
+        self.p_arena(realm_off, &l.props);
+        self.g_load(r::RAX, r::RBX, src_disp);
+        self.p_cmp_handle_floor(r::RAX);
+        self.g_jcc(cc::B, miss);
+        self.p_slot_rooted(l, r::R9, miss);
+        self.g_cmp_byte_imm(r::R9, l.off_cell_tag, l.cell_str_disc);
+        self.g_jcc(cc::NE, miss);
+        // r11 = its rope's address (`Rope::addr`); rax = its hash.
+        self.g_load(r::R11, r::R9, l.off_str_rope);
+        self.g_lea(r::R11, r::R11, l.rope.tag);
+        self.g_mov(r::RAX, r::R11);
+        self.g_movabs(r::RCX, crate::realm::SWITCH_MEMO_HASH);
+        self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]); // imul rax, rcx
+        self.g_movabs(r::R9, ways);
+        // The first way: the hash's top five bits.
+        self.g_mov(r::RCX, r::RAX);
+        self.g_shr_imm(r::RCX, 59);
+        self.code.extend_from_slice(&[0x48, 0xc1, 0xe1, 0x04]); // shl rcx, 4
+        self.g_add(r::RCX, r::R9);
+        let second = self.new_label();
+        self.g_cmp_mem(r::R11, r::RCX, 0);
+        self.g_jcc(cc::NE, second);
+        self.g_load(r::RAX, r::RCX, 8);
+        self.jmp(done);
+        // The second: the next five.
+        self.bind(second);
+        self.g_shr_imm(r::RAX, 54);
+        self.code.extend_from_slice(&[0x83, 0xe0, 0x1f]); // and eax, 31
+        self.code.extend_from_slice(&[0x48, 0xc1, 0xe0, 0x04]); // shl rax, 4
+        self.g_add(r::RAX, r::R9);
+        self.g_cmp_mem(r::R11, r::RAX, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RAX, r::RAX, 8);
+        self.jmp(done);
+    }
+
     /// `rax` = the memoized slot of the String in register `key_disp` in the
     /// layout of the object whose heap slot is `rcx` (a shaped ordinary
     /// object without the exotic flag or accessors: the caller checked),

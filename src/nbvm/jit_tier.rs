@@ -1303,6 +1303,43 @@ pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: 
     // code runs.
     #[allow(unsafe_code)]
     let op = unsafe { &*(op as usize as *const Op) };
+    // A global write validated by an earlier activation (`StoreRefMemo`):
+    // the common case, kept small.
+    if let Op::StoreGlobal { cache, .. } = op
+        && let Some(p) = store_memo_hit(ctx, cache)
+    {
+        return p;
+    }
+    global_ref_slow(ctx, op)
+}
+
+/// The memo hit of [`global_store_ref`], when there is one: the binding
+/// address, with the op's mirror target restored. (The memo is filled only
+/// for a write `global_store_ref` validates.)
+#[inline(always)]
+fn store_memo_hit(ctx: &Ctx, cache: &super::StoreGlobalCache) -> Option<u64> {
+    let (e, mg, p, m) = cache.jit_memo.v.get();
+    if e != crate::env::global_binding_epoch() {
+        return None;
+    }
+    let (_, global) = ctx.host.as_deref()?.global_scope_if_current()?;
+    if global.as_handle() != Some(mg) {
+        return None;
+    }
+    if m == u64::MAX {
+        cache.jit.set(0);
+    } else {
+        if !cache.jit.on() {
+            return None;
+        }
+        cache.jit.set(m);
+    }
+    Some(p)
+}
+
+/// [`jit_helper_global_ref`] past the write memo.
+#[inline(never)]
+fn global_ref_slow(ctx: &mut Ctx, op: &Op) -> u64 {
     let p = match op {
         Op::LoadGlobal { name, cache, .. } => ctx
             .host
@@ -1329,39 +1366,14 @@ fn global_store_ref(
     name: &str,
     cache: &super::StoreGlobalCache,
 ) -> Option<*mut NanBox> {
-    // The address this op validated last, under the same global binding
-    // epoch (no binding added, freed or moved, the global scope not
-    // swapped), while the running scope is still the global scope and the
-    // global object it was validated against still has no like-named own
-    // property (the same object at the same key epoch): what the steps
-    // below would find again. (A body's frame cache holds a write address
-    // only for one activation, so a small function writing a global counter
-    // validated it on every call.)
+    // (Read before validating: a validation that bumped it is not memoized
+    // as current.)
     let epoch = crate::env::global_binding_epoch();
-    let (memo_epoch, memo) = cache.wmemo.get();
-    if memo != 0
-        && memo_epoch == epoch
-        && cache.owned.get() == 1
-        && let Some((_, g)) = ctx.host.as_deref()?.global_scope_if_current()
-        && g.as_handle() == Some(cache.global.get())
-        && ctx
-            .realm
-            .jit_object(Handle::from_raw(cache.global.get()))
-            .is_some_and(|o| o.key_epoch() == cache.epoch.get())
-    {
-        cache.jit.set(0);
-        return Some(memo as usize as *mut NanBox);
-    }
-    cache.wmemo.set((0, 0));
-    let Some((p, g)) =
-        ctx.host
-            .as_deref()?
-            .global_scope_if_current()
-            .and_then(|(scope, global)| {
-                let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
-                Some((p, Handle::from_raw(global.as_handle()?)))
-            })
-    else {
+    let host = ctx.host.as_deref()?;
+    let Some((p, g)) = host.global_scope_if_current().and_then(|(scope, global)| {
+        let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
+        Some((p, Handle::from_raw(global.as_handle()?)))
+    }) else {
         // No plain global-scope binding: an existing writable data property
         // of the global object, written as a binding-less mirror write.
         return super::global_obj::jit_store_ref(ctx, name, cache);
@@ -1379,22 +1391,18 @@ fn global_store_ref(
     // (The lexical test, a search of the scope's lexical names, only matters
     // for a name the global object owns: asked second, as most such writes
     // are a script's `let` counter's, run once per activation.)
-    if !super::global_owns_cached(&ctx.realm, g, name, cache) {
-        cache.jit.set(0);
-        // (Memoized only once the owned-property answer is cached against
-        // this global object's key epoch, which the memo's check reads.)
-        if cache.owned.get() == 1 && cache.global.get() == g.to_raw() {
-            cache.wmemo.set((epoch, p as usize as u64));
-        }
-        return Some(p);
-    }
-    if ctx
-        .host
-        .as_deref()
-        .and_then(|h| h.global_scope_if_current())
-        .is_some_and(|(scope, _)| scope.has_lexical(name))
+    if !super::global_owns_cached(&ctx.realm, g, name, cache)
+        || ctx
+            .host
+            .as_deref()
+            .and_then(|h| h.global_scope_if_current())
+            .is_some_and(|(scope, _)| scope.has_lexical(name))
     {
         cache.jit.set(0);
+        cache
+            .jit_memo
+            .v
+            .set((epoch, g.to_raw(), p as usize as u64, u64::MAX));
         return Some(p);
     }
     // A global `var`: the write also goes to the global object's property,
@@ -1404,6 +1412,10 @@ fn global_store_ref(
     }
     let m = ctx.realm.jit_data_ptr(g, name)?;
     cache.jit.set(m as usize as u64);
+    cache
+        .jit_memo
+        .v
+        .set((epoch, g.to_raw(), p as usize as u64, m as usize as u64));
     Some(p)
 }
 
@@ -1617,6 +1629,24 @@ pub(crate) extern "C" fn jit_helper_to_str(
         None if lazy != 0 => v,
         None => NanBox::handle(ctx.realm.new_primitive_string(value).to_raw()).to_bits(),
     }
+}
+
+/// `x instanceof f` (an `Op::Relational` with `instanceof`) when the
+/// interpreter arm's fast path decides it (`instance_of_fast`: `f` a VM
+/// closure with the default `[[HasInstance]]`, `x`'s chain ordinary): the
+/// boolean's bits; `0`, having done nothing observable, for anything else
+/// (the op itself runs). Runs no JavaScript and never throws.
+pub(crate) extern "C" fn jit_helper_instance_of(
+    ctx: *mut core::ffi::c_void,
+    x: u64,
+    f: u64,
+    _unused: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_site_fill`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    super::instance_of_fast(&mut ctx.realm, NanBox::from_bits(x), NanBox::from_bits(f))
+        .map_or(0, |r| NanBox::boolean(r).to_bits())
 }
 
 /// `Op::SwitchStr` at `op` of the discriminant `v`: the index of the first
