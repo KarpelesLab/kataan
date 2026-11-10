@@ -10920,17 +10920,16 @@ impl JitFunction {
                     // and call sequence in the body first sets it unless
                     // the activation is materialized already
                     // (`call_seq::PlainLazy`). (An inner level's only
-                    // inside its enclosing level's plainly lazy body.)
-                    // (An inner level's whatever is being emitted: a
-                    // speculative fast version of a loop inlined in the
-                    // body too, which calls only to poll, and whose leaves
-                    // continue in its plain copy, in the same window.)
+                    // inside its enclosing level's plainly lazy body.) In a
+                    // speculative loop's fast version too, where the scheme
+                    // above does not apply (a polymorphic way, a body that
+                    // loops): it calls only to poll, and its leaves
+                    // continue in its plain copy, whose windows find the
+                    // marker set or not (`PlainLazy::seq`).
                     let plain = plain_leave[op_idx].filter(|&l| {
                         lazy.is_none()
                             && if outermost {
-                                !num.in_spec(op_idx)
-                                    && plain_open.is_empty()
-                                    && inl_level[op_idx] == 1
+                                plain_open.is_empty() && inl_level[op_idx] == 1
                             } else {
                                 plain_open
                                     .last()
