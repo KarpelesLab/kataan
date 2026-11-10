@@ -127,6 +127,10 @@ pub struct Regex {
     /// The original pattern source, retained so [`scalar_prog`](Self::scalar_prog)
     /// can be parsed+compiled lazily on first adapter use.
     source: alloc::string::String,
+    /// For a program that is one single-character atom (see
+    /// [`single_atom_scan`](Self::single_atom_scan)), the Latin-1 code units
+    /// the atom accepts, by the matcher's own predicate; built on first use.
+    atom_latin1: core::cell::OnceCell<[u64; 4]>,
     /// Whether every path through the program passes a `^` assertion before it
     /// can consume input or match — so a non-multiline match can only begin at
     /// one position and the scan must not retry at every offset. See
@@ -279,6 +283,7 @@ impl Regex {
             linear: linear::Linear::build(&prog, flags, 2 * (group_count + 1)),
             prog,
             scalar_prog: core::cell::OnceCell::new(),
+            atom_latin1: core::cell::OnceCell::new(),
             source: alloc::string::String::from(pattern),
             group_count,
             group_names,
@@ -519,6 +524,60 @@ impl Regex {
             &core::cell::Cell::new(0),
             out,
         )
+    }
+
+    /// Every match of a global scan from `from` (the loop of
+    /// [`captures_into_u16`](Self::captures_into_u16) calls, each resuming
+    /// where the last match ended) appended to `out`, for a pattern that is a
+    /// single one-character atom (a literal, `.` or a class, with no capture
+    /// group or assertion) under flags without `u`/`v`: then a match is
+    /// exactly one code unit the atom accepts, never empty, so the scan is
+    /// one pass over the units (stopping at the first miss when sticky).
+    /// `false`, having appended nothing, for any other pattern.
+    pub fn single_atom_scan(
+        &self,
+        units: &[u16],
+        from: usize,
+        out: &mut Vec<Option<(usize, usize)>>,
+    ) -> bool {
+        use vm::Inst;
+        let flags = self.flags;
+        if flags.unicode || flags.unicode_sets || self.group_count != 0 {
+            return false;
+        }
+        let atom = match self.prog.as_slice() {
+            [
+                Inst::Save(0),
+                atom @ (Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. }),
+                Inst::Save(1),
+                Inst::Match,
+            ] => atom,
+            _ => return false,
+        };
+        let latin1 = self.atom_latin1.get_or_init(|| {
+            let mut set = [0u64; 4];
+            for u in 0u32..256 {
+                if vm::single_consume_matches(atom, u, flags) {
+                    set[(u >> 6) as usize] |= 1u64 << (u & 63);
+                }
+            }
+            set
+        });
+        let accepts = |u: u16| {
+            if u < 256 {
+                latin1[usize::from(u >> 6)] & (1u64 << (u & 63)) != 0
+            } else {
+                vm::single_consume_matches(atom, u32::from(u), flags)
+            }
+        };
+        for (i, &u) in units.iter().enumerate().skip(from) {
+            if accepts(u) {
+                out.push(Some((i, i + 1)));
+            } else if flags.sticky {
+                break;
+            }
+        }
+        true
     }
 
     /// The scan behind [`scan_counted`](Self::scan_counted): on a match, appends

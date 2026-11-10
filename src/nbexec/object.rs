@@ -791,6 +791,82 @@ impl Interp {
         r
     }
 
+    /// A literal's or class body's method definition (`Op` define-method):
+    /// `SetFunctionName(f, fname)` (the define of `f`'s own `name` as
+    /// `{value: fname, writable: false, enumerable: false, configurable:
+    /// true}`), then `DefinePropertyOrThrow(o, key, desc)` with the method
+    /// (`kind` 0), getter (1) or setter (2) and `enumerable` — done as
+    /// exactly the property operations [`apply_descriptor`](Self::apply_descriptor)
+    /// makes for these descriptors, without building them, when nothing
+    /// exotic is involved: `f` is a fresh VM closure whose `name` is still
+    /// synthesized, and `o` is an ordinary extensible object (not a global
+    /// object, mapped `arguments`, tracked built-in prototype or host-exotic
+    /// one) owning no `key` (a string key). `false`, having changed nothing,
+    /// for anything else.
+    pub(crate) fn define_method_fast(
+        &mut self,
+        o: Handle,
+        f: Handle,
+        key: &str,
+        fname: NanBox,
+        kind: u8,
+        enumerable: bool,
+    ) -> bool {
+        if key.starts_with('\0')
+            || !self.realm.is_vm_function(f)
+            || self.realm.is_host_exotic(f)
+            || !self.realm.is_plain_object(o)
+            || self.realm.is_host_exotic(o)
+            || self.realm.is_dispatch_tracked_proto(o)
+            || self.is_mapped_arguments(o)
+            || crate::nbvm::VmHost::is_global_object(self, NanBox::handle(o.to_raw()))
+            || !self.realm.is_extensible(o)
+            || self.realm.has_own(o, key)
+            || self.realm.accessor(o, key).is_some()
+        {
+            return false;
+        }
+        let Some(meta) = self.realm.vm_fn_meta_value(f, "name") else {
+            return false;
+        };
+        // `f.name`: the synthesized property made physical (as the define
+        // of a VM closure's `name` first does), then redefined.
+        self.realm.set_property(f, "name", meta);
+        self.realm.mark_hidden(f, "name");
+        self.realm.set_readonly_property(f, "name");
+        self.realm.clear_accessor(f, "name");
+        self.realm.clear_readonly_property(f, "name");
+        self.realm.force_set_property(f, "name", fname);
+        self.realm.set_readonly_property(f, "name");
+        self.realm.mark_hidden(f, "name");
+        self.realm.clear_non_configurable_property(f, "name");
+        // `o[key]`: a new accessor or writable data property.
+        let func = NanBox::handle(f.to_raw());
+        if kind == 1 || kind == 2 {
+            let (getter, setter) = if kind == 1 {
+                (func, NanBox::undefined())
+            } else {
+                (NanBox::undefined(), func)
+            };
+            self.realm.ensure_key_order(o);
+            self.realm.clear_accessor(o, key);
+            self.realm.delete_data_slot(o, key);
+            self.realm.clear_readonly_property(o, key);
+            self.realm.define_accessor(o, key, getter, setter);
+        } else {
+            self.realm.clear_accessor(o, key);
+            self.realm.clear_readonly_property(o, key);
+            self.realm.force_set_property(o, key, func);
+        }
+        if enumerable {
+            self.realm.clear_hidden_property(o, key);
+        } else {
+            self.realm.mark_hidden(o, key);
+        }
+        self.realm.clear_non_configurable_property(o, key);
+        true
+    }
+
     fn apply_descriptor_inner(
         &mut self,
         obj: Handle,

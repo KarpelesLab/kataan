@@ -2770,6 +2770,23 @@ impl Interp {
         a: NanBox,
         b: NanBox,
     ) -> Result<NanBox, ExecError> {
+        // Two String primitives under a relational operator: ToPrimitive is the
+        // identity on both and neither is a BigInt or Symbol, so the steps
+        // below come straight to the string comparison.
+        if matches!(
+            op,
+            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq
+        ) && let (Some(ra), Some(rb)) = (a.as_handle(), b.as_handle())
+            && self.realm.typeof_is_string(Handle::from_raw(ra))
+            && self.realm.typeof_is_string(Handle::from_raw(rb))
+        {
+            return Ok(match op {
+                BinaryOp::Lt => self.realm.less_than(a, b),
+                BinaryOp::Gt => self.realm.greater_than(a, b),
+                BinaryOp::LtEq => self.realm.less_equal(a, b),
+                _ => self.realm.greater_equal(a, b),
+            });
+        }
         // An operand that is a wrapper/plain object (not a bigint/string primitive
         // or symbol) must be ToPrimitive-coerced *before* the BigInt path, so a
         // BigInt wrapper (`Object(1n)`) or a `Symbol.toPrimitive` yielding a BigInt

@@ -24,7 +24,8 @@ impl Interp {
     /// that value's exact JSON source text. Structural values (objects/arrays) and
     /// values a reviver has forward-substituted get a bare `{}` context.
     ///
-    /// `snapshot` is the parse-time source node for the value currently at
+    /// `snapshot` is the parse-time source node (its spans into the parsed
+    /// `cx.text`) for the value currently at
     /// `holder[key]` (or `None` for a member the reviver added).
     pub(crate) fn json_revive_ctx(
         &mut self,
@@ -32,13 +33,17 @@ impl Interp {
         key: &str,
         reviver: NanBox,
         snapshot: Option<&JsonSrc>,
+        cx: &mut ReviveCx<'_>,
     ) -> Result<NanBox, ExecError> {
         // The walk recurses once per nesting level of the (possibly
         // reviver-grown) value: bounded by the real stack headroom.
         if crate::stack::exhausted() {
             return Err(self.json_too_deep());
         }
-        let value = self.read_member(holder, key)?;
+        // `Get(holder, name)`: an own plain data property is read straight
+        // from its slot (no user code can observe that), anything else takes
+        // the full `[[Get]]`.
+        let value = self.get_own_fast(holder, key)?;
         if let Some(vh) = value.as_handle().map(Handle::from_raw) {
             if self.realm.is_array(self.proxy_key_target(vh)) {
                 let len_v = self.read_member(vh, "length")?;
@@ -50,20 +55,8 @@ impl Interp {
                         Some(JsonSrc::Array(v)) => v.get(i),
                         _ => None,
                     };
-                    let nv = self.json_revive_ctx(vh, &ks, reviver, child)?;
-                    if matches!(nv.unpack(), Unpacked::Undefined) {
-                        self.delete_property_of(vh, &ks)?;
-                    } else {
-                        let desc = self.realm.new_object();
-                        self.realm.set_property(desc, "value", nv);
-                        self.realm
-                            .set_property(desc, "writable", NanBox::boolean(true));
-                        self.realm
-                            .set_property(desc, "enumerable", NanBox::boolean(true));
-                        self.realm
-                            .set_property(desc, "configurable", NanBox::boolean(true));
-                        self.apply_descriptor(vh, &ks, desc, true)?;
-                    }
+                    let nv = self.json_revive_ctx(vh, &ks, reviver, child, cx)?;
+                    self.json_revive_store(vh, &ks, Some(i), nv)?;
                 }
             } else {
                 // EnumerableOwnPropertyNames(val, KEY) for any other object. A
@@ -103,20 +96,8 @@ impl Interp {
                         },
                         _ => None,
                     };
-                    let nv = self.json_revive_ctx(vh, &k, reviver, child)?;
-                    if matches!(nv.unpack(), Unpacked::Undefined) {
-                        self.delete_property_of(vh, &k)?;
-                    } else {
-                        let desc = self.realm.new_object();
-                        self.realm.set_property(desc, "value", nv);
-                        self.realm
-                            .set_property(desc, "writable", NanBox::boolean(true));
-                        self.realm
-                            .set_property(desc, "enumerable", NanBox::boolean(true));
-                        self.realm
-                            .set_property(desc, "configurable", NanBox::boolean(true));
-                        self.apply_descriptor(vh, &k, desc, true)?;
-                    }
+                    let nv = self.json_revive_ctx(vh, &k, reviver, child, cx)?;
+                    self.json_revive_store(vh, &k, None, nv)?;
                 }
             }
         }
@@ -124,11 +105,20 @@ impl Interp {
         // one the parser produced here (SameValue) exposes its `source`.
         let context = self.realm.new_object();
         if !self.is_object_value(value)
-            && let Some(JsonSrc::Prim { value: pv, source }) = snapshot
-            && self.realm.same_value(*pv, value)
+            && let Some(&JsonSrc::Prim {
+                value: pv,
+                span: (a, b),
+            }) = snapshot
+            && self.realm.same_value(pv, value)
+            && let Some(source) = cx.text.get(a..b)
         {
-            let src_box = self.new_str_bytes(source.clone());
-            self.realm.set_property(context, "source", src_box);
+            let src_box = self.new_str_bytes(source.to_vec());
+            if !self
+                .realm
+                .init_data_property_cached(context, "source", src_box, &mut cx.source_ic)
+            {
+                self.realm.set_property(context, "source", src_box);
+            }
         }
         let kb = self.new_key_str(key);
         self.call_with_this(
@@ -136,6 +126,73 @@ impl Interp {
             NanBox::handle(holder.to_raw()),
             &[kb, value, NanBox::handle(context.to_raw())],
         )
+    }
+
+    /// The step of `InternalizeJSONProperty` that puts a revived element
+    /// back: `newElement` undefined deletes `key` from `holder`, anything else
+    /// is `CreateDataProperty(holder, key, newElement)` (whose failure is
+    /// ignored). `index` is `key` as an array index when `holder` was walked
+    /// as an array.
+    fn json_revive_store(
+        &mut self,
+        holder: Handle,
+        key: &str,
+        index: Option<usize>,
+        value: NanBox,
+    ) -> Result<(), ExecError> {
+        if matches!(value.unpack(), Unpacked::Undefined) {
+            self.delete_property_of(holder, key)?;
+            return Ok(());
+        }
+        if self.json_store_existing_plain(holder, key, index, value) {
+            return Ok(());
+        }
+        let desc = self.realm.new_object();
+        self.realm.set_property(desc, "value", value);
+        self.realm
+            .set_property(desc, "writable", NanBox::boolean(true));
+        self.realm
+            .set_property(desc, "enumerable", NanBox::boolean(true));
+        self.realm
+            .set_property(desc, "configurable", NanBox::boolean(true));
+        self.apply_descriptor(holder, key, desc, true)?;
+        Ok(())
+    }
+
+    /// `CreateDataProperty(holder, key, value)` when it is just a store into
+    /// an existing slot: `key` names a present writable, enumerable,
+    /// configurable own data property of an ordinary object or an ordinary
+    /// array (no proxy, no exotic or host-observed object, no global object,
+    /// no mapped `arguments`, no tracked built-in prototype), so the
+    /// `[[DefineOwnProperty]]` only replaces the value. `false`, having
+    /// changed nothing, for anything else.
+    fn json_store_existing_plain(
+        &mut self,
+        holder: Handle,
+        key: &str,
+        index: Option<usize>,
+        value: NanBox,
+    ) -> bool {
+        if self.realm.is_host_exotic(holder) || self.realm.is_dispatch_tracked_proto(holder) {
+            return false;
+        }
+        if let Some(i) = index
+            && self.realm.is_plain_array_cell(holder)
+        {
+            return !self.realm.array_has_index_overrides(holder)
+                && self
+                    .realm
+                    .array_elements(holder)
+                    .is_some_and(|a| a.get(i).is_some_and(|v| !v.is_hole()))
+                && self.realm.set_element(holder, i, value);
+        }
+        if !self.realm.is_plain_object(holder)
+            || self.is_mapped_arguments(holder)
+            || crate::nbvm::VmHost::is_global_object(self, NanBox::handle(holder.to_raw()))
+        {
+            return false;
+        }
+        self.realm.store_existing_plain_data(holder, key, value)
     }
 
     /// `JSON.stringify(value, replacer, space)` — the unified spec algorithm
@@ -1101,7 +1158,7 @@ impl Interp {
 
     /// The RangeError of a recursive JSON walk that ran out of native stack
     /// (the input itself may be valid, so it is not a SyntaxError).
-    fn json_too_deep(&mut self) -> ExecError {
+    pub(super) fn json_too_deep(&mut self) -> ExecError {
         let m = self.new_str("Maximum call stack size exceeded");
         ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m)))
     }
@@ -1233,112 +1290,6 @@ impl Interp {
                 text.parse::<f64>()
                     .map(NanBox::number)
                     .map_err(|_| self.json_error("Invalid number in JSON"))
-            }
-            _ => Err(self.json_error("Unexpected token in JSON")),
-        }
-    }
-
-    /// Like [`Self::json_parse`] but also returns a parallel [`JsonSrc`] tree that
-    /// records, for every primitive leaf, the value produced and its exact source
-    /// substring — the raw material for the `json-parse-with-source` reviver
-    /// `context`. Only invoked when `JSON.parse` is given a callable reviver.
-    pub(crate) fn json_parse_src(
-        &mut self,
-        c: &[char],
-        pos: &mut usize,
-        depth: usize,
-    ) -> Result<(NanBox, JsonSrc), ExecError> {
-        skip_ws(c, pos);
-        let Some(&ch) = c.get(*pos) else {
-            return Err(self.json_error("Unexpected end of JSON input"));
-        };
-        if matches!(ch, '[' | '{')
-            && (depth >= self.realm.limits.max_json_depth || crate::stack::exhausted())
-        {
-            return Err(self.json_too_deep());
-        }
-        // Helper: the source substring `c[start..*pos]` collected as a String.
-        match ch {
-            'n' | 't' | 'f' | '"' | '-' | '0'..='9' => {
-                let start = *pos;
-                let value = self.json_parse(c, pos, depth)?;
-                let source = json_source_bytes(&c[start..*pos], self.json_lone_base);
-                Ok((value, JsonSrc::Prim { value, source }))
-            }
-            '[' => {
-                *pos += 1;
-                let mut elems = Vec::new();
-                let mut srcs = Vec::new();
-                skip_ws(c, pos);
-                if c.get(*pos) == Some(&']') {
-                    *pos += 1;
-                    return Ok((
-                        NanBox::handle(self.realm.new_array(elems).to_raw()),
-                        JsonSrc::Array(srcs),
-                    ));
-                }
-                loop {
-                    let (v, s) = self.json_parse_src(c, pos, depth + 1)?;
-                    elems.push(v);
-                    srcs.push(s);
-                    skip_ws(c, pos);
-                    match c.get(*pos) {
-                        Some(',') => *pos += 1,
-                        Some(']') => {
-                            *pos += 1;
-                            break;
-                        }
-                        _ => return Err(self.json_error("Expected ',' or ']'")),
-                    }
-                }
-                Ok((
-                    NanBox::handle(self.realm.new_array(elems).to_raw()),
-                    JsonSrc::Array(srcs),
-                ))
-            }
-            '{' => {
-                *pos += 1;
-                let obj = self.realm.new_object();
-                let mut pairs = Vec::new();
-                skip_ws(c, pos);
-                if c.get(*pos) == Some(&'}') {
-                    *pos += 1;
-                    return Ok((NanBox::handle(obj.to_raw()), JsonSrc::Object(pairs)));
-                }
-                loop {
-                    skip_ws(c, pos);
-                    if c.get(*pos) != Some(&'"') {
-                        return Err(self.json_error("Expected property name"));
-                    }
-                    let key = crate::realm::user_key_wtf8(&self.json_string(c, pos)?);
-                    skip_ws(c, pos);
-                    if c.get(*pos) != Some(&':') {
-                        return Err(self.json_error("Expected ':'"));
-                    }
-                    *pos += 1;
-                    let (v, s) = self.json_parse_src(c, pos, depth + 1)?;
-                    self.realm.set_property(obj, &key, v);
-                    // A duplicate key keeps the last value (matching `set_property`);
-                    // record the last source for it too.
-                    if let Some(slot) = pairs
-                        .iter_mut()
-                        .find(|(k, _): &&mut (String, JsonSrc)| k == &key)
-                    {
-                        slot.1 = s;
-                    } else {
-                        pairs.push((key, s));
-                    }
-                    skip_ws(c, pos);
-                    match c.get(*pos) {
-                        Some(',') => *pos += 1,
-                        Some('}') => {
-                            *pos += 1;
-                            break;
-                        }
-                        _ => return Err(self.json_error("Expected ',' or '}'")),
-                    }
-                }
-                Ok((NanBox::handle(obj.to_raw()), JsonSrc::Object(pairs)))
             }
             _ => Err(self.json_error("Unexpected token in JSON")),
         }
@@ -1480,24 +1431,27 @@ fn push_json_source_char(ch: char, lone_base: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// A slice of a [`json_text_chars`] text as WTF-8.
-fn json_source_bytes(c: &[char], lone_base: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(c.len());
-    for &ch in c {
-        push_json_source_char(ch, lone_base, &mut out);
-    }
-    out
-}
-
 /// A parse-time source-text snapshot mirroring a parsed JSON value's structure,
 /// used by the `json-parse-with-source` reviver `context`. Each primitive leaf
-/// records the value the parser produced and its exact source substring so the
+/// records the value the parser produced and where its exact source text is so the
 /// reviver can be handed the original text (unless a reviver has since replaced
 /// the value at that position — checked by SameValue).
 pub(crate) enum JsonSrc {
-    Prim { value: NanBox, source: Vec<u8> },
+    /// The value made and the byte range of its source in the parsed text.
+    Prim {
+        value: NanBox,
+        span: (usize, usize),
+    },
     Array(Vec<JsonSrc>),
     Object(Vec<(String, JsonSrc)>),
+}
+
+/// The state of one reviver walk ([`Interp::json_revive_ctx`]): the parsed
+/// text the [`JsonSrc`] spans point into, and the transition cache that adds
+/// `source` to each fresh `context` object.
+pub(crate) struct ReviveCx<'a> {
+    pub(crate) text: &'a [u8],
+    pub(crate) source_ic: crate::ic::PropertyCache,
 }
 
 /// The state of one `JSON.stringify` run: the replacer, the gap, the cycle

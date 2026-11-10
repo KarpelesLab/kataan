@@ -2786,6 +2786,18 @@ impl Object {
             })
     }
 
+    /// `CreateDataProperty(key, value)` for an existing own property that
+    /// is already a writable, enumerable, configurable data property (see
+    /// [`is_plain_data_slot_or_absent`](Self::is_plain_data_slot_or_absent))
+    /// of an object no host hook watches (not exotic, not a global object,
+    /// no write the host must see): the define is exactly the store of the
+    /// new value. `false`, having changed nothing, for anything else.
+    pub fn store_existing_plain(&mut self, key: &str, value: NanBox) -> bool {
+        self.flags & (JIT_FLAG_EXOTIC | JIT_FLAG_NO_INLINE_SET | JIT_FLAG_GLOBAL) == 0
+            && self.is_plain_data_slot_or_absent(key)
+            && self.write_existing(key, value)
+    }
+
     /// `CreateDataProperty(key, value)` through a transition cache, for a
     /// site that always adds the same `key` (an object literal). Returns
     /// `false`, having changed nothing, unless the define is a plain store

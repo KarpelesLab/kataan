@@ -541,6 +541,14 @@ pub struct Interp {
     subject_units_cache: [Option<(u64, alloc::rc::Rc<Vec<u16>>)>; 2],
     /// `RegExpExec`'s `Get(R, "exec")` memo (see `regexp_exec_method`).
     regexp_exec_lookup: crate::realm::builtins_fast::MethodSiteCache,
+    /// The `%RegExp.prototype%` (with its realm, key epoch and the realm's
+    /// cell-swap count) last found to hold the intrinsic `flags` getter and
+    /// flag getters (see `regexp_flags_fast`).
+    regexp_flags_proof: Option<(usize, u64, u32, u32)>,
+    /// `RegExp.prototype[@@replace]` / `[@@match]` / `[@@split]` lookup memos
+    /// (see `regexp_symbol_method`), and those keys' storage strings.
+    regexp_symbol_lookup: [crate::realm::builtins_fast::MethodSiteCache; 3],
+    regexp_symbol_keys: [Option<(usize, alloc::rc::Rc<str>)>; 3],
     /// The layout of a RegExp match array's `index`/`input`/`groups`.
     #[cfg(feature = "regex")]
     match_array_shape: crate::realm::builtins_fast::AuxShapeCache,
@@ -3041,6 +3049,9 @@ impl Interp {
             realm_spares: Vec::new(),
             subject_units_cache: [None, None],
             regexp_exec_lookup: Default::default(),
+            regexp_flags_proof: None,
+            regexp_symbol_lookup: Default::default(),
+            regexp_symbol_keys: [None, None, None],
             #[cfg(feature = "regex")]
             match_array_shape: Default::default(),
             current: Scope::root(),
@@ -9918,8 +9929,11 @@ impl crate::nbvm::VmHost for Interp {
             _ => "",
         };
         let fname = self.realm.function_name_for_key(key, prefix);
-        let nd = self.realm.new_object();
         let nv = self.new_str_bytes(fname);
+        if self.define_method_fast(o, f, &name, nv, kind, enumerable) {
+            return Ok(());
+        }
+        let nd = self.realm.new_object();
         self.realm.set_property(nd, "value", nv);
         self.realm
             .set_property(nd, "writable", NanBox::boolean(false));

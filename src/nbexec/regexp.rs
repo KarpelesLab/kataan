@@ -147,9 +147,7 @@ impl Interp {
             return Ok(false);
         }
         let h = v.as_handle().map(Handle::from_raw).unwrap();
-        let sym = self.well_known_symbol("match");
-        let key = self.member_key(sym);
-        let m = self.read_member(h, &key)?;
+        let m = self.regexp_symbol_get(h, "match")?;
         if !matches!(m.unpack(), Unpacked::Undefined) {
             return Ok(self.realm.truthy(m));
         }
@@ -718,12 +716,38 @@ impl Interp {
     }
 
     /// The fast case of [`regexp_read_flags`](Self::regexp_read_flags).
-    fn regexp_flags_fast(&self, h: Handle) -> Option<String> {
+    fn regexp_flags_fast(&mut self, h: Handle) -> Option<String> {
         let flags = self.realm.regexp_flags(h)?;
         let proto = self.current_regexp_proto()?;
         if self.realm.has_aux_object(h) || self.realm.object_proto(h)? != proto {
             return None;
         }
+        // The getters were all found intact on this prototype at this key
+        // epoch (which any (re)definition or removal of one of its own
+        // properties moves) with no cell swapped since: they still are.
+        let stamp = self.realm.object_key_epoch(proto).map(|epoch| {
+            (
+                core::ptr::from_ref::<Realm>(&self.realm) as usize,
+                proto.to_raw(),
+                epoch,
+                self.realm.cell_swap_count(),
+            )
+        });
+        if stamp.is_none() || self.regexp_flags_proof != stamp {
+            self.regexp_flags_check(proto)?;
+            self.regexp_flags_proof = stamp;
+        }
+        let mut out = String::with_capacity(flags.len());
+        for c in "dgimsuvy".chars().filter(|&c| flags.contains(c)) {
+            out.push(c);
+        }
+        Some(out)
+    }
+
+    /// Whether `proto` holds the intrinsic `flags` getter and every
+    /// intrinsic flag getter `flags` calls (see
+    /// [`regexp_flags_fast`](Self::regexp_flags_fast)).
+    fn regexp_flags_check(&self, proto: Handle) -> Option<()> {
         for key in [
             "flags",
             "hasIndices",
@@ -745,7 +769,7 @@ impl Interp {
                 return None;
             }
         }
-        Some("dgimsuvy".chars().filter(|&c| flags.contains(c)).collect())
+        Some(())
     }
 
     /// `RegExp.prototype.compile(pattern, flags)`: recompiles the RegExp in place.
@@ -1141,6 +1165,9 @@ impl Interp {
         let stride = re.group_count() + 1;
         let mut spans = Vec::new();
         let mut li = self.realm.regex_last_index(rh);
+        if re.single_atom_scan(units, li, &mut spans) {
+            li = usize::MAX;
+        }
         while li <= units.len() && re.captures_into_u16(units, li, &mut spans) {
             let (a, b) = spans[spans.len() - stride].unwrap_or_default();
             li = if a == b {
@@ -1166,6 +1193,48 @@ impl Interp {
         }
         self.realm
             .method_site_fill(h, "exec", &mut self.regexp_exec_lookup)
+    }
+
+    /// `Get(search, @@name)` for `name` one of `replace`, `match`, `split`:
+    /// for a RegExp receiver, answered from a validated method-site cache
+    /// when the lookup provably ends at a data property (so the `[[Get]]`
+    /// runs no user code and reading the slot is the same), else the full
+    /// `[[Get]]`.
+    pub(crate) fn regexp_symbol_get(
+        &mut self,
+        search: Handle,
+        name: &'static str,
+    ) -> Result<NanBox, ExecError> {
+        let which = match name {
+            "replace" => 0,
+            "match" => 1,
+            "split" => 2,
+            _ => {
+                let sym = self.well_known_symbol(name);
+                let key = self.member_key(sym);
+                return self.read_member(search, &key);
+            }
+        };
+        let rp = core::ptr::from_ref::<Realm>(&self.realm) as usize;
+        let key = match &self.regexp_symbol_keys[which] {
+            Some((p, k)) if *p == rp => alloc::rc::Rc::clone(k),
+            _ => {
+                let sym = self.well_known_symbol(name);
+                let k: alloc::rc::Rc<str> = self.member_key(sym).into();
+                self.regexp_symbol_keys[which] = Some((rp, alloc::rc::Rc::clone(&k)));
+                k
+            }
+        };
+        if self.realm.regexp_flags(search).is_some() {
+            let cache = &mut self.regexp_symbol_lookup[which];
+            if let Some(v) = self.realm.method_site_get(search, &key, cache) {
+                return Ok(v);
+            }
+            if let Some(v) = self.realm.method_site_fill(search, &key, cache) {
+                return Ok(v);
+            }
+        }
+        self.read_member(search, &key)
     }
 
     /// `Get(R, "lastIndex")`, read straight from a RegExp's own slot when it
@@ -1289,7 +1358,7 @@ impl Interp {
         let unicode = flags.contains('u') || flags.contains('v');
         // Reset lastIndex to 0 (`Set(rx, "lastIndex", 0, true)`); the receiver is
         // generic, so the property is created/written via the throwing `[[Set]]`.
-        self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
+        self.last_index_put(h, 0)?;
         // Transcoded once, not per iteration: for a pattern that matches empty
         // (`/\s*/g`) the advance below runs at *every* position, so doing it in
         // the loop makes the whole match quadratic in the subject.
@@ -1759,9 +1828,7 @@ impl Interp {
             }
         }
         // `GetMethod(searchValue, @@replace)`.
-        let sym = self.well_known_symbol("replace");
-        let key = self.member_key(sym);
-        let m = self.read_member(argh, &key)?;
+        let m = self.regexp_symbol_get(argh, "replace")?;
         if matches!(m.unpack(), Unpacked::Undefined | Unpacked::Null) {
             // No method: the string algorithm, without a second lookup.
             self.string_symbol_checked = true;
@@ -1825,7 +1892,7 @@ impl Interp {
         let global = flags.contains('g');
         let unicode = flags.contains('u') || flags.contains('v');
         if global {
-            self.set_prop_throwing(h, "lastIndex", NanBox::number(0.0))?;
+            self.last_index_put(h, 0)?;
         }
         // Collect all matches first (so user `exec` runs in the spec order).
         let mut results: Vec<ExecOutcome> = Vec::new();

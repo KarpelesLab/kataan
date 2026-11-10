@@ -1735,6 +1735,14 @@ pub const SCRIPT_REFERRER: u32 = u32::MAX;
 ///
 /// # Errors
 /// The callee's throw, or a VM fault.
+/// Whether `ArraySpeciesCreate(O, n)` for the array `h` is the default
+/// `ArrayCreate(n)`, decided with no observable effect (`O.constructor` is a
+/// data property holding `%Array%` with its built-in `@@species` getter);
+/// see `array_hof::default_species_armed`. Meaningful in a single realm.
+pub(crate) fn array_default_species(realm: &mut Realm, h: Handle) -> bool {
+    array_hof::default_species_armed(realm, h)
+}
+
 pub(crate) fn call_vm_function(
     host: &mut dyn VmHost,
     table: &alloc::rc::Rc<[FnProto]>,

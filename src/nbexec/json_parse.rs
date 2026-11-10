@@ -17,6 +17,7 @@
 //! `CreateDataProperty` at a time through transition caches keyed by nesting
 //! depth and position, and may become its position's new template.
 
+use super::json::JsonSrc;
 use super::*;
 use crate::ic::PropertyCache;
 use crate::rope::Rope;
@@ -284,42 +285,10 @@ impl Interp {
                 b'n' => self.json_fast_lit(p, b"null", NanBox::null())?,
                 b't' => self.json_fast_lit(p, b"true", NanBox::boolean(true))?,
                 b'f' => self.json_fast_lit(p, b"false", NanBox::boolean(false))?,
-                b'"' => match self.json_fast_string(p)? {
-                    // A one-byte (ASCII) string is the realm's shared unit
-                    // string (strings are values: sharing is invisible).
-                    JsonStr::Borrowed(a, b, true) if b == a + 1 => {
-                        let unit = p.src[a];
-                        match p.units[usize::from(unit)] {
-                            Some(s) => s,
-                            None => {
-                                let s = NanBox::handle(
-                                    self.realm.unit_string(u16::from(unit)).to_raw(),
-                                );
-                                p.units[usize::from(unit)] = Some(s);
-                                s
-                            }
-                        }
-                    }
-                    JsonStr::Borrowed(a, b, ascii) => {
-                        // A run between quotes of a well-formed WTF-8 string
-                        // is itself well-formed WTF-8.
-                        let bytes = &p.src[a..b];
-                        let rope = if ascii {
-                            Rope::from_ascii_bytes(bytes)
-                        } else {
-                            Rope::from_bytes(bytes)
-                        };
-                        NanBox::handle(self.realm.new_string_from_rope(rope).to_raw())
-                    }
-                    JsonStr::Scratch(ascii) => {
-                        let rope = if ascii {
-                            Rope::from_ascii_bytes(&p.buf)
-                        } else {
-                            Rope::from_bytes(&p.buf)
-                        };
-                        NanBox::handle(self.realm.new_string_from_rope(rope).to_raw())
-                    }
-                },
+                b'"' => {
+                    let tok = self.json_fast_string(p)?;
+                    self.json_str_value(p, tok)
+                }
                 b'[' => {
                     p.pos += 1;
                     p.skip_ws();
@@ -399,6 +368,201 @@ impl Interp {
                 }
             }
         }
+    }
+
+    /// The string value of a token [`json_fast_string`](Self::json_fast_string)
+    /// scanned.
+    #[inline]
+    fn json_str_value(&mut self, p: &mut JsonParser<'_>, tok: JsonStr) -> NanBox {
+        match tok {
+            // A one-byte (ASCII) string is the realm's shared unit
+            // string (strings are values: sharing is invisible).
+            JsonStr::Borrowed(a, b, true) if b == a + 1 => {
+                let unit = p.src[a];
+                match p.units[usize::from(unit)] {
+                    Some(s) => s,
+                    None => {
+                        let s = NanBox::handle(self.realm.unit_string(u16::from(unit)).to_raw());
+                        p.units[usize::from(unit)] = Some(s);
+                        s
+                    }
+                }
+            }
+            JsonStr::Borrowed(a, b, ascii) => {
+                // A run between quotes of a well-formed WTF-8 string
+                // is itself well-formed WTF-8.
+                let bytes = &p.src[a..b];
+                let rope = if ascii {
+                    Rope::from_ascii_bytes(bytes)
+                } else {
+                    Rope::from_bytes(bytes)
+                };
+                NanBox::handle(self.realm.new_string_from_rope(rope).to_raw())
+            }
+            JsonStr::Scratch(ascii) => {
+                let rope = if ascii {
+                    Rope::from_ascii_bytes(&p.buf)
+                } else {
+                    Rope::from_bytes(&p.buf)
+                };
+                NanBox::handle(self.realm.new_string_from_rope(rope).to_raw())
+            }
+        }
+    }
+
+    /// `JSON.parse(text, reviver)`'s parse of the WTF-8 `src`: the value,
+    /// and the parallel [`JsonSrc`] tree recording, for every primitive, the
+    /// value made and the byte range of its source text in `src` (the raw
+    /// material of the reviver's `context.source`). The same grammar and
+    /// errors as [`json_parse_wtf8`](Self::json_parse_wtf8).
+    pub(crate) fn json_parse_with_source(
+        &mut self,
+        src: &[u8],
+    ) -> Result<(NanBox, JsonSrc), ExecError> {
+        let mut m = self.json_parse_memo.take().unwrap_or_default();
+        m.parse = m.parse.wrapping_add(1);
+        let mut p = JsonParser {
+            src,
+            pos: 0,
+            caches: core::mem::take(&mut m.caches),
+            sites: core::mem::take(&mut m.sites),
+            vals: core::mem::take(&mut m.vals),
+            keys: core::mem::take(&mut m.keys),
+            units: [None; 128],
+            buf: core::mem::take(&mut m.buf),
+            root: self.realm.root_shape_rc(),
+            parse: m.parse,
+        };
+        let r = self.json_src_value(&mut p, 0).and_then(|v| {
+            p.skip_ws();
+            if p.pos == p.src.len() {
+                Ok(v)
+            } else {
+                Err(self.json_error("Unexpected token in JSON"))
+            }
+        });
+        p.vals.clear();
+        p.buf.clear();
+        m.caches = p.caches;
+        m.sites = p.sites;
+        m.vals = p.vals;
+        m.keys = p.keys;
+        m.buf = p.buf;
+        self.json_parse_memo = Some(m);
+        r
+    }
+
+    /// One value of [`json_parse_with_source`](Self::json_parse_with_source)
+    /// at nesting `depth`. An array's elements wait on the value stack until
+    /// it closes (nothing here collects, so they need no rooting).
+    fn json_src_value(
+        &mut self,
+        p: &mut JsonParser<'_>,
+        depth: usize,
+    ) -> Result<(NanBox, JsonSrc), ExecError> {
+        p.skip_ws();
+        let Some(ch) = p.peek() else {
+            return Err(self.json_error("Unexpected end of JSON input"));
+        };
+        if matches!(ch, b'[' | b'{')
+            && (depth >= self.realm.limits.max_json_depth || crate::stack::exhausted())
+        {
+            return Err(self.json_too_deep());
+        }
+        let start = p.pos;
+        let value = match ch {
+            b'n' => self.json_fast_lit(p, b"null", NanBox::null())?,
+            b't' => self.json_fast_lit(p, b"true", NanBox::boolean(true))?,
+            b'f' => self.json_fast_lit(p, b"false", NanBox::boolean(false))?,
+            b'"' => {
+                let tok = self.json_fast_string(p)?;
+                self.json_str_value(p, tok)
+            }
+            b'-' | b'0'..=b'9' => self.json_fast_number(p)?,
+            b'[' => {
+                p.pos += 1;
+                let vstart = p.vals.len();
+                let mut srcs = Vec::new();
+                p.skip_ws();
+                if p.peek() == Some(b']') {
+                    p.pos += 1;
+                } else {
+                    loop {
+                        let (v, s) = self.json_src_value(p, depth + 1)?;
+                        p.vals.push(v);
+                        srcs.push(s);
+                        p.skip_ws();
+                        match p.peek() {
+                            Some(b',') => p.pos += 1,
+                            Some(b']') => {
+                                p.pos += 1;
+                                break;
+                            }
+                            _ => return Err(self.json_error("Expected ',' or ']'")),
+                        }
+                    }
+                }
+                let a = self.realm.new_array_from_slice(&p.vals[vstart..]);
+                p.vals.truncate(vstart);
+                return Ok((NanBox::handle(a.to_raw()), JsonSrc::Array(srcs)));
+            }
+            b'{' => {
+                p.pos += 1;
+                let obj = self.realm.new_object();
+                let mut pairs: Vec<(String, JsonSrc)> = Vec::new();
+                p.skip_ws();
+                if p.peek() == Some(b'}') {
+                    p.pos += 1;
+                    return Ok((NanBox::handle(obj.to_raw()), JsonSrc::Object(pairs)));
+                }
+                let mut ordinal = 0;
+                loop {
+                    p.skip_ws();
+                    if p.peek() != Some(b'"') {
+                        return Err(self.json_error("Expected property name"));
+                    }
+                    // The storage key (a lone surrogate is kept in its
+                    // encoded form, see `realm::user_key_wtf8`).
+                    let key = match self.json_fast_string(p)? {
+                        JsonStr::Borrowed(a, b, _) => crate::realm::user_key_wtf8(&p.src[a..b]),
+                        JsonStr::Scratch(_) => crate::realm::user_key_wtf8(&p.buf),
+                    };
+                    p.skip_ws();
+                    if p.peek() != Some(b':') {
+                        return Err(self.json_error("Expected ':'"));
+                    }
+                    p.pos += 1;
+                    let (v, s) = self.json_src_value(p, depth + 1)?;
+                    self.json_fast_add(p, obj, depth, ordinal, &key, v);
+                    ordinal += 1;
+                    // A duplicate key keeps the last value (as the add does);
+                    // record the last source for it too.
+                    if let Some(slot) = pairs.iter_mut().find(|(k, _)| *k == key) {
+                        slot.1 = s;
+                    } else {
+                        pairs.push((key, s));
+                    }
+                    p.skip_ws();
+                    match p.peek() {
+                        Some(b',') => p.pos += 1,
+                        Some(b'}') => {
+                            p.pos += 1;
+                            break;
+                        }
+                        _ => return Err(self.json_error("Expected ',' or '}'")),
+                    }
+                }
+                return Ok((NanBox::handle(obj.to_raw()), JsonSrc::Object(pairs)));
+            }
+            _ => return Err(self.json_error("Unexpected token in JSON")),
+        };
+        Ok((
+            value,
+            JsonSrc::Prim {
+                value,
+                span: (start, p.pos),
+            },
+        ))
     }
 
     /// The path hash of a container starting at the cursor (see

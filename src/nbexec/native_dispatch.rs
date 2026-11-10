@@ -897,21 +897,14 @@ impl Interp {
                 if !has_reviver {
                     return self.json_parse_wtf8(&text);
                 }
-                let (chars, lone_base) = json::json_text_chars(&text);
-                let mut pos = 0;
-                {
-                    self.json_lone_base = lone_base;
-                    let parsed = self.json_parse_src(&chars, &mut pos, 0);
-                    self.json_lone_base = 0;
-                    let (value, src) = parsed?;
-                    skip_ws(&chars, &mut pos);
-                    if pos != chars.len() {
-                        return Err(self.json_error("Unexpected token in JSON"));
-                    }
-                    let holder = self.realm.new_object();
-                    self.realm.set_property(holder, "", value);
-                    return self.json_revive_ctx(holder, "", reviver, Some(&src));
-                }
+                let (value, src) = self.json_parse_with_source(&text)?;
+                let holder = self.realm.new_object();
+                self.realm.set_property(holder, "", value);
+                let mut cx = json::ReviveCx {
+                    text: &text,
+                    source_ic: crate::ic::PropertyCache::new(),
+                };
+                return self.json_revive_ctx(holder, "", reviver, Some(&src), &mut cx);
             }
             // `JSON.rawJSON(text)` — validates `ToString(text)` as a single JSON
             // primitive (number/string/boolean/null, no surrounding whitespace) and

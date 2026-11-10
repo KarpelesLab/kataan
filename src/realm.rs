@@ -6482,10 +6482,16 @@ impl Realm {
     pub fn array_set_all(&mut self, handle: Handle, elems: Vec<NanBox>) -> bool {
         match self.heap.get_mut(handle).and_then(Cell::as_array_mut) {
             Some(a) => {
-                let side = a.has_side_state();
+                // The sticky flags describe the array, not its elements: an
+                // explicitly set `[[Prototype]]` (a subclass instance) must
+                // stay visible to the fast paths that trust them.
+                let (side, proto_set) = (a.has_side_state(), a.has_proto_set());
                 *a = elems.into();
                 if side {
                     a.mark_side_state();
+                }
+                if proto_set {
+                    a.mark_proto_set();
                 }
                 true
             }
@@ -7555,6 +7561,14 @@ impl Realm {
             .map(crate::object::Object::key_epoch)
     }
 
+    /// How many times two heap cells have swapped contents (a stamp that,
+    /// with an object's [`key epoch`](Self::object_key_epoch), shows the
+    /// object still has the own properties it had).
+    #[must_use]
+    pub fn cell_swap_count(&self) -> u32 {
+        self.cell_swaps
+    }
+
     /// Whether the object at `handle` has an own property `key` (including
     /// accessors) — the `in` operator.
     #[must_use]
@@ -7764,6 +7778,22 @@ impl Realm {
             return true;
         }
         false
+    }
+
+    /// `CreateDataProperty(handle, key, value)` when `handle` is an ordinary
+    /// object (`Cell::Object`) whose own `key` is already a plain writable,
+    /// enumerable, configurable data property: the store of the value (see
+    /// [`Object::store_existing_plain`]). `false`, having changed nothing,
+    /// for anything else; the caller then takes `[[DefineOwnProperty]]`.
+    pub fn store_existing_plain_data(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) else {
+            return false;
+        };
+        if !obj.store_existing_plain(key, value) {
+            return false;
+        }
+        self.write_barrier(handle, value);
+        true
     }
 
     /// `CreateDataProperty(handle, key, value)` for the common case only: the

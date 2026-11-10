@@ -6100,6 +6100,16 @@ impl Interp {
         // IsArray is proxy-aware (a proxy whose target is an Array *is* an Array, and
         // a revoked proxy throws), so unwrap the proxy chain here. The subsequent
         // `Get(original, "constructor")` also runs through any proxy `get` trap.
+        // An ordinary array whose `constructor` and `@@species` lookups
+        // provably reach `%Array%` and its built-in getter through data
+        // properties (with a single realm, so step 6 cannot apply) gets the
+        // default: those reads have no side effect to keep.
+        if !self.realm.multi_realm
+            && self.realm.is_plain_array_cell(original)
+            && crate::nbvm::array_default_species(&mut self.realm, original)
+        {
+            return self.array_create_holes(length);
+        }
         if !self.is_array_unwrap_proxy(NanBox::handle(original.to_raw()))? {
             return self.array_create_holes(length);
         }
@@ -7443,9 +7453,7 @@ impl Interp {
                 )));
             }
         }
-        let sym = self.well_known_symbol(sym_name);
-        let key = self.member_key(sym);
-        let m = self.read_member(argh, &key)?;
+        let m = self.regexp_symbol_get(argh, sym_name)?;
         // `GetMethod(V, P)`: `undefined`/`null` means "no method" — fall through to
         // the plain-string algorithm. Any *other* non-callable value is a
         // TypeError, not a silent fall-through (`"a-a".replace({[Symbol.replace]:
