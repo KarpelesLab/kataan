@@ -445,12 +445,14 @@ impl Compiler<'_> {
     /// split into its two surrogate code units, each a one-unit `Char`, so the
     /// subject is matched code-unit by code-unit (web-compat default). In `u`
     /// mode a single `Char` carries the whole scalar; the VM reads a code point
-    /// (a surrogate pair) to match it.
+    /// (a surrogate pair) to match it. Inside a lookbehind the subject is read
+    /// backward, so the trailing unit comes first.
     fn emit_char(&mut self, c: u32) {
         if !self.unicode && c > 0xFFFF {
             let (hi, lo) = surrogate_pair(c);
-            self.emit(Inst::Char(hi as u32));
-            self.emit(Inst::Char(lo as u32));
+            let (first, second) = if self.reverse { (lo, hi) } else { (hi, lo) };
+            self.emit(Inst::Char(first as u32));
+            self.emit(Inst::Char(second as u32));
         } else {
             self.emit(Inst::Char(c));
         }

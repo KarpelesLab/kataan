@@ -459,7 +459,8 @@ impl Parser {
         let greedy = !self.eat('?');
         // A quantifier may not follow a non-quantifiable assertion. A lookbehind
         // can never be quantified; a lookahead is quantifiable only under Annex B
-        // (non-`u`). `^`, `$`, `\b`, `\B` are likewise unquantifiable under `u`.
+        // (non-`u`, Annex B *QuantifiableAssertion*). `^`, `$`, `\b`, `\B` are
+        // never quantifiable: Annex B's *Term* admits `Assertion` only bare.
         match &atom {
             Node::LookBehind { .. } => {
                 return Err(RegexError::new(
@@ -471,7 +472,7 @@ impl Parser {
                     "a lookahead assertion is not quantifiable in unicode mode",
                 ));
             }
-            Node::Start | Node::End | Node::WordBoundary { .. } if self.unicode => {
+            Node::Start | Node::End | Node::WordBoundary { .. } => {
                 return Err(RegexError::new("this assertion is not quantifiable"));
             }
             _ => {}
@@ -485,8 +486,7 @@ impl Parser {
             && let Node::Char(c) = atom
             && c > 0xFFFF
         {
-            let hi = 0xD800 + ((c - 0x10000) >> 10);
-            let lo = 0xDC00 + ((c - 0x10000) & 0x3FF);
+            let (hi, lo) = utf16_pair(c);
             return Ok(Node::Concat(alloc::vec![
                 Node::Char(hi),
                 Node::Repeat {
@@ -1461,7 +1461,18 @@ impl Parser {
                 }
                 Some(c) => {
                     self.pos += 1;
-                    self.push_class_member(&mut items, c as u32)?;
+                    let c = c as u32;
+                    if !self.unicode && c > 0xFFFF {
+                        // Without `u` the class is a sequence of code units: a
+                        // literal astral character is two ClassAtoms, so only its
+                        // trailing unit can start a range (`[😀-😁]` is
+                        // `\uD83D`, `\uDE00-\uD83D`, `\uDE01`: out of order).
+                        let (hi, lo) = utf16_pair(c);
+                        items.push(ClassItem::Char(hi));
+                        self.push_class_member(&mut items, lo)?;
+                    } else {
+                        self.push_class_member(&mut items, c)?;
+                    }
                 }
             }
         }
@@ -1563,6 +1574,15 @@ impl Parser {
             } else {
                 self.bump().map_or(c, |ch| ch as u32)
             };
+            // Without `u` a literal astral high endpoint is two code units: the
+            // range ends at its leading unit and the trailing unit is the next
+            // ClassAtom (which may itself start a range).
+            let (hi, trail) = if !self.unicode && hi > 0xFFFF {
+                let (lead, trail) = utf16_pair(hi);
+                (lead, Some(trail))
+            } else {
+                (hi, None)
+            };
             // A character-class range whose low endpoint exceeds its high
             // endpoint (`[b-a]`, `[z-a]`) is a Syntax Error in both Annex B and
             // strict mode (NonemptyClassRanges early error). Both endpoints here
@@ -1574,6 +1594,9 @@ impl Parser {
                 ));
             }
             items.push(ClassItem::Range(c, hi));
+            if let Some(trail) = trail {
+                return self.push_class_member(items, trail);
+            }
         } else {
             items.push(ClassItem::Char(c));
         }
@@ -1944,6 +1967,14 @@ fn is_class_set_identity_escape(c: char) -> bool {
             | '^'
             | '`'
             | '~'
+    )
+}
+
+/// The UTF-16 surrogate pair (leading, trailing) of an astral scalar `c`.
+fn utf16_pair(c: u32) -> (u32, u32) {
+    (
+        0xD800 + ((c - 0x10000) >> 10),
+        0xDC00 + ((c - 0x10000) & 0x3FF),
     )
 }
 

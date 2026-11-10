@@ -599,11 +599,164 @@ fn quantifier_on_assertion() {
     assert!(Regex::new(r"(?=a)?b", "").is_ok());
     assert!(Regex::new(r"(?=a)*b", "").is_ok());
     assert!(Regex::new(r"(?=a)?b", "u").is_err());
-    // `^`, `$`, `\b` are unquantifiable under `u`.
-    assert!(Regex::new(r"^?a", "u").is_err());
-    assert!(Regex::new(r"\b?a", "u").is_err());
+    // `^`, `$`, `\b`, `\B` are never quantifiable: Annex B's *Term* admits only a
+    // lookahead as a *QuantifiableAssertion*, a bare *Assertion* takes no quantifier.
+    for flags in ["", "u", "v", "i"] {
+        for pat in [
+            r"^?a", r"^*", r"$+", r"\b?a", r"\b*", r"\B+", r"^{2}", r"\b{1,2}", r"\B{0,}?",
+        ] {
+            assert!(
+                Regex::new(pat, flags).is_err(),
+                "/{pat}/{flags} must be a SyntaxError"
+            );
+        }
+    }
+    // Without `u`, a `{` that does not form a quantifier stays a literal.
+    assert!(re(r"\B{", "").is_match("{"));
+    assert!(re(r"a\b{", "").is_match("a{"));
+    assert!(re(r"^{x", "").is_match("{x"));
     // A quantified group around an assertion is fine.
     assert!(Regex::new(r"(?:^)+", "u").is_ok());
+    assert!(Regex::new(r"(?:\B)*", "").is_ok());
+}
+
+/// Under `u`/`v` a surrogate pair is one character: `\b`/`\B` and lookbehind see
+/// the pair, never its halves, and no match starts or ends between them.
+#[test]
+fn surrogate_pairs_are_atomic_for_assertions() {
+    let units = u16s("s\u{1F600}");
+    // `\B` between `s` (word) and the pair (non-word) is a boundary: no match there;
+    // the only `\B` position is the end.
+    assert_eq!(re(r"\B", "u").find_in_u16(&units, 1), Some((3, 3)));
+    assert_eq!(re(r"\B", "v").find_in_u16(&units, 1), Some((3, 3)));
+    // Lookbehind steps back over the whole pair.
+    let units = u16s("a\u{1F600}b");
+    assert_eq!(
+        re(r"(?<=\u{1F600})b", "u").find_in_u16(&units, 0),
+        Some((3, 4))
+    );
+    assert_eq!(re(r"(?<=\ud83d)", "u").find_in_u16(&units, 0), None);
+    assert_eq!(re(r"(?<=\ude00)", "v").find_in_u16(&units, 0), None);
+    assert_eq!(re(r"(?<=a).", "u").find_in_u16(&units, 0), Some((1, 3)));
+    let caps = re(r"(?<=(.)(.))b", "u").captures_in_u16(&units, 0).unwrap();
+    assert_eq!(caps.group(1), Some((0, 1)));
+    assert_eq!(caps.group(2), Some((1, 3)));
+    // Without `u` the halves are separate characters.
+    let caps = re(r"(?<=(.)(.))b", "").captures_in_u16(&units, 0).unwrap();
+    assert_eq!(caps.group(1), Some((1, 2)));
+    assert_eq!(caps.group(2), Some((2, 3)));
+    // A negated class after a literal still matches a whole pair before `$`.
+    assert_eq!(
+        re(r"a[^x]$", "u").find_in_u16(&u16s("a\u{1F600}"), 0),
+        Some((0, 3))
+    );
+}
+
+/// Without `u`/`v` a literal astral character in the pattern is two code units,
+/// both in a lookbehind (matched trailing unit first) and in a class (two
+/// ClassAtoms, so `[😀-😁]` is an out-of-order range `\uDE00-\uD83D`).
+#[test]
+fn literal_astral_is_two_units_without_u() {
+    let units = u16s("\u{1F600}a\u{1F600}b");
+    assert_eq!(
+        re("(?<!\u{1F600})\\b", "").find_in_u16(&units, 0),
+        Some((3, 3))
+    );
+    assert_eq!(
+        re("\\b(?<=\u{1F600}a)", "").find_in_u16(&units, 0),
+        Some((3, 3))
+    );
+    assert_eq!(
+        re("(?<=\u{1F600})b", "").find_in_u16(&units, 0),
+        Some((5, 6))
+    );
+    assert_eq!(
+        re("(?<=a\u{1F600})b", "i").find_in_u16(&units, 0),
+        Some((5, 6))
+    );
+    assert_eq!(
+        re("(?<=(?:\u{1F600})+)b", "").find_in_u16(&u16s("\u{1F600}\u{1F600}b"), 0),
+        Some((4, 5))
+    );
+    // Classes: each half is its own member; a range may only use the halves.
+    assert!(Regex::new("[\u{1F600}-\u{1F601}]", "").is_err());
+    assert!(Regex::new("[\u{1F600}-\u{1F601}]", "u").is_ok());
+    assert!(Regex::new("[a-\u{1F600}-b]", "").is_err());
+    let r = re("^[a-\u{1F600}]+$", "");
+    let m = |s: &str| r.find_in_u16(&u16s(s), 0).is_some();
+    assert!(m("ab\u{1F600}"));
+    assert!(m("\u{3000}"));
+    assert!(!m("\u{E000}"));
+    assert!(!m("\u{1F601}"));
+    let units = u16s("\u{1F601}");
+    assert_eq!(re("[\u{1F600}]", "").find_in_u16(&units, 0), Some((0, 1)));
+    assert_eq!(
+        re("[\u{1F600}-\u{FFFF}]", "").find_in_u16(&u16s("\u{E000}"), 0),
+        Some((0, 1))
+    );
+    assert_eq!(re("[^\u{1F600}]", "").find_in_u16(&units, 0), Some((1, 2)));
+}
+
+/// Lookbehind captures follow the right-to-left evaluation order, also for
+/// quantified groups and backreferences evaluated inside the lookbehind.
+#[test]
+fn lookbehind_quantified_capture_values() {
+    let grp = |pat: &str, flags: &str, subj: &str, g: usize| -> Option<alloc::string::String> {
+        let units = u16s(subj);
+        let caps = re(pat, flags).captures_in_u16(&units, 0)?;
+        caps.group(g)
+            .map(|(s, e)| alloc::string::String::from_utf16(&units[s..e]).unwrap())
+    };
+    // Each iteration of a quantified group inside a lookbehind runs right to
+    // left, so the group keeps the leftmost (last evaluated) iteration.
+    assert_eq!(grp(r"(?<=(\w)+)f", "", "abcdef", 1).as_deref(), Some("a"));
+    assert_eq!(grp(r"(?<=(\w){3})f", "", "abcdef", 1).as_deref(), Some("c"));
+    assert_eq!(
+        grp(r"(?<=(?:(\w)(\w))+)f", "", "abcdef", 1).as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        grp(r"(?<=(?:(\w)(\w))+)f", "", "abcdef", 2).as_deref(),
+        Some("c")
+    );
+    // The right group is greedy first: it takes all it can.
+    assert_eq!(
+        grp(r"(?<=(\d+)(\d+))$", "", "1053", 1).as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        grp(r"(?<=(\d+)(\d+))$", "", "1053", 2).as_deref(),
+        Some("053")
+    );
+    // A backreference to the left of its group is evaluated after it.
+    assert_eq!(grp(r"(?<=\1(a))b", "", "aab", 1).as_deref(), Some("a"));
+    // To the right of its group it is evaluated first, while it is still unset.
+    assert_eq!(grp(r"(?<=(a)\1)b", "", "aab", 1).as_deref(), Some("a"));
+    // Astral iterations under `u` stay whole.
+    assert_eq!(
+        grp(r"(?<=(?:x(.))+)y", "u", "x\u{1F600}x\u{1F601}y", 1).as_deref(),
+        Some("\u{1F600}")
+    );
+    // Named groups inside a lookbehind.
+    assert_eq!(
+        grp(r"(?<=(?<a>\w){2})c", "", "abc", 1).as_deref(),
+        Some("a")
+    );
+}
+
+/// Under `iv`, class strings fold like characters: `\q{k}` matches `K` and the
+/// Kelvin sign, and `[^\q{s}]` (a complement over the folded set) excludes `S`.
+#[test]
+fn class_strings_fold_under_iv() {
+    assert!(re(r"[\q{k}]", "iv").is_match("K"));
+    assert!(re(r"[\q{k}]", "iv").is_match("\u{212A}"));
+    assert!(!re(r"[\q{k}]", "v").is_match("K"));
+    assert!(!re(r"[^\q{s}]", "iv").is_match("S"));
+    assert!(!re(r"[^\q{s}]", "iv").is_match("\u{17F}"));
+    assert!(re(r"[^\q{s}]", "iv").is_match("\u{DF}"));
+    // An inline `(?-i:…)` group switches folding off only inside itself.
+    assert!(re(r"(?-i:a)|[b]", "iu").is_match("B"));
+    assert!(re(r"(?-i:a)|\p{Ll}", "iv").is_match("B"));
 }
 
 #[test]
