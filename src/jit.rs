@@ -8910,10 +8910,11 @@ impl JitFunction {
         // Per inlined call's guard, the pc of its `InlineLeave` when its
         // activation may be **plainly lazy** in code that calls
         // (`call_seq::PlainLazy`): the window of its outermost level's
-        // guard is straight — no backward branch, entry, catch target or
-        // handler op in it, and every guard in it with its leave in it —
-        // and then so is every inner level's in it. (Polymorphic ways
-        // too: each is a guard with a window of its own.)
+        // guard is closed — no entry, catch target or handler op in it,
+        // and every guard in it with its leave in it — and then so is
+        // every inner level's in it. (Polymorphic ways too: each is a
+        // guard with a window of its own. An inlined loop's header is no
+        // entry, and its back-edge poll is a `call` like any other.)
         let plain_leave: Vec<Option<usize>> = if plain_lazy_enabled() {
             let mut out = alloc::vec![None; ops.len()];
             let levels = inline_levels(ops);
@@ -8940,9 +8941,6 @@ impl JitFunction {
                         && catch_targets.binary_search(&p).is_err()
                         && match ops[p] {
                             GenericOp::PushHandler { .. } | GenericOp::PopHandler => false,
-                            GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => {
-                                target > p
-                            }
                             GenericOp::InlineGuard { .. } => leave_of[p].is_some_and(|q| q < l),
                             _ => true,
                         }
@@ -10529,9 +10527,12 @@ impl JitFunction {
                 lazy_open.truncate(k);
                 a.truncate_lazy_pend(k);
             }
+            // (Whatever the pass: an inlined loop that is a speculative
+            // region of its own has its versions emitted right after it,
+            // inside the window: `numeric::NumGen::schedule`.)
             if let Some(k) = plain_open
                 .iter()
-                .position(|&(g, l, p)| !(g < op_idx && op_idx <= l && p == pass))
+                .position(|&(g, l, _)| !(g < op_idx && op_idx <= l))
             {
                 plain_open.truncate(k);
                 a.truncate_plain_lazy(k);
@@ -10920,15 +10921,20 @@ impl JitFunction {
                     // the activation is materialized already
                     // (`call_seq::PlainLazy`). (An inner level's only
                     // inside its enclosing level's plainly lazy body.)
+                    // (An inner level's whatever is being emitted: a
+                    // speculative fast version of a loop inlined in the
+                    // body too, which calls only to poll, and whose leaves
+                    // continue in its plain copy, in the same window.)
                     let plain = plain_leave[op_idx].filter(|&l| {
                         lazy.is_none()
-                            && !num.in_spec(op_idx)
                             && if outermost {
-                                plain_open.is_empty() && inl_level[op_idx] == 1
+                                !num.in_spec(op_idx)
+                                    && plain_open.is_empty()
+                                    && inl_level[op_idx] == 1
                             } else {
                                 plain_open
                                     .last()
-                                    .is_some_and(|&(g, gl, p)| g < op_idx && l < gl && p == pass)
+                                    .is_some_and(|&(g, gl, _)| g < op_idx && l < gl)
                                     && plain_open.len() + 1 == usize::from(inl_level[op_idx])
                             }
                     });
@@ -11087,9 +11093,21 @@ impl JitFunction {
                 }
                 GenericOp::InlineLeave => {
                     let s = inl_slots.level(inl_level[op_idx])?;
+                    // (A plainly lazy one's, in any version: whether a
+                    // call materialized it, or a call sequence left it
+                    // pending, `call_seq::PlainLazy`.)
+                    if plain_open.last().is_some_and(|&(_, l, _)| l == op_idx) {
+                        plain_open.pop();
+                        let p = a.pop_plain_lazy()?;
+                        num.set_plain_lazy(a.plain_lazy_now());
+                        if p.seq {
+                            call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
+                        } else {
+                            call_seq::emit_inline_leave_plain(&mut a, &helpers.call_layout, &s);
+                        }
                     // (In a speculative loop's fast version the activation
                     // is still pending: nothing there calls.)
-                    if num.in_spec(op_idx) {
+                    } else if num.in_spec(op_idx) {
                         // (A lazily pending one's marker was never set: a
                         // leave sets it on its way out, a call in the
                         // body first, and materializing empties it.)
@@ -11101,21 +11119,6 @@ impl JitFunction {
                             a.truncate_lazy_pend(lazy_open.len());
                         } else {
                             call_seq::emit_inline_leave_pending(&mut a, &s);
-                        }
-                    } else if plain_open
-                        .last()
-                        .is_some_and(|&(_, l, p)| l == op_idx && p == pass)
-                    {
-                        // (A plainly lazy one's: whether a call
-                        // materialized it, or a call sequence left it
-                        // pending, `call_seq::PlainLazy`.)
-                        plain_open.pop();
-                        let p = a.pop_plain_lazy()?;
-                        num.set_plain_lazy(a.plain_lazy_now());
-                        if p.seq {
-                            call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
-                        } else {
-                            call_seq::emit_inline_leave_plain(&mut a, &helpers.call_layout, &s);
                         }
                     } else {
                         call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
