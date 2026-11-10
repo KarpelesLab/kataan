@@ -110,6 +110,11 @@
 use alloc::vec::Vec;
 use core::cell::Cell;
 
+/// The bit of an exit's `at` word that says it is taken after the fallback
+/// op before `at`'s pc ran (`sink::SinkPlan::exit_after`), not at the start
+/// of the op at its pc.
+pub(crate) const AFTER_SHIFT: u32 = 40;
+
 use super::GenericOp;
 
 /// Whether `KATAAN_JIT_DEOPT_STRESS` asks for an exit at every eligible op
@@ -145,6 +150,15 @@ pub struct DeoptInfo {
     pub countdown: Cell<u64>,
     /// The exits taken so far.
     pub taken: Cell<u64>,
+    /// Whether the body leaves every few eligible op starts
+    /// (`KATAAN_JIT_DEOPT_STRESS`); else only where its sunk objects need
+    /// it (`sink`).
+    pub stress: bool,
+    /// The bytecode `body` points at when the body's own (the emitter's)
+    /// was rewritten by `super::sink` (the interpreter runs the original).
+    pub owned: Option<alloc::boxed::Box<[crate::nbvm::Op]>>,
+    /// The body's sunk objects, which every exit materializes first.
+    pub sink: Option<alloc::boxed::Box<super::sink::SinkExits>>,
 }
 
 impl DeoptInfo {
@@ -165,7 +179,25 @@ impl DeoptInfo {
             handlers,
             countdown: Cell::new(1),
             taken: Cell::new(0),
+            stress: stress(),
+            owned: None,
+            sink: None,
         }
+    }
+
+    /// [`Self::new`] for a body with sunk objects (`sink`): the
+    /// interpreter's bytecode is `orig`, the body's own before the rewrite.
+    pub(crate) fn with_sink(
+        orig: alloc::boxed::Box<[crate::nbvm::Op]>,
+        maps: (Vec<u32>, Vec<u32>),
+        handlers: bool,
+        sink: alloc::boxed::Box<super::sink::SinkExits>,
+    ) -> Self {
+        let mut d = Self::new(&orig, maps, handlers);
+        // (The box's contents do not move with it.)
+        d.owned = Some(orig);
+        d.sink = Some(sink);
+        d
     }
 
     /// The body's bytecode.

@@ -134,6 +134,9 @@ struct Site<'a> {
     /// The keys of the derived class constructors among it and the calls
     /// spliced into it ([`Expanded::derived`]).
     derived: Vec<u64>,
+    /// The keys of the sloppy ordinary functions among it and the calls
+    /// spliced into it ([`Expanded::legacy`]).
+    legacy: Vec<u64>,
     /// Its demotion sites ([`Candidate::demote`]), by this body's pc.
     demote: Vec<(usize, Reg)>,
 }
@@ -245,6 +248,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
         })
         .flatten();
     let own = proto.derived.then_some(key);
+    let own_legacy = proto.legacy.then_some(key);
     match inner {
         Some(e) => {
             let mut p = proto.clone();
@@ -252,6 +256,8 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             p.n_regs = e.n_regs;
             let mut derived = e.derived;
             derived.extend(own);
+            let mut legacy = e.legacy;
+            legacy.extend(own_legacy);
             // (Its own sites by the spliced body's pc, and its inlined
             // calls' as that splice placed them.)
             let mut sites: Vec<(usize, Reg)> = demote
@@ -264,6 +270,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                 proto: alloc::borrow::Cow::Owned(p),
                 warm: e.warm,
                 derived,
+                legacy,
                 demote: sites,
             }
         }
@@ -272,6 +279,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             proto: alloc::borrow::Cow::Borrowed(proto),
             warm,
             derived: own.into_iter().collect(),
+            legacy: own_legacy.into_iter().collect(),
             demote,
         },
     }
@@ -294,6 +302,11 @@ pub struct Expanded {
     /// any depth, whose function is a derived class constructor (whose
     /// construct leaves `this` unbound: `call_seq::ConstructFast::derived`).
     pub derived: Vec<u64>,
+    /// The callee keys of the inlined calls, at any depth, whose function is
+    /// a sloppy ordinary one (whose activation's arguments the legacy
+    /// `f.arguments` reads: `crate::jit::sink` never passes it a sunk
+    /// object).
+    pub legacy: Vec<u64>,
     /// The inlined callees' demotion sites ([`Candidate::demote`]) as
     /// spliced: `(new pc, register)`.
     pub demote: Vec<(usize, Reg)>,
@@ -1425,6 +1438,12 @@ pub fn expand<'a>(
         .collect();
     derived.sort_unstable();
     derived.dedup();
+    let mut legacy: Vec<u64> = sites
+        .iter()
+        .flat_map(|(_, ways)| ways.iter().flat_map(|w| w.legacy.iter().copied()))
+        .collect();
+    legacy.sort_unstable();
+    legacy.dedup();
     Some(Expanded {
         ops,
         n_regs,
@@ -1432,6 +1451,7 @@ pub fn expand<'a>(
         orig_of,
         new_of,
         derived,
+        legacy,
         demote,
     })
 }

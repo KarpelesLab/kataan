@@ -4385,6 +4385,29 @@ impl NumGen {
         Some(true)
     }
 
+    /// For a deoptimization exit the generic emitter takes at the start of
+    /// op `pc` (`super::sink`): outside a promoted region, nothing to do
+    /// (`Some` of nothing); in one without a speculative or an integer
+    /// version, the stores of its promoted registers live there (as a call's
+    /// spill: the exit's interpreter then reads them from the register
+    /// file); in any other, `None` (no exit there).
+    pub(super) fn exit_spill(&self, pc: usize) -> Option<Vec<(u8, i32)>> {
+        let Some(ri) = self.region_of.get(pc).copied().filter(|&r| r != u32::MAX) else {
+            return Some(Vec::new());
+        };
+        let rg = self.regions.get(ri as usize)?;
+        if rg.spec.is_some() || rg.int.is_some() || rg.alt_int.is_some() || self.imode.is_some() {
+            return None;
+        }
+        Some(
+            self.call_spill(pc)
+                .into_iter()
+                .filter(|e| e.2)
+                .map(|(x, d, _)| (x, d))
+                .collect(),
+        )
+    }
+
     /// The promoted registers live at region op `pc` that a call in the
     /// generic emitter's code for it must store before it and reload after
     /// it, as `(xmm, register-file displacement, store first)` (empty outside
@@ -6856,6 +6879,16 @@ pub(super) fn def_use(op: &Op, defs: &mut Vec<u16>, uses: &mut Vec<u16>) {
     }
 }
 
+std::thread_local! {
+    /// Per pc, registers [`liveness`] takes as read there besides the op's
+    /// own, while a body with sunk objects compiles (`super::sink`: a sunk
+    /// object's stored fields wherever it is held, which an exit — in a
+    /// speculative region's plain copy too — materializes from the register
+    /// file, so a bail into the copy must write them back).
+    pub(super) static EXTRA_USES: core::cell::RefCell<Vec<Vec<u16>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
 /// Backward register liveness: the live-in set of every pc, as bitsets of
 /// `words` words. A `catch` entry's live-in is live out of every op (any op
 /// may throw to it). `None` if the table would be too large.
@@ -6871,6 +6904,7 @@ pub(super) fn liveness(ops: &[Op], n_regs: usize, catches: &[usize]) -> Option<(
     let mut succ = Vec::with_capacity(2);
     let mut out = vec![0u64; words];
     let mut catch_live = vec![0u64; words];
+    let extra = EXTRA_USES.with(|e| e.borrow().clone());
     loop {
         let mut changed = false;
         catch_live.fill(0);
@@ -6900,6 +6934,13 @@ pub(super) fn liveness(ops: &[Op], n_regs: usize, catches: &[usize]) -> Option<(
             for &u in &uses {
                 if (u as usize) < n_regs {
                     out[u as usize / 64] |= 1u64 << (u % 64);
+                }
+            }
+            if let Some(x) = extra.get(pc) {
+                for &u in x {
+                    if (u as usize) < n_regs {
+                        out[u as usize / 64] |= 1u64 << (u % 64);
+                    }
                 }
             }
             let row = &mut live[pc * words..(pc + 1) * words];

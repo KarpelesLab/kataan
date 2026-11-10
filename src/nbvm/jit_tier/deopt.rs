@@ -4,7 +4,9 @@
 
 use super::super::{Ctx, FnProto, FrameExit, NanBox, Reg, VmError, run_frame_at, with_host};
 use super::stack_of;
+use crate::heap::Handle;
 use crate::jit::DeoptInfo;
+use crate::jit::sink::{MatObj, SinkExits};
 
 /// A deoptimization exit (`crate::jit::GenericHelpers::deopt`): the
 /// activation whose `n_regs`-word window is `regs` leaves its compiled body
@@ -51,7 +53,39 @@ pub(crate) extern "C" fn jit_helper_deopt(
     let body = unsafe { info.body() };
     info.note_exit();
     let pc = (at & 0xffff_ffff) as usize;
-    let level = (at >> 32) as usize;
+    let level = ((at >> 32) & 0xff) as usize;
+    let after = (at >> crate::jit::DEOPT_AFTER_SHIFT) & 1 != 0;
+    // The body's sunk objects (`crate::jit::sink`): made first, as the
+    // interpreter's frame would have them here.
+    if let Some(sx) = info.sink.as_deref() {
+        let forced = after
+            || sx.plan.exit_before.get(pc) == Some(&true)
+            || sx.plan.vget.get(pc) == Some(&true);
+        refresh_memos(ctx, sx, regs, pc, after);
+        if !after {
+            for &(f, recv, site) in &sx.fills {
+                if f == pc
+                    && let Some(h) = regs.get(recv as usize).and_then(|v| v.as_handle())
+                {
+                    // SAFETY: the site is owned with the code that called
+                    // here; only Rust code (this thread's) writes it.
+                    #[allow(unsafe_code)]
+                    unsafe { &mut *site }.fill(&mut ctx.realm, Handle::from_raw(h));
+                }
+            }
+        }
+        materialize(ctx, sx, regs, sx.plan.mats_at(pc, after));
+        if forced {
+            let n = sx.forced.get() + 1;
+            sx.forced.set(n);
+            if super::jit_log_enabled() && n.is_power_of_two() {
+                std::eprintln!("[jit] sink forced exit #{n} at body pc {pc} (after: {after})");
+            }
+            if n == crate::jit::sink::exit_limit() {
+                retire_sinking(ctx, funcs, info);
+            }
+        }
+    }
     // (`KATAAN_JIT_LOG`: a body's first exits, and then every thousandth.)
     if super::jit_log_enabled() && (info.taken.get() <= 4 || info.taken.get() % 1000 == 0) {
         let n = info.taken.get();
@@ -99,7 +133,13 @@ pub(crate) extern "C" fn jit_helper_deopt(
             None => fault = Some(VmError::Unsupported),
         }
     }
-    let mut own = info.own_pc(at_pc);
+    let mut own = info.own_pc(at_pc).or_else(|| {
+        // (An own-level fallback call op that left before it ran: its own
+        // call op.)
+        (level == 0)
+            .then(|| info.sink.as_deref().and_then(|x| x.own_call(at_pc)))
+            .flatten()
+    });
     match fault {
         None => {}
         // A throw out of an inlined body: the activation's own handler.
@@ -234,4 +274,208 @@ fn with_function<R>(
         i
     };
     Some(f(ctx, &newer, &newer[i]))
+}
+
+/// Writes every object of `objs` (innermost first) into the registers that
+/// hold its stand-in: an ordinary object whose `[[Prototype]]` is the
+/// stand-in (the site's prototype, in its `preg`) with its stored fields as
+/// own data properties, in order — what the constructor's plain adds made.
+fn materialize(ctx: &mut Ctx, sx: &SinkExits, regs: &mut [NanBox], objs: &[MatObj]) {
+    for m in objs {
+        let Some(site) = sx.plan.sites.get(m.site as usize) else {
+            continue;
+        };
+        // (The stand-in's own `[[Prototype]]`: the site's prototype when
+        // the object was made.)
+        let Some(proto) = regs
+            .get(site.preg as usize)
+            .and_then(|v| v.as_handle())
+            .and_then(|h| ctx.realm.object_proto(Handle::from_raw(h)))
+        else {
+            continue;
+        };
+        let h = ctx.realm.new_object_with_proto(Some(proto));
+        for (key, &f) in site.keys.iter().zip(&site.fregs).take(m.n as usize) {
+            let v = regs.get(f as usize).copied().unwrap_or(NanBox::undefined());
+            ctx.realm.set_property(h, key, v);
+        }
+        let v = NanBox::handle(h.to_raw());
+        for &r in &m.regs {
+            if let Some(x) = regs.get_mut(r as usize) {
+                *x = v;
+            }
+        }
+    }
+}
+
+/// Fills the guard memos of `sx`'s sites that are stale, from their
+/// construct records (`crate::jit::ConstructFast`): when a record holds at
+/// the current epoch, its prototype's chain is checked (see
+/// [`chain_plain`]). An exit at (or just after) a site's own fallback
+/// `Construct` first fills that record, as the compiled call sequence
+/// would on its first runs (which never come while the site is sunk).
+fn refresh_memos(ctx: &mut Ctx, sx: &SinkExits, regs: &[NanBox], pc: usize, after: bool) {
+    let epoch = crate::object::proto_epoch();
+    for (k, site) in sx.plan.sites.iter().enumerate() {
+        let (Some(memo), Some(&call)) = (sx.memos.get(k), sx.calls.get(k)) else {
+            continue;
+        };
+        if memo.stamp.get() == epoch || call.is_null() {
+            continue;
+        }
+        let at_fallback = if after {
+            pc == site.fallback + 1
+        } else {
+            pc == site.fallback
+        };
+        // SAFETY: the call site is owned with the code that called here, and
+        // only Rust code (this thread's, now) touches it.
+        #[allow(unsafe_code)]
+        let cs = unsafe { &mut *call.cast_mut() };
+        if at_fallback && let Some(ctor) = regs.get(site.ctor as usize).copied() {
+            let ctx_raw = core::ptr::from_mut(ctx).cast::<core::ffi::c_void>();
+            super::fill_construct_site(ctx, ctor, cs);
+            let mut out = 0u64;
+            let _ = super::jit_construct_info(
+                ctx_raw,
+                ctor.to_bits(),
+                ctor.to_bits(),
+                &raw mut out,
+                core::ptr::from_ref(cs),
+            );
+        }
+        let f = &cs.fast;
+        if f.ctor == crate::jit::CallSite::EMPTY
+            || f.derived != 0
+            || f.stamp != crate::object::proto_epoch()
+            || f.proto == 0
+        {
+            continue;
+        }
+        let proto = Handle::from_raw(f.proto);
+        if chain_plain(ctx, proto, &site.keys) {
+            // The stand-in: the layout the site's objects have.
+            let t = ctx.realm.new_object_with_proto(Some(proto));
+            for key in &site.keys {
+                ctx.realm.set_property(t, key, NanBox::number(0.0));
+            }
+            ctx.realm
+                .fill_lit_word(&sx.lits, sx.lit_base + k, NanBox::handle(t.to_raw()));
+            memo.proto.set(f.proto);
+            memo.stamp.set(crate::object::proto_epoch());
+        }
+    }
+}
+
+/// Whether adding each of `keys` to a fresh ordinary object whose
+/// `[[Prototype]]` is `proto` is a plain add: every object on the chain an
+/// ordinary, non-exotic one with no accessor and no non-writable property
+/// of those keys. The chain's objects are watched, so a change to any of
+/// them retires the answer with the prototype epoch.
+fn chain_plain(ctx: &mut Ctx, proto: Handle, keys: &[alloc::string::String]) -> bool {
+    let mut cur = Some(proto);
+    let mut depth = 0;
+    let mut seen: alloc::vec::Vec<Handle> = alloc::vec::Vec::new();
+    while let Some(h) = cur {
+        depth += 1;
+        if depth > 64 {
+            return false;
+        }
+        let Some(o) = ctx.realm.jit_object(h) else {
+            return false;
+        };
+        if o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0 {
+            return false;
+        }
+        for k in keys {
+            if o.accessor(k).is_some() || (o.has_own_key(k) && (o.is_readonly(k) || o.is_frozen()))
+            {
+                return false;
+            }
+        }
+        seen.push(h);
+        cur = o.proto();
+    }
+    for h in seen {
+        ctx.realm.watch_link(h.to_raw(), None);
+    }
+    true
+}
+
+/// A body whose sunk objects' exits keep happening: recompiled now, without
+/// sinking (`crate::jit::JitProto::spec_off` says so once the count is
+/// reached), so the activations to come run compiled code that leaves no
+/// more. (This activation goes on in the interpreter; the old code stays
+/// alive with the function.)
+fn retire_sinking(ctx: &mut Ctx, funcs: &[FnProto], info: &DeoptInfo) {
+    let _ = with_function(ctx, funcs, info, |_, _, _| ());
+    let id = info.func.get() as usize;
+    let Some(proto) = funcs.get(id) else {
+        return;
+    };
+    let Some(Some(old)) = proto.tier.jit() else {
+        return;
+    };
+    if !old.owns_deopt_info(core::ptr::from_ref(info)) {
+        return;
+    }
+    let done = super::recompile(ctx, funcs, id, &old, &[]).is_some();
+    if super::jit_log_enabled() {
+        std::eprintln!(
+            "[jit] fn {}: its sunk objects' exits keep happening: {}",
+            proto.name,
+            if done {
+                "recompiled without sinking"
+            } else {
+                "not recompiled"
+            }
+        );
+    }
+}
+
+/// `Op::GetMethod`'s slow path on a sunk object's stand-in
+/// (`crate::jit::sink`: the prototype the object would have, whose own
+/// properties are the object's inherited ones): the property, through the
+/// ordinary slow path (which fills the site's caches), when the chain from
+/// the stand-in holds it as a plain data property (or not at all), with
+/// nothing but ordinary objects on the way; else the exit sentinel (a
+/// getter would see the stand-in as its receiver, a proxy its trap), and
+/// the op leaves for the interpreter.
+///
+/// # Safety
+/// As `jit_helper_get_method_site`.
+pub(crate) extern "C" fn jit_helper_get_virtual(
+    ctx_raw: *mut core::ffi::c_void,
+    obj: u64,
+    site: *mut crate::jit::MethodSite,
+    call: *const crate::jit::CallSite,
+) -> u64 {
+    {
+        // SAFETY: as `jit_helper_get_method_site`.
+        #[allow(unsafe_code)]
+        let (ctx, site_ref) = unsafe { (&*(ctx_raw as *mut Ctx), &*site) };
+        let key = site_ref.key();
+        let mut cur = NanBox::from_bits(obj).as_handle().map(Handle::from_raw);
+        let mut depth = 0;
+        while let Some(h) = cur {
+            depth += 1;
+            let Some(o) = ctx.realm.jit_object(h) else {
+                return NanBox::jit_exit_bits();
+            };
+            if depth > 64 || o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0 {
+                return NanBox::jit_exit_bits();
+            }
+            if o.accessor(key).is_some() {
+                return NanBox::jit_exit_bits();
+            }
+            if o.has_own_key(key) {
+                break;
+            }
+            cur = o.proto();
+        }
+        if cur.is_none() && depth == 0 {
+            return NanBox::jit_exit_bits();
+        }
+    }
+    super::jit_helper_get_method_site(ctx_raw, obj, site, call)
 }

@@ -248,6 +248,14 @@ impl JitProto {
         };
         let t = &s.tier_up;
         let mut out = t.spec_off.clone();
+        if s.deopt
+            .as_ref()
+            .and_then(|d| d.sink.as_ref())
+            .is_some_and(|x| x.forced.get() >= super::sink::exit_limit())
+            && !out.contains(&super::SINK_OFF)
+        {
+            out.push(super::SINK_OFF);
+        }
         for &(h, ri) in &t.spec_regions {
             let pc = self.orig_pc(h);
             if pc != usize::MAX

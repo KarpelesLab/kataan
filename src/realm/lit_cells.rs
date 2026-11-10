@@ -85,6 +85,23 @@ impl Realm {
         v
     }
 
+    /// Fills word `i` of `cells` with `v` (a heap value the code keeps:
+    /// `crate::jit::sink`'s stand-ins), the table registered as a GC root.
+    pub(crate) fn fill_lit_word(&mut self, cells: &Rc<LitCells>, i: usize, v: NanBox) {
+        let Some(w) = cells.words.get(i) else {
+            return;
+        };
+        if !cells.registered.get() {
+            cells.registered.set(true);
+            if self.lit_cells.len() >= self.lit_cells_prune {
+                self.lit_cells.retain(|t| t.strong_count() > 0);
+                self.lit_cells_prune = (self.lit_cells.len() * 2).max(16);
+            }
+            self.lit_cells.push(Rc::downgrade(cells));
+        }
+        w.set(v.to_bits());
+    }
+
     /// The handles every live table's filled words hold (GC roots).
     pub(crate) fn lit_cell_roots(&self, out: &mut Vec<Handle>) {
         for t in self.lit_cells.iter().filter_map(Weak::upgrade) {

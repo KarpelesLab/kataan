@@ -19,7 +19,7 @@ use crate::jit::{CallSite, CalleeInfo, FRAME_HEADER, JitStack};
 use alloc::rc::Rc;
 
 mod deopt;
-pub(crate) use deopt::jit_helper_deopt;
+pub(crate) use deopt::{jit_helper_deopt, jit_helper_get_virtual};
 
 /// Back-edges an interpreted activation runs before it tries to continue in
 /// native code (on-stack replacement).

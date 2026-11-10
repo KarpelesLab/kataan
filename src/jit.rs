@@ -58,6 +58,8 @@ mod props;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod recv_cache;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod sink;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod typed;
@@ -72,7 +74,9 @@ pub use call_seq::{
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use deopt::DeoptInfo;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-pub(crate) use deopt::{leave_of as deopt_leave_of, site_end as deopt_site_end};
+pub(crate) use deopt::{
+    AFTER_SHIFT as DEOPT_AFTER_SHIFT, leave_of as deopt_leave_of, site_end as deopt_site_end,
+};
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -85,6 +89,11 @@ pub use tierup::MAX_GENERATION;
 /// result outside the range deopts, since `i64` and `f64` arithmetic diverge
 /// beyond it.
 const SAFE_INT_MAX: i64 = 9_007_199_254_740_992;
+
+/// Among a body's no-speculation headers (`JitProto::spec_off`): its
+/// recompilation sinks no objects (`sink`: an earlier body's exits for its
+/// sunk objects kept happening).
+pub const SINK_OFF: usize = usize::MAX;
 
 /// An arithmetic operation in the JIT's tiny IR, applied left-to-right to a
 /// running accumulator seeded with the function's `i64` argument.
@@ -3492,6 +3501,10 @@ pub struct GenericHelpers {
     /// [`get_site`](Self::get_site) for an `Op::GetMethod`'s read, which
     /// first asks the site's built-in memo (`jit_helper_get_method_site`).
     pub get_method_site: JitGetSiteHelper,
+    /// [`get_method_site`](Self::get_method_site) on a sunk object's
+    /// stand-in (`sink`, `jit_helper_get_virtual`): the exit sentinel unless
+    /// the property found is a plain data property.
+    pub get_virtual: JitGetSiteHelper,
     /// The property-set helper (`jit_helper_set_prop`), sloppy mode.
     pub set: JitSetPropHelper,
     /// The strict-mode property-set helper (`jit_helper_set_prop_strict`).
@@ -4280,6 +4293,48 @@ impl JitProto {
         no_spec: &[usize],
         demote: &[(usize, u16)],
     ) -> Option<Self> {
+        // (`SINK_OFF` among the headers: an earlier body's sinking kept
+        // leaving, `Self::spec_off`.)
+        // (Kept in the body's own list, which its recompilation reads.)
+        // (A site whose exits the emitter cannot place is left out of the
+        // next try: `sink::reject`.)
+        // (A try that planned no sinking is the compile without.)
+        let sink = !no_spec.contains(&SINK_OFF) && sink::enabled();
+        if sink {
+            sink::REJECTED.with(|r| r.borrow_mut().clear());
+            for _ in 0..4 {
+                let before = sink::REJECTED.with(|r| r.borrow().len());
+                sink::PLANNED.with(|p| p.set(false));
+                let j = Self::compile_generic_sink(
+                    proto, helpers, warm, plain, pick, no_spec, demote, true,
+                );
+                if j.is_some() || !sink::PLANNED.with(core::cell::Cell::get) {
+                    sink::REJECTED.with(|r| r.borrow_mut().clear());
+                    return j;
+                }
+                if sink::REJECTED.with(|r| r.borrow().len()) == before {
+                    break;
+                }
+            }
+            sink::REJECTED.with(|r| r.borrow_mut().clear());
+        }
+        Self::compile_generic_sink(proto, helpers, warm, plain, pick, no_spec, demote, false)
+    }
+
+    /// [`compile_generic_respec`](Self::compile_generic_respec), sinking the
+    /// objects `sink::plan` finds when `sink` (an emitter that cannot place
+    /// one of its exits fails the compile: the caller compiles again without).
+    #[allow(clippy::too_many_arguments)]
+    fn compile_generic_sink<'a>(
+        proto: &crate::nbvm::FnProto,
+        helpers: &GenericHelpers,
+        warm: &[Option<crate::ic::WarmEntry>],
+        plain: &dyn Fn(u32) -> bool,
+        pick: &dyn Fn(usize, &crate::nbvm::Op) -> Vec<inline::Candidate<'a>>,
+        no_spec: &[usize],
+        demote: &[(usize, u16)],
+        sink: bool,
+    ) -> Option<Self> {
         // The register `call_with_inner` puts `new.target` in, if any (a
         // native-call entry fills it from the call header; one at or below the
         // `this` slot would collide with an input, so such a body gets none).
@@ -4298,6 +4353,10 @@ impl JitProto {
         let derived_keys = expanded
             .as_ref()
             .map_or_else(Vec::new, |e| e.derived.clone());
+        // The inlined sloppy ordinary callees' keys (`sink`).
+        let legacy_keys = expanded
+            .as_ref()
+            .map_or_else(Vec::new, |e| e.legacy.clone());
         // The inlined callees' own demotion sites, as spliced
         // (`inline::Candidate::demote`).
         let callee_demote: Vec<(usize, u16)> = expanded
@@ -4373,6 +4432,59 @@ impl JitProto {
             proto
         };
         let warm = &warm[..];
+        // Scalar replacement (`sink`): the emitter compiles the rewritten
+        // bytecode, the interpreter (at an exit) runs this one.
+        let sink_plan = if sink && !proto.is_async && !proto.is_generator {
+            let rejected = sink::REJECTED.with(|r| r.borrow().clone());
+            sink::plan(
+                &proto.ops,
+                proto.n_regs,
+                proto.n_params,
+                &method_gets,
+                &legacy_keys,
+                pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
+                &rejected,
+            )
+        } else {
+            None
+        };
+        if sink::log()
+            && let Some(p) = &sink_plan
+        {
+            std::eprintln!(
+                "[jit] sink {}: {} sites at {:?}, exits before {:?} after {:?}, vget {:?}",
+                proto.name,
+                p.sites.len(),
+                p.sites.iter().map(|s| s.guard).collect::<Vec<_>>(),
+                (0..p.exit_before.len())
+                    .filter(|&i| p.exit_before[i])
+                    .collect::<Vec<_>>(),
+                (0..p.exit_after.len())
+                    .filter(|&i| p.exit_after[i])
+                    .collect::<Vec<_>>(),
+                (0..p.vget.len()).filter(|&i| p.vget[i]).collect::<Vec<_>>(),
+            );
+        }
+        sink::PLANNED.with(|p| p.set(sink_plan.is_some()));
+        let sunk;
+        let (proto, sink_plan, orig_ops) = match sink_plan {
+            Some(mut plan) => {
+                let orig: alloc::boxed::Box<[crate::nbvm::Op]> =
+                    proto.ops.clone().into_boxed_slice();
+                let mut p = proto.clone();
+                p.ops = core::mem::take(&mut plan.ops);
+                p.n_regs = plan.n_regs;
+                sunk = p;
+                (&sunk, Some(plan), Some(orig))
+            }
+            None => (proto, None, None),
+        };
+        if std::env::var_os("KATAAN_JIT_LOG").is_some_and(|v| v == "3") {
+            std::eprintln!("[jit] spliced {} ({} regs):", proto.name, proto.n_regs);
+            for (pc, op) in proto.ops.iter().enumerate() {
+                std::eprintln!("[jit]   {pc:4} {op:?}");
+            }
+        }
         let inline_closures: Vec<bool> = proto
             .ops
             .iter()
@@ -4608,24 +4720,102 @@ impl JitProto {
         tier_up.int_demote = demote.to_vec();
         // The `for-in` loops' sites (`forin`), owned with the code.
         let forin_plan = forin::plan(&ops, &bytecode, proto.n_regs);
-        let deopt_info = can_deopt.then(|| {
-            alloc::boxed::Box::new(deopt::DeoptInfo::new(
-                &bytecode,
-                pc_map
-                    .as_ref()
-                    .map_or_else(Default::default, |m| (m.1.clone(), m.0.clone())),
-                ops.iter()
-                    .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler)),
-            ))
-        });
-        // One word per string literal (`crate::realm::LitCells`).
+        let maps = || {
+            pc_map
+                .as_ref()
+                .map_or_else(Default::default, |m| (m.1.clone(), m.0.clone()))
+        };
+        let handlers = ops
+            .iter()
+            .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
+        // One word per string literal (`crate::realm::LitCells`), then one per
+        // sunk site (its stand-in, `sink::SinkMemo::word`).
+        let n_strings = bytecode
+            .iter()
+            .filter(|op| matches!(op, crate::nbvm::Op::NewString { .. }))
+            .count();
         let lits = alloc::rc::Rc::new(crate::realm::LitCells::new(
-            bytecode
-                .iter()
-                .filter(|op| matches!(op, crate::nbvm::Op::NewString { .. }))
-                .count(),
+            n_strings + sink_plan.as_ref().map_or(0, |p| p.sites.len()),
         ));
-        let (func, native_entry, (spec_heads, demote_heads)) = JitFunction::compile_generic(
+        let deopt_info = match (sink_plan, orig_ops) {
+            (Some(plan), Some(orig)) => {
+                // Per site, its fallback `Construct`'s call site.
+                let calls: Vec<*const CallSite> = plan
+                    .sites
+                    .iter()
+                    .map(|st| match ops.get(st.fallback) {
+                        Some(GenericOp::Construct { cache, .. }) => call_sites
+                            .get(*cache as usize)
+                            .copied()
+                            .unwrap_or(core::ptr::null()),
+                        _ => core::ptr::null(),
+                    })
+                    .collect();
+                if calls.iter().any(|c| c.is_null()) {
+                    return None;
+                }
+                // An own-level fallback op that leaves before it runs: the
+                // own call op whose expansion it ends.
+                let mut own_calls = Vec::new();
+                for f in (0..ops.len()).filter(|&f| plan.exit_before[f]) {
+                    if let Some(m) = &pc_map
+                        && m.1.get(f) == Some(&u32::MAX)
+                    {
+                        // (The own op whose expansion holds `f`.)
+                        if let Some(p) = m.0.iter().rposition(|&b| (b as usize) <= f)
+                            && p + 1 < m.0.len()
+                            && (m.0[p + 1] as usize) > f
+                        {
+                            own_calls.push((f, p));
+                        }
+                    }
+                }
+                // A method call's fallback that leaves before it runs: its
+                // receiver register and its site's chain cache, which the
+                // exit fills for the stand-in (the inlined guard's lookup
+                // reads that cache; only the call op fills it).
+                let fills: Vec<(usize, u16, *mut props::MethodSite)> = (0..ops.len())
+                    .filter(|&f| plan.exit_before[f])
+                    .filter_map(|f| match ops[f] {
+                        GenericOp::CallMethod { recv, site, .. } => {
+                            let m = site_info.get(site as usize)?.method_ptr;
+                            (!m.is_null()).then_some((f, recv, m))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let n_sites = plan.sites.len();
+                Some(alloc::boxed::Box::new(deopt::DeoptInfo::with_sink(
+                    orig,
+                    maps(),
+                    handlers,
+                    alloc::boxed::Box::new(sink::SinkExits {
+                        plan,
+                        memos: (0..n_sites)
+                            .map(|k| sink::SinkMemo::new(lits.word_addr(n_strings + k)))
+                            .collect(),
+                        lits: alloc::rc::Rc::clone(&lits),
+                        lit_base: n_strings,
+                        calls,
+                        own_calls,
+                        fills,
+                        forced: core::cell::Cell::new(0),
+                    }),
+                )))
+            }
+            _ => can_deopt.then(|| {
+                alloc::boxed::Box::new(deopt::DeoptInfo::new(&bytecode, maps(), handlers))
+            }),
+        };
+        // (A sunk object's fields are live wherever it is held: see
+        // `numeric::EXTRA_USES`.)
+        let held = deopt_info
+            .as_ref()
+            .and_then(|d| d.sink.as_ref())
+            .map(|x| x.plan.held_fregs.clone())
+            .unwrap_or_default();
+        numeric::EXTRA_USES.with(|e| *e.borrow_mut() = held);
+        let compiled = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
             &ops,
@@ -4644,7 +4834,9 @@ impl JitProto {
             deopt_info.as_deref(),
             &derived_keys,
             &lits,
-        )?;
+        );
+        numeric::EXTRA_USES.with(|e| e.borrow_mut().clear());
+        let (func, native_entry, (spec_heads, demote_heads)) = compiled?;
         tier_up.spec_regions = spec_heads;
         tier_up.int_regions = demote_heads;
         Some(Self {
@@ -9333,7 +9525,7 @@ impl JitFunction {
         // Where the body may leave for the interpreter (`deopt`): per op,
         // its inlining depth and whether an exit may be taken at its start.
         let deopt_levels = deopt::levels(ops);
-        let deopt_at: Vec<bool> = if deopt_info.is_some() {
+        let deopt_at: Vec<bool> = if deopt_info.is_some_and(|d| d.stress) {
             deopt::points(
                 ops,
                 &deopt_levels,
@@ -9351,7 +9543,64 @@ impl JitFunction {
             alloc::vec![false; ops.len()]
         };
         // The exits' stubs, emitted out of line: (entry, the op).
-        let mut deopt_stubs: Vec<(Label, usize)> = Vec::new();
+        let mut deopt_stubs: Vec<(Label, usize, bool)> = Vec::new();
+        // The body's sunk objects (`sink`) and where an exit may be forced:
+        // at an op start no promoted loop holds registers of, that is no
+        // branch or leave, and (in the function's own code) an op of its
+        // own or an inlined call's fallback op (whose own call op the
+        // interpreter then runs).
+        let sink_x = deopt_info.and_then(|d| d.sink.as_deref());
+        // (A speculative region's fast versions leave for its plain copy,
+        // whose ops run on the register file; a promoted region without one
+        // has no such place.)
+        let exit_region_ok =
+            |pc: usize| !num.in_any_region(pc) || num.in_spec(pc) || num.exit_spill(pc).is_some();
+        let forced_ok = |pc: usize| {
+            exit_region_ok(pc)
+                && !matches!(
+                    ops.get(pc),
+                    Some(
+                        GenericOp::JumpIfFalse { .. }
+                            | GenericOp::Jump { .. }
+                            | GenericOp::InlineLeave
+                    ) | None
+                )
+                && (deopt_levels.get(pc).copied().unwrap_or(0) > 0
+                    || deopt_info.is_some_and(|d| d.own_start(pc).is_some())
+                    || sink_x.is_some_and(|x| x.own_call(pc).is_some()))
+        };
+        if let Some(x) = sink_x {
+            let p = &x.plan;
+            let mut bad = false;
+            #[allow(clippy::needless_range_loop)]
+            for pc in 0..ops.len() {
+                let ok = if p.exit_before[pc] || p.vget[pc] {
+                    forced_ok(pc) && (!p.vget[pc] || matches!(ops[pc], GenericOp::GetMethod { .. }))
+                } else if p.exit_after[pc] {
+                    forced_ok(pc + 1)
+                        && exit_region_ok(pc)
+                        && matches!(
+                            ops[pc],
+                            GenericOp::Construct { .. }
+                                | GenericOp::CallMethod { .. }
+                                | GenericOp::CallWithMethod { .. }
+                                | GenericOp::CallValue { .. }
+                        )
+                } else {
+                    true
+                };
+                if !ok || (p.sunk_guard[pc].is_some() && !exit_region_ok(pc)) {
+                    if sink::log() {
+                        std::eprintln!("[jit] sink: no exit at body pc {pc} ({:?})", ops[pc]);
+                    }
+                    sink::reject(p, pc);
+                    bad = true;
+                }
+            }
+            if bad {
+                return None;
+            }
+        }
         // (The last 16 bytes: the caller's `r12`/`r13`, see `pin`.)
         let frame = ((24
             + 16
@@ -10129,10 +10378,57 @@ impl JitFunction {
         let mut fb_back: Option<Label> = None;
         for (si, &(op_idx, pass)) in sched.iter().enumerate() {
             let op = &ops[op_idx];
+            // (A sunk object's fallback that leaves after it runs: at the
+            // next op, on the fallback's own path only.)
+            let exit_after = op_idx > 0 && sink_x.is_some_and(|x| x.plan.exit_after[op_idx - 1]);
+            // (In a speculative region's fast version a guard diamond's
+            // fallback is never reached: its miss leaves for the copy. In a
+            // promoted region without one, the exit first stores the
+            // promoted registers.)
+            let fast = num.in_region(op_idx) && num.in_spec(op_idx);
+            let spill = if exit_after && num.in_region(op_idx) && !fast {
+                Some(num.exit_spill(op_idx)?)
+            } else {
+                None
+            };
+            if exit_after && fast {
+                let unreached = ops.iter().enumerate().any(|(g, o)| {
+                    matches!(o, GenericOp::InlineGuard { call, .. } if *call as usize == op_idx - 1)
+                        && num.cold_guard(g)
+                });
+                if !unreached {
+                    if let Some(x) = sink_x {
+                        sink::reject(&x.plan, op_idx);
+                    }
+                    return None;
+                }
+            }
+            let exit_after = exit_after && !fast;
             if let Some((mark, back)) = fb_open.take() {
-                a.jmp(back);
+                if exit_after {
+                    for &(x, d) in spill.iter().flatten() {
+                        a.movsd_mem_x(d, x);
+                    }
+                    let stub = a.new_label();
+                    a.jmp(stub);
+                    deopt_stubs.push((stub, op_idx, true));
+                } else {
+                    a.jmp(back);
+                }
                 a.cold_end(mark);
                 fb_back = Some(back);
+            } else if exit_after && si > 0 && sched[si - 1] == (op_idx - 1, pass) {
+                for &(x, d) in spill.iter().flatten() {
+                    a.movsd_mem_x(d, x);
+                }
+                let stub = a.new_label();
+                a.jmp(stub);
+                deopt_stubs.push((stub, op_idx, true));
+            } else if exit_after {
+                if let Some(x) = sink_x {
+                    sink::reject(&x.plan, op_idx);
+                }
+                return None;
             }
             if fallback_cold.get(op_idx).copied().unwrap_or(false)
                 && pending_run.is_none()
@@ -10184,7 +10480,29 @@ impl JitFunction {
                 a.g_movabs(call_seq::r::R11, info.countdown.as_ptr() as u64);
                 a.g_dec_mem(call_seq::r::R11, 0);
                 a.g_jcc(call_seq::cc::E, stub);
-                deopt_stubs.push((stub, op_idx));
+                deopt_stubs.push((stub, op_idx, false));
+            }
+            // A fallback call op that would read a sunk object: the
+            // interpreter runs it (and the rest).
+            // (In a speculative region's fast version: from its plain copy.)
+            if sink_x.is_some_and(|x| x.plan.exit_before[op_idx]) {
+                if num.in_region(op_idx) && num.in_spec(op_idx) {
+                    let bail = num.spec_bail(&mut a, op_idx)?;
+                    a.jmp(bail);
+                } else {
+                    // (A speculative region's plain copy runs on the file.)
+                    let spill = if num.in_region(op_idx) {
+                        num.exit_spill(op_idx)?
+                    } else {
+                        Vec::new()
+                    };
+                    for (x, d) in spill {
+                        a.movsd_mem_x(d, x);
+                    }
+                    let stub = a.new_label();
+                    a.jmp(stub);
+                    deopt_stubs.push((stub, op_idx, false));
+                }
             }
             // A global binding read or write through the global binding
             // cache: the cached address, else (out of line) a fresh one from
@@ -10592,6 +10910,7 @@ impl JitFunction {
                                 .filter(|_| !core::mem::replace(&mut poly_bound[op_idx], true)),
                             proved: proved_slot[op_idx].map(inl_proved),
                             mproved: mproof_slot[op_idx].map(inl_mproved),
+                            sink: sink_x.and_then(|x| x.guard_emit(op_idx)),
                             cproved: cproof_slot[op_idx].map(inl_cproved),
                             wproof: &wp_disps[op_idx],
                             keep: &num.guard_keep(op_idx),
@@ -13656,9 +13975,22 @@ impl JitFunction {
                     a.load_argreg(1, disp(obj));
                     a.movabs_argreg(2, s.method_ptr as i64);
                     a.movabs_argreg(3, call_site as i64);
-                    a.movabs_rax(get_method_site_helper as i64);
+                    // (A sunk object's: a getter, a proxy, … leave, `sink`.)
+                    let vget = sink_x.is_some_and(|x| x.plan.vget[op_idx]);
+                    if vget {
+                        a.movabs_rax(helpers.get_virtual as usize as i64);
+                    } else {
+                        a.movabs_rax(get_method_site_helper as i64);
+                    }
                     a.call_rax();
                     throw_check!();
+                    if vget {
+                        let stub = a.new_label();
+                        a.g_movabs(call_seq::r::R11, NanBox::jit_exit_bits());
+                        a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
+                        a.g_jcc(call_seq::cc::E, stub);
+                        deopt_stubs.push((stub, op_idx, false));
+                    }
                     a.store_rax(disp(dst));
                     a.bind(done);
                 }
@@ -15988,9 +16320,11 @@ impl JitFunction {
         // activation from the op, and its outcome is the body's (falling
         // off the end returns what the body's own end would).
         if let Some(info) = deopt_info {
-            for (stub, pc) in core::mem::take(&mut deopt_stubs) {
+            for (stub, pc, after) in core::mem::take(&mut deopt_stubs) {
                 a.bind(stub);
-                let at = pc as u64 | u64::from(deopt_levels[pc]) << 32;
+                let at = pc as u64
+                    | u64::from(deopt_levels[pc]) << 32
+                    | u64::from(after) << deopt::AFTER_SHIFT;
                 a.mov_rdi_r15();
                 a.mov_rsi_rbx();
                 a.movabs_argreg(2, n_regs as i64);

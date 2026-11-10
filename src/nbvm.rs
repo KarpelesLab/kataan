@@ -7374,6 +7374,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         set_site: jit_tier::jit_helper_set_prop_site,
         get_site: jit_tier::jit_helper_get_prop_site,
         get_method_site: jit_tier::jit_helper_get_method_site,
+        get_virtual: jit_tier::jit_helper_get_virtual,
         init_prop: jit_helper_init_prop,
         get_elem: jit_helper_get_elem,
         get_elem_key: jit_helper_get_elem_key,

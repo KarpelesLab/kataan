@@ -2571,6 +2571,11 @@ pub(crate) struct InlineEmit<'a> {
     /// ([`MethodProof`]): the receiver value it last identified the callee
     /// on through its memo, with that receiver's heap slot and layout.
     pub mproved: Option<MethodProof>,
+    /// A sunk `new` (`super::sink`): its memo and the register that keeps
+    /// the stand-in. The guard then allocates nothing: `this` (and that
+    /// register) get the stand-in, the prototype the record names, when
+    /// the memo vouches for it at the current epoch (else a miss).
+    pub sink: Option<(*const super::sink::SinkMemo, u16)>,
     /// A monomorphic construct guard's **proof** slots ([`ConstructProof`]).
     pub cproved: Option<ConstructProof>,
     /// Per way of the call site's memo, the way's **memo proof** slot
@@ -3387,6 +3392,45 @@ fn emit_inline_new_this_made(
         return Some(());
     }
     check_construct_proto(a, r::R11, fast, miss);
+    if let Some((memo, preg)) = e.sink {
+        // A sunk object (`super::sink`): no allocation. The memo vouches for
+        // the record's prototype at this epoch; the stand-in (the prototype
+        // itself) goes into `this` and the site's own register.
+        let m = |o: usize| i32::try_from(o).ok();
+        a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
+        a.g_movabs(r::R9, memo as u64);
+        a.g_cmp_mem(r::RSI, r::R9, m(offset_of!(super::sink::SinkMemo, proto))?);
+        a.g_jcc(cc::NE, miss);
+        load_proto_epoch(a, r::RSI);
+        a.g_cmp_mem(r::RSI, r::R9, m(offset_of!(super::sink::SinkMemo, stamp))?);
+        a.g_jcc(cc::NE, miss);
+        // (The stand-in's word, emptied by a compaction, which also bumps
+        // the epoch.)
+        a.g_load(r::RAX, r::R9, m(offset_of!(super::sink::SinkMemo, word))?);
+        a.g_load(r::RAX, r::RAX, 0);
+        a.g_test(r::RAX);
+        a.g_jcc(cc::E, miss);
+        a.g_store(r::RBX, reg(this), r::RAX);
+        a.g_store(r::RBX, reg(preg), r::RAX);
+        // (The way of `this` holds what the register does: the stand-in.)
+        // (A prototype that is no plain shaped object is a miss: later
+        // sites may take the way as filled.)
+        if let Some(w) = e.new_way {
+            a.p_walk_plain(
+                super::compute_jit_layout(),
+                e.layout.realm,
+                (r::RBX, reg(this)),
+                miss,
+            );
+            a.g_load(r::RAX, r::RBX, reg(this));
+            a.g_store(RBP, w.key, r::RAX);
+            a.g_store(RBP, w.cell, r::RCX);
+            a.g_movabs(r::R11, e.memo as u64);
+        }
+        a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+        record(a);
+        return Some(());
+    }
     a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
     let made = a.new_label();
     let by_helper = a.new_label();
