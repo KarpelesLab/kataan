@@ -129,7 +129,7 @@ impl Interp {
             return Ok(v); // number, boolean, null, undefined
         };
         let h = Handle::from_raw(raw);
-        if self.realm.is_string_handle(h) || self.realm.bigint_at(h).is_some() {
+        if self.realm.is_string_handle(h) || self.realm.is_bigint(h) {
             return Ok(v);
         }
         if self.realm.symbol_at(h).is_some() {

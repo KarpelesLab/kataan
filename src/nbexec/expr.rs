@@ -2617,6 +2617,15 @@ impl Interp {
                         let m = self.new_str("Maximum BigInt size exceeded");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
                     }
+                    if let Ok(k) = u32::try_from(mag) {
+                        // Bit shifts, not a multiply/divide by `2^k`.
+                        let r = if left {
+                            x.shl_bits(k)
+                        } else {
+                            x.shr_floor_bits(k)
+                        };
+                        return Ok(Some(val(self, r)));
+                    }
                     let pow2 = two.pow(mag);
                     if left {
                         val(self, x.mul(&pow2))
@@ -2945,7 +2954,7 @@ impl Interp {
                     || v.as_handle().map(Handle::from_raw).is_some_and(|h| {
                         this.realm.is_string_handle(h)
                             || this.realm.symbol_at(h).is_some()
-                            || this.realm.bigint_at(h).is_some()
+                            || this.realm.is_bigint(h)
                     })
             };
             let (a, b) = if obj(self, a) && prim(self, b) {
@@ -3138,7 +3147,7 @@ impl Interp {
         };
         if self.realm.symbol_at(oh).is_some()
             || self.realm.is_string_handle(oh)
-            || self.realm.bigint_at(oh).is_some()
+            || self.realm.is_bigint(oh)
         {
             return Some(false);
         }
@@ -3252,7 +3261,7 @@ impl Interp {
         };
         if self.realm.symbol_at(oh).is_some()
             || self.realm.is_string_handle(oh)
-            || self.realm.bigint_at(oh).is_some()
+            || self.realm.is_bigint(oh)
         {
             return Ok(false);
         }
@@ -3374,7 +3383,7 @@ impl Interp {
             // Heap primitives (string/symbol/bigint values) are not objects.
             if self.realm.is_string_handle(oh)
                 || self.realm.symbol_at(oh).is_some()
-                || self.realm.bigint_at(oh).is_some()
+                || self.realm.is_bigint(oh)
             {
                 return Ok(false);
             }

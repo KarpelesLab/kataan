@@ -1551,10 +1551,13 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(83, out);
             w_reg(*src, out);
         }
-        Op::NewBigInt { dst, digits } => {
+        Op::NewBigInt { dst, value } => {
             w_u8(84, out);
             w_reg(*dst, out);
-            w_str(digits, out);
+            // (The literal's digits, as `parse_bigint` reads them back.)
+            let mut digits = alloc::string::String::from("0x");
+            digits.push_str(&value.to_str_radix(16));
+            w_str(&digits, out);
         }
         Op::ToNumeric { dst, src } => {
             w_u8(85, out);
@@ -2497,7 +2500,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         83 => Op::CheckTdz { src: r.reg()? },
         84 => Op::NewBigInt {
             dst: r.reg()?,
-            digits: r.string()?,
+            value: alloc::boxed::Box::new(crate::nbexec::parse_bigint(&r.string()?)),
         },
         85 => Op::ToNumeric {
             dst: r.reg()?,

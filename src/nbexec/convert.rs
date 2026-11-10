@@ -155,7 +155,7 @@ impl Interp {
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
             // ToNumber on a BigInt throws a TypeError (no implicit conversion).
-            if self.realm.bigint_at(h).is_some() {
+            if self.realm.is_bigint(h) {
                 let m = self.new_str("Cannot convert a BigInt value to a number");
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }

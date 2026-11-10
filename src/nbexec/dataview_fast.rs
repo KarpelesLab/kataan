@@ -65,14 +65,6 @@ pub(crate) fn dv_access_for(name: &[u8]) -> Option<DvAccess> {
     })
 }
 
-/// A handle-valued hidden slot `key` of `h`.
-fn slot_handle(realm: &Realm, h: Handle, key: &str) -> Option<Handle> {
-    realm
-        .get_property(h, key)
-        .and_then(NanBox::as_handle)
-        .map(Handle::from_raw)
-}
-
 /// `dv.<acc>(offset, …rest)` when no step of `GetViewValue` / `SetViewValue`
 /// can run code or throw (see the module docs); `None` means "take the general
 /// path", having changed nothing. `rest` is `[littleEndian]` for a get and
@@ -84,9 +76,22 @@ pub(crate) fn dataview_fast(
     offset: NanBox,
     rest: [NanBox; 2],
 ) -> Option<NanBox> {
+    let as_handle = |v: Option<NanBox>| v.and_then(NanBox::as_handle).map(Handle::from_raw);
     let h = Handle::from_raw(recv.as_handle()?);
-    let buf = slot_handle(realm, h, DATA_VIEW_BUF)?;
-    if acc.set && realm.get_property(buf, ARRAY_BUFFER_IMMUTABLE).is_some() {
+    // (The view's and its buffer's hidden slots, read by layout.)
+    let [buf, view_off, view_len] =
+        realm.hidden_slots(h, &[DATA_VIEW_BUF, DATA_VIEW_OFF, DATA_VIEW_LEN], 0)?;
+    let buf = as_handle(buf)?;
+    let [bytes, detached, immutable] = realm.hidden_slots(
+        buf,
+        &[
+            ARRAY_BUFFER_BYTES,
+            ARRAY_BUFFER_DETACHED,
+            ARRAY_BUFFER_IMMUTABLE,
+        ],
+        1,
+    )?;
+    if acc.set && immutable.is_some() {
         return None;
     }
     // ToIndex(requestIndex) is the identity on an integral Number in range.
@@ -99,19 +104,13 @@ pub(crate) fn dataview_fast(
     } else {
         (None, realm.truthy(rest[0]))
     };
-    if realm.get_property(buf, ARRAY_BUFFER_DETACHED).is_some() {
+    if detached.is_some() {
         return None;
     }
-    let bh = slot_handle(realm, buf, ARRAY_BUFFER_BYTES)?;
-    let base = realm
-        .get_property(h, DATA_VIEW_OFF)
-        .and_then(|n| n.as_number())
-        .unwrap_or(0.0) as usize;
+    let bh = as_handle(bytes)?;
+    let base = view_off.and_then(|n| n.as_number()).unwrap_or(0.0) as usize;
     let total = realm.bytes_len(bh).unwrap_or(0);
-    let recorded = realm
-        .get_property(h, DATA_VIEW_LEN)
-        .and_then(|n| n.as_number())
-        .map(|n| n as usize);
+    let recorded = view_len.and_then(|n| n.as_number()).map(|n| n as usize);
     let oob = match recorded {
         Some(len) => base.checked_add(len).is_none_or(|end| end > total),
         None => base > total,

@@ -423,7 +423,7 @@ impl Interp {
             }
             "i64" => {
                 if let Some(h) = v.as_handle().map(Handle::from_raw)
-                    && self.realm.bigint_at(h).is_some()
+                    && self.realm.is_bigint(h)
                 {
                     v
                 } else {

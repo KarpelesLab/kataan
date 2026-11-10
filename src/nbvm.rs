@@ -512,9 +512,13 @@ pub enum Op {
     /// `dst = new.target`. Always among a function's first two ops (after any
     /// `MakeArguments`); filled in by `call_with_inner` on entry.
     LoadNewTarget { dst: Reg },
-    /// `dst = <BigInt literal>` from its normalized digit string (radix prefix
-    /// kept). Hosted runs only: BigInt arithmetic is the host's.
-    NewBigInt { dst: Reg, digits: String },
+    /// `dst = <BigInt literal>`, a new BigInt of the literal's value (parsed
+    /// once, at compile time). Hosted runs only: BigInt arithmetic is the
+    /// host's.
+    NewBigInt {
+        dst: Reg,
+        value: Box<crate::bignum::BigInt>,
+    },
     /// `dst = ToNumeric(src)`: a BigInt is kept, an object goes through its
     /// `valueOf`/`@@toPrimitive` (via the host), anything else is `ToNumber`.
     ToNumeric { dst: Reg, src: Reg },
@@ -2004,6 +2008,11 @@ fn host_binary(
 ) -> Option<Result<NanBox, VmError>> {
     if ctx.host.is_none() || !(host_operand(&ctx.realm, a) || host_operand(&ctx.realm, b)) {
         return None;
+    }
+    // Two BigInt primitives under an operator that cannot throw: the host's
+    // answer, computed on the borrowed values.
+    if let Some(v) = ctx.realm.bigint_binary_fast(op, a, b) {
+        return Some(Ok(v));
     }
     Some(
         with_host(ctx, |h| h.binary(op, a, b))
@@ -6310,7 +6319,7 @@ fn vm_call_native(
         let bad = prim.as_handle().map(Handle::from_raw).and_then(|h| {
             if ctx.realm.symbol_at(h).is_some() {
                 Some(SYM_NUM_ERR)
-            } else if ctx.realm.bigint_at(h).is_some() {
+            } else if ctx.realm.is_bigint(h) {
                 Some("Cannot convert a BigInt value to a number")
             } else {
                 None
@@ -7847,7 +7856,7 @@ fn coerce_bigint_typed_write(
         }
         Unpacked::Handle(raw) => {
             let h = Handle::from_raw(raw);
-            if realm.bigint_at(h).is_some() {
+            if realm.is_bigint(h) {
                 return Ok(value); // already a BigInt
             } else if let Some(s) = realm.string_value(h) {
                 let t = s.trim_matches(crate::realm::is_js_whitespace);
@@ -8778,15 +8787,15 @@ fn run_frame_at_ic(
                     handle_throw!(VmError::Thrown(e));
                 }
             }
-            Op::NewBigInt { dst, digits } => {
-                let n = crate::nbexec::parse_bigint(digits);
+            Op::NewBigInt { dst, value } => {
+                let n = (**value).clone();
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_bigint(n).to_raw());
             }
             Op::ToNumeric { dst, src } => {
                 let v = regs[*src as usize];
                 let is_big = v
                     .as_handle()
-                    .is_some_and(|h| ctx.realm.bigint_at(Handle::from_raw(h)).is_some());
+                    .is_some_and(|h| ctx.realm.is_bigint(Handle::from_raw(h)));
                 if is_big || v.as_number().is_some() {
                     regs[*dst as usize] = v;
                 } else if ctx.host.is_some()
@@ -11427,7 +11436,7 @@ fn vm_get_elem_from(
         || (ctx.host.is_some()
             && (key
                 .as_handle()
-                .is_some_and(|h| ctx.realm.bigint_at(Handle::from_raw(h)).is_some())
+                .is_some_and(|h| ctx.realm.is_bigint(Handle::from_raw(h)))
                 || (key.as_number().is_some()
                     && recv
                         .as_handle()
@@ -22201,7 +22210,7 @@ impl Compiler {
                 let dst = self.alloc();
                 self.ops.push(Op::NewBigInt {
                     dst,
-                    digits: String::from(&**digits),
+                    value: Box::new(crate::nbexec::parse_bigint(digits)),
                 });
                 Ok(dst)
             }

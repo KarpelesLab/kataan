@@ -167,7 +167,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
         // Only value cells (string/date/bigint/array/object) are serializable roots.
         let serializable = realm.is_string_handle(*r)
             || realm.date_at(*r).is_some()
-            || realm.bigint_at(*r).is_some()
+            || realm.is_bigint(*r)
             || realm.vm_function(*r).is_some()
             || realm.collection_is_set(*r).is_some()
             || realm.is_promise(*r)

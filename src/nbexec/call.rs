@@ -1201,7 +1201,7 @@ impl Interp {
                 let is_boxable_prim = this_val.as_handle().map(Handle::from_raw).is_some_and(|h| {
                     self.realm.is_string_handle(h)
                         || self.realm.symbol_at(h).is_some()
-                        || self.realm.bigint_at(h).is_some()
+                        || self.realm.is_bigint(h)
                 });
                 let this_obj = if this_val.as_handle().is_none() || is_boxable_prim {
                     self.coerce_to_object(this_val)
@@ -3680,7 +3680,7 @@ impl Interp {
     fn sort_key_is_pure(&self, v: NanBox) -> bool {
         match v.as_handle().map(Handle::from_raw) {
             None => !v.is_hole(),
-            Some(h) => self.realm.is_string_handle(h) || self.realm.bigint_at(h).is_some(),
+            Some(h) => self.realm.is_string_handle(h) || self.realm.is_bigint(h),
         }
     }
 

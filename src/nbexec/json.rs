@@ -554,7 +554,7 @@ impl Interp {
                     self.json_quote_string(cx, h)?;
                     return Ok(true);
                 }
-                if self.realm.bigint_at(h).is_some() {
+                if self.realm.is_bigint(h) {
                     let m = self.new_str("Do not know how to serialize a BigInt");
                     return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
                 }

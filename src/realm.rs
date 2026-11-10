@@ -512,6 +512,9 @@ pub struct Realm {
     /// `new Map()` inserts no side-table entry (and can be made without the
     /// host, [`new_default_collection`](Realm::new_default_collection)).
     coll_default: [Option<(Handle, Handle)>; 2],
+    /// [`hidden_slots`](Realm::hidden_slots)' memos: per caller, the last
+    /// layout it read and the slots of its keys there.
+    hidden_memo: [Option<(Rc<Shape>, [Option<u32>; HIDDEN_KEYS_MAX])>; HIDDEN_MEMOS],
     /// The `instanceof` right-hand side memo (`realm::inst_memo`).
     inst_memo: inst_memo::InstMemo,
     /// Class tags for *non-object* cells — a derived instance of a native base
@@ -1073,6 +1076,7 @@ impl Realm {
             regexp_literal_memo: None,
             promise_default_proto: None,
             coll_default: [None; 2],
+            hidden_memo: [const { None }; HIDDEN_MEMOS],
             inst_memo: inst_memo::InstMemo::default(),
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
@@ -3818,6 +3822,122 @@ impl Realm {
     #[must_use]
     pub fn bigint_at(&self, handle: Handle) -> Option<crate::bignum::BigInt> {
         self.heap.get(handle)?.as_bigint().cloned()
+    }
+
+    /// The own values of up to [`HIDDEN_KEYS_MAX`] keys `keys` (internal
+    /// data slots such as a `DataView`'s) of the object at `handle`, each
+    /// `None` when absent: what [`get_property`](Self::get_property) reads
+    /// for each key of a plain object, without its by-name lookups when the
+    /// object's layout is the one `memo` (a caller's own index below
+    /// [`HIDDEN_MEMOS`], always used with the same `keys`) last saw — a
+    /// layout's keys and their slots never change. `None` for a cell that
+    /// is not an object (the caller asks `get_property` instead).
+    pub(crate) fn hidden_slots<const N: usize>(
+        &mut self,
+        handle: Handle,
+        keys: &[&str; N],
+        memo: usize,
+    ) -> Option<[Option<NanBox>; N]> {
+        const { assert!(N <= HIDDEN_KEYS_MAX) };
+        let o = self.heap.get(handle)?.as_object()?;
+        let mut out = [None; N];
+        let Some(shape) = o.shaped_shape() else {
+            for (v, k) in out.iter_mut().zip(keys) {
+                *v = o.get(k);
+            }
+            return Some(out);
+        };
+        let slot = &mut self.hidden_memo[memo];
+        let slots = match slot {
+            Some((s, slots)) if Rc::ptr_eq(s, shape) => slots,
+            _ => {
+                let mut slots = [None; HIDDEN_KEYS_MAX];
+                for (sl, k) in slots.iter_mut().zip(keys) {
+                    *sl = shape.lookup(k);
+                }
+                &mut slot.insert((Rc::clone(shape), slots)).1
+            }
+        };
+        for (v, s) in out.iter_mut().zip(slots.iter()) {
+            *v = s.and_then(|s| o.slot(s));
+        }
+        Some(out)
+    }
+
+    /// The value of the `BigInt` at `handle` (borrowed), if it is one.
+    #[must_use]
+    #[inline]
+    pub fn bigint_ref(&self, handle: Handle) -> Option<&crate::bignum::BigInt> {
+        self.heap.get(handle)?.as_bigint()
+    }
+
+    /// Whether the cell at `handle` is a `BigInt` (no copy of its value).
+    #[must_use]
+    #[inline]
+    pub fn is_bigint(&self, handle: Handle) -> bool {
+        self.bigint_ref(handle).is_some()
+    }
+
+    /// `a op b` for two BigInt primitives, computed on borrowed values, when
+    /// the operator is arithmetic, bitwise, a shift or a comparison and
+    /// cannot throw: the very answer [`crate::nbexec::Interp`]'s BigInt
+    /// arithmetic gives (that general path clones both values out of the
+    /// heap first). `None` for anything else — an operand that is not a
+    /// BigInt, a division by zero, `**`, a shift past the size limit or by a
+    /// count beyond `i64`, `>>>`, or another operator — which the caller
+    /// leaves to the general path (and its errors).
+    pub fn bigint_binary_fast(
+        &mut self,
+        op: crate::ast::BinaryOp,
+        a: NanBox,
+        b: NanBox,
+    ) -> Option<NanBox> {
+        use crate::ast::BinaryOp as B;
+        use core::cmp::Ordering;
+        let x = self.bigint_ref(Handle::from_raw(a.as_handle()?))?;
+        let y = self.bigint_ref(Handle::from_raw(b.as_handle()?))?;
+        let n = match op {
+            B::Add => x.add(y),
+            B::Sub => x.sub(y),
+            B::Mul => x.mul(y),
+            B::Div | B::Mod => {
+                if y.is_zero() {
+                    return None;
+                }
+                let (q, r) = x.divmod(y)?;
+                if op == B::Div { q } else { r }
+            }
+            B::BitAnd => x.bitand(y),
+            B::BitOr => x.bitor(y),
+            B::BitXor => x.bitxor(y),
+            B::Shl | B::Shr => {
+                let count = i64::try_from(y.to_i128()?).ok()?;
+                let left = (op == B::Shl) == (count >= 0);
+                let mag = count.unsigned_abs();
+                let projected = if left {
+                    x.bit_len().saturating_add(mag)
+                } else {
+                    mag
+                };
+                if projected > self.limits.max_bigint_bits {
+                    return None;
+                }
+                let k = u32::try_from(mag).ok()?;
+                if left {
+                    x.shl_bits(k)
+                } else {
+                    x.shr_floor_bits(k)
+                }
+            }
+            B::Lt => return Some(NanBox::boolean(x.cmp(y) == Ordering::Less)),
+            B::Gt => return Some(NanBox::boolean(x.cmp(y) == Ordering::Greater)),
+            B::LtEq => return Some(NanBox::boolean(x.cmp(y) != Ordering::Greater)),
+            B::GtEq => return Some(NanBox::boolean(x.cmp(y) != Ordering::Less)),
+            B::EqEq | B::EqEqEq => return Some(NanBox::boolean(x == y)),
+            B::NotEq | B::NotEqEq => return Some(NanBox::boolean(x != y)),
+            _ => return None,
+        };
+        Some(NanBox::handle(self.new_bigint(n).to_raw()))
     }
 
     /// Allocates a binding cell ([`Cell::Box`]) holding `undefined`.
@@ -10067,6 +10187,13 @@ impl Realm {
 /// The most entries a Map/Set without a hash index is searched by a plain
 /// scan (`Realm::collection_find_ro`) instead of building the index.
 pub(crate) const COLL_SCAN_MAX: usize = 8;
+
+/// The most keys one [`Realm::hidden_slots`] call reads.
+pub(crate) const HIDDEN_KEYS_MAX: usize = 3;
+
+/// The number of [`Realm::hidden_slots`] memos (one per caller): a
+/// `DataView`'s slots (0) and its buffer's (1).
+pub(crate) const HIDDEN_MEMOS: usize = 2;
 
 /// [`Vec::retain`] of `list[from..]` alone: the entries before `from` all
 /// stay, unvisited.

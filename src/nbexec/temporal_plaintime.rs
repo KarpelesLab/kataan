@@ -198,7 +198,7 @@ impl Interp {
         if let Some(raw) = item.as_handle() {
             // A Symbol/BigInt is a handle but not a string → TypeError.
             let sh = Handle::from_raw(raw);
-            if self.realm.symbol_at(sh).is_some() || self.realm.bigint_at(sh).is_some() {
+            if self.realm.symbol_at(sh).is_some() || self.realm.is_bigint(sh) {
                 return Err(self.type_error("Temporal.PlainTime: invalid argument"));
             }
         }

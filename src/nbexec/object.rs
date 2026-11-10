@@ -2025,7 +2025,7 @@ impl Interp {
                     // ToObject(Symbol) → a Symbol wrapper object (its prototype
                     // methods read the boxed symbol via `thisSymbolValue`).
                     self.make_primitive_wrapper(v, N_SYMBOL)
-                } else if self.realm.bigint_at(h).is_some() {
+                } else if self.realm.is_bigint(h) {
                     // ToObject(BigInt) → a BigInt wrapper object.
                     self.make_primitive_wrapper(v, N_BIGINT)
                 } else {
@@ -2954,7 +2954,7 @@ impl Interp {
             "String"
         } else if self.realm.regexp_flags(handle).is_some() {
             "RegExp"
-        } else if self.realm.bigint_at(handle).is_some() {
+        } else if self.realm.is_bigint(handle) {
             "BigInt"
         } else if self.realm.symbol_at(handle).is_some() {
             "Symbol"
