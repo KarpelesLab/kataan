@@ -4508,6 +4508,11 @@ pub struct StoreGlobalCache {
     owned: core::cell::Cell<u8>,
     /// Compiled code's global-object mirror (`crate::jit::global_mirror`).
     pub(crate) jit: global_mirror::MirrorCache,
+    /// Compiled code's last validated write address for a binding the
+    /// global object has no like-named property for, and the global
+    /// binding epoch it was validated under (`jit_tier::global_store_ref`).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) wmemo: core::cell::Cell<(u64, u64)>,
 }
 
 /// The fast path of `PutValue` for a global-environment name: when the

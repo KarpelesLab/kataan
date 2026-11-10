@@ -2187,6 +2187,7 @@ impl Object {
     /// [`cached_get`](Object::cached_get)); a slot from a stale shape would read a
     /// different property.
     #[must_use]
+    #[inline]
     pub fn slot(&self, slot: u32) -> Option<NanBox> {
         self.slot_get(slot)
     }

@@ -1329,6 +1329,30 @@ fn global_store_ref(
     name: &str,
     cache: &super::StoreGlobalCache,
 ) -> Option<*mut NanBox> {
+    // The address this op validated last, under the same global binding
+    // epoch (no binding added, freed or moved, the global scope not
+    // swapped), while the running scope is still the global scope and the
+    // global object it was validated against still has no like-named own
+    // property (the same object at the same key epoch): what the steps
+    // below would find again. (A body's frame cache holds a write address
+    // only for one activation, so a small function writing a global counter
+    // validated it on every call.)
+    let epoch = crate::env::global_binding_epoch();
+    let (memo_epoch, memo) = cache.wmemo.get();
+    if memo != 0
+        && memo_epoch == epoch
+        && cache.owned.get() == 1
+        && let Some((_, g)) = ctx.host.as_deref()?.global_scope_if_current()
+        && g.as_handle() == Some(cache.global.get())
+        && ctx
+            .realm
+            .jit_object(Handle::from_raw(cache.global.get()))
+            .is_some_and(|o| o.key_epoch() == cache.epoch.get())
+    {
+        cache.jit.set(0);
+        return Some(memo as usize as *mut NanBox);
+    }
+    cache.wmemo.set((0, 0));
     let Some((p, g)) =
         ctx.host
             .as_deref()?
@@ -1355,12 +1379,20 @@ fn global_store_ref(
     // (The lexical test, a search of the scope's lexical names, only matters
     // for a name the global object owns: asked second, as most such writes
     // are a script's `let` counter's, run once per activation.)
-    if !super::global_owns_cached(&ctx.realm, g, name, cache)
-        || ctx
-            .host
-            .as_deref()
-            .and_then(|h| h.global_scope_if_current())
-            .is_some_and(|(scope, _)| scope.has_lexical(name))
+    if !super::global_owns_cached(&ctx.realm, g, name, cache) {
+        cache.jit.set(0);
+        // (Memoized only once the owned-property answer is cached against
+        // this global object's key epoch, which the memo's check reads.)
+        if cache.owned.get() == 1 && cache.global.get() == g.to_raw() {
+            cache.wmemo.set((epoch, p as usize as u64));
+        }
+        return Some(p);
+    }
+    if ctx
+        .host
+        .as_deref()
+        .and_then(|h| h.global_scope_if_current())
+        .is_some_and(|(scope, _)| scope.has_lexical(name))
     {
         cache.jit.set(0);
         return Some(p);
