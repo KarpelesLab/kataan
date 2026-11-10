@@ -15,19 +15,25 @@ use core::cmp::Ordering;
 
 /// A string `switch` site's memo of its last few discriminants (see
 /// [`Realm::string_switch_index_memo`]): each the rope of a string it looked
-/// up, with the answer, direct-mapped by the rope's address. A rope is
+/// up, with the answer, at one of two ways chosen by the rope's address
+/// (two-choice: a direct-mapped memo let two hot discriminants that
+/// happened to share a way evict each other on every lookup, so a
+/// program's speed depended on where its literals were allocated). A rope is
 /// immutable and the memo keeps it alive, so a string cell holding that very
 /// rope (`Rope::ptr_eq`) has those contents and that answer. A program
 /// dispatches on a few literal strings (each literal site's evaluations share
 /// one cell), so the memo answers almost every lookup without comparing
 /// bytes. Only short strings are kept.
+/// (Boxed: the op that holds it stays small.)
 #[derive(Default)]
 pub struct SwitchMemo {
-    ways: core::cell::RefCell<[(Option<crate::rope::Rope>, u32); SWITCH_MEMO_WAYS]>,
+    ways: alloc::boxed::Box<
+        core::cell::RefCell<[(Option<crate::rope::Rope>, u32); SWITCH_MEMO_WAYS]>,
+    >,
 }
 
 /// How many discriminants a [`SwitchMemo`] remembers.
-const SWITCH_MEMO_WAYS: usize = 16;
+const SWITCH_MEMO_WAYS: usize = 32;
 
 /// The longest string a [`SwitchMemo`] keeps (bytes).
 const SWITCH_MEMO_MAX: usize = 64;
@@ -82,17 +88,32 @@ impl Realm {
             .get(crate::heap::Handle::from_raw(h))
             .and_then(Cell::as_str)?;
         // (Fibonacci hashing of the address: nodes allocated a fixed stride
-        // apart still spread over the ways.)
-        let way = ((r.addr() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize
-            % SWITCH_MEMO_WAYS;
-        if let (Some(k), i) = &memo.ways.borrow()[way]
-            && k.ptr_eq(r)
+        // apart still spread over the ways. Its top bits pick one way,
+        // the next ones the other.)
+        let h = (r.addr() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let w1 = (h >> 59) as usize % SWITCH_MEMO_WAYS;
+        let w2 = (h >> 54) as usize % SWITCH_MEMO_WAYS;
         {
-            return (*i != SWITCH_NONE).then_some(*i);
+            let ways = memo.ways.borrow();
+            for w in [w1, w2] {
+                if let (Some(k), i) = &ways[w]
+                    && k.ptr_eq(r)
+                {
+                    return (*i != SWITCH_NONE).then_some(*i);
+                }
+            }
         }
         let i = self.string_switch_index(v, table);
         if r.len() <= SWITCH_MEMO_MAX {
-            memo.ways.borrow_mut()[way] = (Some(r.clone()), i.unwrap_or(SWITCH_NONE));
+            let mut ways = memo.ways.borrow_mut();
+            // (The first way if free, else the second if free, else the
+            // first again.)
+            let w = if ways[w1].0.is_some() && ways[w2].0.is_none() {
+                w2
+            } else {
+                w1
+            };
+            ways[w] = (Some(r.clone()), i.unwrap_or(SWITCH_NONE));
         }
         i
     }
