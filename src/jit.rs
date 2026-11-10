@@ -11079,7 +11079,11 @@ impl JitFunction {
                             pend: slots0.pend,
                             save: slots0.save,
                             hdr: slots0.hdr,
-                            seq: false,
+                            // (A speculative region's plain copy may be
+                            // entered inside the body by its fast
+                            // version's leave, with the marker set: its
+                            // leave then clears it, as a call sequence's.)
+                            seq: pass == numeric::PASS_COPY,
                         });
                         plain_open.push((op_idx, l, pass));
                         num.set_plain_lazy(a.plain_lazy_now());
