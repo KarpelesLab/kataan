@@ -5391,6 +5391,12 @@ pub struct X64Assembler {
     /// Per entry of `lazy_pend`, how many of `lazy_args` are its.
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     lazy_args_at: Vec<usize>,
+    /// Inside the windows of plainly lazy pending activations
+    /// (`call_seq::PlainLazy`), outermost first, which a `call` emitted
+    /// there makes pending first
+    /// ([`inline_frame_hook`](Self::inline_frame_hook)).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    plain_lazy: Vec<call_seq::PlainLazy>,
     /// The body's shared **post-call stubs** (each once, with its label):
     /// what a `call` would otherwise expand after it at every site
     /// ([`X64Assembler::post_call_outlined`]), placed by
@@ -6004,6 +6010,14 @@ fn inline_levels(ops: &[GenericOp]) -> Vec<u8> {
             _ => 0,
         })
         .collect()
+}
+
+/// Whether inlined activations may be plainly lazy (`call_seq::PlainLazy`;
+/// `KATAAN_JIT_PLAINLAZY=0` turns it off; read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn plain_lazy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PLAINLAZY").is_none_or(|v| v != "0"))
 }
 
 /// A branch target in an [`X64Assembler`], resolved by [`X64Assembler::bind`].
@@ -8893,6 +8907,60 @@ impl JitFunction {
             }
             out
         };
+        // Per inlined call's guard, the pc of its `InlineLeave` when its
+        // activation may be **plainly lazy** in code that calls
+        // (`call_seq::PlainLazy`): the window of its outermost level's
+        // guard is straight — no backward branch, entry, catch target or
+        // handler op in it, and every guard in it with its leave in it —
+        // and then so is every inner level's in it. (Polymorphic ways
+        // too: each is a guard with a window of its own.)
+        let plain_leave: Vec<Option<usize>> = if plain_lazy_enabled() {
+            let mut out = alloc::vec![None; ops.len()];
+            let levels = inline_levels(ops);
+            let mut leave_of = alloc::vec![None; ops.len()];
+            let mut open: Vec<usize> = Vec::new();
+            for (p, op) in ops.iter().enumerate() {
+                match *op {
+                    GenericOp::InlineGuard { .. } => open.push(p),
+                    GenericOp::InlineLeave => {
+                        if let Some(g) = open.pop() {
+                            leave_of[g] = Some(p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for g in 0..ops.len() {
+                if !matches!(ops[g], GenericOp::InlineGuard { .. }) || levels[g] != 1 {
+                    continue;
+                }
+                let Some(l) = leave_of[g] else { continue };
+                let straight = (g + 1..=l).all(|p| {
+                    !osr_entries.contains(&p)
+                        && catch_targets.binary_search(&p).is_err()
+                        && match ops[p] {
+                            GenericOp::PushHandler { .. } | GenericOp::PopHandler => false,
+                            GenericOp::Jump { target } | GenericOp::JumpIfFalse { target, .. } => {
+                                target > p
+                            }
+                            GenericOp::InlineGuard { .. } => leave_of[p].is_some_and(|q| q < l),
+                            _ => true,
+                        }
+                });
+                if !straight {
+                    continue;
+                }
+                out[g] = Some(l);
+                for p in g + 1..l {
+                    if matches!(ops[p], GenericOp::InlineGuard { .. }) {
+                        out[p] = leave_of[p];
+                    }
+                }
+            }
+            out
+        } else {
+            alloc::vec![None; ops.len()]
+        };
         // An inlined call's guard whose boolean only its own fused test
         // names (nothing enters the body there): where that test is emitted
         // as nothing, no code reads it, so it is not stored
@@ -10346,6 +10414,19 @@ impl JitFunction {
         // The lazily pending activations whose bodies are being emitted,
         // outermost first: `(its guard, its leave, the pass)`.
         let mut lazy_open: Vec<(usize, usize, u8)> = Vec::new();
+        // The plainly lazy activations whose bodies are being emitted
+        // (`call_seq::PlainLazy`), likewise.
+        let mut plain_open: Vec<(usize, usize, u8)> = Vec::new();
+        // The out-of-line stubs (by their entry label) of ops in plainly
+        // lazy windows, with those windows: a call such a stub makes sets
+        // their markers first.
+        let mut plain_stubs: Vec<(Label, Vec<call_seq::PlainLazy>)> = Vec::new();
+        let plain_of = |v: &[(Label, Vec<call_seq::PlainLazy>)], l: Label| {
+            v.iter()
+                .find(|(x, _)| *x == l)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_default()
+        };
         // An inlined call's own call op, the guards' fallback (`inline`):
         // reached only by a guard's miss (the op before it is the last
         // way's jump past it), so its code goes out of line, in a cold
@@ -10392,6 +10473,9 @@ impl JitFunction {
                     let stub = a.new_label();
                     a.jmp(stub);
                     deopt_stubs.push((stub, op_idx, true));
+                    if !a.plain_lazy_now().is_empty() {
+                        plain_stubs.push((stub, a.plain_lazy_now()));
+                    }
                 } else {
                     a.jmp(back);
                 }
@@ -10404,6 +10488,9 @@ impl JitFunction {
                 let stub = a.new_label();
                 a.jmp(stub);
                 deopt_stubs.push((stub, op_idx, true));
+                if !a.plain_lazy_now().is_empty() {
+                    plain_stubs.push((stub, a.plain_lazy_now()));
+                }
             } else if exit_after {
                 if let Some(x) = sink_x {
                     sink::reject(&x.plan, op_idx);
@@ -10442,6 +10529,14 @@ impl JitFunction {
                 lazy_open.truncate(k);
                 a.truncate_lazy_pend(k);
             }
+            if let Some(k) = plain_open
+                .iter()
+                .position(|&(g, l, p)| !(g < op_idx && op_idx <= l && p == pass))
+            {
+                plain_open.truncate(k);
+                a.truncate_plain_lazy(k);
+            }
+            num.set_plain_lazy(a.plain_lazy_now());
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
             a.set_recv_survive(survive.get(op_idx).cloned().unwrap_or_default(), layout);
             // (The body, a speculative region's plain copy, or its integer
@@ -10461,6 +10556,9 @@ impl JitFunction {
                 a.g_dec_mem(call_seq::r::R11, 0);
                 a.g_jcc(call_seq::cc::E, stub);
                 deopt_stubs.push((stub, op_idx, false));
+                if !a.plain_lazy_now().is_empty() {
+                    plain_stubs.push((stub, a.plain_lazy_now()));
+                }
             }
             // A fallback call op that would read a sunk object: the
             // interpreter runs it (and the rest).
@@ -10482,6 +10580,9 @@ impl JitFunction {
                     let stub = a.new_label();
                     a.jmp(stub);
                     deopt_stubs.push((stub, op_idx, false));
+                    if !a.plain_lazy_now().is_empty() {
+                        plain_stubs.push((stub, a.plain_lazy_now()));
+                    }
                 }
             }
             // A global binding read or write through the global binding
@@ -10522,12 +10623,18 @@ impl JitFunction {
                             let h = a.new_label();
                             a.gm_store_gpr(cell, call_seq::r::R11, call_seq::r::RCX, h);
                             cold_mirrors.push((h, done, op_idx));
+                            if !a.plain_lazy_now().is_empty() {
+                                plain_stubs.push((h, a.plain_lazy_now()));
+                            }
                         }
                     }
                     _ => return None,
                 }
                 a.bind(done);
                 cold_globals.push((fetch, back, done, op_idx, slot, k));
+                if !a.plain_lazy_now().is_empty() {
+                    plain_stubs.push((fetch, a.plain_lazy_now()));
+                }
                 continue;
             }
             // The test of an `if (!x)` whose not branched itself.
@@ -10807,6 +10914,24 @@ impl JitFunction {
                                     && lazy_open.len() + 1 == usize::from(inl_level[op_idx])
                             }
                     });
+                    // Elsewhere (code that calls), a guard of a straight
+                    // body likewise leaves its marker unset: every `call`
+                    // and call sequence in the body first sets it unless
+                    // the activation is materialized already
+                    // (`call_seq::PlainLazy`). (An inner level's only
+                    // inside its enclosing level's plainly lazy body.)
+                    let plain = plain_leave[op_idx].filter(|&l| {
+                        lazy.is_none()
+                            && !num.in_spec(op_idx)
+                            && if outermost {
+                                plain_open.is_empty() && inl_level[op_idx] == 1
+                            } else {
+                                plain_open
+                                    .last()
+                                    .is_some_and(|&(g, gl, p)| g < op_idx && l < gl && p == pass)
+                                    && plain_open.len() + 1 == usize::from(inl_level[op_idx])
+                            }
+                    });
                     // (The arguments a promoted loop keeps in SSE registers,
                     // into the register file for the activation: a lazily
                     // pending one's that keep their SSE register through
@@ -10899,7 +11024,7 @@ impl JitFunction {
                             // speculative fast version's guard diamond.)
                             dst_dead: guard_dst_dead.get(op_idx) == Some(&true)
                                 && (cold_miss.is_some() || !num.in_region(op_idx)),
-                            lazy_pend: lazy.is_some(),
+                            lazy_pend: lazy.is_some() || plain.is_some(),
                             fused_miss: match ops.get(op_idx + 1) {
                                 _ if cold_miss.is_some() => cold_miss.map(|c| c.0),
                                 Some(&GenericOp::JumpIfFalse { target, .. })
@@ -10942,6 +11067,17 @@ impl JitFunction {
                         a.push_lazy_pend((stub, slots0.pend, copy, slots0.save), &args);
                         lazy_open.push((op_idx, l, pass));
                     }
+                    if let Some(l) = plain {
+                        a.push_plain_lazy(call_seq::PlainLazy {
+                            stub,
+                            pend: slots0.pend,
+                            save: slots0.save,
+                            hdr: slots0.hdr,
+                            seq: false,
+                        });
+                        plain_open.push((op_idx, l, pass));
+                        num.set_plain_lazy(a.plain_lazy_now());
+                    }
                     inline_stubs.push((
                         stub,
                         argv.clone(),
@@ -10965,6 +11101,21 @@ impl JitFunction {
                             a.truncate_lazy_pend(lazy_open.len());
                         } else {
                             call_seq::emit_inline_leave_pending(&mut a, &s);
+                        }
+                    } else if plain_open
+                        .last()
+                        .is_some_and(|&(_, l, p)| l == op_idx && p == pass)
+                    {
+                        // (A plainly lazy one's: whether a call
+                        // materialized it, or a call sequence left it
+                        // pending, `call_seq::PlainLazy`.)
+                        plain_open.pop();
+                        let p = a.pop_plain_lazy()?;
+                        num.set_plain_lazy(a.plain_lazy_now());
+                        if p.seq {
+                            call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
+                        } else {
+                            call_seq::emit_inline_leave_plain(&mut a, &helpers.call_layout, &s);
                         }
                     } else {
                         call_seq::emit_inline_leave(&mut a, &helpers.call_layout, &s);
@@ -13872,6 +14023,9 @@ impl JitFunction {
                             call_site,
                             (a.call_spill_now(), a.call_globals_now()),
                         ));
+                        if !a.plain_lazy_now().is_empty() {
+                            plain_stubs.push((helper, a.plain_lazy_now()));
+                        }
                     }
                     if ool_past.is_none() {
                         a.bind(done);
@@ -13970,6 +14124,9 @@ impl JitFunction {
                         a.g_cmp(call_seq::r::RAX, call_seq::r::R11);
                         a.g_jcc(call_seq::cc::E, stub);
                         deopt_stubs.push((stub, op_idx, false));
+                        if !a.plain_lazy_now().is_empty() {
+                            plain_stubs.push((stub, a.plain_lazy_now()));
+                        }
                     }
                     a.store_rax(disp(dst));
                     a.bind(done);
@@ -16033,6 +16190,8 @@ impl JitFunction {
         }
         // (No inlined body's window reaches the out-of-line code.)
         a.truncate_lazy_pend(0);
+        a.truncate_plain_lazy(0);
+        num.set_plain_lazy(Vec::new());
         // (The out-of-line code below keeps no way across its calls.)
         a.set_recv_survive(Vec::new(), layout);
         num.set_copy(false);
@@ -16077,6 +16236,7 @@ impl JitFunction {
         for (entry, back, pc) in core::mem::take(&mut cold_mirrors) {
             let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
             a.bind(entry);
+            a.set_plain_lazy(plain_of(&plain_stubs, entry));
             a.mov_rdi_r15();
             a.movabs_argreg(1, op_ptr as i64);
             a.g_mov(call_seq::r::RDX, call_seq::r::RCX);
@@ -16087,6 +16247,7 @@ impl JitFunction {
             exec_op!(pc);
             a.jmp(back);
         }
+        a.set_plain_lazy(Vec::new());
         // The global binding cache's refills: a validated address is cached
         // and used, else the interpreter runs the op.
         let gc_group: Vec<usize> = gc_reads.iter().map(|&k| 1 + k).collect();
@@ -16094,6 +16255,7 @@ impl JitFunction {
             let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
             let slow = a.new_label();
             a.bind(fetch);
+            a.set_plain_lazy(plain_of(&plain_stubs, fetch));
             a.mov_rdi_r15();
             a.movabs_argreg(1, op_ptr as i64);
             a.movabs_rax(helpers.global_ref as usize as i64);
@@ -16109,6 +16271,7 @@ impl JitFunction {
             exec_op!(pc);
             a.jmp(done);
         }
+        a.set_plain_lazy(Vec::new());
         if let Some(stub) = gc_stub {
             let slots: Vec<i32> = (0..gc_plan.slots).map(gc_slot).collect();
             a.emit_body_globals_stub(stub, &slots);
@@ -16238,6 +16401,7 @@ impl JitFunction {
             a.set_call_spill(spill.0);
             a.set_call_globals(spill.1);
             a.bind(helper);
+            a.set_plain_lazy(plain_of(&plain_stubs, helper));
             a.dbg_mark("x-get");
             let slow = a.new_label();
             let getter = a.new_label();
@@ -16296,12 +16460,14 @@ impl JitFunction {
             a.set_call_spill(Vec::new());
             a.set_call_globals(Vec::new());
         }
+        a.set_plain_lazy(Vec::new());
         // The deoptimization exits (`deopt`): the interpreter finishes the
         // activation from the op, and its outcome is the body's (falling
         // off the end returns what the body's own end would).
         if let Some(info) = deopt_info {
             for (stub, pc, after) in core::mem::take(&mut deopt_stubs) {
                 a.bind(stub);
+                a.set_plain_lazy(plain_of(&plain_stubs, stub));
                 let at = pc as u64
                     | u64::from(deopt_levels[pc]) << 32
                     | u64::from(after) << deopt::AFTER_SHIFT;
@@ -16318,6 +16484,7 @@ impl JitFunction {
                 a.frame_epilogue();
             }
         }
+        a.set_plain_lazy(Vec::new());
         // Throw exit. In a body with `try` regions, first offer the pending fault
         // to the activation's innermost handler (exactly the interpreter's
         // `handle_throw!`): a caught throw resumes at its catch pc. Otherwise

@@ -1142,6 +1142,9 @@ struct Stub {
     /// region's integer version, which may have clobbered the int GPRs:
     /// they first come back from their save slots ([`NumGen::int_save`]).
     restore: bool,
+    /// The plainly lazy activations its op lies in (`call_seq::PlainLazy`):
+    /// a call the stub makes sets their markers first.
+    plain: Vec<super::call_seq::PlainLazy>,
 }
 
 /// A lazily pending activation's arguments its guard left in their SSE
@@ -1291,6 +1294,9 @@ pub(super) struct NumGen {
     /// The inline `Math.f(x)` calls whose receiver and method the fast
     /// version's entry checks prove ([`Self::plan_math_proofs`]).
     math_proofs: Vec<MathProof>,
+    /// The plainly lazy activations the op being emitted lies in
+    /// (`call_seq::PlainLazy`), which its stubs take along.
+    plain_lazy: Vec<super::call_seq::PlainLazy>,
 }
 
 /// An inline `Math.f(x)` call of a speculative region's fast version that
@@ -1986,6 +1992,7 @@ impl NumGen {
             rc_relied: Vec::new(),
             keeps_si_di: Vec::new(),
             math_proofs: Vec::new(),
+            plain_lazy: Vec::new(),
         }
     }
 
@@ -2084,6 +2091,12 @@ impl NumGen {
     /// Sets where a back-edge poll that asks the body to leave jumps.
     pub(super) fn set_leave_exit(&mut self, l: Label) {
         self.leave_exit = Some(l);
+    }
+
+    /// The plainly lazy activations the op emitted next lies in
+    /// (`X64Assembler::plain_lazy_now`), which its stubs take along.
+    pub(super) fn set_plain_lazy(&mut self, levels: Vec<super::call_seq::PlainLazy>) {
+        self.plain_lazy = levels;
     }
 
     /// Enters (or leaves) the emission of a speculative region's plain copy.
@@ -3576,6 +3589,7 @@ impl NumGen {
             int: self.imode.is_some(),
             copy: self.copy,
             restore: self.int_saved,
+            plain: self.plain_lazy.clone(),
         });
         Some(entry)
     }
@@ -4962,6 +4976,7 @@ impl NumGen {
             int: self.imode.is_some(),
             copy: self.copy,
             restore: self.int_saved,
+            plain: self.plain_lazy.clone(),
         });
     }
 
@@ -6268,6 +6283,7 @@ impl NumGen {
         let stubs = core::mem::take(&mut self.stubs);
         for s in &stubs {
             a.bind(s.entry);
+            a.set_plain_lazy(s.plain.clone());
             self.cur_pc = s.pc;
             self.copy = s.copy;
             self.imode = if s.int { s.region } else { None };
@@ -6500,6 +6516,7 @@ impl NumGen {
                 }
             }
         }
+        a.set_plain_lazy(Vec::new());
         self.imode = None;
         self.copy = false;
         for (l, pc) in core::mem::take(&mut self.nest_entries) {

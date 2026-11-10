@@ -2041,6 +2041,10 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     if let Some(c) = &ictx {
         let plain = a.new_label();
         let hook = a.new_label();
+        // (Plainly lazy ones are pending from here, and may stay so past
+        // the call: `PlainLazy::seq`.)
+        a.plain_lazy_store();
+        a.plain_lazy_seq();
         a.g_mem(true, &[0x83], 7, RBP, c.pend); // cmp qword [rbp+pend], -1
         a.code.push(0xff);
         a.g_jcc(cc::E, plain);
@@ -2621,6 +2625,33 @@ pub(crate) type CalleeCopy = Option<(i32, i32)>;
 /// inner level, its `save` slot (which, made pending, holds the enclosing
 /// level's stub: [`InlineSlots::save`]).
 pub(crate) type LazyPend = (Label, i32, CalleeCopy, Option<i32>);
+
+/// A **plainly lazy** pending activation: an inlined call whose guard, in
+/// code that may call (not a speculative loop's fast version, whose own
+/// scheme is [`LazyPend`]), leaves its pending marker unset. Its body is a
+/// straight window (no loop, entry, handler or catch: no back-edge poll,
+/// nothing to leave or resume at), so the emitter knows, at every `call`
+/// and call sequence in it, which activations are lazily pending: there
+/// [`X64Assembler::plain_lazy_store`] makes them pending first (unless
+/// they are materialized already), and the out-of-line stubs of its ops
+/// take the window along ([`X64Assembler::plain_lazy_now`]). A guard then
+/// stores nothing, and the leave of a window no call sequence left pending
+/// only checks whether the activation was materialized
+/// ([`emit_inline_leave_plain`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlainLazy {
+    /// Its materialization stub.
+    pub stub: Label,
+    /// The shared pending marker's slot.
+    pub pend: i32,
+    /// An inner level's `save` slot ([`InlineSlots::save`]).
+    pub save: Option<i32>,
+    /// Its header's slot (set once materialized).
+    pub hdr: i32,
+    /// A call sequence in its window left it pending across its call
+    /// (`InlineCtx`): the marker may still be set at its leave.
+    pub seq: bool,
+}
 
 /// A method guard's proof (`InlineEmit::mproved`, `rbp`-relative slots):
 /// the receiver value whose lookup its memo answered (`bits`, one of the
@@ -3603,6 +3634,33 @@ pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &Inline
     a.bind(done);
 }
 
+/// [`emit_inline_leave`] for a plainly lazy activation ([`PlainLazy`]) whose
+/// window no call sequence left pending across its call: the marker is
+/// empty here (every `call` that set it ran the stub, which empties it),
+/// so the activation was either never made pending (nothing to do) or
+/// materialized (its header popped as [`emit_inline_leave`] pops it; an
+/// inner level's `save` emptied, as it is when not active). Preserves
+/// `rax`.
+pub(crate) fn emit_inline_leave_plain(a: &mut X64Assembler, l: &CallLayout, s: &InlineSlots) {
+    a.dbg_mark("leave-l");
+    let done = a.new_label();
+    a.g_mem(true, &[0x83], 7, RBP, s.hdr); // cmp qword [rbp+hdr], -1
+    a.code.push(0xff);
+    a.g_jcc(cc::E, done);
+    a.g_load(r::RCX, RBP, s.hdr);
+    a.g_load(r::R10, r::R15, l.stack);
+    a.g_store(r::R10, STACK_TOP, r::RCX);
+    a.g_load(r::RDX, r::RCX, 0);
+    a.g_store(r::R10, STACK_FRAMES, r::RDX);
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_dec_mem(r::R9, l.total_depth);
+    a.g_store_imm32(RBP, s.hdr, super::RECV_CACHE_EMPTY);
+    if let Some(save) = s.save {
+        a.g_store_imm32(RBP, save, super::RECV_CACHE_EMPTY);
+    }
+    a.bind(done);
+}
+
 /// [`emit_inline_leave`] in a speculative loop's fast version, which makes
 /// no call: the activation its guard made pending is still pending (only a
 /// call materializes one), so it is dropped — `pend` emptied, or for an
@@ -3647,6 +3705,7 @@ impl X64Assembler {
             let levels: alloc::vec::Vec<LazyPend> = self.lazy_pend.clone();
             self.lazy_pend_store(&levels);
         }
+        self.plain_lazy_store();
         if let Some(d) = self.inline_pend {
             // cmp qword [rbp+d], -1 ; je past ; call qword [rbp+d] ; past:
             self.g_mem(true, &[0x83], 7, RBP, d);
@@ -3656,6 +3715,97 @@ impl X64Assembler {
             self.g_mem(false, &[0xff], 2, RBP, d);
             // (The call's length: 4 or 7 bytes, by its displacement's.)
             self.code[at - 1] = u8::try_from(self.code.len() - at).unwrap_or(0);
+        }
+    }
+
+    /// Makes the code emitted next lie in one more (inner) plainly lazy
+    /// activation (see [`PlainLazy`]).
+    pub(crate) fn push_plain_lazy(&mut self, p: PlainLazy) {
+        self.plain_lazy.push(p);
+    }
+
+    /// Keeps only the outermost `n` plainly lazy activations of the code
+    /// emitted next (`0`: none).
+    pub(crate) fn truncate_plain_lazy(&mut self, n: usize) {
+        self.plain_lazy.truncate(n);
+    }
+
+    /// The plainly lazy activations the code emitted next lies in (an
+    /// out-of-line stub of an op emitted now takes them along:
+    /// [`set_plain_lazy`](Self::set_plain_lazy)).
+    pub(crate) fn plain_lazy_now(&self) -> alloc::vec::Vec<PlainLazy> {
+        self.plain_lazy.clone()
+    }
+
+    /// Makes the code emitted next lie in the plainly lazy activations
+    /// `levels` (an out-of-line stub's op's, [`plain_lazy_now`]).
+    pub(crate) fn set_plain_lazy(&mut self, levels: alloc::vec::Vec<PlainLazy>) {
+        self.plain_lazy = levels;
+    }
+
+    /// Whether the innermost plainly lazy activation's window had a call
+    /// sequence leave the activations pending across its call (its leave
+    /// then may find the marker set: [`emit_inline_leave`], not
+    /// [`emit_inline_leave_plain`]). Pops it.
+    pub(crate) fn pop_plain_lazy(&mut self) -> Option<PlainLazy> {
+        self.plain_lazy.pop()
+    }
+
+    /// Before Rust code runs in plainly lazy activations (a `call`, or a
+    /// call sequence's test of the marker): makes pending, as their guards
+    /// would have, the ones not yet materialized — every register kept
+    /// (the flags are not). Materialization goes outermost first, so the
+    /// materialized ones (`hdr` set) are the outermost few: from the first
+    /// that is not, each level's `pend` (shared: the innermost stub wins)
+    /// is its stub, an inner level's `save` the enclosing one's stub, or
+    /// `0` when that one is materialized. Nothing when the innermost one
+    /// is materialized already (all are).
+    pub(crate) fn plain_lazy_store(&mut self) {
+        let levels = self.plain_lazy.clone();
+        let n = levels.len();
+        if n == 0 {
+            return;
+        }
+        let done = self.new_label();
+        self.code.push(0x50); // push rax
+        // cmp qword [rbp + hdr], -1 (`RECV_CACHE_EMPTY`)
+        let hdr_empty = |a: &mut Self, d: i32| {
+            a.g_mem(true, &[0x83], 7, RBP, d);
+            a.code.push(0xff);
+        };
+        hdr_empty(self, levels[n - 1].hdr);
+        self.g_jcc(cc::NE, done);
+        let starts: alloc::vec::Vec<Label> = (0..n).map(|_| self.new_label()).collect();
+        for k in (0..n - 1).rev() {
+            hdr_empty(self, levels[k].hdr);
+            self.g_jcc(cc::NE, starts[k + 1]);
+        }
+        for j in 0..n {
+            self.bind(starts[j]);
+            for k in j..n {
+                if let Some(save) = levels[k].save {
+                    if k == j {
+                        self.g_store_imm32(RBP, save, 0);
+                    } else {
+                        self.g_lea_label(r::RAX, levels[k - 1].stub);
+                        self.g_store(RBP, save, r::RAX);
+                    }
+                }
+            }
+            self.g_lea_label(r::RAX, levels[n - 1].stub);
+            self.g_store(RBP, levels[n - 1].pend, r::RAX);
+            self.jmp(done);
+        }
+        self.bind(done);
+        self.code.push(0x58); // pop rax
+        self.last_store = None;
+    }
+
+    /// Marks every open plainly lazy activation as having had a call
+    /// sequence leave it pending across its call (see [`PlainLazy::seq`]).
+    pub(crate) fn plain_lazy_seq(&mut self) {
+        for p in &mut self.plain_lazy {
+            p.seq = true;
         }
     }
 
