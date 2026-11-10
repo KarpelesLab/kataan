@@ -399,9 +399,13 @@ pub enum Cell {
         /// must reproduce the program text's code units exactly, and program
         /// text (from `eval` of a JS string) may hold lone surrogates, which
         /// `str` cannot represent.
-        source: alloc::boxed::Box<[u8]>,
+        ///
+        /// Shared (`Rc`): every evaluation of one regex literal makes a new
+        /// RegExp with the literal's source and flags, which are then one
+        /// allocation for all of them (see `Realm::new_regexp`).
+        source: alloc::rc::Rc<[u8]>,
         /// The flags (e.g. `"gi"`).
-        flags: alloc::boxed::Box<str>,
+        flags: alloc::rc::Rc<str>,
         /// The mutable `lastIndex` (where the next `g`/`y` search resumes).
         last_index: usize,
         /// A transient cache of the compiled program (RE-P1), populated on first

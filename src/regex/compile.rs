@@ -261,6 +261,28 @@ impl Compiler<'_> {
         max: Option<usize>,
         greedy: bool,
     ) -> Result<(), RegexError> {
+        // `(?:x{1,m})?` (both greedy, `x` one character, no capture) is
+        // `x{0,m}`: both try every count from the most available down to one,
+        // then none, in that order, and neither records anything. The flat
+        // form is a single-character quantifier, which the linear matcher
+        // runs (`/[a-z]+(?:\d+)?/`).
+        if min == 0
+            && max == Some(1)
+            && greedy
+            && let Node::Group {
+                index: None,
+                inner: body,
+            } = inner
+            && let Node::Repeat {
+                inner: atom,
+                min: 1,
+                max: m,
+                greedy: true,
+            } = &**body
+            && is_single_char_atom(atom)
+        {
+            return self.compile_repeat(atom, 0, *m, true);
+        }
         // A quantifier bound may be any decimal integer — the spec caps neither
         // bound of `{n,m}` — but a bound larger than any subject could satisfy
         // needs no expansion at all. An atom that cannot match the empty string
@@ -625,6 +647,16 @@ fn can_match_empty(node: &Node) -> bool {
         Node::Concat(kids) => kids.iter().all(can_match_empty),
         Node::Alt(kids) => kids.iter().any(can_match_empty),
         Node::Repeat { inner, min, .. } => *min == 0 || can_match_empty(inner),
+    }
+}
+
+/// Whether `node` always consumes exactly one character: a BMP literal, `.`
+/// or a plain character class (a `v`-mode class may hold strings).
+fn is_single_char_atom(node: &Node) -> bool {
+    match node {
+        Node::Char(c) => *c <= 0xFFFF,
+        Node::Any | Node::Class { .. } => true,
+        _ => false,
     }
 }
 

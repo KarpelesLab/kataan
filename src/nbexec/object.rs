@@ -808,7 +808,7 @@ impl Interp {
         o: Handle,
         f: Handle,
         key: &str,
-        fname: NanBox,
+        fname: Option<NanBox>,
         kind: u8,
         enumerable: bool,
     ) -> bool {
@@ -830,7 +830,20 @@ impl Interp {
             return false;
         };
         // `f.name`: the synthesized property made physical (as the define
-        // of a VM closure's `name` first does), then redefined.
+        // of a VM closure's `name` first does), then redefined — unless
+        // (`fname` is `None`) the synthesized one already holds the name,
+        // with the attributes the redefinition gives it, at the position
+        // the physical one would take.
+        if let Some(fname) = fname {
+            self.define_fn_name(f, meta, fname);
+        }
+        self.define_method_on(o, f, key, kind, enumerable);
+        true
+    }
+
+    /// `f.name := fname` for [`define_method_fast`](Self::define_method_fast):
+    /// the synthesized `meta` made physical, then redefined.
+    fn define_fn_name(&mut self, f: Handle, meta: NanBox, fname: NanBox) {
         self.realm.set_property(f, "name", meta);
         self.realm.mark_hidden(f, "name");
         self.realm.set_readonly_property(f, "name");
@@ -840,7 +853,11 @@ impl Interp {
         self.realm.set_readonly_property(f, "name");
         self.realm.mark_hidden(f, "name");
         self.realm.clear_non_configurable_property(f, "name");
-        // `o[key]`: a new accessor or writable data property.
+    }
+
+    /// `o[key] := f` for [`define_method_fast`](Self::define_method_fast): a
+    /// new accessor (`kind` 1 getter, 2 setter) or writable data property.
+    fn define_method_on(&mut self, o: Handle, f: Handle, key: &str, kind: u8, enumerable: bool) {
         let func = NanBox::handle(f.to_raw());
         if kind == 1 || kind == 2 {
             let (getter, setter) = if kind == 1 {
@@ -864,7 +881,6 @@ impl Interp {
             self.realm.mark_hidden(o, key);
         }
         self.realm.clear_non_configurable_property(o, key);
-        true
     }
 
     fn apply_descriptor_inner(

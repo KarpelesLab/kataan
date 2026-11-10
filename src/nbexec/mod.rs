@@ -539,12 +539,19 @@ pub struct Interp {
     /// reused slot never matches a stale entry; string cells are immutable, so a
     /// live match is always still valid.
     subject_units_cache: [Option<(u64, alloc::rc::Rc<Vec<u16>>)>; 2],
+    /// The reusable code-unit buffer of the one-step string/RegExp
+    /// operations (see `regexp::Subject`).
+    lean_units: Vec<u16>,
     /// `RegExpExec`'s `Get(R, "exec")` memo (see `regexp_exec_method`).
     regexp_exec_lookup: crate::realm::builtins_fast::MethodSiteCache,
     /// The `%RegExp.prototype%` (with its realm, key epoch and the realm's
     /// cell-swap count) last found to hold the intrinsic `flags` getter and
     /// flag getters (see `regexp_flags_fast`).
     regexp_flags_proof: Option<(usize, u64, u32, u32)>,
+    /// The `%RegExp.prototype%` last proven to hold every intrinsic the
+    /// string/RegExp protocol reads (see `regexp_pristine`).
+    #[cfg(feature = "regex")]
+    regexp_proto_proof: Option<regexp::RegexpProtoProof>,
     /// `RegExp.prototype[@@replace]` / `[@@match]` / `[@@split]` lookup memos
     /// (see `regexp_symbol_method`), and those keys' storage strings.
     regexp_symbol_lookup: [crate::realm::builtins_fast::MethodSiteCache; 3],
@@ -3048,8 +3055,11 @@ impl Interp {
             realm: alloc::boxed::Box::new(Realm::with_limits(limits)),
             realm_spares: Vec::new(),
             subject_units_cache: [None, None],
+            lean_units: Vec::new(),
             regexp_exec_lookup: Default::default(),
             regexp_flags_proof: None,
+            #[cfg(feature = "regex")]
+            regexp_proto_proof: None,
             regexp_symbol_lookup: Default::default(),
             regexp_symbol_keys: [None, None, None],
             #[cfg(feature = "regex")]
@@ -9674,6 +9684,28 @@ impl crate::nbvm::VmHost for Interp {
         None
     }
 
+    fn string_match(
+        &mut self,
+        recv: NanBox,
+        rx: NanBox,
+    ) -> Option<Result<NanBox, crate::nbvm::HostError>> {
+        #[cfg(feature = "regex")]
+        {
+            let h = Handle::from_raw(rx.as_handle()?);
+            if !self.regexp_pristine(h, regexp::NEED_EXEC | regexp::NEED_MATCH) {
+                return None;
+            }
+            self.regexp_match_pristine(h, recv)
+                .map_err(exec_to_host)
+                .transpose()
+        }
+        #[cfg(not(feature = "regex"))]
+        {
+            let _ = (recv, rx);
+            None
+        }
+    }
+
     fn construct(
         &mut self,
         ctor: NanBox,
@@ -9929,10 +9961,26 @@ impl crate::nbvm::VmHost for Interp {
             _ => "",
         };
         let fname = self.realm.function_name_for_key(key, prefix);
-        let nv = self.new_str_bytes(fname);
+        // A closure whose synthesized `name` already reads `fname` (a
+        // method compiled under its static key's name) keeps it as it is.
+        let named = self
+            .realm
+            .vm_fn_meta_value(f, "name")
+            .and_then(|m| m.as_handle())
+            .and_then(|m| self.realm.string_leaf_bytes(Handle::from_raw(m)))
+            .is_some_and(|b| b == fname.as_slice());
+        let nv = if named {
+            None
+        } else {
+            Some(self.new_str_bytes(fname.clone()))
+        };
         if self.define_method_fast(o, f, &name, nv, kind, enumerable) {
             return Ok(());
         }
+        let nv = match nv {
+            Some(v) => v,
+            None => self.new_str_bytes(fname),
+        };
         let nd = self.realm.new_object();
         self.realm.set_property(nd, "value", nv);
         self.realm

@@ -1073,3 +1073,106 @@ fn lead_run_scan_finds_the_leftmost_match() {
         }
     }
 }
+
+/// The linear matcher's shortcuts — an end-anchored greedy run (`\d+$`,
+/// which leaves no choice point), the skip past a failed opening run, the
+/// start filter that looks past assertions (`\b[A-Z]`) and the `(?:x+)?`
+/// flattening — find exactly what the backtracking VM finds, from every
+/// start, sticky or not.
+#[test]
+fn linear_shortcuts_agree_with_the_vm() {
+    for (pat, flags) in [
+        (r"\d+$", ""),
+        (r"\d+$", "m"),
+        (r"\d{1,3}$", ""),
+        (r"[a-z]*$", ""),
+        (r"\s+$", ""),
+        (r"\d+x", ""),
+        (r"[a-z]*;", ""),
+        (r"[a-z]+\d", ""),
+        (r"[ab]+c$", ""),
+        (r"\b[A-Z]", ""),
+        (r"\b[A-Z]\w*", "i"),
+        (r"\B\d", ""),
+        (r"\b(ka|ta)(\w*)", ""),
+        (r"^\d+", "m"),
+        (r"[A-Za-z]+(?:\d+)?", ""),
+        (r"(?:\d+)?\.", ""),
+        (r"(?:x+)?y", ""),
+        (r"(?:x+?)?y", ""),
+        (r"(?:x+)??y", ""),
+        (r"[^.!?]+[.!?]", ""),
+        (r"\d+$", "u"),
+        (r"\w+$", "iu"),
+    ] {
+        let fast = re(pat, flags);
+        let slow = re(pat, flags).without_linear();
+        let sticky_flags = alloc::format!("{flags}y");
+        let fast_y = re(pat, &sticky_flags);
+        let slow_y = re(pat, &sticky_flags).without_linear();
+        for subject in [
+            "",
+            "12345",
+            "12345x",
+            "a1b22c333",
+            "111x111x111",
+            "ab;ab;;a",
+            "aab ab abc",
+            "Hello world. How are you? Fine!",
+            "line1\nline2\n33\n",
+            "kataan12 roma xx1",
+            "xxy xy y .5 12.",
+            "ka ta kaz tab",
+            "\u{e9}t\u{e9} 1 \u{1F600}9",
+        ] {
+            let units: alloc::vec::Vec<u16> = subject.encode_utf16().collect();
+            for start in 0..=units.len() {
+                assert_eq!(
+                    fast.captures_in_u16(&units, start),
+                    slow.captures_in_u16(&units, start),
+                    "/{pat}/{flags} on {subject:?} from {start}"
+                );
+                assert_eq!(
+                    fast_y.captures_in_u16(&units, start),
+                    slow_y.captures_in_u16(&units, start),
+                    "/{pat}/{sticky_flags} on {subject:?} from {start}"
+                );
+            }
+            let (mut all_fast, mut all_slow) = (alloc::vec::Vec::new(), alloc::vec::Vec::new());
+            fast.global_scan_into(&units, 0, fast.flags().unicode, &mut all_fast);
+            let mut li = 0;
+            while li <= units.len() && slow.captures_into_u16(&units, li, &mut all_slow) {
+                let stride = slow.group_count() + 1;
+                let (a, b) = all_slow[all_slow.len() - stride].unwrap_or_default();
+                li = if a == b { b + 1 } else { b };
+            }
+            if !fast.flags().unicode {
+                assert_eq!(all_fast, all_slow, "global /{pat}/{flags} on {subject:?}");
+            }
+        }
+    }
+}
+
+/// A run that fails short of the end is given up at once, not backed off a
+/// unit at a time from every start inside it: on a long subject of digit
+/// runs the scan stays linear (the step budget would otherwise run out and
+/// report no match where there is one).
+#[test]
+fn end_anchored_runs_stay_linear() {
+    let mut s = alloc::string::String::new();
+    for _ in 0..20_000 {
+        s.push_str("1234567890x");
+    }
+    s.push_str("42");
+    let units: alloc::vec::Vec<u16> = s.encode_utf16().collect();
+    let n = units.len();
+    assert_eq!(re(r"\d+$", "").find_in_u16(&units, 0), Some((n - 2, n)));
+    let mut sp = " ".repeat(50_000);
+    sp.push('x');
+    let spaces: alloc::vec::Vec<u16> = sp.encode_utf16().collect();
+    assert_eq!(re(r"\s+$", "").find_in_u16(&spaces, 0), None);
+    sp.push_str("   ");
+    let spaces: alloc::vec::Vec<u16> = sp.encode_utf16().collect();
+    let n = spaces.len();
+    assert_eq!(re(r"\s+$", "").find_in_u16(&spaces, 0), Some((n - 3, n)));
+}

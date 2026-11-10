@@ -67,17 +67,22 @@ pub(super) fn try_run(
             .map_or(NanBox::undefined(), |r| regs[*r as usize])
     };
     let (search, replace) = (arg(0), arg(1));
+    // The replacement is a VM function (its calls are made here) or a
+    // string (a template the host substitutes, with no replacer calls: the
+    // plan is then always run to completion by the host, skipping only the
+    // general method call's lookup of `String.prototype.replace`).
+    let rh = Handle::from_raw(replace.as_handle()?);
+    let replace_ok = ctx.realm.is_vm_function(rh)
+        || (ctx.realm.is_string_handle(rh) && ctx.realm.typeof_is_string(rh));
+    let recv_h = Handle::from_raw(recv.as_handle()?);
     if ctx.realm.multi_realm
-        || !ctx
-            .realm
-            .is_string_handle(Handle::from_raw(recv.as_handle()?))
+        || !ctx.realm.is_string_handle(recv_h)
+        || !ctx.realm.typeof_is_string(recv_h)
         || ctx
             .realm
             .regexp_flags(Handle::from_raw(search.as_handle()?))
             .is_none()
-        || !ctx
-            .realm
-            .is_vm_function(Handle::from_raw(replace.as_handle()?))
+        || !replace_ok
     {
         return None;
     }

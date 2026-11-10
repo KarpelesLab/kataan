@@ -93,6 +93,14 @@ enum Step {
         greedy: bool,
         next_unit: Option<u16>,
     },
+    /// A greedy [`Step::Rep`] whose following steps (captures aside) begin
+    /// with a `$` that holds only at the end of the subject (no `m` flag):
+    /// only taking every character up to the end can succeed, and backing
+    /// off never can, so it leaves no choice point.
+    RepEnd {
+        set: usize,
+        max: Option<usize>,
+    },
     /// A zero-width assertion (an index into [`ASSERTS`]).
     Assert(u8),
     Match,
@@ -123,6 +131,10 @@ pub(crate) struct Linear {
     /// branch begins with at least two exact units: a candidate start whose
     /// text differs is skipped without an attempt.
     lead_lit: Vec<u16>,
+    /// When the one branch opens (captures aside) with an unbounded `B*`
+    /// (`(None, B)`) or with `A B*` (`(Some(A), B)`), outside `u` mode: the
+    /// run skip of [`Linear::find_on`].
+    skip_run: Option<(Option<usize>, usize)>,
 }
 
 /// The unit every match begins with.
@@ -357,7 +369,12 @@ impl Linear {
                         Some(Step::Unit(u)) => Some(*u),
                         _ => None,
                     };
-                    if let Step::Rep { next_unit, .. } = &mut steps[i] {
+                    let at_end = !flags.multiline && matches!(steps.get(j), Some(Step::Assert(1)));
+                    if let Step::Rep { set, max, .. } = steps[i]
+                        && at_end
+                    {
+                        steps[i] = Step::RepEnd { set, max };
+                    } else if let Step::Rep { next_unit, .. } = &mut steps[i] {
                         *next_unit = lit;
                     }
                 }
@@ -387,6 +404,23 @@ impl Linear {
             }
             _ => None,
         };
+        let skip_run = match branches.as_slice() {
+            [only] if !flags.unicode => {
+                let mut consuming = only.iter().filter(|s| !matches!(s, Step::Save(_)));
+                match (consuming.next(), consuming.next()) {
+                    (
+                        Some(Step::Rep { set, max: None, .. } | Step::RepEnd { set, max: None }),
+                        _,
+                    ) => Some((None, *set)),
+                    (
+                        Some(Step::One(a)),
+                        Some(Step::Rep { set, max: None, .. } | Step::RepEnd { set, max: None }),
+                    ) => Some((Some(*a), *set)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let lead_lit: Vec<u16> = match branches.as_slice() {
             [only] => only
                 .iter()
@@ -410,6 +444,7 @@ impl Linear {
             } else {
                 Vec::new()
             },
+            skip_run,
         })
     }
 
@@ -516,7 +551,17 @@ impl Linear {
                     Outcome::NoMatch => {}
                 }
             }
-            s += if U { char_len(units, s) } else { 1 };
+            // The attempt from `s` failed. When the pattern opens with a
+            // run `B*` (after one `A`), every start inside that run fails
+            // too: from a later start `p` the run can only stop somewhere
+            // the run from `s` could also stop (the run's end is the same,
+            // its start later), and from there on the steps see the same
+            // subject at the same positions — nothing in a linear pattern
+            // depends on where the match began. So skip past the run.
+            s = match self.skip_run {
+                Some(skip) if !U => self.skip_past_run(ctx, skip, s),
+                _ => s + if U { char_len(units, s) } else { 1 },
+            };
         }
         None
     }
@@ -573,6 +618,35 @@ impl Linear {
         None
     }
 
+    /// Where [`find_on`](Self::find_on) resumes after a failed attempt at
+    /// `s` for a pattern that opens with the run `(a, b)` (see
+    /// [`Linear::skip_run`]): past the run of `b` the attempt began, or
+    /// `s + 1` when the opening `a` did not even match.
+    #[inline(never)]
+    fn skip_past_run(&self, ctx: &Run, (a, b): (Option<usize>, usize), s: usize) -> usize {
+        let (units, prog, flags) = (ctx.units, ctx.prog, ctx.flags);
+        let set = &self.sets[b];
+        let run_from = match a {
+            None => s,
+            Some(a)
+                if units
+                    .get(s)
+                    .is_some_and(|&u| self.sets[a].has(u32::from(u), prog, flags)) =>
+            {
+                s + 1
+            }
+            Some(_) => return s + 1,
+        };
+        let mut r = run_from;
+        while r < units.len() && set.has(u32::from(units[r]), prog, flags) {
+            r += 1;
+        }
+        // With `A B*`, the start at the run's end is a fresh one (its unit
+        // is not in `B`, but may be in `A`); with a bare `B*`, a start there
+        // stops the run at once, which the run from `s` could do too.
+        if a.is_none() { r + 1 } else { r.max(s + 1) }
+    }
+
     /// One attempt of `steps` at `start`.
     fn run_on<const U: bool>(
         &self,
@@ -615,6 +689,30 @@ impl Linear {
                         }
                         _ => break true,
                     },
+                    Step::RepEnd { set, max } => {
+                        let set = &self.sets[set];
+                        let lo = p;
+                        if U {
+                            let mut left = max.unwrap_or(usize::MAX);
+                            while left > 0
+                                && let Some((c, n)) = read::<true>(units, p)
+                                && set.has(c, prog, flags)
+                            {
+                                p = n;
+                                left -= 1;
+                            }
+                        } else {
+                            let limit = max.map_or(len, |m| len.min(p.saturating_add(m)));
+                            while p < limit && set.has(u32::from(units[p]), prog, flags) {
+                                p += 1;
+                            }
+                        }
+                        work += (p - lo) as u64;
+                        if p != len {
+                            break true;
+                        }
+                        i += 1;
+                    }
                     Step::Rep {
                         set,
                         max,
@@ -834,17 +932,22 @@ fn is_consume(inst: Option<&Inst>) -> bool {
 }
 
 /// The start filter for `branches`: the one unit or set every match begins
-/// with, the union over the branches.
+/// with, the union over the branches. Captures and assertions consume
+/// nothing, so a branch's first character is whatever its first consuming
+/// step takes (`\b[A-Z]` begins with `[A-Z]`).
 fn start_filter(branches: &[Vec<Step>], sets: &mut Vec<Set>) -> First {
     let firsts: Vec<First> = branches
         .iter()
-        .map(
-            |steps| match steps.iter().find(|s| !matches!(s, Step::Save(_))) {
+        .map(|steps| {
+            match steps
+                .iter()
+                .find(|s| !matches!(s, Step::Save(_) | Step::Assert(_)))
+            {
                 Some(Step::Unit(u)) => First::Unit(*u),
                 Some(Step::One(k)) => First::Set(*k),
                 _ => First::Any,
-            },
-        )
+            }
+        })
         .collect();
     match firsts.as_slice() {
         [one] => *one,

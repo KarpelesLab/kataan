@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(feature = "regex")]
+mod lean;
+#[cfg(feature = "regex")]
+pub(crate) use lean::{NEED_EXEC, NEED_MATCH, RegexpProtoProof};
+
 impl Interp {
     /// Builds a match-result array from a `Captures` whose spans are **code-unit**
     /// indices into the pre-collected `&[u16]` subject (the native regex model).
@@ -1162,20 +1167,9 @@ impl Interp {
         }
         let has_indices = flags.contains('d');
         let re = self.realm.regex_compiled(rh)?;
-        let stride = re.group_count() + 1;
         let mut spans = Vec::new();
-        let mut li = self.realm.regex_last_index(rh);
-        if re.single_atom_scan(units, li, &mut spans) {
-            li = usize::MAX;
-        }
-        while li <= units.len() && re.captures_into_u16(units, li, &mut spans) {
-            let (a, b) = spans[spans.len() - stride].unwrap_or_default();
-            li = if a == b {
-                self.advance_string_index(units, b, unicode)
-            } else {
-                b
-            };
-        }
+        let li = self.realm.regex_last_index(rh);
+        re.global_scan_into(units, li, unicode, &mut spans);
         self.realm.set_regex_last_index(rh, 0);
         Some((re, spans, has_indices))
     }
@@ -1215,16 +1209,7 @@ impl Interp {
                 return self.read_member(search, &key);
             }
         };
-        let rp = core::ptr::from_ref::<Realm>(&self.realm) as usize;
-        let key = match &self.regexp_symbol_keys[which] {
-            Some((p, k)) if *p == rp => alloc::rc::Rc::clone(k),
-            _ => {
-                let sym = self.well_known_symbol(name);
-                let k: alloc::rc::Rc<str> = self.member_key(sym).into();
-                self.regexp_symbol_keys[which] = Some((rp, alloc::rc::Rc::clone(&k)));
-                k
-            }
-        };
+        let key = self.regexp_symbol_key(which);
         if self.realm.regexp_flags(search).is_some() {
             let cache = &mut self.regexp_symbol_lookup[which];
             if let Some(v) = self.realm.method_site_get(search, &key, cache) {
@@ -1235,6 +1220,22 @@ impl Interp {
             }
         }
         self.read_member(search, &key)
+    }
+
+    /// The storage key of `RegExp.prototype[@@replace]` (`which` 0),
+    /// `[@@match]` (1) or `[@@split]` (2), memoized per realm.
+    fn regexp_symbol_key(&mut self, which: usize) -> alloc::rc::Rc<str> {
+        let rp = core::ptr::from_ref::<Realm>(&self.realm) as usize;
+        match &self.regexp_symbol_keys[which] {
+            Some((p, k)) if *p == rp => alloc::rc::Rc::clone(k),
+            _ => {
+                let name = ["replace", "match", "split"][which];
+                let sym = self.well_known_symbol(name);
+                let k: alloc::rc::Rc<str> = self.member_key(sym).into();
+                self.regexp_symbol_keys[which] = Some((rp, alloc::rc::Rc::clone(&k)));
+                k
+            }
+        }
     }
 
     /// `Get(R, "lastIndex")`, read straight from a RegExp's own slot when it
@@ -1811,6 +1812,15 @@ impl Interp {
         else {
             return Err(ExecError::Unsupported("replace plan of a non-object"));
         };
+        // A pristine RegExp: every read below lands on an intrinsic, so the
+        // whole call is the matcher plus the splice.
+        if self.regexp_pristine(
+            argh,
+            lean::NEED_EXEC | lean::NEED_REPLACE | if all { lean::NEED_MATCH } else { 0 },
+        ) && let Some(step) = self.regexp_replace_pristine(argh, o, replace, all)?
+        {
+            return Ok(step);
+        }
         // `replaceAll`: a RegExp `searchValue` must be global (`IsRegExp`,
         // then `Get(flags)` containing "g"), checked before `@@replace`.
         if all && self.try_is_regexp(search)? {

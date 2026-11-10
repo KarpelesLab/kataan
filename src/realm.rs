@@ -493,6 +493,14 @@ pub struct Realm {
     /// [`link_regexp_proto`](Realm::link_regexp_proto) of a single-realm run,
     /// so that evaluating a regex literal inserts no side-table entry.
     regexp_default_proto: Option<Handle>,
+    /// The source and flags of the last RegExp `new_regexp` made, shared with
+    /// the next one made from the same pair, and the program they compiled
+    /// to once known (see `new_regexp`). Holds no heap handle.
+    regexp_literal_memo: Option<(
+        alloc::rc::Rc<[u8]>,
+        alloc::rc::Rc<str>,
+        builtins_fast::MemoProgram,
+    )>,
     /// The `[[Prototype]]` of a Promise cell that carries no `native_protos`
     /// entry, as [`regexp_default_proto`](Realm::regexp_default_proto) is a
     /// RegExp's (see [`link_promise_proto`](Realm::link_promise_proto)).
@@ -1062,6 +1070,7 @@ impl Realm {
             callable_null_protos: alloc::collections::BTreeSet::new(),
             vm_fn_default_proto: None,
             regexp_default_proto: None,
+            regexp_literal_memo: None,
             promise_default_proto: None,
             coll_default: [None; 2],
             inst_memo: inst_memo::InstMemo::default(),
@@ -4700,12 +4709,26 @@ impl Realm {
 
     /// Allocates a `RegExp` from its WTF-8 source bytes and flags.
     pub fn new_regexp(&mut self, source: &[u8], flags: &str) -> Handle {
+        // A regex literal evaluated in a loop makes a RegExp per evaluation
+        // from the same source and flags: share the last one's (and the
+        // program it compiled to) rather than copying and looking them up.
+        let (source, flags, program) = match &self.regexp_literal_memo {
+            Some((s, f, p)) if **s == *source && **f == *flags => {
+                (s.clone(), f.clone(), builtins_fast::memo_program(p))
+            }
+            _ => {
+                let s: alloc::rc::Rc<[u8]> = alloc::rc::Rc::from(source);
+                let f: alloc::rc::Rc<str> = alloc::rc::Rc::from(flags);
+                self.regexp_literal_memo = Some((s.clone(), f.clone(), Default::default()));
+                (s, f, Default::default())
+            }
+        };
         self.heap.alloc(Cell::RegExp {
-            source: alloc::boxed::Box::from(source),
-            flags: alloc::boxed::Box::from(flags),
+            source,
+            flags,
             last_index: 0,
             #[cfg(feature = "regex")]
-            compiled: core::cell::RefCell::new(None),
+            compiled: core::cell::RefCell::new(program),
         })
     }
 
@@ -4721,8 +4744,8 @@ impl Realm {
             compiled,
         }) = self.heap.get_mut(handle)
         {
-            *s = alloc::boxed::Box::from(source);
-            *f = alloc::boxed::Box::from(flags);
+            *s = alloc::rc::Rc::from(source);
+            *f = alloc::rc::Rc::from(flags);
             *last_index = 0;
             #[cfg(feature = "regex")]
             {
@@ -4757,6 +4780,7 @@ impl Realm {
         }
         if let Some(re) = self.regex_program_lookup(source, flags) {
             *compiled.borrow_mut() = Some(re.clone());
+            self.regexp_literal_memo_note(source, &re);
             return Some(re);
         }
         // The regex engine parses `&str`; a lone surrogate in the pattern has no
@@ -4768,6 +4792,7 @@ impl Realm {
         );
         *compiled.borrow_mut() = Some(re.clone());
         self.regex_program_remember(source, flags, &re);
+        self.regexp_literal_memo_note(source, &re);
         Some(re)
     }
 
@@ -9808,6 +9833,20 @@ impl Realm {
                 match self.heap.get(h) {
                     Some(Cell::VmFunction { .. }) => return "function",
                     Some(Cell::Str(_)) if !self.aux_props.contains_key(&raw) => return "string",
+                    // An ordinary object: the probes below, by its layout's
+                    // brand flags rather than by property lookups.
+                    Some(Cell::Object(o)) => {
+                        return if o.has_brand_key(crate::shape::BRAND_KEYS[1]) {
+                            "undefined"
+                        } else if o.has_brand_key(crate::shape::BRAND_KEYS[2])
+                            || o.has_brand_key(crate::shape::BRAND_KEYS[3])
+                            || self.is_function_proto_intrinsic(h)
+                        {
+                            "function"
+                        } else {
+                            "object"
+                        };
+                    }
                     _ => {}
                 }
                 // An [[IsHTMLDDA]] exotic object (`document.all`) reports

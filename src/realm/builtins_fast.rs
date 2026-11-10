@@ -210,6 +210,93 @@ impl Realm {
         o.slot(slot)
     }
 
+    /// The `[[Prototype]]` of the RegExp at `handle` when it owns no
+    /// property (it has no auxiliary object) and was never explicitly
+    /// linked, so it inherits from the realm's default RegExp prototype
+    /// (see `link_regexp_proto`): that prototype. `None` for anything else.
+    #[must_use]
+    pub(crate) fn plain_regexp_default_proto(&self, handle: Handle) -> Option<Handle> {
+        let raw = handle.to_raw();
+        if !matches!(self.heap.get(handle), Some(Cell::RegExp { .. }))
+            || self.aux_props.contains_key(&raw)
+            || self.native_protos.contains_key(&raw)
+            || self.has_explicit_null_proto(handle)
+        {
+            return None;
+        }
+        self.regexp_default_proto
+    }
+
+    /// The WTF-8 bytes of two string values, each flattened first (a
+    /// concatenation is joined once, then served as a leaf): `None` unless
+    /// both are string cells with no auxiliary object (no function marker,
+    /// so `typeof` is `"string"` and a relational operator converts
+    /// nothing).
+    pub(crate) fn plain_string_pair(&mut self, a: Handle, b: Handle) -> Option<(&[u8], &[u8])> {
+        for h in [a, b] {
+            match self.heap.get(h) {
+                Some(Cell::Str(r)) if r.as_leaf_bytes().is_some() => {}
+                Some(Cell::Str(_)) => self.flatten_string(h),
+                _ => return None,
+            }
+        }
+        if self.aux_props.contains_key(&a.to_raw()) || self.aux_props.contains_key(&b.to_raw()) {
+            return None;
+        }
+        let x = self.heap.get(a)?.as_str()?.as_leaf_bytes()?;
+        let y = self.heap.get(b)?.as_str()?.as_leaf_bytes()?;
+        Some((x, y))
+    }
+
+    /// Own **data** property `key` of the ordinary (not host-exotic) object
+    /// at `handle`, with where [`own_data_reread`](Self::own_data_reread)
+    /// finds it again while the object's key epoch is unchanged: its slot,
+    /// or `u32::MAX` in dictionary mode. `None` for an accessor, an absent
+    /// key or any other cell.
+    #[must_use]
+    pub(crate) fn own_data_probe(&self, handle: Handle, key: &str) -> Option<(u32, NanBox)> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        if o.accessor(key).is_some() || self.is_host_exotic(handle) {
+            return None;
+        }
+        if o.is_dict() {
+            return Some((u32::MAX, o.get(key)?));
+        }
+        let slot = o.shape().lookup(key)?;
+        Some((slot, o.slot(slot)?))
+    }
+
+    /// Whether, for each `i` with bit `i` of `mask` set, the data property
+    /// `keys[i]` that [`own_data_probe`](Self::own_data_probe) found at
+    /// `at[i].0` still holds the value with bits `at[i].1` — for a caller that
+    /// has checked the object's key epoch (so its layout) is the same.
+    #[must_use]
+    pub(crate) fn own_data_all_hold(
+        &self,
+        handle: Handle,
+        at: &[(u32, u64)],
+        keys: &[alloc::rc::Rc<str>],
+        mask: u32,
+    ) -> bool {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return false;
+        };
+        at.iter()
+            .zip(keys)
+            .enumerate()
+            .all(|(i, (&(slot, bits), key))| {
+                mask & (1 << i) == 0
+                    || (if slot == u32::MAX {
+                        o.get(key)
+                    } else {
+                        o.slot(slot)
+                    })
+                    .is_some_and(|v| v.to_bits() == bits)
+            })
+    }
+
     /// The flags of the RegExp at `handle`, borrowed (no source rendering).
     #[must_use]
     pub fn regexp_flags(&self, handle: Handle) -> Option<&str> {
@@ -1687,6 +1774,37 @@ pub struct MethodSiteCache {
     prim: bool,
     armed: bool,
     swaps: u32,
+}
+
+/// The program slot of `Realm::regexp_literal_memo`.
+#[cfg(feature = "regex")]
+pub(crate) type MemoProgram = core::cell::RefCell<Option<Rc<crate::regex::Regex>>>;
+/// The program slot of `Realm::regexp_literal_memo` (none without `regex`).
+#[cfg(not(feature = "regex"))]
+pub(crate) type MemoProgram = ();
+
+/// A new RegExp's compiled-program cache, from the memo's program slot.
+#[cfg(feature = "regex")]
+pub(crate) fn memo_program(p: &MemoProgram) -> Option<Rc<crate::regex::Regex>> {
+    p.borrow().clone()
+}
+
+/// A new RegExp's compiled-program cache (none without `regex`).
+#[cfg(not(feature = "regex"))]
+pub(crate) fn memo_program(_: &MemoProgram) {}
+
+impl Realm {
+    /// Records `re` as the program of the memoized literal source `source`
+    /// (the very allocation), so the next RegExp made from it starts
+    /// compiled.
+    #[cfg(feature = "regex")]
+    pub(crate) fn regexp_literal_memo_note(&self, source: &Rc<[u8]>, re: &Rc<crate::regex::Regex>) {
+        if let Some((s, _, p)) = &self.regexp_literal_memo
+            && Rc::ptr_eq(s, source)
+        {
+            *p.borrow_mut() = Some(re.clone());
+        }
+    }
 }
 
 /// One remembered compiled regex program (see `Realm::regex_programs`).

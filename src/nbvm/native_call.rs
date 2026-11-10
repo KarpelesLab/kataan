@@ -130,6 +130,8 @@ enum FastOp {
     ArrJoin,
     /// `Array.prototype.slice`.
     ArrSlice,
+    /// `Array.prototype.flat`.
+    ArrFlat,
     /// `String.prototype.toUpperCase` / `toLowerCase`.
     StrCase(bool),
     /// `String.prototype.trim` / `trimStart` / `trimEnd` (which ends).
@@ -140,6 +142,10 @@ enum FastOp {
     StrSplit,
     /// `String.prototype.replace`.
     StrReplace,
+    /// `String.prototype.match` (with a RegExp the host can match in one
+    /// step; otherwise called through the host directly, as
+    /// [`FastOp::HostDirect`]).
+    StrMatch,
     /// `String.prototype.replaceAll` (with a RegExp and a VM function, its
     /// replacer calls run in the VM; otherwise called through the host
     /// directly, as [`FastOp::HostDirect`]).
@@ -396,6 +402,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_STRING_PROTO_FN, b"padEnd") => FastOp::StrPad(false),
         (N_STRING_PROTO_FN, b"split") => FastOp::StrSplit,
         (N_STRING_PROTO_FN, b"replace") => FastOp::StrReplace,
+        (N_STRING_PROTO_FN, b"match") => FastOp::StrMatch,
         (N_STRING_PROTO_FN, b"replaceAll") => FastOp::StrReplaceAll,
         #[cfg(feature = "std")]
         (N_NUMBER_PROTO_FN, b"toFixed") => FastOp::NumToFixed,
@@ -404,6 +411,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"includes") => FastOp::ArrIncludes,
         (N_ARRAY_PROTO_FN, b"join") => FastOp::ArrJoin,
         (N_ARRAY_PROTO_FN, b"slice") => FastOp::ArrSlice,
+        (N_ARRAY_PROTO_FN, b"flat") => FastOp::ArrFlat,
         // `Function.prototype`'s methods share the Array methods' dispatch id.
         (N_ARRAY_PROTO_FN, b"call") => FastOp::FnCall,
         (N_ARRAY_PROTO_FN, b"apply") => FastOp::FnApply,
@@ -479,6 +487,36 @@ fn dense_elements(realm: &Realm, h: Handle) -> Option<&[NanBox]> {
         return None;
     }
     Some(e)
+}
+
+/// `FlattenIntoArray(target, h, len, 0, depth)` for an array whose every
+/// level is dense (each index an own data element, no hole, nothing
+/// inherited to consult): `HasProperty` is then true for every index and
+/// each `Get` reads the element, so the elements are copied, those that
+/// are Arrays spliced in while `depth` lasts. `None`, having appended
+/// what it had, when some level is not (the caller discards `out`) — or
+/// holds a Proxy, which `IsArray` may see through to run traps.
+fn flatten_dense(
+    realm: &Realm,
+    h: Handle,
+    depth: usize,
+    out: &mut alloc::vec::Vec<NanBox>,
+) -> Option<()> {
+    for &v in dense_elements(realm, h)? {
+        if depth > 0
+            && let Some(e) = v.as_handle().map(Handle::from_raw)
+        {
+            if realm.proxy_at(e).is_some() {
+                return None;
+            }
+            if realm.is_array(e) {
+                flatten_dense(realm, e, depth - 1, out)?;
+                continue;
+            }
+        }
+        out.push(v);
+    }
+    Some(())
 }
 
 /// A relative index argument (`ToIntegerOrInfinity`, then counted from the
@@ -1159,6 +1197,27 @@ fn run_op(
             );
         }
     }
+    // A string matched against a RegExp the host can match in one step.
+    if matches!(op, FastOp::StrMatch) {
+        let rx = arg(0);
+        if !ctx.realm.multi_realm
+            && ctx.realm.is_string_handle(h)
+            && ctx.realm.typeof_is_string(h)
+            && rx
+                .as_handle()
+                .is_some_and(|r| ctx.realm.regexp_flags(Handle::from_raw(r)).is_some())
+            && let Some(Some(r)) = with_host(ctx, |host| host.string_match(recv, rx))
+        {
+            return Some(r.map_err(VmError::from));
+        }
+        let method = NanBox::from_bits(method);
+        let argv = super::ArgBuf::from_regs(regs, args);
+        return Some(
+            with_host(ctx, |host| host.call(method, recv, &argv))
+                .unwrap_or(Err(super::HostError::Fault))
+                .map_err(VmError::from),
+        );
+    }
     if matches!(op, FastOp::ObjAssign) {
         if let Some(v) = obj_assign_fast(&mut ctx.realm, regs, args) {
             return Some(Ok(v));
@@ -1177,6 +1236,7 @@ fn run_op(
         | FastOp::ObjAssign
         | FastOp::ArrayHof(_)
         | FastOp::StrReplaceAll
+        | FastOp::StrMatch
         | FastOp::GenResume(_)
         | FastOp::ObjStaticHasOwn => {
             return None;
@@ -1658,6 +1718,22 @@ fn run_op(
             let b = rel_index(arg(1), len, len)?;
             let part = elems.get(a..b.max(a)).unwrap_or(&[]).to_vec();
             NanBox::handle(realm.new_array(part).to_raw())
+        }
+        FastOp::ArrFlat => {
+            // `ArraySpeciesCreate` must be the plain `ArrayCreate`, and the
+            // depth a Number (or `undefined`, depth 1).
+            let depth = match int_arg(arg(0))? {
+                None => 1,
+                Some(d) if d <= 16.0 => d.max(0.0) as usize,
+                // A deeper (or infinite) flattening is the host's.
+                Some(_) => return None,
+            };
+            if !super::array_hof::default_species_armed(realm, h) {
+                return None;
+            }
+            let mut out = alloc::vec::Vec::new();
+            flatten_dense(realm, h, depth, &mut out)?;
+            NanBox::handle(realm.new_array(out).to_raw())
         }
         FastOp::StrCase(upper) => {
             let rope = str_parts(realm, h)?;

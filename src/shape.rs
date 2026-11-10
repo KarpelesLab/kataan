@@ -277,9 +277,11 @@ impl Transitions {
 pub const PRIM_WRAP_KEY: &str = "\u{0}prim";
 
 /// Internal brand keys whose presence a [`Shape`] records as a flag bit (bit
-/// `i` for `BRAND_KEYS[i]`): the primitive-wrapper slot and the
-/// `[[IsHTMLDDA]]` brand.
-pub const BRAND_KEYS: [&str; 2] = [PRIM_WRAP_KEY, "\u{0}htmldda"];
+/// `i` for `BRAND_KEYS[i]`): the primitive-wrapper slot, the
+/// `[[IsHTMLDDA]]` brand, and the two markers that make an ordinary object
+/// report `typeof` `"function"` (a bound function's target slot and a VM
+/// class constructor's marker).
+pub const BRAND_KEYS: [&str; 4] = [PRIM_WRAP_KEY, "\u{0}htmldda", "\u{0}bnd_t", "\u{0}vmfn"];
 
 /// The prefix of a property key that encodes a Symbol (`\0sym:{id}`).
 pub const SYMBOL_KEY_PREFIX: &str = "\u{0}sym:";

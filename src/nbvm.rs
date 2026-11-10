@@ -1232,6 +1232,16 @@ pub trait VmHost {
     ) -> Option<Result<ReplaceStep, HostError>> {
         None
     }
+    /// `recv.match(rx)` for a string `recv` and a RegExp object `rx`, when
+    /// the host can run the whole call in one step (see
+    /// `Interp::regexp_pristine`). `None` when it cannot (nothing has run:
+    /// the caller takes the ordinary call).
+    ///
+    /// # Errors
+    /// A host fault (a pristine match runs no user code).
+    fn string_match(&mut self, _recv: NanBox, _rx: NanBox) -> Option<Result<NanBox, HostError>> {
+        None
+    }
     /// `new ctor(...args)` with the host's `[[Construct]]`.
     ///
     /// # Errors
@@ -6349,6 +6359,9 @@ fn vm_lt(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBo
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         return Ok(NanBox::boolean(x < y));
     }
+    if let Some(lt) = string_lt(&mut ctx.realm, a, b) {
+        return Ok(NanBox::boolean(lt));
+    }
     if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Lt, a, b) {
         return r;
     }
@@ -6358,6 +6371,44 @@ fn vm_lt(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBo
         return Err(VmError::Thrown(e));
     }
     Ok(ctx.realm.less_than(x, y))
+}
+
+/// `a < b` for two strings without an astral character (the case the
+/// sort comparators of real programs make): their code-unit order, which
+/// for such text is their WTF-8 byte order (a lone surrogate's three bytes
+/// order as its unit does among the BMP's). Each operand is flattened
+/// first, so a concatenated key is joined once rather than at every
+/// comparison. `None`, having compared nothing, for anything else.
+/// `Op::Compare`'s relational operator `op` (0 `<`, 1 `>`, 2 `<=`, 3 `>=`)
+/// on two strings, by [`string_lt`]: `>` is `<` swapped, `<=` / `>=` the
+/// negation of the swapped `<` (no NaN among strings). `None` when
+/// `string_lt` declines.
+fn string_compare(realm: &mut Realm, x: NanBox, y: NanBox, op: u8) -> Option<bool> {
+    let lt = match op {
+        0 | 3 => string_lt(realm, x, y)?,
+        1 | 2 => string_lt(realm, y, x)?,
+        _ => return None,
+    };
+    Some(if op >= 2 { !lt } else { lt })
+}
+
+fn string_lt(realm: &mut Realm, a: NanBox, b: NanBox) -> Option<bool> {
+    let (ha, hb) = (
+        Handle::from_raw(a.as_handle()?),
+        Handle::from_raw(b.as_handle()?),
+    );
+    let (x, y) = realm.plain_string_pair(ha, hb)?;
+    // The first difference decides. Before it, both hold the same
+    // characters; at it, WTF-8 byte order is code-unit order unless an
+    // astral character's four-byte lead (0xF0..=0xF4) is involved, which
+    // sorts after the BMP's U+E000..=U+FFFF where its surrogates sort
+    // before them (a difference inside two astral characters with the same
+    // lead is in a continuation byte, and orders like their code units).
+    match x.iter().zip(y).position(|(p, q)| p != q) {
+        None => Some(x.len() < y.len()),
+        Some(i) if x[i] >= 0xF0 || y[i] >= 0xF0 => None,
+        Some(i) => Some(x[i] < y[i]),
+    }
 }
 
 /// Strict equality `===` (`Op::StrictEq`'s semantics), factored out for the
@@ -9236,6 +9287,8 @@ fn run_frame_at_ic(
                         2 => p <= q,
                         _ => p >= q,
                     });
+                } else if let Some(v) = string_compare(&mut ctx.realm, x, y, *op) {
+                    regs[*dst as usize] = NanBox::boolean(v);
                 } else {
                     let bop = match op {
                         0 => crate::ast::BinaryOp::Lt,
@@ -24061,10 +24114,23 @@ impl Compiler {
                     } => {
                         refuse_generator(value, self.hosted)?;
                         let k = self.class_key(key)?;
+                        // A static key's accessor is compiled under the name
+                        // `DefineMethod` gives it (`get k` / `set k`), which
+                        // then has nothing to rename.
+                        let fname = match key {
+                            PropertyKey::Ident(_)
+                            | PropertyKey::Str(_)
+                            | PropertyKey::Number(_) => {
+                                let prefix = if *is_getter { "get " } else { "set " };
+                                alloc::format!("{prefix}{}", static_key(key)?)
+                            }
+                            _ => String::new(),
+                        };
                         let f = self.with_home(OBJ_HOME_NAME, |c| {
                             c.next_closure_is_method = true;
                             c.next_closure_span = Some(*span);
-                            let f = c.make_closure(&value.params, &value.body, false, "", false);
+                            let f =
+                                c.make_closure(&value.params, &value.body, false, &fname, false);
                             c.next_closure_is_method = false;
                             f
                         })?;

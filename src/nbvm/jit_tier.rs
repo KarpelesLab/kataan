@@ -2072,6 +2072,17 @@ pub(crate) extern "C" fn jit_helper_exec_op(
                 _ => None,
             }
         }
+        // A relational comparison of two strings (a sort comparator's
+        // `a[0] < b[0]`): the interpreter arm's string case, which runs no
+        // code. Anything else takes the one-op frame.
+        Op::Compare { dst, op, a, b } => {
+            super::string_compare(&mut ctx.realm, regs[*a as usize], regs[*b as usize], *op).map(
+                |v| {
+                    regs[*dst as usize] = NanBox::boolean(v);
+                    Ok(())
+                },
+            )
+        }
         // A string literal (`'k' + i` evaluates its `'k'` every iteration).
         Op::NewString { dst, value } => {
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_literal_string(value).to_raw());

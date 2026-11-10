@@ -580,6 +580,125 @@ impl Regex {
         true
     }
 
+    /// Every match of a global scan from `from`, appended to `out` (each
+    /// match's `group_count() + 1` spans): the loop of
+    /// [`captures_into_u16`](Self::captures_into_u16) calls a global
+    /// `@@replace`/`@@match` collection makes, each resuming where the last
+    /// match ended — past an empty one by `AdvanceStringIndex` (a whole code
+    /// point under `u`/`v`) — until one fails. Each find has its own step
+    /// budget, as each of those calls would. For a linear pattern the loop
+    /// runs inside one matcher setup rather than one per match. `unicode` is
+    /// the `fullUnicode` of the advance (from the `flags` the caller read).
+    pub fn global_scan_into(
+        &self,
+        units: &[u16],
+        from: usize,
+        unicode: bool,
+        out: &mut Vec<Option<(usize, usize)>>,
+    ) {
+        if self.single_atom_scan(units, from, out) {
+            return;
+        }
+        let flags = self.flags;
+        let Some(lin) = &self.linear else {
+            let stride = self.group_count + 1;
+            let mut li = from;
+            while li <= units.len() && self.captures_into_u16(units, li, out) {
+                let (a, b) = out[out.len() - stride].unwrap_or_default();
+                li = if a == b {
+                    advance_string_index(units, b, unicode)
+                } else {
+                    b
+                };
+            }
+            return;
+        };
+        let slots = lin.slots();
+        let mut tiny = [usize::MAX; 8];
+        let mut heap: Vec<usize>;
+        let saves: &mut [usize] = if slots <= 8 {
+            &mut tiny[..slots]
+        } else {
+            heap = alloc::vec![usize::MAX; slots];
+            &mut heap
+        };
+        let budget = vm::budget_for(units.len());
+        let anchored = self.anchored && !flags.multiline;
+        let mut li = from;
+        while li <= units.len() {
+            // `scan_into`'s bounds for a find from `li`.
+            let start = if flags.unicode && li < units.len() && !is_char_boundary(units, li) {
+                li - 1
+            } else {
+                li
+            };
+            let last = if flags.sticky || anchored {
+                start
+            } else {
+                units.len()
+            };
+            let steps = core::cell::Cell::new(0);
+            if lin
+                .find(&self.prog, units, start, last, flags, saves, &steps, budget)
+                .is_none()
+            {
+                return;
+            }
+            out.extend(
+                saves
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&[a, b]| (a != usize::MAX && b != usize::MAX).then_some((a, b))),
+            );
+            let (a, b) = (saves[0], saves[1]);
+            li = if a == b {
+                advance_string_index(units, b, unicode)
+            } else {
+                b
+            };
+        }
+    }
+
+    /// For a pattern that is a single one-character atom with no capture
+    /// group under flags without `u`/`v` (see
+    /// [`single_atom_scan`](Self::single_atom_scan)): whether the code unit
+    /// `u` is a match on its own — so every match of a scan is exactly one
+    /// such unit. `None` for any other pattern.
+    #[must_use]
+    pub fn single_atom_matcher(&self) -> Option<impl Fn(u16) -> bool + '_> {
+        use vm::Inst;
+        let flags = self.flags;
+        if flags.unicode || flags.unicode_sets || self.group_count != 0 {
+            return None;
+        }
+        let atom = match self.prog.as_slice() {
+            [
+                Inst::Save(0),
+                atom @ (Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. }),
+                Inst::Save(1),
+                Inst::Match,
+            ] => atom,
+            _ => return None,
+        };
+        let latin1 = self.atom_latin1.get_or_init(|| {
+            let mut set = [0u64; 4];
+            for u in 0u32..256 {
+                if vm::single_consume_matches(atom, u, flags) {
+                    set[(u >> 6) as usize] |= 1u64 << (u & 63);
+                }
+            }
+            set
+        });
+        Some(move |u: u16| {
+            if u < 256 {
+                latin1[usize::from(u >> 6)] & (1u64 << (u & 63)) != 0
+            } else {
+                vm::single_consume_matches(atom, u32::from(u), flags)
+            }
+        })
+    }
+
     /// The scan behind [`scan_counted`](Self::scan_counted): on a match, appends
     /// its spans to `out` and returns `true`.
     fn scan_into(
