@@ -514,7 +514,7 @@ pub struct Realm {
     coll_default: [Option<(Handle, Handle)>; 2],
     /// [`hidden_slots`](Realm::hidden_slots)' memos: per caller, the last
     /// layout it read and the slots of its keys there.
-    hidden_memo: [Option<(Rc<Shape>, [Option<u32>; HIDDEN_KEYS_MAX])>; HIDDEN_MEMOS],
+    hidden_memo: [Option<HiddenMemo>; HIDDEN_MEMOS],
     /// The `instanceof` right-hand side memo (`realm::inst_memo`).
     inst_memo: inst_memo::InstMemo,
     /// Class tags for *non-object* cells — a derived instance of a native base
@@ -10187,6 +10187,10 @@ impl Realm {
 /// The most entries a Map/Set without a hash index is searched by a plain
 /// scan (`Realm::collection_find_ro`) instead of building the index.
 pub(crate) const COLL_SCAN_MAX: usize = 8;
+
+/// One [`Realm::hidden_slots`] memo: a layout and the slots of the
+/// caller's keys there.
+type HiddenMemo = (Rc<Shape>, [Option<u32>; HIDDEN_KEYS_MAX]);
 
 /// The most keys one [`Realm::hidden_slots`] call reads.
 pub(crate) const HIDDEN_KEYS_MAX: usize = 3;
