@@ -11947,6 +11947,53 @@ fn array_species_create_through_proxy_receiver() {
 }
 
 #[test]
+fn array_species_create_for_holey_map_filter() {
+    // `map`/`filter` over an array with holes (or a sparse tail) still build
+    // their result with ArraySpeciesCreate: an own `constructor` or a custom
+    // `@@species` is honored, as on a dense array.
+    let harness = "class MyA extends Array {}\
+        function holey(){var a=[1,,3,,5];return a;}\
+        function sparse(){var a=[1,2];a.length=6;return a;}";
+    for shape in ["holey", "sparse"] {
+        for m in ["map", "filter"] {
+            assert_eq!(
+                run(&alloc::format!(
+                    "{harness}var a={shape}();a.constructor=MyA;\
+                     var r=a.{m}(function(x){{return x;}});\
+                     (r instanceof MyA)+','+r.length"
+                )),
+                if m == "map" {
+                    if shape == "holey" { "true,5" } else { "true,6" }
+                } else if shape == "holey" {
+                    "true,3"
+                } else {
+                    "true,2"
+                },
+                "{shape} {m}"
+            );
+            assert_eq!(
+                run(&alloc::format!(
+                    "{harness}var a={shape}();var n=-1;\
+                     a.constructor={{[Symbol.species]:function(len){{n=len;}}}};\
+                     var r=a.{m}(function(x){{return x;}});\
+                     Array.isArray(r)+','+n"
+                )),
+                if m == "map" {
+                    if shape == "holey" {
+                        "false,5"
+                    } else {
+                        "false,6"
+                    }
+                } else {
+                    "false,0"
+                },
+                "{shape} {m} species"
+            );
+        }
+    }
+}
+
+#[test]
 fn array_prototype_has_own_length_zero() {
     // `Array.prototype` exposes an own `length` (0, writable, non-enumerable,
     // non-configurable), so `"length" in Object.create(Array.prototype)` holds.

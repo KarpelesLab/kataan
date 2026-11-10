@@ -3366,6 +3366,14 @@ impl Interp {
                 .array_elements(handle)
                 .is_some_and(|a| a.iter().any(|e| e.is_hole()))
         {
+            // `map`/`filter` build their result with `ArraySpeciesCreate`: a
+            // non-default `constructor`/`@@species` (which the plain-array result
+            // of the scan below would ignore) takes the spec-exact algorithm.
+            if matches!(method, "map" | "filter")
+                && !crate::nbvm::array_species_is_default(&self.realm, handle)
+            {
+                return Ok(Some(self.array_map_filter_generic(method, handle, args)?));
+            }
             // A sparse array uses the conformant *live* iteration: `len` is read
             // once, then each index is probed with `HasProperty` and read with
             // `Get` at that step — so a callback/getter that fills a hole or

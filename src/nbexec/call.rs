@@ -222,6 +222,21 @@ impl Interp {
         // One realm only (none was ever created): every function's realm is
         // the running one, so there is nothing to enter.
         if self.created_realms.is_empty() {
+            // A VM closure — a built-in's callback — is the VM's to run: taken
+            // here, ahead of the general dispatch below (whose frame alone
+            // costs more than a compiled callee's body).
+            if let Some(table) = self.vm_table.as_ref()
+                && let Some(h) = callee.as_handle().map(Handle::from_raw)
+                && self.realm.is_vm_function(h)
+            {
+                // (Before a nested context is set up on what is left of it.)
+                if crate::stack::exhausted() {
+                    return Err(self.stack_exhausted());
+                }
+                let table = alloc::rc::Rc::clone(table);
+                return crate::nbvm::call_vm_function(self, &table, callee, this_val, args)
+                    .map_err(super::vm_to_exec);
+            }
             return self.call_with_this_inner(callee, this_val, args);
         }
         let callee_h = callee.as_handle().map(Handle::from_raw);
@@ -357,7 +372,8 @@ impl Interp {
             return r;
         }
         // A bytecode-VM function value (a callback a hosted VM run handed to a
-        // built-in) runs on the VM.
+        // built-in) runs on the VM. (Single-realm calls took it already, in
+        // `call_with_this`.)
         if self.realm.is_vm_function(handle)
             && let Some(table) = self.vm_table.clone()
         {

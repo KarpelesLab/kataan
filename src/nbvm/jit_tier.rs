@@ -186,6 +186,36 @@ impl TierRuntime {
             ..Self::default()
         }
     }
+
+    /// Readies the state of a pooled hosted context (`hosted_pool`) whose
+    /// call has returned for its next one, as if it were [`Self::hosted`]
+    /// (keeping only the thread's register stack and the allocations):
+    /// `false` when anything is in a state a finished call does not leave,
+    /// and the context should be dropped instead. The compiled-callee memo
+    /// goes, with the bodies it kept alive, as when the context is dropped.
+    pub(super) fn reset_hosted(&mut self) -> bool {
+        if self.base != 0
+            || self.exit_regs != 0
+            || !self.exit_jit.is_null()
+            || self.resume.is_some()
+            || self.left.is_some()
+            || self.demote
+            || self.suspended.is_some()
+            || self.deopt.is_some()
+            || self.tail.is_some()
+            || !self.hosted
+        {
+            return false;
+        }
+        self.handlers.clear();
+        if !self.direct.is_empty() {
+            self.direct.clear();
+        }
+        if !self.direct_retired.is_empty() {
+            self.direct_retired.clear();
+        }
+        true
+    }
 }
 
 /// A pointer to the running thread's [`JitStack`] (null until first use).
@@ -2364,6 +2394,66 @@ pub(super) fn call_compiled_with(
         Ok(_) => Err(VmError::Unsupported),
         Err(e) => Err(e),
     })
+}
+
+/// `Call(callee, this, args)` of a VM closure from a host built-in (a
+/// callback: a `JSON.parse` reviver, a getter the host reads, a
+/// comparator…), in the fresh hosted context `ctx` that
+/// `super::call_vm_function` made for it (call depth 0, no collection): when
+/// the closure is a [`direct_target`] with a native-call entry, its compiled
+/// body is entered there ([`enter_native`]), as a compiled caller enters it
+/// — none of `call_closure` → `call_with` → `call_with_inner`'s generic
+/// activation. `None` (nothing done) for anything else, which takes that
+/// ordinary call.
+///
+/// What the ordinary call keeps is kept: the call-depth limits and the
+/// native-stack check (a catchable `RangeError`), the callee's
+/// `vm_callee_stack` entry (the native-call header stands in for it), and a
+/// throw's propagation (the pending value or fault).
+pub(super) fn call_hosted(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    callee: NanBox,
+    this: NanBox,
+    args: &[NanBox],
+) -> Option<Result<NanBox, VmError>> {
+    let handle = Handle::from_raw(callee.as_handle()?);
+    let (fid, caps) = ctx.realm.vm_function(handle)?;
+    let proto = funcs.get(fid as usize)?;
+    if ctx.realm.multi_realm || caps.len() < proto.n_captures {
+        return None;
+    }
+    let caps = caps.as_ptr();
+    let jit = direct_target(proto)?;
+    let n_regs = jit.n_regs();
+    if jit.native_entry().is_none() || n_regs < proto.n_regs {
+        return None;
+    }
+    // `call_with`'s recursion guard.
+    if ctx.call_depth >= ctx.realm.limits.max_call_depth
+        || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        || crate::stack::exhausted()
+    {
+        let e = vm_error(ctx, "RangeError", super::STACK_EXHAUSTED);
+        return Some(Err(VmError::Thrown(e)));
+    }
+    // SAFETY: `jit` is the callee's compiled body with a native-call entry
+    // over `n_regs` registers; `caps` points at the closure's captures, which
+    // the callee value (held by the host caller) keeps alive, and nothing
+    // runs between taking it and the entry copying them.
+    #[allow(unsafe_code)]
+    unsafe {
+        enter_native(
+            ctx,
+            funcs,
+            &jit,
+            n_regs,
+            callee,
+            caps.cast::<u64>(),
+            this,
+            args,
+        )
+    }
 }
 
 /// `Call(callee, this, args)` of the VM closure `callee` through `jit`'s

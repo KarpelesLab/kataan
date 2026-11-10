@@ -1726,15 +1726,6 @@ pub trait VmHost {
 /// The [`Op::DynImport`] referrer of script (non-module) code.
 pub const SCRIPT_REFERRER: u32 = u32::MAX;
 
-/// Calls the VM function value `f` for the host (a VM callback a built-in
-/// invokes), running it in a nested VM context over the host's realm.
-///
-/// Promise jobs are still queued per VM context (the host's and the VM's queues
-/// are unified in `ROADMAP.md` §2.0 stage 5), so a callback that leaves jobs
-/// behind faults the run rather than dropping them.
-///
-/// # Errors
-/// The callee's throw, or a VM fault.
 /// Whether `ArraySpeciesCreate(O, n)` for the array `h` is the default
 /// `ArrayCreate(n)`, decided with no observable effect (`O.constructor` is a
 /// data property holding `%Array%` with its built-in `@@species` getter);
@@ -1743,6 +1734,21 @@ pub(crate) fn array_default_species(realm: &mut Realm, h: Handle) -> bool {
     array_hof::default_species_armed(realm, h)
 }
 
+/// Calls the VM function value `f` for the host (a VM callback a built-in
+/// invokes), running it in a nested VM context over the host's realm.
+///
+/// Promise jobs are still queued per VM context (the host's and the VM's queues
+/// are unified in `ROADMAP.md` §2.0 stage 5), so a callback that leaves jobs
+/// behind faults the run rather than dropping them.
+///
+/// A built-in calls back once per element (a reviver per key, a getter per
+/// read…), so this is a hot path: the nested context comes from a per-thread
+/// pool of idle ones ([`hosted_pool`]) rather than being built and dropped per
+/// call, and a closure with a compiled body is entered there directly
+/// (`jit_tier::call_hosted`).
+///
+/// # Errors
+/// The callee's throw, or a VM fault.
 pub(crate) fn call_vm_function(
     host: &mut dyn VmHost,
     table: &alloc::rc::Rc<[FnProto]>,
@@ -1750,18 +1756,146 @@ pub(crate) fn call_vm_function(
     this: NanBox,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
-    let mut ctx = hosted_ctx(host.take_realm(), host);
-    let result = {
-        let r = call_closure(&mut ctx, table, f, args, this);
-        if r.is_ok() && !ctx.microtasks.is_empty() {
-            Err(VmError::Unsupported)
-        } else {
-            r
+    #[cfg(feature = "std")]
+    if let Some(mut idle) = hosted_pool::take() {
+        let in_realm = host.realm_index();
+        // SAFETY: the pooled context holds no borrow (its `host` is `None`)
+        // and nothing else refers to it. It is used as a `Ctx<'_>` over
+        // `host` only inside this block: its `host` is cleared before the
+        // block ends, so the `'static` context handed back to the pool holds
+        // no borrow of `host` (a panic drops it instead, borrow and all).
+        #[allow(unsafe_code)]
+        let ctx: &mut Ctx<'_> = unsafe { &mut *core::ptr::from_mut(&mut *idle).cast::<Ctx<'_>>() };
+        // The host's realm comes in as `with_host` lends it: by swapping the
+        // box with the idle context's spare.
+        core::mem::swap(&mut ctx.realm, host.realm_slot());
+        ctx.host = Some(host);
+        ctx.in_realm = in_realm;
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        {
+            ctx.jit_rt.main_realm = in_realm.is_none();
         }
-    };
+        let result = run_vm_callback(ctx, table, f, this, args);
+        let host = ctx.host.take().expect("the hosted context's host");
+        // The host never sees a closure that owes its `prototype`.
+        if ctx.realm.has_owed_fn_protos() {
+            ctx.realm.materialize_owed_fn_protos();
+        }
+        core::mem::swap(&mut ctx.realm, host.realm_slot());
+        hosted_pool::give_back(idle);
+        return result;
+    }
+    let mut ctx = hosted_ctx(host.take_realm(), host);
+    let result = run_vm_callback(&mut ctx, table, f, this, args);
     let realm = ctx.realm;
     host.restore_realm(realm);
     result
+}
+
+/// [`call_vm_function`]'s call in the nested context `ctx`.
+#[inline(always)]
+fn run_vm_callback(
+    ctx: &mut Ctx,
+    table: &[FnProto],
+    f: NanBox,
+    this: NanBox,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    // A closure with a compiled body is entered there directly, as a
+    // compiled caller enters it; anything else is the ordinary VM call.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let r = match jit_tier::call_hosted(ctx, table, f, this, args) {
+        Some(r) => r,
+        None => call_closure(ctx, table, f, args, this),
+    };
+    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    let r = call_closure(ctx, table, f, args, this);
+    if r.is_ok() && !ctx.microtasks.is_empty() {
+        Err(VmError::Unsupported)
+    } else {
+        r
+    }
+}
+
+/// The per-thread pool of idle nested contexts [`call_vm_function`] runs
+/// its callbacks in. An idle context holds a spare realm (swapped for the
+/// host's while it runs, as `with_host` swaps them), no host, and nothing of
+/// the call it last ran: what a call leaves behind is either cleared on
+/// return (the bookkeeping stacks, the pending throw, the per-op inline
+/// caches, whose keys are bytecode addresses only valid while their code
+/// lives, and the compiled-callee memo, whose bodies a recompilation
+/// replaces) or, when it is anything unusual, the context is dropped
+/// instead of pooled. Its generator-slot caches stay, as they stay across
+/// calls in the outermost context.
+#[cfg(feature = "std")]
+mod hosted_pool {
+    use super::Ctx;
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    /// The most idle contexts a thread keeps (a nesting deeper than this
+    /// builds the rest fresh, as before the pool).
+    const MAX_IDLE: usize = 8;
+
+    std::thread_local! {
+        // Boxed: a context is large, and moves in and out of the pool by
+        // pointer.
+        #[allow(clippy::vec_box)]
+        static IDLE: RefCell<Vec<Box<Ctx<'static>>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// An idle context (a new one when the pool is empty); `None` only while
+    /// the pool is unavailable (the thread is exiting).
+    pub(super) fn take() -> Option<Box<Ctx<'static>>> {
+        IDLE.try_with(|p| p.try_borrow_mut().ok().and_then(|mut p| p.pop()))
+            .ok()
+            .map(|c| c.unwrap_or_else(fresh))
+    }
+
+    /// A new idle context.
+    #[cold]
+    fn fresh() -> Box<Ctx<'static>> {
+        Box::new(super::hosted_ctx_in(Box::default(), None))
+    }
+
+    /// Returns the context `c` (its host already cleared, its spare realm
+    /// back in place) to the pool, reset; or drops it when it is not in the
+    /// state a finished call leaves an ordinary context in.
+    pub(super) fn give_back(mut c: Box<Ctx<'static>>) {
+        if c.call_depth != 0 || c.frames_published != 0 || c.gc_lock != 0 || c.host.is_some() {
+            return;
+        }
+        c.output.clear();
+        c.microtasks.clear();
+        c.frame_shadow.clear();
+        c.top_frame_roots.clear();
+        c.pending_callee = None;
+        c.pending_new_target = None;
+        c.gen_open_memo = None;
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        {
+            c.jit_pending = None;
+            c.jit_pending_fault = None;
+            c.jit_funcs = None;
+            c.jit_shadow.clear();
+            c.exec_op_ic.clear();
+            if !c.exec_op_ics.is_empty() {
+                c.exec_op_ics.clear();
+            }
+            if !c.jit_rt.reset_hosted() {
+                return;
+            }
+        }
+        // (A thread that is exiting drops it.)
+        let _ = IDLE.try_with(|p| {
+            if let Ok(mut p) = p.try_borrow_mut()
+                && p.len() < MAX_IDLE
+            {
+                p.push(c);
+            }
+        });
+    }
 }
 
 /// A fresh [`Ctx`] for a run over `realm` inside `host`, with
@@ -1769,7 +1903,7 @@ pub(crate) fn call_vm_function(
 /// outermost one switches it on — see [`run_program_hosted`]).
 fn hosted_ctx<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
     let in_realm = host.realm_index();
-    let mut ctx = hosted_ctx_in(realm, host);
+    let mut ctx = hosted_ctx_in(realm, Some(host));
     ctx.in_realm = in_realm;
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     {
@@ -1778,10 +1912,10 @@ fn hosted_ctx<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
     ctx
 }
 
-fn hosted_ctx_in<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
+fn hosted_ctx_in<'a>(realm: Box<Realm>, host: Option<&'a mut dyn VmHost>) -> Ctx<'a> {
     Ctx {
         realm,
-        host: Some(host),
+        host,
         output: String::new(),
         microtasks: alloc::collections::VecDeque::new(),
         gen_ic: PropertyCache::new(),
