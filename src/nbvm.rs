@@ -7442,6 +7442,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         global_mirror: global_mirror::jit_helper_global_mirror,
         math1: jit_tier::jit_helper_math1,
         site_fill: jit_tier::jit_helper_site_fill,
+        math_memo: jit_tier::jit_helper_math_memo,
         str_proof: jit_tier::jit_helper_str_proof,
         direct_fill: jit_tier::jit_helper_direct_fill,
         direct_call: jit_tier::jit_helper_direct_call,
@@ -15906,6 +15907,25 @@ struct Compiler {
     /// direct eval there may not declare as `var`s (the parameters and
     /// `arguments`), joined by `\n`.
     eval_params: Option<String>,
+    /// Per enclosing hosted `for-of` being compiled (innermost last): its
+    /// `break_sites` index and its **out-of-line exits** ([`OutExit`]).
+    out_exits: Vec<(usize, Vec<OutExit>)>,
+}
+
+/// A `break`/`continue`/`return` leaving a hosted `for-of` whose unwinding is
+/// only handler pops and iterator closes: those ops and the exit's own jump
+/// or `Op::Return` are placed after the loop's back-edge, and the exit site
+/// itself is a plain `Jump` to them ([`Compiler::emit_exit`]). The same ops
+/// run in the same order with the same handler stack, but the loop body is
+/// left with no handler or close op in it, so the JIT can treat it like any
+/// loop whose `break` jumps out.
+struct OutExit {
+    /// The exit site's `Jump`, to patch to the placed ops.
+    jump: usize,
+    ops: Vec<Op>,
+    /// For a `break` (`true`) / `continue` (`false`) of `break_sites[t]`: the
+    /// last op is its jump, to record there once placed.
+    site: Option<(bool, usize)>,
 }
 
 /// The hidden binding holding the innermost host environment of a function
@@ -25148,6 +25168,8 @@ impl Compiler {
             fr.cont_depth = self.handler_depth;
         }
         let top = self.ops.len();
+        self.out_exits
+            .push((self.break_sites.len() - 1, Vec::new()));
         let cur = self.alloc();
         let entry = entry_pair_head(&bind);
         let pair = if entry.is_some() {
@@ -25184,8 +25206,10 @@ impl Compiler {
             _ => self.for_iteration(bind, cur, body),
         };
         self.handler_depth -= 1;
+        let exits = self.out_exits.pop().map(|e| e.1).unwrap_or_default();
         r?;
         self.ops.push(Op::Jump { target: top });
+        self.place_out_exits(exits);
         // A throw from a step, the binding or the body: close quietly (a no-op
         // after a step's throw), rethrow.
         let at = self.ops.len();
@@ -25591,6 +25615,7 @@ impl Compiler {
             Exit::Continue(t) => (t, false, t + 1),
             Exit::Return { .. } => (0, true, 0),
         };
+        let start = self.ops.len();
         if let Some(i) = self.emit_unwind(target, inclusive, fin_min)? {
             let rec = &mut self.fin_routes[i];
             let n = match rec.routes.iter().position(|&e| e == exit) {
@@ -25603,6 +25628,22 @@ impl Compiler {
             self.fin_enter(i, 2 + n as u32, val);
             return Ok(());
         }
+        // An unwinding of only handler pops and iterator closes, leaving the
+        // innermost `for-of` being compiled (or returning): out of line
+        // ([`OutExit`]).
+        let out_of_line = self.ops.len() > start
+            && self.ops[start..]
+                .iter()
+                .all(|o| matches!(o, Op::PopHandler | Op::IterClose { .. }))
+            && self.out_exits.last().is_some_and(|&(k, _)| match exit {
+                Exit::Break(t) | Exit::Continue(t) => t <= k,
+                Exit::Return { derived } => !derived,
+            });
+        let site = match exit {
+            Exit::Break(t) => Some((true, t)),
+            Exit::Continue(t) => Some((false, t)),
+            Exit::Return { .. } => None,
+        };
         match exit {
             Exit::Break(t) => {
                 let j = self.emit_jump();
@@ -25627,7 +25668,45 @@ impl Compiler {
                 }
             }
         }
+        if out_of_line {
+            let ops = self.ops.split_off(start);
+            // The exit's jump moves with them: recorded again once placed.
+            if let Some((brk, t)) = site {
+                let sites = if brk {
+                    &mut self.break_sites
+                } else {
+                    &mut self.continue_sites
+                };
+                let last = sites.get_mut(t).and_then(Vec::pop);
+                debug_assert_eq!(last, Some(start + ops.len() - 1));
+            }
+            let jump = self.emit_jump();
+            if let Some((_, list)) = self.out_exits.last_mut() {
+                list.push(OutExit { jump, ops, site });
+            }
+        }
         Ok(())
+    }
+
+    /// Places the out-of-line exits of the hosted `for-of` whose body has
+    /// just compiled ([`OutExit`]) here, after its back-edge.
+    fn place_out_exits(&mut self, exits: Vec<OutExit>) {
+        for e in exits {
+            let at = self.ops.len();
+            self.patch_to(e.jump, at);
+            let last = at + e.ops.len() - 1;
+            self.ops.extend(e.ops);
+            if let Some((brk, t)) = e.site {
+                let sites = if brk {
+                    &mut self.break_sites
+                } else {
+                    &mut self.continue_sites
+                };
+                if let Some(s) = sites.get_mut(t) {
+                    s.push(last);
+                }
+            }
+        }
     }
 
     /// Enters the `finally` of completion record `i` with `kind` (see

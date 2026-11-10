@@ -3661,6 +3661,10 @@ pub struct GenericHelpers {
     /// method site's key is found on `recv` (`MethodSite::fill`), for the
     /// inline `Math.f(x)` lookup.
     pub site_fill: JitBinHelper,
+    /// `jit_helper_math_memo(ctx, recv, site, native) -> 0`: records an
+    /// inline `Math.f(x)` site's proof across activations
+    /// (`MethodSite::fill_math`).
+    pub math_memo: JitBinHelper,
     /// `jit_helper_str_proof(ctx, recv, site, _) -> 0`: proves
     /// `String.prototype`'s method for a `s.charCodeAt(i)` site.
     pub str_proof: JitBinHelper,
@@ -8668,6 +8672,7 @@ impl JitFunction {
                 global_mirror: helpers.global_mirror as usize as u64,
                 math1: helpers.math1 as usize as u64,
                 site_fill: helpers.site_fill as usize as u64,
+                math_memo: helpers.math_memo as usize as u64,
                 persist,
                 no_spec: no_spec.to_vec(),
                 first_local: n_params + n_caps + 1,
@@ -11254,6 +11259,10 @@ impl JitFunction {
                         if !proved {
                             a.g_cmp_byte_imm(call_seq::r::R15, helpers.call_layout.hosted, 0);
                             a.g_jcc(call_seq::cc::E, general); // not hosted: no chain cache
+                            // The proof an earlier activation made, while it
+                            // holds (`MethodSite::fill_math`).
+                            a.load_rax(disp(recv));
+                            a.p_math_memo_hit(si.method_ptr as u64, proven);
                             // The receiver's heap slot through the site's own
                             // one-entry cache (else walked, out of line).
                             a.load_rax(disp(recv));
@@ -11294,6 +11303,17 @@ impl JitFunction {
                             a.g_mov(call_seq::r::R9, call_seq::r::RAX);
                             a.p_is_native(&layout, helpers.call_layout.realm, native_id, general);
                             a.g_store(call_seq::r::RBP, m_slot(mi, 2), call_seq::r::R9);
+                            // Proved now: kept for later activations (but
+                            // not from a speculative loop's fast version,
+                            // which makes no call; its entry check keeps it).
+                            if !num.in_spec(op_idx) {
+                                a.mov_rdi_r15();
+                                a.load_argreg(1, disp(recv));
+                                a.movabs_argreg(2, si.method_ptr as i64);
+                                a.movabs_argreg(3, i64::from(native_id));
+                                a.movabs_rax(helpers.math_memo as usize as i64);
+                                a.call_rax();
+                            }
                         }
                         a.bind(proven);
                         // In a speculative region's integer version, over
@@ -12837,9 +12857,16 @@ impl JitFunction {
                                 let end = a.new_label();
                                 // (A cursor not a Number truncates to the
                                 // "indefinite" integer: past any count, and
-                                // negative.)
-                                a.movsd_xmm0_mem(disp(iter));
-                                a.cvttsd2si_rax_xmm0();
+                                // negative.) Its cursor slot holds that
+                                // truncation already (`NumGen::iter_cursor`).
+                                let cur = num.iter_cursor(op_idx);
+                                match cur {
+                                    Some(c) => a.g_load(call_seq::r::RAX, call_seq::r::RBP, c),
+                                    None => {
+                                        a.movsd_xmm0_mem(disp(iter));
+                                        a.cvttsd2si_rax_xmm0();
+                                    }
+                                }
                                 a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.len);
                                 a.jae(end);
                                 a.g_load(call_seq::r::R11, call_seq::r::RBP, s.base);
@@ -12849,6 +12876,9 @@ impl JitFunction {
                                 a.je(slow);
                                 a.store_rax(disp(dst));
                                 numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                if let Some(c) = cur {
+                                    a.g_store(call_seq::r::RBP, c, call_seq::r::R8);
+                                }
                                 a.movsd_mem_xmm0(disp(iter));
                                 a.jmp(body);
                                 a.bind(end);

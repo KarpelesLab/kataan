@@ -977,6 +977,9 @@ pub(super) struct NumEnv {
     /// `jit_helper_site_fill` (an entry-proved `Math` call's chain-cache
     /// miss: [`NumGen::math_entry_checks`]).
     pub(super) site_fill: u64,
+    /// `jit_helper_math_memo` (an entry-proved `Math` call's proof, kept
+    /// across activations: [`NumGen::math_entry_checks`]).
+    pub(super) math_memo: u64,
     /// The body's persistent global binding cache (`super::global_persist`).
     pub(super) persist: u64,
     /// The header pcs of the loops to give no speculative version (an
@@ -1252,6 +1255,9 @@ pub(super) struct NumGen {
     n_iproof: usize,
     /// The run-proved answers' slots ([`AProof::slot`]), after those.
     n_aproof: usize,
+    /// The hoisted array steps' cursor slots ([`Self::iter_cursor`]), after
+    /// those: the step pcs, ascending.
+    icur: Vec<usize>,
     /// The compiled `for-in` run proofs' frame slots
     /// ([`NumGen::set_forin_zero`]).
     forin_zero: Vec<(usize, [i32; 2])>,
@@ -1946,7 +1952,7 @@ impl NumGen {
                 }
             }
         }
-        Self {
+        let mut me = Self {
             ident: ident::identity_regs(bytecode, env.n_regs, env.first_local),
             demote_sites: Vec::new(),
             types,
@@ -1996,7 +2002,10 @@ impl NumGen {
             keeps_si_di: Vec::new(),
             math_proofs: Vec::new(),
             plain_lazy: Vec::new(),
-        }
+            icur: Vec::new(),
+        };
+        me.icur = (0..n).filter(|&pc| me.iter_hoisted(pc).is_some()).collect();
+        me
     }
 
     /// Allocates the labels of the speculative regions' plain copies.
@@ -2134,6 +2143,7 @@ impl NumGen {
             + self.n_pproof
             + self.n_iproof
             + self.n_aproof
+            + self.icur.len()
     }
 
     /// The frame slot of carried field flag `k` ([`FCarry::flag`]), after
@@ -2167,6 +2177,20 @@ impl NumGen {
     /// the run-proved ops'.
     fn aproof_disp(&self, k: u32) -> i32 {
         self.iproof_disp(self.n_iproof as u32 + k)
+    }
+
+    /// For a hoisted array step `pc` ([`Self::iter_hoisted`]) being emitted
+    /// in the fast version: its **cursor slot**, which holds the cursor as
+    /// an `i64` (the truncation of the `iter` register's Number, which a
+    /// non-Number makes the negative "indefinite" integer). Every entry into
+    /// the fast version fills it from the register ([`Self::iter_entry_checks`]),
+    /// and inside it only the step writes `iter`, both of them at once: the
+    /// step's loop-carried dependency is then an integer increment, not a
+    /// round trip through a double.
+    pub(super) fn iter_cursor(&self, pc: usize) -> Option<i32> {
+        self.iter_hoisted(pc)?;
+        let k = self.icur.binary_search(&pc).ok()?;
+        Some(self.aproof_disp((self.n_aproof + k) as u32))
     }
 
     /// For the property read or `key in obj` at `pc` in a speculative
@@ -2513,7 +2537,8 @@ impl NumGen {
     }
 
     /// Region `ri`'s hoisted steps' entry checks ([`Self::iter_hoisted`]):
-    /// `done` not `true`, else to `copy`. Clobbers `rax`.
+    /// `done` not `true`, else to `copy`; and their cursor slots filled
+    /// ([`Self::iter_cursor`]). Clobbers `rax`, `xmm0`.
     fn iter_entry_checks(&self, a: &mut X64Assembler, ri: usize, copy: Label) {
         let r = &self.regions[ri];
         for pc in r.head..=r.end {
@@ -2521,6 +2546,14 @@ impl NumGen {
                 a.load_rax(disp(done));
                 a.cmp_rax_const(self.tag_true);
                 a.jcc(CC_E, copy);
+                // (The cursor slot, from the cursor register.)
+                if let (Ok(k), Some(&Op::IterNext { iter, .. })) =
+                    (self.icur.binary_search(&pc), self.bc(pc))
+                {
+                    a.movsd_xmm0_mem(disp(iter));
+                    a.cvttsd2si_rax_xmm0();
+                    a.store_rax(self.aproof_disp((self.n_aproof + k) as u32));
+                }
             }
         }
     }
@@ -3225,6 +3258,10 @@ impl NumGen {
             };
             a.g_cmp_byte_imm(r::R15, m.hosted, 0);
             a.jcc(CC_E, copy);
+            // The proof an earlier activation made, while it holds
+            // (`MethodSite::fill_math`): no walk, no lookup.
+            binding(a);
+            a.p_math_memo_hit(m.site, ok);
             binding(a);
             a.g_cmp_mem(RAX, r::RBP, m.key);
             a.jcc(CC_NE, walk);
@@ -3269,6 +3306,14 @@ impl NumGen {
             a.g_mov(r::R9, RAX);
             a.p_is_native(l, realm, m.native, copy);
             a.g_store(r::RBP, m.proof, r::R9);
+            // Proved now: kept for later activations.
+            a.g_mov(r::RDI, r::R15);
+            binding(a);
+            a.g_mov(r::RSI, RAX);
+            a.g_movabs(r::RDX, m.site);
+            a.g_movabs(r::RCX, u64::from(m.native));
+            a.g_movabs(RAX, self.env.math_memo);
+            a.call_rax();
             a.bind(ok);
         }
     }
@@ -9819,11 +9864,19 @@ fn plain_views_ok(r: &Region, ops: &[GenericOp], bytecode: &[Op]) -> bool {
     let index_like = |k: &str| k == "length" || k.parse::<u32>().is_ok();
     let mut reads = false;
     for pc in r.head..=r.end {
+        // (A guard diamond's fallback arm is not in the fast version: its
+        // test leaves for the plain copy, whose next entry hoists afresh.)
+        if r.is_cold(pc) {
+            continue;
+        }
         let ok = match (ops[pc], &bytecode[pc]) {
             (GenericOp::GetElem { .. } | GenericOp::ArrayLen { .. }, _) => {
                 reads = true;
                 true
             }
+            // (A return leaves the region.)
+            (GenericOp::Ret { .. }, _) => true,
+            (GenericOp::CallWithMethod { .. }, bc) => super::inline_math_got(bc).is_some(),
             // (Its inline store is in bounds and to no hole: a value
             // changes, never the count or the storage.)
             (GenericOp::SetElem { .. }, _) => true,
@@ -9879,6 +9932,15 @@ fn plain_views_ok(r: &Region, ops: &[GenericOp], bytecode: &[Op]) -> bool {
             _ => false,
         };
         if !ok {
+            if specalloc_log() {
+                std::eprintln!(
+                    "[specalloc] region {}..={}: no hoisted arrays, op {pc}: {:?} / {:?}",
+                    r.head,
+                    r.end,
+                    ops[pc],
+                    bytecode[pc]
+                );
+            }
             return false;
         }
     }

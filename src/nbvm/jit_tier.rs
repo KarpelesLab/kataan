@@ -1410,6 +1410,36 @@ pub(crate) extern "C" fn jit_helper_math1(
     .map_or(NanBox::jit_throw_bits(), NanBox::to_bits)
 }
 
+/// Records an inline `Math.f(x)` site's proof that `recv`'s method is the
+/// built-in `native` (`crate::jit::MethodSite::fill_math`, a pure read of
+/// the receiver's chain that watches its links), which later activations
+/// then take with no walk. Returns 0.
+///
+/// # Safety
+/// As [`jit_helper_site_fill`].
+pub(crate) extern "C" fn jit_helper_math_memo(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    site: u64,
+    native: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_site_fill`.
+    #[allow(unsafe_code)]
+    let (ctx, site) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            &mut *(site as usize as *mut crate::jit::MethodSite),
+        )
+    };
+    if ctx.host.is_some()
+        && let Some(h) = NanBox::from_bits(recv).as_handle()
+        && let Ok(native) = u16::try_from(native)
+    {
+        site.fill_math(&mut ctx.realm, Handle::from_raw(h), native);
+    }
+    0
+}
+
 /// Records where a method site's key is found on `recv`
 /// (`crate::jit::MethodSite::fill`, a pure read of the receiver's chain) so
 /// the site's inline chain cache hits next time — for compiled code that

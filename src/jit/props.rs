@@ -508,6 +508,28 @@ pub struct MethodSite {
     /// A direct `Object.hasOwn(o, k)` site's memo of its last answer for an
     /// ordinary shaped object (`super::direct_call`).
     own_key: OwnKeyMemo,
+    /// An inline `Math.f(x)` site's proof that persists across activations
+    /// ([`MethodSite::fill_math`]).
+    math: MathMemo,
+}
+
+/// See [`MethodSite::fill_math`]: while the prototype epoch is `stamp`,
+/// the receiver whose bits are `recv` finds the site's key as a data
+/// property whose value is at `ptr`, and that value proved the built-in
+/// when it was `method`'s bits. Every object on the lookup's chain was
+/// watched when it was made, so a change to any of their layouts (or a
+/// move of the holder's cell or slot array) retires the stamp; a value
+/// written into the slot is read live.
+#[repr(C)]
+struct MathMemo {
+    /// The receiver's bits, or [`super::CallSite::EMPTY`].
+    recv: u64,
+    /// The prototype epoch it was made under (`0`: never; the epoch starts
+    /// at `1`).
+    stamp: u64,
+    /// The address holding the method, and the method's bits.
+    ptr: u64,
+    method: u64,
 }
 
 /// See [`MethodSite::note_own_key`]: for an ordinary shaped object (not
@@ -642,7 +664,72 @@ impl MethodSite {
                 result: 0,
                 keep: None,
             },
+            math: MathMemo {
+                recv: super::CallSite::EMPTY,
+                stamp: 0,
+                ptr: 0,
+                method: 0,
+            },
         }
+    }
+
+    /// For an inline `Math.f(x)` site whose compiled check just proved the
+    /// method `recv[key]` the built-in `native`: records that proof so later
+    /// activations take it with no receiver walk or lookup
+    /// ([`MathMemo`], [`math_offsets`](Self::math_offsets)), when the lookup
+    /// meets only objects whose links can be watched and finds a shaped data
+    /// property there. Otherwise (or in a realm that has made others, whose
+    /// intrinsics differ) the memo is emptied. Runs no code.
+    pub(crate) fn fill_math(
+        &mut self,
+        realm: &mut crate::realm::Realm,
+        recv: crate::heap::Handle,
+        native: u16,
+    ) {
+        self.math.recv = super::CallSite::EMPTY;
+        self.math.stamp = 0;
+        if realm.multi_realm || !realm.is_ordinary_get_cell(recv) {
+            return;
+        }
+        let key = self.key();
+        let Some(Some((holder, shape, slot))) = realm.watch_get_chain(recv, key) else {
+            return;
+        };
+        let Some(o) = realm.jit_object(crate::heap::Handle::from_raw(holder)) else {
+            return;
+        };
+        if !o.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, &shape)) {
+            return;
+        }
+        let (Some(ptr), Some(v)) = (o.jit_slot_ptr(slot), o.slot(slot)) else {
+            return;
+        };
+        let proves = v
+            .as_handle()
+            .is_some_and(|f| realm.native_at(crate::heap::Handle::from_raw(f)) == Some(native));
+        if !proves {
+            return;
+        }
+        self.math = MathMemo {
+            recv: crate::nanbox::NanBox::handle(recv.to_raw()).to_bits(),
+            stamp: crate::object::proto_epoch(),
+            ptr: ptr as u64,
+            method: v.to_bits(),
+        };
+    }
+
+    /// The offsets, from a site, of its [`MathMemo`]'s `recv`, `stamp`,
+    /// `ptr` and `method`.
+    pub(crate) fn math_offsets() -> [i32; 4] {
+        use core::mem::offset_of;
+        let m = offset_of!(MethodSite, math);
+        let i = |v: usize| i32::try_from(m + v).expect("site offset fits in i32");
+        [
+            i(offset_of!(MathMemo, recv)),
+            i(offset_of!(MathMemo, stamp)),
+            i(offset_of!(MathMemo, ptr)),
+            i(offset_of!(MathMemo, method)),
+        ]
     }
 
     /// After a direct `Object.hasOwn(o, k)` answered `result` without
@@ -2837,6 +2924,28 @@ impl X64Assembler {
             self.g_cmp_mem(r::RAX, r::R9, off(f));
             self.g_jcc(cc::NE, miss);
         }
+    }
+
+    /// To `hit` when the inline `Math.f(x)` site `site`'s persistent proof
+    /// ([`MethodSite::fill_math`]) holds for the receiver whose bits are in
+    /// `rax`: the same receiver, the prototype epoch it was made under, and
+    /// the method's slot still holding the proved value. Falls through
+    /// otherwise. Clobbers `rax`, `r11`.
+    pub(crate) fn p_math_memo_hit(&mut self, site: u64, hit: Label) {
+        let [recv, stamp, ptr, method] = MethodSite::math_offsets();
+        let miss = self.new_label();
+        self.g_movabs(r::R11, site);
+        self.g_cmp_mem(r::RAX, r::R11, recv);
+        self.g_jcc(cc::NE, miss);
+        self.g_movabs(r::RAX, crate::object::proto_epoch_addr() as u64);
+        self.g_load(r::RAX, r::RAX, 0);
+        self.g_cmp_mem(r::RAX, r::R11, stamp);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::RAX, r::R11, ptr);
+        self.g_load(r::RAX, r::RAX, 0);
+        self.g_cmp_mem(r::RAX, r::R11, method);
+        self.g_jcc(cc::E, hit);
+        self.bind(miss);
     }
 
     /// To `miss` unless destructuring a fresh array runs no code by the
