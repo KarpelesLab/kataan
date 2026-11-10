@@ -209,6 +209,12 @@ fn transfer(op: &Op, s: &mut [u8]) {
             (*dst, num_if(t(s, *src) == T_NUM))
         }
         Op::Neg { dst, a } | Op::BitNot { dst, a } => (*dst, num_if(t(s, *a) == T_NUM)),
+        // `ToPropertyKey` of a computed key: a primitive is the key as it
+        // is (an object's is a string or a symbol); its source is only read.
+        Op::ToKey { dst, src } => {
+            let v = t(s, *src);
+            (*dst, if v == T_NUM || v == T_BOOL { v } else { T_ANY })
+        }
         // A step writes only booleans to `done` (or leaves it as it was).
         Op::IterNext {
             dst, done, iter, ..
@@ -331,6 +337,7 @@ fn for_each_write(op: &Op, f: &mut dyn FnMut(u16)) {
         | Op::CallMethod { dst, .. }
         | Op::CallWithMethod { dst, .. }
         | Op::LoadGlobal { dst, .. }
+        | Op::ToKey { dst, .. }
         | Op::TypeOf { dst, .. } => f(*dst),
         Op::IterNext {
             dst, done, iter, ..
@@ -2326,6 +2333,7 @@ impl NumGen {
                     }
                     _ => super::typed::HoistFrom::Reg(disp(r)),
                 },
+                ViewSrc::Alias(s) => super::typed::HoistFrom::Reg(disp(s)),
                 _ => super::typed::HoistFrom::Reg(disp(r)),
             };
             let s = ArraySlots {
@@ -2354,6 +2362,7 @@ impl NumGen {
                     }
                     _ => super::typed::HoistFrom::Reg(disp(r)),
                 },
+                ViewSrc::Alias(s) => super::typed::HoistFrom::Reg(disp(s)),
                 _ => super::typed::HoistFrom::Reg(disp(r)),
             };
             a.t_hoist(l, t, self.env.realm, from, v);
@@ -2414,7 +2423,7 @@ impl NumGen {
                         _ => false,
                     }
             }
-            ViewSrc::Held => false,
+            ViewSrc::Held | ViewSrc::Alias(_) => false,
         }
     }
 
@@ -9816,6 +9825,10 @@ enum ViewSrc {
     /// Reads of captured variables or properties write it: its value at
     /// entry, likely what they read again.
     Held,
+    /// Only copies of this register, which no op of the region writes,
+    /// write it (`win[n++] = x` evaluates its receiver into a temporary
+    /// first): that register's value at entry, which every copy yields.
+    Alias(u16),
 }
 
 /// The receivers speculative region `r`'s fast version keeps a **hoisted
@@ -9864,7 +9877,12 @@ fn plan_views(
                 {
                     true
                 }
-                Op::SetKey { .. } | Op::SetKeyStrict { .. } | Op::JumpIfFalse { .. } => true,
+                // (A compound element assignment's check of its receiver,
+                // `a[i] -= x`, writes nothing.)
+                Op::SetKey { .. }
+                | Op::SetKeyStrict { .. }
+                | Op::JumpIfFalse { .. }
+                | Op::RequireObjectCoercible { .. } => true,
                 // (A step writes its value, `done` and cursor registers.)
                 Op::IterNext {
                     dst, done, iter, ..
@@ -9879,15 +9897,32 @@ fn plan_views(
                     writers.push(r.head + i);
                 }
                 Op::GetProp { dst, obj, .. } if *dst == v && *obj != v => writers.push(r.head + i),
+                Op::Move { dst, src } if *dst == v && *src != v && (*src as usize) < n_regs => {
+                    writers.push(r.head + i);
+                }
                 _ => ok = false,
             }
         }
         if !ok {
             continue;
         }
-        let src = match writers.first() {
-            None => ViewSrc::Fixed,
-            Some(&first) => {
+        // Copies of one register the region never writes.
+        let copied = |pc: usize| match bytecode[pc] {
+            Op::Move { src, .. } => Some(src),
+            _ => None,
+        };
+        let alias = writers.first().and_then(|&w| copied(w)).filter(|&s| {
+            writers.iter().all(|&w| copied(w) == Some(s))
+                && !body.iter().any(|op| {
+                    let mut hit = false;
+                    for_each_write(op, &mut |d| hit |= d == s);
+                    hit
+                })
+        });
+        let src = match (writers.first(), alias) {
+            (None, _) => ViewSrc::Fixed,
+            (Some(_), Some(s)) => ViewSrc::Alias(s),
+            (Some(&first), None) => {
                 // One global binding the region never writes: its value
                 // throughout the fast version (no Rust code runs there).
                 let name = |pc: usize| match &bytecode[pc] {
@@ -10727,6 +10762,7 @@ mod tests {
                 proto: callee,
                 warm: Vec::new(),
                 nested: Vec::new(),
+                demote: Vec::new(),
             }]
         })
         .expect("inlined");
@@ -10782,6 +10818,7 @@ mod tests {
                 proto: callee,
                 warm: Vec::new(),
                 nested: Vec::new(),
+                demote: Vec::new(),
             }]
         })
         .expect("inlined");

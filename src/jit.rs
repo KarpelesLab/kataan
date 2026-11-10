@@ -4298,6 +4298,11 @@ impl JitProto {
         let derived_keys = expanded
             .as_ref()
             .map_or_else(Vec::new, |e| e.derived.clone());
+        // The inlined callees' own demotion sites, as spliced
+        // (`inline::Candidate::demote`).
+        let callee_demote: Vec<(usize, u16)> = expanded
+            .as_ref()
+            .map_or_else(Vec::new, |e| e.demote.clone());
         let (proto, warm, pc_map) = match expanded {
             Some(e) => {
                 let mut p = proto.clone();
@@ -4334,6 +4339,36 @@ impl JitProto {
             }
             as_gets = p;
             &as_gets
+        } else {
+            proto
+        };
+        // A computed key's `ToPropertyKey` (`a[i] -= x`, `h[k]++`) whose
+        // source is proven a primitive (a Number or a boolean) is a copy:
+        // the interpreter's op leaves a primitive as it is. As a `Move`, every
+        // analysis and the promoted loop regions see through it.
+        let keys_as_moves;
+        let proto = if proto
+            .ops
+            .iter()
+            .any(|o| matches!(o, crate::nbvm::Op::ToKey { .. }))
+        {
+            let types = numeric::infer(&proto.ops, proto.n_regs);
+            let mut p = proto.clone();
+            let mut any = false;
+            for (pc, op) in p.ops.iter_mut().enumerate() {
+                if let crate::nbvm::Op::ToKey { dst, src } = *op
+                    && matches!(types.get(pc, src), numeric::T_NUM | numeric::T_BOOL)
+                {
+                    *op = crate::nbvm::Op::Move { dst, src };
+                    any = true;
+                }
+            }
+            if any {
+                keys_as_moves = p;
+                &keys_as_moves
+            } else {
+                proto
+            }
         } else {
             proto
         };
@@ -4556,9 +4591,19 @@ impl JitProto {
         let demote_body: Vec<(usize, u16)> = demote
             .iter()
             .filter_map(|&(pc, r)| match &pc_map {
+                // (One inside an inlined callee: by its pc in the earlier
+                // body's splice, kept when this one has an inlined op there
+                // that names the register.)
+                Some(m) if pc & tierup::INLINED_SITE != 0 => {
+                    let p = pc & !tierup::INLINED_SITE;
+                    (m.1.get(p) == Some(&u32::MAX) && tierup::op_names(bytecode.get(p), r))
+                        .then_some((p, r))
+                }
+                _ if pc & tierup::INLINED_SITE != 0 => None,
                 Some(m) => m.0.get(pc).map(|&p| (p as usize, r)),
                 None => Some((pc, r)),
             })
+            .chain(callee_demote)
             .collect();
         tier_up.int_demote = demote.to_vec();
         // The `for-in` loops' sites (`forin`), owned with the code.

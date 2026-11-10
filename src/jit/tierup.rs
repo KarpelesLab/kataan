@@ -83,6 +83,24 @@ pub(super) struct TierUp {
     pub(super) entry_asked: core::cell::Cell<bool>,
 }
 
+/// The flag of a demotion site ([`JitProto::int_demote`]) inside an inlined
+/// callee: the rest is its pc in the inlining body's numbering, not the
+/// function's own. A recompilation that inlines the same callees numbers
+/// them the same way; one that does not finds another op there, or one that
+/// does not name the register, and ignores the site. (Demoting a register
+/// only makes an integer version keep that value as a double: whatever it
+/// is applied to, the code stays exact.)
+pub(super) const INLINED_SITE: usize = !(usize::MAX >> 1);
+
+/// Whether `op` names register `r`.
+pub(super) fn op_names(op: Option<&crate::nbvm::Op>, r: u16) -> bool {
+    let hit = core::cell::Cell::new(false);
+    if let Some(op) = op {
+        crate::bytecode::op_for_each_reg(op, &|x| hit.set(hit.get() || x == r));
+    }
+    hit.get()
+}
+
 /// The hits a compiled-in layout counts as when it seeds a recompilation
 /// (enough to be compiled in again).
 const BAKED_HITS: u32 = 1 << 16;
@@ -277,9 +295,30 @@ impl JitProto {
                 if own != usize::MAX && named && !out.contains(&(own, r)) {
                     out.push((own, r));
                 }
+                // A site inside an inlined callee's loop (`CG` calling an
+                // inlined `A.mul`): kept by its pc in this body's numbering,
+                // which a recompilation applies only where its own splice
+                // has an inlined op there naming the register (see
+                // [`INLINED_SITE`]).
+                if own == usize::MAX
+                    && op_names(ops.get(pc), r)
+                    && !out.contains(&(pc | INLINED_SITE, r))
+                {
+                    out.push((pc | INLINED_SITE, r));
+                }
             }
         }
         out
+    }
+
+    /// [`Self::int_demote`]'s sites at the function's own pcs (what a caller
+    /// that inlines the function applies to its spliced copy,
+    /// `inline::Candidate::demote`).
+    #[must_use]
+    pub fn own_int_demote(&self) -> Vec<(usize, u16)> {
+        let mut v = self.int_demote();
+        v.retain(|&(pc, _)| pc & INLINED_SITE == 0);
+        v
     }
 
     /// Whether one of this body's integer versions found a value no int32
@@ -333,6 +372,18 @@ impl JitProto {
             .any(|(h, _, ri, _)| *h == header && s.persist.demotes(*ri) != 0)
         {
             return true;
+        }
+        // Or such a loop of an inlined callee's inside it (which never polls
+        // at a header of the function's own).
+        if let Ok(i) = t.extents.binary_search_by_key(&header, |l| l.0) {
+            let (head, end) = t.extents[i];
+            if t.int_regions.iter().any(|(h, _, ri, _)| {
+                (head..=end).contains(h)
+                    && self.orig_pc(*h) == usize::MAX
+                    && s.persist.demotes(*ri) != 0
+            }) {
+                return true;
+            }
         }
         // A speculative loop whose fast version keeps leaving.
         if t.spec_regions

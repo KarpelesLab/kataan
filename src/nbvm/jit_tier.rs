@@ -4703,9 +4703,9 @@ fn inline_candidate_key(
     if !crate::jit::inline::callee_ok(proto) && !crate::jit::inline::construct_ok(proto) {
         return None;
     }
-    let mut warm = match proto.tier.jit() {
-        Some(Some(j)) if j.is_generic() => j.runtime_warm(),
-        _ => alloc::vec::Vec::new(),
+    let (mut warm, demote) = match proto.tier.jit() {
+        Some(Some(j)) if j.is_generic() => (j.runtime_warm(), j.own_int_demote()),
+        _ => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
     };
     let interp = super::tier_warm(proto);
     if warm.len() < interp.len() {
@@ -4721,6 +4721,7 @@ fn inline_candidate_key(
         proto,
         warm,
         nested: alloc::vec::Vec::new(),
+        demote,
     })
 }
 

@@ -117,6 +117,11 @@ pub struct Candidate<'a> {
     /// callee's own `super(…)` sites, see `super_nested`), whose `nested`
     /// are ignored.
     pub nested: Vec<(usize, Candidate<'a>)>,
+    /// The callee's own integer-version demotion sites (`(own pc,
+    /// register)`, `JitProto::int_demote` of its compiled body): values its
+    /// loops found no int32, which the spliced copies of those loops keep
+    /// as doubles from the start ([`Expanded::demote`]).
+    pub demote: Vec<(usize, Reg)>,
 }
 
 /// A site's callee as spliced: its function, or (when it inlines calls of
@@ -129,6 +134,8 @@ struct Site<'a> {
     /// The keys of the derived class constructors among it and the calls
     /// spliced into it ([`Expanded::derived`]).
     derived: Vec<u64>,
+    /// Its demotion sites ([`Candidate::demote`]), by this body's pc.
+    demote: Vec<(usize, Reg)>,
 }
 
 /// A way a site could inline ([`expand`]), before the caller's budget
@@ -177,6 +184,7 @@ fn super_nested<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
                     proto: m.proto,
                     warm: m.warm.clone(),
                     nested: Vec::new(),
+                    demote: m.demote.clone(),
                 },
             )
         })
@@ -199,6 +207,7 @@ fn third_level<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
                     proto: m.proto,
                     warm: m.warm.clone(),
                     nested: Vec::new(),
+                    demote: m.demote.clone(),
                 },
             )
         })
@@ -212,6 +221,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
         proto,
         warm,
         nested,
+        demote,
     } = c;
     let inner = (!nested.is_empty())
         .then(|| {
@@ -228,6 +238,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                         } else {
                             third_level(n)
                         },
+                        demote: n.demote.clone(),
                     })
                     .collect()
             })
@@ -241,11 +252,19 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             p.n_regs = e.n_regs;
             let mut derived = e.derived;
             derived.extend(own);
+            // (Its own sites by the spliced body's pc, and its inlined
+            // calls' as that splice placed them.)
+            let mut sites: Vec<(usize, Reg)> = demote
+                .iter()
+                .filter_map(|&(pc, r)| Some((*e.new_of.get(pc)? as usize, r)))
+                .collect();
+            sites.extend(e.demote);
             Site {
                 key,
                 proto: alloc::borrow::Cow::Owned(p),
                 warm: e.warm,
                 derived,
+                demote: sites,
             }
         }
         None => Site {
@@ -253,6 +272,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             proto: alloc::borrow::Cow::Borrowed(proto),
             warm,
             derived: own.into_iter().collect(),
+            demote,
         },
     }
 }
@@ -274,6 +294,9 @@ pub struct Expanded {
     /// any depth, whose function is a derived class constructor (whose
     /// construct leaves `this` unbound: `call_seq::ConstructFast::derived`).
     pub derived: Vec<u64>,
+    /// The inlined callees' demotion sites ([`Candidate::demote`]) as
+    /// spliced: `(new pc, register)`.
+    pub demote: Vec<(usize, Reg)>,
 }
 
 /// Whether `proto` can be inlined: small, a plain call target, and every op
@@ -1053,6 +1076,7 @@ pub fn expand<'a>(
     let mut nwarm: Vec<Option<WarmEntry>> = Vec::with_capacity(proto.ops.len() + added);
     let mut orig_of: Vec<u32> = Vec::with_capacity(proto.ops.len() + added + 1);
     let mut new_of: Vec<u32> = Vec::with_capacity(proto.ops.len() + 1);
+    let mut demote: Vec<(usize, Reg)> = Vec::new();
     // First pass: each own pc's new pc (an inlined site's own pc is its
     // guard's, so a branch to the call enters the guard).
     let mut next = 0usize;
@@ -1275,6 +1299,12 @@ pub fn expand<'a>(
                 // The body: callee pc `j` at `body + body_pc(p, j)`.
                 let body = ops.len();
                 let tgt = |t: usize| body + body_pc(p, t, construct);
+                // (The callee's demotion sites, where its ops land.)
+                for &(q, r) in &c.demote {
+                    if q < p.ops.len() && width(p, q, construct) > 0 && (r as usize) < p.n_regs {
+                        demote.push((tgt(q), view(r)));
+                    }
+                }
                 for (j, bop) in p.ops.iter().enumerate() {
                     let bw = c.warm.get(j).cloned().flatten();
                     match width(p, j, construct) {
@@ -1402,6 +1432,7 @@ pub fn expand<'a>(
         orig_of,
         new_of,
         derived,
+        demote,
     })
 }
 
