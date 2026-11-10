@@ -372,7 +372,7 @@ impl Interp {
 
     /// The string value of a token [`json_fast_string`](Self::json_fast_string)
     /// scanned.
-    #[inline]
+    #[inline(always)]
     fn json_str_value(&mut self, p: &mut JsonParser<'_>, tok: JsonStr) -> NanBox {
         match tok {
             // A one-byte (ASCII) string is the realm's shared unit
@@ -769,6 +769,7 @@ impl Interp {
 
     /// The JSON `Number` production, exactly:
     /// `-`? ( `0` | [1-9][0-9]* ) ( `.` [0-9]+ )? ( [eE] [+-]? [0-9]+ )?
+    #[inline(always)]
     fn json_fast_number(&mut self, p: &mut JsonParser<'_>) -> Result<NanBox, ExecError> {
         let src = p.src;
         let start = p.pos;
