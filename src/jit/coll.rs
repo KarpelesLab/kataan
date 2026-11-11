@@ -392,18 +392,8 @@ impl X64Assembler {
         let [stamp, ptr, method, is_set, tries] = MethodSite::coll_offsets();
         let stale = self.new_label();
         self.p_arena(realm_off, &l.props);
-        self.g_movabs(r::R11, site as u64);
-        // The proof, at the current epoch, with the built-in still in the
-        // prototype's slot.
-        self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
-        self.g_load(r::R9, r::R9, 0);
-        self.g_cmp_mem(r::R9, r::R11, stamp);
-        self.g_jcc(cc::NE, stale);
-        self.g_load(r::R9, r::R11, ptr);
-        self.g_load(r::R9, r::R9, 0);
-        self.g_cmp_mem(r::R9, r::R11, method);
-        self.g_jcc(cc::NE, slow);
-        // The receiver: a strong collection of the proof's kind with the
+        // The receiver first (an indexed or larger collection, whose writes
+        // are never inline, costs no more): a strong collection with the
         // default `[[Prototype]]`, no index, few entries.
         let rbase = self.frame_base(recv);
         self.g_load(r::RAX, rbase, recv);
@@ -411,13 +401,6 @@ impl X64Assembler {
         self.p_slot_rooted(l, r::RCX, slow);
         self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, c.disc);
         self.g_jcc(cc::NE, slow);
-        self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
-        self.g_jcc(cc::NE, slow);
-        self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
-        self.g_jcc(cc::NE, slow);
-        self.g_mem(false, &[0x0f, 0xb6], r::R9, r::RCX, c.is_set);
-        self.g_cmp_mem(r::R9, r::R11, is_set);
-        self.g_jcc(cc::NE, stale);
         self.g_mem(true, &[0x83], 7, r::RCX, c.index); // cmp qword [rcx+index], imm8
         self.code.push(0);
         self.g_jcc(cc::NE, slow);
@@ -427,6 +410,24 @@ impl X64Assembler {
             i32::try_from(crate::realm::COLL_SCAN_MAX).expect("small"),
         );
         self.g_jcc(cc::A, slow);
+        self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
+        self.g_jcc(cc::NE, slow);
+        self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
+        self.g_jcc(cc::NE, slow);
+        // The proof, at the current epoch, with the built-in still in the
+        // prototype's slot, for the receiver's kind.
+        self.g_movabs(r::R11, site as u64);
+        self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
+        self.g_load(r::R9, r::R9, 0);
+        self.g_cmp_mem(r::R9, r::R11, stamp);
+        self.g_jcc(cc::NE, stale);
+        self.g_load(r::R9, r::R11, ptr);
+        self.g_load(r::R9, r::R9, 0);
+        self.g_cmp_mem(r::R9, r::R11, method);
+        self.g_jcc(cc::NE, slow);
+        self.g_mem(false, &[0x0f, 0xb6], r::R9, r::RCX, c.is_set);
+        self.g_cmp_mem(r::R9, r::R11, is_set);
+        self.g_jcc(cc::NE, stale);
         self.g_load(r::RSI, r::RCX, c.entries_ptr);
         // r11 = the key's bits (`-0` as `+0`).
         let kbase = self.frame_base(key);
