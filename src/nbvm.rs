@@ -1551,6 +1551,13 @@ pub trait VmHost {
     fn batch_yields_to_gc(&self) -> bool {
         false
     }
+    /// [`collect_garbage`](Self::collect_garbage) from inside a VM resumption
+    /// job the host's collecting event loop ran straight from the loop (see
+    /// `resume_vm_async`): besides `vm_roots`, the only live values are the
+    /// host's own — its job queues included, which are then no reason to
+    /// decline (they are rooted, and the one job half run is the VM's,
+    /// whose state `vm_roots` holds). A host without such a loop declines.
+    fn collect_garbage_in_job(&mut self, _vm_roots: &[Handle]) {}
     /// The next queued promise job's `(handler, value)`, when the running job
     /// belongs to a plain microtask drain whose function table is `table` and
     /// the next one is a plain reaction (no thenable, `finally` or foreign
@@ -1954,6 +1961,7 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: Option<&'a mut dyn VmHost>) -> Ctx
         call_depth: 0,
         gc_enabled: false,
         gc_lock: 0,
+        in_job: false,
         frame_shadow: alloc::vec::Vec::new(),
         frames_published: 0,
         top_frame_roots: Vec::new(),
@@ -2092,7 +2100,7 @@ fn vm_iter_step(
     // A VM generator with the intrinsic `next`: resumed here (`gen_fast`).
     if nx.as_handle().is_some_and(|n| {
         ctx.realm.native_at(Handle::from_raw(n)) == Some(crate::nbexec::N_GEN_NEXT)
-    }) && let Some(r) = gen_fast::for_of_step(ctx, funcs, it)
+    }) && let Some(r) = gen_fast::for_of_step(ctx, funcs, regs, it)
     {
         let step = r?;
         regs[done as usize] = NanBox::boolean(step.is_none());
@@ -3253,6 +3261,9 @@ fn drive_async(
 /// reason at the `await` — the host's `N_ASYNC_RESUME_*` reaction for a VM
 /// frame. `state` is the frame cell itself.
 ///
+/// `gc`: the job is the host's collecting event loop's own, run straight from
+/// that loop, so the resumed body may collect (see [`job_ctx`]).
+///
 /// # Errors
 /// A VM fault (the body's own throw rejects its promise instead).
 pub(crate) fn resume_vm_async(
@@ -3262,9 +3273,10 @@ pub(crate) fn resume_vm_async(
     state: Option<Handle>,
     fulfilled: bool,
     v: NanBox,
+    gc: bool,
 ) -> Result<(), VmError> {
     let entered = enter_frame_realm(host, controller);
-    let mut ctx = hosted_ctx(host.take_realm(), host);
+    let mut ctx = job_ctx(host, gc && !entered);
     let mut result = resume_async_frame(&mut ctx, table, controller, state, fulfilled, v);
     // The jobs queued right behind this one that resume VM frames too run
     // here, in this context, one after the other: the drain would run exactly
@@ -3287,12 +3299,31 @@ pub(crate) fn resume_vm_async(
             None => break,
         };
     }
+    ctx.realm.vm_total_depth -= 1;
     let realm = ctx.realm;
     host.restore_realm(realm);
     if entered {
         host.leave_fn_realm();
     }
     result
+}
+
+/// The context a resumption job of the host runs VM frames in: each resumed
+/// frame is an activation at depth 1, as a run's outermost frame is. With
+/// `gc` (the job is the collecting event loop's own, run straight from it),
+/// the frame's safepoints may collect: the resumption publishes what it holds
+/// outside the frame's registers (its controller, result promise or
+/// generator, and the settled value), and the host's frames below hold
+/// nothing the host's own roots miss (see
+/// [`VmHost::collect_garbage_in_job`]). The caller undoes the depth's
+/// `vm_total_depth` before restoring the realm.
+fn job_ctx(host: &mut dyn VmHost, gc: bool) -> Ctx<'_> {
+    let mut ctx = hosted_ctx(host.take_realm(), host);
+    ctx.call_depth = 1;
+    ctx.realm.vm_total_depth += 1;
+    ctx.gc_enabled = gc;
+    ctx.in_job = gc;
+    ctx
 }
 
 /// The next queued job, when [`VmHost::peek_batch_job`] offers it and it is
@@ -3372,9 +3403,10 @@ fn resume_async_frame(
         let proto = table.get(id).ok_or(VmError::Unsupported)?;
         // While the frame runs, nothing else need reference its controller
         // (the reaction that resumed it has been dequeued) or its result
-        // promise: root both for the body's safepoints.
+        // promise: root both for the body's safepoints, with the settled value
+        // (a rejection is thrown at the `await` from here).
         let mark = ctx.frame_shadow.len();
-        ctx.frame_shadow.extend_from_slice(&[controller, p]);
+        ctx.frame_shadow.extend_from_slice(&[controller, p, v]);
         // The body's inline caches persist across resumptions, as a
         // generator's do (see `gen_fast`).
         let body = proto.ops.as_ptr() as usize;
@@ -3612,7 +3644,12 @@ fn vm_agen_enqueue_at(
         && st.status != GEN_AWAITING_RETURN
         && st.status != GEN_RETURN_AWAIT
     {
-        agen_drain(ctx, funcs, generator, st.state)?;
+        // (The promise stays rooted once its request leaves the queue.)
+        let mark = ctx.frame_shadow.len();
+        ctx.frame_shadow.push(p);
+        let r = agen_drain(ctx, funcs, generator, st.state);
+        ctx.frame_shadow.truncate(mark);
+        r?;
     }
     Ok(p)
 }
@@ -3795,6 +3832,7 @@ fn agen_step(
 fn agen_direct_next(
     ctx: &mut Ctx,
     funcs: &[FnProto],
+    regs: &[NanBox],
     it: NanBox,
     nx: NanBox,
 ) -> Option<Result<NanBox, VmError>> {
@@ -3812,11 +3850,16 @@ fn agen_direct_next(
     if st.id >= funcs.len() {
         return None;
     }
+    // The calling frame is published, as a sync generator's direct resume
+    // publishes it (`gen_fast`): the body may collect. (The request and its
+    // promise are in the generator's queue.)
+    let mark = gen_fast::publish(ctx, regs, it, NanBox::undefined());
     ctx.call_depth += 1;
     ctx.realm.vm_total_depth += 1;
     let r = vm_agen_enqueue_at(ctx, funcs, it, st, 0, NanBox::undefined());
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
+    gen_fast::unpublish(ctx, mark);
     Some(r)
 }
 
@@ -3837,7 +3880,7 @@ fn async_iter_step(
         with_host(ctx, |h| h.async_from_sync_next(it, nx))
             .unwrap_or(Err(HostError::Fault))
             .map_err(VmError::from)?
-    } else if let Some(r) = agen_direct_next(ctx, funcs, it, nx) {
+    } else if let Some(r) = agen_direct_next(ctx, funcs, regs, it, nx) {
         r?
     } else {
         call_closure(ctx, funcs, nx, &[], it)?
@@ -3887,9 +3930,10 @@ pub(crate) fn resume_vm_agen(
     generator: NanBox,
     fulfilled: bool,
     v: NanBox,
+    gc: bool,
 ) -> Result<(), VmError> {
     let entered = enter_frame_realm(host, generator);
-    let mut ctx = hosted_ctx(host.take_realm(), host);
+    let mut ctx = job_ctx(host, gc && !entered);
     let mut result = resume_agen_frame(&mut ctx, table, generator, None, fulfilled, v);
     // As `resume_vm_async`: the resumption jobs right behind run here.
     while !entered && matches!(result, Ok(()) | Err(VmError::Thrown(_))) {
@@ -3909,6 +3953,7 @@ pub(crate) fn resume_vm_agen(
             None => break,
         };
     }
+    ctx.realm.vm_total_depth -= 1;
     let realm = ctx.realm;
     host.restore_realm(realm);
     if entered {
@@ -3921,6 +3966,25 @@ pub(crate) fn resume_vm_agen(
 /// ([`resume_vm_agen`]'s), in the context `ctx`; `sh` its frame cell, if
 /// the caller has it.
 fn resume_agen_frame(
+    ctx: &mut Ctx,
+    table: &alloc::rc::Rc<[FnProto]>,
+    generator: NanBox,
+    sh: Option<Handle>,
+    fulfilled: bool,
+    v: NanBox,
+) -> Result<(), VmError> {
+    // The generator (whose frame cell and request queue hold the rest of the
+    // resumption's state) and the settled value, rooted for the body's
+    // safepoints: the reaction that resumed it has been dequeued.
+    let mark = ctx.frame_shadow.len();
+    ctx.frame_shadow.extend_from_slice(&[generator, v]);
+    let r = resume_agen_frame_inner(ctx, table, generator, sh, fulfilled, v);
+    ctx.frame_shadow.truncate(mark);
+    r
+}
+
+/// [`resume_agen_frame`] once its inputs are rooted.
+fn resume_agen_frame_inner(
     ctx: &mut Ctx,
     table: &alloc::rc::Rc<[FnProto]>,
     generator: NanBox,
@@ -4952,6 +5016,10 @@ struct Ctx<'a> {
     /// drain, which pops a job into a local before invoking its handler).
     /// [`vm_safepoint`] refuses to collect while it is set.
     gc_lock: usize,
+    /// Whether this context runs a resumption job straight from the host's
+    /// collecting event loop (see [`resume_vm_async`]): its collections go
+    /// through [`VmHost::collect_garbage_in_job`].
+    in_job: bool,
     /// Registers and activation inputs of every *suspended ancestor* frame whose
     /// descent into the current one is fully published.
     ///
@@ -5233,6 +5301,7 @@ pub fn run_program(
             call_depth: 0,
             gc_enabled: true,
             gc_lock: 0,
+            in_job: false,
             frame_shadow: alloc::vec::Vec::new(),
             frames_published: 0,
             top_frame_roots: Vec::new(),
@@ -5286,6 +5355,7 @@ pub fn run_program_capturing(
             call_depth: 0,
             gc_enabled: true,
             gc_lock: 0,
+            in_job: false,
             frame_shadow: alloc::vec::Vec::new(),
             frames_published: 0,
             top_frame_roots: Vec::new(),
@@ -6049,6 +6119,7 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             // this entry point cannot enumerate, so it never collects.
             gc_enabled: false,
             gc_lock: 0,
+            in_job: false,
             frame_shadow: alloc::vec::Vec::new(),
             frames_published: 0,
             top_frame_roots: Vec::new(),
@@ -8339,7 +8410,11 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
         // owing closures that died unobserved: no materialization first.)
         if let Some(host) = ctx.host.as_deref_mut() {
             core::mem::swap(&mut ctx.realm, host.realm_slot());
-            host.collect_garbage(&roots);
+            if ctx.in_job {
+                host.collect_garbage_in_job(&roots);
+            } else {
+                host.collect_garbage(&roots);
+            }
             core::mem::swap(&mut ctx.realm, host.realm_slot());
         }
         return;
@@ -8747,15 +8822,23 @@ fn run_frame_at_ic(
                     };
                     iter_fast::drain_plain_prefix(ctx, regs, *done, *iter, into, &mut out);
                 }
-                while regs[*done as usize].as_boolean() != Some(true) {
-                    match vm_iter_step(ctx, funcs, regs, *done, *iter, *next) {
-                        Ok(Some(v)) => out.push(v),
-                        Ok(None) => {}
-                        Err(e) => {
-                            failed = Some(e);
-                            break;
+                // The values gathered so far live in `Ctx::frame_shadow` while
+                // steps run, rooted for a collection inside one (a resumed
+                // generator's body).
+                if regs[*done as usize].as_boolean() != Some(true) {
+                    let base = ctx.frame_shadow.len();
+                    ctx.frame_shadow.append(&mut out);
+                    while regs[*done as usize].as_boolean() != Some(true) {
+                        match vm_iter_step(ctx, funcs, regs, *done, *iter, *next) {
+                            Ok(Some(v)) => ctx.frame_shadow.push(v),
+                            Ok(None) => {}
+                            Err(e) => {
+                                failed = Some(e);
+                                break;
+                            }
                         }
                     }
+                    out = ctx.frame_shadow.split_off(base);
                 }
                 match failed {
                     None => regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(out).to_raw()),
@@ -29053,6 +29136,7 @@ mod generic_jit_tests {
             call_depth: 0,
             gc_enabled: false,
             gc_lock: 0,
+            in_job: false,
             frame_shadow: alloc::vec::Vec::new(),
             frames_published: 0,
             top_frame_roots: Vec::new(),

@@ -632,7 +632,8 @@ pub(super) fn try_call(
         let arg = args
             .first()
             .map_or(NanBox::undefined(), |r| regs[*r as usize]);
-        if let Some(r) = super::gen_fast::site_call(ctx, funcs, recv, key, mode, method, arg) {
+        if let Some(r) = super::gen_fast::site_call(ctx, funcs, regs, recv, key, mode, method, arg)
+        {
             return Some(r);
         }
     }
@@ -1182,7 +1183,7 @@ fn run_op(
             .map_or(NanBox::undefined(), |r| regs[*r as usize])
     };
     if let FastOp::GenResume(mode) = op {
-        return super::gen_fast::call(ctx, funcs, recv, mode, arg(0));
+        return super::gen_fast::call(ctx, funcs, regs, recv, mode, arg(0));
     }
     // `Object.prototype.hasOwnProperty.call(o, k)` (the `for-in` idiom):
     // `hasOwnProperty`'s own fast op, with `o` its receiver — what the call

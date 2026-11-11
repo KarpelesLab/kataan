@@ -397,11 +397,13 @@ pub(super) fn jit_for_of_step(
     {
         return None;
     }
+    let mark = publish(ctx, regs, regs[iter as usize], NanBox::undefined());
     ctx.call_depth += 1;
     ctx.realm.vm_total_depth += 1;
     let r = hot_next(ctx, funcs, fh, id, state, pc, dst, NanBox::undefined());
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
+    unpublish(ctx, mark);
     let out = match r? {
         Ok(o) => o,
         Err(e) => {
@@ -510,9 +512,16 @@ pub(super) fn result_object(ctx: &mut Ctx, out: GenOut) -> NanBox {
 
 /// Runs `f` — a resume in the caller's own context — as a nested activation:
 /// counted against the recursion limits (a catchable `RangeError` past
-/// them), and with the caller's registers unpublished, so no collection runs
-/// inside it (as none does on the host's path, whose context forbids it).
-fn nested<T>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx) -> Result<T, VmError>) -> Result<T, VmError> {
+/// them), and with the calling frame published for a collection inside the
+/// resumed body (see [`publish`]). (The host's path never collects: its
+/// context forbids it.)
+fn nested<T>(
+    ctx: &mut Ctx,
+    regs: &[NanBox],
+    g: NanBox,
+    v: NanBox,
+    f: impl FnOnce(&mut Ctx) -> Result<T, VmError>,
+) -> Result<T, VmError> {
     if ctx.call_depth >= ctx.realm.limits.max_call_depth
         || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
         || crate::stack::exhausted()
@@ -520,12 +529,44 @@ fn nested<T>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx) -> Result<T, VmError>) -> R
         let e = vm_error(ctx, "RangeError", STACK_EXHAUSTED);
         return Err(VmError::Thrown(e));
     }
+    let mark = publish(ctx, regs, g, v);
     ctx.call_depth += 1;
     ctx.realm.vm_total_depth += 1;
     let r = f(ctx);
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
+    unpublish(ctx, mark);
     r
+}
+
+/// Publishes the frame that resumes the generator `g` — its registers
+/// `regs`, the generator and the sent value `v` — as an audited call does
+/// (`Ctx::frame_shadow`), so the safepoints of the resumed body may collect:
+/// that body runs on a register file moved out of the generator's frame
+/// cell, which is then this activation's own (rooted by the safepoint that
+/// runs on it), and nothing else of the resume lives in a Rust local the
+/// collector cannot see. A window on the JIT register stack is rooted
+/// already. Returns the mark [`unpublish`] restores.
+#[inline]
+pub(super) fn publish(ctx: &mut Ctx, regs: &[NanBox], g: NanBox, v: NanBox) -> usize {
+    let mark = ctx.frame_shadow.len();
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let rooted = super::jit_tier::on_register_stack(ctx, regs);
+    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    let rooted = false;
+    if !rooted {
+        ctx.frame_shadow.extend_from_slice(regs);
+    }
+    ctx.frame_shadow.extend_from_slice(&[g, v]);
+    ctx.frames_published += 1;
+    mark
+}
+
+/// Undoes [`publish`].
+#[inline]
+pub(super) fn unpublish(ctx: &mut Ctx, mark: usize) {
+    ctx.frames_published -= 1;
+    ctx.frame_shadow.truncate(mark);
 }
 
 /// The frame cell of the generator object `g` when the direct path may
@@ -570,9 +611,11 @@ struct SiteEntry {
 /// generator object owning nothing but its state slot, so `g[key]` is the
 /// `[[Get]]` of `key` from its prototype, which [`SiteMemo`] answers. The
 /// iterator result, or `None` (nothing done) for the site's general path.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn site_call(
     ctx: &mut Ctx,
     funcs: &[FnProto],
+    regs: &[NanBox],
     recv: NanBox,
     key: &str,
     mode: u8,
@@ -617,7 +660,12 @@ pub(super) fn site_call(
     if ctx.realm.vm_frame(fh)?.func as usize >= funcs.len() {
         return None;
     }
-    Some(nested(ctx, |ctx| resume_state(ctx, funcs, fh, mode, v)).map(|o| result_object(ctx, o)))
+    Some(
+        nested(ctx, regs, recv, v, |ctx| {
+            resume_state(ctx, funcs, fh, mode, v)
+        })
+        .map(|o| result_object(ctx, o)),
+    )
 }
 
 /// `g.next(v)` / `g.throw(v)` / `g.return(v)` (`mode` 0 / 1 / 2) for a call
@@ -626,12 +674,16 @@ pub(super) fn site_call(
 pub(super) fn call(
     ctx: &mut Ctx,
     funcs: &[FnProto],
+    regs: &[NanBox],
     g: NanBox,
     mode: u8,
     v: NanBox,
 ) -> Option<Result<NanBox, VmError>> {
     let sh = direct_target(ctx, funcs, g)?;
-    Some(nested(ctx, |ctx| resume_state(ctx, funcs, sh, mode, v)).map(|o| result_object(ctx, o)))
+    Some(
+        nested(ctx, regs, g, v, |ctx| resume_state(ctx, funcs, sh, mode, v))
+            .map(|o| result_object(ctx, o)),
+    )
 }
 
 /// A `for-of` step over the generator `it` whose `next` is the intrinsic
@@ -642,12 +694,12 @@ pub(super) fn call(
 pub(super) fn for_of_step(
     ctx: &mut Ctx,
     funcs: &[FnProto],
+    regs: &[NanBox],
     it: NanBox,
 ) -> Option<Result<Option<NanBox>, VmError>> {
     let sh = direct_target(ctx, funcs, it)?;
-    let out = match nested(ctx, |ctx| {
-        resume_state(ctx, funcs, sh, 0, NanBox::undefined())
-    }) {
+    let u = NanBox::undefined();
+    let out = match nested(ctx, regs, it, u, |ctx| resume_state(ctx, funcs, sh, 0, u)) {
         Ok(o) => o,
         Err(e) => return Some(Err(e)),
     };

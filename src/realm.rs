@@ -8387,6 +8387,13 @@ impl Realm {
         self.heap.len()
     }
 
+    /// The heap's slot count, live or free: the most objects that were ever
+    /// live at once (a freed slot is reused, not released).
+    #[must_use]
+    pub fn heap_high_water(&self) -> usize {
+        self.heap.slot_capacity()
+    }
+
     /// Whether `handle` still refers to a live object.
     #[must_use]
     pub fn is_live(&self, handle: Handle) -> bool {

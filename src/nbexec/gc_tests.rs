@@ -436,3 +436,114 @@ fn an_async_function_result_promise_survives_collections_in_its_body() {
     let v = interp.run(&check).expect("exec");
     assert_eq!(interp.realm().to_display_string(v), "disposed,done");
 }
+
+// --- collection inside resumed generator and async bodies ---
+
+/// Runs `src` and returns `(rendered value, the heap's high-water mark)`:
+/// with no collection inside a loop's body, the mark passes what that loop
+/// allocated.
+fn run_with_high_water(src: &str) -> (String, usize) {
+    let program = Parser::parse_program(src).expect("parse");
+    let mut interp = Interp::new();
+    let value = interp.run(&program).expect("exec");
+    let text = interp.realm().to_display_string(value);
+    (text, interp.realm().heap_high_water())
+}
+
+/// A generator body that allocates 400k objects between two yields.
+const GEN_CHURN: &str = "function* gchurn(held) {
+       yield held.v;
+       for (var i = 0; i < 400000; i++) { var t = { k: i }; }
+       yield held.v + '/' + t.k;
+     }";
+
+#[test]
+fn churn_inside_a_resumed_generator_body_is_reclaimed() {
+    // Resumed by `next()`, by a `for-of` step (inside a function and at the
+    // top level) and by a spread: the resumption publishes its caller, so the
+    // body's own back-edges collect.
+    let (v, peak) = run_with_high_water(&format!(
+        "{GEN_CHURN}
+         function viaNext() {{ var it = gchurn({{ v: 'a' }}); it.next(); return it.next().value; }}
+         function viaForOf() {{ var out = []; for (var x of gchurn({{ v: 'b' }})) out.push(x); return out.join(); }}
+         var top = [];
+         for (var y of gchurn({{ v: 'c' }})) top.push(y);
+         viaNext() + ' ' + viaForOf() + ' ' + top.join() + ' ' + [...gchurn({{ v: 'd' }})].join()"
+    ));
+    assert_eq!(v, "a/399999 b,b/399999 c,c/399999 d,d/399999");
+    assert!(
+        verifying() || peak < 200_000,
+        "no collection ran inside a resumed generator body: {peak} objects at once"
+    );
+}
+
+#[test]
+fn resuming_frames_keep_their_registers_across_a_collection_in_the_body() {
+    // `held` lives only in the caller's registers, `own` only in the
+    // generator's (moved out of its frame cell for the run), and the spread's
+    // gathered values only in the spread, while the body collects.
+    assert_eq!(
+        run("function* g(tag) {
+               var own = { tag: tag, list: [] };
+               for (var r = 0; r < 3; r++) {
+                 for (var i = 0; i < 200000; i++) { var t = { k: i }; }
+                 own.list.push({ r: r });
+                 yield own.tag + own.list.length;
+               }
+             }
+             function drive() {
+               var held = { deep: { v: 'reg' } };
+               var out = [];
+               var it = g('n');
+               for (var s = it.next(); !s.done; s = it.next()) out.push(s.value);
+               for (var x of g('f')) out.push(x);
+               return held.deep.v + ':' + out.join() + ':' + [...g('s')].join();
+             }
+             drive()"),
+        "reg:n1,n2,n3,f1,f2,f3:s1,s2,s3"
+    );
+}
+
+#[test]
+fn churn_inside_resumed_async_bodies_is_reclaimed() {
+    // An async function and an async generator allocating between
+    // suspensions: their resumptions run as the collecting event loop's own
+    // jobs, which may collect inside the body (the `for await` step resumes
+    // the generator directly, publishing its caller).
+    let program = Parser::parse_program(
+        "var log = [];
+         async function f(held) {
+           await null;
+           for (var i = 0; i < 400000; i++) { var t = { k: i }; }
+           await null;
+           return held.v + t.k;
+         }
+         async function* ag(held) {
+           await null;
+           for (var i = 0; i < 400000; i++) { var t = { k: i }; }
+           yield held.v + t.k;
+           for (var j = 0; j < 400000; j++) { var u = { k: j }; }
+           yield held.v + u.k;
+         }
+         async function main() {
+           log.push(await f({ v: 'f' }));
+           for await (var x of ag({ v: 'g' })) log.push(x);
+         }
+         main();
+         'scheduled'",
+    )
+    .expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    let peak = interp.realm().heap_high_water();
+    let check = Parser::parse_program("log.join()").expect("parse");
+    let v = interp.run(&check).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(v),
+        "f399999,g399999,g399999"
+    );
+    assert!(
+        verifying() || peak < 200_000,
+        "no collection ran inside resumed async bodies: {peak} objects at once"
+    );
+}

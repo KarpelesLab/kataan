@@ -382,6 +382,16 @@ pub struct Interp {
     /// `async_batch`) then ends once a collection is due, so the loop can
     /// make it between two jobs.
     async_batch_gc: bool,
+    /// Set by the collecting event loop for the job it runs next, and taken
+    /// by that job first thing (so no job run from inside it sees it): a VM
+    /// resumption job then runs with collection enabled inside the resumed
+    /// body (see `nbvm::resume_vm_async`), its host frames holding nothing
+    /// [`gc_roots`](Self::gc_roots) misses.
+    job_gc: bool,
+    /// The values the collecting event loop keeps alive (the script's
+    /// completion value) while it runs, rooted by [`gc_roots`](Self::gc_roots)
+    /// for a collection inside one of its jobs.
+    loop_keep: Vec<NanBox>,
     /// The inline cache of `PromiseResolve`'s read of `%Promise.prototype%`'s
     /// `constructor` (see `Realm::plain_promise_constructor`).
     promise_ctor_ic: crate::ic::PropertyCache,
@@ -3111,6 +3121,8 @@ impl Interp {
             microtasks: alloc::collections::VecDeque::new(),
             async_batch: false,
             async_batch_gc: false,
+            job_gc: false,
+            loop_keep: Vec::new(),
             promise_ctor_ic: crate::ic::PropertyCache::default(),
             promise_then_ic: crate::ic::PropertyCache::default(),
             promise_intrinsics: None,
@@ -9868,6 +9880,10 @@ impl crate::nbvm::VmHost for Interp {
 
     fn collect_garbage(&mut self, vm_roots: &[Handle]) {
         self.collect_with_roots(vm_roots);
+    }
+
+    fn collect_garbage_in_job(&mut self, vm_roots: &[Handle]) {
+        self.collect_with_roots_in_job(vm_roots);
     }
 
     fn get_iterator(&mut self, v: NanBox) -> Result<(NanBox, NanBox), crate::nbvm::HostError> {

@@ -1557,7 +1557,7 @@ impl Interp {
                 N_ASYNC_RESUME_FULFILL | N_ASYNC_RESUME_REJECT
                     if self.async_frame_of(target).is_some() =>
                 {
-                    self.run_async_resume(id, target, arg0)?;
+                    self.run_async_resume(id, target, arg0, false)?;
                 }
                 // `AsyncFromSyncIteratorContinuation` reactions on the settled
                 // `valueWrapper`: `target` is the `[done, syncIterator]` state.

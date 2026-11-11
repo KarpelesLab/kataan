@@ -851,11 +851,17 @@ impl Interp {
                 Some(keep) => {
                     let outer = core::mem::replace(&mut self.async_batch, true);
                     let outer_gc = core::mem::replace(&mut self.async_batch_gc, true);
+                    // A VM resumption job run from here may collect inside its
+                    // body (`job_gc`), with `keep` rooted (`loop_keep`).
+                    let outer_keep = core::mem::replace(&mut self.loop_keep, keep.to_vec());
                     let mut r = Ok(());
                     while r.is_ok() && !self.microtasks.is_empty() {
                         self.event_loop_safepoint(keep);
+                        self.job_gc = true;
                         r = self.run_one_microtask();
+                        self.job_gc = false;
                     }
+                    self.loop_keep = outer_keep;
                     self.async_batch = outer;
                     self.async_batch_gc = outer_gc;
                     r?;
@@ -904,12 +910,15 @@ impl Interp {
     /// Await's resume reaction `id` (`N_ASYNC_RESUME_FULFILL` /
     /// `N_ASYNC_RESUME_REJECT`, bound to `target`) called with the settled
     /// `value`: resumes the suspended VM frame `target` holds. `false`, having
-    /// done nothing, when it holds none.
+    /// done nothing, when it holds none. `gc`: the job is the collecting
+    /// event loop's own, run straight from it (see `Interp::job_gc`), so the
+    /// resumed body may collect.
     pub(crate) fn run_async_resume(
         &mut self,
         id: u16,
         target: Handle,
         value: NanBox,
+        gc: bool,
     ) -> Result<bool, ExecError> {
         let Some(frame) = self.async_frame_of(target) else {
             return Ok(false);
@@ -920,8 +929,8 @@ impl Interp {
         let fulfilled = id == N_ASYNC_RESUME_FULFILL;
         let t = NanBox::handle(target.to_raw());
         match frame {
-            Ok(state) => crate::nbvm::resume_vm_async(self, &table, t, state, fulfilled, value),
-            Err(()) => crate::nbvm::resume_vm_agen(self, &table, t, fulfilled, value),
+            Ok(state) => crate::nbvm::resume_vm_async(self, &table, t, state, fulfilled, value, gc),
+            Err(()) => crate::nbvm::resume_vm_agen(self, &table, t, fulfilled, value, gc),
         }
         .map_err(super::vm_to_exec)?;
         Ok(true)
@@ -929,6 +938,8 @@ impl Interp {
 
     /// Runs the next queued promise reaction.
     pub(crate) fn run_one_microtask(&mut self) -> Result<(), ExecError> {
+        // (Taken first: a job run from inside this one is never the loop's.)
+        let gc = core::mem::take(&mut self.job_gc);
         let Some(job) = self.microtasks.pop_front() else {
             return Ok(());
         };
@@ -943,7 +954,7 @@ impl Interp {
             && let Some((id, target)) = self.realm.bound_native_at(h)
             && matches!(id, N_ASYNC_RESUME_FULFILL | N_ASYNC_RESUME_REJECT)
         {
-            match self.run_async_resume(id, target, job.value) {
+            match self.run_async_resume(id, target, job.value, gc) {
                 Ok(true) | Err(ExecError::Throw(_)) => return Ok(()),
                 Ok(false) => {}
                 Err(other) => return Err(other),

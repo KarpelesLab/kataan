@@ -349,7 +349,7 @@ fn stack_of(ctx: &mut Ctx) -> *mut JitStack {
 
 /// Whether `regs` lies in the running thread's register stack (below its
 /// top): a compiled activation's window, which the GC roots already.
-fn on_register_stack(ctx: &Ctx, regs: &[NanBox]) -> bool {
+pub(super) fn on_register_stack(ctx: &Ctx, regs: &[NanBox]) -> bool {
     let p = ctx.jit_rt.stack.0;
     if p.is_null() {
         return false;
@@ -5197,6 +5197,7 @@ mod direct_memo_tests {
             call_depth: 0,
             gc_enabled: false,
             gc_lock: 0,
+            in_job: false,
             frame_shadow: Vec::new(),
             frames_published: 0,
             top_frame_roots: Vec::new(),

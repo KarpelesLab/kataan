@@ -43,6 +43,14 @@ impl Interp {
         self.collect_with_roots_in(extra, false)
     }
 
+    /// [`collect_with_roots`](Self::collect_with_roots) from inside a VM
+    /// resumption job the collecting event loop ran straight from the loop
+    /// (`VmHost::collect_garbage_in_job`): pending jobs and timers are rooted,
+    /// and the job half run is the VM's, whose state `extra` holds.
+    pub(crate) fn collect_with_roots_in_job(&mut self, extra: &[Handle]) -> bool {
+        self.collect_with_roots_in(extra, true)
+    }
+
     /// [`collect_with_roots`](Self::collect_with_roots), where `jobs_rooted`
     /// says the caller is the event loop between two jobs: pending jobs and
     /// timers are then no reason to decline (they are rooted, see
@@ -181,6 +189,11 @@ impl Interp {
         visit_scope(&self.main_global_scope, out);
         if let Some(s) = &self.eval_var_scope {
             visit_scope(s, out);
+        }
+
+        // --- the collecting event loop's kept values ---
+        for v in &self.loop_keep {
+            push(out, *v);
         }
 
         // --- ambient values ---
