@@ -732,6 +732,11 @@ struct Region {
     /// [`Region::defined`] reads; empty otherwise.
     live: Vec<u64>,
     live_words: usize,
+    /// The speculative version's **numeric element reads**
+    /// ([`plan_num_reads`]): the element reads whose value its fast versions
+    /// take as a Number, every path of the read that may find another
+    /// value leaving for the plain copy.
+    num_reads: Vec<usize>,
 }
 
 impl Region {
@@ -1684,6 +1689,7 @@ impl NumGen {
         let mut skip = vec![false; n + 1];
         for r in &mut regions {
             r.cold = guard_diamonds(r, ops, bytecode, entries, catches);
+            r.num_reads = plan_num_reads(r, ops, bytecode);
             r.spec = if env.no_spec.contains(&r.head) {
                 None
             } else {
@@ -2726,6 +2732,7 @@ impl NumGen {
             len: self.gslot_disp(k + 1),
             base: self.gslot_disp(k + 2),
             held: (src != ViewSrc::Fixed).then(|| self.gslot_disp(k + 3)),
+            hint: super::typed::kind_hint(r),
         })
     }
 
@@ -4641,6 +4648,17 @@ impl NumGen {
     /// a speculative region, under its speculation).
     pub(super) fn is_number_at(&self, pc: usize, r: u16) -> bool {
         self.ty(pc, r) == T_NUM
+    }
+
+    /// Whether element read `pc`, emitted in a speculative region's fast
+    /// version (or its integer version), is a numeric element read
+    /// ([`plan_num_reads`]): every path of it that may find a value other
+    /// than a Number must check it, and leave for the plain copy when it is
+    /// none.
+    pub(super) fn num_read(&self, pc: usize) -> bool {
+        self.region_at(pc).is_some_and(|ri| {
+            self.regions[ri].spec.is_some() && self.regions[ri].num_reads.contains(&pc)
+        }) && self.copy_label(pc).is_some()
     }
 
     /// Whether the `RequireObjectCoercible` at `pc` of a speculative region's
@@ -7720,19 +7738,23 @@ fn plan_regions_sa(
             aproof,
             quiet,
             ghoist,
+            num_reads: Vec::new(),
         });
     }
     out
 }
 
-/// Whether a speculative loop nest may have an integer version
-/// (`int32::plan` over the whole nest): unless `KATAAN_JIT_NESTINT=0`.
-/// Read once per process.
+/// Whether a call-free nest of loops of numeric ops alone (no generic op)
+/// is one region ([`plan_nests`]): unless `KATAAN_JIT_NUMNEST=0`. Read once
+/// per process.
 fn numnest_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NUMNEST").is_none_or(|v| v != "0"))
 }
 
+/// Whether a speculative loop nest may have an integer version
+/// (`int32::plan` over the whole nest): unless `KATAAN_JIT_NESTINT=0`.
+/// Read once per process.
 fn nestint_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NESTINT").is_none_or(|v| v != "0"))
@@ -9294,10 +9316,10 @@ impl DeferState {
 /// with no catch entry inside and no branch from outside into its body, is
 /// promoted as one region: the outer loop's registers stay in their SSE
 /// registers across the inner loops, whose entries and exits are then plain
-/// in-region branches. Only nests of generic loops, all of them call-free
-/// (an inner loop of numeric ops alone keeps its own region and its integer
-/// version; a call would store and reload the outer registers around it).
-/// The outermost qualifying loop wins. Returns the regions to plan as
+/// in-region branches. Only call-free nests (a call would store and reload
+/// the outer registers around it); a nest of numeric ops alone, with no
+/// generic op, too ([`numnest_enabled`]): its integer version then spans the
+/// nest. The outermost qualifying loop wins. Returns the regions to plan as
 /// `(head, end, inner back-edges)`.
 #[allow(clippy::type_complexity)]
 fn plan_nests(
@@ -9657,6 +9679,16 @@ fn spec_transfer(op: &Op, s: &mut [u8]) {
 ///   from the binding and its one store stores), so it has that register's
 ///   type.
 fn spec_step(op: &Op, pc: usize, r: &Region, fields: &[Option<(u64, u32)>], s: &mut [u8]) {
+    // A numeric element read ([`plan_num_reads`]).
+    if let Op::GetKey { dst, .. } = op
+        && r.num_reads.contains(&pc)
+    {
+        spec_transfer(op, s);
+        if let Some(x) = s.get_mut(*dst as usize) {
+            *x = T_NUM;
+        }
+        return;
+    }
     if let Op::GetProp { dst, .. } | Op::CellGet { dst, .. } = op
         && let Some(&(_, src)) = r.reuse.iter().find(|x| x.0 == pc)
         && let Some(&t) = s.get(src as usize)
@@ -9704,6 +9736,66 @@ fn spec_step(op: &Op, pc: usize, r: &Region, fields: &[Option<(u64, u32)>], s: &
             }
         }
     }
+}
+
+/// The **numeric element reads** of region `r` ([`Region::num_reads`]): the
+/// element reads (`a[i]` into a register other than its operands') outside
+/// its guard diamonds' fallback arms whose value every op of the region
+/// that reads it takes as a Number in a fast version (arithmetic, a
+/// [`spec_num_op`], or an inline `Math.f(x)` call's argument: their every
+/// other case leaves for the plain copy) and which is not live into the
+/// header. A fast version takes such a read's value as a Number: a path of
+/// the read that may find another value (an array's element, a property's)
+/// checks it, and leaves for the copy when it is none, which would leave at
+/// its first reader anyway; a typed-array view's element is a Number. Off
+/// with `KATAAN_JIT_NUMREAD=0`.
+fn plan_num_reads(r: &Region, ops: &[GenericOp], bytecode: &[Op]) -> Vec<usize> {
+    if !numread_enabled() || !r.generic {
+        return Vec::new();
+    }
+    let (head, end) = (r.head, r.end.min(ops.len().saturating_sub(1)));
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    let mut out = Vec::new();
+    for (pc, op) in ops.iter().enumerate().take(end + 1).skip(head) {
+        let (GenericOp::GetElem { .. }, Some(&Op::GetKey { dst, obj, key })) =
+            (op, bytecode.get(pc))
+        else {
+            continue;
+        };
+        if dst == obj || dst == key || r.is_cold(pc) || r.live_head.contains(&dst) {
+            continue;
+        }
+        let mut strong = 0usize;
+        let mut ok = true;
+        for (q, op) in bytecode.iter().enumerate().take(end + 1).skip(head) {
+            def_use(op, &mut d, &mut u);
+            if !u.contains(&dst) {
+                continue;
+            }
+            let numeric = spec_num_op(op)
+                || matches!(op, Op::CallMethod { args, recv, .. } | Op::CallWithMethod { args, recv, .. }
+                    if *recv != dst && args.contains(&dst)
+                        && (super::inline_math(op).is_some() || super::inline_math_got(op).is_some()));
+            if !numeric {
+                ok = false;
+                break;
+            }
+            if !r.is_cold(q) {
+                strong += 1;
+            }
+        }
+        if ok && strong > 0 {
+            out.push(pc);
+        }
+    }
+    out
+}
+
+/// Whether numeric element reads ([`plan_num_reads`]) are planned: unless
+/// `KATAAN_JIT_NUMREAD=0`. Read once per process.
+fn numread_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NUMREAD").is_none_or(|v| v != "0"))
 }
 
 /// Plans region `r`'s speculative double version ([`Spec`]): for a region of
@@ -10909,6 +11001,41 @@ mod tests {
         let (qops, ..) = crate::jit::lower_nbvm_generic(&q).expect("generic");
         let qr = plan_regions(&qops, &q.ops, &[], q.n_regs);
         assert!(qr.iter().all(|r| r.loops.is_empty()));
+    }
+
+    #[test]
+    fn element_reads_feeding_arithmetic_are_numeric_reads() {
+        // `a[i] * b[i]`: both reads only feed the product, so a fast version
+        // takes them as Numbers; `k[i]`, used as a key, is no such read.
+        let p = proto_of(
+            "function f(a, b, k, o){ let s = 0; for (let i = 0; i < a.length; i = i + 1) { s = s + a[i] * b[i]; s = s + o[k[i]]; } return s; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let regions = plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1);
+        let r = &regions[0];
+        let reads = plan_num_reads(r, &ops, &p.ops);
+        let keyed: Vec<usize> = (r.head..=r.end)
+            .filter(|&pc| matches!(p.ops[pc], Op::GetKey { .. }))
+            .collect();
+        assert_eq!(keyed.len(), 4);
+        let key_of = |pc: usize| match p.ops[pc] {
+            Op::GetKey { dst, .. } => dst,
+            _ => unreachable!(),
+        };
+        // The read whose value is the next read's key is not one.
+        let as_key = keyed
+            .iter()
+            .copied()
+            .find(|&pc| {
+                keyed
+                    .iter()
+                    .any(|&q| matches!(p.ops[q], Op::GetKey { key, .. } if key == key_of(pc)))
+            })
+            .expect("a read used as a key");
+        assert!(!reads.contains(&as_key));
+        assert!(reads.len() >= 2, "{reads:?}");
     }
 
     #[test]

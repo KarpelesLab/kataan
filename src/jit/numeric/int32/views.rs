@@ -80,17 +80,7 @@ impl NumGen {
         let got = a.new_label();
         self.index_rax(a, index)?;
         a.v_index(v, disp(obj), slow);
-        for kind in [
-            UINT8,
-            INT32,
-            FLOAT64,
-            FLOAT32,
-            UINT16,
-            INT16,
-            INT8,
-            UINT32,
-            UINT8_CLAMPED,
-        ] {
+        for kind in typed::hinted(&typed::READ_ORDER, v.hint) {
             let next = a.new_label();
             a.g_cmp_byte_imm(r::RBP, v.kind, kind);
             a.g_jcc(cc::NE, next);
@@ -174,6 +164,41 @@ impl NumGen {
         }
         self.index_rax(a, index)?;
         a.v_index(v, disp(obj), slow);
+        // The hinted kind first (`typed::kind_hint`), on its own.
+        let h = v.hint;
+        if h <= FLOAT64 && h != UINT8_CLAMPED {
+            let other = a.new_label();
+            a.g_cmp_byte_imm(r::RBP, v.kind, h);
+            a.g_jcc(cc::NE, other);
+            match h {
+                FLOAT64 | FLOAT32 => {
+                    if int {
+                        a.cvtsi2sd32(0, RDX);
+                    }
+                    if h == FLOAT64 {
+                        a.v_elem(Some(0xf2), false, &[0x0f, 0x11], 0, 3); // movsd [..], xmm0
+                    } else {
+                        a.raw(&[0xf2, 0x0f, 0x5a, 0xc8]); // cvtsd2ss xmm1, xmm0
+                        a.v_elem(Some(0xf3), false, &[0x0f, 0x11], 1, 2); // movss [..], xmm1
+                    }
+                }
+                _ => {
+                    if !int {
+                        // (As below: the truncation's low bits.)
+                        a.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd0]); // cvttsd2si rdx, xmm0
+                        a.raw(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx, 1
+                        a.jcc(CC_O, slow);
+                    }
+                    match typed::size_log2(h) {
+                        0 => a.v_elem(None, false, &[0x88], RDX, 0), // mov byte [..], dl
+                        1 => a.v_elem(Some(0x66), false, &[0x89], RDX, 1), // word
+                        _ => a.v_elem(None, false, &[0x89], RDX, 2), // dword
+                    }
+                }
+            }
+            a.jmp(done);
+            a.bind(other);
+        }
         let floats = a.new_label();
         let clamped = a.new_label();
         let (byte, dword) = (a.new_label(), a.new_label());

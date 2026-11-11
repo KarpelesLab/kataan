@@ -95,7 +95,7 @@ impl NumGen {
         let tl = typed::typed_layout();
         a.t_view(&l, tl, miss);
         a.raw(&[0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
-        a.t_get_i32(tl, Src::View, wrap, miss, got);
+        a.t_get_i32(tl, Src::View, wrap, miss, got, typed::kind_hint(obj));
         a.bind(got);
         a.raw(&[0x48, 0x83, 0xc4, 0x08]); // add rsp, 8 (the index)
         for &g in saves.iter().rev() {
@@ -112,6 +112,22 @@ impl NumGen {
         a.jmp(bail);
         a.bind(done);
         Some(())
+    }
+
+    /// For an element read into a register of the double version, with the
+    /// array's element in `rax`: to `miss` on a hole, or, for a numeric
+    /// element read (`NumGen::num_read`), on anything but a Number (a hole
+    /// is none). Clobbers `rcx` and `r11`.
+    fn any_elem_check(&self, a: &mut X64Assembler, miss: crate::jit::Label) {
+        if self.num_read(self.cur_pc) {
+            a.raw(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+            a.movabs_r11(super::super::QNAN as i64);
+            a.and_rcx_r11();
+            a.cmp_rcx_r11();
+        } else {
+            a.cmp_rax_const(crate::nanbox::NanBox::hole().to_bits());
+        }
+        a.jcc(CC_E, miss);
     }
 
     /// Loads register `r` (a generic op's operand: in the register file,
@@ -228,8 +244,7 @@ impl NumGen {
             a.exact_i32_check(RCX);
             a.jcc(CC_NE, miss);
         } else {
-            a.cmp_rax_const(crate::nanbox::NanBox::hole().to_bits());
-            a.jcc(CC_E, miss);
+            self.any_elem_check(a, miss);
         }
         a.raw(&[0x48, 0x83, 0xc4, 0x08]); // add rsp, 8 (the index)
         for &g in saves.iter().rev() {
@@ -283,8 +298,7 @@ impl NumGen {
         a.jae(slow); // past the count, or negative
         a.g_load(R11, rbp, s.base);
         a.mov_rax_at_r11_rax8();
-        a.cmp_rax_const(crate::nanbox::NanBox::hole().to_bits());
-        a.jcc(CC_E, slow);
+        self.any_elem_check(a, slow);
         match self.xmm_of(self.imode, dst) {
             Some(x) => a.movq_x_gpr(x, RAX),
             None => a.store_rax(disp(dst)),

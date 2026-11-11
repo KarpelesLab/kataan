@@ -1862,9 +1862,9 @@ impl NumGen {
         // (A nest's: an entry at an inner header may go straight into this
         // version there, `plain_int_inner_entry`.)
         if !self.regions[ri].loops.is_empty() {
-            for pc in head..=end {
-                if let Some(l) = self.int_labels.get_mut(pc) {
-                    *l = Some(ilabels[pc]);
+            for (pc, &l) in ilabels.iter().enumerate().take(end + 1).skip(head) {
+                if let Some(x) = self.int_labels.get_mut(pc) {
+                    *x = Some(l);
                 }
             }
         }

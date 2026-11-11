@@ -68,7 +68,7 @@ pub(crate) mod sink;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-mod typed;
+pub(crate) mod typed;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod typeof_test;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -4871,6 +4871,8 @@ impl JitProto {
             .map(|x| x.plan.held_fregs.clone())
             .unwrap_or_default();
         numeric::EXTRA_USES.with(|e| *e.borrow_mut() = held);
+        // (The element kinds its registers held, `typed::set_kind_hints`.)
+        typed::activate_kind_hints(proto);
         let compiled = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
@@ -15108,6 +15110,12 @@ impl JitFunction {
                     let done = a.new_label();
                     // Where an element read's value (in `rax`) goes on.
                     let got = a.new_label();
+                    // A numeric element read of a fast version
+                    // (`numeric::plan_num_reads`): a value no typed-array
+                    // view gave goes on through `got_any`, which leaves for
+                    // the plain copy unless it is a Number.
+                    let numread = bail.is_some() && num.num_read(op_idx);
+                    let got_any = if numread { a.new_label() } else { got };
                     // `o[k]` in a compiled `for-in` over `o` (`forin`): the
                     // slot the loop's key table gives the key, with no call.
                     // (In a promoted loop: the key index where the loop
@@ -15155,8 +15163,8 @@ impl JitFunction {
                         a.p_obj_slot_load_inline(&layout, other, spill);
                         a.bind(have);
                         // (A promoted result: `got`'s code puts it there.)
-                        if num.result_xmm(op_idx, dst).is_some() {
-                            a.jmp(got);
+                        if numread || num.result_xmm(op_idx, dst).is_some() {
+                            a.jmp(got_any);
                         } else {
                             a.store_rax(disp(dst));
                             a.jmp(done);
@@ -15215,7 +15223,7 @@ impl JitFunction {
                         a.kp_slot(&layout, &key_probe, cl.realm, disp(index), text);
                         a.bind(slot);
                         a.p_obj_slot_load_inline(&layout, other, spill);
-                        a.jmp(got);
+                        a.jmp(got_any);
                         let cold = a.cold_begin();
                         a.bind(text);
                         a.tp_probe(
@@ -15229,9 +15237,9 @@ impl JitFunction {
                         a.jmp(slot);
                         a.bind(absent);
                         a.movabs_rax(NanBox::undefined().to_bits() as i64);
-                        a.jmp(got);
+                        a.jmp(got_any);
                         a.bind(spill);
-                        a.p_obj_slot_load_spill(&layout, got);
+                        a.p_obj_slot_load_spill(&layout, got_any);
                         a.cold_end(cold);
                         a.bind(other);
                     }
@@ -15301,6 +15309,7 @@ impl JitFunction {
                                     helper,
                                     got,
                                     xmm_past,
+                                    v.hint,
                                 );
                                 a.bind(not_view);
                             }
@@ -15329,7 +15338,7 @@ impl JitFunction {
                         a.g_load(call_seq::r::R11, call_seq::r::RBP, s.base);
                         a.mov_rax_at_r11_rax8(); // rax = elems[idx]
                         a.cmp_rax_const(NanBox::hole().to_bits());
-                        a.jne(got);
+                        a.jne(got_any);
                         a.bind(other);
                         // (A sunk load's register, for the other paths.)
                         num.materialize_sunk(&mut a, op_idx);
@@ -15358,6 +15367,15 @@ impl JitFunction {
                     a.movabs_r11(NanBox::hole().to_bits() as i64);
                     a.cmp_rax_r11();
                     a.je(arr_miss);
+                    if numread {
+                        // (A hole is no Number either.)
+                        a.bind(got_any);
+                        a.raw(&[0x48, 0x89, 0xc1]); // mov rcx, rax
+                        a.movabs_r11(QNAN as i64);
+                        a.and_rcx_r11();
+                        a.cmp_rcx_r11();
+                        a.je(helper);
+                    }
                     a.bind(got);
                     if let Some((x, past)) = xmm_past {
                         numeric::NumGen::set_xmm_from_rax(&mut a, x);
@@ -15388,7 +15406,14 @@ impl JitFunction {
                         a.bind(walked);
                         a.t_view(&layout, tl, helper);
                         elem_index!(helper);
-                        a.t_get(tl, typed::Src::View, helper, got, xmm_past);
+                        a.t_get(
+                            tl,
+                            typed::Src::View,
+                            helper,
+                            got,
+                            xmm_past,
+                            typed::kind_hint(obj),
+                        );
                     }
                     // jit_helper_get_elem(ctx, recv, key).
                     if bail.is_none() {
@@ -15550,7 +15575,13 @@ impl JitFunction {
                             Some(x) => numeric::NumGen::xmm0_from_xmm(&mut a, x),
                             None => a.movsd_xmm0_mem(disp(val)),
                         }
-                        a.t_set(typed::typed_layout(), typed::Src::Hoisted(v), helper, done);
+                        a.t_set(
+                            typed::typed_layout(),
+                            typed::Src::Hoisted(v),
+                            helper,
+                            done,
+                            v.hint,
+                        );
                         a.bind(not_view);
                     }
                     // A speculative loop's hoisted array
@@ -15685,7 +15716,7 @@ impl JitFunction {
                             Some(x) => numeric::NumGen::xmm0_from_xmm(&mut a, x),
                             None => a.movsd_xmm0_mem(disp(val)),
                         }
-                        a.t_set(tl, typed::Src::View, helper, done);
+                        a.t_set(tl, typed::Src::View, helper, done, typed::kind_hint(obj));
                     }
                     // jit_helper_set_elem(ctx, recv, key, val).
                     if bail.is_none() {

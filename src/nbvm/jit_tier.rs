@@ -578,6 +578,7 @@ pub(super) fn enter_on_call(
     }
     if proto.tier.jit().is_none() {
         super::global_mirror::prefill(ctx, proto);
+        note_kind_hints(ctx, proto, regs);
     }
     let mut jit = jit_for(funcs, id, ic)?;
     if jit.is_generic() {
@@ -631,6 +632,24 @@ pub(super) fn enter_async_on_call(
     run_tiering(ctx, funcs, id, jit, regs, 0, &[], ic, false, false)
 }
 
+/// Notes the element kinds of the typed-array views `proto`'s activation's
+/// registers `regs` hold as it gets compiled (`jit::typed::set_kind_hints`):
+/// its accesses of those registers test that kind first.
+fn note_kind_hints(ctx: &Ctx, proto: &FnProto, regs: &[NanBox]) {
+    let n = proto.n_regs.min(regs.len());
+    let hints: alloc::vec::Vec<u8> = regs[..n]
+        .iter()
+        .map(|&v| {
+            ctx.realm
+                .typed_kind_of(v)
+                .unwrap_or(crate::jit::typed::NO_VIEW)
+        })
+        .collect();
+    if hints.iter().any(|&k| k != crate::jit::typed::NO_VIEW) {
+        crate::jit::typed::set_kind_hints(proto, hints);
+    }
+}
+
 /// On-stack replacement from a hot interpreted loop: `program` is the running
 /// body, `regs` its register file, and `target` the loop header the back-edge is
 /// about to jump to. If `program` is a function-table body (or its optimized
@@ -667,6 +686,7 @@ pub(super) fn osr(
     }
     if proto.tier.jit().is_none() {
         super::global_mirror::prefill(ctx, proto);
+        note_kind_hints(ctx, proto, regs);
     }
     let jit: Rc<crate::jit::JitProto> = jit_for(funcs, id, ic)?;
     if !jit.has_entry(target) {

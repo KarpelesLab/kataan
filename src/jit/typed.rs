@@ -137,6 +137,9 @@ pub(crate) struct ViewSlots {
     pub(crate) len: i32,
     pub(crate) base: i32,
     pub(crate) held: Option<i32>,
+    /// The kind its accesses test first ([`kind_hint`], [`NO_VIEW`] for
+    /// none): every other served kind is still tested after it.
+    pub(crate) hint: u8,
 }
 
 /// Where [`t_hoist`](X64Assembler::t_hoist) finds the value to check: a
@@ -173,6 +176,77 @@ pub(crate) const UINT32: u8 = 6;
 pub(crate) const FLOAT32: u8 = 7;
 pub(crate) const FLOAT64: u8 = 8;
 
+/// `order` with `hint` (when it is one of them) moved to the front: the
+/// order an access whose receiver register held a view of kind `hint` when
+/// its body was compiled ([`kind_hint`]) tests the kinds in. A hint only:
+/// every kind of `order` is still tested.
+pub(crate) fn hinted(order: &[u8], hint: u8) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(order.len());
+    if order.contains(&hint) {
+        v.push(hint);
+    }
+    v.extend(order.iter().copied().filter(|&k| k != hint));
+    v
+}
+
+std::thread_local! {
+    /// The element kinds the registers of recently compiled functions held
+    /// views of (`set_kind_hints`): per function (its address), per
+    /// register, the kind ([`NO_VIEW`] for none). At most [`MAX_HINTED`].
+    static KIND_HINTS: core::cell::RefCell<alloc::vec::Vec<(usize, alloc::vec::Vec<u8>)>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+    /// The hints of the compilation under way ([`activate_kind_hints`]).
+    static ACTIVE_HINTS: core::cell::RefCell<alloc::vec::Vec<u8>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
+
+/// How many functions' hints [`set_kind_hints`] keeps (the oldest go).
+const MAX_HINTED: usize = 64;
+
+/// Notes, for the compilations of function `proto` (its first and its
+/// recompilations), the element kind of each register (`NO_VIEW` for
+/// none): what its activation's registers held when it got hot (an
+/// on-stack replacement's, a call's arguments). Its accesses of a register
+/// that held a view test that view's kind first. A hint only: a function
+/// whose address another one has since taken reads that one's hints,
+/// which changes only the order the kinds are tested in.
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+pub(crate) fn set_kind_hints(proto: *const crate::nbvm::FnProto, hints: alloc::vec::Vec<u8>) {
+    let key = proto as usize;
+    KIND_HINTS.with(|h| {
+        let mut h = h.borrow_mut();
+        h.retain(|e| e.0 != key);
+        if h.len() >= MAX_HINTED {
+            h.remove(0);
+        }
+        h.push((key, hints));
+    });
+}
+
+/// Makes the hints noted for `proto` ([`set_kind_hints`], none if none
+/// were) the active ones, for [`kind_hint`].
+pub(super) fn activate_kind_hints(proto: *const crate::nbvm::FnProto) {
+    let key = proto as usize;
+    let v = KIND_HINTS.with(|h| {
+        h.borrow()
+            .iter()
+            .find(|e| e.0 == key)
+            .map(|e| e.1.clone())
+            .unwrap_or_default()
+    });
+    ACTIVE_HINTS.with(|a| *a.borrow_mut() = v);
+}
+
+/// The active hint ([`activate_kind_hints`]) for register `r` of the
+/// function being compiled: the element kind of the view it held, or
+/// [`NO_VIEW`].
+pub(super) fn kind_hint(r: u16) -> u8 {
+    ACTIVE_HINTS.with(|a| a.borrow().get(usize::from(r)).copied().unwrap_or(NO_VIEW))
+}
+
 pub(crate) const fn size_log2(kind: u8) -> u8 {
     match kind {
         INT8 | UINT8 | UINT8_CLAMPED => 0,
@@ -181,6 +255,24 @@ pub(crate) const fn size_log2(kind: u8) -> u8 {
         _ => 3,
     }
 }
+
+/// The order a read tests the kinds in (unhinted: the commonest integer
+/// kinds, then the float ones).
+pub(crate) const READ_ORDER: [u8; 9] = [
+    UINT8,
+    INT32,
+    FLOAT64,
+    FLOAT32,
+    UINT16,
+    INT16,
+    INT8,
+    UINT32,
+    UINT8_CLAMPED,
+];
+
+/// The order an integer version's read tests the integer kinds in.
+pub(crate) const INT_READ_ORDER: [u8; 7] =
+    [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED];
 
 /// x86 condition codes beyond [`cc`]'s.
 const CC_O: u8 = 0x0;
@@ -302,22 +394,17 @@ impl X64Assembler {
         miss: Label,
         got: Label,
         to: Option<(u8, Label)>,
+        hint: u8,
     ) {
         self.t_index(t, src, miss);
         // (The kind slot is loop-invariant for a hoisted view: the chain's
-        // branches are predicted; the float kinds after the commonest
-        // integer ones.)
-        for kind in [
-            UINT8,
-            INT32,
-            FLOAT64,
-            FLOAT32,
-            UINT16,
-            INT16,
-            INT8,
-            UINT32,
-            UINT8_CLAMPED,
-        ] {
+        // branches are predicted; the hinted kind first, the float kinds
+        // after the commonest integer ones.)
+        let hint = match src {
+            Src::Hoisted(v) => v.hint,
+            Src::View => hint,
+        };
+        for kind in hinted(&READ_ORDER, hint) {
             let next = self.new_label();
             self.t_kind(t, src, kind, next, miss);
             let s = size_log2(kind);
@@ -377,9 +464,14 @@ impl X64Assembler {
         wrap: bool,
         miss: Label,
         got: Label,
+        hint: u8,
     ) {
         self.t_index(t, src, miss);
-        for kind in [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED] {
+        let hint = match src {
+            Src::Hoisted(v) => v.hint,
+            Src::View => hint,
+        };
+        for kind in hinted(&INT_READ_ORDER, hint) {
             let next = self.new_label();
             self.t_kind(t, src, kind, next, miss);
             let s = size_log2(kind);
@@ -420,7 +512,7 @@ impl X64Assembler {
         // (No view, `NO_VIEW`, is no kind below: to `miss` with no load.)
         self.g_load(r::R11, r::RBP, v.base);
         let got = self.new_label();
-        for kind in [UINT8, INT32, UINT16, INT16, INT8, UINT32, UINT8_CLAMPED] {
+        for kind in hinted(&INT_READ_ORDER, v.hint) {
             let next = self.new_label();
             self.g_cmp_byte_imm(r::RBP, v.kind, kind);
             self.g_jcc(cc::NE, next);
@@ -593,8 +685,12 @@ impl X64Assembler {
     /// index (and, for [`Src::View`], `rcx` / `r9` from
     /// [`t_view`](Self::t_view)), stores it and on to `done`, else (nothing
     /// written) to `miss`. Clobbers `rdx`, `r8`, `r11`, `xmm1`.
-    pub(crate) fn t_set(&mut self, t: &TypedLayout, src: Src, miss: Label, done: Label) {
+    pub(crate) fn t_set(&mut self, t: &TypedLayout, src: Src, miss: Label, done: Label, hint: u8) {
         self.t_index(t, src, miss);
+        let hint = match src {
+            Src::Hoisted(v) => v.hint,
+            Src::View => hint,
+        };
         // The view's kind byte compared with `imm`.
         macro_rules! cmp_kind {
             ($imm:expr) => {
@@ -612,6 +708,38 @@ impl X64Assembler {
                     self.t_extent(t, $s, miss);
                 }
             };
+        }
+        // The hinted kind first ([`kind_hint`]), on its own.
+        if hint <= FLOAT64 && hint != UINT8_CLAMPED {
+            let other = self.new_label();
+            cmp_kind!(hint);
+            self.g_jcc(cc::NE, other);
+            let s = size_log2(hint);
+            match hint {
+                FLOAT64 => {
+                    extent!(3);
+                    self.t_elem(Some(0xf2), false, &[0x0f, 0x11], 0, 3); // movsd [..], xmm0
+                }
+                FLOAT32 => {
+                    extent!(2);
+                    self.raw(&[0xf2, 0x0f, 0x5a, 0xc8]); // cvtsd2ss xmm1, xmm0
+                    self.t_elem(Some(0xf3), false, &[0x0f, 0x11], 1, 2); // movss [..], xmm1
+                }
+                _ => {
+                    // (As below: the truncation's low bits.)
+                    self.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd0]); // cvttsd2si rdx, xmm0
+                    self.raw(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx, 1
+                    self.g_jcc(CC_O, miss);
+                    extent!(s);
+                    match s {
+                        0 => self.t_elem(None, false, &[0x88], r::RDX, 0), // mov byte [..], dl
+                        1 => self.t_elem(Some(0x66), false, &[0x89], r::RDX, 1), // word
+                        _ => self.t_elem(None, false, &[0x89], r::RDX, 2), // dword
+                    }
+                }
+            }
+            self.jmp(done);
+            self.bind(other);
         }
         // The kinds told apart by ranges, the integer ones first (with no
         // kind past Float64, [`NO_VIEW`] included, ever stored):
