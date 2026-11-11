@@ -16009,6 +16009,8 @@ impl JitFunction {
                     if !ok(dst) || !ok(ra) || nb.target > ops.len() {
                         return None;
                     }
+                    // (A promoted operand, `plan_regions`: stored first.)
+                    let _ = num.operand_xmm(&mut a, op_idx, ra, false);
                     let to = num.branch_label(&labels, op_idx + 1, nb.target)?;
                     // (An object its way proves truthy: `!x` is false, stored
                     // out of line on the way to the branch.)
@@ -16037,6 +16039,7 @@ impl JitFunction {
                     if !ok(dst) || !ok(ra) {
                         return None;
                     }
+                    let _ = num.operand_xmm(&mut a, op_idx, ra, false);
                     if num.is_bool_at(op_idx, ra) {
                         // `!b` of a boolean: `b != true`.
                         a.load_rax(disp(ra));

@@ -321,6 +321,11 @@ pub(super) fn plan(
                 match op {
                     Op::ValueBin { op, .. } if (1..=VB_USHR).contains(op) => {}
                     Op::GetKey { key, obj, .. } if *key == x && *obj != x => {}
+                    // An element store's value (`win[j + 1] = win[j]`, a
+                    // sort's moves): a hoisted view's store takes an int
+                    // register as is (`NumGen::ihoisted_view_set`).
+                    Op::SetKey { obj, key, src } | Op::SetKeyStrict { obj, key, src }
+                        if arith && *src == x && *key != x && *obj != x => {}
                     // (`ToNumeric` of an int register is a copy: a counter
                     // starting at an element, `for (k = p[i]; …; k++)`.)
                     Op::Move { dst, .. } | Op::ToNumeric { dst, .. } => work.push(*dst),
@@ -596,8 +601,10 @@ pub(super) fn plan(
                         // An element read's index.
                         Op::GetKey { key, obj, .. } => (elems || spec) && *key == r && *obj != r,
                         // An element store's index (`NumGen::ihoisted_arr_set`).
-                        Op::SetKey { key, obj, .. } | Op::SetKeyStrict { key, obj, .. } => {
-                            spec && *key == r && *obj != r
+                        // Or its value, by an int index: an element copied
+                        // between views stays an int32 (no double round trip).
+                        Op::SetKey { key, obj, src } | Op::SetKeyStrict { key, obj, src } => {
+                            spec && *obj != r && (*key == r || (*src == r && inn(*key)))
                         }
                         Op::CallMethod { dst, .. } | Op::CallWithMethod { dst, .. }
                             if spec && super::int_math_op(op).is_some() =>
@@ -1966,6 +1973,23 @@ impl NumGen {
                     IK::Imm(0) => self.jump(a, labels, reg, target),
                     IK::Imm(_) => {}
                 }
+            }
+            // `if (!x)` (`dx || dy`) on an int register: to the target when
+            // `x` is non-zero, the not's boolean never stored.
+            GenericOp::Not { dst, a: x } if ii(self, x) && !ii(self, dst) => {
+                let Some(target) = self.int_not_test(pc, ops, dst, x) else {
+                    return Some(false);
+                };
+                match self.ik_ld(a, x, RAX)? {
+                    IK::Gpr(g) => {
+                        a.test32_rr(g, g);
+                        self.jcc_to(a, labels, reg, CC_NE, target);
+                    }
+                    IK::Imm(0) => {}
+                    IK::Imm(_) => self.jump(a, labels, reg, target),
+                    IK::Mem(_) => return None,
+                }
+                self.skip_op(pc + 1);
             }
             GenericOp::CheckTdz { src, .. } if ii(self, src) => {}
             GenericOp::Jump { target } if target <= pc => {

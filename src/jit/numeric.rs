@@ -4965,6 +4965,23 @@ impl NumGen {
         .then_some(target)
     }
 
+    /// [`not_test`](Self::not_test) in a speculative region's integer
+    /// version, `x` an int register: the `JumpIfFalse` target of
+    /// `dst = !x` when only that branch reads `dst`.
+    fn int_not_test(&self, pc: usize, ops: &[GenericOp], dst: u16, x: u16) -> Option<usize> {
+        let Some(&GenericOp::JumpIfFalse { cond, target }) = ops.get(pc + 1) else {
+            return None;
+        };
+        (self.imode.is_some()
+            && cond == dst
+            && dst != x
+            && target > pc + 1
+            && self.mentions.get(dst as usize).copied() == Some(2)
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && self.region_at(pc + 1) == self.region_at(pc))
+        .then_some(target)
+    }
+
     /// Whether op `pc` is a `Not` the comparison right before it may fuse
     /// through ([`fusable`](Self::fusable)), its boolean then never stored:
     /// the `Not`'s start is no point where the register file is complete
@@ -7227,6 +7244,12 @@ fn plan_regions_sa(
                     // (`NumGen::operand_xmm`).
                     let free = match (&ops[pc], &bytecode[pc]) {
                         (_, Op::GetKey { obj, key, .. }) if key != obj => [Some(*key), None],
+                        // `!x`: from its SSE register when it branches on a
+                        // Number (`NumGen::not_test`), from its int register
+                        // in an integer version; else the generic code reads
+                        // it from the register file, where it is stored
+                        // first (`NumGen::operand_xmm`).
+                        (GenericOp::Not { .. }, Op::Not { dst, a }) if a != dst => [Some(*a), None],
                         // (A compiled `for-in`'s key read: its index from
                         // where the region keeps it, `forin::Idx`.)
                         (GenericOp::ArrGet { .. }, Op::GetElem { arr, index, .. })
