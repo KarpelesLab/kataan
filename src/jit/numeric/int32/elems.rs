@@ -129,9 +129,9 @@ impl NumGen {
     /// when it is in bounds and an exact int32 (as its `ToInt32` bits when
     /// the read is wrapped, `IntPlan::wrap_bits`: any integral value below
     /// 2^63 in magnitude), into `dst`, past the op's generic code
-    /// (`int_skip`). Anything else falls into that code, which runs the op
-    /// from the start and checks its value (`int_post`). Touches only
-    /// `rax`, `rcx`, `r11` and `xmm0`.
+    /// (`int_skip`). Another array in the register is walked first
+    /// ([`Self::iwalk_arr_get`]). Anything else falls into that code, which
+    /// runs the op from the start and checks its value (`int_post`).
     pub(in super::super) fn ihoisted_arr_get(
         &mut self,
         a: &mut X64Assembler,
@@ -145,13 +145,15 @@ impl NumGen {
         let wrap = self.iplan()?.wrap_bits.contains(&pc);
         let rbp = crate::jit::call_seq::r::RBP;
         let slow = a.new_label();
+        let walk = a.new_label();
         let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
         // (A receiver known to be the held array whenever there is one: the
         // bounds check alone, the count `0` when the entry found none.)
-        if !self.array_known_fast(pc, obj) {
+        let known = self.array_known_fast(pc, obj);
+        if !known {
             self.iload_operand(a, obj);
             a.g_cmp_mem(RAX, rbp, s.held);
-            a.jne(slow);
+            a.jne(walk);
         }
         self.index_rax(a, index)?;
         a.g_cmp_mem(RAX, rbp, s.len);
@@ -171,8 +173,82 @@ impl NumGen {
         a.jcc(CC_NE, slow);
         self.iput(a, dst, RCX)?;
         a.jmp(done);
+        if !known {
+            a.bind(walk);
+            // (A wrapped read's bits: the generic code's.)
+            if !wrap {
+                self.iwalk_arr_get(a, dst, obj, index, true, done)?;
+            }
+        }
         a.bind(slow);
         self.int_skip = Some(done);
+        Some(())
+    }
+
+    /// For a hoisted-array element read whose receiver is not the held
+    /// array (a row of a grid, `grid[y][x]`, another one each time): the
+    /// element of the plain array the register holds, walked as the
+    /// generic code would but with the index from its int register and no
+    /// int GPR saves for calls (only the walk's clobbered ones pushed), into
+    /// `dst` (`int`: an int register, the element an exact int32; else its
+    /// double-version location, the element any value but a hole), then to
+    /// `done`. Anything else falls through, into the op's generic code,
+    /// which runs it from the start.
+    fn iwalk_arr_get(
+        &mut self,
+        a: &mut X64Assembler,
+        dst: u16,
+        obj: u16,
+        index: u16,
+        int: bool,
+        done: crate::jit::Label,
+    ) -> Option<()> {
+        let saves = self.walk_saves(dst);
+        self.index_rax(a, index)?;
+        for &g in &saves {
+            a.raw(&[0x41, 0x50 + (g & 7)]); // push r8..r10
+        }
+        a.push_rax();
+        let miss = a.new_label();
+        let l = self.env.heap;
+        a.p_arena(self.env.realm, &l.props);
+        self.iload_operand(a, obj);
+        a.p_is_handle(RCX, miss);
+        a.p_slot_rooted(&l, RCX, miss);
+        a.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
+        a.jne(miss);
+        a.p_array_plain(&l, self.env.realm, false, miss);
+        a.raw(&[0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+        a.p_arr_len_ptr(&l);
+        a.cmp_rax_r8();
+        a.jae(miss); // past the count, or negative
+        a.mov_rax_at_r11_rax8();
+        if int {
+            // (A hole is no Number: not one either.)
+            a.exact_i32_check(RCX);
+            a.jcc(CC_NE, miss);
+        } else {
+            a.cmp_rax_const(crate::nanbox::NanBox::hole().to_bits());
+            a.jcc(CC_E, miss);
+        }
+        a.raw(&[0x48, 0x83, 0xc4, 0x08]); // add rsp, 8 (the index)
+        for &g in saves.iter().rev() {
+            a.raw(&[0x41, 0x58 + (g & 7)]); // pop r8..r10
+        }
+        if int {
+            self.iput(a, dst, RCX)?;
+        } else {
+            match self.xmm_of(self.imode, dst) {
+                Some(x) => a.movq_x_gpr(x, RAX),
+                None => a.store_rax(disp(dst)),
+            }
+        }
+        a.jmp(done);
+        a.bind(miss);
+        a.raw(&[0x48, 0x83, 0xc4, 0x08]); // add rsp, 8
+        for &g in saves.iter().rev() {
+            a.raw(&[0x41, 0x58 + (g & 7)]);
+        }
         Some(())
     }
 
@@ -180,8 +256,8 @@ impl NumGen {
     /// integer version, `index` an int register and `dst` none, `obj` a
     /// hoisted array: the held array's element when in bounds and no hole,
     /// into `dst`'s double-version location, past the op's generic code
-    /// (`int_skip`); anything else falls into that code. Touches only
-    /// `rax` and `r11`.
+    /// (`int_skip`); another array in the register is walked first
+    /// ([`Self::iwalk_arr_get`]); anything else falls into that code.
     pub(in super::super) fn ihoisted_arr_get_any(
         &mut self,
         a: &mut X64Assembler,
@@ -194,11 +270,13 @@ impl NumGen {
         self.ik(index)?;
         let rbp = crate::jit::call_seq::r::RBP;
         let slow = a.new_label();
+        let walk = a.new_label();
         let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
-        if !self.array_known_fast(pc, obj) {
+        let known = self.array_known_fast(pc, obj);
+        if !known {
             self.iload_operand(a, obj);
             a.g_cmp_mem(RAX, rbp, s.held);
-            a.jne(slow);
+            a.jne(walk);
         }
         self.index_rax(a, index)?;
         a.g_cmp_mem(RAX, rbp, s.len);
@@ -212,6 +290,10 @@ impl NumGen {
             None => a.store_rax(disp(dst)),
         }
         a.jmp(done);
+        if !known {
+            a.bind(walk);
+            self.iwalk_arr_get(a, dst, obj, index, false, done)?;
+        }
         a.bind(slow);
         self.int_skip = Some(done);
         Some(())
