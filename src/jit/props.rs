@@ -1795,7 +1795,7 @@ impl X64Assembler {
     }
 
     /// `cmove reg, [base+disp32]` (64-bit; the load happens either way).
-    fn g_cmove_mem(&mut self, reg: u8, base: u8, disp: i32) {
+    pub(crate) fn g_cmove_mem(&mut self, reg: u8, base: u8, disp: i32) {
         debug_assert!(base & 7 != 4, "no SIB form");
         let rex = 0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
         self.code.extend_from_slice(&[rex, 0x0f, 0x44]);

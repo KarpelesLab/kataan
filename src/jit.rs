@@ -15325,7 +15325,13 @@ impl JitFunction {
                         () => {
                             if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
                                 let not_view = a.new_label();
-                                a.t_hoisted(v, disp(obj), not_view);
+                                // (A register the loop never writes: its
+                                // view's kind, `NO_VIEW` included, is tested
+                                // on the general path only.)
+                                let late = v.held.is_none() && v.spec().is_some();
+                                if !late {
+                                    a.t_hoisted(v, disp(obj), not_view);
+                                }
                                 elem_index!(helper);
                                 a.t_get(
                                     typed::typed_layout(),
@@ -15334,6 +15340,7 @@ impl JitFunction {
                                     got,
                                     xmm_past,
                                     v.hint,
+                                    late.then_some(not_view),
                                 );
                                 a.bind(not_view);
                             }
@@ -15437,6 +15444,7 @@ impl JitFunction {
                             got,
                             xmm_past,
                             typed::kind_hint_at(op_idx, obj),
+                            None,
                         );
                     }
                     // jit_helper_get_elem(ctx, recv, key).
@@ -15592,7 +15600,12 @@ impl JitFunction {
                     // (`typed::ViewSlots`): the element written with no walk.
                     if let Some(v) = num.hoisted_view(op_idx, obj).filter(|_| typed) {
                         let not_view = a.new_label();
-                        a.t_hoisted(v, disp(obj), not_view);
+                        // (As the read's: the kind tested late.)
+                        let late =
+                            v.held.is_none() && v.spec().is_some_and(|k| k != typed::UINT8_CLAMPED);
+                        if !late {
+                            a.t_hoisted(v, disp(obj), not_view);
+                        }
                         typed_value!();
                         store_index!(helper);
                         match val_x {
@@ -15605,6 +15618,7 @@ impl JitFunction {
                             helper,
                             done,
                             v.hint,
+                            late.then_some(not_view),
                         );
                         a.bind(not_view);
                     }
@@ -15746,6 +15760,7 @@ impl JitFunction {
                             helper,
                             done,
                             typed::kind_hint_at(op_idx, obj),
+                            None,
                         );
                     }
                     // jit_helper_set_elem(ctx, recv, key, val).

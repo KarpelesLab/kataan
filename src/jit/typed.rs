@@ -140,6 +140,24 @@ pub(crate) struct ViewSlots {
     /// The kind its accesses test first ([`kind_hint`], [`NO_VIEW`] for
     /// none): every other served kind is still tested after it.
     pub(crate) hint: u8,
+    /// The **fast length** ([`ViewSlots::spec`]): the length when the view
+    /// is of kind `hint`, else `0` (no view, another kind). An access whose
+    /// index is below it is of that kind, with no test of the kind slot;
+    /// any other index takes the out-of-line general path (the length, then
+    /// every served kind), which also serves the other kinds.
+    pub(crate) flen: i32,
+}
+
+impl ViewSlots {
+    /// The kind its accesses are specialised on ([`ViewSlots::flen`]):
+    /// `hint`, when it is a served kind.
+    pub(crate) const fn spec(self) -> Option<u8> {
+        if self.hint <= FLOAT64 {
+            Some(self.hint)
+        } else {
+            None
+        }
+    }
 }
 
 /// Where [`t_hoist`](X64Assembler::t_hoist) finds the value to check: a
@@ -359,7 +377,7 @@ pub(crate) const INT_READ_ORDER: [u8; 7] =
 
 /// x86 condition codes beyond [`cc`]'s.
 const CC_O: u8 = 0x0;
-const CC_NP: u8 = 0xb;
+const CC_P: u8 = 0xa;
 const CC_NS: u8 = 0x9;
 const CC_S: u8 = 0x8;
 const CC_LE: u8 = 0xe;
@@ -469,7 +487,10 @@ impl X64Assembler {
     /// `xmm0`), an element whose Number is no NaN goes into `xmm x` and on
     /// to `past` instead, skipping the round trip through `rax` that
     /// `got`'s code (`xmm x = rax`, then `past`) would make; a NaN still
-    /// goes through `got`. Clobbers `r8`, `r11`, `xmm0`.
+    /// goes through `got`. With `not_view`, a hoisted view's register that
+    /// holds no view ([`NO_VIEW`]) goes there instead (else to `miss`).
+    /// Clobbers `r8`, `r11`, `xmm0`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn t_get(
         &mut self,
         t: &TypedLayout,
@@ -478,7 +499,40 @@ impl X64Assembler {
         got: Label,
         to: Option<(u8, Label)>,
         hint: u8,
+        not_view: Option<Label>,
     ) {
+        // A hoisted view specialised on its kind ([`ViewSlots::flen`]): an
+        // index below the fast length reads that kind with no kind test;
+        // the general path (out of line) serves the rest.
+        if let Src::Hoisted(v) = src
+            && let Some(k) = v.spec()
+        {
+            let general = self.new_label();
+            self.g_cmp_mem(r::RAX, r::RBP, v.flen);
+            self.g_jcc(cc::AE, general);
+            self.g_load(r::R8, r::RBP, v.base);
+            self.t_get_kind(k, got, to);
+            let cold = self.cold_begin();
+            self.bind(general);
+            if let Some(nv) = not_view {
+                self.g_cmp_byte_imm(r::RBP, v.kind, NO_VIEW);
+                self.g_jcc(cc::E, nv);
+            }
+            self.t_index(t, src, miss);
+            for kind in READ_ORDER.iter().copied().filter(|&q| q != k) {
+                let next = self.new_label();
+                self.t_kind(t, src, kind, next, miss);
+                self.t_get_kind(kind, got, to);
+                self.bind(next);
+            }
+            self.jmp(miss);
+            self.cold_end(cold);
+            return;
+        }
+        if let (Src::Hoisted(v), Some(nv)) = (src, not_view) {
+            self.g_cmp_byte_imm(r::RBP, v.kind, NO_VIEW);
+            self.g_jcc(cc::E, nv);
+        }
         self.t_index(t, src, miss);
         // (The kind slot is loop-invariant for a hoisted view: the chain's
         // branches are predicted; the hinted kind first, the float kinds
@@ -490,48 +544,59 @@ impl X64Assembler {
         for kind in hinted(&READ_ORDER, hint) {
             let next = self.new_label();
             self.t_kind(t, src, kind, next, miss);
-            let s = size_log2(kind);
-            // Where the Number goes: `xmm x`, or `xmm0` (then `rax`).
-            let x = to.map_or(0, |(x, _)| x);
-            match kind {
-                INT8 => self.t_elem(None, false, &[0x0f, 0xbe], r::RAX, s), // movsx eax, byte
-                UINT8 | UINT8_CLAMPED => self.t_elem(None, false, &[0x0f, 0xb6], r::RAX, s),
-                INT16 => self.t_elem(None, false, &[0x0f, 0xbf], r::RAX, s), // movsx eax, word
-                UINT16 => self.t_elem(None, false, &[0x0f, 0xb7], r::RAX, s), // movzx eax, word
-                INT32 | UINT32 => self.t_elem(None, false, &[0x8b], r::RAX, s), // mov eax, dword
-                FLOAT32 => self.t_elem(Some(0xf3), false, &[0x0f, 0x5a], x, s), // cvtss2sd xmm x
-                _ => self.t_elem(Some(0xf2), false, &[0x0f, 0x10], x, s),    // movsd xmm x
-            }
-            if !matches!(kind, FLOAT32 | FLOAT64) {
-                // (`cvtsi2sd` writes only the low lane: without this, each
-                // conversion would wait for the last write of `xmm x`.)
-                self.t_rr(0, false, 0x57, x, x); // xorps xmm x, xmm x
-            }
-            match kind {
-                // cvtsi2sd xmm x, rax (the zero-extended `u32`).
-                UINT32 => self.t_rr(0xf2, true, 0x2a, x, r::RAX),
-                FLOAT32 | FLOAT64 => {
-                    // A NaN is the canonical one.
-                    let num = self.new_label();
-                    self.t_rr(0x66, false, 0x2e, x, x); // ucomisd xmm x, xmm x
-                    self.g_jcc(CC_NP, num);
-                    self.g_movabs(r::RAX, crate::nanbox::NanBox::number(f64::NAN).to_bits());
-                    self.jmp(got);
-                    self.bind(num);
-                }
-                // cvtsi2sd xmm x, eax (the sign- or zero-extended value).
-                _ => self.t_rr(0xf2, false, 0x2a, x, r::RAX),
-            }
-            match to {
-                Some((_, past)) => self.jmp(past),
-                None => {
-                    self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
-                    self.jmp(got);
-                }
-            }
+            self.t_get_kind(kind, got, to);
             self.bind(next);
         }
         self.jmp(miss);
+    }
+
+    /// [`t_get`](Self::t_get)'s read of an element of kind `kind` at `[r8 +
+    /// rax << size]`, then to `got` (or `to`'s `past`).
+    fn t_get_kind(&mut self, kind: u8, got: Label, to: Option<(u8, Label)>) {
+        let s = size_log2(kind);
+        // Where the Number goes: `xmm x`, or `xmm0` (then `rax`).
+        let x = to.map_or(0, |(x, _)| x);
+        match kind {
+            INT8 => self.t_elem(None, false, &[0x0f, 0xbe], r::RAX, s), // movsx eax, byte
+            UINT8 | UINT8_CLAMPED => self.t_elem(None, false, &[0x0f, 0xb6], r::RAX, s),
+            INT16 => self.t_elem(None, false, &[0x0f, 0xbf], r::RAX, s), // movsx eax, word
+            UINT16 => self.t_elem(None, false, &[0x0f, 0xb7], r::RAX, s), // movzx eax, word
+            INT32 | UINT32 => self.t_elem(None, false, &[0x8b], r::RAX, s), // mov eax, dword
+            FLOAT32 => self.t_elem(Some(0xf3), false, &[0x0f, 0x5a], x, s), // cvtss2sd xmm x
+            _ => self.t_elem(Some(0xf2), false, &[0x0f, 0x10], x, s),    // movsd xmm x
+        }
+        if !matches!(kind, FLOAT32 | FLOAT64) {
+            // (`cvtsi2sd` writes only the low lane: without this, each
+            // conversion would wait for the last write of `xmm x`.)
+            self.t_rr(0, false, 0x57, x, x); // xorps xmm x, xmm x
+        }
+        match kind {
+            // cvtsi2sd xmm x, rax (the zero-extended `u32`).
+            UINT32 => self.t_rr(0xf2, true, 0x2a, x, r::RAX),
+            FLOAT32 | FLOAT64 => {
+                // A NaN is the canonical one (out of line).
+                let nan = self.new_label();
+                let num = self.new_label();
+                self.t_rr(0x66, false, 0x2e, x, x); // ucomisd xmm x, xmm x
+                self.g_jcc(CC_P, nan);
+                self.jmp(num);
+                let cold = self.cold_begin();
+                self.bind(nan);
+                self.g_movabs(r::RAX, crate::nanbox::NanBox::number(f64::NAN).to_bits());
+                self.jmp(got);
+                self.cold_end(cold);
+                self.bind(num);
+            }
+            // cvtsi2sd xmm x, eax (the sign- or zero-extended value).
+            _ => self.t_rr(0xf2, false, 0x2a, x, r::RAX),
+        }
+        match to {
+            Some((_, past)) => self.jmp(past),
+            None => {
+                self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+                self.jmp(got);
+            }
+        }
     }
 
     /// The element read of the integer version (`numeric::int32`): with
@@ -581,7 +646,17 @@ impl X64Assembler {
     /// the register at frame displacement `recv` holds view `v` and the
     /// index is below its length, then `eax` = the element of an integer
     /// kind (a Uint32 one past `i32::MAX` only when `wrap`), else to `miss`.
-    pub(crate) fn t_hoisted_get_i32(&mut self, v: ViewSlots, recv: i32, wrap: bool, miss: Label) {
+    /// With `out` another GPR, the element goes there instead of `eax`; a
+    /// miss finds `out` as it was, or holding the index's low 32 bits (so it
+    /// may be the GPR of the index, whose last read this is).
+    pub(crate) fn t_hoisted_get_i32(
+        &mut self,
+        v: ViewSlots,
+        recv: i32,
+        wrap: bool,
+        miss: Label,
+        out: u8,
+    ) {
         if let Some(h) = v.held {
             // (The value the facts are about: the index rides in `r11`.)
             self.g_mov(r::R11, r::RAX);
@@ -590,32 +665,90 @@ impl X64Assembler {
             self.g_jcc(cc::NE, miss);
             self.g_mov(r::RAX, r::R11);
         }
+        let got = self.new_label();
+        // Specialised on its kind ([`ViewSlots::flen`]): an index below the
+        // fast length reads that kind; the general path is out of line.
+        let spec = v.spec().filter(|&k| k != FLOAT32 && k != FLOAT64);
+        let cold = if let Some(k) = spec {
+            let general = self.new_label();
+            self.g_cmp_mem(r::RAX, r::RBP, v.flen);
+            self.g_jcc(cc::AE, general);
+            self.g_load(r::R11, r::RBP, v.base);
+            self.t_hoisted_i32_kind(k, wrap, miss, out);
+            self.jmp(got);
+            let cold = self.cold_begin();
+            self.bind(general);
+            Some((cold, k))
+        } else {
+            None
+        };
         self.g_cmp_mem(r::RAX, r::RBP, v.len);
         self.g_jcc(cc::AE, miss); // past the length, or negative
         // (No view, `NO_VIEW`, is no kind below: to `miss` with no load.)
         self.g_load(r::R11, r::RBP, v.base);
-        let got = self.new_label();
         for kind in hinted(&INT_READ_ORDER, v.hint) {
+            if cold.as_ref().is_some_and(|&(_, k)| k == kind) {
+                continue;
+            }
             let next = self.new_label();
             self.g_cmp_byte_imm(r::RBP, v.kind, kind);
             self.g_jcc(cc::NE, next);
-            let sib = (size_log2(kind) << 6) | 0x03; // [r11 + rax << s]
-            match kind {
-                INT8 => self.raw(&[0x41, 0x0f, 0xbe, 0x04, sib]), // movsx eax, byte
-                UINT8 | UINT8_CLAMPED => self.raw(&[0x41, 0x0f, 0xb6, 0x04, sib]),
-                INT16 => self.raw(&[0x41, 0x0f, 0xbf, 0x04, sib]), // movsx eax, word
-                UINT16 => self.raw(&[0x41, 0x0f, 0xb7, 0x04, sib]), // movzx eax, word
-                _ => self.raw(&[0x41, 0x8b, 0x04, sib]),           // mov eax, dword
-            }
-            if kind == UINT32 && !wrap {
-                self.raw(&[0x85, 0xc0]); // test eax, eax
-                self.g_jcc(CC_S, miss); // past i32::MAX
+            self.t_hoisted_i32_kind(kind, wrap, miss, r::RAX);
+            if out != r::RAX {
+                // mov out32, eax
+                self.code
+                    .extend_from_slice(&[0x40 | ((out >> 3) & 1), 0x89, 0xc0 | (out & 7)]);
             }
             self.jmp(got);
             self.bind(next);
         }
         self.jmp(miss);
+        if let Some((c, _)) = cold {
+            self.cold_end(c);
+        }
         self.bind(got);
+    }
+
+    /// [`t_hoisted_get_i32`](Self::t_hoisted_get_i32)'s read of an element
+    /// of integer kind `kind` at `[r11 + rax << size]` into `eax` (a Uint32
+    /// one past `i32::MAX` to `miss` unless `wrap`).
+    fn t_hoisted_i32_kind(&mut self, kind: u8, wrap: bool, miss: Label, out: u8) {
+        let sib = (size_log2(kind) << 6) | 0x03; // [r11 + rax << s]
+        // REX (B for `r11`, R for an `out` past `rdi`); ModRM `[SIB]`.
+        let rex = 0x41 | (((out >> 3) & 1) << 2);
+        let m = ((out & 7) << 3) | 0x04;
+        match kind {
+            INT8 => self.raw(&[rex, 0x0f, 0xbe, m, sib]), // movsx out, byte
+            UINT8 | UINT8_CLAMPED => self.raw(&[rex, 0x0f, 0xb6, m, sib]),
+            INT16 => self.raw(&[rex, 0x0f, 0xbf, m, sib]), // movsx out, word
+            UINT16 => self.raw(&[rex, 0x0f, 0xb7, m, sib]), // movzx out, word
+            _ => self.raw(&[rex, 0x8b, m, sib]),           // mov out, dword
+        }
+        if kind == UINT32 && !wrap {
+            // test out, out
+            self.raw(&[
+                0x40 | (((out >> 3) & 1) * 5),
+                0x85,
+                0xc0 | ((out & 7) << 3) | (out & 7),
+            ]);
+            if out == r::RAX {
+                self.g_jcc(CC_S, miss); // past i32::MAX
+            } else {
+                // (`out` gets the index back, out of line: it may be the
+                // index's own GPR, which the miss must still see.)
+                let back = self.new_label();
+                let past = self.new_label();
+                self.g_jcc(CC_S, back);
+                self.jmp(past);
+                let cold = self.cold_begin();
+                self.bind(back);
+                self.code
+                    .extend_from_slice(&[0x40 | ((out >> 3) & 1), 0x89, 0xc0 | (out & 7)]); // mov out32, eax
+                self.jmp(miss);
+                self.cold_end(cold);
+                self.bind(past);
+            }
+        }
     }
 
     /// A hoisted view's entry check ([`ViewSlots`]): when the register at
@@ -661,6 +794,15 @@ impl X64Assembler {
         self.bind(ok);
         self.g_load(r::RAX, r::RCX, t.off_length);
         self.g_store(r::RBP, v.len, r::RAX);
+        // The fast length: the length for a view of the specialised kind.
+        if let Some(k) = v.spec() {
+            let same = self.new_label();
+            self.g_cmp_byte_imm(r::RCX, t.off_kind, k);
+            self.g_jcc(cc::E, same);
+            self.raw(&[0x31, 0xc0]); // xor eax, eax
+            self.bind(same);
+        }
+        self.g_store(r::RBP, v.flen, r::RAX);
         self.g_load(r::RAX, r::R9, t.off_data_ptr);
         self.g_add_mem(r::RAX, r::RCX, t.off_byte_offset);
         self.g_store(r::RBP, v.base, r::RAX);
@@ -675,6 +817,7 @@ impl X64Assembler {
         self.jmp(done);
         self.bind(none);
         self.g_store_imm32(r::RBP, v.kind, i32::from(NO_VIEW));
+        self.g_store_imm32(r::RBP, v.flen, 0);
         if let Some(h) = v.held {
             // (No register holds the throw sentinel: no access matches.)
             self.g_movabs(r::RAX, crate::nanbox::NanBox::jit_throw_bits());
@@ -768,10 +911,79 @@ impl X64Assembler {
     /// index (and, for [`Src::View`], `rcx` / `r9` from
     /// [`t_view`](Self::t_view)), stores it and on to `done`, else (nothing
     /// written) to `miss`. Clobbers `rdx`, `r8`, `r11`, `xmm1`.
-    pub(crate) fn t_set(&mut self, t: &TypedLayout, src: Src, miss: Label, done: Label, hint: u8) {
+    pub(crate) fn t_set(
+        &mut self,
+        t: &TypedLayout,
+        src: Src,
+        miss: Label,
+        done: Label,
+        hint: u8,
+        not_view: Option<Label>,
+    ) {
+        // A hoisted view specialised on its kind ([`ViewSlots::flen`]): an
+        // index below the fast length writes that kind with no kind test;
+        // the general path (out of line) serves the rest.
+        let spec = match src {
+            Src::Hoisted(v) => v.spec().filter(|&k| k != UINT8_CLAMPED),
+            Src::View => None,
+        };
+        let mut cold = None;
+        if let (Src::Hoisted(v), Some(k)) = (src, spec) {
+            let general = self.new_label();
+            self.g_cmp_mem(r::RAX, r::RBP, v.flen);
+            self.g_jcc(cc::AE, general);
+            self.g_load(r::R8, r::RBP, v.base);
+            self.t_set_kind(k, miss);
+            self.jmp(done);
+            cold = Some(self.cold_begin());
+            self.bind(general);
+        }
+        if let (Src::Hoisted(v), Some(nv)) = (src, not_view) {
+            self.g_cmp_byte_imm(r::RBP, v.kind, NO_VIEW);
+            self.g_jcc(cc::E, nv);
+        }
+        self.t_set_general(
+            t,
+            src,
+            miss,
+            done,
+            if spec.is_some() { NO_VIEW } else { hint },
+        );
+        if let Some(c) = cold {
+            self.cold_end(c);
+        }
+    }
+
+    /// [`t_set`](Self::t_set)'s write of the Number in `xmm0` as an element
+    /// of kind `kind` (not Uint8Clamped) at `[r8 + rax << size]` (a hoisted
+    /// view's, wholly in its store), else to `miss` (nothing written).
+    fn t_set_kind(&mut self, kind: u8, miss: Label) {
+        match kind {
+            FLOAT64 => self.t_elem(Some(0xf2), false, &[0x0f, 0x11], 0, 3), // movsd [..], xmm0
+            FLOAT32 => {
+                self.raw(&[0xf2, 0x0f, 0x5a, 0xc8]); // cvtsd2ss xmm1, xmm0
+                self.t_elem(Some(0xf3), false, &[0x0f, 0x11], 1, 2); // movss [..], xmm1
+            }
+            _ => {
+                // (The truncation's low bits, see `t_set_general`.)
+                self.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd0]); // cvttsd2si rdx, xmm0
+                self.raw(&[0x48, 0x83, 0xfa, 0x01]); // cmp rdx, 1
+                self.g_jcc(CC_O, miss);
+                match size_log2(kind) {
+                    0 => self.t_elem(None, false, &[0x88], r::RDX, 0), // mov byte [..], dl
+                    1 => self.t_elem(Some(0x66), false, &[0x89], r::RDX, 1), // word
+                    _ => self.t_elem(None, false, &[0x89], r::RDX, 2), // dword
+                }
+            }
+        }
+    }
+
+    /// [`t_set`](Self::t_set) testing the kinds (`hint` first, when one).
+    fn t_set_general(&mut self, t: &TypedLayout, src: Src, miss: Label, done: Label, hint: u8) {
         self.t_index(t, src, miss);
         let hint = match src {
-            Src::Hoisted(v) => v.hint,
+            Src::Hoisted(v) if hint != NO_VIEW => v.hint,
+            Src::Hoisted(_) => NO_VIEW,
             Src::View => hint,
         };
         // The view's kind byte compared with `imm`.

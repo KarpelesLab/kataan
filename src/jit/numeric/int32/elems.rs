@@ -33,6 +33,67 @@ fn row_memo_enabled() -> bool {
 }
 
 impl NumGen {
+    /// At inner loop header `h` of the integer version being emitted, on
+    /// entry into the loop: its row fills (`Region::fills`) — each
+    /// register's array (or view) becomes its hoisted one, as the region's
+    /// entry check would make it (else its slots say there is none), so the
+    /// loop's accesses of it need no compare (`NumGen::row_known`).
+    pub(in super::super) fn irow_fills(&mut self, a: &mut X64Assembler, h: usize) -> Option<()> {
+        let ri = self.imode?;
+        let Some(mut regs) = self.regions[ri]
+            .fills
+            .iter()
+            .find(|f| f.0 == h)
+            .map(|f| f.2.clone())
+        else {
+            return Some(());
+        };
+        regs.sort_unstable();
+        regs.dedup();
+        self.cur_pc = h;
+        let l = self.env.heap;
+        // Plain arrays' only (no register with a hoisted view too), with the
+        // arena pinned: only `rax`, `rcx`, `r11` and `xmm0` (`p_fill_array`).
+        let arrays = regs.iter().all(|&r| {
+            self.hoisted_array(h, r).is_some() && self.hoisted_view_slots(ri, r).is_none()
+        });
+        if arrays && a.pinned() {
+            for r in regs {
+                self.iload_operand(a, r);
+                if let Some(s) = self.hoisted_array(h, r) {
+                    a.p_fill_array(&l, self.env.realm, s);
+                }
+            }
+            return Some(());
+        }
+        // (The checks clobber `rax`, `rcx`, `r8`, `r9`, `r11`, unpinned
+        // `rdx` / `r10`, and `xmm0`.)
+        let saves = self.walk_saves(u16::MAX);
+        for &g in &saves {
+            a.raw(&[0x41, 0x50 + (g & 7)]); // push r8..r10
+        }
+        for r in regs {
+            // (Its value into the register file, where the check reads it.)
+            if let Some(x) = self.xmm_of(self.imode, r) {
+                a.movq_gpr_x(RAX, x);
+                a.store_rax(disp(r));
+            }
+            let from = typed::HoistFrom::Reg(disp(r));
+            // (Both, for a register with a hoisted array and a hoisted view:
+            // every access of it in the loop takes either as known.)
+            if let Some(s) = self.hoisted_array(h, r) {
+                a.p_hoist_array(&l, self.env.realm, from, s);
+            }
+            if let Some(v) = self.hoisted_view_slots(ri, r) {
+                a.t_hoist(&l, typed::typed_layout(), self.env.realm, from, v);
+            }
+        }
+        for &g in saves.iter().rev() {
+            a.raw(&[0x41, 0x58 + (g & 7)]); // pop r8..r10
+        }
+        Some(())
+    }
+
     /// The int GPRs the walk clobbers that hold an int register live at the
     /// current pc other than `dst` (whose value the op replaces).
     fn walk_saves(&self, dst: u16) -> alloc::vec::Vec<u8> {
@@ -180,7 +241,7 @@ impl NumGen {
         let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
         // (A receiver known to be the held array whenever there is one: the
         // bounds check alone, the count `0` when the entry found none.)
-        let known = self.array_known_fast(pc, obj);
+        let known = self.array_known_fast(pc, obj) || self.row_known(pc, obj);
         if !known {
             self.iload_operand(a, obj);
             a.g_cmp_mem(RAX, rbp, s.held);
@@ -204,6 +265,7 @@ impl NumGen {
         a.jcc(CC_NE, slow);
         self.iput(a, dst, RCX)?;
         a.jmp(done);
+        self.skip_cold(a);
         if !known {
             a.bind(walk);
             // (A wrapped read's bits: the generic code's.)
@@ -326,7 +388,7 @@ impl NumGen {
         let slow = a.new_label();
         let walk = a.new_label();
         let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
-        let known = self.array_known_fast(pc, obj);
+        let known = self.array_known_fast(pc, obj) || self.row_known(pc, obj);
         if !known {
             self.iload_operand(a, obj);
             a.g_cmp_mem(RAX, rbp, s.held);
@@ -343,6 +405,7 @@ impl NumGen {
             None => a.store_rax(disp(dst)),
         }
         a.jmp(done);
+        self.skip_cold(a);
         if !known {
             a.bind(walk);
             self.iwalk_arr_get(a, dst, obj, index, false, done, s)?;
@@ -379,7 +442,7 @@ impl NumGen {
         };
         let slow = a.new_label();
         let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
-        if !self.array_known_fast(pc, obj) {
+        if !self.array_known_fast(pc, obj) && !self.row_known(pc, obj) {
             self.iload_operand(a, obj);
             a.g_cmp_mem(RAX, RBP, s.held);
             a.jne(slow);
@@ -418,6 +481,7 @@ impl NumGen {
         }
         a.mov_at_r11_rax8_rdx(); // elems[idx] = val
         a.jmp(done);
+        self.skip_cold(a);
         a.bind(slow);
         self.int_skip = Some(done);
         Some(())
@@ -439,7 +503,7 @@ impl NumGen {
         let rbp = crate::jit::call_seq::r::RBP;
         let slow = a.new_label();
         let done = self.int_skip.take().unwrap_or_else(|| a.new_label());
-        if self.array_known_fast(pc, arr) {
+        if self.array_known_fast(pc, arr) || self.row_known(pc, arr) {
             a.cmp_frame_imm8(s.held, crate::jit::RECV_CACHE_EMPTY as i8);
             a.jcc(CC_E, slow);
         } else {
@@ -453,6 +517,7 @@ impl NumGen {
         a.jcc(super::super::CC_A, slow);
         self.iput(a, dst, RAX)?;
         a.jmp(done);
+        self.skip_cold(a);
         a.bind(slow);
         self.int_skip = Some(done);
         Some(())
@@ -478,8 +543,14 @@ impl NumGen {
         // double.)
         self.demote_last(dst);
         self.index_rax(a, index)?;
-        a.t_hoisted_get_i32(v, disp(obj), wrap, bail);
-        self.iput(a, dst, RAX)?;
+        // (Straight into `dst`'s GPR, which a miss leaves as it was or
+        // holding the index: it may be the index's.)
+        let out = match self.ik(dst)? {
+            IK::Gpr(g) => g,
+            _ => RAX,
+        };
+        a.t_hoisted_get_i32(v, disp(obj), wrap, bail, out);
+        self.iput(a, dst, out)?;
         Some(())
     }
 

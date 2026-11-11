@@ -737,6 +737,16 @@ struct Region {
     /// take as a Number, every path of the read that may find another
     /// value leaving for the plain copy.
     num_reads: Vec<usize>,
+    /// The loops' invariant prefixes ([`plan_licm`]), for its integer
+    /// version (kept by `NumGen::new` for a speculative one).
+    licm: Vec<Licm>,
+    /// Its integer version's **row fills**: per inner loop `(header, end)`
+    /// of a nest, the hoisted arrays ([`Region::aviews`]) of registers the
+    /// region writes but that loop does not, which the loop reads: on every
+    /// entry into the loop (falling into its header), the array the
+    /// register holds becomes the hoisted one (`NumGen::irow_fill`), so
+    /// every access of it in the loop is the inline one.
+    fills: Vec<(usize, usize, Vec<u16>)>,
 }
 
 impl Region {
@@ -1289,6 +1299,9 @@ pub(super) struct NumGen {
     /// has its value (past the generic emitter's code for the op, which is
     /// its slow path): bound by [`Self::after_generic_op`].
     int_skip: Option<Label>,
+    /// With `int_skip`: the cold region its slow paths are in
+    /// (`int32::NumGen::skip_cold`).
+    int_skip_cold: Option<super::ColdMark>,
     /// The int GPRs (bits by their index in `int32::GPRS`) whose save
     /// slots hold their current values, so the next save may skip them
     /// (`int32::NumGen::int_save`), and that set before the op being
@@ -1311,6 +1324,11 @@ pub(super) struct NumGen {
     /// The plainly lazy activations the op being emitted lies in
     /// (`call_seq::PlainLazy`), which its stubs take along.
     plain_lazy: Vec<super::call_seq::PlainLazy>,
+    /// While a speculative region's integer version is emitted: per loop
+    /// header with an invariant prefix or row fills ([`Region::licm`],
+    /// [`Region::fills`]), where its back-edge goes (past them), and whether
+    /// its row fills were emitted.
+    loop_body: Vec<(usize, Label, bool)>,
 }
 
 /// An inline `Math.f(x)` call of a speculative region's fast version that
@@ -1926,6 +1944,66 @@ impl NumGen {
                 n_aproof += 1;
             }
         }
+        // The numeric promoted bindings of the integer versions without a
+        // speculative one, and the registers only their reads write.
+        if regions
+            .iter()
+            .any(|r| !r.spec_int && r.int.as_ref().is_some_and(|p| !p.globals.is_empty()))
+            && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
+        {
+            let live_at = |pc: usize, r: u16| {
+                (r as usize) < env.n_regs
+                    && live
+                        .get(pc * words + r as usize / 64)
+                        .is_none_or(|w| w & (1u64 << (r % 64)) != 0)
+            };
+            for r in &mut regions {
+                let (head, end) = (r.head, r.end);
+                if r.spec_int {
+                    continue;
+                }
+                let Some(p) = r.int.as_mut() else {
+                    continue;
+                };
+                let body = &bytecode[head..=end];
+                let mut names: Vec<&str> = Vec::new();
+                for g in &mut p.globals {
+                    let Some(Op::LoadGlobal { name, .. } | Op::StoreGlobal { name, .. }) =
+                        g.load_pc.or(g.store_pc).and_then(|q| bytecode.get(q))
+                    else {
+                        continue;
+                    };
+                    g.num = g.xmm.is_some()
+                        && body.iter().enumerate().all(|(i, op)| match op {
+                            Op::StoreGlobal { name: m, src, .. } if *m == *name => {
+                                types.get(head + i, *src) == T_NUM
+                            }
+                            _ => true,
+                        });
+                    if g.num {
+                        names.push(name.as_str());
+                    }
+                }
+                let mut regs: Vec<u16> = Vec::new();
+                for op in body {
+                    if let Op::LoadGlobal { dst, name, .. } = op
+                        && names.contains(&name.as_str())
+                        && !regs.contains(dst)
+                    {
+                        regs.push(*dst);
+                    }
+                }
+                regs.retain(|&x| {
+                    !live_at(head, x)
+                        && body.iter().all(|op| {
+                            let mut hit = written_reg(op) == Some(x);
+                            for_each_write(op, &mut |w| hit |= w == x);
+                            !hit || matches!(op, Op::LoadGlobal { name, .. } if names.contains(&name.as_str()))
+                        })
+                });
+                p.num_regs = regs;
+            }
+        }
         if regions.iter().any(|r| r.spec.is_some())
             && let Some((words, live)) = liveness(bytecode, env.n_regs, catches)
         {
@@ -1975,9 +2053,10 @@ impl NumGen {
                             continue;
                         }
                         r.views.push((v, (first + n_view_slots) as u32, src));
-                        // (A register the region may write: and the value
-                        // the facts are about, `ViewSlots::held`.)
-                        n_view_slots += if src == ViewSrc::Fixed { 3 } else { 4 };
+                        // (Its kind, length, first element and fast length;
+                        // for a register the region may write, also the
+                        // value the facts are about, `ViewSlots::held`.)
+                        n_view_slots += if src == ViewSrc::Fixed { 4 } else { 5 };
                     }
                 }
             }
@@ -2013,6 +2092,97 @@ impl NumGen {
                         }
                     }
                 }
+            }
+        }
+        // The speculative integer versions' invariant prefixes: only ops into
+        // int registers, reading hoisted views or arrays (whose inline reads
+        // walk nothing); their stops are where the loops' back-edges land.
+        // And their inner loops' row fills.
+        for r in &mut regions {
+            let Some(p) = r.int.as_ref().filter(|_| r.spec_int && licm_enabled()) else {
+                r.licm.clear();
+                continue;
+            };
+            let hoisted =
+                |x: u16| r.views.iter().any(|v| v.0 == x) || r.aviews.iter().any(|v| v.0 == x);
+            let cold = &r.cold;
+            r.licm.retain_mut(|l| {
+                let mut stop = l.head;
+                while stop < l.stop {
+                    if (stop > l.head && is_target.get(stop).copied().unwrap_or(true))
+                        || cold.iter().any(|&(_, f, e)| (f..e).contains(&stop))
+                    {
+                        break;
+                    }
+                    let ok = match &bytecode[stop] {
+                        Op::GetKey { obj, dst, .. } => hoisted(*obj) && p.has_int(*dst),
+                        Op::ArrayLen { arr, dst } => hoisted(*arr) && p.has_int(*dst),
+                        op => written_reg(op).is_some_and(|d| p.has_int(d)),
+                    };
+                    if !ok {
+                        break;
+                    }
+                    stop += 1;
+                }
+                l.regs.truncate(stop - l.head);
+                l.stop = stop;
+                stop > l.head
+            });
+            for l in &r.licm {
+                if let Some(t) = is_target.get_mut(l.stop) {
+                    *t = true;
+                }
+                if licm_log() {
+                    std::eprintln!(
+                        "[licm] loop {}..={}: prefix to {} {:?}",
+                        l.head,
+                        l.end,
+                        l.stop,
+                        l.regs
+                    );
+                }
+            }
+            let mut fills = Vec::new();
+            for &(h, e) in &r.loops {
+                // (Only an innermost loop, as an invariant prefix's: an entry
+                // at the header of a loop inside it would skip its fills.)
+                if r.loops
+                    .iter()
+                    .any(|&(h2, e2)| (h2, e2) != (h, e) && h <= h2 && e2 <= e)
+                {
+                    continue;
+                }
+                let body = &bytecode[h..=e];
+                let regs: Vec<u16> = r
+                    .views
+                    .iter()
+                    .chain(r.aviews.iter())
+                    .filter(|&&(v, _, src)| {
+                        src == ViewSrc::Held
+                            && body.iter().any(|op| match op {
+                                Op::GetKey { obj, .. }
+                                | Op::SetKey { obj, .. }
+                                | Op::SetKeyStrict { obj, .. } => *obj == v,
+                                Op::ArrayLen { arr, .. } => *arr == v,
+                                _ => false,
+                            })
+                            && !body.iter().any(|op| {
+                                let mut hit = written_reg(op) == Some(v);
+                                for_each_write(op, &mut |w| hit |= w == v);
+                                hit
+                            })
+                    })
+                    .map(|&(v, _, _)| v)
+                    .collect();
+                if !regs.is_empty() {
+                    if licm_log() {
+                        std::eprintln!("[licm] loop {h}..={e}: row fills {regs:?}");
+                    }
+                    fills.push((h, e, regs));
+                }
+            }
+            if rowfill_enabled() {
+                r.fills = fills;
             }
         }
         let mut me = Self {
@@ -2059,6 +2229,7 @@ impl NumGen {
             int_math: None,
             int_post: None,
             int_skip: None,
+            int_skip_cold: None,
             int_clean: (0, 0),
             int_clean_ok: false,
             rc_relied: Vec::new(),
@@ -2066,6 +2237,7 @@ impl NumGen {
             math_proofs: Vec::new(),
             plain_lazy: Vec::new(),
             icur: Vec::new(),
+            loop_body: Vec::new(),
         };
         me.icur = (0..n).filter(|&pc| me.iter_hoisted(pc).is_some()).collect();
         me
@@ -2392,14 +2564,102 @@ impl NumGen {
     pub(super) fn hoisted_view(&self, pc: usize, r: u16) -> Option<super::typed::ViewSlots> {
         let ri = self.region_at(pc)?;
         self.regions[ri].spec.as_ref()?;
-        self.hoisted_view_slots(ri, r)
+        let mut v = self.hoisted_view_slots(ri, r)?;
+        // (A register known to hold the value the entry check found, a
+        // global binding's just read: no compare. Should the entry have found
+        // no view there, the fast length is `0` and the kind slot `NO_VIEW`,
+        // which every general path tests.)
+        if v.held.is_some()
+            && let Some(&(_, _, src)) = self.regions[ri].views.iter().find(|x| x.0 == r)
+            && (self.src_known_at(ri, pc, r, src) || self.row_known(pc, r))
+        {
+            v.held = None;
+        }
+        Some(v)
+    }
+
+    /// Whether at op `pc` of the integer version being emitted, register
+    /// `r` holds the array (or view) its hoisted slots hold, if any: `pc`
+    /// lies in an inner loop whose entry filled them from `r`, which the
+    /// loop does not write ([`Region::fills`]).
+    pub(super) fn row_known(&self, pc: usize, r: u16) -> bool {
+        let Some(ri) = self.imode else {
+            return false;
+        };
+        self.regions[ri].fills.iter().any(|&(h, e, ref regs)| {
+            h <= pc
+                && pc <= e
+                && regs.contains(&r)
+                && self.loop_body.iter().any(|b| b.0 == h && b.2)
+        })
+    }
+
+    /// Whether at op `pc` of region `ri`'s fast version, register `r`
+    /// (hoisted from `src`) holds the value its entry check found: always
+    /// for one no op of the region writes ([`ViewSrc::Fixed`]); for a global
+    /// binding's reads ([`ViewSrc::Global`]), when such a read into `r` comes
+    /// a few ops before, with no join and no other write of `r` between.
+    fn src_known_at(&self, ri: usize, pc: usize, r: u16, src: ViewSrc) -> bool {
+        match src {
+            ViewSrc::Fixed => true,
+            ViewSrc::Global(g) => {
+                let Some(Op::LoadGlobal { name: n, .. }) = self.bc(g) else {
+                    return false;
+                };
+                let head = self.regions[ri].head;
+                let (mut d, mut u) = (Vec::new(), Vec::new());
+                let mut q = pc;
+                for _ in 0..8 {
+                    if q <= head || self.is_target.get(q).copied().unwrap_or(true) {
+                        return false;
+                    }
+                    q -= 1;
+                    let Some(o) = self.bc(q) else {
+                        return false;
+                    };
+                    if let Op::LoadGlobal { name, dst, .. } = o
+                        && *dst == r
+                    {
+                        return name == n;
+                    }
+                    def_use(o, &mut d, &mut u);
+                    let mut hit = d.contains(&r) || written_reg(o) == Some(r);
+                    for_each_write(o, &mut |w| hit |= w == r);
+                    if hit {
+                        return false;
+                    }
+                }
+                false
+            }
+            ViewSrc::Held | ViewSrc::Alias(_) => false,
+        }
+    }
+
+    /// Whether register `r` may be live on entry to header `h` of region
+    /// `ri` (its own, or an inner loop's of a nest): `false` only when the
+    /// region's liveness says it is not.
+    fn live_at_header(&self, ri: usize, h: usize, r: u16) -> bool {
+        let reg = &self.regions[ri];
+        if !reg.generic {
+            return true;
+        }
+        if h == reg.head {
+            return reg.live_head.contains(&r);
+        }
+        reg.live_inner
+            .iter()
+            .find(|x| x.0 == h)
+            .is_none_or(|x| x.1.contains(&r))
     }
 
     /// Speculative region `ri`'s hoisted views' entry checks (see
     /// [`super::typed::ViewSlots`]), at a point where nothing promoted is
-    /// live and the register file is up to date. Clobbers `rax`, `rcx`,
-    /// `rdx`, `r8`..`r11`.
-    fn hoist_views(&self, a: &mut X64Assembler, ri: usize) {
+    /// live and the register file is up to date: on entry to its header
+    /// `at` (the region's, or an inner loop's). A register the region writes
+    /// that is not live there (written before it is read) gets no check: its
+    /// slots only say there is no view (an access compares the register
+    /// with them first). Clobbers `rax`, `rcx`, `rdx`, `r8`..`r11`.
+    fn hoist_views(&self, a: &mut X64Assembler, ri: usize, at: usize) {
         // The entry-hoisted global reads ([`plan_hoisted_globals`]): their
         // registers from the bindings (`spec_globals_ready` just proved
         // the addresses filled). Not one the fast version leaves out anyway
@@ -2443,6 +2703,17 @@ impl NumGen {
                 lend: self.gslot_disp(k + 3),
                 wb: self.gslot_disp(k + 4),
             };
+            if src == ViewSrc::Held && !self.live_at_header(ri, at, r) {
+                // (No register holds the empty key; the count `0` rejects
+                // every index of an access that does not compare.)
+                a.g_movabs(
+                    super::call_seq::r::RAX,
+                    super::RECV_CACHE_EMPTY as i64 as u64,
+                );
+                a.g_store(super::call_seq::r::RBP, s.held, super::call_seq::r::RAX);
+                a.g_store_imm32(super::call_seq::r::RBP, s.len, 0);
+                continue;
+            }
             a.p_hoist_array(l, self.env.realm, from, s);
         }
         if self.regions[ri].views.is_empty() {
@@ -2510,21 +2781,7 @@ impl NumGen {
         let Some(&(_, _, src)) = self.regions[ri].aviews.iter().find(|v| v.0 == r) else {
             return false;
         };
-        match src {
-            ViewSrc::Fixed => true,
-            ViewSrc::Global(g) => {
-                pc > self.regions[ri].head
-                    && !self.is_target.get(pc).copied().unwrap_or(true)
-                    && match (self.bc(g), self.bc(pc - 1)) {
-                        (
-                            Some(Op::LoadGlobal { name: n, .. }),
-                            Some(Op::LoadGlobal { name, dst, .. }),
-                        ) => *dst == r && name == n,
-                        _ => false,
-                    }
-            }
-            ViewSrc::Held | ViewSrc::Alias(_) => false,
-        }
+        self.src_known_at(ri, pc, r, src)
     }
 
     /// For an array iteration's step `pc` (`IterNext`) in a speculative
@@ -2788,7 +3045,8 @@ impl NumGen {
             kind: self.gslot_disp(k),
             len: self.gslot_disp(k + 1),
             base: self.gslot_disp(k + 2),
-            held: (src != ViewSrc::Fixed).then(|| self.gslot_disp(k + 3)),
+            flen: self.gslot_disp(k + 3),
+            held: (src != ViewSrc::Fixed).then(|| self.gslot_disp(k + 4)),
             hint: self.view_hint(ri, r),
         })
     }
@@ -2820,6 +3078,49 @@ impl NumGen {
                 Some(_) => return NO_VIEW,
                 None => {}
             }
+        }
+        if seen != NO_VIEW {
+            return seen;
+        }
+        // A global binding's view, read in a loop that had not run when the
+        // body was compiled (a function's second loop nest): what the
+        // function's other accesses of that binding's reads saw.
+        let Some(&(_, _, ViewSrc::Global(g))) = self.regions[ri].views.iter().find(|v| v.0 == r)
+        else {
+            return NO_VIEW;
+        };
+        let Some(Op::LoadGlobal { name, .. }) = self.bc(g) else {
+            return NO_VIEW;
+        };
+        let n = self.env.bytecode_len;
+        let regs: Vec<u16> = (0..n)
+            .filter_map(|q| match self.bc(q) {
+                Some(Op::LoadGlobal { dst, name: m, .. }) if m == name => Some(*dst),
+                _ => None,
+            })
+            .collect();
+        let loads = |o: u16| regs.contains(&o);
+        for pc in 0..n {
+            let obj = match self.bc(pc) {
+                Some(
+                    Op::GetKey { obj, .. } | Op::SetKey { obj, .. } | Op::SetKeyStrict { obj, .. },
+                ) => *obj,
+                _ => continue,
+            };
+            let k = match crate::ic::elem_fb::typed_kind(site_kind(pc)) {
+                Some(k) => k,
+                None => match kind_hint(obj) {
+                    NO_VIEW => continue,
+                    k => k,
+                },
+            };
+            if !loads(obj) {
+                continue;
+            }
+            if seen != NO_VIEW && seen != k {
+                return NO_VIEW;
+            }
+            seen = k;
         }
         seen
     }
@@ -3835,6 +4136,17 @@ impl NumGen {
     }
 
     fn ty(&self, pc: usize, r: u16) -> u8 {
+        // (A numeric promoted binding's read, in the integer version:
+        // `IntPlan::num_regs`.)
+        if let Some(ri) = self.imode
+            && self.region_at(pc) == Some(ri)
+            && self.regions[ri]
+                .int
+                .as_ref()
+                .is_some_and(|p| p.num_regs.contains(&r))
+        {
+            return T_NUM;
+        }
         if let Some(ri) = self.region_at(pc)
             && let Some(sp) = &self.regions[ri].spec
         {
@@ -3880,6 +4192,25 @@ impl NumGen {
                         self.ilabels[q] = self.int_labels[q]?;
                     }
                     self.spec_int_entry(a, ri)?;
+                    // Where each loop's back-edge goes: past its invariant
+                    // prefix (`Region::licm`).
+                    self.loop_body.clear();
+                    for l in &self.regions[ri].licm {
+                        self.loop_body.push((l.head, self.ilabels[l.stop], false));
+                    }
+                } else if self.regions[ri].fills.iter().any(|f| f.0 == pc) {
+                    // An inner loop's entry: its row fills, which its
+                    // back-edge goes past (`Region::fills`).
+                    self.irow_fills(a, pc)?;
+                    match self.loop_body.iter_mut().find(|b| b.0 == pc) {
+                        Some(b) => b.2 = true,
+                        None => {
+                            let past = a.new_label();
+                            a.bind(past);
+                            self.loop_body.push((pc, past, true));
+                        }
+                    }
+                    self.cur_pc = pc;
                 }
                 let il = core::mem::take(&mut self.ilabels);
                 let r = self.emit_spec_int_op(a, &il, throw_exit, pc, ops, reg);
@@ -3915,7 +4246,7 @@ impl NumGen {
                 self.leaves_ok(a, ri, pc)?;
                 self.refresh_globals(a, ri, true);
                 self.spec_globals_ready(a, ri, pc)?;
-                self.hoist_views(a, ri);
+                self.hoist_views(a, ri, pc);
                 self.load_carried_globals(a, ri);
             }
             for s in &self.regions[ri].slots {
@@ -4479,7 +4810,7 @@ impl NumGen {
                     if validate {
                         self.refresh_globals(a, ri, true);
                         self.spec_globals_ready(a, ri, target)?;
-                        self.hoist_views(a, ri);
+                        self.hoist_views(a, ri, target);
                     }
                     self.reload(a, reg);
                     if !validate {
@@ -6816,7 +7147,7 @@ impl NumGen {
                 a.jmp(copy);
                 continue;
             }
-            self.hoist_views(a, ri);
+            self.hoist_views(a, ri, h);
             self.load_carried_globals(a, ri);
             // (A nest's integer version first, when it has one: an
             // on-stack replacement at an inner header, or the copy after a
@@ -7251,6 +7582,21 @@ fn plan_regions_sa(
             && (r as usize) < n_regs
             && live[pc * words + r as usize / 64] & (1u64 << (r % 64)) != 0
     };
+    // Where a branch (or a `catch`) may land.
+    let mut targets = vec![false; n + 1];
+    for op in bytecode {
+        if let Op::Jump { target } | Op::JumpIfFalse { target, .. } | Op::PushHandler { target, .. } =
+            op
+            && let Some(t) = targets.get_mut(*target)
+        {
+            *t = true;
+        }
+    }
+    for &c in catches {
+        if let Some(t) = targets.get_mut(c) {
+            *t = true;
+        }
+    }
     let mut out = Vec::new();
     for (head, end, loops) in cands {
         // Per register named in the body: first / last mention, uses, written.
@@ -7322,6 +7668,27 @@ fn plan_regions_sa(
         // runs (`spec_int_op`) may have one (`NumGen::emit_spec_int_op`).
         let arms = cold_arms(ops, head, end);
         let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+        // The loops' invariant prefixes (for a speculative integer version:
+        // `licm_live` spans their registers' intervals over their loops).
+        let licm = if licm_enabled() {
+            let mut all = alloc::vec![(head, end)];
+            all.extend(loops.iter().copied());
+            plan_licm(
+                bytecode,
+                &all,
+                &arms,
+                &|pc| targets.get(pc).copied().unwrap_or(true),
+                &is_live,
+            )
+        } else {
+            Vec::new()
+        };
+        let licm_live = |pc: usize, r: u16| {
+            is_live(pc, r)
+                || licm
+                    .iter()
+                    .any(|l| l.head <= pc && pc <= l.end && l.regs.contains(&r))
+        };
         let spec_int_cand = generic0
             && (loops.is_empty() || nestint_enabled())
             && (head..=end).all(|pc| {
@@ -7745,7 +8112,11 @@ fn plan_regions_sa(
                     &dbl_xmm,
                     elems,
                     spec.then_some(&arms[..]),
-                    &is_live,
+                    if spec {
+                        &licm_live as &dyn Fn(usize, u16) -> bool
+                    } else {
+                        &is_live
+                    },
                     if spec { &gcarry[..] } else { &[] },
                     if spec { &extra_int[..] } else { &[] },
                     &demote,
@@ -7839,9 +8210,33 @@ fn plan_regions_sa(
             quiet,
             ghoist,
             num_reads: Vec::new(),
+            licm,
+            fills: Vec::new(),
         });
     }
     out
+}
+
+/// Whether speculative integer versions run their loops' invariant
+/// prefixes once per entry ([`plan_licm`]) and fill their inner loops' rows
+/// at their entries ([`Region::fills`]): unless `KATAAN_JIT_LICM=0`. Read
+/// once per process.
+fn licm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LICM").is_none_or(|v| v != "0"))
+}
+
+/// Whether the row fills ([`Region::fills`]) are made (with
+/// [`licm_enabled`]): unless `KATAAN_JIT_ROWFILL=0`. Read once.
+fn rowfill_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ROWFILL").is_none_or(|v| v != "0"))
+}
+
+/// `KATAAN_JIT_LICM=log`: report the invariant prefixes and row fills kept.
+fn licm_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LICM").is_some_and(|v| v == "log"))
 }
 
 /// Whether a call-free nest of loops of numeric ops alone (no generic op)
@@ -9562,6 +9957,147 @@ fn float_bin_operands(op: &GenericOp, dst: u16) -> Option<(u16, u16, bool)> {
     }
 }
 
+/// A loop's **invariant prefix** ([`plan_licm`]): ops `head..stop` of the
+/// loop `head..=end` (its header's first ops, before any branch) compute
+/// the same values every iteration, into registers `regs` that no other op
+/// of the loop writes. A speculative region's integer version runs them
+/// once per entry into the loop (falling into its header) and its
+/// back-edge goes to `stop`, past them; their registers' int intervals span
+/// the whole loop (`int32::plan`).
+#[derive(Clone, Debug)]
+struct Licm {
+    head: usize,
+    end: usize,
+    stop: usize,
+    regs: Vec<u16>,
+}
+
+/// Whether op `op` may stand in a loop whose invariant prefix reads an
+/// element or a length ([`plan_licm`]): it writes no heap state (no store,
+/// no call), so an element it did not write keeps its value.
+fn licm_quiet_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::LoadConst { .. }
+            | Op::Move { .. }
+            | Op::Add { .. }
+            | Op::AddValue { .. }
+            | Op::Sub { .. }
+            | Op::Mul { .. }
+            | Op::Div { .. }
+            | Op::Mod { .. }
+            | Op::Neg { .. }
+            | Op::BitNot { .. }
+            | Op::ValueBin { .. }
+            | Op::ToNumeric { .. }
+            | Op::Step { .. }
+            | Op::Lt { .. }
+            | Op::Compare { .. }
+            | Op::StrictEq { .. }
+            | Op::Not { .. }
+            | Op::Jump { .. }
+            | Op::JumpIfFalse { .. }
+            | Op::GetKey { .. }
+            | Op::ArrayLen { .. }
+            | Op::LoadGlobal { .. }
+            | Op::CheckTdz { .. }
+    )
+}
+
+/// The **invariant prefixes** ([`Licm`]) of the loops `loops` (a region's
+/// own and its inner ones): from each header on, while no branch lands in
+/// between, ops that compute a value from registers the loop does not write
+/// (or that the prefix computed before) — constants, copies, `+ - *`, and
+/// element and `.length` reads when no op of the loop writes heap state
+/// ([`licm_quiet_op`]) — into a register that op alone writes in the loop
+/// and that is not live into its header. `target`: whether a branch may
+/// land at a pc. (The integer version keeps only the ones whose results
+/// are int registers, reading hoisted views or arrays: `NumGen::new`.)
+fn plan_licm(
+    bytecode: &[Op],
+    loops: &[(usize, usize)],
+    arms: &[(usize, usize, usize)],
+    target: &dyn Fn(usize) -> bool,
+    live: &dyn Fn(usize, u16) -> bool,
+) -> Vec<Licm> {
+    let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
+    let (mut d, mut u) = (Vec::new(), Vec::new());
+    let mut out = Vec::new();
+    for &(h, e) in loops {
+        // (Only an innermost loop: an entry at the header of a loop inside
+        // it, from the plain copy, would skip its prefix.)
+        if loops
+            .iter()
+            .any(|&(h2, e2)| (h2, e2) != (h, e) && h <= h2 && e2 <= e)
+        {
+            continue;
+        }
+        let Some(body) = bytecode.get(h..=e) else {
+            continue;
+        };
+        let writes = |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| {
+            body.iter()
+                .filter(|op| {
+                    def_use(op, d, u);
+                    let mut hit = d.contains(&r) || written_reg(op) == Some(r);
+                    for_each_write(op, &mut |w| hit |= w == r);
+                    hit
+                })
+                .count()
+        };
+        let quiet = body.iter().all(licm_quiet_op);
+        let mut regs: Vec<u16> = Vec::new();
+        let mut q = h;
+        while q < e {
+            if (q > h && target(q)) || in_arm(q) {
+                break;
+            }
+            let op = &bytecode[q];
+            let ok_op = match op {
+                Op::LoadConst { .. }
+                | Op::Move { .. }
+                | Op::ToNumeric { .. }
+                | Op::Add { .. }
+                | Op::AddValue { .. }
+                | Op::Sub { .. }
+                | Op::Mul { .. } => true,
+                Op::GetKey { obj, key, .. } => quiet && obj != key,
+                Op::ArrayLen { .. } => quiet,
+                _ => false,
+            };
+            if !ok_op {
+                break;
+            }
+            def_use(op, &mut d, &mut u);
+            let (Some(&dst), uses) = (d.first(), u.clone()) else {
+                break;
+            };
+            if d.len() != 1
+                || uses.contains(&dst)
+                || live(h, dst)
+                || regs.contains(&dst)
+                || writes(dst, &mut d, &mut u) != 1
+                || !uses
+                    .iter()
+                    .all(|&x| regs.contains(&x) || writes(x, &mut d, &mut u) == 0)
+            {
+                break;
+            }
+            regs.push(dst);
+            q += 1;
+        }
+        if !regs.is_empty() {
+            out.push(Licm {
+                head: h,
+                end: e,
+                stop: q,
+                regs,
+            });
+        }
+    }
+    out
+}
+
 /// The property reads of loop body `head..=end` whose value a register
 /// already holds, for the loop's speculative version ([`Spec`]): `(pc,
 /// src)` for a `GetProp` of `obj.key` after a `GetProp` of the same register's
@@ -10621,6 +11157,42 @@ impl X64Assembler {
         self.g_movabs(r::RAX, 0);
         self.g_store(r::RBP, s.len, r::RAX);
         self.g_store(r::RBP, s.wb, r::RAX);
+        self.bind(done);
+    }
+
+    /// A row fill (`Region::fills`): [`p_hoist_array`](Self::p_hoist_array)
+    /// of the value in `rax`, the arena pinned, touching only `rax`, `rcx`,
+    /// `r11` and `xmm0`; the array's stores always take the write barrier's
+    /// path (`wb` `0`).
+    pub(super) fn p_fill_array(&mut self, l: &super::JitLayout, realm: i32, s: ArraySlots) {
+        use super::call_seq::r;
+        debug_assert!(self.pinned());
+        let none = self.new_label();
+        let done = self.new_label();
+        self.p_is_handle(r::RCX, none);
+        self.p_slot_rooted(l, r::RCX, none);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
+        self.jne(none);
+        self.p_array_plain(l, realm, false, none);
+        self.g_store(r::RBP, s.held, r::RAX);
+        // (As `p_arr_len_ptr`, the count in `rax`.)
+        self.p_load8(r::RAX, r::RCX, l.off_arr_inline_len);
+        self.g_lea(r::R11, r::RCX, l.off_arr_inline);
+        self.g_cmp_imm(r::RAX, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmove_mem(r::RAX, r::RCX, l.off_arr_len);
+        self.g_cmove_mem(r::R11, r::RCX, l.off_arr_ptr);
+        self.g_store(r::RBP, s.len, r::RAX);
+        self.g_store(r::RBP, s.base, r::R11);
+        self.cvtsi2sd_x_gpr(0, r::RAX);
+        self.code.push(0xf2);
+        self.g_mem(false, &[0x0f, 0x11], 0, r::RBP, s.lend); // movsd [rbp + lend], xmm0
+        self.g_store_imm32(r::RBP, s.wb, 0);
+        self.jmp(done);
+        self.bind(none);
+        self.g_movabs(r::RAX, super::RECV_CACHE_EMPTY as i64 as u64);
+        self.g_store(r::RBP, s.held, r::RAX);
+        self.g_store_imm32(r::RBP, s.len, 0);
+        self.g_store_imm32(r::RBP, s.wb, 0);
         self.bind(done);
     }
 

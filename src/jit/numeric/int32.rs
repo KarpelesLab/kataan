@@ -63,6 +63,14 @@ fn inplace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INPLACE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the slow paths of the integer version's inline element accesses
+/// go out of line (`NumGen::skip_cold`; `KATAAN_JIT_SKIPCOLD=0` turns it
+/// off; read once).
+fn skip_cold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SKIPCOLD").is_none_or(|v| v != "0"))
+}
+
 /// Whether the integer version's `%` by a register tries its division-free
 /// paths first (`KATAAN_JIT_IMODFAST=0` turns them off; read once).
 fn imod_fast_enabled() -> bool {
@@ -140,6 +148,10 @@ pub(super) struct IntPlan {
     exact_ushr: Vec<usize>,
     /// The promoted global bindings.
     pub(super) globals: Vec<PGlobal>,
+    /// The registers that hold a Number wherever they are read in the
+    /// integer version: written in the loop only by reads of numeric
+    /// promoted bindings (`PGlobal::num`), and not live into its header.
+    pub(super) num_regs: Vec<u16>,
     /// The integer version's entry (region entry jumps here first).
     pub(super) entry: Option<Label>,
     /// The double version's entry (its header loads).
@@ -161,11 +173,15 @@ pub(super) struct IntPlan {
 /// can observe the binding meanwhile: only calls run other code.
 pub(super) struct PGlobal {
     vreg: u16,
-    load_pc: Option<usize>,
-    store_pc: Option<usize>,
-    xmm: Option<u8>,
+    pub(super) load_pc: Option<usize>,
+    pub(super) store_pc: Option<usize>,
+    pub(super) xmm: Option<u8>,
     dirty: bool,
     pub(super) slot: u32,
+    /// Kept in `xmm` and only ever stored a Number in the loop
+    /// (`NumGen::new`): its value is checked to be a Number where it is
+    /// loaded (`gload`), so its reads yield one (`IntPlan::num_regs`).
+    pub(super) num: bool,
 }
 
 impl IntPlan {
@@ -745,6 +761,16 @@ pub(super) fn plan(
                     {
                         consts.push((x.0, c.1, x.1, x.2));
                     }
+                    // (Or a negated constant, `-1`: neither `0`, whose
+                    // negation is `-0`, nor `-2^31`.)
+                    if let [d] = ds[..]
+                        && let Op::Neg { a: src, .. } = bytecode[d]
+                        && let Some(c) = consts.iter().find(|c| c.0 == src && c.2 <= d && d <= c.3)
+                        && c.1 != 0
+                        && c.1 != i32::MIN
+                    {
+                        consts.push((x.0, -c.1, x.1, x.2));
+                    }
                 }
                 if consts.len() == before {
                     break;
@@ -946,6 +972,7 @@ pub(super) fn plan(
                     xmm: if inn(vreg) { None } else { xmms.next() },
                     dirty: pc_of(true).is_some(),
                     slot: u32::MAX,
+                    num: false,
                 }
             })
             .collect();
@@ -1126,6 +1153,7 @@ pub(super) fn plan(
             wrap_bits,
             exact_ushr,
             globals,
+            num_regs: Vec::new(),
             entry: None,
             dbl_entry: None,
             inner: None,
@@ -1558,7 +1586,17 @@ impl NumGen {
         for g in &p.globals {
             a.load_rax(self.gslot_disp(g.slot));
             match (g.xmm, Self::ggpr(p, g.vreg)) {
-                (Some(x), _) => a.sse_mem_rax(0x10, x), // movsd x, [rax]
+                (Some(x), _) => {
+                    a.sse_mem_rax(0x10, x); // movsd x, [rax]
+                    if g.num {
+                        // A Number (`PGlobal::num`), else `fail`.
+                        a.raw(&[0x48, 0x8b, 0x08]); // mov rcx, [rax]
+                        a.movabs_r11(super::QNAN as i64);
+                        a.and_rcx_r11();
+                        a.cmp_rcx_r11();
+                        a.jcc(CC_E, fail);
+                    }
+                }
                 (None, Some(gpr)) => {
                     a.raw(&[0xf2, 0x0f, 0x2c, 0x08]); // cvttsd2si ecx, [rax]
                     a.raw(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
@@ -1906,8 +1944,7 @@ impl NumGen {
             .collect();
         let mut fails = Vec::new();
         for (r, gpr) in carried {
-            a.load_rax(disp(r));
-            a.exact_i32_check(RCX);
+            a.exact_i32_check_mem(RCX, disp(r));
             let f = self.entry_fail(a, ri, r, efail, &mut fails);
             a.jcc(CC_NE, f);
             if gpr >= MEM_BASE {
@@ -2001,11 +2038,42 @@ impl NumGen {
                 self.store_xmm0(a, reg, dst);
             }
             GenericOp::ToNumeric { dst, src, .. } if ii(self, dst) => {
+                // `x++` as a statement (`ToNumeric t1, x; Step t2, t1; Move x,
+                // t2`): `x` stepped in place, undone before a bail, which
+                // runs the three ops again from here.
+                if let Some(dec) = self.fold_step(pc, dst, src) {
+                    let IK::Gpr(g) = self.ik(src)? else {
+                        return None;
+                    };
+                    let step = if dec { -1 } else { 1 };
+                    a.add32_imm8(g, step);
+                    let bail = self.ibail(a);
+                    if let Some(Op::Step { dst: t2, .. }) = self.bc(pc + 1) {
+                        let t2 = *t2;
+                        self.cur_pc = pc + 1;
+                        self.demote_last(t2);
+                        self.cur_pc = pc;
+                    }
+                    let undo = a.new_label();
+                    let past = a.new_label();
+                    a.jcc(CC_O, undo);
+                    a.jmp(past);
+                    let cold = a.cold_begin();
+                    a.bind(undo);
+                    a.add32_imm8(g, -step);
+                    a.jmp(bail);
+                    a.cold_end(cold);
+                    a.bind(past);
+                    self.skip_op(pc + 1);
+                    self.skip_op(pc + 2);
+                    return Some(true);
+                }
                 self.iout(dst)?;
                 let s = self.ival(a, src, RAX)?;
                 self.iput(a, dst, s)?;
             }
             GenericOp::Step { dst, src, dec, .. } if ii(self, dst) => {
+                let dst = self.fold_move(pc, dst).unwrap_or(dst);
                 let d = self.iout(dst)?;
                 let s = self.ival(a, src, RAX)?;
                 let step = if dec { -1 } else { 1 };
@@ -2036,6 +2104,7 @@ impl NumGen {
             | GenericOp::NumAdd {
                 dst, a: x, b: y, ..
             } if ii(self, dst) => {
+                let dst = self.fold_move(pc, dst).unwrap_or(dst);
                 self.iarith(a, 0x01, dst, x, y)?;
             }
             GenericOp::Arith {
@@ -2044,7 +2113,10 @@ impl NumGen {
                 b: y,
                 op: gop,
             } if ii(self, dst) => match gop {
-                GA_SUB => self.iarith(a, 0x29, dst, x, y)?,
+                GA_SUB => {
+                    let dst = self.fold_move(pc, dst).unwrap_or(dst);
+                    self.iarith(a, 0x29, dst, x, y)?;
+                }
                 GA_MUL => self.imul(a, dst, x, y)?,
                 GA_MOD => self.imod(a, dst, x, y)?,
                 _ => return None,
@@ -2169,10 +2241,20 @@ impl NumGen {
                     // the register file up to date), the views hoisted.
                     self.refresh_globals(a, ri, true);
                     self.spec_globals_ready(a, ri, target)?;
-                    self.hoist_views(a, ri);
+                    self.hoist_views(a, ri, target);
                     self.ireload(a, ri);
+                    // (After a call, the loop's invariant prefix and row
+                    // fills run again; else its back-edge goes past them.)
+                    let body = self
+                        .loop_body
+                        .iter()
+                        .find(|b| b.0 == target)
+                        .map_or(inner, |b| b.1);
+                    if body != inner {
+                        a.jmp(inner);
+                    }
                     a.bind(skip);
-                    a.jmp(inner);
+                    a.jmp(body);
                     return Some(true);
                 }
                 let p = self.regions[ri].int.as_ref()?;
@@ -2214,6 +2296,9 @@ impl NumGen {
                 self.iglobal(a, pc)?;
             }
             GenericOp::Interp { .. } => match *bc {
+                // (A negated constant's live range: nothing, `plan`.)
+                Op::Neg { dst, .. }
+                    if ii(self, dst) && matches!(self.ik(dst), Some(IK::Imm(_))) => {}
                 Op::Neg { dst, a: src } if ii(self, dst) => {
                     self.iout(dst)?;
                     let s = self.ival(a, src, RAX)?;
@@ -2299,6 +2384,62 @@ impl NumGen {
             _ => return Some(false),
         }
         Some(true)
+    }
+
+    /// **Copy coalescing**: when op `pc`'s int result `t` is only moved into
+    /// int register `x` by the next op (`Move x, t`, nothing else naming
+    /// `t`, no branch landing on the move), and `x` lives in a GPR: `x`, which
+    /// the op then writes itself (`x`'s old value is dead there: the move
+    /// overwrites it, and an operand is read before the result is written;
+    /// a bail at the op finds it as it was, or dead), the move marked
+    /// emitted.
+    fn fold_move(&mut self, pc: usize, t: u16) -> Option<u16> {
+        let &Op::Move { dst: x, src } = self.bc(pc + 1)? else {
+            return None;
+        };
+        let ok = inplace_enabled()
+            && src == t
+            && x != t
+            && self.mentions.get(t as usize) == Some(&2)
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && self.region_at(pc + 1) == self.region_at(pc)
+            && self.is_int(x)
+            && matches!(self.ik(x), Some(IK::Gpr(_)))
+            && !self.iplan().is_some_and(|p| p.wraps.contains(&pc));
+        if !ok {
+            return None;
+        }
+        self.skip_op(pc + 1);
+        Some(x)
+    }
+
+    /// For the `ToNumeric t1, x` at `pc`: whether it, the next op and the
+    /// one after are a statement `x++` / `x--` (`Step t2, t1` and `Move x,
+    /// t2`, `t1` and `t2` named by nothing else, no branch landing between,
+    /// `x` an int register in a GPR), and which way it steps.
+    fn fold_step(&self, pc: usize, t1: u16, x: u16) -> Option<bool> {
+        let &Op::Step { dst: t2, src, dec } = self.bc(pc + 1)? else {
+            return None;
+        };
+        let &Op::Move { dst: x2, src: s2 } = self.bc(pc + 2)? else {
+            return None;
+        };
+        let ok = inplace_enabled()
+            && src == t1
+            && s2 == t2
+            && x2 == x
+            && t1 != x
+            && t2 != x
+            && t1 != t2
+            && self.mentions.get(t1 as usize) == Some(&2)
+            && self.mentions.get(t2 as usize) == Some(&2)
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && !self.is_target.get(pc + 2).copied().unwrap_or(true)
+            && self.region_at(pc + 2) == self.region_at(pc)
+            && self.is_int(x)
+            && self.is_int(t2)
+            && matches!(self.ik(x), Some(IK::Gpr(_)));
+        ok.then_some(dec)
     }
 
     /// `dst = x <add|sub> y` over int registers (`opc` the `op r/m32, r32` byte),
@@ -2419,7 +2560,7 @@ impl NumGen {
     /// `dst = x % y` over int registers, bailing on a zero divisor (NaN) and on a
     /// zero remainder of a negative dividend (`-0`).
     fn imod(&mut self, a: &mut X64Assembler, dst: u16, x: u16, y: u16) -> Option<()> {
-        self.iout(dst)?;
+        let d = self.iout(dst)?;
         if let IK::Imm(c) = self.ik(y)?
             && c != 0
             && c != i32::MIN
@@ -2427,35 +2568,75 @@ impl NumGen {
             return self.imod_const(a, dst, x, c.unsigned_abs());
         }
         let gx = self.ival(a, x, RAX)?;
-        a.movsxd(RAX, gx);
         let gy = self.ival(a, y, RCX)?;
-        a.movsxd(RCX, gy);
-        let ok = a.new_label();
+        let ok = a.new_label(); // the remainder in `edx`
+        let done = a.new_label(); // the remainder in `dst`
         let div = a.new_label();
         if imod_fast_enabled() {
             // A divisor `d > 0` and a dividend `x >= 0` (whose remainder is
             // `x mod d`, never `-0`) need no division in the commonest
             // cases: `x < d` (the remainder is `x`), `x < 2d` (a wrapped
             // index, `(i + 1) % n`: `x - d`) and a power of two `d`
-            // (`x & (d - 1)`).
-            a.test32_rr(RCX, RCX);
+            // (`x & (d - 1)`), out of line with the division.
+            a.test32_rr(gy, gy);
             a.jcc(CC_LE, div);
-            a.test32_rr(RAX, RAX);
+            a.test32_rr(gx, gx);
             a.jcc(CC_S, div);
-            a.mov32_rr(RDX, RAX);
-            a.alu32_rr(0x39, RDX, RCX); // cmp edx, ecx
-            a.jcc(super::CC_B, ok);
-            a.alu32_rr(0x29, RDX, RCX); // sub edx, ecx
-            a.alu32_rr(0x39, RDX, RCX); // cmp edx, ecx
-            a.jcc(super::CC_B, ok);
-            a.raw(&[0x44, 0x8d, 0x59, 0xff]); // lea r11d, [rcx - 1]
-            a.raw(&[0x44, 0x85, 0xd9]); // test ecx, r11d
+            // (In place when the result takes the dividend's GPR, undone
+            // before the other paths, which read it.)
+            let inplace = d == gx && gx != RAX && d != gy;
+            let other = a.new_label();
+            let undo = a.new_label();
+            if inplace {
+                a.alu32_rr(0x39, gx, gy); // cmp x, y
+                a.jcc(super::CC_B, done);
+                a.alu32_rr(0x29, gx, gy); // sub x, y
+                a.alu32_rr(0x39, gx, gy);
+                a.jcc(super::CC_B, done);
+                a.jmp(undo);
+            } else {
+                let t = if d != gx && d != gy && d != RAX {
+                    d
+                } else {
+                    RDX
+                };
+                a.mov32_rr(t, gx);
+                a.alu32_rr(0x39, t, gy); // cmp t, y
+                a.jcc(super::CC_B, if t == RDX { ok } else { done });
+                a.alu32_rr(0x29, t, gy); // sub t, y
+                a.alu32_rr(0x39, t, gy);
+                a.jcc(super::CC_B, if t == RDX { ok } else { done });
+                a.jmp(other);
+            }
+            let cold = a.cold_begin();
+            a.bind(undo);
+            a.alu32_rr(0x01, gx, gy); // add x, y (the dividend again)
+            a.bind(other);
+            // lea r11d, [y - 1]; test y, r11d
+            a.raw(&[0x44 | ((gy >> 3) & 1), 0x8d, 0x58 | (gy & 7), 0xff]);
+            a.raw(&[0x44 | ((gy >> 3) & 1), 0x85, 0xd8 | (gy & 7)]);
             a.jcc(CC_NE, div);
-            a.mov32_rr(RDX, RAX);
+            a.mov32_rr(RDX, gx);
             a.raw(&[0x44, 0x21, 0xda]); // and edx, r11d
             a.jmp(ok);
+            self.imod_div(a, gx, gy, div, ok);
+            a.cold_end(cold);
+        } else {
+            self.imod_div(a, gx, gy, div, ok);
         }
+        a.bind(ok);
+        self.iput(a, dst, RDX)?;
+        a.bind(done);
+        Some(())
+    }
+
+    /// [`imod`](Self::imod)'s division (at label `div`): `edx` = `x % y`
+    /// (`gx`, `gy` their GPRs), then to `ok`; a bail on a zero divisor and
+    /// on a zero remainder of a negative dividend (`-0`).
+    fn imod_div(&mut self, a: &mut X64Assembler, gx: u8, gy: u8, div: Label, ok: Label) {
         a.bind(div);
+        a.movsxd(RAX, gx);
+        a.movsxd(RCX, gy);
         let bail = self.ibail_ovf(a);
         a.test32_rr(RCX, RCX);
         a.jcc(CC_E, bail);
@@ -2467,8 +2648,7 @@ impl NumGen {
         a.jcc(CC_NE, ok);
         a.raw(&[0x4d, 0x85, 0xdb]); // test r11, r11
         a.jcc(CC_S, bail);
-        a.bind(ok);
-        self.iput(a, dst, RDX)
+        a.jmp(ok);
     }
 
     /// `dst = x % c` for a constant divisor `0 < c < 2^31` (the sign of a
@@ -2894,7 +3074,22 @@ impl NumGen {
         let skip = self.int_skip.take();
         self.after_generic_post(a);
         if let Some(l) = skip {
+            // (The slow path out of line: `skip_cold`.)
+            if let Some(m) = self.int_skip_cold.take() {
+                a.jmp(l);
+                a.cold_end(m);
+            }
             a.bind(l);
+        }
+    }
+
+    /// After an inline fast path's last jump past its op's generic code
+    /// (`int_skip`): the rest — other inline paths, the generic code, its
+    /// checks — goes out of line, up to where the fast path lands
+    /// (`after_generic_op`).
+    pub(super) fn skip_cold(&mut self, a: &mut X64Assembler) {
+        if self.int_skip_cold.is_none() && skip_cold_enabled() {
+            self.int_skip_cold = Some(a.cold_begin());
         }
     }
 
@@ -3110,7 +3305,7 @@ impl NumGen {
         let efail = self.entry_retry(a, ri, dbl, copy);
         self.refresh_globals(a, ri, true);
         self.spec_globals_ready(a, ri, head)?;
-        self.hoist_views(a, ri);
+        self.hoist_views(a, ri, head);
         // The carried bindings' registers start as the bindings, as in the
         // double version (their plan has them carried, so a bail into the
         // double version finds them equal to the bindings).
@@ -3136,8 +3331,7 @@ impl NumGen {
             .collect();
         let mut fails = Vec::new();
         for (r, gpr) in carried {
-            a.load_rax(disp(r));
-            a.exact_i32_check(RCX);
+            a.exact_i32_check_mem(RCX, disp(r));
             let f = self.entry_fail(a, ri, r, efail, &mut fails);
             a.jcc(CC_NE, f);
             if gpr >= MEM_BASE {
@@ -3219,8 +3413,7 @@ impl NumGen {
         let saved = self.imode.replace(ri);
         let pc = core::mem::replace(&mut self.cur_pc, h);
         for (r, k) in ints {
-            a.load_rax(disp(r));
-            a.exact_i32_check(RCX);
+            a.exact_i32_check_mem(RCX, disp(r));
             a.jcc(CC_NE, dbl);
             match k {
                 IK::Gpr(g) => a.mov32_rr(g, RCX),
@@ -3279,8 +3472,7 @@ impl NumGen {
         // (The bindings' validation first: its calls clobber the GPRs.)
         self.gvalidate(a, p, dbl);
         for (r, k) in ints {
-            a.load_rax(disp(r));
-            a.exact_i32_check(RCX);
+            a.exact_i32_check_mem(RCX, disp(r));
             a.jcc(CC_NE, dbl);
             match k {
                 IK::Gpr(g) => a.mov32_rr(g, RCX),
@@ -3700,6 +3892,15 @@ impl X64Assembler {
         self.cvtsi2sd32(0, gpr);
         self.movq_gpr_x(R11, 0);
         self.cmp_rax_r11();
+    }
+
+    /// [`exact_i32_check`](Self::exact_i32_check) of register-file slot
+    /// `[rbx + disp]`, converted and compared from memory (no `rax`).
+    fn exact_i32_check_mem(&mut self, gpr: u8, disp: i32) {
+        self.cvttsd2si32_mem(gpr, disp);
+        self.cvtsi2sd32(0, gpr);
+        self.movq_gpr_x(R11, 0);
+        self.g_cmp_mem(R11, super::super::call_seq::r::RBX, disp);
     }
 }
 
