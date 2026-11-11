@@ -9988,8 +9988,9 @@ fn plain_views_ok(r: &Region, ops: &[GenericOp], bytecode: &[Op]) -> bool {
 }
 
 /// The most typed-array views a speculative region hoists (three or four
-/// frame slots and an entry check each).
-const MAX_VIEWS: usize = 4;
+/// frame slots and an entry check each): a sparse matrix product's row
+/// pointers, columns, values, input and output.
+const MAX_VIEWS: usize = 6;
 
 /// Where a hoisted view's entry check finds the register's value
 /// ([`plan_views`]).
@@ -10026,7 +10027,9 @@ fn plan_views(
     n_regs: usize,
     iters: bool,
 ) -> Vec<(u16, ViewSrc)> {
+    // (Per register: the deepest loop of the nest an access of it is in.)
     let mut regs: Vec<u16> = Vec::new();
+    let mut depth: Vec<usize> = Vec::new();
     for (pc, op) in ops.iter().enumerate().take(r.end + 1).skip(r.head) {
         let recv = match (*op, &bytecode[pc]) {
             (GenericOp::GetElem { obj, .. } | GenericOp::SetElem { obj, .. }, _) => obj,
@@ -10039,10 +10042,23 @@ fn plan_views(
             }
             _ => continue,
         };
-        if (recv as usize) < n_regs && !regs.contains(&recv) {
-            regs.push(recv);
+        let d = r.loops.iter().filter(|&&(h, e)| h <= pc && pc <= e).count();
+        if (recv as usize) >= n_regs {
+            continue;
+        }
+        match regs.iter().position(|&x| x == recv) {
+            Some(i) => depth[i] = depth[i].max(d),
+            None => {
+                regs.push(recv);
+                depth.push(d);
+            }
         }
     }
+    // Past `MAX_VIEWS`, those an inner loop of a nest reads go first (a
+    // stable sort: otherwise in order of first access).
+    let mut order: Vec<usize> = (0..regs.len()).collect();
+    order.sort_by_key(|&i| core::cmp::Reverse(depth[i]));
+    let regs: Vec<u16> = order.into_iter().map(|i| regs[i]).collect();
     let body = &bytecode[r.head..=r.end];
     let mut out = Vec::new();
     for v in regs {

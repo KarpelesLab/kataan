@@ -119,6 +119,10 @@ pub(super) struct IntPlan {
     /// Uint32 element or a `>>>` result past `i32::MAX`): like a wrapped
     /// op's, read only by bitwise ops before anything can bail.
     wrap_bits: Vec<usize>,
+    /// The pcs of the `>>>` ops by a constant count that is not a multiple
+    /// of 32 (`i >>> 5`): their result is below 2^31, an exact int32 held
+    /// like any other (an element index, say).
+    exact_ushr: Vec<usize>,
     /// The promoted global bindings.
     pub(super) globals: Vec<PGlobal>,
     /// The integer version's entry (region entry jumps here first).
@@ -986,14 +990,36 @@ pub(super) fn plan(
         }
         let (wrap_bits, wraps): (Vec<usize>, Vec<usize>) =
             wraps.into_iter().partition(|&p| bits_op(&bytecode[p]));
+        // A `>>>` by a constant count (mod 32) of at least one is below 2^31.
+        let exact_ushr: Vec<usize> = body
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| match op {
+                Op::ValueBin { op, dst, a, b }
+                    if *op == VB_USHR
+                        && inn(*dst)
+                        && inn(*a)
+                        && a != b
+                        && cval(*b).is_some_and(|c| c & 31 != 0)
+                        && !wrap_bits.contains(&(head + i)) =>
+                {
+                    Some(head + i)
+                }
+                _ => None,
+            })
+            .collect();
         if elems || spec {
-            // A `>>>` result that is not held as bits is not an int32.
+            // A `>>>` result that is not held as bits (nor exact) is not
+            // an int32.
             let lost: Vec<u16> = body
                 .iter()
                 .enumerate()
                 .filter_map(|(i, op)| match op {
                     Op::ValueBin { op, dst, .. }
-                        if *op == VB_USHR && inn(*dst) && !wrap_bits.contains(&(head + i)) =>
+                        if *op == VB_USHR
+                            && inn(*dst)
+                            && !wrap_bits.contains(&(head + i))
+                            && !exact_ushr.contains(&(head + i)) =>
                     {
                         Some(*dst)
                     }
@@ -1027,6 +1053,7 @@ pub(super) fn plan(
             slots,
             wraps,
             wrap_bits,
+            exact_ushr,
             globals,
             entry: None,
             dbl_entry: None,
@@ -2415,7 +2442,11 @@ impl NumGen {
             self.iout(dst)?;
             // A `>>>` result only where it is held as its bits
             // (`IntPlan::wrap_bits`): else it is planned never (a uint32).
-            if vop == VB_USHR && !self.iplan()?.wrap_bits.contains(&pc) {
+            // (Or where its count makes it exact, `IntPlan::exact_ushr`.)
+            if vop == VB_USHR
+                && !self.iplan()?.wrap_bits.contains(&pc)
+                && !self.iplan()?.exact_ushr.contains(&pc)
+            {
                 return None;
             }
             self.iput(a, dst, RAX)?;
