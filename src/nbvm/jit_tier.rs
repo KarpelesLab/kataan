@@ -1276,21 +1276,21 @@ pub(crate) extern "C" fn jit_helper_unwind(
 /// address of the global scope's own initialized binding of the name — exactly
 /// where [`vm_load_global`]'s first step reads; for `Op::StoreGlobal`, the
 /// address of that binding when [`vm_store_global_fast`] would assign it without
-/// mirroring the write onto the global object (the running scope is the global
-/// scope, the binding is plain and initialized, the global object has no
+/// mirroring the write onto the global object (the binding is plain and
+/// initialized, the global object has no
 /// like-named own property — and is a global object, `JIT_FLAG_GLOBAL`, whose
 /// key changes the global binding epoch tracks) — or, for an op whose compiled
 /// code mirrors the write (`super::global_mirror`), when it would mirror it
 /// onto a writable data property it can store into directly, whose address it
 /// leaves in the op's mirror cache. `0` otherwise. The address
 /// stays valid, and the facts true, until Rust code next runs (which alone can
-/// add or free a binding, change the running scope or realm, or give the
-/// global object a property) — and past that for as long as the global binding
-/// epoch (`crate::env`) is unchanged, since every such change but the running
-/// scope's bumps it, and the running scope a compiled activation sees is the
-/// same after each call returns (the generic tier's cache, which also starts
-/// over in a `catch` handler, relies on this; promoted loops drop the address
-/// after a call).
+/// add or free a binding, change the realm, or give the global object a
+/// property) — and past that for as long as the global binding epoch
+/// (`crate::env`) is unchanged, since every such change bumps it. (The scope
+/// running when the op executes — a caller's direct eval or `with` body —
+/// never matters: a global-environment reference resolves in the global
+/// scope. The generic tier's cache, which also starts over in a `catch`
+/// handler, relies on this; promoted loops drop the address after a call.)
 ///
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
@@ -1322,7 +1322,7 @@ fn store_memo_hit(ctx: &Ctx, cache: &super::StoreGlobalCache) -> Option<u64> {
     if e != crate::env::global_binding_epoch() {
         return None;
     }
-    let (_, global) = ctx.host.as_deref()?.global_scope_if_current()?;
+    let (_, global) = ctx.host.as_deref()?.global_env()?;
     if global.as_handle() != Some(mg) {
         return None;
     }
@@ -1370,7 +1370,7 @@ fn global_store_ref(
     // as current.)
     let epoch = crate::env::global_binding_epoch();
     let host = ctx.host.as_deref()?;
-    let Some((p, g)) = host.global_scope_if_current().and_then(|(scope, global)| {
+    let Some((p, g)) = host.global_env().and_then(|(scope, global)| {
         let p = scope.jit_binding_ptr(name, &cache.slot, true)?;
         Some((p, Handle::from_raw(global.as_handle()?)))
     }) else {
@@ -1395,7 +1395,7 @@ fn global_store_ref(
         || ctx
             .host
             .as_deref()
-            .and_then(|h| h.global_scope_if_current())
+            .and_then(|h| h.global_env())
             .is_some_and(|(scope, _)| scope.has_lexical(name))
     {
         cache.jit.set(0);

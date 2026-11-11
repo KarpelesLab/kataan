@@ -1143,12 +1143,15 @@ pub trait VmHost {
     /// The host's global scope, for the VM's slot-cached reads of it (the
     /// bindings [`global`](VmHost::global) reads). Needs no realm.
     fn global_scope(&self) -> &crate::env::Scope;
-    /// The global scope and the global object when the host's running lexical
-    /// scope *is* the global scope — so an identifier reference the global
-    /// scope binds resolves straight to that binding (no `with` object or
-    /// inner frame in between). `None` otherwise. Needs no realm.
-    fn global_scope_if_current(&self) -> Option<(&crate::env::Scope, NanBox)>;
-    /// [`global_scope_if_current`](VmHost::global_scope_if_current) when,
+    /// The global scope and the global object of the running realm: where
+    /// every global-environment reference (`LoadGlobal`, `StoreGlobal`, …)
+    /// resolves. Such a reference belongs to code whose [[Environment]] chain
+    /// reaches the global environment with nothing in between, so the scope
+    /// running when it is evaluated (a caller's direct eval or `with` body)
+    /// never matters. `None` when the host has no global environment. Needs
+    /// no realm.
+    fn global_env(&self) -> Option<(&crate::env::Scope, NanBox)>;
+    /// [`global_env`](VmHost::global_env) when,
     /// moreover, a name the global scope does not bind resolves to the global
     /// object record (no module import aliases one): the global object
     /// record fast paths (`global_obj`). Needs no realm.
@@ -4514,13 +4517,13 @@ pub struct StoreGlobalCache {
     pub(crate) jit_memo: StoreRefMemo,
 }
 
-/// What `jit_tier::global_store_ref` last validated for its `StoreGlobal`
-/// while the running scope was the global scope: the global binding epoch
+/// What `jit_tier::global_store_ref` last validated for its `StoreGlobal`:
+/// the global binding epoch
 /// (`crate::env::global_binding_epoch`) and global object it was validated
 /// under, the binding's address and the mirror target it recorded (`u64::MAX`
 /// for a `let`/`const`/`class` or a name the global object does not own,
 /// whose mirror target is `0`). Every fact the validation reads is fixed while
-/// that epoch is current and the same global object and scope are running
+/// that epoch is current and the same global object is the realm's
 /// (the epoch is bumped whenever the global scope is swapped, its bindings
 /// change, or the global object's own keys may have changed). A clone starts
 /// empty (its op's mirror state does too).
@@ -4540,13 +4543,13 @@ impl Clone for StoreRefMemo {
 }
 
 /// The fast path of `PutValue` for a global-environment name: when the
-/// running scope is the global scope and binds `name` as a plain mutable,
+/// global scope binds `name` as a plain mutable,
 /// initialized binding, assigns it directly and mirrors the write onto a
 /// like-named own property of the global object — exactly what the host's
 /// `write_global` → `assign_to_name` → `sync_global_var` does for that case.
 /// Returns `false`, having changed nothing, for every other case (a module
-/// name, the temporal dead zone, a `const`, an unbound name, an inner scope
-/// running), which takes the host's general path.
+/// name, the temporal dead zone, a `const`, an unbound name), which takes
+/// the host's general path.
 /// `Op::CellGet`: the value a binding cell holds — a [`Cell::Box`]'s, or a
 /// one-element array cell's element 0 (as `GetElem` reads it).
 fn vm_cell_get(ctx: &mut Ctx, cell: Handle) -> NanBox {
@@ -4571,7 +4574,7 @@ fn vm_store_global_fast(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: 
     let Some(host) = ctx.host.as_deref() else {
         return false;
     };
-    let Some((scope, global)) = host.global_scope_if_current() else {
+    let Some((scope, global)) = host.global_env() else {
         return false;
     };
     if !scope.cached_set_plain_local(name, &cache.slot, v) {
@@ -9663,11 +9666,11 @@ fn run_frame_at_ic(
                 }
             }
             Op::GlobalExists { dst, name, cache } => {
-                // A name the running (global) scope binds itself resolves.
+                // A name the global scope binds itself resolves.
                 if ctx
                     .host
                     .as_deref()
-                    .and_then(VmHost::global_scope_if_current)
+                    .and_then(VmHost::global_env)
                     .is_some_and(|(scope, _)| scope.cached_has_local(name, cache))
                 {
                     regs[*dst as usize] = NanBox::boolean(true);

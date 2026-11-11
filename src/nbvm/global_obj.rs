@@ -69,11 +69,7 @@ pub(super) fn store(ctx: &mut Ctx, name: &str, cache: &StoreGlobalCache, v: NanB
 /// property of the global object, so it is left alone). `false` (nothing
 /// done) for anything else.
 pub(super) fn set_prop(ctx: &mut Ctx, recv: NanBox, key: &str, v: NanBox) -> bool {
-    let Some((scope, global)) = ctx
-        .host
-        .as_deref()
-        .and_then(|h| h.global_scope_if_current())
-    else {
+    let Some((scope, global)) = ctx.host.as_deref().and_then(|h| h.global_env()) else {
         return false;
     };
     if recv != global {

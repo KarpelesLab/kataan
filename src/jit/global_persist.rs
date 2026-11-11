@@ -22,9 +22,8 @@
 //! epoch stale first takes the array's entries when the array's epoch is the
 //! current one, and a validation writes what it found back.
 //!
-//! Only reads persist: a write's validation also depends on the host's
-//! running scope (`global_scope_if_current`), which an activation does not
-//! fix.
+//! Only reads persist: a write's validation is memoized per op instead
+//! (`StoreRefMemo`).
 //!
 //! The array's invariant: every non-empty entry of a group was validated
 //! under (or after) the group's noted epoch. A group's entries are emptied

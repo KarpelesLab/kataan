@@ -5509,6 +5509,23 @@ impl Interp {
         }
     }
 
+    /// Runs `f` with the global environment as the running lexical scope: how
+    /// the VM's global-environment references (`LoadGlobal`, `StoreGlobal`,
+    /// `TypeofGlobal`, …) resolve. Such a reference belongs to code whose
+    /// [[Environment]] chain reaches the global environment with nothing in
+    /// between, so it must never see the scope that happens to be running
+    /// when it is evaluated — a direct eval's or a `with` body's in a caller.
+    fn at_global_env<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.current.ptr_eq(&self.global_scope) {
+            return f(self);
+        }
+        let g = self.global_scope.clone();
+        let saved = core::mem::replace(&mut self.current, g);
+        let r = f(self);
+        self.current = saved;
+        r
+    }
+
     /// The underlying realm (e.g. to render a result with `to_display_string`).
     #[must_use]
     pub fn realm(&self) -> &Realm {
@@ -9500,10 +9517,8 @@ impl crate::nbvm::VmHost for Interp {
         &self.global_scope
     }
 
-    fn global_scope_if_current(&self) -> Option<(&Scope, NanBox)> {
-        self.current
-            .ptr_eq(&self.global_scope)
-            .then_some((&self.global_scope, self.global_this))
+    fn global_env(&self) -> Option<(&Scope, NanBox)> {
+        Some((&self.global_scope, self.global_this))
     }
 
     fn global_object_record(&self) -> Option<(&Scope, NanBox)> {
@@ -9511,7 +9526,7 @@ impl crate::nbvm::VmHost for Interp {
         if !self.module_imports.is_empty() {
             return None;
         }
-        self.global_scope_if_current()
+        self.global_env()
     }
 
     fn global(&self, name: &str) -> Option<NanBox> {
@@ -9551,7 +9566,8 @@ impl crate::nbvm::VmHost for Interp {
         if let Some((m, n)) = crate::nbvm::split_module_name(name) {
             return self.vm_module_read(m, n).map_err(exec_to_host);
         }
-        self.read_ident_ref(name).map_err(exec_to_host)
+        self.at_global_env(|this| this.read_ident_ref(name))
+            .map_err(exec_to_host)
     }
 
     fn typeof_global(&mut self, name: &str) -> Result<&'static str, crate::nbvm::HostError> {
@@ -9559,16 +9575,19 @@ impl crate::nbvm::VmHost for Interp {
         if let Some((m, n)) = crate::nbvm::split_module_name(name) {
             return self.vm_module_typeof(m, n);
         }
-        // Mirrors the `typeof` identifier shortcut in `eval`: an unresolvable
-        // name is "undefined", never a ReferenceError.
-        if self.current.get(name).is_none()
-            && self.with_binding(name).is_none()
-            && !matches!(name, "undefined" | "NaN" | "Infinity")
-            && !self.global_object_provides(name)
-        {
+        // An unresolvable name is "undefined", never a ReferenceError.
+        let v = self.at_global_env(|this| {
+            if this.current.get(name).is_none()
+                && !matches!(name, "undefined" | "NaN" | "Infinity")
+                && !this.global_object_provides(name)
+            {
+                return Ok(None);
+            }
+            this.read_ident_ref(name).map(Some)
+        });
+        let Some(v) = v.map_err(exec_to_host)? else {
             return Ok("undefined");
-        }
-        let v = self.read_ident_ref(name).map_err(exec_to_host)?;
+        };
         let t = self.unary(UnaryOp::Typeof, v).map_err(exec_to_host)?;
         let t = self.realm.to_display_string(t);
         Ok(TYPEOF_NAMES
@@ -9588,26 +9607,28 @@ impl crate::nbvm::VmHost for Interp {
         if let Some((m, n)) = crate::nbvm::split_module_name(name) {
             return self.vm_module_write(m, n, value).map_err(exec_to_host);
         }
-        // Strict: a name the global object provides only through its
-        // prototype chain (an inherited property, a proxy's `has` trap) is a
-        // resolvable reference — `[[Set]]` on the global object.
-        if strict
-            && self.current.get(name).is_none()
-            && let Some(g) = self.global_this.as_handle().map(Handle::from_raw)
-            && !self.realm.has_own(g, name)
-            && self.with_binding(name).is_none()
-            && self.global_object_provides(name)
-        {
-            let key = self.new_str(name);
-            let saved = core::mem::replace(&mut self.strict, true);
-            let r = self.assign_member_value(g, key, value);
-            self.strict = saved;
-            return r.map_err(exec_to_host);
-        }
-        let saved = core::mem::replace(&mut self.strict, strict);
-        let r = self.assign_to_name(name, value);
-        self.strict = saved;
-        r.map_err(exec_to_host)
+        self.at_global_env(|this| {
+            // Strict: a name the global object provides only through its
+            // prototype chain (an inherited property, a proxy's `has` trap) is
+            // a resolvable reference — `[[Set]]` on the global object.
+            if strict
+                && this.current.get(name).is_none()
+                && let Some(g) = this.global_this.as_handle().map(Handle::from_raw)
+                && !this.realm.has_own(g, name)
+                && this.global_object_provides(name)
+            {
+                let key = this.new_str(name);
+                let saved = core::mem::replace(&mut this.strict, true);
+                let r = this.assign_member_value(g, key, value);
+                this.strict = saved;
+                return r;
+            }
+            let saved = core::mem::replace(&mut this.strict, strict);
+            let r = this.assign_to_name(name, value);
+            this.strict = saved;
+            r
+        })
+        .map_err(exec_to_host)
     }
 
     fn init_global_lexical(
@@ -9781,9 +9802,9 @@ impl crate::nbvm::VmHost for Interp {
         if let Some((m, n)) = crate::nbvm::split_module_name(name) {
             return self.vm_module_exists(m, n);
         }
-        self.current.get(name).is_some()
-            || self.with_binding(name).is_some()
-            || self.global_object_provides(name)
+        self.at_global_env(|this| {
+            this.current.get(name).is_some() || this.global_object_provides(name)
+        })
     }
 
     fn run_jobs(&mut self) -> Result<(), crate::nbvm::HostError> {
@@ -10682,7 +10703,7 @@ impl crate::nbvm::VmHost for Interp {
 
     fn delete_global(&mut self, name: &str) -> bool {
         // Module code is strict: `delete identifier` is an early error there.
-        self.delete_identifier(name).0
+        self.at_global_env(|this| this.delete_identifier(name).0)
     }
 
     fn to_property_key(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {

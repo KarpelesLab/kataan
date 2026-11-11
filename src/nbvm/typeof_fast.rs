@@ -2,14 +2,14 @@
 //!
 //! `Op::TypeofGlobal` (a `typeof` of a name no enclosing function binds) used
 //! to ask the host every time, which swaps the realm in and out and resolves
-//! the name from scratch. When the running scope is the global scope, the
+//! the name from scratch. Usually the
 //! answer is one of three things the VM can read itself: the value of an
 //! initialized global binding (found through a slot cache), the value of an
 //! own **data** property of the global object, or `"undefined"` for a name
 //! neither provides (an unresolvable reference, which `typeof` tolerates).
 //! Anything else (a module name, the temporal dead zone, an accessor, an
-//! inherited property, an exotic object on the global object's chain, an
-//! inner scope running) is the host's.
+//! inherited property, an exotic object on the global object's chain) is
+//! the host's.
 //!
 //! Absence is remembered per site: the global binding epoch
 //! (`crate::env`) moves whenever the global scope gains, loses or

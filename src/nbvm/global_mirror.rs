@@ -181,7 +181,7 @@ pub(crate) extern "C" fn jit_helper_global_mirror(
     let Some(g) = ctx
         .host
         .as_deref()
-        .and_then(|h| h.global_scope_if_current())
+        .and_then(|h| h.global_env())
         .and_then(|(_, g)| g.as_handle())
     else {
         // (Not expected: the address was validated with the global scope
@@ -207,11 +207,7 @@ pub(crate) extern "C" fn jit_helper_global_mirror(
 /// code that has not run — top-level code compiled at its first loop, say.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn prefill(ctx: &super::Ctx, proto: &super::FnProto) {
-    let Some((_, global)) = ctx
-        .host
-        .as_deref()
-        .and_then(|h| h.global_scope_if_current())
-    else {
+    let Some((_, global)) = ctx.host.as_deref().and_then(|h| h.global_env()) else {
         return;
     };
     let Some(g) = global.as_handle().map(super::Handle::from_raw) else {
