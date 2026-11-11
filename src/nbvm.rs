@@ -853,6 +853,40 @@ pub enum Op {
         this: Reg,
         args: Vec<Reg>,
     },
+    /// The proper tail call of the ordinary call op right after it (a strict
+    /// `return callee.call(this, ...args)` spelled as a method call, a
+    /// `super.m(…)`, a private method call, a member tag), whose `Return` of
+    /// its value follows: when the realm's call depth is half its limit or
+    /// more ([`tail_deep`]) and `callee` is a VM function of this table in
+    /// the running realm, the activation ends in a tail call of it
+    /// ([`FrameExit::Tail`], so unbounded tail recursion runs in bounded
+    /// space); otherwise nothing happens and the call op runs (the shallow
+    /// case costs one depth compare, and keeps every fast path and the
+    /// call site's feedback).
+    TailCallGuard {
+        callee: Reg,
+        this: Reg,
+        args: Vec<Reg>,
+    },
+    /// [`Op::TailCallGuard`] for a call with spread arguments: the argument
+    /// list is the `items` registers' values then the elements of `src`,
+    /// taken only when spreading `src` runs no code (as for
+    /// [`Op::CallSpreadPlain`]).
+    TailSpreadGuard {
+        callee: Reg,
+        this: Reg,
+        items: Vec<Reg>,
+        src: Reg,
+    },
+    /// [`Op::TailCallGuard`] for an [`Op::CallMethod`] (`recv.key(args)`,
+    /// the method read after the arguments): the method is looked up only
+    /// on the deep path, and only a data property holding a VM function
+    /// (no accessor, no proxy: a lookup that runs no code) is tail-called.
+    TailMethodGuard {
+        recv: Reg,
+        key: String,
+        args: Vec<Reg>,
+    },
     /// The guard of a call the generic machine-code tier inlined (never
     /// emitted by the compiler: the tier splices it, with the callee's body,
     /// into its own copy of a caller's bytecode; see `crate::jit::inline`).
@@ -5746,6 +5780,13 @@ fn call_with_inner(
     // Where this activation's published inputs start; reset on every tail-call
     // rebinding and truncated back to on return.
     let inputs_mark = ctx.frame_shadow.len();
+    // This activation's entry on the realm's callee stack and where its
+    // arguments start in `vm_args_buf` (`call_with` pushed both): a proper
+    // tail call rebinds them to the callee it runs next, so what reads the
+    // running function (its realm, the legacy `f.caller` / `f.arguments`)
+    // sees the activation that replaced this one.
+    let callee_slot = ctx.realm.vm_callee_stack.len().wrapping_sub(1);
+    let args_slot = ctx.realm.vm_callee_args.last().copied();
     loop {
         // `id` can originate from a runtime value (an indirect call reads it out of
         // a callee array's slot 0), so a hostile script can make it point past the
@@ -5930,8 +5971,9 @@ fn call_with_inner(
                     args = alloc::borrow::Cow::Owned(targs);
                     captures = alloc::borrow::Cow::Owned(tcaps);
                     this_val = this;
-                    callee = None;
+                    callee = ctx.pending_callee.take();
                     new_target = None;
+                    rebind_tail_activation(ctx, callee_slot, args_slot, callee, &args);
                     continue;
                 }
                 FrameExit::Yield { .. } => return Err(VmError::Unsupported),
@@ -6042,10 +6084,32 @@ fn call_with_inner(
                 args = alloc::borrow::Cow::Owned(targs);
                 captures = alloc::borrow::Cow::Owned(tcaps);
                 this_val = this;
-                callee = None;
+                callee = ctx.pending_callee.take();
                 new_target = None;
+                rebind_tail_activation(ctx, callee_slot, args_slot, callee, &args);
             }
         }
+    }
+}
+
+/// A proper tail call's rebinding of the activation `call_with` pushed onto
+/// the realm's callee stack (entry `slot`, arguments from `args_at` in
+/// `vm_args_buf`) to the callee that now runs in it.
+fn rebind_tail_activation(
+    ctx: &mut Ctx,
+    slot: usize,
+    args_at: Option<usize>,
+    callee: Option<NanBox>,
+    args: &[NanBox],
+) {
+    if let Some(e) = ctx.realm.vm_callee_stack.get_mut(slot) {
+        *e = callee.unwrap_or(NanBox::undefined());
+    }
+    if let Some(at) = args_at
+        && at <= ctx.realm.vm_args_buf.len()
+    {
+        ctx.realm.vm_args_buf.truncate(at);
+        ctx.realm.vm_args_buf.extend_from_slice(args);
     }
 }
 
@@ -11250,6 +11314,7 @@ fn run_frame_at_ic(
             // strict `return f(...)`), so no fallback is needed.
             Op::TailCall { func, args } => {
                 let argv = ArgBuf::from_regs(regs, args);
+                ctx.pending_callee = None;
                 return Ok(FrameExit::Tail {
                     id: *func as usize,
                     args: argv.to_vec(),
@@ -11270,6 +11335,7 @@ fn run_frame_at_ic(
                     .and_then(|h| ctx.realm.vm_function(h).map(|(f, c)| (f, c.to_vec())))
                     .filter(|_| !tail_call_changes_realm(ctx, val))
                 {
+                    ctx.pending_callee = Some(val);
                     return Ok(FrameExit::Tail {
                         id: fid as usize,
                         args: argv.to_vec(),
@@ -11286,6 +11352,59 @@ fn run_frame_at_ic(
                 match pub_r {
                     Ok(v) => return Ok(FrameExit::Return(Some(v))),
                     Err(e) => handle_throw!(e),
+                }
+            }
+            // A proper tail call of the call op that follows, once the stack
+            // is deep (see `Op::TailCallGuard`); else the call op runs.
+            Op::TailCallGuard { callee, this, args } => {
+                if tail_deep(ctx) {
+                    let val = regs[*callee as usize];
+                    if let Some((fid, caps)) = tail_target(ctx, funcs, val) {
+                        ctx.pending_callee = Some(val);
+                        return Ok(FrameExit::Tail {
+                            id: fid,
+                            args: ArgBuf::from_regs(regs, args).to_vec(),
+                            captures: caps,
+                            this: regs[*this as usize],
+                        });
+                    }
+                }
+            }
+            Op::TailSpreadGuard {
+                callee,
+                this,
+                items,
+                src,
+            } => {
+                if tail_deep(ctx) {
+                    let val = regs[*callee as usize];
+                    if let Some((fid, caps)) = tail_target(ctx, funcs, val)
+                        && let Some(argv) = plain_spread_argv(ctx, regs, items, regs[*src as usize])
+                    {
+                        ctx.pending_callee = Some(val);
+                        return Ok(FrameExit::Tail {
+                            id: fid,
+                            args: argv.to_vec(),
+                            captures: caps,
+                            this: regs[*this as usize],
+                        });
+                    }
+                }
+            }
+            Op::TailMethodGuard { recv, key, args } => {
+                if tail_deep(ctx) {
+                    let recv_val = regs[*recv as usize];
+                    if let Some(val) = tail_method_of(ctx, recv_val, key)
+                        && let Some((fid, caps)) = tail_target(ctx, funcs, val)
+                    {
+                        ctx.pending_callee = Some(val);
+                        return Ok(FrameExit::Tail {
+                            id: fid,
+                            args: ArgBuf::from_regs(regs, args).to_vec(),
+                            captures: caps,
+                            this: recv_val,
+                        });
+                    }
                 }
             }
             // An inlined call's guard and end (machine-code tier only): the
@@ -11306,6 +11425,7 @@ fn run_frame_at_ic(
                             .map(|(f, c)| (f, c.to_vec()))
                             .filter(|_| !tail_call_changes_realm(ctx, val))
                         {
+                            ctx.pending_callee = Some(val);
                             return Ok(FrameExit::Tail {
                                 id: fid as usize,
                                 args: argv.to_vec(),
@@ -11346,6 +11466,39 @@ fn tail_call_changes_realm(ctx: &Ctx, callee: NanBox) -> bool {
             .host
             .as_deref()
             .is_some_and(|h| h.fn_realm_index(callee) != h.realm_index())
+}
+
+/// Whether the realm's call depth is half its limit or more: where a tail
+/// call guard (`Op::TailCallGuard` and kin) reuses the frame. Below it the
+/// ordinary call is made (no observable difference but the stack's size),
+/// keeping every fast path of the call op; the machine-code tier tests the
+/// same (`call_seq::emit_tail_depth_check`).
+#[inline]
+fn tail_deep(ctx: &Ctx) -> bool {
+    ctx.realm.vm_total_depth.saturating_mul(2) >= ctx.realm.limits.max_call_depth
+}
+
+/// The activation a proper tail call of `callee` reuses the frame for: its
+/// function id and captures when it is a VM function of this table (not one
+/// eval code defined later) in the running realm; `None` makes the
+/// ordinary call.
+fn tail_target(ctx: &Ctx, funcs: &[FnProto], callee: NanBox) -> Option<(usize, Vec<NanBox>)> {
+    let h = Handle::from_raw(callee.as_handle()?);
+    let (f, caps) = ctx.realm.vm_function(h)?;
+    if f as usize >= funcs.len() || tail_call_changes_realm(ctx, callee) {
+        return None;
+    }
+    Some((f as usize, caps.to_vec()))
+}
+
+/// The method an `Op::TailMethodGuard` tail-calls: `recv.key` when looking it
+/// up runs no code and finds a data property holding a VM function (see
+/// [`vm_method_of`]); a legacy `f.caller` read is the call op's to resolve.
+fn tail_method_of(ctx: &Ctx, recv: NanBox, key: &str) -> Option<NanBox> {
+    if key == "caller" {
+        return None;
+    }
+    vm_method_of(ctx, recv, key)
 }
 
 /// Interpreter-aware `JSON.stringify(value, replacer?, space?)`: normalizes the
@@ -16415,6 +16568,12 @@ struct Compiler {
     /// `finally` follows), since a call there is not in tail position. Toggled
     /// (save/restore) around `try` compilation.
     tail_ok: bool,
+    /// Set by [`Self::compile_tail_return`] just before it compiles a call
+    /// expression in tail position the ordinary way, and taken by the very
+    /// next [`Self::expr_any`] (that call's): its call op is then preceded by
+    /// a tail call guard (`Op::TailCallGuard` and kin). Nested expressions
+    /// see it cleared.
+    tail_next: bool,
     /// This function's strict-mode flag (its own directive or an inherited strict
     /// context). Nested functions inherit it (strict code's inner functions are
     /// strict). Distinct from [`Self::tail_ok`], which is mutated during `try`.
@@ -16848,6 +17007,7 @@ impl Compiler {
             super_ctor,
             super_class: super_class.clone(),
             tail_ok: strict && !is_async && class_ctor.is_none() && !is_generator,
+            tail_next: false,
             in_generator: is_generator,
             in_async: is_async && hosted,
             derived_ctor: class_ctor == Some(true),
@@ -20448,8 +20608,12 @@ impl Compiler {
                 if (self.hosted && is_import_form(e))
                     || !self.try_emit_tail_call(callee, arguments)?
                 {
-                    let src = self.expr(e)?;
-                    self.ops.push(Op::Return { src });
+                    // A method / `super.` / private / spread call: the
+                    // ordinary call, guarded (`Op::TailCallGuard`).
+                    self.tail_next = self.hosted && !is_import_form(e);
+                    let src = self.expr(e);
+                    self.tail_next = false;
+                    self.ops.push(Op::Return { src: src? });
                 }
                 Ok(())
             }
@@ -20480,9 +20644,12 @@ impl Compiler {
                 self.ops.push(Op::TailCallValue { callee, args });
                 Ok(())
             }
+            // A member tag: the ordinary method call, guarded.
             Expr::TaggedTemplate { .. } if self.hosted => {
-                let src = self.expr(e)?;
-                self.ops.push(Op::Return { src });
+                self.tail_next = true;
+                let src = self.expr(e);
+                self.tail_next = false;
+                self.ops.push(Op::Return { src: src? });
                 Ok(())
             }
             // A tagged template's tag is invoked in tail position.
@@ -20727,6 +20894,8 @@ impl Compiler {
 
     #[inline(never)]
     fn expr_any(&mut self, expr: &Expr) -> Result<Reg, CompileError> {
+        // This expression is a call in tail position (`Self::tail_next`).
+        let tail = core::mem::take(&mut self.tail_next);
         match expr {
             // `import(…)`, `import.defer/source(…)`, `import.meta` (the parser
             // spells them through the reserved name `import`).
@@ -21572,7 +21741,7 @@ impl Compiler {
                         (f, self.constant(NanBox::undefined())?)
                     }
                 };
-                self.call_spread(f, this, arguments, callee_text(callee))
+                self.call_spread_tail(f, this, arguments, callee_text(callee), tail)
             }
             Expr::Call {
                 callee,
@@ -21614,6 +21783,14 @@ impl Compiler {
                     let f = self.expr(callee)?;
                     let this = self.this_value();
                     let args = self.spread_args(arguments)?;
+                    if tail {
+                        self.ops.push(Op::TailSpreadGuard {
+                            callee: f,
+                            this,
+                            items: Vec::new(),
+                            src: args,
+                        });
+                    }
                     let dst = self.alloc();
                     self.ops.push(Op::CallSpread {
                         dst,
@@ -21739,9 +21916,16 @@ impl Compiler {
                     // EvaluateCall reads the callee before the arguments: when
                     // they could tell, the read comes first.
                     if self.hosted && !self.args_pure(arguments) {
-                        return self.method_call_ordered(recv, key, None, arguments);
+                        return self.method_call_ordered(recv, key, None, arguments, tail);
                     }
                     let args = self.call_args(arguments)?;
+                    if tail {
+                        self.ops.push(Op::TailMethodGuard {
+                            recv,
+                            key: String::from(&**key),
+                            args: args.clone(),
+                        });
+                    }
                     let dst = self.alloc();
                     self.ops.push(Op::CallMethod {
                         dst,
@@ -21770,8 +21954,8 @@ impl Compiler {
                             key: None,
                         });
                     }
-                    if self.hosted && !self.args_pure(arguments) {
-                        return self.method_call_ordered(recv, "", Some(key), arguments);
+                    if self.hosted && (tail || !self.args_pure(arguments)) {
+                        return self.method_call_ordered(recv, "", Some(key), arguments, tail);
                     }
                     let args = self.call_args(arguments)?;
                     let dst = self.alloc();
@@ -21802,6 +21986,14 @@ impl Compiler {
                         cache: crate::realm::PrivCache::default(),
                     });
                     let args = self.spread_args(arguments)?;
+                    if tail {
+                        self.ops.push(Op::TailSpreadGuard {
+                            callee: f,
+                            this: recv,
+                            items: Vec::new(),
+                            src: args,
+                        });
+                    }
                     let dst = self.alloc();
                     self.ops.push(Op::CallSpread {
                         dst,
@@ -22373,7 +22565,10 @@ impl Compiler {
                 };
                 // EvaluateCall reads a method tag before the substitutions
                 // run: when they could tell, the read comes first.
-                let pure = quasi.expressions.iter().all(|e| self.arg_pure(e));
+                // (In tail position a computed-key tag's call is the guarded
+                // ordered one.)
+                let pure = !(tail && matches!(call, TagCall::Key(..)))
+                    && quasi.expressions.iter().all(|e| self.arg_pure(e));
                 let got = match &call {
                     TagCall::Method(r, k) if !pure => {
                         let f = self.alloc();
@@ -22419,6 +22614,13 @@ impl Compiler {
                         TagCall::Key(recv, _) => (recv, String::new()),
                         TagCall::Value(_) => return Err(CompileError::Unsupported("tag")),
                     };
+                    if tail {
+                        self.ops.push(Op::TailCallGuard {
+                            callee,
+                            this: recv,
+                            args: args.clone(),
+                        });
+                    }
                     self.ops.push(Op::CallWithMethod {
                         dst,
                         callee,
@@ -22427,6 +22629,13 @@ impl Compiler {
                         args,
                     });
                     return Ok(dst);
+                }
+                if tail && let TagCall::Method(recv, key) = &call {
+                    self.ops.push(Op::TailMethodGuard {
+                        recv: *recv,
+                        key: key.clone(),
+                        args: args.clone(),
+                    });
                 }
                 self.ops.push(match call {
                     TagCall::Method(recv, key) => Op::CallMethod {
@@ -22899,6 +23108,19 @@ impl Compiler {
         arguments: &[crate::ast::Argument],
         name: Option<Box<str>>,
     ) -> Result<Reg, CompileError> {
+        self.call_spread_tail(f, this, arguments, name, false)
+    }
+
+    /// [`Self::call_spread`]; `tail`: the call is in tail position, so its
+    /// call ops are preceded by an `Op::TailSpreadGuard`.
+    fn call_spread_tail(
+        &mut self,
+        f: Reg,
+        this: Reg,
+        arguments: &[crate::ast::Argument],
+        name: Option<Box<str>>,
+        tail: bool,
+    ) -> Result<Reg, CompileError> {
         let dst = self.alloc();
         if let Some((crate::ast::Argument::Spread(last), init)) = arguments.split_last()
             && init.len() < ARGBUF_INLINE
@@ -22917,6 +23139,14 @@ impl Compiler {
                 items.push(r);
             }
             let src = self.expr(last)?;
+            if tail {
+                self.ops.push(Op::TailSpreadGuard {
+                    callee: f,
+                    this,
+                    items: items.clone(),
+                    src,
+                });
+            }
             let ok = self.alloc();
             self.ops.push(Op::CallSpreadPlain {
                 dst,
@@ -22947,6 +23177,14 @@ impl Compiler {
             return Ok(dst);
         }
         let args = self.spread_args(arguments)?;
+        if tail {
+            self.ops.push(Op::TailSpreadGuard {
+                callee: f,
+                this,
+                items: Vec::new(),
+                src: args,
+            });
+        }
         self.ops.push(Op::CallSpread {
             dst,
             callee: f,
@@ -23583,10 +23821,16 @@ impl Compiler {
         key: &str,
         ckey: Option<Reg>,
         arguments: &[crate::ast::Argument],
+        tail: bool,
     ) -> Result<Reg, CompileError> {
         let dst = self.alloc();
         let mut done = None;
-        if let Some(leaves) = self.args_guard(arguments) {
+        // (In tail position a computed key's call is the guarded ordered
+        // one: `Op::TailMethodGuard` names a static key.)
+        if let Some(leaves) = self
+            .args_guard(arguments)
+            .filter(|_| !tail || ckey.is_none())
+        {
             let mut regs = Vec::with_capacity(leaves.len());
             for l in &leaves {
                 regs.push(self.expr(l)?);
@@ -23599,6 +23843,13 @@ impl Compiler {
                 Some(self.emit_jump_if_false(ok))
             };
             let args = self.call_args(arguments)?;
+            if tail {
+                self.ops.push(Op::TailMethodGuard {
+                    recv,
+                    key: String::from(key),
+                    args: args.clone(),
+                });
+            }
             self.ops.push(match ckey {
                 None => Op::CallMethod {
                     dst,
@@ -23634,6 +23885,13 @@ impl Compiler {
         });
         let f = self.pin_operand(f, args_may_assign(arguments));
         let args = self.call_args(arguments)?;
+        if tail {
+            self.ops.push(Op::TailCallGuard {
+                callee: f,
+                this: recv,
+                args: args.clone(),
+            });
+        }
         self.ops.push(Op::CallWithMethod {
             dst,
             callee: f,

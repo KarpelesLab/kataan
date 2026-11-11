@@ -810,6 +810,16 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             *cond = reg(*cond);
             *t = target(*t);
         }
+        // A tail call guard: an inlined body is no activation of its own
+        // (its frame is the caller's, which the guard must not end), and
+        // its depth is bounded, so the guarded call is just the call: the
+        // guard becomes a no-op (a register's copy to itself).
+        Op::TailCallGuard { callee: r, .. }
+        | Op::TailSpreadGuard { callee: r, .. }
+        | Op::TailMethodGuard { recv: r, .. } => {
+            let r = reg(*r);
+            *op = Op::Move { dst: r, src: r };
+        }
         _ => return false,
     }
     true

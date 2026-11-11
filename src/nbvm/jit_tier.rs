@@ -3642,21 +3642,99 @@ pub(crate) extern "C" fn jit_helper_tail_call(
     #[allow(unsafe_code)]
     let op = unsafe { &*op_raw };
     let hand_back = !deep.is_null() && regs_addr == ctx.jit_rt.exit_regs;
-    let (callee, args, static_id) = match op {
-        Op::TailCall { func, args } => (NanBox::undefined(), args, Some(*func as usize)),
-        Op::TailCallValue { callee, args } => (regs[*callee as usize], args, None),
+    // A tail call guard (`Op::TailCallGuard` and kin, always on its deep
+    // path): `this` is the call's receiver, and a callee that is not a VM
+    // function of this table in this realm (or a spread that would run code)
+    // declines with the fall-off sentinel, after which the compiled code
+    // runs the guarded call op.
+    let declined = NanBox::jit_falloff_bits();
+    let (callee, this, argv, static_id, guard) = match op {
+        Op::TailCall { func, args } => (
+            NanBox::undefined(),
+            NanBox::undefined(),
+            super::ArgBuf::from_regs(regs, args),
+            Some(*func as usize),
+            false,
+        ),
+        Op::TailCallValue { callee, args } => (
+            regs[*callee as usize],
+            NanBox::undefined(),
+            super::ArgBuf::from_regs(regs, args),
+            None,
+            false,
+        ),
+        Op::TailCallGuard { callee, this, args } => (
+            regs[*callee as usize],
+            regs[*this as usize],
+            super::ArgBuf::from_regs(regs, args),
+            None,
+            true,
+        ),
+        Op::TailSpreadGuard {
+            callee,
+            this,
+            items,
+            src,
+        } => match super::plain_spread_argv(ctx, regs, items, regs[*src as usize]) {
+            Some(argv) => (
+                regs[*callee as usize],
+                regs[*this as usize],
+                argv,
+                None,
+                true,
+            ),
+            None => return declined,
+        },
+        Op::TailMethodGuard { recv, key, args } => {
+            let r = regs[*recv as usize];
+            match super::tail_method_of(ctx, r, key) {
+                Some(f) => (f, r, super::ArgBuf::from_regs(regs, args), None, true),
+                None => return declined,
+            }
+        }
         _ => {
             ctx.jit_pending_fault = Some(VmError::Unsupported);
             return NanBox::jit_throw_bits();
         }
     };
+    if guard {
+        let Some((id, captures)) = super::tail_target(ctx, funcs, callee) else {
+            return declined;
+        };
+        if hand_back {
+            ctx.pending_callee = Some(callee);
+            ctx.jit_rt.tail = Some(TailCall {
+                id,
+                args: argv.to_vec(),
+                captures,
+                this,
+            });
+            return NanBox::jit_exit_bits();
+        }
+        // The ordinary call, through `call_with` (whose trampoline takes the
+        // callee's own tail calls), the caller's registers published.
+        let pub_mark = ctx.frame_shadow.len();
+        if !on_register_stack(ctx, regs) {
+            ctx.frame_shadow.extend_from_slice(regs);
+        }
+        ctx.frames_published += 1;
+        let r = super::call_closure(ctx, funcs, callee, &argv, this);
+        ctx.frames_published -= 1;
+        ctx.frame_shadow.truncate(pub_mark);
+        return match r {
+            Ok(v) => v.to_bits(),
+            Err(e) => {
+                ctx.jit_pending_fault = Some(e);
+                NanBox::jit_throw_bits()
+            }
+        };
+    }
     if static_id.is_none() && !site.is_null() {
         // SAFETY: the site's own cache (see the function contract).
         #[allow(unsafe_code)]
         let site = unsafe { &mut *site.cast::<CallSite>() };
         fill_call_site(ctx, callee, site);
     }
-    let argv = super::ArgBuf::from_regs(regs, args);
     if hand_back {
         // The interpreter arm's tail call (`Op::TailCall` / `TailCallValue`).
         let target = match static_id {
@@ -3671,6 +3749,7 @@ pub(crate) extern "C" fn jit_helper_tail_call(
                 .filter(|_| !super::tail_call_changes_realm(ctx, callee)),
         };
         if let Some((id, captures)) = target {
+            ctx.pending_callee = static_id.is_none().then_some(callee);
             ctx.jit_rt.tail = Some(TailCall {
                 id,
                 args: argv.to_vec(),
@@ -3684,8 +3763,8 @@ pub(crate) extern "C" fn jit_helper_tail_call(
     // registers published for the GC. A deep one goes through `call_with`,
     // whose trampoline then takes the callee's own tail calls (a compiled
     // callee entered natively would only nest again).
-    let compiled = match static_id {
-        None if deep.is_null() => {
+    let compiled = match op {
+        Op::TailCallValue { args, .. } if deep.is_null() => {
             call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined())
         }
         _ => None,

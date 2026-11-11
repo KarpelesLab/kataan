@@ -12503,6 +12503,42 @@ impl JitFunction {
                         a.frame_epilogue();
                         break 'interp;
                     }
+                    // A tail call guard (`Op::TailCallGuard` and kin): nothing
+                    // while the call depth is shallow (the call op after it
+                    // runs); deeper, the helper's tail call (or ordinary
+                    // call) is the activation's value — unless it declined
+                    // (a callee that is not a VM function: the fall-off
+                    // sentinel), when the call op runs.
+                    if matches!(
+                        bytecode.get(pc as usize),
+                        Some(
+                            crate::nbvm::Op::TailCallGuard { .. }
+                                | crate::nbvm::Op::TailSpreadGuard { .. }
+                                | crate::nbvm::Op::TailMethodGuard { .. }
+                        )
+                    ) {
+                        let deep = a.new_label();
+                        let cont = a.new_label();
+                        call_seq::emit_tail_depth_check(&mut a, &helpers.call_layout, deep);
+                        let cold = a.cold_begin();
+                        a.bind(deep);
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, 0);
+                        a.movabs_argreg(5, 1);
+                        a.movabs_rax(tail_call_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                        a.movabs_r11(NanBox::jit_falloff_bits() as i64);
+                        a.cmp_rax_r11();
+                        a.je(cont);
+                        a.frame_epilogue();
+                        a.cold_end(cold);
+                        a.bind(cont);
+                        break 'interp;
+                    }
                     // `ToPropertyKey` of a computed key (`a[i] -= x`): a
                     // primitive is the key as it is, inline for a Number;
                     // anything else is the interpreter's.

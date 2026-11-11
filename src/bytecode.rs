@@ -545,9 +545,24 @@ fn verify_op_with(
             reg(*callee)?;
             regs(args)
         }
-        Op::TailCallThis { callee, this, args } => {
+        Op::TailCallThis { callee, this, args } | Op::TailCallGuard { callee, this, args } => {
             reg(*callee)?;
             reg(*this)?;
+            regs(args)
+        }
+        Op::TailSpreadGuard {
+            callee,
+            this,
+            items,
+            src,
+        } => {
+            reg(*callee)?;
+            reg(*this)?;
+            reg(*src)?;
+            regs(items)
+        }
+        Op::TailMethodGuard { recv, args, .. } => {
+            reg(*recv)?;
             regs(args)
         }
         Op::LoadGlobal { dst, .. } | Op::TypeofGlobal { dst, .. } => reg(*dst),
@@ -1431,6 +1446,30 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_u8(201, out);
             w_reg(*callee, out);
             w_reg(*this, out);
+            w_regs(args, out);
+        }
+        Op::TailCallGuard { callee, this, args } => {
+            w_u8(228, out);
+            w_reg(*callee, out);
+            w_reg(*this, out);
+            w_regs(args, out);
+        }
+        Op::TailSpreadGuard {
+            callee,
+            this,
+            items,
+            src,
+        } => {
+            w_u8(229, out);
+            w_reg(*callee, out);
+            w_reg(*this, out);
+            w_regs(items, out);
+            w_reg(*src, out);
+        }
+        Op::TailMethodGuard { recv, key, args } => {
+            w_u8(230, out);
+            w_reg(*recv, out);
+            w_str(key, out);
             w_regs(args, out);
         }
         Op::InlineGuard {
@@ -2422,6 +2461,22 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         201 => Op::TailCallThis {
             callee: r.reg()?,
             this: r.reg()?,
+            args: r.regs()?,
+        },
+        228 => Op::TailCallGuard {
+            callee: r.reg()?,
+            this: r.reg()?,
+            args: r.regs()?,
+        },
+        229 => Op::TailSpreadGuard {
+            callee: r.reg()?,
+            this: r.reg()?,
+            items: r.regs()?,
+            src: r.reg()?,
+        },
+        230 => Op::TailMethodGuard {
+            recv: r.reg()?,
+            key: r.string()?,
             args: r.regs()?,
         },
         60 => Op::LoadGlobal {
