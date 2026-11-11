@@ -730,8 +730,9 @@ pub(super) fn prove_array_push(realm: &mut Realm, site: &mut crate::jit::MethodS
     prove_proto_method(realm, site, start, "push", FastOp::ArrayPush);
 }
 
-/// What compiled code's inline `m.get(k)` / `m.has(k)` / `s.has(k)` relies
-/// on, for `site` and the collection `recv` (`crate::jit::coll`): the proof
+/// What compiled code's inline `m.get(k)` / `m.has(k)` / `s.has(k)` (and
+/// `m.set(k, v)` / `s.add(k)` / `.delete(k)`) relies on, for `site` and the
+/// collection `recv` (`crate::jit::coll`): the proof
 /// that a collection of `recv`'s kind with the default `[[Prototype]]`
 /// finds the built-in. Whether it was made.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -747,6 +748,10 @@ pub(super) fn prove_coll(
         ("get", false) => FastOp::MapGet,
         ("has", false) => FastOp::MapHas,
         ("has", true) => FastOp::SetHas,
+        ("set", false) => FastOp::MapSet,
+        ("add", true) => FastOp::SetAdd,
+        ("delete", false) => FastOp::MapDelete,
+        ("delete", true) => FastOp::SetDelete,
         _ => return false,
     };
     site.fill_coll(realm, start, is_set, |realm, v| classify(realm, v) == want)

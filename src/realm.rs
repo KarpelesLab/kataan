@@ -4140,13 +4140,15 @@ impl Realm {
         }
     }
 
-    /// Allocates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`).
+    /// Allocates an empty `Map` (`is_set = false`) or `Set` (`is_set = true`),
+    /// with room for a few entries: compiled code appends an entry in place
+    /// only within the capacity (`jit::coll`), and most collections get some.
     pub fn new_collection(&mut self, is_set: bool) -> Handle {
         self.heap.alloc(Cell::Collection {
             is_set,
             is_weak: false,
             default_proto: false,
-            entries: Vec::new(),
+            entries: Vec::with_capacity(4),
             live: 0,
             iters: 0,
             epoch: 0,

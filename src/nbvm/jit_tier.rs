@@ -1742,8 +1742,8 @@ pub(crate) extern "C" fn jit_helper_str_proof(
                 }),
         );
     }
-    if matches!(site.key(), "get" | "has") {
-        // An inline `Map`/`Set` lookup's proof (`crate::jit::coll`): `1`
+    if matches!(site.key(), "get" | "has" | "set" | "add" | "delete") {
+        // An inline `Map`/`Set` lookup's or update's proof (`crate::jit::coll`): `1`
         // when made, so the lookup is retried.
         return u64::from(
             ctx.host.is_some()

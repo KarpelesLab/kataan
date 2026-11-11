@@ -1250,9 +1250,12 @@ pub(crate) struct CollCellLayout {
     pub is_set_off: usize,
     pub is_weak_off: usize,
     pub default_proto_off: usize,
-    /// The entries `Vec`'s data pointer and length.
+    /// The entries `Vec`'s data pointer, length and capacity.
     pub entries_ptr_off: usize,
     pub entries_len_off: usize,
+    pub entries_cap_off: usize,
+    /// The `live` count (a `u32`).
+    pub live_off: usize,
     /// The `index` word (`Option<Box<_>>`: zero for `None`).
     pub index_off: usize,
     /// One entry's size, and its key's and value's offsets in it.
@@ -1290,6 +1293,7 @@ pub(crate) fn jit_coll_layout() -> CollCellLayout {
         is_weak,
         default_proto,
         entries,
+        live,
         index,
         ..
     } = &cell
@@ -1311,6 +1315,12 @@ pub(crate) fn jit_coll_layout() -> CollCellLayout {
         .iter()
         .position(|&w| w == entries.len())
         .expect("a Vec holds its length");
+    let cap_word = words
+        .iter()
+        .position(|&w| w == entries.capacity())
+        .expect("a Vec holds its capacity");
+    assert!(ptr_word != cap_word && len_word != cap_word);
+    assert_eq!(core::mem::size_of_val(live), 4);
     let index_at = core::ptr::addr_of!(*index) as usize;
     assert_eq!(
         core::mem::size_of::<Option<alloc::boxed::Box<crate::realm::CollIndex>>>(),
@@ -1335,6 +1345,8 @@ pub(crate) fn jit_coll_layout() -> CollCellLayout {
         default_proto_off: off(core::ptr::addr_of!(*default_proto) as usize),
         entries_ptr_off: off(vec_base) + 8 * ptr_word,
         entries_len_off: off(vec_base) + 8 * len_word,
+        entries_cap_off: off(vec_base) + 8 * cap_word,
+        live_off: off(core::ptr::addr_of!(*live) as usize),
         index_off: off(index_at),
         entry_size: core::mem::size_of::<(NanBox, NanBox)>(),
         entry_key_off: core::ptr::addr_of!(e0.0) as usize - ebase,

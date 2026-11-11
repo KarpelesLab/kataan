@@ -11670,6 +11670,59 @@ impl JitFunction {
                         a.cold_end(cold);
                         a.bind(slow);
                     }
+                    // `m.set(k, v)`, `s.add(k)`, `m.delete(k)` on a small
+                    // collection with the default `[[Prototype]]`: with no
+                    // call either (`coll`), under the same kind of proof.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && let Some((w, k, v)) = match (key.as_str(), &margs[..]) {
+                            ("set", &[k, v]) => Some((coll::CollWrite::MapSet, k, v)),
+                            ("add", &[k]) => Some((coll::CollWrite::SetAdd, k, k)),
+                            ("delete", &[k]) => Some((coll::CollWrite::Delete, k, k)),
+                            _ => None,
+                        }
+                        && ok(dst)
+                        && ok(recv)
+                        && ok(k)
+                        && ok(v)
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                    {
+                        for r in [recv, k, v] {
+                            num.operand_xmm(&mut a, op_idx, r, false);
+                        }
+                        let slow = a.new_label();
+                        let fill = a.new_label();
+                        let retry = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, slow);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, slow);
+                        a.bind(retry);
+                        a.coll_update(
+                            &layout,
+                            cl.realm,
+                            si.method_ptr,
+                            w,
+                            (disp(recv), disp(k), disp(v), disp(dst)),
+                            (fill, slow, done),
+                        );
+                        let cold = a.cold_begin();
+                        a.bind(fill);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.jne(retry);
+                        a.jmp(slow);
+                        a.cold_end(cold);
+                        a.bind(slow);
+                    }
                     // `m.get(k)`, `s.add(v)`, …: a site that last called the
                     // `Map`/`Set` method on this receiver serves it in one
                     // helper call (`jit_helper_coll_call`), else on to the call.
