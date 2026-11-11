@@ -219,6 +219,24 @@ impl Interp {
         this_val: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // Each host call takes the next serial number (see
+        // `crate::realm::host_roots`).
+        let outer = self.call_serial;
+        let hr = &mut self.realm.host_roots;
+        hr.serial = hr.serial.wrapping_add(1);
+        self.call_serial = hr.serial;
+        let r = self.call_with_this_serial(callee, this_val, args);
+        self.call_serial = outer;
+        r
+    }
+
+    /// [`call_with_this`](Self::call_with_this) once numbered.
+    fn call_with_this_serial(
+        &mut self,
+        callee: NanBox,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         // One realm only (none was ever created): every function's realm is
         // the running one, so there is nothing to enter.
         if self.created_realms.is_empty() {
@@ -2092,6 +2110,18 @@ impl Interp {
         callee: NanBox,
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
+        // Numbered as a call is (see `call_with_this`).
+        let outer = self.call_serial;
+        let hr = &mut self.realm.host_roots;
+        hr.serial = hr.serial.wrapping_add(1);
+        self.call_serial = hr.serial;
+        let r = self.construct_serial(callee, args);
+        self.call_serial = outer;
+        r
+    }
+
+    /// [`construct`](Self::construct) once numbered.
+    fn construct_serial(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
         // Enter the constructor's realm for the duration of the construction, so a
         // cross-realm `new other.Function(...)` (whose body scope, sloppy-`this`,
         // and generated intrinsics come from *its* realm's globals) and a
@@ -2722,7 +2752,9 @@ impl Interp {
             // writable + configurable but **not** enumerable.
             if is_aggregate && let Some(eh) = err.as_handle().map(Handle::from_raw) {
                 let errors = args.first().copied().unwrap_or(NanBox::undefined());
-                let list = self.iterate_values(errors)?;
+                let mut keep = alloc::vec![err, callee, native_new_target];
+                keep.extend_from_slice(args);
+                let list = self.iterate_values_keep(errors, &keep)?;
                 let arr = self.realm.new_array(list);
                 self.realm
                     .set_property(eh, "errors", NanBox::handle(arr.to_raw()));
@@ -3273,7 +3305,14 @@ impl Interp {
                     // `%ArrayIteratorPrototype%.next`) — before coercing each value.
                     let bigint = is_bigint_kind(kind);
                     let iterator = self.call_with_this(iter_fn, args[0], &[])?;
-                    let values = self.drain_iterator_values(iterator)?;
+                    // (What this frame holds across the drain: the construction's
+                    // inputs and the `[[Prototype]]` read from `new.target`.)
+                    let proto = nt_proto
+                        .flatten()
+                        .map_or(NanBox::undefined(), |p| NanBox::handle(p.to_raw()));
+                    let mut keep = alloc::vec![callee, native_new_target, proto];
+                    keep.extend_from_slice(args);
+                    let values = self.drain_iterator_values(iterator, &keep)?;
                     let mut elems = Vec::with_capacity(values.len());
                     for v in values {
                         let v = if bigint { v } else { self.coerce_to_number(v)? };
@@ -3586,32 +3625,44 @@ impl Interp {
                     (it, self.read_member(it, "next")?)
                 }
             };
-            while let Some(entry) = self.iter_step(it, next)? {
+            // The collection, its adder and the iterator record are rooted
+            // across each step, so the generator body (or VM `next`) it
+            // resumes may collect (see `host_roots`).
+            let mut sc = self.root_scope(&[
+                callee,
+                native_new_target,
+                first,
+                map_val,
+                adder,
+                NanBox::handle(it.to_raw()),
+                next,
+            ]);
+            while let Some(entry) = sc.step(it, next)? {
                 let call_res = if is_set {
-                    self.call_with_this(adder, map_val, &[entry])
-                } else if !self.is_object_value(entry) {
-                    let _ = self.iterator_close(it);
-                    return Err(self.type_error("Map iterator value is not an entry object"));
+                    sc.call_with_this(adder, map_val, &[entry])
+                } else if !sc.is_object_value(entry) {
+                    let _ = sc.iterator_close(it);
+                    return Err(sc.type_error("Map iterator value is not an entry object"));
                 } else {
                     let eh = entry.as_handle().map(Handle::from_raw).unwrap();
-                    let k = match self.read_member(eh, "0") {
+                    let k = match sc.read_member(eh, "0") {
                         Ok(k) => k,
                         Err(e) => {
-                            let _ = self.iterator_close(it);
+                            let _ = sc.iterator_close(it);
                             return Err(e);
                         }
                     };
-                    let v = match self.read_member(eh, "1") {
+                    let v = match sc.read_member(eh, "1") {
                         Ok(v) => v,
                         Err(e) => {
-                            let _ = self.iterator_close(it);
+                            let _ = sc.iterator_close(it);
                             return Err(e);
                         }
                     };
-                    self.call_with_this(adder, map_val, &[k, v])
+                    sc.call_with_this(adder, map_val, &[k, v])
                 };
                 if let Err(e) = call_res {
-                    let _ = self.iterator_close(it);
+                    let _ = sc.iterator_close(it);
                     return Err(e);
                 }
             }

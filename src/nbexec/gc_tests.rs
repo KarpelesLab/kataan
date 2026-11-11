@@ -547,3 +547,67 @@ fn churn_inside_resumed_async_bodies_is_reclaimed() {
         "no collection ran inside resumed async bodies: {peak} objects at once"
     );
 }
+
+// --- collection inside generator bodies a host built-in drains ---
+
+#[test]
+fn churn_inside_a_generator_drained_by_a_builtin_is_reclaimed() {
+    // `Array.from`, `new Set`, `Object.fromEntries` over a user iterator, an
+    // iterator helper chain and `Promise.all` each drain a churning generator
+    // under a root scope (`host_roots`), so its body's back-edges collect.
+    let program = Parser::parse_program(&format!(
+        "{GEN_CHURN}
+         var log = [];
+         function entries() {{ var it = gchurn({{ v: 'e' }}); return {{ [Symbol.iterator]() {{ return this; }}, next() {{ var s = it.next(); return {{ done: s.done, value: [s.value, 1] }}; }} }}; }}
+         log.push(Array.from(gchurn({{ v: 'a' }})).join());
+         log.push(Array.from(gchurn({{ v: 'm' }}), function (x) {{ return x + '!'; }}).join());
+         log.push([...new Set(gchurn({{ v: 's' }}))].join());
+         log.push(Object.keys(Object.fromEntries(entries())).join());
+         log.push(gchurn({{ v: 'h' }}).map(function (x) {{ return x + '?'; }}).toArray().join());
+         Promise.all(gchurn({{ v: 'p' }})).then(function (v) {{ log.push(v.join()); }});
+         'scheduled'"
+    ))
+    .expect("parse");
+    let mut interp = Interp::new();
+    interp.run(&program).expect("exec");
+    let peak = interp.realm().heap_high_water();
+    let check = Parser::parse_program("log.join(' ')").expect("parse");
+    let v = interp.run(&check).expect("exec");
+    assert_eq!(
+        interp.realm().to_display_string(v),
+        "a,a/399999 m!,m/399999! s,s/399999 e,e/399999 h?,h/399999? p,p/399999"
+    );
+    assert!(
+        verifying() || peak < 200_000,
+        "no collection ran inside a generator a built-in drained: {peak} objects at once"
+    );
+}
+
+#[test]
+fn a_builtin_draining_a_generator_keeps_what_it_holds_across_a_collection() {
+    // What only the built-in's frame holds while the body collects: the
+    // values gathered so far, the mapping function and its `this`, the
+    // collection being filled, the reduce accumulator, the caller's
+    // registers; and a built-in called by another one (`map(Object.fromEntries)`)
+    // must not collect under the caller's unrooted state.
+    assert_eq!(
+        run("function* g(tag, n) {
+               for (var r = 0; r < n; r++) {
+                 for (var i = 0; i < 150000; i++) { var t = { k: i }; }
+                 yield { tag: tag, r: r, box: [r] };
+               }
+             }
+             function* pairs(tag) { for (var o of g(tag, 3)) yield [tag + o.r, o]; }
+             function drive() {
+               var held = { deep: { v: 'reg' } };
+               var a = Array.from(g('a', 3), function (o) { return { s: this.p + o.tag + o.box[0] }; }, { p: '>' });
+               var s = new Map(pairs('m'));
+               var red = g('r', 3).reduce(function (acc, o) { return { n: acc.n + o.box[0] + 1 }; }, { n: 0 });
+               var objs = [pairs('x'), pairs('y')].map(Object.fromEntries);
+               return held.deep.v + ':' + a.map(function (x) { return x.s; }).join() + ':' +
+                 s.get('m2').box[0] + ':' + red.n + ':' + objs.map(function (o) { return o.x2 ? o.x2.tag : o.y2.tag; }).join();
+             }
+             drive()"),
+        "reg:>a0,>a1,>a2:2:6:x,y"
+    );
+}

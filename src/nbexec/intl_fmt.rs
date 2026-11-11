@@ -6017,32 +6017,29 @@ impl Interp {
         // (arrays/strings/Maps/Sets/generators) have no readable iterator method;
         // they are drained eagerly and then validated element-by-element.
         if let Some(ih) = self.for_of_get_iterator(iterable)? {
+            // The strings gathered are Rust strings; the iterable and its
+            // iterator are rooted across each step (see `host_roots`).
+            let mut sc = self.root_scope(&[iterable, NanBox::handle(ih.to_raw())]);
             let mut out = Vec::new();
             loop {
-                let next_fn = self.read_member(ih, "next")?;
-                let res = self.call_with_this(next_fn, NanBox::handle(ih.to_raw()), &[])?;
-                let Some(rh) = self.as_object_handle(res) else {
-                    return Err(self.type_error("iterator result is not an object"));
-                };
-                let done = self.read_member(rh, "done")?;
-                if self.realm.truthy(done) {
+                let next_fn = sc.read_member(ih, "next")?;
+                let Some(value) = sc.step(ih, next_fn)? else {
                     break;
-                }
-                let value = self.read_member(rh, "value")?;
+                };
                 match value.as_handle().map(Handle::from_raw) {
-                    Some(vh) if self.realm.type_of(vh) == Some("string") => {
-                        out.push(self.realm.string_value(vh).unwrap_or_default());
+                    Some(vh) if sc.realm.type_of(vh) == Some("string") => {
+                        out.push(sc.realm.string_value(vh).unwrap_or_default());
                     }
                     _ => {
                         // Non-String element: close the iterator, then throw.
-                        let _ = self.iterator_close(ih);
+                        let _ = sc.iterator_close(ih);
                         return Err(
-                            self.type_error("Intl.ListFormat: list elements must all be strings")
+                            sc.type_error("Intl.ListFormat: list elements must all be strings")
                         );
                     }
                 }
                 if out.len() > GEN_CAP {
-                    return Err(self.type_error("iterator did not terminate"));
+                    return Err(sc.type_error("iterator did not terminate"));
                 }
             }
             return Ok(out);

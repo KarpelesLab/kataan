@@ -35,7 +35,7 @@
 //! implementation that must call back into VM code (a callback-taking method)
 //! can do so with `ctx`/`funcs` rather than through the host.
 
-use super::{Ctx, FnProto, Reg, VmError, with_host};
+use super::{Ctx, FnProto, Reg, VmError, with_host, with_host_regs};
 use crate::heap::Handle;
 use crate::ic::PropertyCache;
 use crate::nanbox::{NanBox, Unpacked};
@@ -1262,7 +1262,7 @@ fn run_op(
             let method = NanBox::from_bits(method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(
-                with_host(ctx, |host| host.call(method, recv, &argv))
+                with_host_regs(ctx, regs, |host| host.call(method, recv, &argv))
                     .unwrap_or(Err(super::HostError::Fault))
                     .map_err(VmError::from),
             );
@@ -1284,7 +1284,7 @@ fn run_op(
         let method = NanBox::from_bits(method);
         let argv = super::ArgBuf::from_regs(regs, args);
         return Some(
-            with_host(ctx, |host| host.call(method, recv, &argv))
+            with_host_regs(ctx, regs, |host| host.call(method, recv, &argv))
                 .unwrap_or(Err(super::HostError::Fault))
                 .map_err(VmError::from),
         );
@@ -1296,7 +1296,7 @@ fn run_op(
         let method = NanBox::from_bits(method);
         let argv = super::ArgBuf::from_regs(regs, args);
         return Some(
-            with_host(ctx, |host| host.call(method, recv, &argv))
+            with_host_regs(ctx, regs, |host| host.call(method, recv, &argv))
                 .unwrap_or(Err(super::HostError::Fault))
                 .map_err(VmError::from),
         );
@@ -1631,7 +1631,7 @@ fn run_op(
             // function itself, as `FastOp::HostDirect` makes it.
             if !vm {
                 return Some(
-                    with_host(ctx, |host| host.call(recv, this, &argv))
+                    with_host_regs(ctx, regs, |host| host.call(recv, this, &argv))
                         .unwrap_or(Err(super::HostError::Fault))
                         .map_err(VmError::from),
                 );
@@ -1651,16 +1651,18 @@ fn run_op(
             let method = NanBox::from_bits(method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(
-                with_host(ctx, |host| host.call_regexp_method(method, recv, &argv))
-                    .unwrap_or(Err(super::HostError::Fault))
-                    .map_err(VmError::from),
+                with_host_regs(ctx, regs, |host| {
+                    host.call_regexp_method(method, recv, &argv)
+                })
+                .unwrap_or(Err(super::HostError::Fault))
+                .map_err(VmError::from),
             );
         }
         FastOp::HostDirect => {
             let method = NanBox::from_bits(method);
             let argv = super::ArgBuf::from_regs(regs, args);
             return Some(
-                with_host(ctx, |host| host.call(method, recv, &argv))
+                with_host_regs(ctx, regs, |host| host.call(method, recv, &argv))
                     .unwrap_or(Err(super::HostError::Fault))
                     .map_err(VmError::from),
             );

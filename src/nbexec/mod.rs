@@ -388,6 +388,10 @@ pub struct Interp {
     /// body (see `nbvm::resume_vm_async`), its host frames holding nothing
     /// [`gc_roots`](Self::gc_roots) misses.
     job_gc: bool,
+    /// The serial number of the innermost running host function call (see
+    /// `crate::realm::host_roots`): whether a built-in's call was the first
+    /// one a VM crossing (or a stepping root scope) made.
+    call_serial: u32,
     /// The values the collecting event loop keeps alive (the script's
     /// completion value) while it runs, rooted by [`gc_roots`](Self::gc_roots)
     /// for a collection inside one of its jobs.
@@ -2991,6 +2995,7 @@ mod gc;
 #[cfg(test)]
 mod gc_tests;
 mod generator;
+mod host_roots;
 mod intl_aliases;
 mod intl_fmt;
 mod iter_plain;
@@ -3122,6 +3127,7 @@ impl Interp {
             async_batch: false,
             async_batch_gc: false,
             job_gc: false,
+            call_serial: 0,
             loop_keep: Vec::new(),
             promise_ctor_ic: crate::ic::PropertyCache::default(),
             promise_then_ic: crate::ic::PropertyCache::default(),

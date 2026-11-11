@@ -2453,16 +2453,34 @@ impl Interp {
                         };
                         (it, self.read_member(it, "next")?)
                     };
-                    while let Some(val) = self.iter_step(it, next)? {
+                    // Everything the loop holds across a step is rooted, so the
+                    // generator body or `next` it resumes may collect (see
+                    // `host_roots`); the mapped values are held there too.
+                    let target_v =
+                        target_h.map_or(NanBox::undefined(), |th| NanBox::handle(th.to_raw()));
+                    let mut sc = self.root_scope(&[
+                        arg(0),
+                        items_box,
+                        map_fn,
+                        this_arg,
+                        NanBox::handle(it.to_raw()),
+                        next,
+                        target_v,
+                    ]);
+                    let base = sc.held_mark();
+                    for v in out {
+                        sc.hold(v);
+                    }
+                    while let Some(val) = sc.step(it, next)? {
                         let mapped = if has_map {
-                            match self.call_with_this(
+                            match sc.call_with_this(
                                 map_fn,
                                 this_arg,
                                 &[val, NanBox::number(k as f64)],
                             ) {
                                 Ok(m) => m,
                                 Err(e) => {
-                                    let _ = self.iterator_close(it);
+                                    let _ = sc.iterator_close(it);
                                     return Err(e);
                                 }
                             }
@@ -2471,12 +2489,12 @@ impl Interp {
                         };
                         // A `CreateDataPropertyOrThrow` failure also closes the iterator.
                         if let Some(th) = target_h {
-                            if let Err(e) = self.create_data_property_or_throw(th, k, mapped) {
-                                let _ = self.iterator_close(it);
+                            if let Err(e) = sc.create_data_property_or_throw(th, k, mapped) {
+                                let _ = sc.iterator_close(it);
                                 return Err(e);
                             }
                         } else {
-                            out.push(mapped);
+                            sc.hold(mapped);
                         }
                         k += 1;
                     }
@@ -2484,10 +2502,11 @@ impl Interp {
                         // `Set(A, "length", k, true)` — the *throwing* form: a
                         // read-only / getter-only / un-addable `length` on the
                         // constructed target is a TypeError even in sloppy code.
-                        self.set_length_or_throw(th, k)?;
+                        sc.set_length_or_throw(th, k)?;
                         NanBox::handle(th.to_raw())
                     } else {
-                        NanBox::handle(self.realm.new_array(out).to_raw())
+                        let out = sc.take_held(base);
+                        NanBox::handle(sc.realm.new_array(out).to_raw())
                     }
                 } else {
                     // Array-like: `len = LengthOfArrayLike(items)`, then
@@ -3069,36 +3088,44 @@ impl Interp {
                 // (or a throwing read) closes the iterator (IteratorClose).
                 let it = self.get_iter_object(arg(0))?;
                 let next = self.read_member(it, "next")?;
-                while let Some(entry) = self.iter_step(it, next)? {
-                    if !self.is_object_value(entry) {
-                        let _ = self.iterator_close(it);
-                        return Err(self.type_error("Object.fromEntries entry is not an object"));
+                // The object, the source and the iterator record are rooted
+                // across each step (see `host_roots`).
+                let mut sc = self.root_scope(&[
+                    arg(0),
+                    NanBox::handle(obj.to_raw()),
+                    NanBox::handle(it.to_raw()),
+                    next,
+                ]);
+                while let Some(entry) = sc.step(it, next)? {
+                    if !sc.is_object_value(entry) {
+                        let _ = sc.iterator_close(it);
+                        return Err(sc.type_error("Object.fromEntries entry is not an object"));
                     }
                     let eh = entry.as_handle().map(Handle::from_raw).unwrap();
-                    let k = match self.read_member(eh, "0") {
+                    let k = match sc.read_member(eh, "0") {
                         Ok(k) => k,
                         Err(e) => {
-                            let _ = self.iterator_close(it);
+                            let _ = sc.iterator_close(it);
                             return Err(e);
                         }
                     };
-                    let v = match self.read_member(eh, "1") {
+                    let v = match sc.read_member(eh, "1") {
                         Ok(v) => v,
                         Err(e) => {
-                            let _ = self.iterator_close(it);
+                            let _ = sc.iterator_close(it);
                             return Err(e);
                         }
                     };
                     // ToPropertyKey(k) may throw (a poisoned `toString`/
                     // `@@toPrimitive`); IfAbruptCloseIterator closes the iterator.
-                    let key = match self.coerce_property_key(k) {
+                    let key = match sc.coerce_property_key(k) {
                         Ok(key) => key,
                         Err(e) => {
-                            let _ = self.iterator_close(it);
+                            let _ = sc.iterator_close(it);
                             return Err(e);
                         }
                     };
-                    self.realm.set_property(obj, &key, v);
+                    sc.realm.set_property(obj, &key, v);
                 }
                 NanBox::handle(obj.to_raw())
             }
@@ -3259,12 +3286,15 @@ impl Interp {
             N_MATH_SUM_PRECISE => {
                 let it = self.get_iter_object(arg(0))?;
                 let next = self.read_member(it, "next")?;
+                // The iterator record is rooted across each step (see
+                // `host_roots`); the sum holds no handle.
+                let mut sc = self.root_scope(&[arg(0), NanBox::handle(it.to_raw()), next]);
                 // Spec state machine. `state`: 0=minus-zero, 1=finite,
                 // 2=plus-infinity, 3=minus-infinity, 4=not-a-number.
                 let mut state: u8 = 0;
                 let mut acc = ExactSum::new();
                 loop {
-                    let step = self.iter_step(it, next);
+                    let step = sc.step(it, next);
                     let v = match step {
                         Ok(Some(v)) => v,
                         Ok(None) => break,
@@ -3272,8 +3302,8 @@ impl Interp {
                     };
                     let Some(n) = v.as_number() else {
                         // Non-Number element: close the iterator, then throw.
-                        let _ = self.iterator_close(it);
-                        return Err(self.type_error("Math.sumPrecise expects only Numbers"));
+                        let _ = sc.iterator_close(it);
+                        return Err(sc.type_error("Math.sumPrecise expects only Numbers"));
                     };
                     if state == 4 {
                         // Already NaN: keep draining but ignore values.
@@ -3298,6 +3328,7 @@ impl Interp {
                         }
                     }
                 }
+                drop(sc);
                 if state == 1 && acc.overflowed {
                     // The spec's count/overflow guard: not expected in practice.
                     let m = self.new_str("Math.sumPrecise overflow");
@@ -4419,7 +4450,9 @@ impl Interp {
                 }
                 if is_aggregate && let Some(eh) = err.as_handle().map(Handle::from_raw) {
                     let errors = args.first().copied().unwrap_or(NanBox::undefined());
-                    let list = self.iterate_values(errors)?;
+                    let mut keep = alloc::vec![err];
+                    keep.extend_from_slice(args);
+                    let list = self.iterate_values_keep(errors, &keep)?;
                     let arr = self.realm.new_array(list);
                     self.realm
                         .set_property(eh, "errors", NanBox::handle(arr.to_raw()));

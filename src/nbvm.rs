@@ -1799,7 +1799,12 @@ pub(crate) fn call_vm_function(
         {
             ctx.jit_rt.main_realm = in_realm.is_none();
         }
+        let gc = take_host_arm(ctx);
         let result = run_vm_callback(ctx, table, f, this, args);
+        if gc {
+            ctx.gc_enabled = false;
+            ctx.in_job = false;
+        }
         let host = ctx.host.take().expect("the hosted context's host");
         // The host never sees a closure that owes its `prototype`.
         if ctx.realm.has_owed_fn_protos() {
@@ -1810,6 +1815,7 @@ pub(crate) fn call_vm_function(
         return result;
     }
     let mut ctx = hosted_ctx(host.take_realm(), host);
+    take_host_arm(&mut ctx);
     let result = run_vm_callback(&mut ctx, table, f, this, args);
     let realm = ctx.realm;
     host.restore_realm(realm);
@@ -2106,7 +2112,7 @@ fn vm_iter_step(
         regs[done as usize] = NanBox::boolean(step.is_none());
         return Ok(step);
     }
-    match with_host(ctx, |h| h.iter_step(it, nx)) {
+    match with_host_regs(ctx, regs, |h| h.iter_step(it, nx)) {
         Some(Ok(Some(v))) => {
             regs[done as usize] = NanBox::boolean(false);
             Ok(Some(v))
@@ -2682,7 +2688,7 @@ fn call_got_method(
     let r = if vm.is_some() || ctx.host.is_none() || key.is_empty() {
         call_closure(ctx, funcs, method, &argv, recv)
     } else {
-        with_host(ctx, |h| h.call_got_method(method, recv, key, &argv))
+        with_host_call(ctx, |h| h.call_got_method(method, recv, key, &argv))
             .unwrap_or(Err(HostError::Fault))
             .map_err(VmError::from)
     };
@@ -4144,6 +4150,73 @@ pub(crate) fn resume_vm_generator(
     result
 }
 
+/// One `IteratorStep` of the VM generator `generator` through the intrinsic
+/// `%GeneratorPrototype%.next`, for a host built-in draining it: `Ok(Ok(Some(v)))`
+/// for a value, `Ok(Ok(None))` once done, `Ok(Err(result))` for the result
+/// object of a `yield*` step (whose `done`/`value` the caller reads).
+///
+/// When the host armed this re-entry (`crate::realm::host_roots`), the body
+/// runs as an outermost activation that may collect, as a job's resumption
+/// does ([`job_ctx`]): the generator itself is the caller's, rooted by its
+/// root scope.
+///
+/// # Errors
+/// The generator body's throw, or a VM fault.
+pub(crate) fn host_generator_step(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    generator: NanBox,
+) -> Result<Result<Option<NanBox>, NanBox>, VmError> {
+    let entered = enter_frame_realm(host, generator);
+    let mut ctx = hosted_ctx(host.take_realm(), host);
+    let gc = take_host_arm(&mut ctx);
+    if gc {
+        ctx.call_depth = 1;
+        ctx.realm.vm_total_depth += 1;
+    }
+    let result = match generator.as_handle().map(Handle::from_raw) {
+        None => Err(VmError::NotAnObject),
+        Some(gh) => match gen_fast::resume(&mut ctx, table, gh, 0, NanBox::undefined()) {
+            Ok(_) if !ctx.microtasks.is_empty() => Err(VmError::Unsupported),
+            Ok(gen_fast::GenOut::Yield(v)) => Ok(Ok(Some(v))),
+            Ok(gen_fast::GenOut::Done(_)) => Ok(Ok(None)),
+            Ok(out) => Ok(Err(gen_fast::result_object(&mut ctx, out))),
+            Err(e) => Err(e),
+        },
+    };
+    if gc {
+        ctx.call_depth = 0;
+        ctx.realm.vm_total_depth -= 1;
+    }
+    let realm = ctx.realm;
+    host.restore_realm(realm);
+    if entered {
+        host.leave_fn_realm();
+    }
+    result
+}
+
+/// Lets the nested context `ctx`, just entered for the host, collect when
+/// the host armed this entry under a root scope (see
+/// `crate::realm::host_roots`); spends the arm either way. Returns whether
+/// it did.
+#[inline]
+fn take_host_arm(ctx: &mut Ctx) -> bool {
+    if ctx.realm.host_roots.armed == 0 {
+        return false;
+    }
+    if !ctx.realm.host_roots.take_arm() {
+        return false;
+    }
+    // Its collections root the host's pending jobs and timers, as a job's
+    // resumption does (`job_ctx`): with an active root scope below, no host
+    // frame holds a job it has dequeued and not finished (the event loop's
+    // crossing is no relay, and a VM job runs in a context of its own).
+    ctx.gc_enabled = true;
+    ctx.in_job = true;
+    true
+}
+
 /// `IsConstructor(v)`: a VM constructor, or (hosted) whatever the host says.
 fn vm_is_constructor(ctx: &mut Ctx, v: NanBox) -> bool {
     let Some(h) = v.as_handle().map(Handle::from_raw) else {
@@ -4236,7 +4309,7 @@ fn super_construct_parent(
     {
         return vm_construct(ctx, funcs, parent, args, new_target);
     }
-    with_host(ctx, |h| h.construct_with_target(parent, args, new_target))
+    with_host_call(ctx, |h| h.construct_with_target(parent, args, new_target))
         .unwrap_or(Err(HostError::Fault))
         .map_err(VmError::from)
 }
@@ -4910,15 +4983,76 @@ impl From<HostError> for VmError {
 
 /// Runs `f` against the host with the realm swapped back into it, then takes
 /// the realm again. `None` when this run has no host.
+#[inline]
 fn with_host<R>(ctx: &mut Ctx, f: impl FnOnce(&mut dyn VmHost) -> R) -> Option<R> {
+    with_host_in(ctx, None, false, f)
+}
+
+/// [`with_host`] for a call of a host function `f` makes (a call or
+/// construct site whose frame is published): a relay crossing, whose first
+/// host call may open an active root scope (`crate::realm::host_roots`).
+#[inline]
+fn with_host_call<R>(ctx: &mut Ctx, f: impl FnOnce(&mut dyn VmHost) -> R) -> Option<R> {
+    with_host_in(ctx, None, true, f)
+}
+
+/// [`with_host_call`] from a frame whose register file `regs` is not
+/// published: the crossing names it, so a root scope of the host may let
+/// what it re-enters collect (see `crate::realm::host_roots`) with no copy
+/// made.
+#[inline]
+fn with_host_regs<R>(
+    ctx: &mut Ctx,
+    regs: &[NanBox],
+    f: impl FnOnce(&mut dyn VmHost) -> R,
+) -> Option<R> {
+    with_host_in(ctx, Some(regs), true, f)
+}
+
+/// [`with_host`], counting the crossing (`crate::realm::host_roots`): it is
+/// linked when every frame of this context is published, or every frame but
+/// the running one, whose registers are `regs`; `relay` when it is a call of
+/// a host function.
+fn with_host_in<R>(
+    ctx: &mut Ctx,
+    regs: Option<&[NanBox]>,
+    relay: bool,
+    f: impl FnOnce(&mut dyn VmHost) -> R,
+) -> Option<R> {
+    // (Only a relay is linked: a root scope is active only over one, and a
+    // context entered from anything else never collects, so it needs no
+    // roots of the contexts below.)
+    let linked = relay
+        && ctx.gc_enabled
+        && ctx.gc_lock == 0
+        && ctx.frames_published + usize::from(regs.is_some()) == ctx.call_depth;
+    let ctx_addr = core::ptr::from_ref::<Ctx>(ctx) as usize;
     let host = ctx.host.as_deref_mut()?;
     // The host never sees a closure that owes its `prototype`.
     if ctx.realm.has_owed_fn_protos() {
         ctx.realm.materialize_owed_fn_protos();
     }
+    let hr = &mut ctx.realm.host_roots;
+    hr.crossings += 1;
+    if linked {
+        let (regs, regs_len) = regs.map_or((0, 0), |r| (r.as_ptr() as usize, r.len()));
+        hr.links.push(crate::realm::host_roots::HostLink {
+            crossing: hr.crossings,
+            ctx: ctx_addr,
+            regs,
+            regs_len,
+            serial: hr.serial,
+            relay,
+        });
+    }
     core::mem::swap(&mut ctx.realm, host.realm_slot());
     let r = f(host);
     core::mem::swap(&mut ctx.realm, host.realm_slot());
+    let hr = &mut ctx.realm.host_roots;
+    if linked {
+        hr.links.pop();
+    }
+    hr.crossings -= 1;
     Some(r)
 }
 
@@ -8371,6 +8505,11 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
     {
         push(&mut roots, *r);
     }
+    // A run a host built-in re-entered under a root scope: the published
+    // frames of the contexts below it (see `crate::realm::host_roots`).
+    if !ctx.realm.host_roots.links.is_empty() {
+        link_roots(ctx, &mut roots);
+    }
     // Compiled activations' windows and native-call headers (`jit_tier`);
     // what finished ones left above them is zeroed first.
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -8420,6 +8559,58 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
         return;
     }
     ctx.realm.maybe_collect(&roots);
+}
+
+/// The roots of the VM contexts below a run a host built-in re-entered under a
+/// root scope (`crate::realm::host_roots`): each linked context's published
+/// frames and activation inputs, its outermost frame's inputs and its pending
+/// microtasks. (Its compiled windows are on this thread's register stack,
+/// which the safepoint roots whole: adopted here when this context has not
+/// touched it yet.)
+fn link_roots(ctx: &mut Ctx, roots: &mut Vec<Handle>) {
+    fn push(roots: &mut Vec<Handle>, v: NanBox) {
+        if let Some(raw) = v.as_handle() {
+            roots.push(Handle::from_raw(raw));
+        }
+    }
+    for i in 0..ctx.realm.host_roots.links.len() {
+        let addr = ctx.realm.host_roots.links[i].ctx;
+        // SAFETY: a link names a context that crossed into the host and is
+        // suspended in that crossing (`with_host`) until the link is popped,
+        // so it is alive and nothing mutates it while this runs; only fields
+        // that crossing leaves untouched (not its host, not its realm slot)
+        // are read.
+        #[allow(unsafe_code)]
+        let below: &Ctx<'_> = unsafe { &*(addr as *const Ctx<'_>) };
+        for v in below
+            .frame_shadow
+            .iter()
+            .chain(below.top_frame_roots.iter())
+        {
+            push(roots, *v);
+        }
+        let link = ctx.realm.host_roots.links[i];
+        if link.regs_len != 0 {
+            // SAFETY: the crossing's running frame lent its register file
+            // (`with_host_regs`) for as long as the link is on the stack, and
+            // a suspended frame does not write its registers.
+            #[allow(unsafe_code)]
+            let regs =
+                unsafe { core::slice::from_raw_parts(link.regs as *const NanBox, link.regs_len) };
+            for v in regs {
+                push(roots, *v);
+            }
+        }
+        for t in &below.microtasks {
+            push(roots, t.handler);
+            push(roots, t.value);
+            roots.push(t.result);
+        }
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if ctx.jit_rt.stack.0.is_null() {
+            ctx.jit_rt.stack.0 = below.jit_rt.stack.0;
+        }
+    }
 }
 
 /// The handle-valued bytecode constants of `funcs` (and of their optimized
@@ -9872,7 +10063,7 @@ fn run_frame_at_ic(
                     }
                     continue;
                 }
-                match with_host(ctx, |h| h.construct(c, &argv)) {
+                match with_host_regs(ctx, regs, |h| h.construct(c, &argv)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
@@ -9903,7 +10094,7 @@ fn run_frame_at_ic(
                     regs[*dst as usize] = v;
                     continue;
                 }
-                match with_host(ctx, |h| h.construct(c, &argv)) {
+                match with_host_regs(ctx, regs, |h| h.construct(c, &argv)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
@@ -10745,9 +10936,11 @@ fn run_frame_at_ic(
                         // loops here, in this context (`array_hof`).
                         None => match array_hof::try_call(ctx, funcs, regs, recv_val, key, &argv) {
                             Some(r) => r,
-                            None => with_host(ctx, |h| h.call_method(recv_val, key, &argv))
-                                .unwrap_or(Err(HostError::Fault))
-                                .map_err(VmError::from),
+                            None => {
+                                with_host_regs(ctx, regs, |h| h.call_method(recv_val, key, &argv))
+                                    .unwrap_or(Err(HostError::Fault))
+                                    .map_err(VmError::from)
+                            }
                         },
                     };
                     match outcome {
@@ -12008,7 +12201,7 @@ fn call_closure(
         if let Some(v) = native_call::try_call_value(&mut ctx.realm, closure, args) {
             return Ok(v);
         }
-        return with_host(ctx, |h| h.call(closure, this_val, args))
+        return with_host_call(ctx, |h| h.call(closure, this_val, args))
             .unwrap_or(Err(HostError::Fault))
             .map_err(VmError::from);
     }

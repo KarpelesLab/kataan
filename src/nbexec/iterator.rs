@@ -84,20 +84,25 @@ impl Interp {
         // Consuming helpers: pull from `this` lazily via its `next` method, so a
         // user iterator's side effects and closing semantics are observed.
         let next = self.read_member(this_h, "next")?;
+        // The receiver, its `next`, the callback and what the helper has
+        // gathered are rooted across each step (see `host_roots`).
+        let mut sc = self.root_scope(&[this_val, next, f]);
+        sc.hold(args.get(1).copied().unwrap_or(NanBox::undefined()));
         match method {
             "toArray" => {
-                let mut out = Vec::new();
-                while let Some(v) = self.iter_step(this_h, next)? {
-                    out.push(v);
+                let base = sc.held_mark();
+                while let Some(v) = sc.step(this_h, next)? {
+                    sc.hold(v);
                 }
-                Ok(NanBox::handle(self.realm.new_array(out).to_raw()))
+                let out = sc.take_held(base);
+                Ok(NanBox::handle(sc.realm.new_array(out).to_raw()))
             }
             "forEach" => {
                 let mut i = 0u64;
-                while let Some(v) = self.iter_step(this_h, next)? {
-                    let r = self.call(f, &[v, NanBox::number(i as f64)]);
+                while let Some(v) = sc.step(this_h, next)? {
+                    let r = sc.call(f, &[v, NanBox::number(i as f64)]);
                     if let Err(e) = r {
-                        let _ = self.iterator_close(this_h);
+                        let _ = sc.iterator_close(this_h);
                         return Err(e);
                     }
                     i += 1;
@@ -106,26 +111,26 @@ impl Interp {
             }
             "some" | "every" | "find" => {
                 let mut i = 0u64;
-                while let Some(v) = self.iter_step(this_h, next)? {
-                    let r = match self.call(f, &[v, NanBox::number(i as f64)]) {
+                while let Some(v) = sc.step(this_h, next)? {
+                    let r = match sc.call(f, &[v, NanBox::number(i as f64)]) {
                         Ok(r) => r,
                         Err(e) => {
-                            let _ = self.iterator_close(this_h);
+                            let _ = sc.iterator_close(this_h);
                             return Err(e);
                         }
                     };
-                    let t = self.realm.truthy(r);
+                    let t = sc.realm.truthy(r);
                     match method {
                         "every" if !t => {
-                            self.iterator_close(this_h)?;
+                            sc.iterator_close(this_h)?;
                             return Ok(NanBox::boolean(false));
                         }
                         "some" if t => {
-                            self.iterator_close(this_h)?;
+                            sc.iterator_close(this_h)?;
                             return Ok(NanBox::boolean(true));
                         }
                         "find" if t => {
-                            self.iterator_close(this_h)?;
+                            sc.iterator_close(this_h)?;
                             return Ok(v);
                         }
                         _ => {}
@@ -142,26 +147,32 @@ impl Interp {
             _ => {
                 let mut acc;
                 let mut i = 0u64;
+                let slot = sc.held_mark();
+                sc.hold(NanBox::undefined());
                 if args.len() >= 2 {
                     acc = args[1];
                 } else {
-                    match self.iter_step(this_h, next)? {
+                    match sc.step(this_h, next)? {
                         Some(v) => {
                             acc = v;
+                            sc.set_held(slot, v);
                             i = 1;
                         }
                         None => {
                             return Err(
-                                self.type_error("Reduce of empty iterator with no initial value")
+                                sc.type_error("Reduce of empty iterator with no initial value")
                             );
                         }
                     }
                 }
-                while let Some(v) = self.iter_step(this_h, next)? {
-                    acc = match self.call(f, &[acc, v, NanBox::number(i as f64)]) {
-                        Ok(a) => a,
+                while let Some(v) = sc.step(this_h, next)? {
+                    acc = match sc.call(f, &[acc, v, NanBox::number(i as f64)]) {
+                        Ok(a) => {
+                            sc.set_held(slot, a);
+                            a
+                        }
                         Err(e) => {
-                            let _ = self.iterator_close(this_h);
+                            let _ = sc.iterator_close(this_h);
                             return Err(e);
                         }
                     };
@@ -232,6 +243,24 @@ impl Interp {
             }
             _ => self.call_with_this(next, NanBox::handle(it.to_raw()), &[])?,
         };
+        self.iter_result_done(res)
+    }
+
+    /// `IteratorValue` of an iterator result `res` that is not done (see
+    /// [`Self::iter_result_done`]); `None` once done.
+    pub(crate) fn iter_result_value(&mut self, res: NanBox) -> Result<Option<NanBox>, ExecError> {
+        let Some(rh) = self.iter_result_done(res)? else {
+            return Ok(None);
+        };
+        Ok(Some(match self.ordinary_own_data(rh, "value") {
+            Some(v) => v,
+            None => self.read_member(rh, "value")?,
+        }))
+    }
+
+    /// The tail of `IteratorStep`: the iterator result `res` must be an
+    /// object; its `done` is read, and the result returned while not done.
+    fn iter_result_done(&mut self, res: NanBox) -> Result<Option<Handle>, ExecError> {
         if !self.is_object_value(res) {
             return Err(self.type_error("iterator result is not an object"));
         }
@@ -628,52 +657,62 @@ impl Interp {
         next: NanBox,
         f: Option<NanBox>,
     ) -> Result<Option<NanBox>, ExecError> {
+        // The helper (which holds the source, its `next`, the callback and
+        // the open inner iterator) is rooted across each step, so the
+        // generator body or VM `next` it resumes may collect (see
+        // `host_roots`).
+        let mut sc = self.root_scope(&[
+            NanBox::handle(h.to_raw()),
+            NanBox::handle(src_h.to_raw()),
+            next,
+            f.unwrap_or(NanBox::undefined()),
+        ]);
         match kind {
             "take" => {
-                let rem = self
+                let rem = sc
                     .realm
                     .get_property(h, HELPER_LIMIT)
                     .and_then(|n| n.as_number())
                     .unwrap_or(0.0);
                 if rem <= 0.0 {
                     // Limit reached: close the underlying iterator.
-                    self.iterator_close(src_h)?;
+                    sc.iterator_close(src_h)?;
                     return Ok(None);
                 }
-                self.realm
+                sc.realm
                     .set_hidden_property(h, HELPER_LIMIT, NanBox::number(rem - 1.0));
-                self.iter_step(src_h, next)
+                sc.step(src_h, next)
             }
             "drop" => {
-                let mut rem = self
+                let mut rem = sc
                     .realm
                     .get_property(h, HELPER_LIMIT)
                     .and_then(|n| n.as_number())
                     .unwrap_or(0.0);
                 while rem > 0.0 {
-                    if self.iter_step_result(src_h, next)?.is_none() {
+                    if sc.iter_step_result(src_h, next)?.is_none() {
                         return Ok(None);
                     }
                     rem -= 1.0;
                 }
-                self.realm
+                sc.realm
                     .set_hidden_property(h, HELPER_LIMIT, NanBox::number(0.0));
-                self.iter_step(src_h, next)
+                sc.step(src_h, next)
             }
-            "map" => match self.iter_step(src_h, next)? {
+            "map" => match sc.step(src_h, next)? {
                 Some(v) => {
-                    let c = self.helper_counter_incr(h);
-                    let r = self.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
+                    let c = sc.helper_counter_incr(h);
+                    let r = sc.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
                     Ok(Some(r))
                 }
                 None => Ok(None),
             },
             "filter" => loop {
-                match self.iter_step(src_h, next)? {
+                match sc.step(src_h, next)? {
                     Some(v) => {
-                        let c = self.helper_counter_incr(h);
-                        let keep = self.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
-                        if self.realm.truthy(keep) {
+                        let c = sc.helper_counter_incr(h);
+                        let keep = sc.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
+                        if sc.realm.truthy(keep) {
                             return Ok(Some(v));
                         }
                     }
@@ -684,13 +723,13 @@ impl Interp {
             _ => {
                 loop {
                     // Drain the current inner iterator first, if any.
-                    if let Some(inner) = self
+                    if let Some(inner) = sc
                         .realm
                         .get_property(h, HELPER_INNER)
                         .and_then(|v| v.as_handle())
                         .map(Handle::from_raw)
                     {
-                        let inner_next = self
+                        let inner_next = sc
                             .realm
                             .get_property(h, HELPER_INNER_NEXT)
                             .unwrap_or(NanBox::undefined());
@@ -698,47 +737,44 @@ impl Interp {
                         // inner step throws — a non-callable `next`, a throwing
                         // `next`, or a throwing `done`/`value` getter on its result
                         // — closes the **outer** iterator before propagating.
-                        let stepped = match self.iter_step(inner, inner_next) {
+                        let stepped = match sc.step(inner, inner_next) {
                             Ok(v) => v,
                             Err(e) => {
-                                let _ = self.iterator_close(src_h);
+                                let _ = sc.iterator_close(src_h);
                                 return Err(e);
                             }
                         };
                         match stepped {
                             Some(v) => return Ok(Some(v)),
                             None => {
-                                self.realm.set_hidden_property(
-                                    h,
-                                    HELPER_INNER,
-                                    NanBox::undefined(),
-                                );
-                                self.realm.delete_property(h, HELPER_INNER);
+                                sc.realm
+                                    .set_hidden_property(h, HELPER_INNER, NanBox::undefined());
+                                sc.realm.delete_property(h, HELPER_INNER);
                             }
                         }
                     }
                     // Pull the next outer value and open its inner iterator.
-                    match self.iter_step(src_h, next)? {
+                    match sc.step(src_h, next)? {
                         Some(v) => {
-                            let c = self.helper_counter_incr(h);
-                            let mapped = self.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
-                            let inner = self.get_iterator_flattenable(mapped, src_h)?;
+                            let c = sc.helper_counter_incr(h);
+                            let mapped = sc.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
+                            let inner = sc.get_iterator_flattenable(mapped, src_h)?;
                             // `GetV(innerIterator, "next")` is part of
                             // GetIteratorFlattenable — a throwing accessor there also
                             // closes the outer iterator.
-                            let inner_next = match self.read_member(inner, "next") {
+                            let inner_next = match sc.read_member(inner, "next") {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    let _ = self.iterator_close(src_h);
+                                    let _ = sc.iterator_close(src_h);
                                     return Err(e);
                                 }
                             };
-                            self.realm.set_hidden_property(
+                            sc.realm.set_hidden_property(
                                 h,
                                 HELPER_INNER,
                                 NanBox::handle(inner.to_raw()),
                             );
-                            self.realm
+                            sc.realm
                                 .set_hidden_property(h, HELPER_INNER_NEXT, inner_next);
                         }
                         None => return Ok(None),
@@ -1113,7 +1149,10 @@ impl Interp {
             .realm
             .get_property(h, HELPER_NEXT)
             .unwrap_or(NanBox::undefined());
-        self.call_with_this(next, src, &[])
+        // (A VM `next` may collect: what this frame holds is rooted, see
+        // `host_roots`.)
+        let mut sc = self.root_scope(&[this, src, next]);
+        sc.call_next(next, src)
     }
 
     /// `%WrapForValidIteratorPrototype%.return` — forwards to the wrapped iterator's
@@ -1676,100 +1715,107 @@ impl Interp {
     /// One `IteratorZip` closure step: produces the next zipped array (`zip`) or
     /// null-prototype object (`zipKeyed`), or `None` when the whole zip is done.
     fn zip_step(&mut self, h: Handle) -> Result<Option<NanBox>, ExecError> {
-        let iters = self
+        // The zip (which holds the iterators, their `next` methods and the
+        // padding) and the values gathered this step are rooted across each
+        // step (see `host_roots`).
+        let mut sc = self.root_scope(&[NanBox::handle(h.to_raw())]);
+        let iters = sc
             .realm
             .get_property(h, ZIP_ITERS)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .unwrap();
-        let nexts = self
+        let nexts = sc
             .realm
             .get_property(h, ZIP_NEXTS)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .unwrap();
-        let fin = self
+        let fin = sc
             .realm
             .get_property(h, ZIP_FINISHED)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .unwrap();
-        let padding = self
+        let padding = sc
             .realm
             .get_property(h, ZIP_PADDING)
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
             .unwrap();
-        let mode = self
+        let mode = sc
             .realm
             .get_property(h, ZIP_MODE)
             .and_then(|n| n.as_number())
             .unwrap_or(0.0) as u8;
-        let count = self.realm.array_elements(iters).map_or(0, <[_]>::len);
+        let count = sc.realm.array_elements(iters).map_or(0, <[_]>::len);
         // If openIters is empty, the zip is done.
-        if (0..count).all(|i| self.zip_fin(fin, i)) {
+        if (0..count).all(|i| sc.zip_fin(fin, i)) {
             return Ok(None);
         }
         let mut results: Vec<NanBox> = Vec::with_capacity(count);
         for i in 0..count {
-            if self.zip_fin(fin, i) {
+            if sc.zip_fin(fin, i) {
                 // A finished iterator (longest) contributes its padding value.
-                results.push(self.realm.get_element(padding, i));
+                results.push(sc.realm.get_element(padding, i));
                 continue;
             }
-            let ih = self
+            let ih = sc
                 .realm
                 .get_element(iters, i)
                 .as_handle()
                 .map(Handle::from_raw)
                 .unwrap();
-            let next = self.realm.get_element(nexts, i);
-            match self.iter_step(ih, next) {
-                Ok(Some(v)) => results.push(v),
+            let next = sc.realm.get_element(nexts, i);
+            match sc.step(ih, next) {
+                Ok(Some(v)) => {
+                    sc.hold(v);
+                    results.push(v);
+                }
                 Err(e) => {
-                    self.realm.set_element(fin, i, NanBox::boolean(true));
-                    return Err(self.zip_close_open_throw(iters, fin, e));
+                    sc.realm.set_element(fin, i, NanBox::boolean(true));
+                    return Err(sc.zip_close_open_throw(iters, fin, e));
                 }
                 Ok(None) => {
                     // Remove this iterator from openIters.
-                    self.realm.set_element(fin, i, NanBox::boolean(true));
+                    sc.realm.set_element(fin, i, NanBox::boolean(true));
                     match mode {
                         0 => {
                             // shortest: close the remaining open iterators, finish.
-                            self.zip_close_open_normal(iters, fin)?;
+                            sc.zip_close_open_normal(iters, fin)?;
                             return Ok(None);
                         }
                         2 => {
                             // strict: a later iterator finishing first is a mismatch.
                             if i != 0 {
-                                let te = self.type_error(
+                                let te = sc.type_error(
                                     "Iterator.zip strict mode: iterators have different lengths",
                                 );
-                                return Err(self.zip_close_open_throw(iters, fin, te));
+                                return Err(sc.zip_close_open_throw(iters, fin, te));
                             }
                             // The first finished: every other iterator must also be
                             // done on this step (IteratorStep, value not read).
                             for k in 1..count {
-                                let kh = self
+                                let kh = sc
                                     .realm
                                     .get_element(iters, k)
                                     .as_handle()
                                     .map(Handle::from_raw)
                                     .unwrap();
-                                let knext = self.realm.get_element(nexts, k);
-                                match self.iter_step_done(kh, knext) {
+                                let knext = sc.realm.get_element(nexts, k);
+                                match sc.iter_step_done(kh, knext) {
                                     Ok(true) => {
-                                        self.realm.set_element(fin, k, NanBox::boolean(true));
+                                        sc.realm.set_element(fin, k, NanBox::boolean(true));
                                     }
                                     Ok(false) => {
-                                        let te = self.type_error(
+                                        let te = sc.type_error(
                                             "Iterator.zip strict mode: iterators have different lengths",
                                         );
-                                        return Err(self.zip_close_open_throw(iters, fin, te));
+                                        return Err(sc.zip_close_open_throw(iters, fin, te));
                                     }
                                     Err(e) => {
-                                        self.realm.set_element(fin, k, NanBox::boolean(true));
-                                        return Err(self.zip_close_open_throw(iters, fin, e));
+                                        sc.realm.set_element(fin, k, NanBox::boolean(true));
+                                        return Err(sc.zip_close_open_throw(iters, fin, e));
                                     }
                                 }
                             }
@@ -1778,16 +1824,16 @@ impl Interp {
                         _ => {
                             // longest: when the last live iterator finishes, we are
                             // done; otherwise this slot contributes its padding.
-                            if (0..count).all(|j| self.zip_fin(fin, j)) {
+                            if (0..count).all(|j| sc.zip_fin(fin, j)) {
                                 return Ok(None);
                             }
-                            results.push(self.realm.get_element(padding, i));
+                            results.push(sc.realm.get_element(padding, i));
                         }
                     }
                 }
             }
         }
-        Ok(Some(self.zip_finish_results(h, results)))
+        Ok(Some(sc.zip_finish_results(h, results)))
     }
 
     /// One `IteratorStep` (done-only, does not read `value`): returns whether the
@@ -1949,7 +1995,14 @@ impl Interp {
                     .realm
                     .get_property(h, HELPER_INNER_NEXT)
                     .unwrap_or(NanBox::undefined());
-                match self.iter_step(inner, inner_next) {
+                // (The concat result holds the inner iterator and its `next`;
+                // both are rooted across the step, see `host_roots`.)
+                let stepped = {
+                    let mut sc =
+                        self.root_scope(&[this, NanBox::handle(inner.to_raw()), inner_next]);
+                    sc.step(inner, inner_next)
+                };
+                match stepped {
                     Ok(Some(v)) => return Ok(self.iter_result(v, false)),
                     Ok(None) => {
                         self.realm.delete_property(h, HELPER_INNER);
@@ -2469,6 +2522,7 @@ impl Interp {
     pub(crate) fn drain_iterator_values(
         &mut self,
         iterator: NanBox,
+        keep: &[NanBox],
     ) -> Result<Vec<NanBox>, ExecError> {
         let Some(ih) = iterator.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("iterator is not an object"));
@@ -2483,23 +2537,19 @@ impl Interp {
         // `next` *accessor* (which may hand back a fresh, self-resetting iterator each
         // read, i.e. never terminate).
         let next_fn = self.read_member(ih, "next")?;
-        let mut out = Vec::new();
-        loop {
-            let res = self.call_with_this(next_fn, iterator, &[])?;
-            if !self.is_object_value(res) {
-                return Err(self.type_error("iterator result is not an object"));
-            }
-            let rh = Handle::from_raw(res.as_handle().unwrap());
-            let done = self.read_member(rh, "done")?;
-            if self.realm.truthy(done) {
-                break;
-            }
-            out.push(self.read_member(rh, "value")?);
-            if out.len() > GEN_CAP {
-                return Err(self.type_error("iterator did not terminate"));
+        // The iterator record, what the caller holds (`keep`) and the values
+        // drained so far are rooted across each step (see `host_roots`).
+        let mut sc = self.root_scope(keep);
+        sc.hold(iterator);
+        sc.hold(next_fn);
+        let base = sc.held_mark();
+        while let Some(v) = sc.step(ih, next_fn)? {
+            sc.hold(v);
+            if sc.held_mark() - base > GEN_CAP {
+                return Err(sc.type_error("iterator did not terminate"));
             }
         }
-        Ok(out)
+        Ok(sc.take_held(base))
     }
 
     /// `GroupBy(items, callbackfn, keyCoercion)`'s iteration (ECMA-262 7.3.35):
@@ -2539,12 +2589,21 @@ impl Interp {
             return Ok(pairs);
         };
         let next = self.read_member(it, "next")?;
+        // The source, the callback, the iterator record and every item and
+        // (value) key gathered are rooted across each step (see `host_roots`).
+        let mut sc = self.root_scope(&[items, cb, NanBox::handle(it.to_raw()), next]);
         let mut k = 0usize;
-        while let Some(item) = self.iter_step(it, next)? {
-            match key_of(self, item, k) {
-                Ok(key) => pairs.push((key, item)),
+        while let Some(item) = sc.step(it, next)? {
+            match key_of(&mut sc, item, k) {
+                Ok(key) => {
+                    sc.hold(item);
+                    if let Err(v) = key {
+                        sc.hold(v);
+                    }
+                    pairs.push((key, item));
+                }
                 Err(e) => {
-                    let _ = self.iterator_close(it);
+                    let _ = sc.iterator_close(it);
                     return Err(e);
                 }
             }
@@ -2554,6 +2613,26 @@ impl Interp {
     }
 
     pub(crate) fn iterate_values(&mut self, v: NanBox) -> Result<Vec<NanBox>, ExecError> {
+        self.iterate_values_in(v, None)
+    }
+
+    /// [`Self::iterate_values`] for a caller that holds `keep` (and nothing
+    /// else unrooted) across it: a custom iterable is stepped under a root
+    /// scope, so the generator body or VM `next` it resumes may collect (see
+    /// `host_roots`).
+    pub(crate) fn iterate_values_keep(
+        &mut self,
+        v: NanBox,
+        keep: &[NanBox],
+    ) -> Result<Vec<NanBox>, ExecError> {
+        self.iterate_values_in(v, Some(keep))
+    }
+
+    fn iterate_values_in(
+        &mut self,
+        v: NanBox,
+        keep: Option<&[NanBox]>,
+    ) -> Result<Vec<NanBox>, ExecError> {
         let Some(h) = v.as_handle().map(Handle::from_raw) else {
             let m = self.new_str("is not iterable");
             return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
@@ -2564,7 +2643,7 @@ impl Interp {
             && let Some(ph) = prim.as_handle().map(Handle::from_raw)
             && self.realm.is_string_handle(ph)
         {
-            return self.iterate_values(prim);
+            return self.iterate_values_in(prim, keep);
         }
         if let Some(mut elems) = self.realm.elements_vec(h) {
             // The %ArrayIteratorPrototype% `next` does `Get(array, index)`, so a
@@ -2658,6 +2737,24 @@ impl Interp {
             // readable property) is drained directly from its buffer.
             if self.realm.get_property(ih, GEN_BUF).is_some() {
                 return self.iterate_values(iterator);
+            }
+            if let Some(keep) = keep {
+                // (`next` is re-read each step, as below.)
+                let mut sc = self.root_scope(keep);
+                sc.hold(v);
+                sc.hold(iterator);
+                let base = sc.held_mark();
+                loop {
+                    let next_fn = sc.read_member(ih, "next")?;
+                    let Some(value) = sc.step(ih, next_fn)? else {
+                        break;
+                    };
+                    sc.hold(value);
+                    if sc.held_mark() - base > GEN_CAP {
+                        return Err(sc.type_error("iterator did not terminate"));
+                    }
+                }
+                return Ok(sc.take_held(base));
             }
             let mut out = Vec::new();
             loop {

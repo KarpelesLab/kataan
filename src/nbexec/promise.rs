@@ -1603,12 +1603,26 @@ impl Interp {
         }
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
+        // The combinator's state and the iterator record are rooted across
+        // each step (see `host_roots`).
+        let mut sc = self.root_scope(&[
+            c,
+            iterable,
+            promise_resolve,
+            values_box,
+            NanBox::handle(remaining.to_raw()),
+            cap.promise,
+            cap.resolve,
+            cap.reject,
+            NanBox::handle(it.to_raw()),
+            next_m,
+        ]);
         let mut i = 0usize;
-        while let Some(item) = self.iter_step(it, next_m)? {
-            self.realm.set_element(values, i, NanBox::undefined());
-            let cur = self.cell_get(remaining);
-            self.cell_set(remaining, cur + 1.0);
-            let step = self.perform_promise_all_element(
+        while let Some(item) = sc.step(it, next_m)? {
+            sc.realm.set_element(values, i, NanBox::undefined());
+            let cur = sc.cell_get(remaining);
+            sc.cell_set(remaining, cur + 1.0);
+            let step = sc.perform_promise_all_element(
                 c,
                 promise_resolve,
                 item,
@@ -1619,11 +1633,12 @@ impl Interp {
                 settled,
             );
             if let Err(e) = step {
-                let _ = self.iterator_close(it);
+                let _ = sc.iterator_close(it);
                 return Err(e);
             }
             i += 1;
         }
+        drop(sc);
         // Decrement the initial +1: if every input already settled synchronously
         // (count back to 0) resolve now.
         let n = self.cell_get(remaining) - 1.0;
@@ -1690,9 +1705,21 @@ impl Interp {
         // Lazy iteration + IteratorClose on an abrupt `promiseResolve`/`then`.
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
-        while let Some(item) = self.iter_step(it, next_m)? {
-            if let Err(e) = self.perform_promise_race_element(c, promise_resolve, item, cap) {
-                let _ = self.iterator_close(it);
+        // The combinator's state and the iterator record are rooted across
+        // each step (see `host_roots`).
+        let mut sc = self.root_scope(&[
+            c,
+            iterable,
+            promise_resolve,
+            cap.promise,
+            cap.resolve,
+            cap.reject,
+            NanBox::handle(it.to_raw()),
+            next_m,
+        ]);
+        while let Some(item) = sc.step(it, next_m)? {
+            if let Err(e) = sc.perform_promise_race_element(c, promise_resolve, item, cap) {
+                let _ = sc.iterator_close(it);
                 return Err(e);
             }
         }
@@ -1737,12 +1764,26 @@ impl Interp {
         let remaining = self.count_cell(1.0);
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
+        // The combinator's state and the iterator record are rooted across
+        // each step (see `host_roots`).
+        let mut sc = self.root_scope(&[
+            c,
+            iterable,
+            promise_resolve,
+            errors_box,
+            NanBox::handle(remaining.to_raw()),
+            cap.promise,
+            cap.resolve,
+            cap.reject,
+            NanBox::handle(it.to_raw()),
+            next_m,
+        ]);
         let mut i = 0usize;
-        while let Some(item) = self.iter_step(it, next_m)? {
-            self.realm.set_element(errors, i, NanBox::undefined());
-            let cur = self.cell_get(remaining);
-            self.cell_set(remaining, cur + 1.0);
-            let step = self.perform_promise_any_element(
+        while let Some(item) = sc.step(it, next_m)? {
+            sc.realm.set_element(errors, i, NanBox::undefined());
+            let cur = sc.cell_get(remaining);
+            sc.cell_set(remaining, cur + 1.0);
+            let step = sc.perform_promise_any_element(
                 c,
                 promise_resolve,
                 item,
@@ -1752,16 +1793,16 @@ impl Interp {
                 i,
             );
             if let Err(e) = step {
-                let _ = self.iterator_close(it);
+                let _ = sc.iterator_close(it);
                 return Err(e);
             }
             i += 1;
         }
-        let n = self.cell_get(remaining) - 1.0;
-        self.cell_set(remaining, n);
+        let n = sc.cell_get(remaining) - 1.0;
+        sc.cell_set(remaining, n);
         if n == 0.0 {
-            let agg = self.make_aggregate_error(errors_box);
-            self.capability_reject(cap, agg)?;
+            let agg = sc.make_aggregate_error(errors_box);
+            sc.capability_reject(cap, agg)?;
         }
         Ok(cap.promise)
     }

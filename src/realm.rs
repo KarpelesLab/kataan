@@ -64,6 +64,7 @@ pub use str_switch::{SWITCH_MEMO_HASH, SwitchMemo, switch_key_order};
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use typed_fast::typed_elems_seen;
 mod handle_map;
+pub(crate) mod host_roots;
 
 use crate::atom::{Atom, AtomTable};
 use crate::cell::Cell;
@@ -681,6 +682,10 @@ pub struct Realm {
     /// eval code and host callbacks see the enclosing activations (the legacy
     /// `fn.caller`). Rooted by the VM's safepoints.
     pub vm_callee_stack: Vec<NanBox>,
+    /// What host built-ins hold across a re-entry into JS, and whether a
+    /// nested VM run may collect (see [`host_roots`]). Its `vals` are roots
+    /// of every collection.
+    pub(crate) host_roots: host_roots::HostRoots,
     /// Each [`Self::vm_callee_stack`] activation's arguments, concatenated;
     /// `vm_callee_args[i]` is where activation `i`'s start (`fn.arguments`).
     pub vm_args_buf: Vec<NanBox>,
@@ -1001,6 +1006,7 @@ impl Realm {
             str_special: false,
             str_int_memo: None,
             vm_callee_stack: Vec::new(),
+            host_roots: host_roots::HostRoots::default(),
             vm_args_buf: Vec::new(),
             vm_callee_args: Vec::new(),
             vm_reg_pool: Vec::new(),
@@ -8530,6 +8536,7 @@ impl Realm {
                 .iter()
                 .flatten()
                 .chain(self.jit_shadow_roots.iter())
+                .chain(self.host_roots.vals.iter())
                 .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
         );
         // Deliberately **not** included: `aux_props`, `fn_protos`, `fn_ctor` and

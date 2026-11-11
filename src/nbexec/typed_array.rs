@@ -191,7 +191,7 @@ impl Interp {
             // Steps 5.a–5.c: drain the iterator to a list first, then
             // `TypedArrayCreate(C, « len »)` — build the target after collecting.
             let iterator = self.call_with_this(method, source, &[])?;
-            let values = self.drain_iterator_values(iterator)?;
+            let values = self.drain_iterator_values(iterator, &[ctor, source, mapfn, this_arg])?;
             let target = self.typed_array_create(ctor, values.len())?;
             // Step 5.d: map then `Set` each element, interleaved.
             for (k, v) in values.into_iter().enumerate() {

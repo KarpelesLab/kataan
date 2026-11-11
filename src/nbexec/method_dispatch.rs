@@ -7535,6 +7535,15 @@ impl Interp {
         // its results) may add to / delete from `this` between steps, and
         // `isSupersetOf`/`isDisjointFrom` must see those changes.
         let in_mine = |this: &mut Self, v: NanBox| this.realm.collection_has(handle, v);
+        // The receiver, the set record and the result being built are rooted
+        // across each step of the argument's keys (see `host_roots`).
+        let mut sc = self.root_scope(&[
+            NanBox::handle(handle.to_raw()),
+            other,
+            NanBox::handle(obj.to_raw()),
+            has,
+            keys,
+        ]);
 
         match method {
             "isSubsetOf" => {
@@ -7546,9 +7555,9 @@ impl Interp {
                 // passed to `has` (ECMA-262 iterates `O.[[SetData]]` by index,
                 // skipping now-empty slots).
                 let mut last = None;
-                while let Some((e, idx)) = self.collection_live_step(handle, last) {
+                while let Some((e, idx)) = sc.collection_live_step(handle, last) {
                     last = Some((e, idx));
-                    if !other_has(self, e)? {
+                    if !other_has(&mut sc, e)? {
                         return Ok(NanBox::boolean(false));
                     }
                 }
@@ -7561,15 +7570,17 @@ impl Interp {
                 // Iterate the argument's keys LAZILY: return false (and
                 // IteratorClose) as soon as a key is not in this set — the rest of
                 // the iterator must not be drained.
-                let (ih, next) = self.open_set_keys(obj, keys)?;
-                while let Some(k) = self.iter_step(ih, next)? {
+                let (ih, next) = sc.open_set_keys(obj, keys)?;
+                sc.hold(NanBox::handle(ih.to_raw()));
+                sc.hold(next);
+                while let Some(k) = sc.step(ih, next)? {
                     let k = if k.as_number() == Some(0.0) {
                         NanBox::number(0.0)
                     } else {
                         k
                     };
-                    if !in_mine(self, k) {
-                        self.iterator_close(ih)?;
+                    if !in_mine(&mut sc, k) {
+                        sc.iterator_close(ih)?;
                         return Ok(NanBox::boolean(false));
                     }
                 }
@@ -7581,24 +7592,26 @@ impl Interp {
                     // `this`, and a since-deleted element must not be passed to
                     // `has` (see `isSubsetOf`).
                     let mut last = None;
-                    while let Some((e, idx)) = self.collection_live_step(handle, last) {
+                    while let Some((e, idx)) = sc.collection_live_step(handle, last) {
                         last = Some((e, idx));
-                        if other_has(self, e)? {
+                        if other_has(&mut sc, e)? {
                             return Ok(NanBox::boolean(false));
                         }
                     }
                 } else {
                     // Lazily iterate the argument's keys: return false (and
                     // IteratorClose) on the first key found in this set.
-                    let (ih, next) = self.open_set_keys(obj, keys)?;
-                    while let Some(k) = self.iter_step(ih, next)? {
+                    let (ih, next) = sc.open_set_keys(obj, keys)?;
+                    sc.hold(NanBox::handle(ih.to_raw()));
+                    sc.hold(next);
+                    while let Some(k) = sc.step(ih, next)? {
                         let k = if k.as_number() == Some(0.0) {
                             NanBox::number(0.0)
                         } else {
                             k
                         };
-                        if in_mine(self, k) {
-                            self.iterator_close(ih)?;
+                        if in_mine(&mut sc, k) {
+                            sc.iterator_close(ih)?;
                             return Ok(NanBox::boolean(false));
                         }
                     }
@@ -7610,24 +7623,28 @@ impl Interp {
                 // `keys()` and reads its `next` — runs **before** `resultSetData` is
                 // copied from `O.[[SetData]]`. A `keys()` / `get next` that mutates
                 // the receiver is therefore reflected in the copy.
-                let (ih, next) = self.open_set_keys(obj, keys)?;
-                let result = self.new_collection_object(true);
-                for (m, _) in self.realm.collection_entries(handle).unwrap_or_default() {
-                    self.realm.collection_set(result, m, m);
+                let (ih, next) = sc.open_set_keys(obj, keys)?;
+                sc.hold(NanBox::handle(ih.to_raw()));
+                sc.hold(next);
+                let result = sc.new_collection_object(true);
+                sc.hold(NanBox::handle(result.to_raw()));
+                for (m, _) in sc.realm.collection_entries(handle).unwrap_or_default() {
+                    sc.realm.collection_set(result, m, m);
                 }
-                while let Some(k) = self.iter_step(ih, next)? {
+                while let Some(k) = sc.step(ih, next)? {
                     // CanonicalizeKeyedCollectionKey: `-0` is stored as `+0`.
                     let k = if k.as_number() == Some(0.0) {
                         NanBox::number(0.0)
                     } else {
                         k
                     };
-                    self.realm.collection_set(result, k, k);
+                    sc.realm.collection_set(result, k, k);
                 }
                 Ok(NanBox::handle(result.to_raw()))
             }
             "intersection" => {
-                let result = self.new_collection_object(true);
+                let result = sc.new_collection_object(true);
+                sc.hold(NanBox::handle(result.to_raw()));
                 if my_size <= other_size {
                     // 24.2.4.9 step 4: walk `O.[[SetData]]` LIVE by index. A
                     // `has` that deletes and re-adds an element moves it to the
@@ -7635,10 +7652,10 @@ impl Interp {
                     // time (and `thisSize` is re-read each step) — a snapshot of
                     // `this` would miss that. `resultSetData` dedupes.
                     let mut last = None;
-                    while let Some((e, idx)) = self.collection_live_step(handle, last) {
+                    while let Some((e, idx)) = sc.collection_live_step(handle, last) {
                         last = Some((e, idx));
-                        if other_has(self, e)? {
-                            self.realm.collection_set(result, e, e);
+                        if other_has(&mut sc, e)? {
+                            sc.realm.collection_set(result, e, e);
                         }
                     }
                 } else {
@@ -7646,15 +7663,17 @@ impl Interp {
                     // time and each is tested against the **live** `O.[[SetData]]`
                     // (the iterator may mutate `this` between steps), then appended
                     // to `resultSetData` if absent from it.
-                    let (ih, next) = self.open_set_keys(obj, keys)?;
-                    while let Some(k) = self.iter_step(ih, next)? {
+                    let (ih, next) = sc.open_set_keys(obj, keys)?;
+                    sc.hold(NanBox::handle(ih.to_raw()));
+                    sc.hold(next);
+                    while let Some(k) = sc.step(ih, next)? {
                         let k = if k.as_number() == Some(0.0) {
                             NanBox::number(0.0)
                         } else {
                             k
                         };
-                        if in_mine(self, k) {
-                            self.realm.collection_set(result, k, k);
+                        if in_mine(&mut sc, k) {
+                            sc.realm.collection_set(result, k, k);
                         }
                     }
                 }
@@ -7664,9 +7683,10 @@ impl Interp {
                 // 24.2.4.5 step 2: `resultSetData` is a copy of `O.[[SetData]]`
                 // taken before anything else runs; every membership test below is
                 // against that **copy**, never against the live receiver.
-                let result = self.new_collection_object(true);
+                let result = sc.new_collection_object(true);
+                sc.hold(NanBox::handle(result.to_raw()));
                 for m in &mine {
-                    self.realm.collection_set(result, *m, *m);
+                    sc.realm.collection_set(result, *m, *m);
                 }
                 if my_size <= other_size {
                     // Step 4 walks `O.[[SetData]]` by index. The snapshot taken at
@@ -7675,21 +7695,23 @@ impl Interp {
                     // must still visit the original members (never the ones added
                     // afterwards) — which is what every other engine does too.
                     for m in &mine {
-                        if other_has(self, *m)? {
-                            self.realm.collection_delete(result, *m);
+                        if other_has(&mut sc, *m)? {
+                            sc.realm.collection_delete(result, *m);
                         }
                     }
                 } else {
                     // Step 5: consume the argument's keys one at a time, removing
                     // each from the copy.
-                    let (ih, next) = self.open_set_keys(obj, keys)?;
-                    while let Some(k) = self.iter_step(ih, next)? {
+                    let (ih, next) = sc.open_set_keys(obj, keys)?;
+                    sc.hold(NanBox::handle(ih.to_raw()));
+                    sc.hold(next);
+                    while let Some(k) = sc.step(ih, next)? {
                         let k = if k.as_number() == Some(0.0) {
                             NanBox::number(0.0)
                         } else {
                             k
                         };
-                        self.realm.collection_delete(result, k);
+                        sc.realm.collection_delete(result, k);
                     }
                 }
                 Ok(NanBox::handle(result.to_raw()))
@@ -7700,25 +7722,28 @@ impl Interp {
             // ECMA-262 24.2.4.19 — not against the `resultSetData` copy.
             _ => {
                 // As for `union`, the keys iterator is opened before the copy.
-                let (ih, next) = self.open_set_keys(obj, keys)?;
-                let result = self.new_collection_object(true);
-                for (m, _) in self.realm.collection_entries(handle).unwrap_or_default() {
-                    self.realm.collection_set(result, m, m);
+                let (ih, next) = sc.open_set_keys(obj, keys)?;
+                sc.hold(NanBox::handle(ih.to_raw()));
+                sc.hold(next);
+                let result = sc.new_collection_object(true);
+                sc.hold(NanBox::handle(result.to_raw()));
+                for (m, _) in sc.realm.collection_entries(handle).unwrap_or_default() {
+                    sc.realm.collection_set(result, m, m);
                 }
-                while let Some(k) = self.iter_step(ih, next)? {
+                while let Some(k) = sc.step(ih, next)? {
                     let k = if k.as_number() == Some(0.0) {
                         NanBox::number(0.0)
                     } else {
                         k
                     };
-                    let in_o = self.realm.collection_has(handle, k);
-                    let in_result = self.realm.collection_has(result, k);
+                    let in_o = sc.realm.collection_has(handle, k);
+                    let in_result = sc.realm.collection_has(result, k);
                     if in_o {
                         if in_result {
-                            self.realm.collection_delete(result, k);
+                            sc.realm.collection_delete(result, k);
                         }
                     } else if !in_result {
-                        self.realm.collection_set(result, k, k);
+                        sc.realm.collection_set(result, k, k);
                     }
                 }
                 Ok(NanBox::handle(result.to_raw()))
