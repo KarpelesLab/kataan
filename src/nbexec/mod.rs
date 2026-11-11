@@ -10247,7 +10247,7 @@ impl crate::nbvm::VmHost for Interp {
             return Err(crate::nbvm::HostError::Fault);
         };
         let p = self
-            .async_from_sync_next_pub(ih, next)
+            .as_host_call(|i| i.async_from_sync_next_pub(ih, next))
             .map_err(exec_to_host)?;
         Ok(NanBox::handle(p.to_raw()))
     }
@@ -10287,7 +10287,7 @@ impl crate::nbvm::VmHost for Interp {
             return Err(crate::nbvm::HostError::Fault);
         };
         let p = self
-            .async_from_sync_next_args(ih, next, &[v])
+            .as_host_call(|i| i.async_from_sync_next_args(ih, next, &[v]))
             .map_err(exec_to_host)?;
         Ok(NanBox::handle(p.to_raw()))
     }
@@ -11206,6 +11206,11 @@ impl Interp {
         } else {
             (NanBox::undefined(), NanBox::undefined())
         };
+        // The replacer and the strings passed to every call are rooted across
+        // them (`call_cb`): an allocating replacer may collect (see
+        // `host_roots`).
+        let mut sc = self.root_scope(&[search, repl, whole, matched]);
+        let this = &mut *sc;
         let mut out: Vec<u16> = Vec::with_capacity(s.len());
         let mut end_of_last = 0;
         // A `$`-free template substitutes as itself, so its length is known
@@ -11214,25 +11219,26 @@ impl Interp {
         for p in positions {
             out.extend_from_slice(&s[end_of_last.min(p)..p]);
             if is_fn {
-                let r = self.call(repl, &[matched, NanBox::number(p as f64), whole])?;
-                let rb = self.arg_string_bytes_fallible(r)?;
-                self.check_str_len(out.len() + rb.len())?;
+                let args = [matched, NanBox::number(p as f64), whole];
+                let r = this.call_cb(repl, NanBox::undefined(), &args)?;
+                let rb = this.arg_string_bytes_fallible(r)?;
+                this.check_str_len(out.len() + rb.len())?;
                 out.extend(crate::wtf8::utf16_units(&rb));
             } else if plain_template {
-                self.check_str_len(out.len() + template.len())?;
+                this.check_str_len(out.len() + template.len())?;
                 out.extend_from_slice(&template);
             } else {
                 out.extend(get_substitution_units(&template, &s, p, pat.len()));
             }
-            self.check_str_len(out.len())?;
+            this.check_str_len(out.len())?;
             end_of_last = p + pat.len();
         }
         if end_of_last < s.len() {
             out.extend_from_slice(&s[end_of_last..]);
         }
         let out = crate::wtf8::from_utf16(&out);
-        self.check_str_len(out.len())?;
-        Ok(self.new_str_bytes(out))
+        this.check_str_len(out.len())?;
+        Ok(this.new_str_bytes(out))
     }
 }
 

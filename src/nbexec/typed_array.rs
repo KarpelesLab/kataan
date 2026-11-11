@@ -193,14 +193,25 @@ impl Interp {
             let iterator = self.call_with_this(method, source, &[])?;
             let values = self.drain_iterator_values(iterator, &[ctor, source, mapfn, this_arg])?;
             let target = self.typed_array_create(ctor, values.len())?;
+            // The arguments, the target and the values drained are rooted
+            // across each `mapfn` call (`call_cb`): an allocating one may
+            // collect (see `host_roots`).
+            // (Without one, nothing re-entered may collect: nothing to root.)
+            let mut sc = self.root_scope(&[ctor, source, mapfn, this_arg]);
+            sc.hold(NanBox::handle(target.to_raw()));
+            if has_mapfn {
+                for v in &values {
+                    sc.hold(*v);
+                }
+            }
             // Step 5.d: map then `Set` each element, interleaved.
             for (k, v) in values.into_iter().enumerate() {
                 let mapped = if has_mapfn {
-                    self.call_with_this(mapfn, this_arg, &[v, NanBox::number(k as f64)])?
+                    sc.call_cb(mapfn, this_arg, &[v, NanBox::number(k as f64)])?
                 } else {
                     v
                 };
-                self.typed_array_set_index_coerced(target, k, mapped)?;
+                sc.typed_array_set_index_coerced(target, k, mapped)?;
             }
             target
         } else {
@@ -222,14 +233,17 @@ impl Interp {
                 len_f as usize
             };
             let target = self.typed_array_create(ctor, len)?;
+            // (Rooted across each `mapfn` call, as above.)
+            let mut sc = self.root_scope(&[ctor, source, mapfn, this_arg, obj]);
+            sc.hold(NanBox::handle(target.to_raw()));
             for k in 0..len {
-                let kv = self.read_member(oh, &alloc::format!("{k}"))?;
+                let kv = sc.read_member(oh, &alloc::format!("{k}"))?;
                 let mapped = if has_mapfn {
-                    self.call_with_this(mapfn, this_arg, &[kv, NanBox::number(k as f64)])?
+                    sc.call_cb(mapfn, this_arg, &[kv, NanBox::number(k as f64)])?
                 } else {
                     kv
                 };
-                self.typed_array_set_index_coerced(target, k, mapped)?;
+                sc.typed_array_set_index_coerced(target, k, mapped)?;
             }
             target
         };

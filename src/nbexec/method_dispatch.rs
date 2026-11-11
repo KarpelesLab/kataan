@@ -86,6 +86,33 @@ impl Interp {
                 return r;
             }
         }
+        // The callback-taking array methods run under a root scope over the
+        // receiver and the arguments; their bodies root what else they hold
+        // across a callback call (`root_hold`) and make it with `call_cb`, so
+        // an allocating callback may collect (see `host_roots`).
+        if matches!(
+            method,
+            "forEach"
+                | "map"
+                | "filter"
+                | "some"
+                | "every"
+                | "find"
+                | "findIndex"
+                | "findLast"
+                | "findLastIndex"
+                | "reduce"
+                | "reduceRight"
+                | "flatMap"
+                | "sort"
+                | "toSorted"
+        ) {
+            let mut sc = self.root_scope(&[recv]);
+            for a in args {
+                sc.hold(*a);
+            }
+            return sc.call_method_inner(recv, method, args);
+        }
         self.call_method_inner(recv, method, args)
     }
 
@@ -3852,6 +3879,36 @@ impl Interp {
                 .is_none_or(|h| !h.get(i).copied().unwrap_or(false))
         };
         if let Some(elems) = self.realm.elements_vec(handle) {
+            // A callback method (run inside `call_method`'s root scope): the
+            // receiver as iterated (a materialized snapshot, a wrapper), the
+            // original one, and the elements read off it are rooted across
+            // its callback calls.
+            if matches!(
+                method,
+                "forEach"
+                    | "map"
+                    | "filter"
+                    | "some"
+                    | "every"
+                    | "find"
+                    | "findIndex"
+                    | "findLast"
+                    | "findLastIndex"
+                    | "reduce"
+                    | "reduceRight"
+                    | "flatMap"
+                    | "sort"
+                    | "toSorted"
+            ) {
+                self.root_hold(NanBox::handle(handle.to_raw()));
+                self.root_hold(callback_recv);
+                // (`sort_array` roots the values it sorts itself.)
+                if !matches!(method, "sort" | "toSorted") {
+                    for e in &elems {
+                        self.root_hold(*e);
+                    }
+                }
+            }
             // Methods whose integer-position arguments go through
             // ToIntegerOrInfinity (→ ToNumber): a Symbol argument must throw a
             // TypeError before any element processing. The downstream code coerces
@@ -4627,6 +4684,7 @@ impl Interp {
                     if let Some(len) = self.realm.typed_len(handle) {
                         self.require_callable(f, "map callback")?;
                         let dest = self.typed_species_create(handle, len)?;
+                        self.root_hold(NanBox::handle(dest.to_raw()));
                         // A species result over an immutable buffer fails before any
                         // callback runs (the writes could never succeed).
                         self.guard_view_immutable(dest)?;
@@ -4638,7 +4696,7 @@ impl Interp {
                                 .typed_get(handle, i)
                                 .unwrap_or_else(NanBox::undefined);
                             let cb_args = [kv, NanBox::number(i as f64), arr];
-                            let mapped = self.call_with_this(f, this_arg, &cb_args)?;
+                            let mapped = self.call_cb(f, this_arg, &cb_args)?;
                             // Set(A, k, mappedValue) — coerce per the result kind
                             // (a BigInt-result write of a Number throws TypeError).
                             self.set_element_checked(dest, i, mapped)?;
@@ -4666,7 +4724,9 @@ impl Interp {
                             None => out.push(NanBox::hole()),
                             Some(e) => {
                                 let cb_args = [e, NanBox::number(i as f64), arr];
-                                out.push(self.call_with_this(f, this_arg, &cb_args)?);
+                                let mapped = self.call_cb(f, this_arg, &cb_args)?;
+                                self.root_hold(mapped);
+                                out.push(mapped);
                             }
                         }
                     }
@@ -4699,7 +4759,9 @@ impl Interp {
                                 .typed_get(handle, i)
                                 .unwrap_or_else(NanBox::undefined);
                             let cb_args = [e, NanBox::number(i as f64), arr];
-                            let r = self.call_with_this(f, this_arg, &cb_args)?;
+                            // (Kept after the call: rooted across it.)
+                            self.root_hold(e);
+                            let r = self.call_cb(f, this_arg, &cb_args)?;
                             if self.realm.truthy(r) {
                                 out.push(e);
                             }
@@ -4727,7 +4789,9 @@ impl Interp {
                             continue; // holes are skipped
                         };
                         let cb_args = [e, NanBox::number(i as f64), arr];
-                        let r = self.call_with_this(f, this_arg, &cb_args)?;
+                        // (Kept after the call: rooted across it.)
+                        self.root_hold(e);
+                        let r = self.call_cb(f, this_arg, &cb_args)?;
                         if self.realm.truthy(r) {
                             out.push(e);
                         }
@@ -4765,7 +4829,7 @@ impl Interp {
                             }
                         };
                         let cb_args = [e, NanBox::number(i as f64), arr];
-                        if let Err(err) = self.call_with_this(f, this_arg, &cb_args) {
+                        if let Err(err) = self.call_cb(f, this_arg, &cb_args) {
                             failed = Some(err);
                             break;
                         }
@@ -4817,6 +4881,8 @@ impl Interp {
                             }
                         }
                     }
+                    // (The accumulator is rooted across each call.)
+                    let slot = self.root_slot(acc);
                     for i in start..elems.len() {
                         let present = is_present(i);
                         let Some(e) = self.array_cb_read(
@@ -4832,7 +4898,9 @@ impl Interp {
                         else {
                             continue; // holes are skipped
                         };
-                        acc = self.call(f, &[acc, e, NanBox::number(i as f64), arr])?;
+                        let cb_args = [acc, e, NanBox::number(i as f64), arr];
+                        acc = self.call_cb(f, NanBox::undefined(), &cb_args)?;
+                        self.root_set(slot, acc);
                     }
                     return Ok(Some(acc));
                 }
@@ -4878,6 +4946,8 @@ impl Interp {
                             }
                         }
                     }
+                    // (The accumulator is rooted across each call.)
+                    let slot = self.root_slot(acc);
                     while idx > 0 {
                         idx -= 1;
                         let present = is_present(idx);
@@ -4894,7 +4964,9 @@ impl Interp {
                         else {
                             continue; // holes are skipped
                         };
-                        acc = self.call(f, &[acc, e, NanBox::number(idx as f64), arr])?;
+                        let cb_args = [acc, e, NanBox::number(idx as f64), arr];
+                        acc = self.call_cb(f, NanBox::undefined(), &cb_args)?;
+                        self.root_set(slot, acc);
                     }
                     return Ok(Some(acc));
                 }
@@ -5298,6 +5370,7 @@ impl Interp {
                     let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
                         return Err(self.type_error("Array species did not return an object"));
                     };
+                    self.root_hold(a_v);
                     let default_array = self.realm.is_array(a_h) && !self.realm.is_frozen(a_h);
                     // `flatMap(callbackfn, thisArg)` — the optional second argument
                     // is the `this` value for each callback invocation.
@@ -5326,7 +5399,7 @@ impl Interp {
                         else {
                             continue;
                         };
-                        let r = self.call_with_this(
+                        let r = self.call_cb(
                             f,
                             this_arg,
                             &[e, NanBox::number(i as f64), callback_recv],
@@ -5501,6 +5574,7 @@ impl Interp {
                 }
                 "find" => {
                     let f = arg(0);
+                    let found_slot = self.root_slot(NanBox::undefined());
                     let typed = self.realm.typed_kind(handle).is_some();
                     let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
@@ -5517,7 +5591,9 @@ impl Interp {
                                 array_proto_generic,
                             )?
                             .unwrap_or_else(NanBox::undefined);
-                        if self.call_truthy_this(
+                        // (Returned after the call: rooted across it.)
+                        self.root_set(found_slot, e);
+                        if self.call_truthy_cb(
                             f,
                             arg(1),
                             &[e, NanBox::number(i as f64), callback_recv],
@@ -5545,7 +5621,7 @@ impl Interp {
                                 array_proto_generic,
                             )?
                             .unwrap_or_else(NanBox::undefined);
-                        if self.call_truthy_this(
+                        if self.call_truthy_cb(
                             f,
                             arg(1),
                             &[e, NanBox::number(i as f64), callback_recv],
@@ -5558,6 +5634,7 @@ impl Interp {
                 // `findLast`/`findLastIndex` — scan right-to-left.
                 "findLast" => {
                     let f = arg(0);
+                    let found_slot = self.root_slot(NanBox::undefined());
                     let typed = self.realm.typed_kind(handle).is_some();
                     let live = !typed && self.realm.is_array(handle);
                     #[allow(clippy::needless_range_loop)]
@@ -5574,7 +5651,9 @@ impl Interp {
                                 array_proto_generic,
                             )?
                             .unwrap_or_else(NanBox::undefined);
-                        if self.call_truthy_this(
+                        // (Returned after the call: rooted across it.)
+                        self.root_set(found_slot, e);
+                        if self.call_truthy_cb(
                             f,
                             arg(1),
                             &[e, NanBox::number(i as f64), callback_recv],
@@ -5602,7 +5681,7 @@ impl Interp {
                                 array_proto_generic,
                             )?
                             .unwrap_or_else(NanBox::undefined);
-                        if self.call_truthy_this(
+                        if self.call_truthy_cb(
                             f,
                             arg(1),
                             &[e, NanBox::number(i as f64), callback_recv],
@@ -5634,7 +5713,7 @@ impl Interp {
                         else {
                             continue;
                         };
-                        if self.call_truthy_this(
+                        if self.call_truthy_cb(
                             f,
                             arg(1),
                             &[e, NanBox::number(i as f64), callback_recv],
@@ -5664,7 +5743,7 @@ impl Interp {
                         else {
                             continue;
                         };
-                        if !self.call_truthy_this(
+                        if !self.call_truthy_cb(
                             f,
                             arg(1),
                             &[e, NanBox::number(i as f64), callback_recv],
@@ -5882,8 +5961,11 @@ impl Interp {
                         return Ok(Some(v));
                     }
                     // The callback receives the *canonical* key as its sole argument.
-                    let computed = self.call(arg(1), &[key])?;
-                    self.realm.collection_set(handle, key, computed);
+                    // (The collection and the key are rooted across it: an
+                    // allocating callback may collect, see `host_roots`.)
+                    let mut sc = self.root_scope(&[NanBox::handle(handle.to_raw()), key, arg(1)]);
+                    let computed = sc.call_cb(arg(1), NanBox::undefined(), &[key])?;
+                    sc.realm.collection_set(handle, key, computed);
                     return Ok(Some(computed));
                 }
                 "forEach" => {
@@ -5899,15 +5981,22 @@ impl Interp {
                     // skipped, and a delete-then-re-add is revisited. Track the last
                     // key and re-read entries each step, resuming after the last key's
                     // current position (or the recorded index if it was deleted).
+                    // The collection, the callback, its `this` and the last key
+                    // visited (compared by identity after each call) are rooted
+                    // across the calls: an allocating callback may collect (see
+                    // `host_roots`).
+                    let mut sc = self.root_scope(&[coll, f, this_arg]);
+                    let key_slot = sc.held_mark();
+                    sc.hold(NanBox::undefined());
                     let mut last_key: Option<NanBox> = None;
                     let mut idx: usize = 0;
                     loop {
-                        let entries = self.realm.collection_entries(handle).unwrap_or_default();
+                        let entries = sc.realm.collection_entries(handle).unwrap_or_default();
                         let next_pos = match last_key {
                             None => 0,
                             Some(lk) => match entries
                                 .iter()
-                                .position(|(k, _)| self.realm.same_value_zero(*k, lk))
+                                .position(|(k, _)| sc.realm.same_value_zero(*k, lk))
                             {
                                 // Still at (or before) its recorded slot — a pure
                                 // delete only shifts survivors left — so advance past.
@@ -5926,11 +6015,12 @@ impl Interp {
                             break;
                         };
                         last_key = Some(k);
+                        sc.set_held(key_slot, k);
                         idx = next_pos;
                         // The callback gets `(value, key, collection)` with `thisArg`
                         // (a Set yields its element as both value and key).
                         let val = if is_set { k } else { v };
-                        self.call_with_this(f, this_arg, &[val, k, coll])?;
+                        sc.call_cb(f, this_arg, &[val, k, coll])?;
                     }
                     return Ok(Some(NanBox::undefined()));
                 }
@@ -6270,7 +6360,9 @@ impl Interp {
             }
             let mut element = self.read_member(source, &key)?;
             if let Some(m) = mapper {
-                element = self.call_with_this(
+                // (Only `array_flat_generic` passes a mapper, from a root scope
+                // over the source and the target.)
+                element = self.call_cb(
                     m,
                     this_arg,
                     &[
@@ -6308,7 +6400,24 @@ impl Interp {
     /// `Array.prototype.flat`/`flatMap` by the spec algorithm: `LengthOfArrayLike`,
     /// the depth coercion (or IsCallable(mapper)), `ArraySpeciesCreate(O, 0)`, then
     /// `FlattenIntoArray` reading the receiver live.
+    ///
+    /// Runs under a root scope over the receiver, the arguments and the
+    /// result, so a `flatMap` callback may collect (see `host_roots`).
     fn array_flat_generic(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let mut sc = self.root_scope(&[NanBox::handle(handle.to_raw())]);
+        for a in args {
+            sc.hold(*a);
+        }
+        sc.array_flat_generic_in(method, handle, args)
+    }
+
+    /// [`Self::array_flat_generic`] inside its root scope.
+    fn array_flat_generic_in(
         &mut self,
         method: &str,
         handle: Handle,
@@ -6328,6 +6437,7 @@ impl Interp {
             (1, Some(arg(0)), arg(1))
         };
         let a_v = self.array_species_create(handle, 0)?;
+        self.root_hold(a_v);
         let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Array species did not return an object"));
         };
@@ -6340,7 +6450,25 @@ impl Interp {
     /// `ArraySpeciesCreate` (an out-of-range length throws before any callback), then
     /// per index `HasProperty` → `Get` → callback, reading each element *live* so a
     /// callback that mutates a later index is observed.
+    ///
+    /// Runs under a root scope over the receiver, the arguments, the result
+    /// and the value a `filter` keeps, so the callback may collect (see
+    /// `host_roots`).
     fn array_map_filter_generic(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let mut sc = self.root_scope(&[NanBox::handle(handle.to_raw())]);
+        for a in args {
+            sc.hold(*a);
+        }
+        sc.array_map_filter_generic_in(method, handle, args)
+    }
+
+    /// [`Self::array_map_filter_generic`] inside its root scope.
+    fn array_map_filter_generic_in(
         &mut self,
         method: &str,
         handle: Handle,
@@ -6352,6 +6480,8 @@ impl Interp {
         self.require_callable(f, &alloc::format!("{method} callback"))?;
         let is_map = method == "map";
         let a_v = self.array_species_create(handle, if is_map { len } else { 0 })?;
+        self.root_hold(a_v);
+        let kv_slot = self.root_slot(NanBox::undefined());
         let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Array species did not return an object"));
         };
@@ -6371,7 +6501,8 @@ impl Interp {
                 continue;
             }
             let kv = self.read_member(handle, &key)?;
-            let mapped = self.call_with_this(f, this_arg, &[kv, NanBox::number(i as f64), o])?;
+            self.root_set(kv_slot, kv);
+            let mapped = self.call_cb(f, this_arg, &[kv, NanBox::number(i as f64), o])?;
             if is_map {
                 self.create_data_property_or_throw(a_h, i, mapped)?;
             } else if self.realm.truthy(mapped) {
@@ -6846,7 +6977,11 @@ impl Interp {
                     i += 1;
                 }
                 let count = items.len();
-                let sorted = self.sort_array(items, cmp, false)?;
+                // (The receiver, which may be a wrapper made for a primitive
+                // `this`, is rooted across the comparator's calls.)
+                let mut sc = self.root_scope(&[NanBox::handle(handle.to_raw())]);
+                let sorted = sc.sort_array(items, cmp, false)?;
+                drop(sc);
                 for (i, v) in sorted.into_iter().enumerate() {
                     self.array_like_set(handle, i, v)?;
                 }
@@ -7012,7 +7147,27 @@ impl Interp {
         Ok(NanBox::handle(self.realm.new_array(out).to_raw()))
     }
 
+    ///
+    /// Runs under a root scope over the receiver, the arguments and what the
+    /// scan keeps across a callback call (its result values, the accumulator,
+    /// the value `find` returns), so the callback may collect (see
+    /// `host_roots`).
     fn array_iter_sparse(
+        &mut self,
+        method: &str,
+        handle: Handle,
+        args: &[NanBox],
+        len: Option<usize>,
+    ) -> Result<NanBox, ExecError> {
+        let mut sc = self.root_scope(&[NanBox::handle(handle.to_raw())]);
+        for a in args {
+            sc.hold(*a);
+        }
+        sc.array_iter_sparse_in(method, handle, args, len)
+    }
+
+    /// [`Self::array_iter_sparse`] inside its root scope.
+    fn array_iter_sparse_in(
         &mut self,
         method: &str,
         handle: Handle,
@@ -7137,7 +7292,7 @@ impl Interp {
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
-                        self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        self.call_cb(f, this_arg, &[v, NanBox::number(i as f64), o])?;
                     }
                     i += 1;
                 }
@@ -7149,11 +7304,10 @@ impl Interp {
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
-                        out.push(self.call_with_this(
-                            f,
-                            this_arg,
-                            &[v, NanBox::number(i as f64), o],
-                        )?);
+                        let mapped =
+                            self.call_cb(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        self.root_hold(mapped);
+                        out.push(mapped);
                     } else {
                         out.push(NanBox::hole());
                     }
@@ -7171,8 +7325,9 @@ impl Interp {
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
-                        let r =
-                            self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        // (Kept after the call: rooted across it.)
+                        self.root_hold(v);
+                        let r = self.call_cb(f, this_arg, &[v, NanBox::number(i as f64), o])?;
                         if self.realm.truthy(r) {
                             out.push(v);
                         }
@@ -7191,8 +7346,7 @@ impl Interp {
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
-                        let r =
-                            self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        let r = self.call_cb(f, this_arg, &[v, NanBox::number(i as f64), o])?;
                         if self.realm.truthy(r) {
                             return Ok(NanBox::boolean(true));
                         }
@@ -7211,8 +7365,7 @@ impl Interp {
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
-                        let r =
-                            self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                        let r = self.call_cb(f, this_arg, &[v, NanBox::number(i as f64), o])?;
                         if !self.realm.truthy(r) {
                             return Ok(NanBox::boolean(false));
                         }
@@ -7224,9 +7377,12 @@ impl Interp {
             // `find`/`findIndex`/`findLast`/`findLastIndex` do NOT skip holes — they
             // visit every index `[0,len)` (or reverse), reading a hole as undefined.
             "find" | "findIndex" => {
+                let slot = self.root_slot(NanBox::undefined());
                 for i in 0..len {
                     let v = self.read_member(handle, &alloc::format!("{i}"))?;
-                    let r = self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                    // (`find` returns it after the call: rooted across it.)
+                    self.root_set(slot, v);
+                    let r = self.call_cb(f, this_arg, &[v, NanBox::number(i as f64), o])?;
                     if self.realm.truthy(r) {
                         return Ok(if method == "find" {
                             v
@@ -7242,10 +7398,12 @@ impl Interp {
                 })
             }
             "findLast" | "findLastIndex" => {
+                let slot = self.root_slot(NanBox::undefined());
                 let mut i = len as i64 - 1;
                 while i >= 0 {
                     let v = self.read_member(handle, &alloc::format!("{i}"))?;
-                    let r = self.call_with_this(f, this_arg, &[v, NanBox::number(i as f64), o])?;
+                    self.root_set(slot, v);
+                    let r = self.call_cb(f, this_arg, &[v, NanBox::number(i as f64), o])?;
                     if self.realm.truthy(r) {
                         return Ok(if method == "findLast" {
                             v
@@ -7289,6 +7447,8 @@ impl Interp {
                         }
                     }
                 }
+                // (The accumulator is rooted across each call.)
+                let slot = self.root_slot(acc);
                 let mut i = start;
                 while i < len {
                     i = self.sparse_next_index(handle, i, len);
@@ -7298,7 +7458,9 @@ impl Interp {
                     let key = alloc::format!("{i}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
-                        acc = self.call(f, &[acc, v, NanBox::number(i as f64), o])?;
+                        let cb_args = [acc, v, NanBox::number(i as f64), o];
+                        acc = self.call_cb(f, NanBox::undefined(), &cb_args)?;
+                        self.root_set(slot, acc);
                     }
                     i += 1;
                 }
@@ -7335,6 +7497,8 @@ impl Interp {
                         }
                     }
                 }
+                // (The accumulator is rooted across each call.)
+                let slot = self.root_slot(acc);
                 while idx >= 0 {
                     match self.sparse_prev_index(handle, idx as usize, 0) {
                         Some(p) => idx = p as i64,
@@ -7343,7 +7507,9 @@ impl Interp {
                     let key = alloc::format!("{idx}");
                     if self.has_property(handle, &key) {
                         let v = self.read_member(handle, &key)?;
-                        acc = self.call(f, &[acc, v, NanBox::number(idx as f64), o])?;
+                        let cb_args = [acc, v, NanBox::number(idx as f64), o];
+                        acc = self.call_cb(f, NanBox::undefined(), &cb_args)?;
+                        self.root_set(slot, acc);
                     }
                     idx -= 1;
                 }
@@ -7479,7 +7645,14 @@ impl Interp {
         }
         let mut call_args = alloc::vec![o];
         call_args.extend_from_slice(&args[1.min(args.len())..]);
-        Ok(Some(self.call_with_this(m, search, &call_args)?))
+        // (A tail call, under a scope over what it is passed: a VM method may
+        // collect, and the intrinsic `@@replace` & co. may open an active
+        // scope of their own, see `host_roots`.)
+        let mut sc = self.root_scope(&[o, search, m]);
+        for a in args {
+            sc.hold(*a);
+        }
+        Ok(Some(sc.call_cb(m, search, &call_args)?))
     }
 
     /// One step of a **live**, delete-tolerant cursor over collection `coll`'s

@@ -2065,7 +2065,30 @@ impl Interp {
 
     /// `RegExp.prototype[@@replace]` steps 14–15: the output string built from
     /// the collected `results` over the subject `str_v` (code units `units`).
+    ///
+    /// Runs under a root scope over the replacer, the subject and the result
+    /// objects a user `exec` returned, so a replacer function (called through
+    /// `call_cb`) may collect (see `host_roots`).
     fn regexp_replace_build(
+        &mut self,
+        results: Vec<ExecOutcome>,
+        func_replace: bool,
+        replace: NanBox,
+        repl_str: &[u8],
+        str_v: NanBox,
+        units: &[u16],
+    ) -> Result<crate::nbvm::ReplaceStep, ExecError> {
+        let mut sc = self.root_scope(&[replace, str_v]);
+        for r in &results {
+            if let ExecOutcome::Object(v) = r {
+                sc.hold(*v);
+            }
+        }
+        sc.regexp_replace_build_in(results, func_replace, replace, repl_str, str_v, units)
+    }
+
+    /// [`Self::regexp_replace_build`] inside its root scope.
+    fn regexp_replace_build_in(
         &mut self,
         results: Vec<ExecOutcome>,
         func_replace: bool,
@@ -2101,7 +2124,7 @@ impl Interp {
                     if !named.is_undefined() {
                         call_args.push(named);
                     }
-                    let r = self.call(replace, &call_args)?;
+                    let r = self.call_cb(replace, NanBox::undefined(), &call_args)?;
                     // `ToString(replValue)` runs for every result; only a match at
                     // or past the next source position is spliced in.
                     if pos >= next_source_position {
@@ -2252,7 +2275,8 @@ impl Interp {
             if !matches!(named.unpack(), Unpacked::Undefined) {
                 call_args.push(named);
             }
-            let r = self.call(replace, &call_args)?;
+            // (From `regexp_replace_build`'s root scope.)
+            let r = self.call_cb(replace, NanBox::undefined(), &call_args)?;
             self.coerce_to_string_bytes(r)
         } else {
             // ES2018 named captures: a non-undefined `groups` is `ToObject`'d

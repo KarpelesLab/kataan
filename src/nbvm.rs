@@ -1780,6 +1780,21 @@ pub(crate) fn call_vm_function(
     this: NanBox,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
+    call_vm_function_in(host, table, f, this, args, false)
+}
+
+/// [`call_vm_function`]; `collect`: the caller is a host built-in whose
+/// active root scope roots everything it holds (`Interp::call_cb`), so the
+/// callee may collect as an armed entry would (see
+/// `crate::realm::host_roots`), without the arm.
+pub(crate) fn call_vm_function_in(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    f: NanBox,
+    this: NanBox,
+    args: &[NanBox],
+    collect: bool,
+) -> Result<NanBox, VmError> {
     #[cfg(feature = "std")]
     if let Some(mut idle) = hosted_pool::take() {
         let in_realm = host.realm_index();
@@ -1799,7 +1814,11 @@ pub(crate) fn call_vm_function(
         {
             ctx.jit_rt.main_realm = in_realm.is_none();
         }
-        let gc = take_host_arm(ctx);
+        let gc = if collect {
+            enable_host_gc(ctx)
+        } else {
+            take_host_arm(ctx)
+        };
         let result = run_vm_callback(ctx, table, f, this, args);
         if gc {
             ctx.gc_enabled = false;
@@ -1815,7 +1834,11 @@ pub(crate) fn call_vm_function(
         return result;
     }
     let mut ctx = hosted_ctx(host.take_realm(), host);
-    take_host_arm(&mut ctx);
+    if collect {
+        enable_host_gc(&mut ctx);
+    } else {
+        take_host_arm(&mut ctx);
+    }
     let result = run_vm_callback(&mut ctx, table, f, this, args);
     let realm = ctx.realm;
     host.restore_realm(realm);
@@ -3883,7 +3906,9 @@ fn async_iter_step(
 ) -> Result<(), VmError> {
     let (it, nx) = (regs[iter as usize], regs[next as usize]);
     let v = if regs[sync as usize].as_boolean() == Some(true) {
-        with_host(ctx, |h| h.async_from_sync_next(it, nx))
+        // (A relay lending this frame's registers: the sync generator the
+        // step resumes may collect, `crate::realm::host_roots`.)
+        with_host_regs(ctx, regs, |h| h.async_from_sync_next(it, nx))
             .unwrap_or(Err(HostError::Fault))
             .map_err(VmError::from)?
     } else if let Some(r) = agen_direct_next(ctx, funcs, regs, it, nx) {
@@ -3909,6 +3934,14 @@ pub(crate) fn vm_agen_request(
 ) -> Result<NanBox, VmError> {
     let entered = enter_frame_realm(host, generator);
     let mut ctx = hosted_ctx(host.take_realm(), host);
+    // Armed under a root scope (`crate::realm::host_roots`): the body runs
+    // as an outermost activation that may collect, as `agen_direct_next`'s
+    // does; the generator is the caller's, rooted by its scope.
+    let gc = take_host_arm(&mut ctx);
+    if gc {
+        ctx.call_depth = 1;
+        ctx.realm.vm_total_depth += 1;
+    }
     let result = {
         let r = vm_agen_enqueue(&mut ctx, table, generator, kind, v);
         if r.is_ok() && !ctx.microtasks.is_empty() {
@@ -3917,6 +3950,10 @@ pub(crate) fn vm_agen_request(
             r
         }
     };
+    if gc {
+        ctx.call_depth = 0;
+        ctx.realm.vm_total_depth -= 1;
+    }
     let realm = ctx.realm;
     host.restore_realm(realm);
     if entered {
@@ -4134,6 +4171,12 @@ pub(crate) fn resume_vm_generator(
 ) -> Result<NanBox, VmError> {
     let entered = enter_frame_realm(host, generator);
     let mut ctx = hosted_ctx(host.take_realm(), host);
+    // Armed under a root scope: as `host_generator_step`.
+    let gc = take_host_arm(&mut ctx);
+    if gc {
+        ctx.call_depth = 1;
+        ctx.realm.vm_total_depth += 1;
+    }
     let result = {
         let r = vm_generator_resume(&mut ctx, table, generator, mode, v);
         if r.is_ok() && !ctx.microtasks.is_empty() {
@@ -4142,6 +4185,10 @@ pub(crate) fn resume_vm_generator(
             r
         }
     };
+    if gc {
+        ctx.call_depth = 0;
+        ctx.realm.vm_total_depth -= 1;
+    }
     let realm = ctx.realm;
     host.restore_realm(realm);
     if entered {
@@ -4208,10 +4255,18 @@ fn take_host_arm(ctx: &mut Ctx) -> bool {
     if !ctx.realm.host_roots.take_arm() {
         return false;
     }
-    // Its collections root the host's pending jobs and timers, as a job's
-    // resumption does (`job_ctx`): with an active root scope below, no host
-    // frame holds a job it has dequeued and not finished (the event loop's
-    // crossing is no relay, and a VM job runs in a context of its own).
+    enable_host_gc(ctx)
+}
+
+/// What an armed nested entry gets ([`take_host_arm`]): collection on, and
+/// its collections root the host's pending jobs and timers, as a job's
+/// resumption does (`job_ctx`): with an active root scope below, no host
+/// frame holds a job it has dequeued and not finished (the event loop's own
+/// job is rooted by the loop's scope, and a VM job runs in a context of its
+/// own). Returns `true`.
+#[inline]
+fn enable_host_gc(ctx: &mut Ctx) -> bool {
+    ctx.realm.host_roots.armed = 0;
     ctx.gc_enabled = true;
     ctx.in_job = true;
     true
@@ -5448,7 +5503,7 @@ pub fn run_program(
             in_realm: None,
         };
         let r = call(&mut ctx, funcs, id, args).and_then(|value| {
-            drain_microtasks(&mut ctx, funcs)?;
+            drain_microtasks(&mut ctx, funcs, &[value])?;
             Ok(value)
         });
         (r, ctx.realm)
@@ -5504,7 +5559,7 @@ pub fn run_program_capturing(
         let r = call(&mut ctx, funcs, id, args).and_then(|value| {
             // Run the promise event loop before returning (then-callbacks, async
             // tails).
-            drain_microtasks(&mut ctx, funcs)?;
+            drain_microtasks(&mut ctx, funcs, &[value])?;
             Ok((value, core::mem::take(&mut ctx.output)))
         });
         (r, ctx.realm)
@@ -5548,7 +5603,7 @@ pub fn run_program_hosted(
             // the host's (reactions to promises its built-ins created, timers).
             // Each may enqueue work on the other.
             loop {
-                drain_microtasks(&mut ctx, funcs)?;
+                drain_microtasks(&mut ctx, funcs, &[v])?;
                 // (With nothing of this run's own left in flight — its body has
                 // returned and its own queue is drained — the host's loop may
                 // collect between jobs, keeping the completion value.)
@@ -8302,15 +8357,19 @@ fn promise_then(ctx: &mut Ctx, p: Handle, on_f: NanBox, on_r: NanBox) -> Handle 
     result
 }
 
-/// Runs the promise microtask queue to completion (the event loop).
-fn drain_microtasks(ctx: &mut Ctx, funcs: &[FnProto]) -> Result<(), VmError> {
-    // The popped job's handler/value/result live in a Rust local for the duration
-    // of the handler call, and the handler runs at `call_depth == 1` (the depth
-    // that may collect) — so lock the GC out for the whole drain rather than
-    // trying to publish a moving target.
-    ctx.gc_lock += 1;
+/// Runs the promise microtask queue to completion (the event loop), from a
+/// run's outermost level (`call_depth` 0) once its body returned; `keep` is
+/// what the caller still holds (the completion value).
+///
+/// Each handler runs at `call_depth` 1, the depth that may collect: the
+/// popped job's handler, value and result promise, and `keep`, are rooted in
+/// [`Ctx::frame_shadow`] for the call, so a long reaction collects as a
+/// function body does.
+fn drain_microtasks(ctx: &mut Ctx, funcs: &[FnProto], keep: &[NanBox]) -> Result<(), VmError> {
+    let mark = ctx.frame_shadow.len();
+    ctx.frame_shadow.extend_from_slice(keep);
     let r = drain_microtasks_inner(ctx, funcs);
-    ctx.gc_lock -= 1;
+    ctx.frame_shadow.truncate(mark);
     r
 }
 
@@ -8318,7 +8377,15 @@ fn drain_microtasks_inner(ctx: &mut Ctx, funcs: &[FnProto]) -> Result<(), VmErro
     while let Some(task) = ctx.microtasks.pop_front() {
         if task.handler.as_handle().is_some() {
             // A handler runs and its result settles the dependent promise.
-            match call_closure(ctx, funcs, task.handler, &[task.value], NanBox::undefined()) {
+            let mark = ctx.frame_shadow.len();
+            ctx.frame_shadow.extend_from_slice(&[
+                task.handler,
+                task.value,
+                NanBox::handle(task.result.to_raw()),
+            ]);
+            let r = call_closure(ctx, funcs, task.handler, &[task.value], NanBox::undefined());
+            ctx.frame_shadow.truncate(mark);
+            match r {
                 Ok(ret) => settle(ctx, task.result, ret, true),
                 Err(VmError::Thrown(e)) => settle(ctx, task.result, e, false),
                 Err(other) => return Err(other),
@@ -9360,7 +9427,7 @@ fn run_frame_at_ic(
                 regs[*act as usize] = NanBox::number(0.0);
                 let r = if m == 0 {
                     if is_sync {
-                        with_host(ctx, |h| h.async_from_sync_next_with(it, nx, v))
+                        with_host_regs(ctx, regs, |h| h.async_from_sync_next_with(it, nx, v))
                             .unwrap_or(Err(HostError::Fault))
                             .map_err(VmError::from)
                     } else {
@@ -10843,13 +10910,17 @@ fn run_frame_at_ic(
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))) =>
             {
                 let argv = ArgBuf::from_regs(regs, args);
-                match call_closure(
-                    ctx,
-                    funcs,
-                    regs[*callee as usize],
-                    &argv,
-                    NanBox::undefined(),
-                ) {
+                let f = regs[*callee as usize];
+                // `call_closure`'s host call, lending this frame's registers:
+                // a built-in called here may let what it re-enters collect
+                // (`crate::realm::host_roots`).
+                let r = match native_call::try_call_value(&mut ctx.realm, f, &argv) {
+                    Some(v) => Ok(v),
+                    None => with_host_regs(ctx, regs, |h| h.call(f, NanBox::undefined(), &argv))
+                        .unwrap_or(Err(HostError::Fault))
+                        .map_err(VmError::from),
+                };
+                match r {
                     Ok(ret) => regs[*dst as usize] = ret,
                     Err(e) => {
                         let e = name_not_callable(ctx, regs[*callee as usize], name.as_deref(), e);

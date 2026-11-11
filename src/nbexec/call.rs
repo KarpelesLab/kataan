@@ -230,6 +230,20 @@ impl Interp {
         r
     }
 
+    /// Runs `f` numbered as a host call, as [`call_with_this`](Self::call_with_this)
+    /// numbers one: for a VM operation the host performs as a built-in would
+    /// (an `%AsyncFromSyncIteratorPrototype%.next` of a `for await` step), so
+    /// a root scope it opens may be active (see `crate::realm::host_roots`).
+    pub(crate) fn as_host_call<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.call_serial;
+        let hr = &mut self.realm.host_roots;
+        hr.serial = hr.serial.wrapping_add(1);
+        self.call_serial = hr.serial;
+        let r = f(self);
+        self.call_serial = outer;
+        r
+    }
+
     /// [`call_with_this`](Self::call_with_this) once numbered.
     fn call_with_this_serial(
         &mut self,
@@ -679,7 +693,14 @@ impl Interp {
                     if callable {
                         let mut call_args = alloc::vec![this_val];
                         call_args.extend_from_slice(&args[1.min(args.len())..]);
-                        return self.call_with_this(m, arg0, &call_args);
+                        // (A tail call, under a scope over what it is passed: a
+                        // VM method may collect, and the intrinsic `@@replace`
+                        // & co. may open an active scope, see `host_roots`.)
+                        let mut sc = self.root_scope(&[this_val, arg0, m]);
+                        for a in args {
+                            sc.hold(*a);
+                        }
+                        return sc.call_cb(m, arg0, &call_args);
                     }
                 }
                 // `ToString(this)`: a string primitive is its own string; anything
@@ -2490,13 +2511,20 @@ impl Interp {
             let reject = self.realm.new_bound_native(N_REJECT, promise);
             self.install_fn_name_length(resolve, "", 1);
             self.install_fn_name_length(reject, "", 1);
-            let r = self.call(
+            // The promise (which its resolving functions hold) and the
+            // arguments are rooted across the executor's call: an allocating
+            // executor may collect (see `host_roots`).
+            let pv = NanBox::handle(promise.to_raw());
+            let mut sc = self.root_scope(&[pv, executor, callee, native_new_target]);
+            let r = sc.call_cb(
                 executor,
+                NanBox::undefined(),
                 &[
                     NanBox::handle(resolve.to_raw()),
                     NanBox::handle(reject.to_raw()),
                 ],
             );
+            drop(sc);
             if let Err(ExecError::Throw(e)) = r {
                 // Step 10a: the executor's abrupt completion calls the *reject*
                 // resolving function, which is a no-op once the promise has already
@@ -3720,7 +3748,16 @@ impl Interp {
         }
         let n = elems.len();
         let mut scratch = alloc::vec![NanBox::undefined(); n];
-        self.sort_run(&mut elems, &mut scratch, cmp, has_cmp, numeric)?;
+        // The comparator and every value sorted (the merge only permutes them)
+        // are rooted across its calls (`sort_compare` makes them with
+        // `call_cb`), so an allocating comparator may collect (see
+        // `host_roots`). The caller roots what else it holds.
+        let mut sc = self.root_scope(&[cmp]);
+        for e in &elems {
+            sc.hold(*e);
+        }
+        sc.sort_run(&mut elems, &mut scratch, cmp, has_cmp, numeric)?;
+        drop(sc);
         // Re-append the `undefined` holes after the ordered defined values.
         elems.extend(core::iter::repeat_n(NanBox::undefined(), undefined_count));
         Ok(elems)
@@ -3749,7 +3786,8 @@ impl Interp {
         numeric: bool,
     ) -> Result<f64, ExecError> {
         let order = if has_cmp {
-            let r = self.call(cmp, &[x, y])?;
+            // (From `sort_array`'s root scope.)
+            let r = self.call_cb(cmp, NanBox::undefined(), &[x, y])?;
             let n = self.coerce_to_number(r)?;
             self.realm.to_number(n)
         } else if numeric {

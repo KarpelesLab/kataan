@@ -805,6 +805,14 @@ impl Interp {
     /// ties by insertion order), advancing the virtual clock to that fire-time. A
     /// no-op when none are pending.
     pub(crate) fn run_one_macrotask(&mut self) -> Result<(), ExecError> {
+        self.run_one_macrotask_in(false)
+    }
+
+    /// [`Self::run_one_macrotask`]; `gc`: the collecting event loop runs it
+    /// straight, so the callback runs under a scope of the loop's (over the
+    /// timer's callback and arguments, which nothing else holds once it is
+    /// dequeued) and may collect (see `host_roots`).
+    fn run_one_macrotask_in(&mut self, gc: bool) -> Result<(), ExecError> {
         let Some(t) = self.macrotasks.pop() else {
             return Ok(());
         };
@@ -825,6 +833,14 @@ impl Interp {
                 args: t.args.clone(),
                 period: t.period,
             });
+        }
+        if gc {
+            let mut sc = self.root_scope_loop(&[t.callback]);
+            for a in &t.args {
+                sc.hold(*a);
+            }
+            sc.call_cb(t.callback, NanBox::undefined(), &t.args)?;
+            return Ok(());
         }
         self.call(t.callback, &t.args)?;
         Ok(())
@@ -876,8 +892,14 @@ impl Interp {
             if !self.macrotasks.is_empty() {
                 if let Some(keep) = keep {
                     self.event_loop_safepoint(keep);
+                    // (`keep` is rooted while the timer runs, as for a job.)
+                    let outer_keep = core::mem::replace(&mut self.loop_keep, keep.to_vec());
+                    let r = self.run_one_macrotask_in(true);
+                    self.loop_keep = outer_keep;
+                    r?;
+                } else {
+                    self.run_one_macrotask()?;
                 }
-                self.run_one_macrotask()?;
                 // A timer-driven poll loop (`$262.agent.getReportAsync`) must let
                 // the other agents run, or the report it waits for never arrives.
                 self.agent_tick()?;
@@ -960,6 +982,44 @@ impl Interp {
                 Err(other) => return Err(other),
             }
         }
+        // The collecting loop's own job runs under a scope of the loop's,
+        // over everything the job uses after its handler returns: a VM
+        // handler may collect inside, a built-in continuation (an
+        // `Array.fromAsync` step...) may open an active scope (see
+        // `crate::realm::host_roots`).
+        // (Only for a handler that can use it: a VM function, which may then
+        // collect, or an `Array.fromAsync` continuation, which steps the
+        // iterator under a scope of its own.)
+        if gc
+            && let Some(h) = job.handler.as_handle().map(Handle::from_raw)
+            && (self.realm.is_vm_function(h)
+                || self
+                    .realm
+                    .bound_native_at(h)
+                    .is_some_and(|(id, _)| matches!(id, N_FROM_ASYNC_STEP | N_FROM_ASYNC_THROW)))
+        {
+            let u = NanBox::undefined();
+            let (t0, t1) = job.thenable.unwrap_or((u, u));
+            let (c0, c1) = job.cap.unwrap_or((u, u));
+            let vals = [
+                job.handler,
+                job.value,
+                NanBox::handle(job.result.to_raw()),
+                t0,
+                t1,
+                c0,
+                c1,
+            ];
+            let mut sc = self.root_scope_loop(&vals);
+            return sc.run_job(&job);
+        }
+        self.run_job(&job)
+    }
+
+    /// [`Self::run_one_microtask`]'s run of the dequeued reaction `job`; its
+    /// handler is called through `call_cb`.
+    #[inline(always)]
+    fn run_job(&mut self, job: &Job) -> Result<(), ExecError> {
         // PromiseResolveThenableJob: `handler` is the thenable's `then` method;
         // call `then.call(thenable, resolve, reject)`. A throw rejects via the
         // job's `reject` (the bound resolve/reject of `result`).
@@ -969,7 +1029,7 @@ impl Interp {
             // (see `N_THENABLE_RESOLVE`); an abrupt `then` calls its reject,
             // a no-op once `then` has resolved.
             let args = [resolve, reject];
-            if let Err(ExecError::Throw(e)) = self.call_with_this(job.handler, job.value, &args) {
+            if let Err(ExecError::Throw(e)) = self.call_cb(job.handler, job.value, &args) {
                 self.call(reject, &[e])?;
             }
             return Ok(());
@@ -983,15 +1043,15 @@ impl Interp {
         {
             // `finally`: run the callback (no args), then pass the original
             // value/rejection through (a throw from the callback overrides it).
-            match self.call(job.handler, &[]) {
+            match self.call_cb(job.handler, NanBox::undefined(), &[]) {
                 Ok(_) => {
                     if job.fulfilled {
-                        self.job_settle(&job, job.value, true)?;
+                        self.job_settle(job, job.value, true)?;
                     } else {
-                        self.job_settle(&job, job.value, false)?;
+                        self.job_settle(job, job.value, false)?;
                     }
                 }
-                Err(ExecError::Throw(e)) => self.job_settle(&job, e, false)?,
+                Err(ExecError::Throw(e)) => self.job_settle(job, e, false)?,
                 Err(other) => return Err(other),
             }
         } else if job
@@ -1000,16 +1060,16 @@ impl Interp {
             .map(Handle::from_raw)
             .is_some_and(|h| self.is_callable(h))
         {
-            match self.call(job.handler, &[job.value]) {
-                Ok(v) => self.job_settle(&job, v, true)?,
-                Err(ExecError::Throw(e)) => self.job_settle(&job, e, false)?,
+            match self.call_cb(job.handler, NanBox::undefined(), &[job.value]) {
+                Ok(v) => self.job_settle(job, v, true)?,
+                Err(ExecError::Throw(e)) => self.job_settle(job, e, false)?,
                 Err(other) => return Err(other),
             }
         } else if job.fulfilled {
             // Passthrough: settle with the same status/value.
-            self.job_settle(&job, job.value, true)?;
+            self.job_settle(job, job.value, true)?;
         } else {
-            self.job_settle(&job, job.value, false)?;
+            self.job_settle(job, job.value, false)?;
         }
         Ok(())
     }

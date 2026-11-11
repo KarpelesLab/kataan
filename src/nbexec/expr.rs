@@ -142,16 +142,17 @@ impl Interp {
         sym
     }
 
-    /// Calls `f(args)` and returns the result's truthiness.
-    /// Calls `f` with an explicit `this` and returns whether the result is truthy
-    /// (for array predicates with a `thisArg`).
-    pub(crate) fn call_truthy_this(
+    /// Calls `f` with an explicit `this` through `call_cb` and returns whether
+    /// the result is truthy (for array predicates with a `thisArg`): for a
+    /// built-in that roots everything it holds across the call (see
+    /// `host_roots`).
+    pub(crate) fn call_truthy_cb(
         &mut self,
         f: NanBox,
         this: NanBox,
         args: &[NanBox],
     ) -> Result<bool, ExecError> {
-        let r = self.call_with_this(f, this, args)?;
+        let r = self.call_cb(f, this, args)?;
         Ok(self.realm.truthy(r))
     }
 

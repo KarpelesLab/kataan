@@ -60,7 +60,9 @@ impl Interp {
             }
             let list = self.get_v(options, "transfer")?;
             if !list.is_undefined() {
-                for t in self.iterate_values(list)? {
+                // (Only the arguments and the list are held while a custom
+                // list is stepped: a generator body it resumes may collect.)
+                for t in self.iterate_values_keep(list, &[value, options, list])? {
                     if !self.is_object_value(t) {
                         return Err(self.type_error("a transferable must be an object"));
                     }

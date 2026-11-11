@@ -44,7 +44,14 @@ impl Interp {
         // from its slot (no user code can observe that), anything else takes
         // the full `[[Get]]`.
         let value = self.get_own_fast(holder, key)?;
+        // An object walked is rooted while its members are revived (a reviver
+        // may detach it from `holder`): the walk runs in `JSON.parse`'s root
+        // scope, and each reviver call is a `call_cb`, so an allocating
+        // reviver may collect (see `host_roots`). Its own reviver call is
+        // passed it (the VM roots a call's arguments).
+        let mut mark = None;
         if let Some(vh) = value.as_handle().map(Handle::from_raw) {
+            mark = Some(self.root_slot(value));
             if self.realm.is_array(self.proxy_key_target(vh)) {
                 let len_v = self.read_member(vh, "length")?;
                 let len_f = self.coerce_to_integer_or_infinity(len_v)?;
@@ -109,8 +116,8 @@ impl Interp {
                 value: pv,
                 span: (a, b),
             }) = snapshot
-            && self.realm.same_value(pv, value)
             && let Some(source) = cx.text.get(a..b)
+            && self.json_src_same(pv, value, source)
         {
             let src_box = self.new_str_bytes(source.to_vec());
             if !self
@@ -121,11 +128,39 @@ impl Interp {
             }
         }
         let kb = self.new_key_str(key);
-        self.call_with_this(
-            reviver,
-            NanBox::handle(holder.to_raw()),
-            &[kb, value, NanBox::handle(context.to_raw())],
-        )
+        if let Some(m) = mark {
+            self.root_truncate(m);
+        }
+        let args = [kb, value, NanBox::handle(context.to_raw())];
+        let holder = NanBox::handle(holder.to_raw());
+        if cx.reviver_vm && self.created_realms.is_empty() {
+            return self.call_vm_cb(reviver, holder, &args);
+        }
+        self.call_cb(reviver, holder, &args)
+    }
+
+    /// `SameValue(pv, value)` of the primitive `pv` a source record holds
+    /// (whose JSON text is `source`) and the current `value`. A string the
+    /// parser made is not rooted during the walk (a reviver may drop the
+    /// last reference to it, and collect): it is used only when it is the
+    /// very value at hand, else its text is parsed again.
+    fn json_src_same(&mut self, pv: NanBox, value: NanBox, source: &[u8]) -> bool {
+        if pv.to_bits() == value.to_bits() {
+            return true;
+        }
+        if pv.as_handle().is_none() {
+            return self.realm.same_value(pv, value);
+        }
+        if !value
+            .as_handle()
+            .is_some_and(|h| self.realm.is_string_handle(Handle::from_raw(h)))
+        {
+            return false;
+        }
+        match self.json_parse_wtf8(source) {
+            Ok(fresh) => self.realm.same_value(fresh, value),
+            Err(_) => false,
+        }
     }
 
     /// The step of `InternalizeJSONProperty` that puts a revived element
@@ -295,36 +330,49 @@ impl Interp {
         } else {
             None
         };
+        // The arguments and the holder are rooted for the whole walk, and
+        // every object or array being serialized (the cycle stack) before any
+        // `toJSON`, replacer or getter call (`json_root_stack`): those calls
+        // are `call_cb`s, so an allocating one may collect (see `host_roots`).
+        // A value such a call returns needs no root of its own: it is passed
+        // to the next call (whose arguments the VM roots) or entered on the
+        // stack before any further call.
+        let holder_v = holder.map_or(NanBox::undefined(), |h| NanBox::handle(h.to_raw()));
+        let mut sc = self.root_scope(&[value, replacer, space, holder_v]);
+        let this = &mut *sc;
+        let stack_base = this.realm.host_roots.vals.len();
         let mut cx = JsonOut {
             replacer_fn,
             property_list: property_list.as_deref(),
             gap: &gap,
             stack: Vec::new(),
             deep: alloc::collections::BTreeSet::new(),
-            out: Vec::with_capacity(self.json_out_hint),
-            shape_keys: core::mem::take(&mut self.json_shape_memo),
+            out: Vec::with_capacity(this.json_out_hint),
+            shape_keys: core::mem::take(&mut this.json_shape_memo),
             tojson_obj: crate::ic::PropertyCache::new(),
             tojson_arr: Default::default(),
             fast: replacer_fn.as_handle().is_none() && property_list.is_none() && gap.is_empty(),
-            max_len: self.realm.limits.max_string_len,
+            max_len: this.realm.limits.max_string_len,
             slow: 0,
-            proofs: self.json_proofs,
+            proofs: this.json_proofs,
             last_plan: None,
+            stack_base,
+            stack_rooted: 0,
         };
         let wrote = match holder {
-            Some(holder) => match self.read_member(holder, "") {
-                Ok(value) => self.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, ""),
+            Some(holder) => match this.read_member(holder, "") {
+                Ok(value) => this.json_ser_got(&mut cx, holder, JsonKey::Str(""), value, ""),
                 Err(e) => Err(e),
             },
             // No step dereferences the holder without a replacer function:
             // a handle to no cell stands in for it.
-            None => self.json_ser_got(&mut cx, NO_HOLDER, JsonKey::Str(""), value, ""),
+            None => this.json_ser_got(&mut cx, NO_HOLDER, JsonKey::Str(""), value, ""),
         };
-        self.json_shape_memo = core::mem::take(&mut cx.shape_keys);
-        self.json_proofs = cx.proofs;
+        this.json_shape_memo = core::mem::take(&mut cx.shape_keys);
+        this.json_proofs = cx.proofs;
         // The next output buffer starts at this one's size (small outputs
         // then grow in place at most rarely; a huge one is not kept).
-        self.json_out_hint = cx.out.len().clamp(64, 4096);
+        this.json_out_hint = cx.out.len().clamp(64, 4096);
         Ok(wrote?.then_some(cx.out))
     }
 
@@ -438,13 +486,15 @@ impl Interp {
             let tj = self.json_to_json_of(cx, h)?;
             if self.is_callable_value(tj) {
                 let kb = key.to_value(self);
-                value = self.call_with_this(tj, value, &[kb])?;
+                self.json_root_stack(cx);
+                value = self.call_cb(tj, value, &[kb])?;
             }
         }
         // ReplacerFunction: value = replacer.call(holder, key, value).
         if self.is_callable_value(cx.replacer_fn) {
             let kb = key.to_value(self);
-            value = self.call_with_this(
+            self.json_root_stack(cx);
+            value = self.call_cb(
                 cx.replacer_fn,
                 NanBox::handle(holder.to_raw()),
                 &[kb, value],
@@ -739,7 +789,7 @@ impl Interp {
                     // itself run a getter).
                     cnt = 0;
                     cx.slow += 1;
-                    self.get_own_fast(h, k)?
+                    self.json_get_cb(cx, h, k)?
                 }
             };
             let mark = cx.out.len();
@@ -769,7 +819,7 @@ impl Interp {
                 cx.out.truncate(mark);
             }
         }
-        Self::json_leave(cx);
+        self.json_leave(cx);
         cx.out.push(b'}');
         Ok(())
     }
@@ -815,7 +865,7 @@ impl Interp {
             }
             i += 1;
         }
-        Self::json_leave(cx);
+        self.json_leave(cx);
         cx.out.push(b']');
         self.check_str_len(cx.out.len())
     }
@@ -885,6 +935,50 @@ impl Interp {
         Some(m)
     }
 
+    /// Roots the objects on the cycle stack not rooted yet, before a call
+    /// made through `call_cb` (see `json_stringify`). They are rooted in
+    /// stack order on top of the walk's root scope, so leaving one drops its
+    /// root (`json_leave`).
+    fn json_root_stack(&mut self, cx: &mut JsonOut<'_>) {
+        let vals = &mut self.realm.host_roots.vals;
+        debug_assert_eq!(vals.len(), cx.stack_base + cx.stack_rooted);
+        vals.extend(
+            cx.stack[cx.stack_rooted..]
+                .iter()
+                .map(|h| NanBox::handle(h.to_raw())),
+        );
+        cx.stack_rooted = cx.stack.len();
+    }
+
+    /// `Get(h, key)` of an object being serialized (on the cycle stack, see
+    /// `json_root_stack`): an own data property of an ordinary object is its
+    /// slot; an own accessor's getter is called through `call_cb` (an
+    /// allocating getter may collect, see `host_roots`); anything else takes
+    /// the full `[[Get]]`.
+    fn json_get_cb(
+        &mut self,
+        cx: &mut JsonOut<'_>,
+        h: Handle,
+        key: &str,
+    ) -> Result<NanBox, ExecError> {
+        if let Some(v) = self.ordinary_own_data(h, key) {
+            return Ok(v);
+        }
+        if self.realm.proxy_at(h).is_none()
+            && self.realm.typed_kind(h).is_none()
+            && !self.realm.is_host_exotic(h)
+            && !self.is_mapped_arguments(h)
+            && let Some((getter, _)) = self.realm.accessor(h, key)
+            && getter
+                .as_handle()
+                .is_some_and(|g| self.realm.is_vm_function(Handle::from_raw(g)))
+        {
+            self.json_root_stack(cx);
+            return self.call_cb(getter, NanBox::handle(h.to_raw()), &[]);
+        }
+        self.read_member(h, key)
+    }
+
     /// The cycle check shared by objects and arrays: pushes `h` on the stack,
     /// or throws if it is already being serialized. The nesting is bounded by
     /// `max_json_depth` (a RangeError past it, as for any runaway recursion):
@@ -916,11 +1010,16 @@ impl Interp {
     }
 
     /// Pops the object [`json_enter`](Self::json_enter) pushed.
-    fn json_leave(cx: &mut JsonOut<'_>) {
+    fn json_leave(&mut self, cx: &mut JsonOut<'_>) {
         if let Some(h) = cx.stack.pop()
             && cx.stack.len() >= JSON_STACK_SCAN
         {
             cx.deep.remove(&h.to_raw());
+        }
+        // (Its root, if `json_root_stack` made one.)
+        if cx.stack_rooted > cx.stack.len() {
+            cx.stack_rooted = cx.stack.len();
+            self.root_truncate(cx.stack_base + cx.stack_rooted);
         }
     }
 
@@ -1002,17 +1101,14 @@ impl Interp {
             cx.out.extend_from_slice(if pretty { b": " } else { b":" });
             // `Get(h, k)`: an own data property of an ordinary object is its
             // slot; everything else takes the full `[[Get]]`.
-            let value = match self.ordinary_own_data(h, &k) {
-                Some(v) => v,
-                None => self.read_member(h, &k)?,
-            };
+            let value = self.json_get_cb(cx, h, &k)?;
             if self.json_ser_got(cx, h, JsonKey::Str(&k), value, &new_indent)? {
                 any = true;
             } else {
                 cx.out.truncate(mark);
             }
         }
-        Self::json_leave(cx);
+        self.json_leave(cx);
         if any && pretty {
             cx.out.push(b'\n');
             cx.out.extend_from_slice(indent.as_bytes());
@@ -1060,7 +1156,7 @@ impl Interp {
             }
             let value = match self.realm.plain_slot_under(h, &plan.shape, *slot) {
                 Some(v) => v,
-                None => self.get_own_fast(h, k)?,
+                None => self.json_get_cb(cx, h, k)?,
             };
             if self.json_ser_got(cx, h, JsonKey::Str(k), value, &new_indent)? {
                 any = true;
@@ -1068,7 +1164,7 @@ impl Interp {
                 cx.out.truncate(mark);
             }
         }
-        Self::json_leave(cx);
+        self.json_leave(cx);
         if any && pretty {
             cx.out.push(b'\n');
             cx.out.extend_from_slice(indent.as_bytes());
@@ -1140,7 +1236,7 @@ impl Interp {
                 cx.out.extend_from_slice(b"null");
             }
         }
-        Self::json_leave(cx);
+        self.json_leave(cx);
         if len > 0 && pretty {
             cx.out.push(b'\n');
             cx.out.extend_from_slice(indent.as_bytes());
@@ -1452,6 +1548,9 @@ pub(crate) enum JsonSrc {
 pub(crate) struct ReviveCx<'a> {
     pub(crate) text: &'a [u8],
     pub(crate) source_ic: crate::ic::PropertyCache,
+    /// The walk's root scope is active and the reviver is a VM function
+    /// (`Interp::cb_is_vm`): each call may collect, made at once.
+    pub(crate) reviver_vm: bool,
 }
 
 /// The state of one `JSON.stringify` run: the replacer, the gap, the cycle
@@ -1488,6 +1587,10 @@ struct JsonOut<'a> {
     proofs: [(u64, u64); 4],
     /// The plan [`Interp::json_fast_object`] used last.
     last_plan: Option<Rc<JsonShapeKeys>>,
+    /// Where the roots of `stack` start on the realm's host root stack, and
+    /// how many of its objects are rooted there (`Interp::json_root_stack`).
+    stack_base: usize,
+    stack_rooted: usize,
 }
 
 /// The holder `JSON.stringify` passes along when there is no replacer

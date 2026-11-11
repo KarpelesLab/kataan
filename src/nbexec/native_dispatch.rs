@@ -900,11 +900,16 @@ impl Interp {
                 let (value, src) = self.json_parse_with_source(&text)?;
                 let holder = self.realm.new_object();
                 self.realm.set_property(holder, "", value);
+                // The holder and the reviver are rooted for the walk, in which
+                // an allocating reviver may collect (see `host_roots`; the
+                // source records' strings are not rooted: `json_src_same`).
+                let sc = &mut self.root_scope(&[NanBox::handle(holder.to_raw()), reviver]);
                 let mut cx = json::ReviveCx {
                     text: &text,
                     source_ic: crate::ic::PropertyCache::new(),
+                    reviver_vm: sc.cb_is_vm(reviver),
                 };
-                return self.json_revive_ctx(holder, "", reviver, Some(&src), &mut cx);
+                return sc.json_revive_ctx(holder, "", reviver, Some(&src), &mut cx);
             }
             // `JSON.rawJSON(text)` — validates `ToString(text)` as a single JSON
             // primitive (number/string/boolean/null, no surrounding whitespace) and
@@ -1845,7 +1850,10 @@ impl Interp {
                     return Err(self.type_error("Reflect.apply target is not a function"));
                 }
                 let list = self.create_list_from_array_like(arg(2))?;
-                return self.call_with_this(arg(0), arg(1), &list);
+                // (A tail call: nothing is held after it, so a VM target may
+                // collect, see `host_roots`.)
+                let mut sc = self.root_scope(&[arg(0), arg(1), arg(2)]);
+                return sc.call_cb(arg(0), arg(1), &list);
             }
             N_REFLECT_CONSTRUCT => {
                 // `target` must be a constructor.
@@ -2382,26 +2390,37 @@ impl Interp {
                     } else {
                         None
                     };
+                    // Everything the loop holds across a step or a `mapFn` call
+                    // is rooted, so the generator body, `next` or `mapFn` it
+                    // runs may collect (see `host_roots`); the mapped values
+                    // are held there too.
+                    let target_v =
+                        target_h.map_or(NanBox::undefined(), |th| NanBox::handle(th.to_raw()));
+                    let mut sc = self.root_scope(&[arg(0), items_box, map_fn, this_arg, target_v]);
+                    // (The iterator record's slots, filled once it is opened.)
+                    let it_slot = sc.held_mark();
+                    sc.hold(NanBox::undefined());
+                    sc.hold(NanBox::undefined());
+                    let base = sc.held_mark();
                     // A plain array into a plain result: by index, with no
                     // iterator (see `iter_plain`), until a step needs the
                     // protocol path. Each element is re-read live (`mapFn` may
                     // change the array); a throwing `mapFn` closes the iterator
                     // the elided one would be by then.
-                    let mut out = Vec::new();
                     let mut k = 0usize;
                     let plain = if target_h.is_none() && using_iterator.is_some() {
-                        self.plain_iterable_array(arg(0))
+                        sc.plain_iterable_array(arg(0))
                     } else {
                         None
                     };
                     let resume = match plain {
                         Some(arr) => loop {
-                            match self.plain_array_step(arr, k) {
+                            match sc.plain_array_step(arr, k) {
                                 Some(None) => break None,
-                                None => break Some(self.plain_array_iterator_at(arr, k)?),
+                                None => break Some(sc.plain_array_iterator_at(arr, k)?),
                                 Some(Some(val)) => {
                                     let mapped = if has_map {
-                                        match self.call_with_this(
+                                        match sc.call_cb(
                                             map_fn,
                                             this_arg,
                                             &[val, NanBox::number(k as f64)],
@@ -2409,15 +2428,15 @@ impl Interp {
                                             Ok(m) => m,
                                             Err(e) => {
                                                 let (it, _) =
-                                                    self.plain_array_iterator_at(arr, k + 1)?;
-                                                let _ = self.iterator_close(it);
+                                                    sc.plain_array_iterator_at(arr, k + 1)?;
+                                                let _ = sc.iterator_close(it);
                                                 return Err(e);
                                             }
                                         }
                                     } else {
                                         val
                                     };
-                                    out.push(mapped);
+                                    sc.hold(mapped);
                                     k += 1;
                                 }
                             }
@@ -2425,7 +2444,8 @@ impl Interp {
                         None => None,
                     };
                     if plain.is_some() && resume.is_none() {
-                        return Ok(NanBox::handle(self.realm.new_array(out).to_raw()));
+                        let out = sc.take_held(base);
+                        return Ok(NanBox::handle(sc.realm.new_array(out).to_raw()));
                     }
                     // Iterate LAZILY, applying mapFn per element interleaved with
                     // IteratorStep, so an abrupt mapFn completion IteratorCloses the
@@ -2438,46 +2458,27 @@ impl Interp {
                             // called with the **original** `items` value as its `this`
                             // (a primitive stays a primitive for a strict method).
                             Some(f) => {
-                                let iterator = self.call_with_this(f, arg(0), &[])?;
+                                let iterator = sc.call_with_this(f, arg(0), &[])?;
                                 match iterator.as_handle().map(Handle::from_raw) {
                                     Some(ih) => ih,
                                     None => {
-                                        return Err(self.type_error(
+                                        return Err(sc.type_error(
                                             "[Symbol.iterator] did not return an object",
                                         ));
                                     }
                                 }
                             }
                             // A built-in iterable with no readable `@@iterator`.
-                            None => self.get_iter_object(items_box)?,
+                            None => sc.get_iter_object(items_box)?,
                         };
-                        (it, self.read_member(it, "next")?)
+                        sc.set_held(it_slot, NanBox::handle(it.to_raw()));
+                        (it, sc.read_member(it, "next")?)
                     };
-                    // Everything the loop holds across a step is rooted, so the
-                    // generator body or `next` it resumes may collect (see
-                    // `host_roots`); the mapped values are held there too.
-                    let target_v =
-                        target_h.map_or(NanBox::undefined(), |th| NanBox::handle(th.to_raw()));
-                    let mut sc = self.root_scope(&[
-                        arg(0),
-                        items_box,
-                        map_fn,
-                        this_arg,
-                        NanBox::handle(it.to_raw()),
-                        next,
-                        target_v,
-                    ]);
-                    let base = sc.held_mark();
-                    for v in out {
-                        sc.hold(v);
-                    }
+                    sc.set_held(it_slot, NanBox::handle(it.to_raw()));
+                    sc.set_held(it_slot + 1, next);
                     while let Some(val) = sc.step(it, next)? {
                         let mapped = if has_map {
-                            match sc.call_with_this(
-                                map_fn,
-                                this_arg,
-                                &[val, NanBox::number(k as f64)],
-                            ) {
+                            match sc.call_cb(map_fn, this_arg, &[val, NanBox::number(k as f64)]) {
                                 Ok(m) => m,
                                 Err(e) => {
                                     let _ = sc.iterator_close(it);
@@ -2512,19 +2513,25 @@ impl Interp {
                     // Array-like: `len = LengthOfArrayLike(items)`, then
                     // `A = IsConstructor(C) ? Construct(C, «len») : ArrayCreate(len)`,
                     // then `Get`/mapFn/`CreateDataPropertyOrThrow` each index.
-                    let mut out = Vec::new();
+                    // The source, `mapFn`, its `this`, the target and the values
+                    // gathered are rooted across each `mapFn` call, so it may
+                    // collect (see `host_roots`).
+                    let mut sc = self.root_scope(&[arg(0), items_box, map_fn, this_arg]);
+                    let target_slot = sc.held_mark();
+                    sc.hold(NanBox::undefined());
+                    let base = sc.held_mark();
                     let mut target_h = None;
                     let mut final_len = 0usize;
                     if let Some(h) = items_box.as_handle().map(Handle::from_raw) {
-                        let len_val = self.read_member(h, "length")?;
-                        let len_num = self.coerce_to_number(len_val)?;
-                        let len_raw = self.realm.to_number(len_num);
+                        let len_val = sc.read_member(h, "length")?;
+                        let len_num = sc.coerce_to_number(len_val)?;
+                        let len_raw = sc.realm.to_number(len_num);
                         // Cap the array-like length against `max_array_len` BEFORE
                         // allocating, so `from({length: 2**32-1})` throws a catchable
                         // RangeError instead of a multi-gigabyte allocation.
-                        if len_raw > self.realm.limits.max_array_len as f64 {
-                            let m = self.new_str("Invalid array length");
-                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        if len_raw > sc.realm.limits.max_array_len as f64 {
+                            let m = sc.new_str("Invalid array length");
+                            return Err(ExecError::Throw(sc.make_error(N_RANGE_ERROR, Some(m))));
                         }
                         let len = if len_raw.is_nan() || len_raw <= 0.0 {
                             0
@@ -2533,39 +2540,37 @@ impl Interp {
                         };
                         final_len = len;
                         if use_ctor {
-                            let target = self.construct(this_c, &[NanBox::number(len as f64)])?;
+                            let target = sc.construct(this_c, &[NanBox::number(len as f64)])?;
+                            sc.set_held(target_slot, target);
                             target_h = Some(match target.as_handle().map(Handle::from_raw) {
                                 Some(th) => th,
                                 None => {
-                                    return Err(self.type_error(
+                                    return Err(sc.type_error(
                                         "Array.from constructor did not return an object",
                                     ));
                                 }
                             });
                         }
                         for i in 0..len {
-                            let v = self.read_member(h, &alloc::format!("{i}"))?;
+                            let v = sc.read_member(h, &alloc::format!("{i}"))?;
                             let v = if has_map {
-                                self.call_with_this(
-                                    map_fn,
-                                    this_arg,
-                                    &[v, NanBox::number(i as f64)],
-                                )?
+                                sc.call_cb(map_fn, this_arg, &[v, NanBox::number(i as f64)])?
                             } else {
                                 v
                             };
                             match target_h {
-                                Some(th) => self.create_data_property_or_throw(th, i, v)?,
-                                None => out.push(v),
+                                Some(th) => sc.create_data_property_or_throw(th, i, v)?,
+                                None => sc.hold(v),
                             }
                         }
                     }
                     if let Some(th) = target_h {
                         // `Set(A, "length", len, true)` — throwing form (see above).
-                        self.set_length_or_throw(th, final_len)?;
+                        sc.set_length_or_throw(th, final_len)?;
                         NanBox::handle(th.to_raw())
                     } else {
-                        NanBox::handle(self.realm.new_array(out).to_raw())
+                        let out = sc.take_held(base);
+                        NanBox::handle(sc.realm.new_array(out).to_raw())
                     }
                 }
             }

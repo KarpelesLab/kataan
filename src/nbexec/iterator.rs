@@ -1,3 +1,4 @@
+use super::host_roots::RootScope;
 use super::*;
 use crate::realm::hidden_layout::HiddenLayout;
 
@@ -85,7 +86,8 @@ impl Interp {
         // user iterator's side effects and closing semantics are observed.
         let next = self.read_member(this_h, "next")?;
         // The receiver, its `next`, the callback and what the helper has
-        // gathered are rooted across each step (see `host_roots`).
+        // gathered are rooted across each step and callback call (see
+        // `host_roots`).
         let mut sc = self.root_scope(&[this_val, next, f]);
         sc.hold(args.get(1).copied().unwrap_or(NanBox::undefined()));
         match method {
@@ -100,7 +102,7 @@ impl Interp {
             "forEach" => {
                 let mut i = 0u64;
                 while let Some(v) = sc.step(this_h, next)? {
-                    let r = sc.call(f, &[v, NanBox::number(i as f64)]);
+                    let r = sc.call_cb(f, NanBox::undefined(), &[v, NanBox::number(i as f64)]);
                     if let Err(e) = r {
                         let _ = sc.iterator_close(this_h);
                         return Err(e);
@@ -111,8 +113,13 @@ impl Interp {
             }
             "some" | "every" | "find" => {
                 let mut i = 0u64;
+                // (`find` returns the value it passed: rooted across the call.)
+                let slot = sc.held_mark();
+                sc.hold(NanBox::undefined());
                 while let Some(v) = sc.step(this_h, next)? {
-                    let r = match sc.call(f, &[v, NanBox::number(i as f64)]) {
+                    sc.set_held(slot, v);
+                    let r = match sc.call_cb(f, NanBox::undefined(), &[v, NanBox::number(i as f64)])
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             let _ = sc.iterator_close(this_h);
@@ -166,7 +173,8 @@ impl Interp {
                     }
                 }
                 while let Some(v) = sc.step(this_h, next)? {
-                    acc = match sc.call(f, &[acc, v, NanBox::number(i as f64)]) {
+                    let args = [acc, v, NanBox::number(i as f64)];
+                    acc = match sc.call_cb(f, NanBox::undefined(), &args) {
                         Ok(a) => {
                             sc.set_held(slot, a);
                             a
@@ -707,18 +715,24 @@ impl Interp {
                 }
                 None => Ok(None),
             },
-            "filter" => loop {
-                match sc.step(src_h, next)? {
-                    Some(v) => {
-                        let c = sc.helper_counter_incr(h);
-                        let keep = sc.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
-                        if sc.realm.truthy(keep) {
-                            return Ok(Some(v));
+            "filter" => {
+                // (The value yielded once kept: rooted across the call.)
+                let slot = sc.held_mark();
+                sc.hold(NanBox::undefined());
+                loop {
+                    match sc.step(src_h, next)? {
+                        Some(v) => {
+                            sc.set_held(slot, v);
+                            let c = sc.helper_counter_incr(h);
+                            let keep = sc.call_helper_cb(src_h, f, &[v, NanBox::number(c)])?;
+                            if sc.realm.truthy(keep) {
+                                return Ok(Some(v));
+                            }
                         }
+                        None => return Ok(None),
                     }
-                    None => return Ok(None),
                 }
-            },
+            }
             // flatMap
             _ => {
                 loop {
@@ -796,7 +810,8 @@ impl Interp {
     }
 
     /// Invokes a helper callback; on an abrupt completion the underlying iterator
-    /// is closed (then the error re-propagates).
+    /// is closed (then the error re-propagates). Made from `iter_helper_step`'s
+    /// root scope (`call_cb`): an allocating callback may collect.
     fn call_helper_cb(
         &mut self,
         src_h: Handle,
@@ -804,7 +819,7 @@ impl Interp {
         args: &[NanBox],
     ) -> Result<NanBox, ExecError> {
         let f = f.unwrap_or(NanBox::undefined());
-        match self.call(f, args) {
+        match self.call_cb(f, NanBox::undefined(), args) {
             Ok(v) => Ok(v),
             Err(e) => {
                 let _ = self.iterator_close(src_h);
@@ -1381,6 +1396,11 @@ impl Interp {
                 return Err(self.type_error(&alloc::format!("{what}: padding is not an object")));
             }
         }
+        // The arguments, the padding option and every iterator, `next` method,
+        // key and padding value gathered below are rooted while the iterables
+        // and the padding are stepped (see `host_roots`): a generator body they
+        // resume may collect.
+        let mut sc = self.root_scope(&[iterables, options, padding_opt]);
         // 8-12. Open each underlying iterator (in order). The positional form
         // iterates `iterables` itself; the keyed form walks its own enumerable keys.
         let mut iters: Vec<NanBox> = Vec::new();
@@ -1388,9 +1408,9 @@ impl Interp {
         let mut keys: Vec<NanBox> = Vec::new();
         if keyed {
             let ih = iterables.as_handle().map(Handle::from_raw).unwrap();
-            self.zip_open_keyed(ih, &mut iters, &mut nexts, &mut keys)?;
+            sc.zip_open_keyed(ih, &mut iters, &mut nexts, &mut keys)?;
         } else {
-            self.zip_open_positional(iterables, &mut iters, &mut nexts)?;
+            Self::zip_open_positional(&mut sc, iterables, &mut iters, &mut nexts)?;
         }
         let iter_count = iters.len();
         // 14. padding (longest mode only).
@@ -1402,40 +1422,43 @@ impl Interp {
                 // Per-key Get(paddingOption, key).
                 let ph = padding_opt.as_handle().map(Handle::from_raw).unwrap();
                 for key in &keys {
-                    let name = self.member_key(*key);
-                    match self.read_member(ph, &name) {
-                        Ok(v) => padding.push(v),
-                        Err(e) => return Err(self.zip_close_throw(&iters, e)),
+                    let name = sc.member_key(*key);
+                    match sc.read_member(ph, &name) {
+                        Ok(v) => {
+                            sc.hold(v);
+                            padding.push(v);
+                        }
+                        Err(e) => return Err(sc.zip_close_throw(&iters, e)),
                     }
                 }
             } else {
-                self.zip_iterate_padding(padding_opt, &iters, &mut padding, iter_count)?;
+                Self::zip_iterate_padding(&mut sc, padding_opt, &iters, &mut padding, iter_count)?;
             }
         }
         while padding.len() < iter_count {
             padding.push(NanBox::undefined());
         }
         // Build the lazy result object (a `%IteratorHelperPrototype%` instance).
-        let proto = self.iter_helper_proto();
-        let h = self.realm.new_object_with_proto(proto);
-        let iters_arr = self.realm.new_array(iters);
-        let nexts_arr = self.realm.new_array(nexts);
-        let pad_arr = self.realm.new_array(padding);
+        let proto = sc.iter_helper_proto();
+        let h = sc.realm.new_object_with_proto(proto);
+        let iters_arr = sc.realm.new_array(iters);
+        let nexts_arr = sc.realm.new_array(nexts);
+        let pad_arr = sc.realm.new_array(padding);
         let fin: Vec<NanBox> = (0..iter_count).map(|_| NanBox::boolean(false)).collect();
-        let fin_arr = self.realm.new_array(fin);
-        self.realm
+        let fin_arr = sc.realm.new_array(fin);
+        sc.realm
             .set_hidden_property(h, ZIP_ITERS, NanBox::handle(iters_arr.to_raw()));
-        self.realm
+        sc.realm
             .set_hidden_property(h, ZIP_NEXTS, NanBox::handle(nexts_arr.to_raw()));
-        self.realm
+        sc.realm
             .set_hidden_property(h, ZIP_MODE, NanBox::number(f64::from(mode)));
-        self.realm
+        sc.realm
             .set_hidden_property(h, ZIP_PADDING, NanBox::handle(pad_arr.to_raw()));
-        self.realm
+        sc.realm
             .set_hidden_property(h, ZIP_FINISHED, NanBox::handle(fin_arr.to_raw()));
         if keyed {
-            let keys_arr = self.realm.new_array(keys);
-            self.realm
+            let keys_arr = sc.realm.new_array(keys);
+            sc.realm
                 .set_hidden_property(h, ZIP_KEYS, NanBox::handle(keys_arr.to_raw()));
         }
         Ok(NanBox::handle(h.to_raw()))
@@ -1446,30 +1469,38 @@ impl Interp {
     /// abrupt step the opened iterators are closed (reverse); on an abrupt flatten
     /// the opened iterators *and* the input iterator are closed (reverse of
     /// « inputIter » ++ iters).
+    ///
+    /// Runs in the caller's root scope `sc`, which holds the input iterator
+    /// and each iterator and `next` opened, so the input's steps may collect.
     fn zip_open_positional(
-        &mut self,
+        sc: &mut RootScope<'_>,
         iterables: NanBox,
         iters: &mut Vec<NanBox>,
         nexts: &mut Vec<NanBox>,
     ) -> Result<(), ExecError> {
-        let input_ih = self.get_iter_object(iterables)?;
-        let input_next = self.read_member(input_ih, "next")?;
+        let input_ih = sc.get_iter_object(iterables)?;
+        let input_next = sc.read_member(input_ih, "next")?;
+        sc.hold(NanBox::handle(input_ih.to_raw()));
+        sc.hold(input_next);
         loop {
-            match self.iter_step(input_ih, input_next) {
+            match sc.step(input_ih, input_next) {
                 Ok(None) => break,
-                Ok(Some(v)) => match self.zip_get_iterator_flattenable(v) {
+                Ok(Some(v)) => match sc.zip_get_iterator_flattenable(v) {
                     Ok((ih, next)) => {
-                        iters.push(NanBox::handle(ih.to_raw()));
+                        let ih = NanBox::handle(ih.to_raw());
+                        sc.hold(ih);
+                        sc.hold(next);
+                        iters.push(ih);
                         nexts.push(next);
                     }
                     Err(e) => {
                         // « inputIter » ++ iters, reverse: iters (reverse) then input.
-                        let err = self.zip_close_throw(iters, e);
-                        let _ = self.iterator_close(input_ih);
+                        let err = sc.zip_close_throw(iters, e);
+                        let _ = sc.iterator_close(input_ih);
                         return Err(err);
                     }
                 },
-                Err(e) => return Err(self.zip_close_throw(iters, e)),
+                Err(e) => return Err(sc.zip_close_throw(iters, e)),
             }
         }
         Ok(())
@@ -1513,8 +1544,13 @@ impl Interp {
             }
             match self.zip_get_iterator_flattenable(value) {
                 Ok((ih, next)) => {
+                    // (Rooted in the caller's scope, `iterator_zip`'s.)
+                    let ih = NanBox::handle(ih.to_raw());
+                    self.root_hold(key);
+                    self.root_hold(ih);
+                    self.root_hold(next);
                     keys.push(key);
-                    iters.push(NanBox::handle(ih.to_raw()));
+                    iters.push(ih);
                     nexts.push(next);
                 }
                 Err(e) => return Err(self.zip_close_throw(iters, e)),
@@ -1561,38 +1597,46 @@ impl Interp {
     /// times, filling any remaining slots (and every slot after it is exhausted) with
     /// undefined; if the padding iterator was not exhausted it is closed. An abrupt
     /// completion closes the opened sub-iterators (reverse) and propagates.
+    ///
+    /// Runs in the caller's root scope `sc` (which holds `iters`), holding
+    /// the padding iterator and values, so its steps may collect.
     fn zip_iterate_padding(
-        &mut self,
+        sc: &mut RootScope<'_>,
         padding_opt: NanBox,
         iters: &[NanBox],
         padding: &mut Vec<NanBox>,
         iter_count: usize,
     ) -> Result<(), ExecError> {
-        let pad_ih = match self.get_iter_object(padding_opt) {
+        let pad_ih = match sc.get_iter_object(padding_opt) {
             Ok(h) => h,
-            Err(e) => return Err(self.zip_close_throw(iters, e)),
+            Err(e) => return Err(sc.zip_close_throw(iters, e)),
         };
-        let pad_next = match self.read_member(pad_ih, "next") {
+        let pad_next = match sc.read_member(pad_ih, "next") {
             Ok(n) => n,
-            Err(e) => return Err(self.zip_close_throw(iters, e)),
+            Err(e) => return Err(sc.zip_close_throw(iters, e)),
         };
+        sc.hold(NanBox::handle(pad_ih.to_raw()));
+        sc.hold(pad_next);
         let mut using = true;
         for _ in 0..iter_count {
             if using {
-                match self.iter_step(pad_ih, pad_next) {
-                    Ok(Some(v)) => padding.push(v),
+                match sc.step(pad_ih, pad_next) {
+                    Ok(Some(v)) => {
+                        sc.hold(v);
+                        padding.push(v);
+                    }
                     Ok(None) => {
                         using = false;
                         padding.push(NanBox::undefined());
                     }
-                    Err(e) => return Err(self.zip_close_throw(iters, e)),
+                    Err(e) => return Err(sc.zip_close_throw(iters, e)),
                 }
             } else {
                 padding.push(NanBox::undefined());
             }
         }
-        if using && let Err(e) = self.iterator_close(pad_ih) {
-            return Err(self.zip_close_throw(iters, e));
+        if using && let Err(e) = sc.iterator_close(pad_ih) {
+            return Err(sc.zip_close_throw(iters, e));
         }
         Ok(())
     }
@@ -2338,13 +2382,17 @@ impl Interp {
         }
         let iter = self.fa(s, FA_ITER);
         let next_fn = self.fa(s, FA_NEXT);
-        let res = if self.realm.truthy(self.fa(s, FA_ASYNC)) {
-            self.call_with_this(next_fn, iter, &[])?
+        let ih = Handle::from_raw(iter.as_handle().expect("an iterator object"));
+        // The loop state (which holds everything else: the iterator, `next`,
+        // the result array and promise) is rooted across the step, so the
+        // generator body it resumes may collect (see `host_roots`).
+        let mut sc = self.root_scope(&[NanBox::handle(s.to_raw())]);
+        let res = if sc.realm.truthy(sc.fa(s, FA_ASYNC)) {
+            sc.next_result(ih, next_fn, &[])?
         } else {
-            let ih = Handle::from_raw(iter.as_handle().expect("an iterator object"));
-            NanBox::handle(self.async_from_sync_next_pub(ih, next_fn)?.to_raw())
+            NanBox::handle(sc.async_from_sync_next_pub(ih, next_fn)?.to_raw())
         };
-        self.fa_await(s, res, FA_STAGE_NEXT_RESULT);
+        sc.fa_await(s, res, FA_STAGE_NEXT_RESULT);
         Ok(())
     }
 
@@ -2372,15 +2420,18 @@ impl Interp {
         }
         let this_arg = self.fa(s, FA_THIS);
         let k = self.fa_num(s, FA_K);
+        // (The state is rooted across the call: an allocating mapfn may
+        // collect, see `host_roots`.)
+        let mut sc = self.root_scope(&[NanBox::handle(s.to_raw())]);
         // A throwing mapfn closes the iterator (`return()`) and rejects with the
         // original error; the close's own completion is discarded.
-        match self.call_with_this(map_fn, this_arg, &[value, NanBox::number(k)]) {
+        match sc.call_cb(map_fn, this_arg, &[value, NanBox::number(k)]) {
             Ok(m) => {
-                self.fa_await(s, m, FA_STAGE_MAPPED);
+                sc.fa_await(s, m, FA_STAGE_MAPPED);
                 Ok(())
             }
             Err(ExecError::Throw(e)) => {
-                self.fa_close_then_reject(s, e);
+                sc.fa_close_then_reject(s, e);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -2424,8 +2475,9 @@ impl Interp {
         }
         let this_arg = self.fa(s, FA_THIS);
         let k = self.fa_num(s, FA_K);
-        let m = self.call_with_this(map_fn, this_arg, &[value, NanBox::number(k)])?;
-        self.fa_await(s, m, FA_STAGE_LIKE_MAPPED);
+        let mut sc = self.root_scope(&[NanBox::handle(s.to_raw())]);
+        let m = sc.call_cb(map_fn, this_arg, &[value, NanBox::number(k)])?;
+        sc.fa_await(s, m, FA_STAGE_LIKE_MAPPED);
         Ok(())
     }
 
@@ -2567,8 +2619,10 @@ impl Interp {
         property_keys: bool,
     ) -> Result<Vec<(Result<String, NanBox>, NanBox)>, ExecError> {
         let mut pairs = Vec::new();
+        // (Called from a root scope holding `item`: `call_cb` lets an
+        // allocating callback collect, see `host_roots`.)
         let key_of = |this: &mut Self, item: NanBox, k: usize| {
-            let key = this.call(cb, &[item, NanBox::number(k as f64)])?;
+            let key = this.call_cb(cb, NanBox::undefined(), &[item, NanBox::number(k as f64)])?;
             if property_keys {
                 return this.coerce_property_key(key).map(Ok);
             }
@@ -2581,9 +2635,18 @@ impl Interp {
         };
         let Some(it) = self.for_of_get_iterator_ext(items, true)? else {
             // A built-in iterable without a stepping iterator here (a string, a
-            // generator): its values, then the callback over each.
-            for (k, item) in self.iterate_values(items)?.into_iter().enumerate() {
-                let key = key_of(self, item, k)?;
+            // generator): its values, then the callback over each, every value
+            // and (value) key rooted across the calls.
+            let vals = self.iterate_values(items)?;
+            let mut sc = self.root_scope(&[items, cb]);
+            for v in &vals {
+                sc.hold(*v);
+            }
+            for (k, item) in vals.into_iter().enumerate() {
+                let key = key_of(&mut sc, item, k)?;
+                if let Err(v) = key {
+                    sc.hold(v);
+                }
                 pairs.push((key, item));
             }
             return Ok(pairs);
@@ -2594,9 +2657,9 @@ impl Interp {
         let mut sc = self.root_scope(&[items, cb, NanBox::handle(it.to_raw()), next]);
         let mut k = 0usize;
         while let Some(item) = sc.step(it, next)? {
+            sc.hold(item);
             match key_of(&mut sc, item, k) {
                 Ok(key) => {
-                    sc.hold(item);
                     if let Err(v) = key {
                         sc.hold(v);
                     }

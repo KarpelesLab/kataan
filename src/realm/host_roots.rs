@@ -40,6 +40,15 @@
 //!   The nested context then collects as an outermost one would, adding the
 //!   linked contexts' frames to its roots.
 //!
+//! * The collecting event loop's own job runs under a scope of the loop's
+//!   ([`LOOP`]): its handler, when a VM function, is an armed re-entry, and
+//!   a host handler (a built-in's continuation) may open an active scope as
+//!   if relayed to. A nested entry armed at the loop level collects with no
+//!   link: nothing but the interpreter's own roots, its job queues and the
+//!   root stack is live below it.
+//! * A built-in's callback (`Interp::call_cb`) is armed the same way as a
+//!   step: a VM function is the re-entry; anything else is relayed to.
+//!
 //! The collector does not move objects, so a copy of a value is as good a
 //! root as the original, and nothing needs updating afterwards.
 
@@ -78,8 +87,9 @@ pub(crate) struct HostRoots {
     pub(crate) links: Vec<HostLink>,
     /// The serial number of the last host function call begun.
     pub(crate) serial: u32,
-    /// An active scope's step through a host `next`: `(crossing, serial)`
-    /// when it began, so the call it makes may open an active scope too.
+    /// An active scope's step through a host `next` (or call of a host
+    /// callback): `(scope, serial)` when it began, so the call it makes may
+    /// open an active scope too.
     pub(crate) relay: Option<(u32, u32)>,
     /// The crossing whose host segment runs inside an active root scope (0:
     /// none).
@@ -87,6 +97,16 @@ pub(crate) struct HostRoots {
     /// The crossing at which the next nested VM entry may collect (0: none).
     pub(crate) armed: u32,
 }
+
+/// The flag of a [`HostRoots::scope`] / [`HostRoots::armed`] value (over the
+/// crossing count it was opened at) of a scope at the level of the
+/// collecting event loop: what is below it is the loop's frames, which root
+/// what they hold (the loop's keep list and its queues, and the job being
+/// run under a scope of its own), and the outermost hosted run whose body
+/// has returned (its completion value is the loop's keep, its own job queue
+/// is empty), crossed by no relay: exactly the state a VM resumption job of
+/// the loop collects in (`Interp::job_gc`).
+pub(crate) const LOOP: u32 = 1 << 31;
 
 impl HostRoots {
     /// Whether a root scope opened now by the host call numbered `call` may
@@ -96,6 +116,14 @@ impl HostRoots {
     #[inline]
     pub(crate) fn activation(&self, call: u32) -> u32 {
         let c = self.crossings;
+        // The event loop's level: a call an active scope of that level (the
+        // loop's own, over the job it runs) relayed to.
+        if let Some((rc, rs)) = self.relay
+            && rc == c | LOOP
+            && call == rs.wrapping_add(1)
+        {
+            return c | LOOP;
+        }
         let Some(link) = self.links.last().filter(|l| c != 0 && l.crossing == c) else {
             return 0;
         };
@@ -115,12 +143,20 @@ impl HostRoots {
     /// active root scope; returns whether it did.
     #[inline]
     pub(crate) fn arm(&mut self) -> bool {
-        if self.scope != 0 && self.scope == self.crossings {
+        if self.live() {
             self.armed = self.scope;
             true
         } else {
             false
         }
+    }
+
+    /// Whether the running host segment holds an active root scope: one
+    /// opened at the current crossing, or at the event loop's level with no
+    /// crossing made since.
+    #[inline]
+    pub(crate) fn live(&self) -> bool {
+        self.scope != 0 && self.scope & !LOOP == self.crossings
     }
 
     /// Takes the arm for a nested VM entry made now: whether the entry may
@@ -129,6 +165,9 @@ impl HostRoots {
     #[inline]
     pub(crate) fn take_arm(&mut self) -> bool {
         let armed = core::mem::take(&mut self.armed);
+        if armed & LOOP != 0 {
+            return armed & !LOOP == self.crossings;
+        }
         armed != 0
             && armed == self.crossings
             && self.links.last().is_some_and(|l| l.crossing == armed)

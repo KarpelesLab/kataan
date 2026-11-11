@@ -428,22 +428,14 @@ impl Interp {
     /// the error surfaces one turn later (observable, and what `for await` over a
     /// poisoned sync iterator relies on).
     fn async_from_sync_next(&mut self, iter: Handle, next: NanBox) -> Result<Handle, ExecError> {
-        let iter_val = NanBox::handle(iter.to_raw());
-        let result = self.call_with_this(next, iter_val, &[]);
-        match self.async_from_sync_continuation(iter, result) {
-            Ok(p) => Ok(p),
-            Err(ExecError::Throw(e)) => {
-                let p = self.fresh_promise();
-                self.settle(p, e, false);
-                Ok(p)
-            }
-            // A non-throw fatal (stack overflow, resource limit) is not a JS
-            // completion and must keep unwinding.
-            Err(other) => Err(other),
-        }
+        self.async_from_sync_next_args(iter, next, &[])
     }
 
     /// [`Self::async_from_sync_next`] passing `args` to the sync `next`.
+    ///
+    /// The sync step runs under a root scope over the iterator, `next` and
+    /// `args`: a VM generator's body (or VM `next`) it resumes may collect
+    /// (see `host_roots`).
     pub(crate) fn async_from_sync_next_args(
         &mut self,
         iter: Handle,
@@ -451,14 +443,19 @@ impl Interp {
         args: &[NanBox],
     ) -> Result<Handle, ExecError> {
         let iter_val = NanBox::handle(iter.to_raw());
-        let result = self.call_with_this(next, iter_val, args);
-        match self.async_from_sync_continuation(iter, result) {
+        debug_assert!(args.len() <= 1);
+        let sent = args.first().copied().unwrap_or_else(NanBox::undefined);
+        let mut sc = self.root_scope(&[iter_val, next, sent]);
+        let result = sc.next_result(iter, next, args);
+        match sc.async_from_sync_continuation(iter, result) {
             Ok(p) => Ok(p),
             Err(ExecError::Throw(e)) => {
-                let p = self.fresh_promise();
-                self.settle(p, e, false);
+                let p = sc.fresh_promise();
+                sc.settle(p, e, false);
                 Ok(p)
             }
+            // A non-throw fatal (stack overflow, resource limit) is not a JS
+            // completion and must keep unwinding.
             Err(other) => Err(other),
         }
     }
