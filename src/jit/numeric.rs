@@ -7816,14 +7816,31 @@ fn plan_carried_globals(
             Op::LoadGlobal { name: n, .. } | Op::StoreGlobal { name: n, .. } => n == name,
             _ => false,
         };
-        let stores = bytecode[head..=end]
-            .iter()
-            .filter(|o| matches!(o, Op::StoreGlobal { .. }) && named(o))
-            .count();
+        // The last store carries the binding. Earlier ones are allowed when
+        // every path through the first goes on, straight, to this one (no
+        // join between them), and every read of the binding comes before
+        // the first (so before this store's source is written, below): an
+        // iteration that stores at all ends with this store's value, and a
+        // read finds the iteration's starting value. (`gforward` turns the
+        // reads after a store of the same straight run into copies.)
+        let stores: Vec<usize> = (head..=end)
+            .filter(|&q| matches!(bytecode[q], Op::StoreGlobal { .. }) && named(&bytecode[q]))
+            .collect();
+        if stores.last() != Some(&pc) {
+            continue;
+        }
+        let first = stores[0];
         let read = (head..=end)
             .find(|&q| matches!(bytecode[q], Op::LoadGlobal { .. }) && named(&bytecode[q]));
         let Some(read) = read else { continue };
-        if stores != 1 || !in_info(*src) || carried_r(*src) {
+        if !in_info(*src) || carried_r(*src) {
+            continue;
+        }
+        if stores.len() > 1
+            && ((first + 1..=pc).any(is_target)
+                || (first..=end)
+                    .any(|q| matches!(bytecode[q], Op::LoadGlobal { .. }) && named(&bytecode[q])))
+        {
             continue;
         }
         // Its one write.

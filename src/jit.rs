@@ -44,6 +44,8 @@ mod fused;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod gelim;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod gforward;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_mirror;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_persist;
@@ -4452,6 +4454,23 @@ impl JitProto {
             }
         } else {
             proto
+        };
+        // A read of a script `let` that an op of the same straight run just
+        // wrote or read is a copy of that op's register (`gforward`).
+        let globals_forwarded;
+        let forwarded = if proto.is_async || proto.is_generator {
+            None
+        } else {
+            gforward::plan(&proto.ops, proto.n_regs)
+        };
+        let proto = match forwarded {
+            Some(ops) => {
+                let mut p = proto.clone();
+                p.ops = ops;
+                globals_forwarded = p;
+                &globals_forwarded
+            }
+            None => proto,
         };
         let warm = &warm[..];
         // Scalar replacement (`sink`): the emitter compiles the rewritten
