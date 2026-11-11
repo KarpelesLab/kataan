@@ -1368,6 +1368,57 @@ impl MathProof {
     }
 }
 
+std::thread_local! {
+    /// Per body pc of the compilation under way: whether it is the header
+    /// of a loop of the function's own that encloses an inlined callee's
+    /// loop ([`set_leave_heads`]).
+    static LEAVE_HEADS: core::cell::RefCell<Vec<bool>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes, for the body being compiled (`bytecode`, its pcs' own pcs
+/// `pc_orig`, `u32::MAX` inside an inlined body; empty when it inlined
+/// nothing), the headers of its own loops that enclose an inlined callee's
+/// loop ([`leave_head`]).
+pub(super) fn set_leave_heads(bytecode: &[Op], pc_orig: &[u32]) -> bool {
+    let n = bytecode.len();
+    let own = |pc: usize| pc_orig.get(pc).is_some_and(|&o| o != u32::MAX);
+    let mut heads = vec![false; n];
+    if !pc_orig.is_empty() {
+        let loops: Vec<(usize, usize)> = bytecode
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| match *op {
+                Op::Jump { target } if target <= pc => Some((target, pc)),
+                _ => None,
+            })
+            .collect();
+        for &(h, e) in &loops {
+            if own(h) && loops.iter().any(|&(h2, e2)| h < h2 && e2 <= e && !own(h2)) {
+                heads[h] = true;
+            }
+        }
+    }
+    let any = heads.contains(&true);
+    LEAVE_HEADS.with(|l| *l.borrow_mut() = heads);
+    any
+}
+
+/// Whether body pc `header` heads a loop of the function's own that
+/// encloses an inlined callee's loop ([`set_leave_heads`]): an activation
+/// whose recompilation such an inner loop asked for can leave at its
+/// back-edge (`call_seq::emit_leave_check`).
+pub(super) fn leave_head(header: usize) -> bool {
+    LEAVE_HEADS.with(|l| l.borrow().get(header).copied().unwrap_or(false))
+}
+
+/// Whether an integer version computes a promoted double result in its
+/// own SSE register (`KATAAN_JIT_IFLOAT=0` turns it off; read once).
+fn int_inplace_float() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IFLOAT").is_none_or(|v| v != "0"))
+}
+
 /// [`NumGen::schedule`]'s passes: the body itself, a speculative region's
 /// plain copy, its integer version.
 pub(super) const PASS_MAIN: u8 = 0;
@@ -1920,6 +1971,9 @@ impl NumGen {
             for r in &mut regions {
                 if r.spec.is_some() {
                     for (v, src) in plan_views(r, ops, bytecode, env.n_regs, false) {
+                        if feedback_rules_out(r, bytecode, v, true) {
+                            continue;
+                        }
                         r.views.push((v, (first + n_view_slots) as u32, src));
                         // (A register the region may write: and the value
                         // the facts are about, `ViewSlots::held`.)
@@ -1940,6 +1994,9 @@ impl NumGen {
                     _ => None,
                 };
                 for (v, src) in plan_views(r, ops, bytecode, env.n_regs, true) {
+                    if feedback_rules_out(r, bytecode, v, false) {
+                        continue;
+                    }
                     // Registers that all read one global binding share
                     // its array's slots (one entry check).
                     let shared = binding(src).and_then(|n| {
@@ -2732,8 +2789,39 @@ impl NumGen {
             len: self.gslot_disp(k + 1),
             base: self.gslot_disp(k + 2),
             held: (src != ViewSrc::Fixed).then(|| self.gslot_disp(k + 3)),
-            hint: super::typed::kind_hint(r),
+            hint: self.view_hint(ri, r),
         })
+    }
+
+    /// The kind region `ri`'s accesses of hoisted view register `r` test
+    /// first: the one `r` held when the body was compiled
+    /// (`typed::kind_hint`), else the one the region's element access
+    /// sites of `r` all saw (`typed::site_kind`), else none.
+    fn view_hint(&self, ri: usize, r: u16) -> u8 {
+        use super::typed::{NO_VIEW, kind_hint, site_kind};
+        let h = kind_hint(r);
+        if h != NO_VIEW {
+            return h;
+        }
+        let (head, end) = (self.regions[ri].head, self.regions[ri].end);
+        let mut seen = NO_VIEW;
+        for pc in head..=end {
+            let obj = match self.bc(pc) {
+                Some(
+                    Op::GetKey { obj, .. } | Op::SetKey { obj, .. } | Op::SetKeyStrict { obj, .. },
+                ) => *obj,
+                _ => continue,
+            };
+            if obj != r {
+                continue;
+            }
+            match crate::ic::elem_fb::typed_kind(site_kind(pc)) {
+                Some(k) if seen == NO_VIEW || seen == k => seen = k,
+                Some(_) => return NO_VIEW,
+                None => {}
+            }
+        }
+        seen
     }
 
     /// The frame slots the prologue must empty: the epoch slots of the
@@ -4350,8 +4438,11 @@ impl NumGen {
                         a.new_label()
                     };
                     let direct = self.regions[ri].int.is_none() && self.imode.is_none();
+                    let poll = a.new_label();
+                    super::call_seq::emit_leave_check(a, &self.env.layout, target, poll);
                     a.dec_frame8(COUNTDOWN);
                     a.jne(skip);
+                    a.bind(poll);
                     let validate = self.regions[ri].spec.is_some();
                     // (Every poll decays the leave count, the quiet ones
                     // too: an activation's first back-edge polls, so a
@@ -5402,8 +5493,11 @@ impl NumGen {
                 }
             }
             // A promoted result in a region: computed in its own register
-            // (`x` copied in first, or `y` when `+` / `*` can commute).
-            Some(xd) if self.imode.is_none() => {
+            // (`x` copied in first, or `y` when `+` / `*` can commute). (In
+            // an integer version too: its operands were checked first, and
+            // its slots are never handed on, so no other value lives in
+            // the result's register.)
+            Some(xd) if self.imode.is_none() || int_inplace_float() => {
                 let (xx, xy) = (self.xmm_of(reg, x), self.xmm_of(reg, y));
                 if xy == Some(xd) && xx != Some(xd) {
                     if opc == 0x58 || opc == 0x59 {
@@ -5420,8 +5514,14 @@ impl NumGen {
                         Some(s) => a.movapd_xx(xd, s),
                         None => Self::xmm_from_slot(a, xd, x, RAX),
                     }
-                    let ys = self.xmm_src(a, reg, y, 1);
-                    a.sse_rr(0xf2, opc, xd, ys);
+                    match (xy, self.const_num_bits_at(pc, y)) {
+                        // `x <op> k`: the constant as the memory operand.
+                        (None, Some(k)) if y != x => a.sse_rip_const(0xf2, opc, xd, k),
+                        _ => {
+                            let ys = self.xmm_src(a, reg, y, 1);
+                            a.sse_rr(0xf2, opc, xd, ys);
+                        }
+                    }
                 }
                 // (A NaN of Numbers is the canonical NaN.)
             }
@@ -10112,6 +10212,44 @@ enum ViewSrc {
     Alias(u16),
 }
 
+/// Whether the element access feedback (`ic::elem_fb`) of region `r`'s
+/// element reads and writes on register `v` says it never held a
+/// typed-array view (`typed`), or never a plain array (`!typed`): each of
+/// those sites saw something, and none that kind of receiver. Its hoisted
+/// view (or array) would then only cost its entry check and a compare per
+/// access. A hint only.
+fn feedback_rules_out(r: &Region, bytecode: &[Op], v: u16, typed: bool) -> bool {
+    use crate::ic::elem_fb;
+    let mut any = false;
+    for (pc, op) in bytecode.iter().enumerate().take(r.end + 1).skip(r.head) {
+        let obj = match op {
+            Op::GetKey { obj, .. } | Op::SetKey { obj, .. } | Op::SetKeyStrict { obj, .. } => *obj,
+            _ => continue,
+        };
+        if obj != v {
+            continue;
+        }
+        let f = super::typed::site_kind(pc);
+        let ruled_out = if typed {
+            matches!(
+                f,
+                elem_fb::ARR_INT
+                    | elem_fb::ARR_NUM
+                    | elem_fb::ARR_FRAC
+                    | elem_fb::ARR_ANY
+                    | elem_fb::OTHER
+            )
+        } else {
+            elem_fb::typed_kind(f).is_some() || f == elem_fb::OTHER
+        };
+        if !ruled_out {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 /// The receivers speculative region `r`'s fast version keeps a **hoisted
 /// view** of (`super::typed::ViewSlots`): the registers its element reads,
 /// element writes and `.length` reads are on, found from the ops that name
@@ -11094,6 +11232,7 @@ mod tests {
                 warm: Vec::new(),
                 nested: Vec::new(),
                 demote: Vec::new(),
+                kinds: Vec::new(),
             }]
         })
         .expect("inlined");
@@ -11150,6 +11289,7 @@ mod tests {
                 warm: Vec::new(),
                 nested: Vec::new(),
                 demote: Vec::new(),
+                kinds: Vec::new(),
             }]
         })
         .expect("inlined");

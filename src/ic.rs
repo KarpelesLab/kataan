@@ -46,6 +46,10 @@ pub struct PropertyCache {
     /// Whether `shape` was last armed by an add (see
     /// [`arm_transition`](Self::arm_transition)) rather than a lookup.
     by_add: bool,
+    /// For an element access site (`obj[key]`, `obj[key] = v`): what the
+    /// interpreter saw it access ([`elem_fb`]), the feedback the
+    /// machine-code tier orders its element kind tests by.
+    elem_kind: u8,
     /// For a call site: which VM closure it calls ([`CalleeHint`]), the
     /// feedback the machine-code tier inlines a callee from.
     callee: CalleeHint,
@@ -124,6 +128,72 @@ impl CalleeHint {
             Self::Poly(f) => f.iter().copied().filter(|&x| x != Self::NO_FN).collect(),
             _ => alloc::vec::Vec::new(),
         }
+    }
+}
+
+/// Element access feedback (`PropertyCache::elem_kind`): what an
+/// `obj[key]` site's receiver (and, for a plain array, its element) was
+/// each time the interpreter ran it, merged into one byte. A hint only:
+/// the compiled code tests every case anyway, the feedback only orders the
+/// tests (and keeps an integer version from speculating that a site whose
+/// elements were never int32s reads int32s).
+pub mod elem_fb {
+    /// Nothing seen yet.
+    pub const NONE: u8 = 0;
+    /// A typed-array view of kind `k` (`TYPED_ARRAY_KINDS` index `k`, one
+    /// the compiled code serves) is `TYPED + k`.
+    pub const TYPED: u8 = 1;
+    /// The last typed kind (Float64).
+    pub const TYPED_LAST: u8 = TYPED + 8;
+    /// A plain array, the element an int32 Number.
+    pub const ARR_INT: u8 = 10;
+    /// A plain array, the element another integral Number below 2^53 in
+    /// magnitude (a uint32 hash word, say: its `ToInt32` bits are exact).
+    pub const ARR_NUM: u8 = 11;
+    /// A plain array, the element another Number (a fraction, `-0`, NaN,
+    /// an infinity, a huge one).
+    pub const ARR_FRAC: u8 = 12;
+    /// A plain array, the element anything else (a hole, out of bounds, an
+    /// object, a string).
+    pub const ARR_ANY: u8 = 13;
+    /// Anything else (an object, a string, another typed array kind).
+    pub const OTHER: u8 = 14;
+    /// More than one of the above (other than plain arrays' element types,
+    /// which widen).
+    pub const MIXED: u8 = 15;
+
+    /// The feedback of a site that saw `a`, then `b`.
+    #[must_use]
+    pub const fn merge(a: u8, b: u8) -> u8 {
+        if a == b || b == NONE {
+            a
+        } else if a == NONE {
+            b
+        } else if a >= ARR_INT && a <= ARR_ANY && b >= ARR_INT && b <= ARR_ANY {
+            if a > b { a } else { b }
+        } else {
+            MIXED
+        }
+    }
+
+    /// The typed-array kind a site's feedback `f` names, if it names one.
+    #[must_use]
+    pub const fn typed_kind(f: u8) -> Option<u8> {
+        if f >= TYPED && f <= TYPED_LAST {
+            Some(f - TYPED)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a site with feedback `f` was never seen to give an element
+    /// an integer version could hold (an int32, or the `ToInt32` bits of an
+    /// integral one that only bitwise ops read): a float view's, a plain
+    /// array's fraction or non-Number, or anything else's. (No feedback, or
+    /// mixed, says nothing.)
+    #[must_use]
+    pub const fn never_int(f: u8) -> bool {
+        matches!(f, ARR_FRAC | ARR_ANY | OTHER) || f == TYPED + 7 || f == TYPED + 8
     }
 }
 
@@ -281,6 +351,20 @@ impl PropertyCache {
         self.callee
     }
 
+    /// The element access site's feedback ([`elem_fb`]).
+    #[must_use]
+    pub fn elem_kind(&self) -> u8 {
+        self.elem_kind
+    }
+
+    /// Notes that the element access site accessed `kind` ([`elem_fb`]).
+    #[inline]
+    pub fn note_elem(&mut self, kind: u8) {
+        if self.elem_kind != kind {
+            self.elem_kind = elem_fb::merge(self.elem_kind, kind);
+        }
+    }
+
     /// Arms the cache with `warm`'s memo (counters start afresh).
     pub fn seed(&mut self, warm: &WarmEntry) {
         self.shape = Some(Rc::clone(&warm.shape));
@@ -352,6 +436,27 @@ pub(crate) fn jit_cache_layout() -> CacheLayout {
 mod tests {
     use super::*;
     use crate::object::Object;
+
+    #[test]
+    fn element_feedback_merges() {
+        use elem_fb::*;
+        let mut ic = PropertyCache::new();
+        assert_eq!(ic.elem_kind(), NONE);
+        ic.note_elem(TYPED + 8);
+        ic.note_elem(TYPED + 8);
+        assert_eq!(elem_fb::typed_kind(ic.elem_kind()), Some(8));
+        assert!(never_int(ic.elem_kind()));
+        ic.note_elem(TYPED + 5);
+        assert_eq!(ic.elem_kind(), MIXED);
+        assert!(!never_int(MIXED));
+        // A plain array's element types widen.
+        assert_eq!(merge(ARR_INT, ARR_NUM), ARR_NUM);
+        assert_eq!(merge(ARR_ANY, ARR_INT), ARR_ANY);
+        assert_eq!(merge(ARR_INT, TYPED + 1), MIXED);
+        assert_eq!(merge(ARR_NUM, ARR_FRAC), ARR_FRAC);
+        assert!(!never_int(ARR_INT) && !never_int(ARR_NUM) && !never_int(TYPED + 1));
+        assert!(never_int(ARR_FRAC) && never_int(ARR_ANY) && never_int(TYPED + 8));
+    }
 
     #[test]
     fn first_lookup_misses_then_repeats_hit() {

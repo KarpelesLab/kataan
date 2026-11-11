@@ -24,6 +24,14 @@ use super::{CC_E, CC_NE, IK, R11};
 use crate::jit::X64Assembler;
 use crate::jit::typed::{self, Src};
 
+/// Whether a hoisted array's walked read makes the row it walked the
+/// hoisted one (`NumGen::iwalk_arr_get`; `KATAAN_JIT_ROWMEMO=0` turns it
+/// off, read once).
+fn row_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ROWMEMO").is_none_or(|v| v != "0"))
+}
+
 impl NumGen {
     /// The int GPRs the walk clobbers that hold an int register live at the
     /// current pc other than `dst` (whose value the op replaces).
@@ -95,7 +103,14 @@ impl NumGen {
         let tl = typed::typed_layout();
         a.t_view(&l, tl, miss);
         a.raw(&[0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
-        a.t_get_i32(tl, Src::View, wrap, miss, got, typed::kind_hint(obj));
+        a.t_get_i32(
+            tl,
+            Src::View,
+            wrap,
+            miss,
+            got,
+            typed::kind_hint_at(self.cur_pc, obj),
+        );
         a.bind(got);
         a.raw(&[0x48, 0x83, 0xc4, 0x08]); // add rsp, 8 (the index)
         for &g in saves.iter().rev() {
@@ -193,7 +208,7 @@ impl NumGen {
             a.bind(walk);
             // (A wrapped read's bits: the generic code's.)
             if !wrap {
-                self.iwalk_arr_get(a, dst, obj, index, true, done)?;
+                self.iwalk_arr_get(a, dst, obj, index, true, done, s)?;
             }
         }
         a.bind(slow);
@@ -210,6 +225,13 @@ impl NumGen {
     /// double-version location, the element any value but a hole), then to
     /// `done`. Anything else falls through, into the op's generic code,
     /// which runs it from the start.
+    ///
+    /// The array walked becomes the register's hoisted one (`s`): what the
+    /// walk found about it holds to the back-edge as the entry check's
+    /// would (the fast version changes no array's element count or place),
+    /// so the next reads of that row take the inline path. (Its stores of
+    /// handles still go the generic way: `wb` says the barrier is needed.)
+    #[allow(clippy::too_many_arguments)]
     fn iwalk_arr_get(
         &mut self,
         a: &mut X64Assembler,
@@ -218,6 +240,7 @@ impl NumGen {
         index: u16,
         int: bool,
         done: crate::jit::Label,
+        s: crate::jit::numeric::ArraySlots,
     ) -> Option<()> {
         let saves = self.walk_saves(dst);
         self.index_rax(a, index)?;
@@ -234,8 +257,24 @@ impl NumGen {
         a.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
         a.jne(miss);
         a.p_array_plain(&l, self.env.realm, false, miss);
-        a.raw(&[0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
-        a.p_arr_len_ptr(&l);
+        if row_memo_enabled() {
+            // (The hoisted array's slots, as `p_hoist_array` fills them.)
+            let rbp = crate::jit::call_seq::r::RBP;
+            a.p_arr_len_ptr(&l); // r8 = the count, r11 = the first element
+            a.g_store(rbp, s.len, 8);
+            a.g_store(rbp, s.base, R11);
+            a.cvtsi2sd_x_gpr(0, 8);
+            a.movq_gpr_x(RCX, 0);
+            a.g_store(rbp, s.lend, RCX);
+            a.raw(&[0x31, 0xc9]); // xor ecx, ecx
+            a.g_store(rbp, s.wb, RCX);
+            self.iload_operand(a, obj);
+            a.g_store(rbp, s.held, RAX);
+            a.raw(&[0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+        } else {
+            a.raw(&[0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+            a.p_arr_len_ptr(&l);
+        }
         a.cmp_rax_r8();
         a.jae(miss); // past the count, or negative
         a.mov_rax_at_r11_rax8();
@@ -306,7 +345,7 @@ impl NumGen {
         a.jmp(done);
         if !known {
             a.bind(walk);
-            self.iwalk_arr_get(a, dst, obj, index, false, done)?;
+            self.iwalk_arr_get(a, dst, obj, index, false, done, s)?;
         }
         a.bind(slow);
         self.int_skip = Some(done);

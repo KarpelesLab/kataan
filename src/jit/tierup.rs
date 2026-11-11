@@ -113,6 +113,16 @@ pub(super) struct TierUp {
     /// body was compiled to keep as doubles (inherited by its
     /// recompilations).
     pub(super) int_demote: Vec<(usize, u16)>,
+    /// The function's own element access sites' feedback this body was
+    /// compiled with (`(own pc, feedback)`, `ic::elem_fb`; inherited by
+    /// its recompilations, which may run while the interpreter's caches are
+    /// out of the function's tier).
+    pub(super) elem_kinds: Vec<(usize, u8)>,
+    /// Whether a loop of the function's own encloses an inlined callee's
+    /// loop (`numeric::leave_head`): an activation of this body can then
+    /// be asked to leave at the next such loop's back-edge
+    /// ([`JitProto::leaves_soon`]).
+    pub(super) leave_heads: bool,
     /// Polls left until the next real check ([`CHECK_EVERY`]).
     pub(super) countdown: core::cell::Cell<u8>,
     /// Whether [`JitProto::wants_recompile_on_entry`] has said yes (it
@@ -246,6 +256,8 @@ impl TierUp {
             spec_off: Vec::new(),
             int_regions: Vec::new(),
             int_demote: Vec::new(),
+            elem_kinds: Vec::new(),
+            leave_heads: false,
             guard_calls: ops
                 .iter()
                 .enumerate()
@@ -300,6 +312,16 @@ impl JitProto {
                 Some((pc, s.call_pcs[i].1))
             })
             .collect();
+    }
+
+    /// The function's own element access sites' feedback this body was
+    /// compiled with (`(own pc, feedback)`, `ic::elem_fb`): what its
+    /// recompilation starts from.
+    #[must_use]
+    pub fn elem_kinds(&self) -> Vec<(usize, u8)> {
+        self.sites
+            .as_ref()
+            .map_or_else(Vec::new, |s| s.tier_up.elem_kinds.clone())
     }
 
     /// The function's own header pcs of the loops a recompilation of this
@@ -391,6 +413,15 @@ impl JitProto {
         let mut v = self.int_demote();
         v.retain(|&(pc, _)| pc & INLINED_SITE == 0);
         v
+    }
+
+    /// Whether an activation of this body that wants to be recompiled for
+    /// a demotion ([`Self::wants_demote`]) can be asked to leave at the
+    /// next back-edge of a loop of its own that encloses an inlined
+    /// callee's loop (`numeric::leave_head`): it has such a loop.
+    #[must_use]
+    pub fn leaves_soon(&self) -> bool {
+        self.sites.as_ref().is_some_and(|s| s.tier_up.leave_heads) && self.wants_demote()
     }
 
     /// Whether one of this body's integer versions found a value no int32

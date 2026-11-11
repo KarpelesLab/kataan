@@ -122,6 +122,10 @@ pub struct Candidate<'a> {
     /// loops found no int32, which the spliced copies of those loops keep
     /// as doubles from the start ([`Expanded::demote`]).
     pub demote: Vec<(usize, Reg)>,
+    /// The callee's element access sites' feedback (`(own pc, feedback)`,
+    /// `crate::ic::elem_fb`), which the spliced copies of those sites are
+    /// compiled with ([`Expanded::kinds`]).
+    pub kinds: Vec<(usize, u8)>,
 }
 
 /// A site's callee as spliced: its function, or (when it inlines calls of
@@ -139,6 +143,8 @@ struct Site<'a> {
     legacy: Vec<u64>,
     /// Its demotion sites ([`Candidate::demote`]), by this body's pc.
     demote: Vec<(usize, Reg)>,
+    /// Its element access feedback ([`Candidate::kinds`]), by this body's pc.
+    kinds: Vec<(usize, u8)>,
 }
 
 /// A way a site could inline ([`expand`]), before the caller's budget
@@ -188,6 +194,7 @@ fn super_nested<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
                     warm: m.warm.clone(),
                     nested: Vec::new(),
                     demote: m.demote.clone(),
+                    kinds: m.kinds.clone(),
                 },
             )
         })
@@ -211,6 +218,7 @@ fn third_level<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
                     warm: m.warm.clone(),
                     nested: Vec::new(),
                     demote: m.demote.clone(),
+                    kinds: m.kinds.clone(),
                 },
             )
         })
@@ -225,6 +233,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
         warm,
         nested,
         demote,
+        kinds,
     } = c;
     let inner = (!nested.is_empty())
         .then(|| {
@@ -242,6 +251,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                             third_level(n)
                         },
                         demote: n.demote.clone(),
+                        kinds: n.kinds.clone(),
                     })
                     .collect()
             })
@@ -265,6 +275,11 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                 .filter_map(|&(pc, r)| Some((*e.new_of.get(pc)? as usize, r)))
                 .collect();
             sites.extend(e.demote);
+            let mut ks: Vec<(usize, u8)> = kinds
+                .iter()
+                .filter_map(|&(pc, k)| Some((*e.new_of.get(pc)? as usize, k)))
+                .collect();
+            ks.extend(e.kinds);
             Site {
                 key,
                 proto: alloc::borrow::Cow::Owned(p),
@@ -272,6 +287,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                 derived,
                 legacy,
                 demote: sites,
+                kinds: ks,
             }
         }
         None => Site {
@@ -281,6 +297,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             derived: own.into_iter().collect(),
             legacy: own_legacy.into_iter().collect(),
             demote,
+            kinds,
         },
     }
 }
@@ -310,6 +327,9 @@ pub struct Expanded {
     /// The inlined callees' demotion sites ([`Candidate::demote`]) as
     /// spliced: `(new pc, register)`.
     pub demote: Vec<(usize, Reg)>,
+    /// The inlined callees' element access feedback ([`Candidate::kinds`])
+    /// as spliced: `(new pc, feedback)`.
+    pub kinds: Vec<(usize, u8)>,
 }
 
 /// Whether `proto` can be inlined: small, a plain call target, and every op
@@ -1090,6 +1110,7 @@ pub fn expand<'a>(
     let mut orig_of: Vec<u32> = Vec::with_capacity(proto.ops.len() + added + 1);
     let mut new_of: Vec<u32> = Vec::with_capacity(proto.ops.len() + 1);
     let mut demote: Vec<(usize, Reg)> = Vec::new();
+    let mut kinds: Vec<(usize, u8)> = Vec::new();
     // First pass: each own pc's new pc (an inlined site's own pc is its
     // guard's, so a branch to the call enters the guard).
     let mut next = 0usize;
@@ -1318,6 +1339,12 @@ pub fn expand<'a>(
                         demote.push((tgt(q), view(r)));
                     }
                 }
+                // (And its element access feedback.)
+                for &(q, k) in &c.kinds {
+                    if q < p.ops.len() && width(p, q, construct) > 0 {
+                        kinds.push((tgt(q), k));
+                    }
+                }
                 for (j, bop) in p.ops.iter().enumerate() {
                     let bw = c.warm.get(j).cloned().flatten();
                     match width(p, j, construct) {
@@ -1453,6 +1480,7 @@ pub fn expand<'a>(
         derived,
         legacy,
         demote,
+        kinds,
     })
 }
 

@@ -4391,6 +4391,21 @@ impl JitProto {
         let callee_demote: Vec<(usize, u16)> = expanded
             .as_ref()
             .map_or_else(Vec::new, |e| e.demote.clone());
+        // The function itself (the hints are noted by its address), and its
+        // element access sites' feedback with the inlined callees', by the
+        // body's pc (`typed::activate_site_kinds`).
+        let own_proto: *const crate::nbvm::FnProto = proto;
+        let own_kinds = typed::merge_kinds(
+            typed::offered_own_kinds().unwrap_or_default(),
+            &crate::nbvm::tier_elem_kinds(proto),
+        );
+        let mut site_kinds = own_kinds.clone();
+        if let Some(e) = expanded.as_ref() {
+            for k in &mut site_kinds {
+                k.0 = e.new_of.get(k.0).map_or(usize::MAX, |&p| p as usize);
+            }
+            site_kinds.extend(e.kinds.iter().copied());
+        }
         let (proto, warm, pc_map) = match expanded {
             Some(e) => {
                 let mut p = proto.clone();
@@ -4754,6 +4769,9 @@ impl JitProto {
             })
             .collect();
         tier_up.spec_off = no_spec.to_vec();
+        tier_up.elem_kinds = own_kinds;
+        tier_up.leave_heads =
+            numeric::set_leave_heads(&bytecode, pc_map.as_ref().map_or(&[][..], |m| &m.1[..]));
         // (Likewise the ops whose results an earlier body's integer
         // versions found no int32: `TierUp::int_demote`.)
         let demote_body: Vec<(usize, u16)> = demote
@@ -4871,8 +4889,10 @@ impl JitProto {
             .map(|x| x.plan.held_fregs.clone())
             .unwrap_or_default();
         numeric::EXTRA_USES.with(|e| *e.borrow_mut() = held);
-        // (The element kinds its registers held, `typed::set_kind_hints`.)
-        typed::activate_kind_hints(proto);
+        // (The element kinds its registers held, `typed::set_kind_hints`,
+        // and its sites saw.)
+        typed::activate_kind_hints(own_proto);
+        typed::activate_site_kinds(proto.ops.len(), &site_kinds);
         let compiled = JitFunction::compile_generic(
             persist.addr(),
             proto.n_regs,
@@ -8538,6 +8558,7 @@ impl JitFunction {
         if ops.len() != bytecode.len() || n_regs > 0xffff {
             return None;
         }
+        let _ = numeric::set_leave_heads(bytecode, pc_orig);
         let add_helper = helpers.add as usize as u64;
         let get_site_helper = helpers.get_site as usize as u64;
         let get_method_site_helper = helpers.get_method_site as usize as u64;
@@ -10133,8 +10154,11 @@ impl JitFunction {
         macro_rules! backedge {
             ($header:expr) => {{
                 let skip = a.new_label();
+                let poll = a.new_label();
+                call_seq::emit_leave_check(&mut a, &helpers.call_layout, $header as usize, poll);
                 a.dec_frame8(COUNTDOWN);
                 a.jne(skip);
+                a.bind(poll);
                 call_seq::emit_quiet_poll(&mut a, &helpers.call_layout, i32::from(COUNTDOWN), skip);
                 a.mov_rdi_r15();
                 a.mov_rsi_rbx();
@@ -15412,7 +15436,7 @@ impl JitFunction {
                             helper,
                             got,
                             xmm_past,
-                            typed::kind_hint(obj),
+                            typed::kind_hint_at(op_idx, obj),
                         );
                     }
                     // jit_helper_get_elem(ctx, recv, key).
@@ -15716,7 +15740,13 @@ impl JitFunction {
                             Some(x) => numeric::NumGen::xmm0_from_xmm(&mut a, x),
                             None => a.movsd_xmm0_mem(disp(val)),
                         }
-                        a.t_set(tl, typed::Src::View, helper, done, typed::kind_hint(obj));
+                        a.t_set(
+                            tl,
+                            typed::Src::View,
+                            helper,
+                            done,
+                            typed::kind_hint_at(op_idx, obj),
+                        );
                     }
                     // jit_helper_set_elem(ctx, recv, key, val).
                     if bail.is_none() {

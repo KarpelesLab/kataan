@@ -98,6 +98,37 @@ impl Realm {
         fast_kind(kind).then_some(kind)
     }
 
+    /// The element access feedback (`ic::elem_fb`) of an `obj[key]` site
+    /// whose receiver is `obj` and whose element (read, or written) is `v`.
+    #[inline]
+    pub(crate) fn elem_feedback(&self, obj: NanBox, v: NanBox) -> u8 {
+        use crate::ic::elem_fb;
+        let Some(cell) = obj
+            .as_handle()
+            .and_then(|h| self.heap.get(Handle::from_raw(h)))
+        else {
+            return elem_fb::OTHER;
+        };
+        match cell {
+            Cell::Array(_) => match v.as_number() {
+                Some(n) if n as i32 as f64 == n && !(n == 0.0 && n.is_sign_negative()) => {
+                    elem_fb::ARR_INT
+                }
+                Some(n)
+                    if (-9_007_199_254_740_992.0..9_007_199_254_740_992.0).contains(&n)
+                        && n as i64 as f64 == n
+                        && n != 0.0 =>
+                {
+                    elem_fb::ARR_NUM
+                }
+                Some(_) => elem_fb::ARR_FRAC,
+                None => elem_fb::ARR_ANY,
+            },
+            Cell::TypedArray { kind, .. } if fast_kind(*kind) => elem_fb::TYPED + *kind,
+            _ => elem_fb::OTHER,
+        }
+    }
+
     pub(crate) fn typed_get_fast(&self, handle: Handle, i: usize) -> Option<NanBox> {
         let (buffer, start, end, kind) = slot(self.heap.get(handle)?, i)?;
         let bytes = self.bytes_at(buffer)?;

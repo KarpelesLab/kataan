@@ -870,6 +870,23 @@ pub struct PollLayout {
     /// A byte an integer version's overflow bail sets (`numeric::int32`'s
     /// demotion): the next poll then calls, to recompile the body.
     pub demote: i32,
+    /// A byte set while the activation that may leave should leave at the
+    /// next header of its own it can (`jit_tier::leave_soon`): the
+    /// back-edges of loops enclosing an inlined callee's loop
+    /// (`numeric::leave_head`) then poll.
+    pub leave_soon: i32,
+}
+
+/// Before a back-edge's countdown of a loop at `header` that encloses an
+/// inlined callee's loop (`numeric::leave_head`): to `poll` (the poll's
+/// inline do-nothing test, then its call) while the activation that may
+/// leave waits to leave (`PollLayout::leave_soon`). Emits nothing for any
+/// other loop.
+pub(crate) fn emit_leave_check(a: &mut X64Assembler, l: &CallLayout, header: usize, poll: Label) {
+    if super::numeric::leave_head(header) {
+        a.g_cmp_byte_imm(r::R15, l.poll.leave_soon, 0);
+        a.g_jcc(cc::NE, poll);
+    }
 }
 
 /// The back-edge poll's do-nothing test, inline: no agent scheduling, no

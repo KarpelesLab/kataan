@@ -198,6 +198,89 @@ std::thread_local! {
     /// The hints of the compilation under way ([`activate_kind_hints`]).
     static ACTIVE_HINTS: core::cell::RefCell<alloc::vec::Vec<u8>> =
         const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+    /// The element access feedback (`ic::elem_fb`) of the compilation
+    /// under way, by body pc ([`activate_site_kinds`]).
+    static SITE_KINDS: core::cell::RefCell<alloc::vec::Vec<u8>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
+
+std::thread_local! {
+    /// The function's own element access feedback a compilation's caller
+    /// offers ([`with_own_kinds`]), in place of its tier's caches'.
+    static OFFERED: core::cell::RefCell<Option<alloc::vec::Vec<(usize, u8)>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (a compilation of a function) with `kinds` as the function's
+/// own element access sites' feedback (`(own pc, feedback)`,
+/// `ic::elem_fb`): what the running interpreter frame's caches (which are
+/// out of the function's tier while it runs) and an earlier body saw.
+pub(crate) fn with_own_kinds<T>(kinds: alloc::vec::Vec<(usize, u8)>, f: impl FnOnce() -> T) -> T {
+    let old = OFFERED.with(|o| o.borrow_mut().replace(kinds));
+    let r = f();
+    OFFERED.with(|o| *o.borrow_mut() = old);
+    r
+}
+
+/// The feedback [`with_own_kinds`] offers for the compilation under way, if
+/// any.
+pub(super) fn offered_own_kinds() -> Option<alloc::vec::Vec<(usize, u8)>> {
+    OFFERED.with(|o| o.borrow().clone())
+}
+
+/// Merges element access feedback lists (`(pc, feedback)`, sorted by pc
+/// on return).
+pub(crate) fn merge_kinds(
+    mut a: alloc::vec::Vec<(usize, u8)>,
+    b: &[(usize, u8)],
+) -> alloc::vec::Vec<(usize, u8)> {
+    for &(pc, k) in b {
+        match a.iter_mut().find(|e| e.0 == pc) {
+            Some(e) => e.1 = crate::ic::elem_fb::merge(e.1, k),
+            None => a.push((pc, k)),
+        }
+    }
+    a.sort_unstable();
+    a
+}
+
+/// Makes `kinds` (`(body pc, feedback)`, `ic::elem_fb`: the function's own
+/// element access sites' and its inlined callees', as the interpreter saw
+/// them) the feedback of the compilation of a body of `n_ops` ops, for
+/// [`site_kind`]. A hint only.
+pub(super) fn activate_site_kinds(n_ops: usize, kinds: &[(usize, u8)]) {
+    SITE_KINDS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.resize(n_ops, crate::ic::elem_fb::NONE);
+        for &(pc, k) in kinds {
+            if let Some(x) = s.get_mut(pc) {
+                *x = crate::ic::elem_fb::merge(*x, k);
+            }
+        }
+    });
+}
+
+/// The element access feedback (`ic::elem_fb`) of the op at body pc `pc`
+/// of the compilation under way ([`activate_site_kinds`]).
+pub(crate) fn site_kind(pc: usize) -> u8 {
+    SITE_KINDS.with(|s| {
+        s.borrow()
+            .get(pc)
+            .copied()
+            .unwrap_or(crate::ic::elem_fb::NONE)
+    })
+}
+
+/// The kind an element access at body pc `pc` of register `r` tests
+/// first: the kind of the view `r` held when the body was compiled
+/// ([`kind_hint`]), else the one the site's feedback names, else
+/// [`NO_VIEW`].
+pub(super) fn kind_hint_at(pc: usize, r: u16) -> u8 {
+    match kind_hint(r) {
+        NO_VIEW => crate::ic::elem_fb::typed_kind(site_kind(pc)).unwrap_or(NO_VIEW),
+        k => k,
+    }
 }
 
 /// How many functions' hints [`set_kind_hints`] keeps (the oldest go).

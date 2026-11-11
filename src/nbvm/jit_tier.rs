@@ -121,6 +121,16 @@ pub(super) struct TierRuntime {
     /// poll calls [`jit_helper_backedge`], which has the polling body
     /// recompiled ([`demote_poll`]).
     demote: bool,
+    /// Set while the activation that may leave ([`TierRuntime::exit_regs`])
+    /// should leave at the next loop header of its function's own that it
+    /// can: its body wants to be recompiled for a demotion that an inlined
+    /// callee's loop (with no header of the function's own, where it
+    /// cannot leave) asked for. The back-edges of the loops that enclose an
+    /// inlined callee's loop then poll (`jit::numeric::leave_head`). See
+    /// [`leave_soon`]; `leave_tries` is how many such polls may still find
+    /// a header where it does not leave.
+    leave_soon: bool,
+    leave_tries: u32,
     /// A sync generator's compiled body that just suspended
     /// ([`jit_helper_suspend`]): the pc its resumption continues at (the
     /// function's own), the value it yields and the register a `next(v)`
@@ -171,6 +181,8 @@ impl Default for TierRuntime {
             left: None,
             poll_interval: if exit_stress() { 1 } else { POLL_INTERVAL },
             demote: false,
+            leave_soon: false,
+            leave_tries: 0,
             suspended: None,
             deopt: None,
             tail: None,
@@ -454,9 +466,11 @@ fn run_compiled_at(
             core::slice::from_raw_parts_mut(top.cast::<NanBox>(), n)
         };
         let outer = (ctx.jit_rt.exit_regs, ctx.jit_rt.exit_jit);
+        let outer_leave = (ctx.jit_rt.leave_soon, ctx.jit_rt.leave_tries);
         if exitable {
             ctx.jit_rt.exit_regs = window.as_ptr() as usize;
             ctx.jit_rt.exit_jit = jit as *const crate::jit::JitProto;
+            (ctx.jit_rt.leave_soon, ctx.jit_rt.leave_tries) = (false, 0);
         }
         // SAFETY: as above.
         #[allow(unsafe_code)]
@@ -467,6 +481,9 @@ fn run_compiled_at(
         let after = unsafe { (*st).frames };
         debug_assert_eq!(frames, after, "a compiled activation left a call header");
         (ctx.jit_rt.exit_regs, ctx.jit_rt.exit_jit) = outer;
+        if exitable {
+            (ctx.jit_rt.leave_soon, ctx.jit_rt.leave_tries) = outer_leave;
+        }
         if keep || raw == Some(NanBox::jit_exit_bits()) {
             let k = regs.len();
             regs.copy_from_slice(&window[..k]);
@@ -1046,20 +1063,24 @@ fn recompile(
     // (And no speculative version for a loop whose fast version kept
     // leaving it.)
     let cold = cold_call_pcs(proto, &hints);
-    let mut new = crate::jit::with_entry_poll(!cold.is_empty(), || {
-        crate::jit::JitProto::compile_generic_respec(
-            proto,
-            &super::jit_generic_helpers(),
-            &warm,
-            &|f| {
-                funcs
-                    .get(f as usize)
-                    .is_some_and(|p| !(p.is_async && !p.is_generator))
-            },
-            &|pc, _| inline_candidate(funcs, id, &hints, pc),
-            &old.spec_off(),
-            &old.int_demote(),
-        )
+    // (Its element access feedback: the old body's, and the caches'.)
+    let kinds = crate::jit::typed::merge_kinds(old.elem_kinds(), &super::elem_kinds_of(ic));
+    let mut new = crate::jit::typed::with_own_kinds(kinds, || {
+        crate::jit::with_entry_poll(!cold.is_empty(), || {
+            crate::jit::JitProto::compile_generic_respec(
+                proto,
+                &super::jit_generic_helpers(),
+                &warm,
+                &|f| {
+                    funcs
+                        .get(f as usize)
+                        .is_some_and(|p| !(p.is_async && !p.is_generator))
+                },
+                &|pc, _| inline_candidate(funcs, id, &hints, pc),
+                &old.spec_off(),
+                &old.int_demote(),
+            )
+        })
     })?;
     new.note_cold_calls(&cold);
     new.note_function(id);
@@ -4583,6 +4604,7 @@ fn poll_layout() -> crate::jit::PollLayout {
         exit_regs: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, exit_regs)),
         interval: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, poll_interval)),
         demote: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, demote)),
+        leave_soon: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, leave_soon)),
     }
 }
 
@@ -4820,12 +4842,56 @@ pub(crate) extern "C" fn jit_helper_backedge(
     }
     vm_safepoint(ctx, funcs, program, regs);
     if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, header) {
+        ctx.jit_rt.leave_soon = false;
         return NanBox::jit_exit_bits();
+    }
+    if regs_addr == ctx.jit_rt.exit_regs {
+        leave_soon(ctx);
     }
     if core::mem::take(&mut ctx.jit_rt.demote) {
         demote_poll(ctx, funcs, ops);
     }
     ctx.jit_rt.poll_interval
+}
+
+/// How many back-edge polls [`leave_soon`] lets find a header where the
+/// activation does not leave before it gives up.
+const LEAVE_TRIES: u32 = 256;
+
+/// For a back-edge poll of the activation that may leave, at a loop header
+/// where it does not (an inlined callee's, which has no header of the
+/// function's own): when its body wants to be recompiled for a demotion
+/// (`JitProto::wants_demote`: an integer version found a value no int32,
+/// most likely in that inlined loop) and has loops of its own that enclose
+/// an inlined callee's loop (`JitProto::leaves_soon`), their back-edges
+/// poll from now on ([`TierRuntime::leave_soon`]), so the activation leaves
+/// at the first header of its own where the recompilation helps (the body
+/// [`demote_poll`] compiles), instead of finishing in a body whose integer
+/// version keeps bailing (or is never tried again). At most
+/// [`LEAVE_TRIES`] polls per wait.
+fn leave_soon(ctx: &mut Ctx) {
+    if ctx.jit_rt.exit_jit.is_null() {
+        return;
+    }
+    // SAFETY: as in `wants_to_leave`.
+    #[allow(unsafe_code)]
+    let jit = unsafe { &*ctx.jit_rt.exit_jit };
+    if !jit.leaves_soon() {
+        ctx.jit_rt.leave_soon = false;
+        return;
+    }
+    if !ctx.jit_rt.leave_soon {
+        if ctx.jit_rt.leave_tries != u32::MAX {
+            ctx.jit_rt.leave_soon = true;
+            ctx.jit_rt.leave_tries = LEAVE_TRIES;
+        }
+    } else if ctx.jit_rt.leave_tries <= 1 {
+        // (Given up: the activation finishes in its body.)
+        ctx.jit_rt.leave_soon = false;
+        ctx.jit_rt.leave_tries = u32::MAX;
+    } else {
+        ctx.jit_rt.leave_tries -= 1;
+    }
 }
 
 /// A back-edge poll after an integer version asked for a register's
@@ -5025,9 +5091,13 @@ fn inline_candidate_key(
     if !crate::jit::inline::callee_ok(proto) && !crate::jit::inline::construct_ok(proto) {
         return None;
     }
-    let (mut warm, demote) = match proto.tier.jit() {
-        Some(Some(j)) if j.is_generic() => (j.runtime_warm(), j.own_int_demote()),
-        _ => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
+    let (mut warm, demote, kinds) = match proto.tier.jit() {
+        Some(Some(j)) if j.is_generic() => (j.runtime_warm(), j.own_int_demote(), j.elem_kinds()),
+        _ => (
+            alloc::vec::Vec::new(),
+            alloc::vec::Vec::new(),
+            alloc::vec::Vec::new(),
+        ),
     };
     let interp = super::tier_warm(proto);
     if warm.len() < interp.len() {
@@ -5044,6 +5114,7 @@ fn inline_candidate_key(
         warm,
         nested: alloc::vec::Vec::new(),
         demote,
+        kinds: crate::jit::typed::merge_kinds(kinds, &super::tier_elem_kinds(proto)),
     })
 }
 

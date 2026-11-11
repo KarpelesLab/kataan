@@ -6053,6 +6053,28 @@ fn tier_warm(proto: &FnProto) -> Vec<Option<crate::ic::WarmEntry>> {
     )
 }
 
+/// Function `proto`'s persistent element access sites' feedback
+/// (`ic::elem_fb`): `(pc, feedback)` for each site that has some.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn tier_elem_kinds(proto: &FnProto) -> Vec<(usize, u8)> {
+    proto
+        .tier
+        .0
+        .try_borrow()
+        .map_or_else(|_| Vec::new(), |t| elem_kinds_of(&t.ic))
+}
+
+/// The element access sites' feedback (`ic::elem_fb`) in caches `ic` (by
+/// pc): `(pc, feedback)` for each site that has some.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn elem_kinds_of(ic: &[PropertyCache]) -> Vec<(usize, u8)> {
+    ic.iter()
+        .enumerate()
+        .filter(|(_, c)| c.elem_kind() != crate::ic::elem_fb::NONE)
+        .map(|(pc, c)| (pc, c.elem_kind()))
+        .collect()
+}
+
 /// Function `proto`'s persistent call sites' callee feedback, by pc (as
 /// [`tier_warm`]).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -6126,18 +6148,23 @@ fn ensure_jit(
                 None => (tier_warm(&funcs[id]), tier_hints(&funcs[id])),
             };
             let cold = jit_tier::cold_call_pcs(&funcs[id], &hints);
-            crate::jit::with_entry_poll(!cold.is_empty(), || {
-                crate::jit::JitProto::compile_generic_inlining(
-                    &funcs[id],
-                    &jit_generic_helpers(),
-                    &warm,
-                    &|f| {
-                        funcs
-                            .get(f as usize)
-                            .is_some_and(|p| !(p.is_async && !p.is_generator))
-                    },
-                    &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
-                )
+            // (The running frame's element access feedback: its caches are
+            // out of the function's tier while it runs.)
+            let kinds = ic.map(elem_kinds_of).unwrap_or_default();
+            crate::jit::typed::with_own_kinds(kinds, || {
+                crate::jit::with_entry_poll(!cold.is_empty(), || {
+                    crate::jit::JitProto::compile_generic_inlining(
+                        &funcs[id],
+                        &jit_generic_helpers(),
+                        &warm,
+                        &|f| {
+                            funcs
+                                .get(f as usize)
+                                .is_some_and(|p| !(p.is_async && !p.is_generator))
+                        },
+                        &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
+                    )
+                })
             })
             .map(|mut j| {
                 j.note_cold_calls(&cold);
@@ -10434,8 +10461,14 @@ fn run_frame_at_ic(
                 // `obj[key]` read: array element / typed-array / string index /
                 // canonical numeric-string key / `length` / accessor / ordinary
                 // property), so the two tiers can never diverge.
-                match vm_get_elem(ctx, funcs, regs[*obj as usize], regs[*key as usize]) {
-                    Ok(v) => regs[*dst as usize] = v,
+                let o = regs[*obj as usize];
+                match vm_get_elem(ctx, funcs, o, regs[*key as usize]) {
+                    Ok(v) => {
+                        regs[*dst as usize] = v;
+                        // (The site's element feedback, `ic::elem_fb`.)
+                        let k = ctx.realm.elem_feedback(o, v);
+                        site_cache!(site).note_elem(k);
+                    }
                     Err(e) => handle_throw!(e),
                 }
             }
@@ -10444,28 +10477,22 @@ fn run_frame_at_ic(
                 // `obj[key] = v` write). A descriptor-aware case (demoted/frozen
                 // index, non-writable `length`) returns `Err(Unsupported)` to fault
                 // to the interpreter, exactly as before.
-                match vm_set_elem_mode(
-                    ctx,
-                    funcs,
-                    regs[*obj as usize],
-                    regs[*key as usize],
-                    regs[*src as usize],
-                    false,
-                ) {
-                    Ok(()) => {}
+                let (o, v) = (regs[*obj as usize], regs[*src as usize]);
+                match vm_set_elem_mode(ctx, funcs, o, regs[*key as usize], v, false) {
+                    Ok(()) => {
+                        let k = ctx.realm.elem_feedback(o, v);
+                        site_cache!(site).note_elem(k);
+                    }
                     Err(e) => handle_throw!(e),
                 }
             }
             Op::SetKeyStrict { obj, key, src } => {
-                match vm_set_elem_mode(
-                    ctx,
-                    funcs,
-                    regs[*obj as usize],
-                    regs[*key as usize],
-                    regs[*src as usize],
-                    true,
-                ) {
-                    Ok(()) => {}
+                let (o, v) = (regs[*obj as usize], regs[*src as usize]);
+                match vm_set_elem_mode(ctx, funcs, o, regs[*key as usize], v, true) {
+                    Ok(()) => {
+                        let k = ctx.realm.elem_feedback(o, v);
+                        site_cache!(site).note_elem(k);
+                    }
                     Err(e) => handle_throw!(e),
                 }
             }

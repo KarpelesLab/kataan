@@ -55,6 +55,21 @@ mod views;
 /// their scratch, `rbx`/`r15` are pinned).
 const GPRS: [u8; 5] = [6, 7, 8, 9, 10];
 
+/// Whether the integer version's `+`, `-` and `++` compute in place when
+/// their result takes an operand's GPR (`KATAAN_JIT_INPLACE=0` turns it
+/// off; read once).
+fn inplace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INPLACE").is_none_or(|v| v != "0"))
+}
+
+/// Whether the integer version's `%` by a register tries its division-free
+/// paths first (`KATAAN_JIT_IMODFAST=0` turns them off; read once).
+fn imod_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IMODFAST").is_none_or(|v| v != "0"))
+}
+
 /// How many times in a row an integer version's entry may find a
 /// loop-carried value that is not an int32 and have it tried again after an
 /// iteration elsewhere (`NumGen::entry_retry`).
@@ -597,7 +612,12 @@ pub(super) fn plan(
                     // (Arithmetic readers only for a read by an int index,
                     // whose read of a hoisted array is inline: a keyed
                     // read's generic code would cost the GPRs' saves.)
-                    (elems || spec) && elem_reader_ok(*dst, *obj, &inn, spec && inn(*key))
+                    // (Nor a site whose elements the interpreter never saw
+                    // be int32s: a float view's, `ic::elem_fb::never_int`,
+                    // whose reads would only ever bail.)
+                    (elems || spec)
+                        && !crate::ic::elem_fb::never_int(crate::jit::typed::site_kind(pc))
+                        && elem_reader_ok(*dst, *obj, &inn, spec && inn(*key))
                 }
                 Op::ArrayLen { .. } => elems || spec,
                 // A promoted global reads / writes its pseudo-register.
@@ -1988,12 +2008,29 @@ impl NumGen {
             GenericOp::Step { dst, src, dec, .. } if ii(self, dst) => {
                 let d = self.iout(dst)?;
                 let s = self.ival(a, src, RAX)?;
-                let t = if d != s { d } else { RAX };
-                a.mov32_rr(t, s);
-                a.add32_imm8(t, if dec { -1 } else { 1 });
-                let bail = self.ibail_ovf(a);
-                a.jcc(CC_O, bail);
-                self.iput(a, dst, t)?;
+                let step = if dec { -1 } else { 1 };
+                if d == s && matches!(self.ik(dst), Some(IK::Gpr(_))) && inplace_enabled() {
+                    // (In place, undone on overflow: see `iarith`.)
+                    a.add32_imm8(d, step);
+                    let bail = self.ibail_ovf(a);
+                    let undo = a.new_label();
+                    let past = a.new_label();
+                    a.jcc(CC_O, undo);
+                    a.jmp(past);
+                    let cold = a.cold_begin();
+                    a.bind(undo);
+                    a.add32_imm8(d, -step);
+                    a.jmp(bail);
+                    a.cold_end(cold);
+                    a.bind(past);
+                } else {
+                    let t = if d != s { d } else { RAX };
+                    a.mov32_rr(t, s);
+                    a.add32_imm8(t, step);
+                    let bail = self.ibail_ovf(a);
+                    a.jcc(CC_O, bail);
+                    self.iput(a, dst, t)?;
+                }
             }
             GenericOp::Add { dst, a: x, b: y }
             | GenericOp::NumAdd {
@@ -2097,8 +2134,11 @@ impl NumGen {
                     self.regions[ri].int.as_ref()?.inner?
                 };
                 let skip = a.new_label();
+                let poll = a.new_label();
+                super::super::call_seq::emit_leave_check(a, &self.env.layout, target, poll);
                 a.dec_frame8(super::COUNTDOWN);
                 a.jne(skip);
+                a.bind(poll);
                 super::super::call_seq::emit_quiet_poll(
                     a,
                     &self.env.layout,
@@ -2271,6 +2311,41 @@ impl NumGen {
             _ => None,
         };
         let wrap = self.iplan().is_some_and(|p| p.wraps.contains(&self.cur_pc));
+        // An operand in `d` itself (a value whose GPR its last reader's
+        // result takes over, `k + 1` into `k`'s): computed in place, an
+        // overflow undoing it (wrapping `add` and `sub` are exact inverses)
+        // before the bail, which must still see the operands.
+        let other = if Some(d) == gpr(kx) && Some(d) != gpr(ky) {
+            Some(ky)
+        } else if opc == 0x01 && Some(d) == gpr(ky) && Some(d) != gpr(kx) {
+            Some(kx)
+        } else {
+            None
+        };
+        if let Some(k) = other.filter(|_| inplace_enabled()) {
+            let op = |a: &mut X64Assembler, opc: u8| match k {
+                IK::Gpr(g) => a.alu32_rr(opc, d, g),
+                // (`81 /0` add, `81 /5` sub.)
+                IK::Imm(v) => a.alu32_imm(if opc == 0x01 { 0 } else { 5 }, d, v),
+                // (`03` add, `2b` sub: `op r32, r/m32`.)
+                IK::Mem(m) => a.g_mem(false, &[opc + 2], d, super::super::call_seq::r::RBP, m),
+            };
+            op(a, opc);
+            if !wrap {
+                let bail = self.ibail_ovf(a);
+                let undo = a.new_label();
+                let past = a.new_label();
+                a.jcc(CC_O, undo);
+                a.jmp(past);
+                let cold = a.cold_begin();
+                a.bind(undo);
+                op(a, if opc == 0x01 { 0x29 } else { 0x01 });
+                a.jmp(bail);
+                a.cold_end(cold);
+                a.bind(past);
+            }
+            return Some(());
+        }
         // Computing in `d` itself is fine unless an operand lives there (a bail
         // must still see the operands).
         let t = if Some(d) != gpr(kx) && Some(d) != gpr(ky) {
@@ -2301,6 +2376,23 @@ impl NumGen {
     /// product with a negative factor (`-0`).
     fn imul(&mut self, a: &mut X64Assembler, dst: u16, x: u16, y: u16) -> Option<()> {
         let d = self.iout(dst)?;
+        // `x * k` by a constant: `imul r32, r/m32, imm32`, and with `k > 0`
+        // only an overflow can make the product no int32 (no `-0`: a zero
+        // product has a zero `x`, whose sign the positive `k` keeps, and
+        // `+0 * k` is `+0`).
+        if let (Some(IK::Imm(k)), true) = (self.ik(y), inplace_enabled())
+            && k > 0
+            && let Some(IK::Gpr(gx)) = self.ik(x)
+        {
+            let wrap = self.iplan().is_some_and(|p| p.wraps.contains(&self.cur_pc));
+            let t = if d != gx { d } else { RAX };
+            a.imul32_rr_imm(t, gx, k);
+            if !wrap {
+                let bail = self.ibail_ovf(a);
+                a.jcc(CC_O, bail);
+            }
+            return self.iput(a, dst, t);
+        }
         let gx = self.ival(a, x, RDX)?;
         let gy = self.ival(a, y, RCX)?;
         if self.iplan().is_some_and(|p| p.wraps.contains(&self.cur_pc)) {
@@ -2338,6 +2430,32 @@ impl NumGen {
         a.movsxd(RAX, gx);
         let gy = self.ival(a, y, RCX)?;
         a.movsxd(RCX, gy);
+        let ok = a.new_label();
+        let div = a.new_label();
+        if imod_fast_enabled() {
+            // A divisor `d > 0` and a dividend `x >= 0` (whose remainder is
+            // `x mod d`, never `-0`) need no division in the commonest
+            // cases: `x < d` (the remainder is `x`), `x < 2d` (a wrapped
+            // index, `(i + 1) % n`: `x - d`) and a power of two `d`
+            // (`x & (d - 1)`).
+            a.test32_rr(RCX, RCX);
+            a.jcc(CC_LE, div);
+            a.test32_rr(RAX, RAX);
+            a.jcc(CC_S, div);
+            a.mov32_rr(RDX, RAX);
+            a.alu32_rr(0x39, RDX, RCX); // cmp edx, ecx
+            a.jcc(super::CC_B, ok);
+            a.alu32_rr(0x29, RDX, RCX); // sub edx, ecx
+            a.alu32_rr(0x39, RDX, RCX); // cmp edx, ecx
+            a.jcc(super::CC_B, ok);
+            a.raw(&[0x44, 0x8d, 0x59, 0xff]); // lea r11d, [rcx - 1]
+            a.raw(&[0x44, 0x85, 0xd9]); // test ecx, r11d
+            a.jcc(CC_NE, div);
+            a.mov32_rr(RDX, RAX);
+            a.raw(&[0x44, 0x21, 0xda]); // and edx, r11d
+            a.jmp(ok);
+        }
+        a.bind(div);
         let bail = self.ibail_ovf(a);
         a.test32_rr(RCX, RCX);
         a.jcc(CC_E, bail);
@@ -2345,7 +2463,6 @@ impl NumGen {
         // Sign-extended 64-bit operands: `-2^31 / -1` cannot overflow.
         a.cqo();
         a.idiv_rcx();
-        let ok = a.new_label();
         a.test32_rr(RDX, RDX);
         a.jcc(CC_NE, ok);
         a.raw(&[0x4d, 0x85, 0xdb]); // test r11, r11
@@ -2469,6 +2586,22 @@ impl NumGen {
             };
             if let Some((r, v)) = pair {
                 let g = self.ival(a, r, RAX)?;
+                // (Into an int register's GPR directly — nothing after the
+                // op can bail — and `x | 0`, `x ^ 0`, `x & -1` are copies.)
+                if let Some(IK::Gpr(d)) = self
+                    .ik(dst)
+                    .filter(|_| self.is_int(dst) && inplace_enabled())
+                {
+                    a.mov32_rr(d, g);
+                    let identity = match ext {
+                        4 => v == -1,
+                        _ => v == 0,
+                    };
+                    if !identity {
+                        a.alu32_imm(ext, d, v);
+                    }
+                    return Some(());
+                }
                 a.mov32_rr(RAX, g);
                 a.alu32_imm(ext, RAX, v);
                 return self.ibitwise_result(a, vop, dst);
@@ -3402,6 +3535,17 @@ impl X64Assembler {
     /// `test r32(x), r32(y)`.
     fn test32_rr(&mut self, x: u8, y: u8) {
         self.alu32_rr(0x85, x, y);
+    }
+
+    /// `imul r32(d), r32(s), imm32`.
+    fn imul32_rr_imm(&mut self, d: u8, s: u8, k: i32) {
+        let rex = 0x40 | ((d >> 3) << 2) | (s >> 3);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code
+            .extend_from_slice(&[0x69, 0xc0 | ((d & 7) << 3) | (s & 7)]);
+        self.code.extend_from_slice(&k.to_le_bytes());
     }
 
     /// `imul r32(d), r32(s)`.
