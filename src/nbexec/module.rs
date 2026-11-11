@@ -2807,7 +2807,7 @@ impl Interp {
                     .find(|n| *n == t)
                     .unwrap_or("object"));
             }
-            crate::nbvm::VmHost::typeof_global(this, name)
+            this.typeof_ident(name)
         })
         .unwrap_or(Err(crate::nbvm::HostError::Fault))
     }
@@ -2855,7 +2855,7 @@ impl Interp {
     /// Whether `name` resolves in VM module `index`'s environment.
     pub(crate) fn vm_module_exists(&mut self, index: u32, name: &str) -> bool {
         self.in_vm_module(index, |this| {
-            this.module_imports.contains_key(name) || crate::nbvm::VmHost::global_exists(this, name)
+            this.module_imports.contains_key(name) || this.ident_resolves(name)
         })
         .unwrap_or(false)
     }

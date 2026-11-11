@@ -5526,6 +5526,37 @@ impl Interp {
         r
     }
 
+    /// `typeof name` resolved from the running scope: `"undefined"` for an
+    /// unresolvable reference (never a `ReferenceError`), else the value's
+    /// type.
+    pub(crate) fn typeof_ident(
+        &mut self,
+        name: &str,
+    ) -> Result<&'static str, crate::nbvm::HostError> {
+        if self.current.get(name).is_none()
+            && self.with_binding(name).is_none()
+            && !matches!(name, "undefined" | "NaN" | "Infinity")
+            && !self.global_object_provides(name)
+        {
+            return Ok("undefined");
+        }
+        let v = self.read_ident_ref(name).map_err(exec_to_host)?;
+        let t = self.unary(UnaryOp::Typeof, v).map_err(exec_to_host)?;
+        let t = self.realm.to_display_string(t);
+        Ok(TYPEOF_NAMES
+            .iter()
+            .copied()
+            .find(|n| *n == t)
+            .unwrap_or("object"))
+    }
+
+    /// Whether the identifier reference `name` resolves from the running scope.
+    pub(crate) fn ident_resolves(&mut self, name: &str) -> bool {
+        self.current.get(name).is_some()
+            || self.with_binding(name).is_some()
+            || self.global_object_provides(name)
+    }
+
     /// The underlying realm (e.g. to render a result with `to_display_string`).
     #[must_use]
     pub fn realm(&self) -> &Realm {
@@ -9575,26 +9606,7 @@ impl crate::nbvm::VmHost for Interp {
         if let Some((m, n)) = crate::nbvm::split_module_name(name) {
             return self.vm_module_typeof(m, n);
         }
-        // An unresolvable name is "undefined", never a ReferenceError.
-        let v = self.at_global_env(|this| {
-            if this.current.get(name).is_none()
-                && !matches!(name, "undefined" | "NaN" | "Infinity")
-                && !this.global_object_provides(name)
-            {
-                return Ok(None);
-            }
-            this.read_ident_ref(name).map(Some)
-        });
-        let Some(v) = v.map_err(exec_to_host)? else {
-            return Ok("undefined");
-        };
-        let t = self.unary(UnaryOp::Typeof, v).map_err(exec_to_host)?;
-        let t = self.realm.to_display_string(t);
-        Ok(TYPEOF_NAMES
-            .iter()
-            .copied()
-            .find(|n| *n == t)
-            .unwrap_or("object"))
+        self.at_global_env(|this| this.typeof_ident(name))
     }
 
     fn write_global(
@@ -9802,9 +9814,7 @@ impl crate::nbvm::VmHost for Interp {
         if let Some((m, n)) = crate::nbvm::split_module_name(name) {
             return self.vm_module_exists(m, n);
         }
-        self.at_global_env(|this| {
-            this.current.get(name).is_some() || this.global_object_provides(name)
-        })
+        self.at_global_env(|this| this.ident_resolves(name))
     }
 
     fn run_jobs(&mut self) -> Result<(), crate::nbvm::HostError> {
