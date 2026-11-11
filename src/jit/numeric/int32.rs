@@ -305,7 +305,30 @@ pub(super) fn plan(
     // index, or a move into a register read only that way. (A Float64
     // element summed up would only ever bail; a loop that only compares
     // elements keeps its speculative version, whose views are hoisted.)
-    let elem_reader_ok = |r: u16, inn: &dyn Fn(u16) -> bool, arith: bool| {
+    // Whether some read of array register `o` feeds arithmetic, a
+    // comparison or a bitwise op (its elements are numbers, not objects
+    // being moved around, as a heap's swaps are).
+    let numeric_reads = |o: u16| {
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        body.iter().any(|op| match op {
+            Op::GetKey { obj, dst, .. } if *obj == o && *dst != o => body.iter().any(|q| {
+                def_use(q, &mut d, &mut u);
+                u.contains(dst)
+                    && match q {
+                        Op::Add { .. }
+                        | Op::AddValue { .. }
+                        | Op::Sub { .. }
+                        | Op::Mul { .. }
+                        | Op::Lt { .. } => true,
+                        Op::Compare { op, .. } => *op <= 3,
+                        Op::ValueBin { op, .. } => (1..=VB_USHR).contains(op),
+                        _ => false,
+                    }
+            }),
+            _ => false,
+        })
+    };
+    let elem_reader_ok = |r: u16, obj: u16, inn: &dyn Fn(u16) -> bool, arith: bool| {
         let mut work = alloc::vec![r];
         let mut seen: Vec<u16> = Vec::new();
         let (mut d, mut u) = (Vec::new(), Vec::new());
@@ -327,9 +350,23 @@ pub(super) fn plan(
                     Op::GetKey { key, obj, .. } if *key == x && *obj != x => {}
                     // An element store's value (`win[j + 1] = win[j]`, a
                     // sort's moves): a hoisted view's store takes an int
-                    // register as is (`NumGen::ihoisted_view_set`).
-                    Op::SetKey { obj, key, src } | Op::SetKeyStrict { obj, key, src }
-                        if arith && *src == x && *key != x && *obj != x => {}
+                    // register as is (`NumGen::ihoisted_view_set`). Only
+                    // when the array read, or the one written, is
+                    // otherwise read as numbers.
+                    Op::SetKey { obj: o, key, src } | Op::SetKeyStrict { obj: o, key, src }
+                        if arith
+                            && *src == x
+                            && *key != x
+                            && *o != x
+                            && [obj, *o].iter().any(|&q| {
+                                // (Or the register it copies: `win[n++] = …`
+                                // writes through a copy of `win`.)
+                                numeric_reads(q)
+                                    || body.iter().any(|m| {
+                                        matches!(m, Op::Move { dst, src }
+                                            if *dst == q && numeric_reads(*src))
+                                    })
+                            }) => {}
                     // (`ToNumeric` of an int register is a copy: a counter
                     // starting at an element, `for (k = p[i]; …; k++)`.)
                     Op::Move { dst, .. } | Op::ToNumeric { dst, .. } => work.push(*dst),
@@ -556,11 +593,11 @@ pub(super) fn plan(
                 }
                 // (In a speculative region's, checked after the generic
                 // emitter's read: `NumGen::int_post`.)
-                Op::GetKey { dst, key, .. } => {
+                Op::GetKey { dst, key, obj } => {
                     // (Arithmetic readers only for a read by an int index,
                     // whose read of a hoisted array is inline: a keyed
                     // read's generic code would cost the GPRs' saves.)
-                    (elems || spec) && elem_reader_ok(*dst, &inn, spec && inn(*key))
+                    (elems || spec) && elem_reader_ok(*dst, *obj, &inn, spec && inn(*key))
                 }
                 Op::ArrayLen { .. } => elems || spec,
                 // A promoted global reads / writes its pseudo-register.
