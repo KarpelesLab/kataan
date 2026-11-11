@@ -736,12 +736,26 @@ pub(super) fn plan(
         let needs = |x: &&(u16, usize, usize, u32, bool)| {
             cset.binary_search(&x.0).is_ok() && !consts.iter().any(|c| c.0 == x.0 && c.2 == x.1)
         };
-        // (A speculative region's integer version: by weight, and the
-        // values that lose a GPR live in frame slots, `spec_alloc`.)
-        let spec_slots = if spec {
+        // (A speculative region's integer version, or a nest's: by weight,
+        // and the values that lose a GPR live in frame slots, `spec_alloc`.)
+        let spec_slots = if spec || !loops.is_empty() {
             let in_arm = |pc: usize| arm_of(pc).is_some();
             let need = |x: &(u16, usize, usize, u32, bool)| needs(&x);
-            match spec_alloc(bytecode, (head, end), info, &need, &carried, &in_arm, loops) {
+            match spec_alloc(bytecode, (head, end), info, &need, &carried, &in_arm, loops).and_then(
+                |v| {
+                    // (A promoted global lives in a GPR, `PGlobal`.)
+                    let homeless: Vec<u16> =
+                        v.0.iter()
+                            .filter(|s| s.reg as usize >= n_regs && s.gpr >= MEM_BASE)
+                            .map(|s| s.reg)
+                            .collect();
+                    if homeless.is_empty() {
+                        Ok(v)
+                    } else {
+                        Err(homeless)
+                    }
+                },
+            ) {
                 Ok(v) => Some(v),
                 Err(failed) => {
                     if super::specalloc_log() {
@@ -1170,6 +1184,10 @@ fn spec_alloc(
                 8u64.pow(d.min(5) as u32)
             })
             .sum();
+        // (A register no op names is a promoted global's pseudo-register
+        // (a numeric nest's, `PGlobal`), which must have a GPR: first.)
+        let named = (head..=end).any(|pc| super::op_regs(&bytecode[pc]).contains(&x.0));
+        let w = if named { w } else { u64::MAX >> 16 };
         ivs.push((x.0, s, e, c, x.4, w));
     }
     ivs.sort_by(|p, q| p.1.cmp(&q.1).then(q.3.cmp(&p.3)).then(p.0.cmp(&q.0)));
@@ -1841,6 +1859,15 @@ impl NumGen {
         for l in ilabels.iter_mut().take(end + 1).skip(head) {
             *l = a.new_label();
         }
+        // (A nest's: an entry at an inner header may go straight into this
+        // version there, `plain_int_inner_entry`.)
+        if !self.regions[ri].loops.is_empty() {
+            for pc in head..=end {
+                if let Some(l) = self.int_labels.get_mut(pc) {
+                    *l = Some(ilabels[pc]);
+                }
+            }
+        }
         self.cur_pc = head;
         a.bind(entry);
         // A value not an int32 runs an iteration of the double version, whose
@@ -2061,10 +2088,7 @@ impl NumGen {
                 // (In a speculative nest's integer version, an inner loop's
                 // back-edge too: to that header's label in this version.)
                 let nested = pc != self.regions[ri].end || target != self.regions[ri].head;
-                if nested
-                    && !(self.regions[ri].spec_int
-                        && self.regions[ri].loops.contains(&(target, pc)))
-                {
+                if nested && !self.regions[ri].loops.contains(&(target, pc)) {
                     return None;
                 }
                 let inner = if nested {
@@ -3085,6 +3109,65 @@ impl NumGen {
         a.bind(dbl);
     }
 
+    /// The entry at inner header `h` of numeric nest `ri` (a nest with no
+    /// speculative version, on-stack replacement there) into its integer
+    /// version there, the register file up to date: every int register
+    /// live at `h` checked to be an exact int32 and loaded, every other
+    /// promoted register live there loaded; any failed check falls through
+    /// (the double version's entry follows). Its promoted global bindings
+    /// are validated and loaded as at its own entry. Clobbers `rax`, `rcx`, `xmm`s and the int GPRs.
+    pub(super) fn plain_int_inner_entry(&mut self, a: &mut X64Assembler, ri: usize, h: usize) {
+        let rg = &self.regions[ri];
+        let (Some(p), Some(Some(target))) = (rg.int.as_ref(), self.int_labels.get(h).copied())
+        else {
+            return;
+        };
+        if rg.spec.is_some() || rg.spec_int {
+            return;
+        }
+        let Some(live) = rg.live_inner.iter().find(|x| x.0 == h).map(|x| &x.1) else {
+            return;
+        };
+        let ints: Vec<(u16, IK)> = p
+            .slots
+            .iter()
+            .filter(|s| s.start <= h && h <= s.end && live.contains(&s.reg))
+            .map(|s| (s.reg, self.slot_ik(s)))
+            .collect();
+        let dbls: Vec<(u8, u16)> = rg
+            .slots
+            .iter()
+            .filter(|s| s.start <= h && h <= s.end && p.ints.binary_search(&s.reg).is_err())
+            .map(|s| (s.xmm, s.reg))
+            .collect();
+        let dbl = a.new_label();
+        let saved = self.imode.replace(ri);
+        let pc = core::mem::replace(&mut self.cur_pc, h);
+        // (The bindings' validation first: its calls clobber the GPRs.)
+        self.gvalidate(a, p, dbl);
+        for (r, k) in ints {
+            a.load_rax(disp(r));
+            a.exact_i32_check(RCX);
+            a.jcc(CC_NE, dbl);
+            match k {
+                IK::Gpr(g) => a.mov32_rr(g, RCX),
+                IK::Mem(d) => a.st32(d, RCX),
+                IK::Imm(_) => {}
+            }
+        }
+        for (x, r) in dbls {
+            a.movsd_x_mem(x, disp(r));
+        }
+        if let Some(p) = self.regions[ri].int.as_ref() {
+            self.gload(a, p, dbl);
+        }
+        self.refresh_globals(a, ri, false);
+        self.imode = saved;
+        self.cur_pc = pc;
+        a.jmp(target);
+        a.bind(dbl);
+    }
+
     /// Op `pc` of a speculative region's integer version (`labels`: the
     /// version's): as `emit_int_op` / the double emitter, else (`false`)
     /// the generic emitter's, the int registers saved around it.
@@ -3633,6 +3716,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn numeric_nests_are_one_region_with_an_integer_version() {
+        // Counting loops with integer arithmetic alone (no element or
+        // property access): one region over the nest, no speculative
+        // version, an integer version keeping both counters and the sum
+        // (more live values than GPRs: some in frame slots).
+        let p = proto_of(
+            "function f(n){ let s = 0, t = 1; for (let i = 0; i < n; i = i + 1) { const u = i * 3, v = i ^ 5; for (let j = 0; j < n; j = j + 1) { s = (s + i * j + (j ^ i) + u - v) | 0; t = (t + s) & 1023; } } return s + t; }",
+            "f",
+        );
+        let (ops, ..) = crate::jit::lower_nbvm_generic(&p).expect("generic");
+        let regions = super::super::plan_regions(&ops, &p.ops, &[], p.n_regs);
+        assert_eq!(regions.len(), 1, "one region");
+        let r = &regions[0];
+        assert_eq!(r.loops.len(), 1, "over the nest");
+        assert!(r.spec.is_none() && !r.spec_int);
+        let ip = r.int.as_ref().expect("an integer version");
+        for o in &p.ops {
+            if let Op::Compare { a, .. } = o {
+                assert!(ip.ints.binary_search(a).is_ok(), "counter r{a} is an int");
+            }
+        }
+        assert!(ip.n_mem > 0, "some int registers live in frame slots");
+        let (h, _) = r.loops[0];
+        assert!(
+            r.live_inner.iter().any(|x| x.0 == h),
+            "its inner header's liveness"
+        );
     }
 
     #[test]

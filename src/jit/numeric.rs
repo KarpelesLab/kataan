@@ -2305,11 +2305,11 @@ impl NumGen {
     /// int registers in around a generic op ([`Self::int_save`]): one per
     /// int GPR, after the hoisted views'.
     fn int_save_slots(&self) -> usize {
-        // (Then the frame slots the int registers without a GPR live in.)
+        // (Then the frame slots the int registers without a GPR live in: a
+        // numeric nest's integer version has those too.)
         self.regions
             .iter()
-            .filter(|r| r.spec_int)
-            .filter_map(|r| r.int.as_ref())
+            .filter_map(|r| r.int.as_ref().filter(|p| r.spec_int || p.n_mem > 0))
             .map(|p| int32::N_GPRS + p.n_mem)
             .max()
             .unwrap_or(0)
@@ -6619,6 +6619,8 @@ impl NumGen {
                 }
                 continue;
             }
+            // (A numeric nest's integer version first, when it has one.)
+            self.plain_int_inner_entry(a, ri, pc);
             self.refresh_globals(a, ri, false);
             for s in &self.regions[ri].slots {
                 if s.start <= pc && pc <= s.end {
@@ -7672,7 +7674,7 @@ fn plan_regions_sa(
         } else {
             Vec::new()
         };
-        let live_inner = if generic {
+        let live_inner = if generic || !loops.is_empty() {
             loops
                 .iter()
                 .map(|&(h, _)| (h, (0..n_regs as u16).filter(|&r| is_live(h, r)).collect()))
@@ -7726,6 +7728,11 @@ fn plan_regions_sa(
 /// Whether a speculative loop nest may have an integer version
 /// (`int32::plan` over the whole nest): unless `KATAAN_JIT_NESTINT=0`.
 /// Read once per process.
+fn numnest_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NUMNEST").is_none_or(|v| v != "0"))
+}
+
 fn nestint_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NESTINT").is_none_or(|v| v != "0"))
@@ -9328,7 +9335,8 @@ fn plan_nests(
         })
         .collect();
     let generic_loop = |h: usize, e: usize| {
-        (h..=e).any(|pc| generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
+        (numnest_enabled()
+            || (h..=e).any(|pc| generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))))
             && !(h..=e).any(|pc| region_call(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
     };
     // Per back-edge (as in `backs`): the inner back-edges of the nest it heads.
