@@ -24,9 +24,9 @@
 //! it or throws (TDZ, `const`), so right after either op the binding holds
 //! its register's value. Between that op and the read, every op is one
 //! that cannot run JavaScript or Rust code that writes bindings
-//! ([`pure`]): a copy, a constant, arithmetic over operands the type
-//! inference proves Numbers, a test, or another such binding's read or
-//! write. Nothing between them writes the register, and no join lies in
+//! ([`pure`]): a copy, a constant, arithmetic over operands the same run
+//! made primitives ([`prim_result`]: a primitive's conversion runs no
+//! code), a test, or another such binding's read or write. Nothing between them writes the register, and no join lies in
 //! between (a branch target, a handler's entry, an inlined call's
 //! fallback), so every path to the read came through the op. A throw in
 //! between never reaches the read.
@@ -55,15 +55,16 @@ fn log() -> bool {
 }
 
 /// The ops between a binding's write or read and a later read of it that
-/// keep the binding's value and run no code: their operands are proven
-/// Numbers where an object operand could run a conversion (`num`).
-fn pure(op: &Op, lex: &[&str], num: &dyn Fn(Reg) -> bool) -> bool {
+/// keep the binding's value and run no code: their operands are known
+/// primitives (`prim`) where an object operand could run a conversion
+/// (`valueOf`, `toString`, `Symbol.toPrimitive`); a primitive's conversion
+/// runs none (a BigInt mixed with a Number, a Symbol converted, throws).
+fn pure(op: &Op, lex: &[&str], prim: &dyn Fn(Reg) -> bool) -> bool {
     match op {
         Op::LoadConst { .. }
         | Op::Move { .. }
         | Op::StrictEq { .. }
         | Op::Not { .. }
-        | Op::TypeOf { .. }
         | Op::CheckTdz { .. } => true,
         Op::LoadGlobal { name, .. } | Op::StoreGlobal { name, .. } => lex.contains(&name.as_str()),
         Op::Add { a, b, .. }
@@ -74,16 +75,42 @@ fn pure(op: &Op, lex: &[&str], num: &dyn Fn(Reg) -> bool) -> bool {
         | Op::Mod { a, b, .. }
         | Op::Lt { a, b, .. }
         | Op::ValueBin { a, b, .. }
-        | Op::Compare { a, b, .. } => num(*a) && num(*b),
-        Op::Neg { a, .. } | Op::BitNot { a, .. } => num(*a),
-        Op::ToNumeric { src, .. } | Op::Step { src, .. } => num(*src),
+        | Op::Compare { a, b, .. } => prim(*a) && prim(*b),
+        Op::Neg { a, .. } | Op::BitNot { a, .. } => prim(*a),
+        Op::ToNumeric { src, .. } | Op::Step { src, .. } => prim(*src),
+        _ => false,
+    }
+}
+
+/// Whether `op`'s result (its one written register) is always a primitive:
+/// a non-heap constant, a copy of a known primitive (`prim`), or an
+/// operator's result.
+fn prim_result(op: &Op, prim: &dyn Fn(Reg) -> bool) -> bool {
+    match op {
+        Op::LoadConst { value, .. } => value.as_handle().is_none(),
+        Op::Move { src, .. } => prim(*src),
+        Op::Add { .. }
+        | Op::AddValue { .. }
+        | Op::Sub { .. }
+        | Op::Mul { .. }
+        | Op::Div { .. }
+        | Op::Mod { .. }
+        | Op::Lt { .. }
+        | Op::ValueBin { .. }
+        | Op::Compare { .. }
+        | Op::StrictEq { .. }
+        | Op::Not { .. }
+        | Op::Neg { .. }
+        | Op::BitNot { .. }
+        | Op::ToNumeric { .. }
+        | Op::Step { .. } => true,
         _ => false,
     }
 }
 
 /// The rewritten bytecode (see the module docs), or `None` when no read is
-/// forwarded. `n_regs` sizes the type inference.
-pub(super) fn plan(ops: &[Op], n_regs: usize) -> Option<Vec<Op>> {
+/// forwarded.
+pub(super) fn plan(ops: &[Op]) -> Option<Vec<Op>> {
     if !enabled() {
         return None;
     }
@@ -116,16 +143,19 @@ pub(super) fn plan(ops: &[Op], n_regs: usize) -> Option<Vec<Op>> {
             *j = true;
         }
     }
-    let types = super::numeric::infer(ops, n_regs);
     let mut out: Option<Vec<Op>> = None;
     let mut moved: Vec<usize> = Vec::new();
     // The bindings whose value a register holds: `(name, register)`.
     let mut known: Vec<(String, Reg)> = Vec::new();
+    // The registers known to hold primitives, within the straight run.
+    let mut prims: Vec<Reg> = Vec::new();
     let (mut d, mut u) = (Vec::new(), Vec::new());
     for (pc, op) in ops.iter().enumerate() {
         if join[pc] {
             known.clear();
+            prims.clear();
         }
+        super::numeric::def_use(op, &mut d, &mut u);
         match op {
             Op::LoadGlobal { dst, name, .. } if lex.contains(&name.as_str()) => {
                 let held = known.iter().find(|k| &k.0 == name).map(|k| k.1);
@@ -136,6 +166,7 @@ pub(super) fn plan(ops: &[Op], n_regs: usize) -> Option<Vec<Op>> {
                 }
                 known.retain(|k| k.1 != *dst && &k.0 != name);
                 known.push((name.clone(), *dst));
+                prims.retain(|r| r != dst);
                 continue;
             }
             Op::StoreGlobal { src, name, .. } if lex.contains(&name.as_str()) => {
@@ -145,12 +176,20 @@ pub(super) fn plan(ops: &[Op], n_regs: usize) -> Option<Vec<Op>> {
             }
             _ => {}
         }
-        let num = |r: Reg| types.get(pc, r) == super::numeric::T_NUM;
-        if !pure(op, &lex, &num) {
+        let is_prim = |r: Reg| prims.contains(&r);
+        let ok = pure(op, &lex, &is_prim);
+        let result = prim_result(op, &is_prim);
+        prims.retain(|r| !d.contains(r));
+        if result && let [w] = d[..] {
+            prims.push(w);
+        }
+        if !ok {
+            // (Nor is what it wrote known: `def_use` lists the writes of
+            // the ops above only.)
             known.clear();
+            prims.clear();
             continue;
         }
-        super::numeric::def_use(op, &mut d, &mut u);
         known.retain(|k| !d.contains(&k.1));
     }
     if log() && !moved.is_empty() {

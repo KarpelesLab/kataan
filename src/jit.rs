@@ -4461,7 +4461,7 @@ impl JitProto {
         let forwarded = if proto.is_async || proto.is_generator {
             None
         } else {
-            gforward::plan(&proto.ops, proto.n_regs)
+            gforward::plan(&proto.ops)
         };
         let proto = match forwarded {
             Some(ops) => {
