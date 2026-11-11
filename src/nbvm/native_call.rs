@@ -623,6 +623,19 @@ pub(super) fn try_call(
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
     }
+    // A generator's `next` / `throw` / `return`: proved by the generator's
+    // own memo (`gen_fast::site_call`), whose receivers are ever new objects.
+    if let Some(site) = cache.native.as_deref()
+        && let FastOp::GenResume(mode) = site.op
+    {
+        let method = site.method;
+        let arg = args
+            .first()
+            .map_or(NanBox::undefined(), |r| regs[*r as usize]);
+        if let Some(r) = super::gen_fast::site_call(ctx, funcs, recv, key, mode, method, arg) {
+            return Some(r);
+        }
+    }
     // A static method (`Object.hasOwn`, `Number.isInteger`): the receiver the
     // site recorded, owning the method itself, unchanged — the general
     // path's `site_hit` on it, in a few compares.

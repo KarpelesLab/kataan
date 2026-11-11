@@ -180,6 +180,10 @@ pub struct Realm {
     /// The `{value, done}` layout of an iterator result object (see
     /// `Realm::new_iter_result`), grown from `root_shape` once.
     iter_result_shape: Option<Rc<Shape>>,
+    /// The layouts of a sync / an async generator object (its one hidden
+    /// state slot; see `Realm::new_generator_object`), grown from
+    /// `root_shape` once each.
+    gen_shapes: [Option<Rc<Shape>>; 2],
     /// The layouts of the `arguments` objects [`Realm::new_arguments_object`]
     /// makes, by `3 * argc + kind` (unmapped, mapped, mapped with its
     /// parameter cells; see `args_fast`), made on first use.
@@ -1008,6 +1012,7 @@ impl Realm {
             owed_fn_protos_old: 0,
             owed_fn_props: None,
             iter_result_shape: None,
+            gen_shapes: [None, None],
             args_shapes: alloc::vec::Vec::new(),
             args_cells_attached: false,
             atoms: AtomTable::new(),
@@ -9990,7 +9995,7 @@ impl Realm {
     pub fn is_html_dda(&self, handle: Handle) -> bool {
         // Only an ordinary object can carry the brand; skip the property lookup
         // for every other cell kind so the hot `typeof`/`truthy` paths stay cheap.
-        matches!(self.heap.get(handle), Some(Cell::Object(o)) if o.has_brand_key(HTMLDDA_SLOT))
+        matches!(self.heap.get(handle), Some(Cell::Object(o)) if o.has_any_brand(1 << 1))
     }
 
     /// The `typeof` string for any value: primitives via the box
@@ -10010,17 +10015,26 @@ impl Realm {
                     Some(Cell::Str(_)) if !self.aux_props.contains_key(&raw) => return "string",
                     // An ordinary object: the probes below, by its layout's
                     // brand flags rather than by property lookups.
+                    // (Brand bits: `BRAND_KEYS[1]` the `[[IsHTMLDDA]]` slot,
+                    // `[2]` / `[3]` a bound function's / a VM closure's
+                    // marker.)
                     Some(Cell::Object(o)) => {
-                        return if o.has_brand_key(crate::shape::BRAND_KEYS[1]) {
+                        return if o.has_any_brand(1 << 1) {
                             "undefined"
-                        } else if o.has_brand_key(crate::shape::BRAND_KEYS[2])
-                            || o.has_brand_key(crate::shape::BRAND_KEYS[3])
+                        } else if o.has_any_brand((1 << 2) | (1 << 3))
                             || self.is_function_proto_intrinsic(h)
                         {
                             "function"
                         } else {
                             "object"
                         };
+                    }
+                    // An array owns a marker key (below) only in its
+                    // auxiliary object: without one it is an object.
+                    Some(Cell::Array(_)) if !self.aux_props.contains_key(&raw) => return "object",
+                    // A built-in function is one whatever else it holds.
+                    Some(Cell::Native(_) | Cell::BoundNative { .. } | Cell::HostFn(_)) => {
+                        return "function";
                     }
                     _ => {}
                 }

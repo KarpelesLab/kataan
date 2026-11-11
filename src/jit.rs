@@ -3555,6 +3555,11 @@ pub struct GenericHelpers {
     /// The interpreter-op helper (`jit_helper_exec_op`) — runs one bytecode op
     /// (any op without a native lowering) on the body's register file.
     pub exec_op: JitExecOpHelper,
+    /// `typeof v === 'lit'` for a heap value the word alone does not decide
+    /// (`jit_helper_typeof_test(ctx, regs, n_regs, op)`, `op` the fused
+    /// `TypeOf`, the `StrEqConst` right after it): stores the compare's
+    /// boolean — never throws.
+    pub typeof_test: JitExecOpHelper,
     /// The loop back-edge poll (`jit_helper_backedge`) — host interrupt, agent
     /// scheduling and the GC safepoint; returns the next poll countdown.
     pub backedge: JitBackedgeHelper,
@@ -8598,6 +8603,7 @@ impl JitFunction {
         let truthy_helper = helpers.truthy as usize as u64;
         let call_native_helper = helpers.call_native as usize as u64;
         let exec_op_helper = helpers.exec_op as usize as u64;
+        let typeof_helper = helpers.typeof_test as usize as u64;
         let backedge_helper = helpers.backedge as usize as u64;
         let suspend_helper = helpers.suspend as usize as u64;
         let push_handler_helper = helpers.push_handler as usize as u64;
@@ -12555,6 +12561,21 @@ impl JitFunction {
                         {
                             use typeof_test::TypeLit as L;
                             let t = typeof_at.get(op_idx).copied().flatten()?;
+                            // What the word does not decide: the pair's
+                            // outcome from the cell, by one leaf helper.
+                            macro_rules! typeof_slow {
+                                () => {{
+                                    let op_ptr: *const crate::nbvm::Op =
+                                        bytecode.get(pc as usize)?;
+                                    a.mov_rdi_r15();
+                                    a.mov_rsi_rbx();
+                                    a.movabs_argreg(2, n_regs as i64);
+                                    a.movabs_argreg(3, op_ptr as i64);
+                                    a.movabs_rax(typeof_helper as i64);
+                                    a.call_rax();
+                                    throw_check!();
+                                }};
+                            }
                             let fz = num
                                 .fused_branch(op_idx + 1, ops, t.d)
                                 .filter(|f| f.target <= ops.len());
@@ -12640,8 +12661,7 @@ impl JitFunction {
                                     a.bind(r_true);
                                     a.jmp(done);
                                     a.bind(slow);
-                                    exec_op!(pc);
-                                    exec_op!(pc + 1);
+                                    typeof_slow!();
                                     a.load_rax(disp(t.d));
                                     a.movabs_r11(tag_true as i64);
                                     a.cmp_rax_r11();
@@ -12665,8 +12685,7 @@ impl JitFunction {
                                     a.store_rax(disp(t.d));
                                     a.jmp(done);
                                     a.bind(slow);
-                                    exec_op!(pc);
-                                    exec_op!(pc + 1);
+                                    typeof_slow!();
                                 }
                             }
                             num.skip_op(op_idx + 1);

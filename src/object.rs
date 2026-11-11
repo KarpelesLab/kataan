@@ -2101,6 +2101,24 @@ impl Object {
         }
     }
 
+    /// [`has_brand_key`](Self::has_brand_key) of `BRAND_KEYS[i]` for each
+    /// index `i` whose bit `mask` sets (`1 << i`, the key's
+    /// [`crate::shape::brand_bit`]): whether the object holds any of them,
+    /// with no key compared in shaped mode.
+    #[inline]
+    #[must_use]
+    pub fn has_any_brand(&self, mask: u8) -> bool {
+        if self.is_dict() {
+            let map = &self.dict().map;
+            crate::shape::BRAND_KEYS
+                .iter()
+                .enumerate()
+                .any(|(i, k)| mask & (1 << i) != 0 && map.contains_key(*k))
+        } else {
+            self.shape.has_brand(mask)
+        }
+    }
+
     /// Whether the object has no accessor properties at all.
     #[inline]
     #[must_use]

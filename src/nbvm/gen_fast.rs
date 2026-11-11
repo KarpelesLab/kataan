@@ -540,6 +540,86 @@ fn direct_target(ctx: &mut Ctx, funcs: &[FnProto], g: NanBox) -> Option<Handle> 
     (id < funcs.len()).then_some(fh)
 }
 
+/// The method names of the resumption modes.
+const MODE_KEYS: [&str; 3] = ["next", "throw", "return"];
+
+/// [`site_call`]'s memo: for a few generator prototypes (a call site such as
+/// a scheduler's `gen.next(v)` resumes generators of several functions, each
+/// with its own prototype), where the `[[Get]]` of a resumption method from
+/// that prototype finds its data property, validated at prototype epoch
+/// `stamp`. While the epoch stands, no object on the (watched) chain changed
+/// its keys, layout or `[[Prototype]]`, so the property is still at that
+/// slot: only its value is re-read.
+#[derive(Default)]
+pub(super) struct SiteMemo {
+    entries: [Option<SiteEntry>; 4],
+    /// The entry the next fill replaces.
+    next: usize,
+}
+
+struct SiteEntry {
+    proto: u64,
+    mode: u8,
+    stamp: u64,
+    at: crate::realm::builtins_fast::StampedSlot,
+}
+
+/// `g.next(v)` / `g.throw(v)` / `g.return(v)` (`mode` 0 / 1 / 2) at a method
+/// call site `g[key](v)` whose memo says it called the intrinsic `method`
+/// before, proved here without the site's general receiver walk: `g` is a
+/// generator object owning nothing but its state slot, so `g[key]` is the
+/// `[[Get]]` of `key` from its prototype, which [`SiteMemo`] answers. The
+/// iterator result, or `None` (nothing done) for the site's general path.
+pub(super) fn site_call(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    key: &str,
+    mode: u8,
+    method: u64,
+    v: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    if MODE_KEYS.get(usize::from(mode)) != Some(&key) || ctx.host.is_none() || ctx.realm.multi_realm
+    {
+        return None;
+    }
+    let gh = Handle::from_raw(recv.as_handle()?);
+    let proto = ctx.realm.generator_owns_only_state(gh)?;
+    let raw = proto.to_raw();
+    let epoch = crate::object::proto_epoch();
+    let found = match ctx
+        .gen_site_memo
+        .entries
+        .iter()
+        .flatten()
+        .find(|e| e.proto == raw && e.mode == mode && e.stamp == epoch)
+    {
+        Some(e) => ctx.realm.stamped_slot(&e.at)?,
+        None => {
+            let at = ctx.realm.watch_get_chain(proto, key)??;
+            let found = ctx.realm.stamped_slot(&at)?;
+            let m = &mut ctx.gen_site_memo;
+            let i = m.next;
+            m.next = (i + 1) % m.entries.len();
+            m.entries[i] = Some(SiteEntry {
+                proto: raw,
+                mode,
+                stamp: crate::object::proto_epoch(),
+                at,
+            });
+            found
+        }
+    };
+    if found.to_bits() != method {
+        return None;
+    }
+    let fh = state_of(ctx, gh)?;
+    if ctx.realm.vm_frame(fh)?.func as usize >= funcs.len() {
+        return None;
+    }
+    Some(nested(ctx, |ctx| resume_state(ctx, funcs, fh, mode, v)).map(|o| result_object(ctx, o)))
+}
+
 /// `g.next(v)` / `g.throw(v)` / `g.return(v)` (`mode` 0 / 1 / 2) for a call
 /// site that proved the method is the intrinsic: the iterator result, or
 /// `None` (nothing done) to take the host's call.

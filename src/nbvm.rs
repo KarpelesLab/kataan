@@ -1890,6 +1890,7 @@ mod hosted_pool {
         c.pending_callee = None;
         c.pending_new_target = None;
         c.gen_open_memo = None;
+        c.gen_site_memo = super::gen_fast::SiteMemo::default();
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         {
             c.jit_pending = None;
@@ -1937,6 +1938,8 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: Option<&'a mut dyn VmHost>) -> Ctx
         microtasks: alloc::collections::VecDeque::new(),
         gen_ic: PropertyCache::new(),
         gen_open_memo: None,
+        gen_site_memo: gen_fast::SiteMemo::default(),
+        gen_proto_ic: PropertyCache::new(),
         agen_ic: PropertyCache::new(),
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         jit_pending: None,
@@ -2935,7 +2938,13 @@ fn make_generator(
     pc: usize,
     handlers: Vec<(usize, Reg)>,
 ) -> Result<NanBox, VmError> {
+    // (A made closure's own data `prototype`, by the site's cache.)
+    let fast = callee.and_then(|c| c.as_handle()).and_then(|h| {
+        ctx.realm
+            .vm_fn_prototype_cached(Handle::from_raw(h), &mut ctx.gen_proto_ic)
+    });
     let proto = match callee {
+        _ if let Some(p) = fast => p,
         // A VM generator function's own `prototype` is a non-configurable
         // data property: its `[[Get]]` is the own value.
         Some(c) => match c.as_handle().map(Handle::from_raw).filter(|&h| {
@@ -2968,10 +2977,6 @@ fn make_generator(
             .ok_or(VmError::Unsupported)?
             .1
     };
-    let g = ctx
-        .realm
-        .new_object_with_proto(proto.as_handle().map(Handle::from_raw));
-    note_frame_callee(ctx, g, callee);
     // An async generator also carries its request queue.
     let aux = if is_async {
         NanBox::handle(ctx.realm.new_array(Vec::new()).to_raw())
@@ -2989,9 +2994,16 @@ fn make_generator(
         resume_fns: (NanBox::undefined(), NanBox::undefined()),
         callee: NanBox::undefined(),
     });
+    // (The frame cell is reachable from nothing until the object below
+    // holds it; neither allocation collects.)
     let slot = if is_async { VM_AGEN } else { VM_GEN };
-    ctx.realm
-        .set_hidden_property(g, slot, NanBox::handle(fh.to_raw()));
+    let g = ctx.realm.new_generator_object(
+        proto.as_handle().map(Handle::from_raw),
+        slot,
+        is_async,
+        NanBox::handle(fh.to_raw()),
+    );
+    note_frame_callee(ctx, g, callee);
     Ok(NanBox::handle(g.to_raw()))
 }
 
@@ -4885,6 +4897,11 @@ struct Ctx<'a> {
     agen_ic: PropertyCache,
     /// The memo of `gen_fast::open`'s lookups.
     gen_open_memo: Option<gen_fast::OpenMemo>,
+    /// The memo of `gen_fast::site_call`'s lookups.
+    gen_site_memo: gen_fast::SiteMemo,
+    /// A generator call's read of its function's own `prototype`
+    /// (`make_generator`).
+    gen_proto_ic: PropertyCache,
     /// An in-flight thrown value stashed by a generic-JIT runtime helper (see
     /// [`jit_helper_add`]). The helper returns the reserved throw sentinel and
     /// leaves the value here; [`call_generic`] takes it back out as
@@ -5200,6 +5217,8 @@ pub fn run_program(
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
             gen_open_memo: None,
+            gen_site_memo: gen_fast::SiteMemo::default(),
+            gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
@@ -5251,6 +5270,8 @@ pub fn run_program_capturing(
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
             gen_open_memo: None,
+            gen_site_memo: gen_fast::SiteMemo::default(),
+            gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
@@ -5924,13 +5945,19 @@ fn ensure_jit(
     if jit_tier::jit_log_enabled() {
         let what = match &compiled {
             Some(j) if j.inlined() > 0 => alloc::format!(
-                "compiled ({:?} tier, {} bytes, {} calls inlined: {:?})",
+                "compiled ({:?} tier, {} bytes at {:#x}, {} calls inlined: {:?})",
                 j.abi_kind(),
                 j.code_len(),
+                j.code_ptr(),
                 j.inlined(),
                 j.inlined_sites()
             ),
-            Some(j) => alloc::format!("compiled ({:?} tier, {} bytes)", j.abi_kind(), j.code_len()),
+            Some(j) => alloc::format!(
+                "compiled ({:?} tier, {} bytes at {:#x})",
+                j.abi_kind(),
+                j.code_len(),
+                j.code_ptr()
+            ),
             None => alloc::format!(
                 "rejected: {}",
                 crate::jit::generic_reject_reason(&funcs[id])
@@ -6004,6 +6031,8 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
             gen_open_memo: None,
+            gen_site_memo: gen_fast::SiteMemo::default(),
+            gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             jit_pending: None,
@@ -7452,6 +7481,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         truthy: jit_helper_truthy,
         call_native: jit_helper_call_native,
         exec_op: jit_tier::jit_helper_exec_op,
+        typeof_test: jit_tier::jit_helper_typeof_test,
         backedge: jit_tier::jit_helper_backedge,
         entry_poll: jit_tier::jit_helper_entry_poll,
         suspend: jit_tier::jit_helper_suspend,
@@ -29011,6 +29041,8 @@ mod generic_jit_tests {
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
             gen_open_memo: None,
+            gen_site_memo: gen_fast::SiteMemo::default(),
+            gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
             jit_pending: None,
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

@@ -732,6 +732,16 @@ impl Shape {
 mod tests {
     use super::*;
 
+    /// `Object::has_any_brand` callers name brand keys by bit (key `i`'s),
+    /// the `[[IsHTMLDDA]]` slot the second.
+    #[test]
+    fn brand_key_bits_are_their_indices() {
+        for (i, k) in BRAND_KEYS.iter().enumerate() {
+            assert_eq!(brand_bit(k), 1 << i);
+        }
+        assert_eq!(BRAND_KEYS[1], crate::realm::HTMLDDA_SLOT);
+    }
+
     #[test]
     fn one_then_many_children_are_each_reused() {
         let root = Shape::root();

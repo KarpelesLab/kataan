@@ -1050,9 +1050,10 @@ fn recompile(
             id,
             proto,
             &alloc::format!(
-                "recompiled (generation {}, {} bytes, {} calls inlined: {:?})",
+                "recompiled (generation {}, {} bytes at {:#x}, {} calls inlined: {:?})",
                 new.generation(),
                 new.code_len(),
+                new.code_ptr(),
                 new.inlined(),
                 new.inlined_sites()
             ),
@@ -1994,6 +1995,57 @@ pub(crate) extern "C" fn jit_helper_enum_keys(
         site.hold(None);
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// A fused `typeof v === 'lit'` (`crate::jit::typeof_test`) whose operand
+/// the word alone does not decide: `op` is the `TypeOf`, directly followed
+/// by the `StrEqConst` that alone reads its result. Stores that compare's
+/// boolean — `typeof`'s name of the value, compared with the literal byte
+/// for byte (two Strings are equal under `==` exactly when under `===`) —
+/// without making the name's String. Never throws (`typeof` runs no code).
+///
+/// # Safety
+/// As [`jit_helper_exec_op`]; `op` is followed by its pair in the same
+/// bytecode.
+pub(crate) extern "C" fn jit_helper_typeof_test(
+    ctx: *mut core::ffi::c_void,
+    regs: *mut u64,
+    n_regs: usize,
+    op: *const Op,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let (ctx_ref, regs_ref, pair) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs),
+            (&*op, &*op.add(1)),
+        )
+    };
+    if let (
+        Op::TypeOf { dst: t, a: v },
+        Op::StrEqConst {
+            dst: d,
+            src,
+            lit,
+            kind,
+        },
+    ) = pair
+        && src == t
+    {
+        let name = ctx_ref.realm.type_of_value(regs_ref[*v as usize]);
+        let eq = name.as_bytes() == lit.as_slice();
+        regs_ref[*d as usize] = NanBox::boolean(eq != (kind & super::STR_EQ_NEGATE != 0));
+        return 0;
+    }
+    // (Not the fused pair: both ops, as the interpreter runs them.)
+    let r = jit_helper_exec_op(ctx, regs, n_regs, op);
+    if r != 0 {
+        return r;
+    }
+    // SAFETY: as above.
+    #[allow(unsafe_code)]
+    jit_helper_exec_op(ctx, regs, n_regs, unsafe { op.add(1) })
 }
 
 pub(crate) extern "C" fn jit_helper_exec_op(
@@ -5134,6 +5186,8 @@ mod direct_memo_tests {
             microtasks: alloc::collections::VecDeque::new(),
             gen_ic: PropertyCache::new(),
             gen_open_memo: None,
+            gen_site_memo: super::super::gen_fast::SiteMemo::default(),
+            gen_proto_ic: crate::ic::PropertyCache::new(),
             agen_ic: PropertyCache::new(),
             jit_pending: None,
             jit_pending_fault: None,

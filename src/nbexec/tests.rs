@@ -13609,3 +13609,76 @@ fn typeof_global_site_cache_follows_bindings_and_chain() {
          undefinedundefined"
     );
 }
+
+/// `typeof v === 'lit'` over every kind of value, hot enough that the
+/// compiled tier tests it (`jit::typeof_test`, whose heap values a leaf
+/// helper classifies): the `[[IsHTMLDDA]]` object, proxies (callable,
+/// revoked, nested), bound and built-in functions, arrays (one with its
+/// own properties, one whose prototype is a function), wrappers and the
+/// rest; the first (interpreted) round's answers are the last round's.
+#[test]
+fn typeof_tests_classify_every_kind_of_value() {
+    let src = r#"
+        const dda = $262_IsHTMLDDA();
+        const rp = Proxy.revocable(function () {}, {}); rp.revoke();
+        const ro = Proxy.revocable({}, {}); ro.revoke();
+        const arr2 = [1]; arr2.x = 1;
+        const arr3 = [2]; Object.setPrototypeOf(arr3, function () {});
+        class K {}
+        const vals = [undefined, null, true, 0, -0, NaN, 1.5, "", "s", Symbol("y"), 10n,
+          {}, [], arr2, arr3, function () {}, () => 1, K, Math.max, Math.max.bind(null),
+          new Proxy(function () {}, {}), new Proxy({}, {}), rp.proxy, ro.proxy,
+          new Proxy(new Proxy(class {}, {}), {}), dda, Object(1), Object("s"), Object(Symbol()),
+          new Map(), /r/, new Date(0), Promise.resolve(), new Uint8Array(1), Function.prototype,
+          Object.create(Math.max), Object.create(null)];
+        const lits = ["undefined", "object", "boolean", "number", "string", "symbol", "bigint",
+          "function", "Object", ""];
+        function eq(v, l) {
+          switch (l) {
+            case "undefined": return [typeof v === "undefined", typeof v !== "undefined", typeof v == "undefined"];
+            case "object": return [typeof v === "object", typeof v !== "object", typeof v == "object"];
+            case "boolean": return [typeof v === "boolean", typeof v != "boolean"];
+            case "number": return [typeof v === "number", typeof v !== "number"];
+            case "string": return [typeof v === "string", typeof v !== "string"];
+            case "symbol": return [typeof v === "symbol", typeof v !== "symbol"];
+            case "bigint": return [typeof v === "bigint", typeof v !== "bigint"];
+            case "function": return [typeof v === "function", typeof v !== "function", typeof v == "function"];
+            case "Object": return [typeof v === "Object"];
+            default: return [typeof v === ""];
+          }
+        }
+        function branchy(v) {
+          if (typeof v === "object") return "o";
+          if (typeof v !== "function") return "n";
+          return "f";
+        }
+        let first = "", last = "";
+        for (let k = 0; k < 3000; k++) {
+          let s = "";
+          for (const v of vals) {
+            for (const l of lits) {
+              const r = eq(v, l);
+              for (let i = 0; i < r.length; i++) s += r[i] ? "1" : "0";
+            }
+            s += branchy(v) + typeof v + ";";
+          }
+          if (k === 0) first = s; else last = s;
+        }
+        [first === last, last].join("|")
+    "#;
+    let out = run_hooks(src);
+    let (same, last) = out.split_once('|').expect("two parts");
+    assert_eq!(same, "true", "interpreted and compiled answers differ");
+    let names: alloc::vec::Vec<&str> = last
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches(['0', '1']))
+        .collect();
+    assert_eq!(
+        names.join(","),
+        "nundefined,oobject,nboolean,nnumber,nnumber,nnumber,nnumber,nstring,nstring,nsymbol,\
+         nbigint,oobject,oobject,oobject,oobject,ffunction,ffunction,ffunction,ffunction,\
+         ffunction,ffunction,oobject,ffunction,oobject,ffunction,nundefined,oobject,oobject,\
+         oobject,oobject,oobject,oobject,oobject,oobject,ffunction,oobject,oobject"
+    );
+}

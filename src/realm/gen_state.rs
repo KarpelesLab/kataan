@@ -11,6 +11,7 @@ use super::Realm;
 use crate::cell::{Cell, VmFrame};
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 impl Realm {
@@ -133,12 +134,15 @@ impl Realm {
 
     /// The `[[Prototype]]` of the generator object `h` when it is an
     /// ordinary shaped object owning nothing but its one hidden state slot
-    /// (so every named lookup on it continues at that prototype).
+    /// (so every named lookup on it continues at that prototype). An own
+    /// accessor (kept beside the layout) is an own property too.
+    #[inline]
     pub(crate) fn generator_owns_only_state(&self, h: Handle) -> Option<Handle> {
         let o = self.heap.get(h)?.as_object()?;
         if o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0
-            || self.is_host_exotic(h)
             || o.shaped_shape()?.len() != 1
+            || !o.has_no_accessors()
+            || self.is_host_exotic(h)
         {
             return None;
         }
@@ -233,6 +237,74 @@ impl Realm {
         }
         self.no_then_stamp = crate::object::proto_epoch();
         true
+    }
+
+    /// A fresh generator object: `[[Prototype]]` `proto`, owning only the
+    /// non-enumerable state slot `key` (`VM_GEN`, or `VM_AGEN` for an async
+    /// generator: `is_async`) that holds `frame` — the object a fresh
+    /// object's [`set_hidden_property`](Self::set_hidden_property) of that
+    /// one key makes, built in its final layout at once.
+    pub(crate) fn new_generator_object(
+        &mut self,
+        proto: Option<Handle>,
+        key: &str,
+        is_async: bool,
+        frame: NanBox,
+    ) -> Handle {
+        if 1 < self.limits.object_dictionary_threshold {
+            let i = usize::from(is_async);
+            let shape = match &self.gen_shapes[i] {
+                Some(s) if s.last_key() == Some(key) => Rc::clone(s),
+                _ => {
+                    let s = self.root_shape.transition(key);
+                    self.gen_shapes[i] = Some(Rc::clone(&s));
+                    s
+                }
+            };
+            if let Some(mut obj) =
+                crate::object::Object::with_data_hidden_prefix(shape, &[frame], 1)
+            {
+                obj.set_proto(proto);
+                let h = self.heap.alloc(Cell::Object(obj));
+                if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
+                    marker.mark_grey(p);
+                }
+                self.write_barrier(h, frame);
+                return h;
+            }
+        }
+        let g = self.new_object_with_proto(proto);
+        self.set_hidden_property(g, key, frame);
+        g
+    }
+
+    /// The own `prototype` data property of the VM closure `h` when reading
+    /// it runs no code and makes nothing: `h` owes no prototype (it was
+    /// made already) and its auxiliary object holds no accessor; read
+    /// through the inline cache `cache`. `None` for anything else (the
+    /// general `[[Get]]`).
+    pub(crate) fn vm_fn_prototype_cached(
+        &self,
+        h: Handle,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
+        if !matches!(
+            self.heap.get(h)?,
+            Cell::VmFunction {
+                owes_proto: false,
+                ..
+            }
+        ) {
+            return None;
+        }
+        let aux = self
+            .heap
+            .get(*self.aux_props.get(&h.to_raw())?)?
+            .as_object()?;
+        if !aux.has_no_accessors() {
+            return None;
+        }
+        aux.cached_get("prototype", cache)
     }
 
     /// CreateIterResultObject(`value`, `done`): a fresh ordinary object with
