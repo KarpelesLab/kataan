@@ -1145,7 +1145,7 @@ pub trait VmHost {
     fn global_scope(&self) -> &crate::env::Scope;
     /// The global scope and the global object of the running realm: where
     /// every global-environment reference (`LoadGlobal`, `StoreGlobal`, …)
-    /// resolves. Such a reference belongs to code whose [[Environment]] chain
+    /// resolves. Such a reference belongs to code whose `[[Environment]]` chain
     /// reaches the global environment with nothing in between, so the scope
     /// running when it is evaluated (a caller's direct eval or `with` body)
     /// never matters. `None` when the host has no global environment. Needs

@@ -5512,7 +5512,7 @@ impl Interp {
     /// Runs `f` with the global environment as the running lexical scope: how
     /// the VM's global-environment references (`LoadGlobal`, `StoreGlobal`,
     /// `TypeofGlobal`, …) resolve. Such a reference belongs to code whose
-    /// [[Environment]] chain reaches the global environment with nothing in
+    /// `[[Environment]]` chain reaches the global environment with nothing in
     /// between, so it must never see the scope that happens to be running
     /// when it is evaluated — a direct eval's or a `with` body's in a caller.
     fn at_global_env<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
