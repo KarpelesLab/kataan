@@ -7611,7 +7611,15 @@ impl Realm {
             if (o.is_sealed() || o.is_non_configurable(key)) && o.has_own_key(key) {
                 return false;
             }
+            // A bound function (an ordinary object cell with the reserved
+            // `\0bnd_t` slot) has its `name`/`length` synthesized on read
+            // when the physical slot is absent: record the deletion, as for
+            // the callables below, so they do not come back.
+            let tomb = fn_meta_tombstone(key).filter(|_| o.has_own_key("\u{0}bnd_t"));
             o.delete(root, key);
+            if let Some(tomb) = tomb {
+                self.set_hidden_property(handle, tomb, NanBox::boolean(true));
+            }
             return true;
         }
         // A callable/array cell stores named props in its auxiliary object (e.g. a

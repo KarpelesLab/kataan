@@ -607,8 +607,9 @@ pub(super) fn enter_on_call(
     if jit.is_generic() {
         // A call site it could not inline has settled since: recompile
         // first (`JitProto::wants_recompile_on_entry`).
-        if jit.wants_recompile_on_entry(u32::try_from(id).unwrap_or(u32::MAX))
-            && let Some(new) = recompile(ctx, funcs, id, &jit, ic)
+        if jit.wants_recompile_on_entry(u32::try_from(id).unwrap_or(u32::MAX), &|k| {
+            could_inline(funcs, k)
+        }) && let Some(new) = recompile(ctx, funcs, id, &jit, ic)
         {
             jit = new;
         }
@@ -1128,7 +1129,14 @@ fn recompile(
     let cold = cold_call_pcs(proto, &hints);
     // (Its element access feedback: the old body's, and the caches'.)
     let kinds = crate::jit::typed::merge_kinds(old.elem_kinds(), &super::elem_kinds_of(ic));
-    let mut new = crate::jit::typed::with_own_kinds(kinds, || {
+    // (And what its inlined callees' sites learned.)
+    let inl = if crate::jit::inl_warm_enabled() {
+        old.inlined_warm()
+    } else {
+        alloc::vec::Vec::new()
+    };
+    let prev = INLINED_WARM.with(|iw| core::mem::replace(&mut *iw.borrow_mut(), inl));
+    let new = crate::jit::typed::with_own_kinds(kinds, || {
         crate::jit::with_entry_poll(!cold.is_empty(), || {
             crate::jit::JitProto::compile_generic_respec(
                 proto,
@@ -1144,7 +1152,9 @@ fn recompile(
                 &old.int_demote(),
             )
         })
-    })?;
+    });
+    INLINED_WARM.with(|iw| *iw.borrow_mut() = prev);
+    let mut new = new?;
     new.note_cold_calls(&cold);
     new.note_function(id);
     new.set_generation(old.generation() + 1);
@@ -1245,7 +1255,9 @@ pub(crate) extern "C" fn jit_helper_entry_poll(ctx: *mut core::ffi::c_void, word
         }
         return 0;
     };
-    let yes = jit.entry_poll(u32::try_from(id).unwrap_or(u32::MAX));
+    let yes = jit.entry_poll(u32::try_from(id).unwrap_or(u32::MAX), &|k| {
+        could_inline(funcs, k)
+    });
     if jit_log_enabled() {
         jit_log(
             id,
@@ -4977,14 +4989,14 @@ pub(crate) extern "C" fn jit_helper_backedge(
             return NanBox::jit_throw_bits();
         }
         vm_safepoint(ctx, funcs, program, regs);
-        return if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, header) {
+        return if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, funcs, header) {
             NanBox::jit_exit_bits()
         } else {
             1
         };
     }
     vm_safepoint(ctx, funcs, program, regs);
-    if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, header) {
+    if regs_addr == ctx.jit_rt.exit_regs && wants_to_leave(ctx, funcs, header) {
         ctx.jit_rt.leave_soon = false;
         return NanBox::jit_exit_bits();
     }
@@ -5071,7 +5083,7 @@ fn exit_stress() -> bool {
 /// ([`TierRuntime`]'s exit fields: its window is the one polling), should
 /// leave at loop header `header` to be recompiled: its body wants it
 /// (`JitProto::wants_recompile`). Records the header if so.
-fn wants_to_leave(ctx: &mut Ctx, header: usize) -> bool {
+fn wants_to_leave(ctx: &mut Ctx, funcs: &[FnProto], header: usize) -> bool {
     if ctx.jit_rt.exit_jit.is_null() {
         return false;
     }
@@ -5083,11 +5095,28 @@ fn wants_to_leave(ctx: &mut Ctx, header: usize) -> bool {
     // An inlined callee's loop has none — its activation is pending, the
     // interpreter has no frame to resume — so it never leaves.)
     let own = jit.orig_pc(header);
-    if own == usize::MAX || (!exit_stress() && !jit.wants_recompile(header)) {
+    if own == usize::MAX
+        || (!exit_stress() && !jit.wants_recompile(header, &|k| could_inline(funcs, k)))
+    {
         return false;
     }
     ctx.jit_rt.resume = Some(own);
     true
+}
+
+/// Whether the function with callee key `key` (`function id | capture count
+/// << 32`) could be inlined at a call site ([`inline_candidate_key`]'s own
+/// test of the callee): a call site that settled on any other is no reason
+/// to recompile its caller, which would inline nothing more
+/// (`JitProto::wants_recompile`). `KATAAN_JIT_COLDINL=0` (read once per
+/// process) counts every callee.
+fn could_inline(funcs: &[FnProto], key: u64) -> bool {
+    if !crate::jit::cold_inl_enabled() {
+        return true;
+    }
+    funcs
+        .get((key & 0xffff_ffff) as usize)
+        .is_some_and(|p| crate::jit::inline::callee_ok(p) || crate::jit::inline::construct_ok(p))
 }
 
 /// Whether the generic tier inlines calls (`KATAAN_JIT_INLINE=0` turns it
@@ -5220,6 +5249,14 @@ fn nested_candidates<'a>(
         .collect()
 }
 
+std::thread_local! {
+    /// While a body is recompiled: what the property-site caches of the
+    /// callees the old body inlined learned (`JitProto::inlined_warm`),
+    /// which [`inline_candidate_key`] lays over the callees' own feedback.
+    static INLINED_WARM: core::cell::RefCell<alloc::vec::Vec<(u32, usize, crate::ic::WarmEntry, bool)>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
+}
+
 /// [`inline_candidate_one`] without the callee's own inlined calls.
 fn inline_candidate_key(
     funcs: &[FnProto],
@@ -5251,6 +5288,22 @@ fn inline_candidate_key(
             *w = i;
         }
     }
+    // (What the inlined copies of its sites in the body being recompiled
+    // learned: `INLINED_WARM`.)
+    INLINED_WARM.with(|iw| {
+        for (f, pc, e, live) in iw.borrow().iter() {
+            if *f as usize != fid {
+                continue;
+            }
+            if warm.len() <= *pc {
+                warm.resize(*pc + 1, None);
+            }
+            let w = &mut warm[*pc];
+            if *live || !w.as_ref().is_some_and(crate::ic::WarmEntry::is_stable) {
+                *w = Some(e.clone());
+            }
+        }
+    });
     Some(crate::jit::inline::Candidate {
         key,
         proto,

@@ -145,6 +145,8 @@ struct Site<'a> {
     demote: Vec<(usize, Reg)>,
     /// Its element access feedback ([`Candidate::kinds`]), by this body's pc.
     kinds: Vec<(usize, u8)>,
+    /// Per op of this body: where it came from ([`Expanded::src_of`]).
+    src: Vec<u64>,
 }
 
 /// A way a site could inline ([`expand`]), before the caller's budget
@@ -259,6 +261,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
         .flatten();
     let own = proto.derived.then_some(key);
     let own_legacy = proto.legacy.then_some(key);
+    let fid = key & 0xffff_ffff;
     match inner {
         Some(e) => {
             let mut p = proto.clone();
@@ -280,6 +283,20 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                 .filter_map(|&(pc, k)| Some((*e.new_of.get(pc)? as usize, k)))
                 .collect();
             ks.extend(e.kinds);
+            // (Its own ops come from it, its inlined calls' from where
+            // that splice says.)
+            let src = e
+                .src_of
+                .iter()
+                .zip(&e.orig_of)
+                .map(|(&s, &o)| {
+                    if o == u32::MAX {
+                        s
+                    } else {
+                        fid << 32 | u64::from(o)
+                    }
+                })
+                .collect();
             Site {
                 key,
                 proto: alloc::borrow::Cow::Owned(p),
@@ -288,6 +305,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                 legacy,
                 demote: sites,
                 kinds: ks,
+                src,
             }
         }
         None => Site {
@@ -298,9 +316,13 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             legacy: own_legacy.into_iter().collect(),
             demote,
             kinds,
+            src: (0..proto.ops.len() as u64).map(|j| fid << 32 | j).collect(),
         },
     }
 }
+
+/// [`Expanded::src_of`] of an op no inlined body brought.
+pub const NO_SRC: u64 = u64::MAX;
 
 /// A caller's bytecode with its inlined calls spliced in.
 pub struct Expanded {
@@ -315,6 +337,10 @@ pub struct Expanded {
     pub orig_of: Vec<u32>,
     /// Per own pc (and one past the end): its new pc.
     pub new_of: Vec<u32>,
+    /// Per new pc: for an op an inlined body brought (at any depth), the
+    /// function it came from and its pc there (`function id << 32 | pc`);
+    /// [`NO_SRC`] for the function's own ops and the splice's own.
+    pub src_of: Vec<u64>,
     /// The callee keys (`Op::InlineGuard::key`) of the inlined calls, at
     /// any depth, whose function is a derived class constructor (whose
     /// construct leaves `this` unbound: `call_seq::ConstructFast::derived`).
@@ -1118,6 +1144,7 @@ pub fn expand<'a>(
     let mut ops: Vec<Op> = Vec::with_capacity(proto.ops.len() + added);
     let mut nwarm: Vec<Option<WarmEntry>> = Vec::with_capacity(proto.ops.len() + added);
     let mut orig_of: Vec<u32> = Vec::with_capacity(proto.ops.len() + added + 1);
+    let mut nsrc: Vec<u64> = Vec::with_capacity(proto.ops.len() + added);
     let mut new_of: Vec<u32> = Vec::with_capacity(proto.ops.len() + 1);
     let mut demote: Vec<(usize, Reg)> = Vec::new();
     let mut kinds: Vec<(usize, u8)> = Vec::new();
@@ -1200,6 +1227,7 @@ pub fn expand<'a>(
                     for o in [pre, Op::JumpIfFalse { cond: flag, target }] {
                         ops.push(o);
                         nwarm.push(None);
+                        nsrc.push(NO_SRC);
                         orig_of.push(u32::MAX);
                     }
                     spread_tail = Some((ok, flag, w.take()));
@@ -1210,6 +1238,7 @@ pub fn expand<'a>(
                     // throw from it is the call's, as `Op::CallKey`'s is.
                     ops.push(read);
                     nwarm.push(None);
+                    nsrc.push(NO_SRC);
                     orig_of.push(u32::MAX);
                     w = None;
                     alloc::borrow::Cow::Owned(call)
@@ -1254,6 +1283,7 @@ pub fn expand<'a>(
                     ($o:expr, $w:expr, $ops:expr $(,)?) => {{
                         $ops.push($o);
                         nwarm.push($w);
+                        nsrc.push(NO_SRC);
                         orig_of.push(u32::MAX);
                     }};
                 }
@@ -1403,6 +1433,9 @@ pub fn expand<'a>(
                                 return None;
                             }
                             emit!(o, bw, ops);
+                            if let Some(l) = nsrc.last_mut() {
+                                *l = c.src.get(j).copied().unwrap_or(NO_SRC);
+                            }
                         }
                     }
                 }
@@ -1439,16 +1472,19 @@ pub fn expand<'a>(
             // The call itself, with its warm cache.
             ops.push(op.clone());
             nwarm.push(w);
+            nsrc.push(NO_SRC);
             orig_of.push(u32::MAX);
             // A spread's: `ok`, the jump past the site, the spread call.
             if let (Some((ok, flag, sw)), Some(sop)) = (spread_tail, spread_op) {
                 for o in [Op::Move { dst: ok, src: flag }, Op::Jump { target: end }] {
                     ops.push(o);
                     nwarm.push(None);
+                    nsrc.push(NO_SRC);
                     orig_of.push(u32::MAX);
                 }
                 ops.push(sop);
                 nwarm.push(sw);
+                nsrc.push(NO_SRC);
                 orig_of.push(u32::MAX);
             }
             continue;
@@ -1465,10 +1501,12 @@ pub fn expand<'a>(
         }
         ops.push(o);
         nwarm.push(w);
+        nsrc.push(NO_SRC);
         orig_of.push(u32::try_from(pc).ok()?);
     }
     orig_of.push(u32::try_from(proto.ops.len()).ok()?);
     debug_assert_eq!(ops.len() + 1, orig_of.len());
+    debug_assert_eq!(ops.len(), nsrc.len());
     let mut derived: Vec<u64> = sites
         .iter()
         .flat_map(|(_, ways)| ways.iter().flat_map(|w| w.derived.iter().copied()))
@@ -1487,6 +1525,7 @@ pub fn expand<'a>(
         warm: nwarm,
         orig_of,
         new_of,
+        src_of: nsrc,
         derived,
         legacy,
         demote,

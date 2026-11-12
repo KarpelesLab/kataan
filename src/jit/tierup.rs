@@ -64,10 +64,37 @@ const ENTRY_RECOMPILE_SMALL: usize = 16 * 1024;
 /// How many times a function's generic body may be recompiled.
 pub const MAX_GENERATION: u8 = 3;
 
+/// Whether a call site that settled on a callee no recompilation could
+/// inline is no reason to recompile its caller (`JitProto::wants_recompile`
+/// and the entry polls take an `inlinable` test of the callee), while a large
+/// body whose cold call sites all settled so is recompiled at its entry poll
+/// when its property sites learned something since ([`JitProto::entry_poll`]);
+/// `KATAAN_JIT_COLDINL=0` turns it off (read once per process).
+#[must_use]
+pub fn cold_inl_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLDINL").is_none_or(|v| v != "0"))
+}
+
+/// Whether an inlined callee's property sites carry what their caches
+/// learned into the recompilation of the body that inlined them
+/// ([`JitProto::inlined_warm`]); `KATAAN_JIT_INLWARM=0` turns it off (read
+/// once per process). Off, a recompilation compiles an inlined callee's
+/// sites from the callee's own feedback only (which a callee that only
+/// ever runs inlined never improves), and the back-edge poll still asks
+/// for recompilations on account of those sites.
+#[must_use]
+pub fn inl_warm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INLWARM").is_none_or(|v| v != "0"))
+}
+
 /// What a body's recompilation checks need, recorded at compile time.
 pub(super) struct TierUp {
     /// `(pc, site)` of every `GetProp`/`SetProp`, by pc.
     pub(super) site_pcs: Vec<(usize, u16)>,
+    /// Per site: whether it is a `SetProp`'s.
+    pub(super) site_writes: Vec<bool>,
     /// Per loop header (ascending): the `(site, is a write)` of the property
     /// sites between it and its last back-edge.
     pub(super) loops: Vec<(usize, Vec<(u16, bool)>)>,
@@ -89,6 +116,9 @@ pub(super) struct TierUp {
     /// cache has since settled on a single callee is worth a recompilation
     /// that may inline it.
     pub(super) cold_calls: Vec<(usize, u16)>,
+    /// The call caches of the [`Self::cold_calls`] outside every loop (the
+    /// ones [`JitProto::wants_recompile_on_entry`] checks).
+    pub(super) entry_cold: Vec<u16>,
     /// `(pc, call cache)` of every inlined call's guard: one whose misses
     /// turned a speculative loop's fast version off
     /// (`call_seq::CallSite::spec_misses`) is worth a recompilation, which
@@ -133,6 +163,9 @@ pub(super) struct TierUp {
     pub(super) entry_seen: core::cell::Cell<u32>,
     /// The native-call entry's polls so far.
     pub(super) entry_round: core::cell::Cell<u8>,
+    /// The callee key [`JitProto::wants_recompile_on_entry`] last found not
+    /// inlinable (`call_seq::CallSite::EMPTY` for none).
+    pub(super) not_inlinable: core::cell::Cell<u64>,
 }
 
 /// The flag of a demotion site ([`JitProto::int_demote`]) inside an inlined
@@ -183,8 +216,14 @@ fn settled_call(s: &super::GenericSites, cache: u16) -> Option<u64> {
 
 /// Whether the call site whose cache is `cache` has taken a callee an
 /// inlining recompilation could use — one or a few, none of them function
-/// `own` (which never inlines itself) — if it has taken any.
-fn took_callee(s: &super::GenericSites, cache: u16, own: u32) -> Option<bool> {
+/// `own` (which never inlines itself), all of them `inlinable` — if it has
+/// taken any.
+fn took_callee(
+    s: &super::GenericSites,
+    cache: u16,
+    own: u32,
+    inlinable: &dyn Fn(u64) -> bool,
+) -> Option<bool> {
     let c = s.calls.get(cache as usize)?;
     // SAFETY: as in `settled_call`.
     #[allow(unsafe_code)]
@@ -197,7 +236,8 @@ fn took_callee(s: &super::GenericSites, cache: u16, own: u32) -> Option<bool> {
     };
     let n = keys().count();
     (n > 0).then(|| {
-        n <= crate::ic::CalleeHint::POLY_MAX && keys().all(|k| k & 0xffff_ffff != u64::from(own))
+        n <= crate::ic::CalleeHint::POLY_MAX
+            && keys().all(|k| k & 0xffff_ffff != u64::from(own) && inlinable(k))
     })
 }
 
@@ -210,9 +250,14 @@ impl TierUp {
         added: Vec<Option<(Rc<Shape>, u32)>>,
     ) -> Self {
         let mut site_pcs = Vec::new();
+        let mut site_writes = Vec::new();
         for (pc, op) in ops.iter().enumerate() {
             if let GenericOp::GetProp { site, .. } | GenericOp::SetProp { site, .. } = *op {
                 site_pcs.push((pc, site));
+                if site_writes.len() <= site as usize {
+                    site_writes.resize(site as usize + 1, false);
+                }
+                site_writes[site as usize] = matches!(op, GenericOp::SetProp { .. });
             }
         }
         // Each header's extent: up to its last back-edge.
@@ -246,12 +291,14 @@ impl TierUp {
             .collect();
         Self {
             site_pcs,
+            site_writes,
             loops,
             baked,
             added,
             extents,
             num_slots: Vec::new(),
             cold_calls: Vec::new(),
+            entry_cold: Vec::new(),
             spec_regions: Vec::new(),
             spec_off: Vec::new(),
             int_regions: Vec::new(),
@@ -281,6 +328,7 @@ impl TierUp {
             entry_asked: core::cell::Cell::new(false),
             entry_seen: core::cell::Cell::new(0),
             entry_round: core::cell::Cell::new(0),
+            not_inlinable: core::cell::Cell::new(super::call_seq::CallSite::EMPTY),
         }
     }
 }
@@ -311,6 +359,17 @@ impl JitProto {
                     .ok()?;
                 Some((pc, s.call_pcs[i].1))
             })
+            .collect();
+        let t = &mut s.tier_up;
+        t.entry_cold = t
+            .cold_calls
+            .iter()
+            .filter(|&&(pc, _)| {
+                !t.extents
+                    .iter()
+                    .any(|&(head, end)| (head..=end).contains(&pc))
+            })
+            .map(|&(_, cache)| cache)
             .collect();
     }
 
@@ -459,9 +518,11 @@ impl JitProto {
     /// code: one of its property sites' runtime caches now holds a stable
     /// layout (the same test the compiler applies to the interpreter's) other
     /// than the one compiled in, if any — while the function's
-    /// recompilation budget lasts.
+    /// recompilation budget lasts. (A cold call site that settled counts
+    /// only when its callee is `inlinable`, by its key: a recompilation
+    /// could not inline any other.)
     #[must_use]
-    pub fn wants_recompile(&self, header: usize) -> bool {
+    pub fn wants_recompile(&self, header: usize, inlinable: &dyn Fn(u64) -> bool) -> bool {
         let Some(s) = self.sites.as_ref() else {
             return false;
         };
@@ -531,40 +592,83 @@ impl JitProto {
         }
         t.countdown.set(CHECK_EVERY);
         if let Some((head, end)) = calls
-            && t.cold_calls
-                .iter()
-                .any(|&(pc, cache)| (head..=end).contains(&pc) && settled_call(s, cache).is_some())
+            && t.cold_calls.iter().any(|&(pc, cache)| {
+                (head..=end).contains(&pc) && settled_call(s, cache).is_some_and(inlinable)
+            })
         {
             return true;
         }
         let Some(i) = props else {
             return false;
         };
-        t.loops[i].1.iter().any(|&(site, write)| {
-            let site = site as usize;
-            // A Number-only slot the loop's code may rely on no longer is.
-            if !write
-                && t.num_slots.get(site).copied().unwrap_or(false)
-                && let Some(Some((shape, slot))) = t.baked.get(site)
-                && shape.may_be_non_number(*slot)
-            {
-                return true;
-            }
-            let (Some(cache), Some(key)) = (s.caches.get(site), s.keys.get(site)) else {
-                return false;
-            };
-            // SAFETY: the body that writes this cache (through its raw pointer)
-            // is suspended in the poll's call, and no other borrow of it is live.
-            #[allow(unsafe_code)]
-            let Some((shape, slot, by_add)) = (unsafe { (*cache.get()).stable_memo() }) else {
-                return false;
-            };
-            !(write && (by_add || shape.is_wrapper()))
-                && !t
-                    .baked
-                    .get(site)
-                    .is_some_and(|b| b.as_ref().is_some_and(|(s, _)| Rc::ptr_eq(s, shape)))
-                && shape.lookup(key) == Some(slot)
+        t.loops[i]
+            .1
+            .iter()
+            .any(|&(site, write)| self.site_learned(site as usize, write))
+    }
+
+    /// Whether property site `site` (a write if `write`) learned something a
+    /// recompilation would compile in: its compiled-in layout's slot, which
+    /// the code relies on holding only Numbers, no longer does; or its cache
+    /// now holds a stable layout other than the one compiled in (a write's
+    /// by a plain store), which has the key at the cached slot.
+    fn site_learned(&self, site: usize, write: bool) -> bool {
+        let Some(s) = self.sites.as_ref() else {
+            return false;
+        };
+        let t = &s.tier_up;
+        // A Number-only slot the loop's code may rely on no longer is.
+        if !write
+            && t.num_slots.get(site).copied().unwrap_or(false)
+            && let Some(Some((shape, slot))) = t.baked.get(site)
+            && shape.may_be_non_number(*slot)
+        {
+            return true;
+        }
+        let (Some(cache), Some(key)) = (s.caches.get(site), s.keys.get(site)) else {
+            return false;
+        };
+        // (An inlined callee's site whose origin is unknown: no
+        // recompilation would compile what its cache learned in.)
+        if inl_warm_enabled()
+            && t.site_pcs
+                .iter()
+                .find(|&&(_, x)| x as usize == site)
+                .is_some_and(|&(pc, _)| {
+                    self.orig_pc(pc) == usize::MAX && self.inl_src(pc).is_none()
+                })
+        {
+            return false;
+        }
+        // SAFETY: the body that writes this cache (through its raw pointer)
+        // is suspended in the poll's call, and no other borrow of it is live.
+        #[allow(unsafe_code)]
+        let Some((shape, slot, by_add)) = (unsafe { (*cache.get()).stable_memo() }) else {
+            return false;
+        };
+        !(write && (by_add || shape.is_wrapper()))
+            && !t
+                .baked
+                .get(site)
+                .is_some_and(|b| b.as_ref().is_some_and(|(s, _)| Rc::ptr_eq(s, shape)))
+            && shape.lookup(key) == Some(slot)
+    }
+
+    /// Whether any property site of this body learned something a
+    /// recompilation would compile in ([`Self::site_learned`]).
+    fn any_site_learned(&self) -> bool {
+        let Some(s) = self.sites.as_ref() else {
+            return false;
+        };
+        s.tier_up.site_pcs.iter().any(|&(_, site)| {
+            self.site_learned(
+                site as usize,
+                s.tier_up
+                    .site_writes
+                    .get(site as usize)
+                    .copied()
+                    .unwrap_or(true),
+            )
         })
     }
 
@@ -579,23 +683,40 @@ impl JitProto {
     /// no reason: a function never inlines itself. A call from Rust code
     /// costs far more than the check, so every one checks, until the body
     /// has said yes once: a site that settled on a callee that could not
-    /// be inlined is no cold site of the recompilation.)
+    /// be inlined is no cold site of the recompilation; nor is one whose
+    /// callee is not `inlinable`, by its key.)
     #[must_use]
-    pub fn wants_recompile_on_entry(&self, own: u32) -> bool {
+    pub fn wants_recompile_on_entry(&self, own: u32, inlinable: &dyn Fn(u64) -> bool) -> bool {
         let Some(s) = self.sites.as_ref() else {
             return false;
         };
         let t = &s.tier_up;
-        if t.generation >= MAX_GENERATION || t.cold_calls.is_empty() || t.entry_asked.get() {
+        if t.generation >= MAX_GENERATION || t.entry_cold.is_empty() || t.entry_asked.get() {
             return false;
         }
-        let yes = t.cold_calls.iter().any(|&(pc, cache)| {
-            !t.extents
-                .iter()
-                .any(|&(head, end)| (head..=end).contains(&pc))
-                && settled_call(s, cache).is_some_and(|k| k & 0xffff_ffff != u64::from(own))
+        // (A callee found not inlinable is remembered: this runs on every
+        // call from Rust code.)
+        let usable = |k: u64| {
+            if k == t.not_inlinable.get() {
+                return false;
+            }
+            let ok = inlinable(k);
+            if !ok {
+                t.not_inlinable.set(k);
+            }
+            ok
+        };
+        let yes = t.entry_cold.iter().any(|&cache| {
+            settled_call(s, cache).is_some_and(|k| k & 0xffff_ffff != u64::from(own) && usable(k))
         });
-        t.entry_asked.set(yes);
+        // (Nor does it ask again once each such site has taken callees:
+        // the answer can no longer change.)
+        let done = yes
+            || (cold_inl_enabled()
+                && t.entry_cold
+                    .iter()
+                    .all(|&cache| took_callee(s, cache, own, &|_| true).is_some()));
+        t.entry_asked.set(done);
         yes
     }
 
@@ -608,9 +729,10 @@ impl JitProto {
     /// body was compiled, and the rest are no longer being reached. While
     /// none has, each poll waits twice as long as the one before (up to
     /// [`ENTRY_ROUNDS`] doublings); once some have, the next poll comes
-    /// soon. All while the recompilation budget lasts.
+    /// soon. All while the recompilation budget lasts. (A callee counts as
+    /// usable only when `inlinable`, by its key.)
     #[must_use]
-    pub fn entry_poll(&self, own: u32) -> bool {
+    pub fn entry_poll(&self, own: u32, inlinable: &dyn Fn(u64) -> bool) -> bool {
         let Some(s) = self.sites.as_ref() else {
             return false;
         };
@@ -621,7 +743,7 @@ impl JitProto {
         }
         let (mut learned, mut open) = (0u32, 0u32);
         for &(_, cache) in &t.cold_calls {
-            match took_callee(s, cache, own) {
+            match took_callee(s, cache, own, inlinable) {
                 Some(true) => learned += 1,
                 Some(false) => {}
                 None => open += 1,
@@ -636,9 +758,12 @@ impl JitProto {
             // function itself, as a recursive `fib`'s second call; or too
             // many): nothing more to learn. A small body is recompiled once
             // more all the same — its recompilation has no cold sites,
-            // so no poll costing every call; a large one stops polling.
+            // so no poll costing every call; a large one stops polling,
+            // unless its property sites learned since (a body only compiled
+            // callers enter never polls at a back-edge for them).
             s.persist.set_entry_poll(u64::MAX);
-            return self.code_len() <= ENTRY_RECOMPILE_SMALL;
+            return self.code_len() <= ENTRY_RECOMPILE_SMALL
+                || (cold_inl_enabled() && self.any_site_learned());
         }
         t.entry_seen.set(learned);
         let first = super::global_persist::ENTRY_FIRST;
@@ -660,6 +785,69 @@ impl JitProto {
         self.sites
             .as_ref()
             .map_or(0, |s| s.persist.entry_poll_addr())
+    }
+
+    /// Where body pc `pc`'s op came from when an inlined callee brought it:
+    /// `(function id, its pc there)` (`inline::Expanded::src_of`).
+    #[must_use]
+    pub fn inl_src(&self, pc: usize) -> Option<(u32, usize)> {
+        let s = *self.pc_map.as_ref()?.2.get(pc)?;
+        (s != super::inline::NO_SRC).then_some(((s >> 32) as u32, (s & 0xffff_ffff) as usize))
+    }
+
+    /// The memos the property-site caches of the callees this body inlined
+    /// hold, as `(function id, its pc, memo, live)`, with the same rules as
+    /// [`Self::runtime_warm`] (a compiled-in layout counts as settled unless
+    /// the cache settled on another; `live`: the cache's own stable memo,
+    /// not the compiled-in layout): what a recompilation that inlines the
+    /// same callees compiles their spliced sites from, before their own
+    /// feedback (which a callee that only runs inlined never improves). A
+    /// site whose cache knows nothing stable is left out.
+    #[must_use]
+    pub fn inlined_warm(&self) -> Vec<(u32, usize, crate::ic::WarmEntry, bool)> {
+        let Some(s) = self.sites.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &(pc, site) in &s.tier_up.site_pcs {
+            if self.orig_pc(pc) != usize::MAX {
+                continue;
+            }
+            let (Some((f, fpc)), Some(c)) = (self.inl_src(pc), s.caches.get(site as usize)) else {
+                continue;
+            };
+            // SAFETY: as in `wants_recompile` (or the body is not running).
+            #[allow(unsafe_code)]
+            let w = unsafe { (*c.get()).warm_entry() };
+            let baked = s.tier_up.baked.get(site as usize).cloned().flatten();
+            let added = s.tier_up.added.get(site as usize).cloned().flatten();
+            let (e, live) = match (w, baked, added) {
+                (Some(w), _, _) if w.is_stable() => (w, true),
+                (_, Some((shape, slot)), _) => (
+                    crate::ic::WarmEntry {
+                        shape,
+                        slot,
+                        hits: BAKED_HITS,
+                        misses: 0,
+                        by_add: false,
+                    },
+                    false,
+                ),
+                (_, None, Some((shape, slot))) => (
+                    crate::ic::WarmEntry {
+                        shape,
+                        slot,
+                        hits: BAKED_HITS,
+                        misses: 0,
+                        by_add: true,
+                    },
+                    false,
+                ),
+                _ => continue,
+            };
+            out.push((f, fpc, e, live));
+        }
+        out
     }
 
     /// The memos this body's own property-site caches hold, by the

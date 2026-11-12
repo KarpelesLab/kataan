@@ -88,7 +88,7 @@ pub use props::MethodSite;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use props::shape_word;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-pub use tierup::{MAX_GENERATION, with_entry_poll};
+pub use tierup::{MAX_GENERATION, cold_inl_enabled, inl_warm_enabled, with_entry_poll};
 
 /// `2^53` — the largest magnitude an `f64` represents every integer below
 /// exactly. The integer JIT keeps a value only while it stays within ±this; a
@@ -3402,6 +3402,12 @@ pub struct NativeEntries {
     room: usize,
 }
 
+/// A generic body's pc maps when it inlined calls (`JitProto::pc_map`): per
+/// own pc its body pc, per body pc the own pc (`u32::MAX` inside an inlined
+/// body), per body pc an inlined op's origin (`inline::Expanded::src_of`).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+type PcMap = (Vec<u32>, Vec<u32>, Vec<u64>);
+
 /// A bytecode-VM function compiled to native code, callable from the VM with
 /// `NanBox` values. This is the end-to-end fast path: it owns the compiled
 /// machine code and performs the unbox→native→rebox round-trip with an integer
@@ -3435,8 +3441,9 @@ pub struct JitProto {
     sites: Option<GenericSites>,
     /// Generic tier, a body that inlined calls (`inline`): its pc maps — per
     /// own pc its pc in the body, and per body pc the function's own (or
-    /// `u32::MAX` inside an inlined body).
-    pc_map: Option<alloc::boxed::Box<(Vec<u32>, Vec<u32>)>>,
+    /// `u32::MAX` inside an inlined body); and per body pc where an inlined
+    /// body's op came from (`inline::Expanded::src_of`).
+    pc_map: Option<alloc::boxed::Box<PcMap>>,
     /// Int tier: the body returns a comparison's native `0`/`1` (a predicate;
     /// see [`numeric_tier_booleans`]), which [`Self::call_guarded`] boxes as
     /// a boolean. Such a body is never a native callee of another Int body.
@@ -4415,7 +4422,7 @@ impl JitProto {
                 (
                     &spliced,
                     e.warm,
-                    Some(alloc::boxed::Box::new((e.new_of, e.orig_of))),
+                    Some(alloc::boxed::Box::new((e.new_of, e.orig_of, e.src_of))),
                 )
             }
             None => (proto, warm.to_vec(), None),
