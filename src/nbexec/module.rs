@@ -388,6 +388,10 @@ pub struct ModuleRegistry {
     /// A VM fault happened where it could not propagate (see
     /// `Interp::vm_module_faulted`).
     vm_fault: bool,
+    /// The keys of the JavaScript modules loaded but not yet tried for the VM
+    /// (what `vm_compile_pending` compiles), so a link does not scan every
+    /// loaded module: that made N dynamic imports O(N²).
+    vm_pending: Vec<String>,
 }
 
 /// A VM module's environment: its scope and its import alias table.
@@ -410,6 +414,7 @@ impl ModuleRegistry {
             vm_table: None,
             vm_note: None,
             vm_fault: false,
+            vm_pending: Vec::new(),
         }
     }
 
@@ -564,6 +569,9 @@ impl Interp {
             .map(|i| (i.key.clone(), i.type_attr.clone()))
             .chain(record.reexports.iter().map(reexport_key_type))
             .collect();
+        if !record.vm_tried && matches!(record.kind, ModuleKind::JavaScript) {
+            self.modules.vm_pending.push(key.to_string());
+        }
         self.modules.records.insert(key.to_string(), record);
         for (dep, dep_type) in deps {
             self.load_module(&dep, host, dep_type.as_deref())?;
@@ -2613,20 +2621,28 @@ impl Interp {
     /// Compiles every loaded JavaScript module not yet tried for the VM. A
     /// module the VM refuses fails to link (see `instantiate_module_functions`).
     fn vm_compile_pending(&mut self) {
-        let pending: Vec<String> = self
-            .modules
-            .records
-            .values()
-            .filter(|r| {
-                !r.vm_tried
-                    && matches!(r.kind, ModuleKind::JavaScript)
-                    && matches!(r.status, Status::New | Status::Loaded)
-            })
-            .map(|r| r.key.clone())
-            .collect();
+        // The untried JavaScript modules, in key order; one not yet `New` or
+        // `Loaded` stays queued for a later link.
+        let mut pending: Vec<String> = Vec::new();
+        let mut later: Vec<String> = Vec::new();
+        for key in core::mem::take(&mut self.modules.vm_pending) {
+            match self.modules.records.get(&key) {
+                Some(r) if !r.vm_tried && matches!(r.kind, ModuleKind::JavaScript) => {
+                    if matches!(r.status, Status::New | Status::Loaded) {
+                        pending.push(key);
+                    } else {
+                        later.push(key);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.modules.vm_pending = later;
         if pending.is_empty() {
             return;
         }
+        pending.sort_unstable();
+        pending.dedup();
         let old = self.module_vm_table().unwrap_or_default();
         let mut table = crate::nbvm::ProtoVec::after(old.len());
         for key in pending {

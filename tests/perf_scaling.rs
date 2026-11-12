@@ -383,3 +383,60 @@ fn scope_early_errors_are_linear() {
         );
     }
 }
+
+/// An in-memory module host for the module workloads: `entry` is the given
+/// source, any other key `m<i>` a tiny module exporting `i`.
+#[cfg(all(feature = "module", feature = "std"))]
+struct GenHost(String);
+
+#[cfg(all(feature = "module", feature = "std"))]
+impl kataan::nbexec::module::ModuleHost for GenHost {
+    fn resolve(&self, specifier: &str, _referrer: Option<&str>) -> Result<String, String> {
+        Ok(specifier.to_string())
+    }
+    fn load(&self, key: &str) -> Result<String, String> {
+        if key == "entry" {
+            return Ok(self.0.clone());
+        }
+        let i = key.trim_start_matches('m');
+        Ok(format!(
+            "export default {i}; export function f() {{ return {i}; }}"
+        ))
+    }
+}
+
+/// Loading modules is linear in their number: each link compiled the modules
+/// the loader had just added by scanning every loaded module for untried
+/// ones, so an N-module graph (or N dynamic imports) was O(N²) — 16 000
+/// modules took 0.6-0.8 s. Untried modules are now queued at load.
+#[cfg(all(feature = "module", feature = "std"))]
+#[test]
+fn module_loading_is_linear() {
+    // Wall clock around the whole run: the imports load and link before any
+    // module code runs, so the script cannot time them itself. Realm setup
+    // is a small constant next to thousands of modules.
+    let run = |n: usize| -> f64 {
+        let mut src = String::new();
+        for i in 0..n {
+            src.push_str(&format!("import m{i} from 'm{i}';\n"));
+        }
+        src.push_str(&format!("console.log(m0 + m{});", n - 1));
+        let t = std::time::Instant::now();
+        let (out, _) = kataan::nbvm::execute_module_typed(
+            "entry",
+            &GenHost(src),
+            kataan::limits::Limits::default(),
+        )
+        .unwrap_or_else(|e| panic!("module workload threw: {}: {}", e.name, e.message));
+        assert_eq!(out.trim(), (n - 1).to_string());
+        (t.elapsed().as_secs_f64() * 1000.0).max(1.0)
+    };
+    let best = |n: usize| (0..3).map(|_| run(n)).fold(f64::INFINITY, f64::min);
+    let (small, large) = (best(2_000), best(8_000));
+    let ratio = large / small;
+    assert!(
+        ratio <= 8.0,
+        "module graph: scaling n x4 scaled the work x{ratio:.1} (bound 8.0) — \
+         {small:.0}ms at n=2000 vs {large:.0}ms at n=8000. Linear is ~4, quadratic ~16."
+    );
+}
