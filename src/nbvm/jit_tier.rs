@@ -1753,17 +1753,70 @@ pub(crate) extern "C" fn jit_helper_to_str(
 /// closure with the default `[[HasInstance]]`, `x`'s chain ordinary): the
 /// boolean's bits; `0`, having done nothing observable, for anything else
 /// (the op itself runs). Runs no JavaScript and never throws.
+///
+/// With `memo` (the address of the site's three-word memo,
+/// `crate::jit::instof`, else `0`), an answer also records `f`, its
+/// `prototype` and the prototype epoch there, `f` watched first.
 pub(crate) extern "C" fn jit_helper_instance_of(
     ctx: *mut core::ffi::c_void,
     x: u64,
     f: u64,
-    _unused: u64,
+    memo: u64,
 ) -> u64 {
     // SAFETY: as `jit_helper_site_fill`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
-    super::instance_of_fast(&mut ctx.realm, NanBox::from_bits(x), NanBox::from_bits(f))
-        .map_or(0, |r| NanBox::boolean(r).to_bits())
+    let r = super::instance_of_fast(&mut ctx.realm, NanBox::from_bits(x), NanBox::from_bits(f));
+    if memo != 0 && r.is_some() {
+        instance_of_memo_fill(&mut ctx.realm, NanBox::from_bits(f), memo);
+    }
+    r.map_or(0, |r| NanBox::boolean(r).to_bits())
+}
+
+/// Records in the memo at `memo` (`crate::jit::instof`) that `f`, a VM
+/// closure `instance_of_fast` just answered for (the default
+/// `[[HasInstance]]`), holds its `prototype` as a data property at an
+/// address of its auxiliary object (shaped, no accessors), as of the
+/// prototype epoch read after watching `f` and that object: any change to
+/// their layout (an own `@@hasInstance` added, `prototype` deleted or made an
+/// accessor, the object's slots moved) or to `f`'s `[[Prototype]]` retires
+/// the stamp, while the value at the address is read live. Nothing in a
+/// multi-realm run (which `instance_of_fast`'s memo does not serve either).
+fn instance_of_memo_fill(realm: &mut crate::realm::Realm, f: NanBox, memo: u64) {
+    if realm.multi_realm {
+        return;
+    }
+    let Some(fh) = f.as_handle().map(Handle::from_raw) else {
+        return;
+    };
+    if !matches!(realm.instance_of_target(fh), Some(Some(_))) {
+        return;
+    }
+    let Some(aux) = realm.jit_aux_of(fh) else {
+        return;
+    };
+    let Some(ptr) = realm.jit_object(aux).and_then(|o| {
+        if !o.has_no_accessors() {
+            return None;
+        }
+        let slot = o.shaped_shape()?.lookup("prototype")?;
+        o.jit_slot_ptr(slot)
+    }) else {
+        return;
+    };
+    realm.watch_cell(fh.to_raw());
+    let stamp = crate::object::proto_epoch();
+    // SAFETY: `memo` addresses three words of the calling body's persistent
+    // array (`global_persist::Persist::with_extra`), alive while its code
+    // runs, which only that code (suspended in this call) and this helper
+    // touch.
+    #[allow(unsafe_code)]
+    unsafe {
+        let w = memo as usize as *mut u64;
+        *w = f.to_bits();
+        *w.add(1) = ptr as usize as u64;
+        *w.add(2) = stamp;
+    }
 }
 
 /// `Op::SwitchStr` at `op` of the discriminant `v`: the index of the first

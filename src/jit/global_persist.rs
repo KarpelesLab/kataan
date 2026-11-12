@@ -113,10 +113,11 @@ pub(super) struct Persist {
 }
 
 impl Persist {
-    /// A fresh array, every entry and epoch empty.
-    pub(super) fn new() -> Self {
+    /// A fresh array, every entry and epoch empty, with `extra` zeroed words
+    /// past [`ENTRY_POLL`] for other memos ([`extra_off`]).
+    pub(super) fn with_extra(extra: usize) -> Self {
         Self {
-            words: (0..=ENTRY_POLL)
+            words: (0..=ENTRY_POLL + extra)
                 .map(|w| {
                     core::cell::UnsafeCell::new(match w {
                         _ if w < LEN => EMPTY,
@@ -178,6 +179,11 @@ impl Persist {
     pub(super) fn addr(&self) -> u64 {
         core::cell::UnsafeCell::raw_get(self.words.as_ptr()) as usize as u64
     }
+}
+
+/// Byte offset of the extra word `k` ([`Persist::with_extra`]).
+pub(super) fn extra_off(k: usize) -> i32 {
+    off(ENTRY_POLL + 1 + k)
 }
 
 /// Byte offset of word `w`.

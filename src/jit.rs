@@ -54,6 +54,8 @@ mod handle;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod instof;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod key_probe;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod pin;
@@ -4769,7 +4771,24 @@ impl JitProto {
         }));
         osr_entries.sort_unstable();
         osr_entries.dedup();
-        let persist = global_persist::Persist::new();
+        // (Past its words, the `instanceof` sites' memos: `instof`.)
+        let n_instof = if instof::memo_enabled() {
+            bytecode
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        crate::nbvm::Op::Relational {
+                            instanceof: true,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        } else {
+            0
+        };
+        let persist = global_persist::Persist::with_extra(n_instof * instof::MEMO_WORDS);
         // (In the body's numbering.)
         let no_spec_body: Vec<usize> = no_spec
             .iter()
@@ -13696,20 +13715,69 @@ impl JitFunction {
                         {
                             let slow = a.new_label();
                             let done = a.new_label();
-                            a.mov_rdi_r15();
-                            a.load_argreg(1, disp(*x));
-                            a.load_argreg(2, disp(*f));
-                            a.movabs_rax(helpers.instance_of as usize as i64);
-                            a.call_rax();
-                            a.test_rax_rax();
-                            a.je(slow);
-                            a.store_rax(disp(*dst));
-                            let cold = a.cold_begin();
-                            a.bind(slow);
-                            exec_op!(pc);
-                            a.jmp(done);
-                            a.cold_end(cold);
-                            a.bind(done);
+                            // The site's memo (`instof`), the `k`th of the
+                            // body's sites.
+                            let memo = instof::memo_enabled().then(|| {
+                                let k = bytecode[..op_idx]
+                                    .iter()
+                                    .filter(|o| {
+                                        matches!(
+                                            o,
+                                            crate::nbvm::Op::Relational {
+                                                instanceof: true,
+                                                ..
+                                            }
+                                        )
+                                    })
+                                    .count();
+                                persist + global_persist::extra_off(k * instof::MEMO_WORDS) as u64
+                            });
+                            if let Some(m) = memo {
+                                // The memo's answer in line, the helper (and
+                                // then the op) out of line.
+                                let call = a.new_label();
+                                let cl = &helpers.call_layout;
+                                a.instof_memo_hit(
+                                    &layout,
+                                    (cl.realm, cl.multi_realm),
+                                    m,
+                                    (disp(*x), disp(*f), disp(*dst)),
+                                    (call, done),
+                                );
+                                let cold = a.cold_begin();
+                                a.bind(call);
+                                a.mov_rdi_r15();
+                                a.load_argreg(1, disp(*x));
+                                a.load_argreg(2, disp(*f));
+                                a.movabs_argreg(3, m as i64);
+                                a.movabs_rax(helpers.instance_of as usize as i64);
+                                a.call_rax();
+                                a.test_rax_rax();
+                                a.je(slow);
+                                a.store_rax(disp(*dst));
+                                a.jmp(done);
+                                a.bind(slow);
+                                exec_op!(pc);
+                                a.jmp(done);
+                                a.cold_end(cold);
+                                a.bind(done);
+                            } else {
+                                a.mov_rdi_r15();
+                                a.load_argreg(1, disp(*x));
+                                a.load_argreg(2, disp(*f));
+                                a.movabs_argreg(3, 0);
+                                a.movabs_rax(helpers.instance_of as usize as i64);
+                                a.call_rax();
+                                a.test_rax_rax();
+                                a.je(slow);
+                                a.store_rax(disp(*dst));
+                                let cold = a.cold_begin();
+                                a.bind(slow);
+                                exec_op!(pc);
+                                a.jmp(done);
+                                a.cold_end(cold);
+                                a.bind(done);
+                            }
                         }
                         // A `for-in`'s per-key liveness check `key in obj`
                         // (its key register one of `forin_keys`), decided
