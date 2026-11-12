@@ -585,10 +585,10 @@ pub struct Interp {
     /// While this interpreter hosts a bytecode-VM run (`ROADMAP.md` §2.0), the
     /// run's function table, so a VM function value the interpreter is asked to
     /// call (a callback handed to a built-in) runs on the VM.
-    vm_table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
+    vm_table: Option<crate::nbvm::FnTable>,
     /// The function table eval code extended (functions it defined appended to
     /// the run's table; see `vm_env`).
-    vm_ext_table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
+    vm_ext_table: Option<crate::nbvm::FnTable>,
     /// The running realms bytecode-VM activations of cross-realm functions
     /// entered (see `VmHost::enter_fn_realm`), innermost last.
     vm_realm_guards: Vec<call::RealmGuard>,
@@ -5961,23 +5961,16 @@ impl Interp {
             let m = self.new_str("`import`/`export` may only appear at the top level of a module");
             return Err(ExecError::Throw(self.make_error(N_SYNTAX_ERROR, Some(m))));
         }
-        let mut table = self.vm_table_vec();
-        let main = crate::nbvm::compile_program_into(program, true, &mut table)
+        let old = self.vm_newest_table().unwrap_or_default();
+        let mut tail = crate::nbvm::ProtoVec::after(old.len());
+        let main = crate::nbvm::compile_program_tail(program, true, &mut tail)
             .map_err(|e| self.compile_error(&e, "the bytecode compiler refused this program"))?;
-        let table: alloc::rc::Rc<[crate::nbvm::FnProto]> = table.into();
+        let table = old.extended(tail.into_tail());
         // Installed for good, not just for this run: closures the script leaves
         // behind (in globals, timers, promise reactions) stay callable after it.
-        self.install_vm_table(alloc::rc::Rc::clone(&table));
+        self.install_vm_table(table.clone());
         self.prepare_script_for_vm(program)?;
         crate::nbvm::run_program_hosted(self, &table, main as usize, &[]).map_err(vm_to_exec)
-    }
-
-    /// The function table VM code compiled into this interpreter lives in (a
-    /// copy, to extend with more code); empty before the first VM run.
-    fn vm_table_vec(&self) -> Vec<crate::nbvm::FnProto> {
-        self.vm_newest_table()
-            .map(|t| t.to_vec())
-            .unwrap_or_default()
     }
 
     /// Installs `table` (the newest table extended with new code) as this
@@ -5985,8 +5978,8 @@ impl Interp {
     /// The one growth chain every VM compilation into this interpreter extends
     /// — scripts (`run`), eval code / `Function` bodies and dynamically
     /// imported modules — so each table is a prefix of the next.
-    pub(crate) fn install_vm_table(&mut self, table: alloc::rc::Rc<[crate::nbvm::FnProto]>) {
-        self.vm_ext_table = Some(alloc::rc::Rc::clone(&table));
+    pub(crate) fn install_vm_table(&mut self, table: crate::nbvm::FnTable) {
+        self.vm_ext_table = Some(table.clone());
         #[cfg(all(feature = "module", feature = "std"))]
         self.install_module_vm_table(table);
         #[cfg(not(all(feature = "module", feature = "std")))]
@@ -10103,15 +10096,12 @@ impl crate::nbvm::VmHost for Interp {
         (NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw()))
     }
 
-    fn peek_batch_job(
-        &self,
-        table: &alloc::rc::Rc<[crate::nbvm::FnProto]>,
-    ) -> Option<(NanBox, NanBox)> {
+    fn peek_batch_job(&self, table: &crate::nbvm::FnTable) -> Option<(NanBox, NanBox)> {
         if !self.async_batch
             || !self
                 .vm_table
                 .as_ref()
-                .is_some_and(|t| alloc::rc::Rc::ptr_eq(t, table))
+                .is_some_and(|t| crate::nbvm::FnTable::ptr_eq(t, table))
         {
             return None;
         }
@@ -10128,13 +10118,13 @@ impl crate::nbvm::VmHost for Interp {
         self.microtasks.pop_front();
     }
 
-    fn batch_queue_empty(&self, table: &alloc::rc::Rc<[crate::nbvm::FnProto]>) -> bool {
+    fn batch_queue_empty(&self, table: &crate::nbvm::FnTable) -> bool {
         self.async_batch
             && self.microtasks.is_empty()
             && self
                 .vm_table
                 .as_ref()
-                .is_some_and(|t| alloc::rc::Rc::ptr_eq(t, table))
+                .is_some_and(|t| crate::nbvm::FnTable::ptr_eq(t, table))
     }
 
     fn await_resume(
@@ -10777,7 +10767,7 @@ impl crate::nbvm::VmHost for Interp {
         self.vm_env_op(req).map_err(exec_to_host)
     }
 
-    fn vm_table_now(&mut self) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
+    fn vm_table_now(&mut self) -> Option<crate::nbvm::FnTable> {
         self.vm_newest_table()
     }
 
@@ -10809,8 +10799,8 @@ impl crate::nbvm::VmHost for Interp {
 
     fn set_vm_table(
         &mut self,
-        table: Option<alloc::rc::Rc<[crate::nbvm::FnProto]>>,
-    ) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
+        table: Option<crate::nbvm::FnTable>,
+    ) -> Option<crate::nbvm::FnTable> {
         // Code compiled mid-run (eval, `Function`, a dynamic `import()`)
         // extends the table; the newest one serves every later call.
         let table = table.map(|t| match self.vm_newest_table() {

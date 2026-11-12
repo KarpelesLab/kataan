@@ -105,7 +105,7 @@ pub fn compile_module_into(
     program: &Program,
     module: u32,
     is_async: bool,
-    table: &mut Vec<FnProto>,
+    table: &mut super::ProtoVec,
 ) -> Result<ModuleProtos, CompileError> {
     let mut body: Vec<Stmt> = Vec::new();
     let mut fns: Vec<TopFn> = Vec::new();
@@ -161,23 +161,7 @@ pub fn compile_module_into(
     let fn_ids = Rc::new(BTreeMap::new());
     let classes = Rc::new(BTreeMap::new());
     let protos = Rc::new(core::cell::RefCell::new(core::mem::take(table)));
-    let placeholder = || FnProto {
-        ops: Vec::new(),
-        n_regs: 0,
-        n_params: 0,
-        n_captures: 0,
-        rest_from: None,
-        is_async: false,
-        length: 0,
-        name: String::new(),
-        legacy: false,
-        class_ctor: false,
-        derived: false,
-        is_generator: false,
-        source_span: None,
-        source: None,
-        tier: Default::default(),
-    };
+    let placeholder = super::placeholder_proto;
     protos
         .borrow_mut()
         .extend((base..=init_id).map(|_| placeholder()));
@@ -344,14 +328,12 @@ fn run_hosted_script(
     interp: &mut crate::nbexec::Interp,
     program: &Program,
 ) -> Result<NanBox, crate::nbexec::Thrown> {
-    let mut table: Vec<FnProto> = interp
-        .module_vm_table()
-        .map(|t| t.to_vec())
-        .unwrap_or_default();
-    let main = super::compile_program_into(program, true, &mut table)
+    let old = interp.module_vm_table().unwrap_or_default();
+    let mut tail = super::ProtoVec::after(old.len());
+    let main = super::compile_program_tail(program, true, &mut tail)
         .map_err(|e| super::compile_refused(&e))?;
-    let table: Rc<[FnProto]> = table.into();
-    interp.install_module_vm_table(Rc::clone(&table));
+    let table = old.extended(tail.into_tail());
+    interp.install_module_vm_table(table.clone());
     if let Err(e) = interp.prepare_script_for_vm(program) {
         return Err(crate::nbexec::thrown_from_exec_error(
             interp,

@@ -402,15 +402,15 @@ impl Interp {
     /// running one, or the one eval code extended from it.
     /// (Every table of one interpreter is a prefix of the next: eval code and
     /// dynamically imported modules only ever append to the longest.)
-    pub(crate) fn vm_newest_table(&self) -> Option<alloc::rc::Rc<[crate::nbvm::FnProto]>> {
+    pub(crate) fn vm_newest_table(&self) -> Option<crate::nbvm::FnTable> {
         let mut best = self.vm_table.clone();
-        let mut consider = |t: alloc::rc::Rc<[crate::nbvm::FnProto]>| {
+        let mut consider = |t: crate::nbvm::FnTable| {
             if best.as_ref().is_none_or(|b| t.len() > b.len()) {
                 best = Some(t);
             }
         };
         if let Some(ext) = &self.vm_ext_table {
-            consider(alloc::rc::Rc::clone(ext));
+            consider(ext.clone());
         }
         #[cfg(all(feature = "module", feature = "std"))]
         if let Some(m) = self.module_vm_table() {
@@ -529,18 +529,10 @@ impl Interp {
         strict: bool,
         flags: u8,
         privates: &[&str],
-    ) -> Result<
-        (
-            alloc::rc::Rc<[crate::nbvm::FnProto]>,
-            alloc::rc::Rc<crate::nbvm::FnProto>,
-        ),
-        ExecError,
-    > {
+    ) -> Result<(crate::nbvm::FnTable, alloc::rc::Rc<crate::nbvm::FnProto>), ExecError> {
         // Before any VM run (a host calling `eval` on a fresh interpreter)
         // the table is empty.
-        let table = self
-            .vm_newest_table()
-            .unwrap_or_else(|| alloc::rc::Rc::from(Vec::new()));
+        let table = self.vm_newest_table().unwrap_or_default();
         let key = (
             core::ptr::from_ref(program) as usize,
             u16::from(flags) | (u16::from(strict) << 8),
@@ -549,11 +541,13 @@ impl Interp {
         let proto = match self.vm_eval_cache.get(&key) {
             Some(p) => alloc::rc::Rc::clone(p),
             None => {
-                // Without nested functions the body needs no table slots.
-                let mut scratch = Vec::new();
-                let first =
-                    crate::nbvm::compile_eval_code(program, &mut scratch, strict, flags, privates);
-                let proto = match first {
+                // The functions the code defines take the ids after the
+                // table's; only they are compiled and stored (the table grows
+                // in place, see `FnTable::extended`).
+                let mut tail = crate::nbvm::ProtoVec::after(table.len());
+                let proto = match crate::nbvm::compile_eval_code(
+                    program, &mut tail, strict, flags, privates,
+                ) {
                     Err(_e) => {
                         #[cfg(feature = "std")]
                         if std::env::var_os("KATAAN_DEBUG_EVAL").is_some() {
@@ -563,22 +557,13 @@ impl Interp {
                             self.compile_error(&_e, "the bytecode compiler refused this eval code")
                         );
                     }
-                    Ok(p) if scratch.is_empty() => p,
-                    Ok(_) => {
-                        let mut full: Vec<crate::nbvm::FnProto> = table.to_vec();
-                        let base = full.len();
-                        let p = crate::nbvm::compile_eval_code(
-                            program, &mut full, strict, flags, privates,
-                        )
-                        .map_err(|e| {
-                            self.compile_error(&e, "the bytecode compiler refused this eval code")
-                        })?;
-                        crate::nbvm::resolve_source_text(&mut full[base..], &program.source);
-                        // One growth chain with scripts and dynamic imports.
-                        self.install_vm_table(full.into());
-                        p
-                    }
+                    Ok(p) => p,
                 };
+                let tail = tail.into_tail();
+                if !tail.is_empty() {
+                    // One growth chain with scripts and dynamic imports.
+                    self.install_vm_table(table.extended(tail));
+                }
                 let rc = alloc::rc::Rc::new(proto);
                 self.vm_eval_cache.insert(key, alloc::rc::Rc::clone(&rc));
                 rc

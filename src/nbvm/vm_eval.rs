@@ -19,8 +19,8 @@
 
 use super::{
     BTreeSet, Binding, CompileError, Compiler, Ctx, EK_DECL_FN, ENV_NAME, EnvSite, FnProto,
-    FrameExit, GlobalWrite, NT_NAME, NanBox, Op, Program, Stmt, THIS_NAME, VmError, VmHost,
-    hosted_ctx, pattern_names, run_frame,
+    FnTable, FrameExit, GlobalWrite, NT_NAME, NanBox, Op, Program, ProtoVec, Stmt, THIS_NAME,
+    VmError, VmHost, hosted_ctx, pattern_names, run_frame,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -56,7 +56,7 @@ pub(crate) const EVAL_DERIVED: u8 = 32;
 /// unchanged.
 pub(crate) fn compile_eval_code(
     program: &Program,
-    table: &mut Vec<FnProto>,
+    table: &mut super::ProtoVec,
     strict: bool,
     flags: u8,
     privates: &[&str],
@@ -80,7 +80,7 @@ pub(crate) fn compile_eval_code(
 
 fn compile_eval_body(
     program: &Program,
-    protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+    protos: &alloc::rc::Rc<core::cell::RefCell<ProtoVec>>,
     strict: bool,
     flags: u8,
     privates: &[&str],
@@ -235,7 +235,7 @@ fn finish_eval_proto(mut c: Compiler, n_captures: usize) -> FnProto {
 /// The eval code's throw, or a VM fault.
 pub(crate) fn run_eval_code(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     proto: &FnProto,
     captures: &[NanBox],
     this_cell: bool,

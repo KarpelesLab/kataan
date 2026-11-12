@@ -382,7 +382,7 @@ pub struct ModuleRegistry {
     vm_envs: Vec<Option<VmEnv>>,
     /// The function table holding every VM-compiled module (and the code
     /// compiled before them); it only grows.
-    vm_table: Option<Rc<[crate::nbvm::FnProto]>>,
+    vm_table: Option<crate::nbvm::FnTable>,
     /// Why the first module the VM refused could not run.
     vm_note: Option<String>,
     /// A VM fault happened where it could not propagate (see
@@ -418,10 +418,10 @@ impl ModuleRegistry {
     /// table of one interpreter is a prefix of the next.
     pub(crate) fn prefer_module_table(
         &self,
-        table: Option<Rc<[crate::nbvm::FnProto]>>,
-    ) -> Option<Rc<[crate::nbvm::FnProto]>> {
+        table: Option<crate::nbvm::FnTable>,
+    ) -> Option<crate::nbvm::FnTable> {
         match (table, &self.vm_table) {
-            (Some(t), Some(m)) if m.len() > t.len() => Some(Rc::clone(m)),
+            (Some(t), Some(m)) if m.len() > t.len() => Some(m.clone()),
             (t, _) => t,
         }
     }
@@ -2587,15 +2587,15 @@ impl Interp {
 /// `crate::nbvm::compile_module_into` for the VM side).
 impl Interp {
     /// The VM function table modules are compiled into, if any yet.
-    pub(crate) fn module_vm_table(&self) -> Option<Rc<[crate::nbvm::FnProto]>> {
+    pub(crate) fn module_vm_table(&self) -> Option<crate::nbvm::FnTable> {
         self.modules.prefer_module_table(self.vm_table.clone())
     }
 
     /// Installs `table` — the previous table plus newly compiled code — as the
     /// VM function table, for the running VM code and for later runs.
-    pub(crate) fn install_module_vm_table(&mut self, table: Rc<[crate::nbvm::FnProto]>) {
+    pub(crate) fn install_module_vm_table(&mut self, table: crate::nbvm::FnTable) {
         self.realm.register_vm_fn_meta(&table);
-        self.vm_table = Some(Rc::clone(&table));
+        self.vm_table = Some(table.clone());
         self.modules.vm_table = Some(table);
     }
 
@@ -2627,10 +2627,8 @@ impl Interp {
         if pending.is_empty() {
             return;
         }
-        let mut table: Vec<crate::nbvm::FnProto> = self
-            .module_vm_table()
-            .map(|t| t.to_vec())
-            .unwrap_or_default();
+        let old = self.module_vm_table().unwrap_or_default();
+        let mut table = crate::nbvm::ProtoVec::after(old.len());
         for key in pending {
             let index = self.modules.vm_keys.len() as u32;
             self.modules.vm_keys.push(key.clone());
@@ -2648,7 +2646,7 @@ impl Interp {
                 }
             }
         }
-        self.install_module_vm_table(table.into());
+        self.install_module_vm_table(old.extended(table.into_tail()));
     }
 
     /// `InitializeEnvironment` for a VM module: `var` bindings start

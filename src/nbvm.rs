@@ -47,6 +47,8 @@ mod array_hof;
 pub(crate) fn array_species_is_default(realm: &Realm, h: Handle) -> bool {
     array_hof::default_species(realm, h)
 }
+mod fn_table;
+pub use fn_table::{FnTable, ProtoVec};
 mod free_memo;
 mod fresh_lit;
 mod global_mirror;
@@ -1089,6 +1091,28 @@ impl core::ops::Deref for FnSource {
     }
 }
 
+/// An empty [`FnProto`]: a table slot reserved before its function is
+/// compiled.
+pub(crate) fn placeholder_proto() -> FnProto {
+    FnProto {
+        ops: Vec::new(),
+        n_regs: 0,
+        n_params: 0,
+        n_captures: 0,
+        rest_from: None,
+        is_async: false,
+        length: 0,
+        name: String::new(),
+        legacy: false,
+        class_ctor: false,
+        derived: false,
+        is_generator: false,
+        source_span: None,
+        source: None,
+        tier: TierSlot::default(),
+    }
+}
+
 /// A compiled function: its instruction stream, register-file size, and the
 /// number of leading registers that receive call arguments.
 #[derive(Clone, Debug)]
@@ -1599,7 +1623,7 @@ pub trait VmHost {
     /// exactly as the drain would run it next. The job stays queued (see
     /// [`pop_job`](Self::pop_job)). Reads only the job queue: the realm may be
     /// out.
-    fn peek_batch_job(&self, _table: &alloc::rc::Rc<[FnProto]>) -> Option<(NanBox, NanBox)> {
+    fn peek_batch_job(&self, _table: &FnTable) -> Option<(NanBox, NanBox)> {
         None
     }
     /// Dequeues the job [`peek_batch_job`](Self::peek_batch_job) named.
@@ -1608,7 +1632,7 @@ pub trait VmHost {
     /// function table is `table` (as for [`peek_batch_job`](Self::peek_batch_job))
     /// and no job is queued: a job queued now would be the one the drain runs
     /// next. Reads only the job queue: the realm may be out.
-    fn batch_queue_empty(&self, _table: &alloc::rc::Rc<[FnProto]>) -> bool {
+    fn batch_queue_empty(&self, _table: &FnTable) -> bool {
         false
     }
     /// GetIterator(v, async) for `for await`: `(iterator, next, sync)` — a sync
@@ -1746,13 +1770,10 @@ pub trait VmHost {
     }
     /// Installs the running VM program's function table (returning the previous
     /// one), so VM function values handed to the host stay callable.
-    fn set_vm_table(
-        &mut self,
-        table: Option<alloc::rc::Rc<[FnProto]>>,
-    ) -> Option<alloc::rc::Rc<[FnProto]>>;
+    fn set_vm_table(&mut self, table: Option<FnTable>) -> Option<FnTable>;
     /// The newest function table: the running one, or the one eval code
     /// extended (a superset — functions are only ever appended).
-    fn vm_table_now(&mut self) -> Option<alloc::rc::Rc<[FnProto]>>;
+    fn vm_table_now(&mut self) -> Option<FnTable>;
     /// `import.meta` of the VM module `module` (an index the host assigned
     /// when it compiled the module — see `compile_module_into`).
     ///
@@ -1816,7 +1837,7 @@ pub(crate) fn array_default_species(realm: &mut Realm, h: Handle) -> bool {
 /// The callee's throw, or a VM fault.
 pub(crate) fn call_vm_function(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     f: NanBox,
     this: NanBox,
     args: &[NanBox],
@@ -1830,7 +1851,7 @@ pub(crate) fn call_vm_function(
 /// `crate::realm::host_roots`), without the arm.
 pub(crate) fn call_vm_function_in(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     f: NanBox,
     this: NanBox,
     args: &[NanBox],
@@ -3400,7 +3421,7 @@ fn drive_async(
 /// A VM fault (the body's own throw rejects its promise instead).
 pub(crate) fn resume_vm_async(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     controller: NanBox,
     state: Option<Handle>,
     fulfilled: bool,
@@ -3465,7 +3486,7 @@ fn job_ctx(host: &mut dyn VmHost, gc: bool) -> Ctx<'_> {
 /// exists: a frame of another realm resumes in its own.)
 fn next_batch_resume(
     ctx: &mut Ctx,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
 ) -> Option<(Handle, Option<Handle>, bool, NanBox)> {
     if ctx.realm.multi_realm || !ctx.microtasks.is_empty() {
         return None;
@@ -3505,7 +3526,7 @@ fn next_batch_resume(
 /// `controller` ([`resume_vm_async`]'s), in the context `ctx`.
 fn resume_async_frame(
     ctx: &mut Ctx,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     controller: NanBox,
     state: Option<Handle>,
     fulfilled: bool,
@@ -3635,7 +3656,7 @@ fn resume_async_frame(
 /// fulfilled. Then PerformPromiseThen would queue the resumption at once as
 /// the only job, which the loop would run next: its value (`Some`), for the
 /// caller to resume with in place. `None` otherwise: the ordinary await.
-fn await_settled_now(ctx: &mut Ctx, table: &alloc::rc::Rc<[FnProto]>, v: NanBox) -> Option<NanBox> {
+fn await_settled_now(ctx: &mut Ctx, table: &FnTable, v: NanBox) -> Option<NanBox> {
     if ctx.realm.multi_realm || !ctx.microtasks.is_empty() {
         return None;
     }
@@ -4100,7 +4121,7 @@ fn async_iter_step(
 /// A VM fault.
 pub(crate) fn vm_agen_request(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     generator: NanBox,
     kind: u8,
     v: NanBox,
@@ -4142,7 +4163,7 @@ pub(crate) fn vm_agen_request(
 /// A VM fault.
 pub(crate) fn resume_vm_agen(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     generator: NanBox,
     fulfilled: bool,
     v: NanBox,
@@ -4183,7 +4204,7 @@ pub(crate) fn resume_vm_agen(
 /// the caller has it.
 fn resume_agen_frame(
     ctx: &mut Ctx,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     generator: NanBox,
     sh: Option<Handle>,
     fulfilled: bool,
@@ -4202,7 +4223,7 @@ fn resume_agen_frame(
 /// [`resume_agen_frame`] once its inputs are rooted.
 fn resume_agen_frame_inner(
     ctx: &mut Ctx,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     generator: NanBox,
     sh: Option<Handle>,
     fulfilled: bool,
@@ -4337,7 +4358,7 @@ fn vm_generator_resume(
 /// The generator body's throw, or a VM fault.
 pub(crate) fn resume_vm_generator(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     generator: NanBox,
     mode: u8,
     v: NanBox,
@@ -4384,7 +4405,7 @@ pub(crate) fn resume_vm_generator(
 /// The generator body's throw, or a VM fault.
 pub(crate) fn host_generator_step(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     generator: NanBox,
 ) -> Result<Result<Option<NanBox>, NanBox>, VmError> {
     let entered = enter_frame_realm(host, generator);
@@ -4786,7 +4807,7 @@ fn is_object_value(realm: &Realm, v: NanBox) -> bool {
 /// fault.
 pub(crate) fn construct_vm_function(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     f: NanBox,
     args: &[NanBox],
     new_target: NanBox,
@@ -4799,7 +4820,7 @@ pub(crate) fn construct_vm_function(
 /// so the constructor may collect.
 pub(crate) fn construct_vm_function_in(
     host: &mut dyn VmHost,
-    table: &alloc::rc::Rc<[FnProto]>,
+    table: &FnTable,
     f: NanBox,
     args: &[NanBox],
     new_target: NanBox,
@@ -5783,7 +5804,7 @@ pub fn run_program_capturing(
 /// Propagates a [`VmError`] from any faulting instruction.
 pub fn run_program_hosted(
     host: &mut dyn VmHost,
-    funcs: &alloc::rc::Rc<[FnProto]>,
+    funcs: &FnTable,
     id: usize,
     args: &[NanBox],
 ) -> Result<NanBox, VmError> {
@@ -5792,7 +5813,7 @@ pub fn run_program_hosted(
     // one host is a prefix of the next.
     let grown = host.vm_table_now().filter(|t| t.len() > funcs.len());
     let funcs = grown.as_ref().unwrap_or(funcs);
-    let previous = host.set_vm_table(Some(alloc::rc::Rc::clone(funcs)));
+    let previous = host.set_vm_table(Some(funcs.clone()));
     // VM closures' own `name`/`length` are synthesized by the realm from this.
     host.realm_slot().register_vm_fn_meta(funcs);
     let mut ctx = hosted_ctx(host.take_realm(), host);
@@ -14577,7 +14598,7 @@ pub fn execute_typed_interruptible(
             crate::nbexec::ErrorPhase::Runtime,
         ));
     }
-    let protos: alloc::rc::Rc<[FnProto]> = protos.into();
+    let protos: FnTable = protos.into();
     match run_program_hosted(&mut interp, &protos, main as usize, &[]) {
         Ok(value) => Ok((String::from(interp.output()), interp.display(value))),
         Err(e) => Err(vm_thrown(&interp, e)),
@@ -14700,7 +14721,7 @@ pub fn execute_scripts_typed(
     // global environment, intrinsics and console serve the VM. Each script's
     // global declarations are instantiated by the interpreter just before its
     // body runs.
-    let table: alloc::rc::Rc<[FnProto]> = table.into();
+    let table: FnTable = table.into();
     let mut interp = crate::nbexec::Interp::new_with_limits(limits);
     let mut completion = String::new();
     for (program, main) in programs.iter().zip(&mains) {
@@ -14965,6 +14986,25 @@ pub fn compile_program_into(
     hosted: bool,
     table: &mut Vec<FnProto>,
 ) -> Result<u32, CompileError> {
+    let mut all = ProtoVec::from(core::mem::take(table));
+    let r = compile_program_tail(program, hosted, &mut all);
+    *table = all.into_tail();
+    r
+}
+
+/// [`compile_program_into`] a table that holds `table.base()` functions
+/// already, given only the (initially empty) tail: the new functions are
+/// appended to `table` and take the ids from `table.base()` on, and the
+/// existing ones are neither read nor copied — so growing a large table by a
+/// small program costs only the program (see [`FnTable::extended`]).
+///
+/// # Errors
+/// As [`compile_program_into`]; `table` is left unchanged.
+pub fn compile_program_tail(
+    program: &Program,
+    hosted: bool,
+    table: &mut ProtoVec,
+) -> Result<u32, CompileError> {
     let base = table.len() as u32;
     let _free_memo = free_memo_session(&program.body);
     // Dynamic code (`eval` / `Function`) needs a host (it accesses the live
@@ -15032,23 +15072,7 @@ pub fn compile_program_into(
     let classes = alloc::rc::Rc::new(class_map);
 
     let protos = alloc::rc::Rc::new(core::cell::RefCell::new(core::mem::take(table)));
-    let placeholder = || FnProto {
-        ops: Vec::new(),
-        n_regs: 0,
-        n_params: 0,
-        n_captures: 0,
-        rest_from: None,
-        is_async: false,
-        length: 0,
-        name: alloc::string::String::new(),
-        legacy: false,
-        class_ctor: false,
-        derived: false,
-        is_generator: false,
-        source_span: None,
-        source: None,
-        tier: Default::default(),
-    };
+    let placeholder = placeholder_proto;
     // Reserve slots: main (0), top-level functions (1..=N), then class members
     // (N+1..next_id). Nested function expressions append beyond `next_id`.
     protos
@@ -16890,7 +16914,7 @@ struct Compiler {
     /// Class name → its constructor/method function ids, for `new C(...)`.
     classes: alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
     /// The shared function table; nested function expressions append to it.
-    protos: alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+    protos: alloc::rc::Rc<core::cell::RefCell<ProtoVec>>,
     /// Names in *this* function that are captured by a nested function and so
     /// must be stored as cells.
     cell_names: alloc::collections::BTreeSet<String>,
@@ -17132,7 +17156,7 @@ impl Compiler {
     fn compile_fn(
         fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
         classes: &alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
-        protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+        protos: &alloc::rc::Rc<core::cell::RefCell<ProtoVec>>,
         params: &[crate::ast::Param],
         captures: &[String],
         body: &[Stmt],
@@ -17171,7 +17195,7 @@ impl Compiler {
     fn compile_fn_inner(
         fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
         classes: &alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
-        protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+        protos: &alloc::rc::Rc<core::cell::RefCell<ProtoVec>>,
         params: &[crate::ast::Param],
         captures: &[String],
         body: &[Stmt],
@@ -17244,7 +17268,7 @@ impl Compiler {
     fn compile_fn_inner_impl(
         fn_ids: &alloc::rc::Rc<alloc::collections::BTreeMap<String, u32>>,
         classes: &alloc::rc::Rc<alloc::collections::BTreeMap<String, ClassInfo>>,
-        protos: &alloc::rc::Rc<core::cell::RefCell<Vec<FnProto>>>,
+        protos: &alloc::rc::Rc<core::cell::RefCell<ProtoVec>>,
         params: &[crate::ast::Param],
         captures: &[String],
         body: &[Stmt],

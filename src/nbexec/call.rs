@@ -265,7 +265,7 @@ impl Interp {
                 if crate::stack::exhausted() {
                     return Err(self.stack_exhausted());
                 }
-                let table = alloc::rc::Rc::clone(table);
+                let table = table.clone();
                 return crate::nbvm::call_vm_function(self, &table, callee, this_val, args)
                     .map_err(super::vm_to_exec);
             }

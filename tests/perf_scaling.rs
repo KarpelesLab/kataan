@@ -297,3 +297,29 @@ fn property_attributes_scale_linearly() {
         )
     });
 }
+
+/// Dynamic code is linear in the number of functions it creates. Every
+/// `Function(…)` body (and every `eval` that defines a function) extends the
+/// interpreter's shared function table, which was copied whole on each
+/// extension: 32 000 `Function` calls took 84 s. The table now grows in place
+/// (`FnTable::extended`).
+#[test]
+fn dynamic_functions_are_linear() {
+    for (name, make) in [
+        ("Function", "Function('a','return a+'+i)"),
+        ("new Function", "new Function('a','return a+'+i)"),
+        ("GeneratorFunction", "GF('a','yield a+'+i)"),
+        ("AsyncFunction", "AF('a','return a+'+i)"),
+        ("AsyncGeneratorFunction", "AGF('a','yield a+'+i)"),
+        ("indirect eval", "(0,eval)('(function(a){return a+'+i+'})')"),
+    ] {
+        assert_scaling(name, 2_000, 8.0, |n| {
+            timed(
+                "const GF=Object.getPrototypeOf(function*(){}).constructor, \
+                 AF=Object.getPrototypeOf(async function(){}).constructor, \
+                 AGF=Object.getPrototypeOf(async function*(){}).constructor;",
+                &format!("for(let i=0;i<{n};i++) {make};"),
+            )
+        });
+    }
+}
