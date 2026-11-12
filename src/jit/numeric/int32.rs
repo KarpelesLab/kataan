@@ -2571,7 +2571,7 @@ impl NumGen {
         if imul_direct_enabled() && d == gx && gx != gy && gx != RDX && gx != RCX {
             // Into the first factor's own GPR (its value is dead past the op,
             // a bail must still see it): kept in `r11` first, put back
-            // before every bail; `r11` also serves the `-0` test.
+            // before every bail (the `-0` test ORs a copy of it).
             let undo = a.new_label();
             let ok = a.new_label();
             a.mov32_rr(R11, gx);
@@ -2579,7 +2579,9 @@ impl NumGen {
             a.jcc(CC_O, undo);
             a.test32_rr(gx, gx);
             a.jcc(CC_NE, ok);
-            a.alu32_rr(0x09, R11, gy); // or r11d, y
+            // (In `eax`: `r11` must keep the factor for the undo.)
+            a.mov32_rr(RAX, R11);
+            a.alu32_rr(0x09, RAX, gy); // or eax, y
             a.jcc(CC_S, undo);
             a.jmp(ok);
             let cold = a.cold_begin();
