@@ -32,7 +32,7 @@ use core::cmp::Ordering;
 /// are kept.
 /// (Boxed: the op that holds it stays small.)
 ///
-/// Compiled code reads the ways in place ([`SwitchMemoLayout`]): a String
+/// Compiled code reads the ways in place (`SwitchMemoLayout`): a String
 /// held in its rope node (`Node::Small`, bytes past its length zero) has its
 /// text's words at its buffer's start.
 pub struct SwitchMemo {
@@ -102,7 +102,7 @@ pub(crate) fn jit_switch_memo_layout() -> SwitchMemoLayout {
 }
 
 impl SwitchMemo {
-    /// The address of the first way (see [`SwitchMemoLayout`]).
+    /// The address of the first way (see `SwitchMemoLayout`).
     #[must_use]
     pub fn jit_ways_addr(&self) -> usize {
         self.ways.as_ptr() as usize
