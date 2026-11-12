@@ -302,6 +302,10 @@ pub struct Interp {
     wasm_next_id: u32,
     /// The `Symbol.for` global registry: shared symbols keyed by string.
     symbol_registry: alloc::collections::BTreeMap<String, NanBox>,
+    /// The registry the other way round, keyed by the symbol's value bits
+    /// (`Symbol.keyFor`, CanBeHeldWeakly): a registered symbol is rooted for
+    /// good and the collector does not move cells, so its bits identify it.
+    symbol_registry_keys: alloc::collections::BTreeMap<u64, String>,
     /// Cached well-known symbols (e.g. `Symbol.iterator`), created on first use.
     well_known_symbols: alloc::collections::BTreeMap<&'static str, NanBox>,
     /// The property-storage key of `Symbol.hasInstance`, once computed (the
@@ -3108,6 +3112,7 @@ impl Interp {
             wasm_mem_objs: alloc::collections::BTreeMap::new(),
             wasm_next_id: 0,
             symbol_registry: alloc::collections::BTreeMap::new(),
+            symbol_registry_keys: alloc::collections::BTreeMap::new(),
             well_known_symbols: alloc::collections::BTreeMap::new(),
             has_instance_key: None,
             tagged_template_cache: alloc::collections::BTreeMap::new(),

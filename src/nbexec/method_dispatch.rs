@@ -1162,6 +1162,7 @@ impl Interp {
                         return Ok(Some(*s));
                     }
                     let sym = NanBox::handle(self.realm.new_symbol(&key).to_raw());
+                    self.symbol_registry_keys.insert(sym.to_bits(), key.clone());
                     self.symbol_registry.insert(key, sym);
                     return Ok(Some(sym));
                 }
@@ -1176,11 +1177,7 @@ impl Interp {
                     {
                         return Err(self.type_error("Symbol.keyFor requires a symbol argument"));
                     }
-                    let found = self
-                        .symbol_registry
-                        .iter()
-                        .find(|(_, v)| self.realm.strict_equals(**v, target))
-                        .map(|(k, _)| k.clone());
+                    let found = self.symbol_registry_keys.get(&target.to_bits()).cloned();
                     return Ok(Some(match found {
                         Some(k) => self.new_key_str(&k),
                         None => NanBox::undefined(),

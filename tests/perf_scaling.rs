@@ -298,6 +298,26 @@ fn property_attributes_scale_linearly() {
     });
 }
 
+/// `Symbol.keyFor` is O(log n) in the size of the global symbol registry (it
+/// scanned the whole registry, so a `Symbol.for`/`keyFor` loop was quadratic:
+/// 32 000 keys took 1.3 s), and so is the registered-symbol test of
+/// CanBeHeldWeakly behind `WeakMap`/`WeakRef`/`FinalizationRegistry`.
+#[test]
+fn symbol_registry_lookups_are_logarithmic() {
+    assert_scaling("Symbol.keyFor", 8_000, 8.0, |n| {
+        timed(
+            "",
+            &format!("let c=0; for(let i=0;i<{n};i++) c+=Symbol.keyFor(Symbol.for('k'+i)).length;"),
+        )
+    });
+    assert_scaling("WeakMap key check against the registry", 20_000, 8.0, |n| {
+        timed(
+            &format!("for(let i=0;i<{n};i++) Symbol.for('k'+i); const wm=new WeakMap();"),
+            &format!("for(let i=0;i<{n};i++) wm.set(Symbol('u'+i), i);"),
+        )
+    });
+}
+
 /// Dynamic code is linear in the number of functions it creates. Every
 /// `Function(…)` body (and every `eval` that defines a function) extends the
 /// interpreter's shared function table, which was copied whole on each

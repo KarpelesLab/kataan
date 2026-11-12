@@ -1713,10 +1713,7 @@ impl Interp {
         };
         // A symbol: weakly holdable unless it lives in the global registry.
         if self.realm.symbol_at(h).is_some() {
-            return !self
-                .symbol_registry
-                .values()
-                .any(|s| self.realm.same_value(*s, v));
+            return !self.symbol_registry_keys.contains_key(&v.to_bits());
         }
         // Any other heap value that is not a non-object primitive (string /
         // bigint are heap cells but not weakly holdable).
