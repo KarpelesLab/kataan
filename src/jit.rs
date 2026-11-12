@@ -6069,6 +6069,15 @@ fn finish_jumps(
 /// so no register ever holds them.
 const RECV_CACHE_EMPTY: i32 = -1;
 
+/// Whether the frame prologue empties its slots two at a time through
+/// `xmm15` (`X64Assembler::frame_prologue`); `KATAAN_JIT_SSECLR=0` turns it
+/// off (read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn prologue_sse_clear() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SSECLR").is_none_or(|v| v != "0"))
+}
+
 /// The least number of bytes (roughly) of in-line post-call code that a
 /// shared stub replaces (`X64Assembler::post_call_outlined`): below it the
 /// in-line sequence is about as short as the stub's `call`.
@@ -7493,6 +7502,23 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
         self.code.extend_from_slice(&frame.to_le_bytes());
         // (The entry empties every way.)
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        if prologue_sse_clear() {
+            // Every slot the entry empties, two side by side at a time
+            // through `xmm15` (`clear_keys`): nothing lives in an SSE
+            // register on entry (no argument is passed in one, and the
+            // promoted registers are loaded where their regions start).
+            self.recv_survive.clear();
+            let mut all: Vec<i32> = Vec::with_capacity(
+                self.recv_cache_keys.len() + self.entry_clear.len() + self.inline_clear.len() + 1,
+            );
+            all.extend(self.recv_seen);
+            all.extend_from_slice(&self.recv_cache_keys);
+            all.extend_from_slice(&self.entry_clear);
+            all.extend_from_slice(&self.inline_clear);
+            self.clear_keys(&all, true);
+            return;
+        }
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         {
             self.recv_survive.clear();
