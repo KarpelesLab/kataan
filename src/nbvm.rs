@@ -919,7 +919,7 @@ pub enum Op {
 }
 
 // `Op::ValueBin` op codes.
-const VB_POW: u8 = 0;
+pub(crate) const VB_POW: u8 = 0;
 /// `Op::ValueBin` op code for `&` (exposed for the JIT's bitwise lowering).
 pub(crate) const VB_BIT_AND: u8 = 1;
 /// `Op::ValueBin` op code for `|`.
