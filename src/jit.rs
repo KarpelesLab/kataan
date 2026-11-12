@@ -60,6 +60,8 @@ mod key_probe;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod pin;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod poly;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod prologue;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod props;
@@ -4026,6 +4028,8 @@ pub struct SiteInfo {
     /// For a write site that was a monomorphic add while interpreted: that
     /// add, compiled in (its shapes kept alive by the owning `JitProto`).
     add: Option<props::BakedAdd>,
+    /// For a polymorphic site: its further layouts, compiled in (`poly`).
+    poly: poly::Ways,
 }
 
 /// A property site's layout compiled into its code: a receiver whose shape
@@ -4609,6 +4613,10 @@ impl JitProto {
             alloc::vec![None; keys.len()];
         let mut tier_added: Vec<Option<(alloc::rc::Rc<crate::shape::Shape>, u32)>> =
             alloc::vec![None; keys.len()];
+        // A polymorphic site's further layouts (`poly`).
+        let mut poly_at: Vec<poly::Ways> = alloc::vec![[None; poly::MAX_WAYS]; keys.len()];
+        let mut tier_poly: Vec<Vec<(alloc::rc::Rc<crate::shape::Shape>, u32)>> =
+            alloc::vec![Vec::new(); keys.len()];
         for (pc, op) in ops.iter().enumerate() {
             let (site, write) = match *op {
                 GenericOp::GetProp { site, .. } => (site as usize, false),
@@ -4626,17 +4634,23 @@ impl JitProto {
                 continue;
             }
             cache.get_mut().seed(w);
-            if w.is_stable() && !(write && (w.by_add || w.shape.is_wrapper())) {
+            let legacy = w.is_stable() && !(write && (w.by_add || w.shape.is_wrapper()));
+            // A polymorphic site's primary and further layouts (`poly`).
+            let (primary, sel) = poly::choose(w, key, write, legacy);
+            if !sel.is_empty() {
+                poly_at[site] = poly::ways_of(&sel);
+                baked.extend(sel.iter().map(|(s, _)| alloc::rc::Rc::clone(s)));
+                tier_poly[site] = sel;
+            }
+            if let Some((shape, slot)) = primary {
                 baked_at[site] = Some(Baked {
-                    shape: props::shape_word(&w.shape),
-                    slot: w.slot,
-                    num: !w.shape.may_be_non_number(w.slot),
-                    dda: w
-                        .shape
-                        .has_brand(crate::shape::brand_bit(crate::shape::BRAND_KEYS[1])),
+                    shape: props::shape_word(&shape),
+                    slot,
+                    num: !shape.may_be_non_number(slot),
+                    dda: shape.has_brand(crate::shape::brand_bit(crate::shape::BRAND_KEYS[1])),
                 });
-                baked.push(alloc::rc::Rc::clone(&w.shape));
-                tier_baked[site] = Some((alloc::rc::Rc::clone(&w.shape), w.slot));
+                tier_baked[site] = Some((alloc::rc::Rc::clone(&shape), slot));
+                baked.push(shape);
             } else if write
                 && w.by_add
                 && w.hits >= 4
@@ -4698,9 +4712,11 @@ impl JitProto {
                 method_ptr: m.as_ref().map_or(core::ptr::null_mut(), |m| m.get()),
                 baked: None,
                 add: None,
+                poly: [None; poly::MAX_WAYS],
             })
             .collect();
         let mut tier_up = tierup::TierUp::plan(&ops, tier_baked, tier_added);
+        tier_up.poly = tier_poly;
         tier_up.num_slots = baked_at.iter().map(|b| b.is_some_and(|b| b.num)).collect();
         let call_pcs: Vec<(u32, u16)> = ops
             .iter()
@@ -4738,10 +4754,11 @@ impl JitProto {
         }
         let site_info: Vec<SiteInfo> = site_info
             .into_iter()
-            .zip(baked_at.into_iter().zip(add_at))
-            .map(|(si, (b, add))| SiteInfo {
+            .zip(baked_at.into_iter().zip(add_at).zip(poly_at))
+            .map(|(si, ((b, add), poly))| SiteInfo {
                 baked: b,
                 add,
+                poly,
                 ..si
             })
             .collect();
@@ -10533,8 +10550,15 @@ impl JitFunction {
         let mut cold_reloads: Vec<(Label, Label, Label, Label, usize)> = Vec::new();
         // The cache paths of `GetProp`s with a compiled-in layout: (entry,
         // return, miss, the promoted result's spill read, cache).
-        let mut cold_caches: Vec<(Label, Label, Label, Option<Label>, *mut core::ffi::c_void)> =
-            Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut cold_caches: Vec<(
+            Label,
+            Label,
+            Label,
+            Option<Label>,
+            *mut core::ffi::c_void,
+            poly::Ways,
+        )> = Vec::new();
         // The shape compares a layout-proving way's hit skips: (entry, a
         // write's store-guard miss, layout, mismatch, resume).
         let mut cold_verifies: Vec<(Label, Option<Label>, u64, Label, Label)> = Vec::new();
@@ -14619,7 +14643,9 @@ impl JitFunction {
                         // recompiled, `tierup`.)
                         match num.spec_bail(&mut a, op_idx) {
                             Some(bail) => cold_bails.push((cached, bail)),
-                            None => cold_caches.push((cached, back, helper, spill, s.cache_ptr)),
+                            None => {
+                                cold_caches.push((cached, back, helper, spill, s.cache_ptr, s.poly))
+                            }
                         }
                         a.bind(back);
                         if let (Some(x), Some(spill)) = (x, spill) {
@@ -14632,11 +14658,16 @@ impl JitFunction {
                             a.jmp(done);
                         }
                     } else {
+                        // A polymorphic site's layouts (`poly`): a hit has
+                        // its slot index in `eax`, as a cache hit.
+                        let slot_in = a.new_label();
+                        a.p_poly_slot(&layout, &s.poly, slot_in);
                         a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
                         a.cmp_rax_at_r11(layout.cache_shape_off);
                         a.jne(helper);
                         a.mov_eax_at_r11(layout.cache_slot_off);
                         a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                        a.bind(slot_in);
                     }
                     if s.baked.is_some() {
                         // Emitted above.
@@ -15243,6 +15274,20 @@ impl JitFunction {
                             a.jmp(b);
                         }
                     }
+                    // A polymorphic site's further layouts (`poly`), outside
+                    // a speculative loop's fast version (the flags test
+                    // above has passed; `rax`, the shape word, survives a
+                    // miss).
+                    if bail.is_none() {
+                        a.p_poly_set(
+                            &layout,
+                            helpers.call_layout.realm,
+                            &s.poly,
+                            (disp(val), val_num, val_x),
+                            helper,
+                            done,
+                        );
+                    }
                     a.movabs_r11(s.cache_ptr as i64);
                     a.cmp_rax_at_r11(layout.cache_shape_off);
                     a.jne(shape_miss);
@@ -15255,6 +15300,13 @@ impl JitFunction {
                         let spill = a.new_label();
                         a.mov_eax_at_r11(layout.cache_slot_off);
                         a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                        if s.baked.is_some() {
+                            a.p_site_count(
+                                layout.cache_hits_off,
+                                helpers.call_layout.poll.site_req,
+                                bytecode.as_ptr() as u64,
+                            );
+                        }
                         match val_x {
                             Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x),
                             None => a.load_rdx(disp(val)),
@@ -15283,6 +15335,13 @@ impl JitFunction {
                             helper,
                         );
                         a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+                        if s.baked.is_some() {
+                            a.p_site_count(
+                                layout.cache_hits_off,
+                                helpers.call_layout.poll.site_req,
+                                bytecode.as_ptr() as u64,
+                            );
+                        }
                         a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
                         a.load_rdx(disp(val));
                         a.g_store(call_seq::r::R11, 0, call_seq::r::RDX); // slots[slot] = val
@@ -17091,19 +17150,26 @@ impl JitFunction {
         // The cache paths of sites with a compiled-in layout, for a receiver
         // of another shape (in `rax`; its heap slot in `rcx`): the site's
         // cache, else the miss path. The value goes back in `rax`.
-        for (cached, back, miss, spill, cache) in core::mem::take(&mut cold_caches) {
+        for (cached, back, miss, spill, cache, ways) in core::mem::take(&mut cold_caches) {
             a.dbg_mark("x-cache");
             a.bind(cached);
-            a.mov_rax_at_rcx(layout.off_shape);
             // Not the layout: a way that proves it may not keep this object.
             for &w in &shape_ways {
                 a.store_empty(rc_key(w));
             }
+            // A polymorphic site's further layouts (`poly`).
+            a.p_poly_get(&layout, &ways, back);
+            a.mov_rax_at_rcx(layout.off_shape);
             a.movabs_r11(cache as i64);
             a.cmp_rax_at_r11(layout.cache_shape_off);
             a.jne(miss);
             a.mov_eax_at_r11(layout.cache_slot_off);
             a.add_dword_at_r11_imm(layout.cache_hits_off, 1);
+            a.p_site_count(
+                layout.cache_hits_off,
+                helpers.call_layout.poll.site_req,
+                bytecode.as_ptr() as u64,
+            );
             match spill {
                 // The promoted result's spill read is `cold_reloads`'.
                 Some(spill) => {

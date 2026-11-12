@@ -149,6 +149,14 @@ pub(super) struct TierRuntime {
     /// A proper tail call the activation that just left its compiled body
     /// handed to the trampoline ([`jit_helper_tail_call`]).
     tail: Option<TailCall>,
+    /// Set by a property site's cache path every so many hits (the
+    /// address of its body's bytecode; `0`: none): the next back-edge poll
+    /// calls [`jit_helper_backedge`], which may have that body recompiled
+    /// ([`site_request`]).
+    site_req: u64,
+    /// The last body a [`site_request`] looked for: its bytecode's address
+    /// and the function id it found (`usize::MAX`: none).
+    site_memo: (usize, usize),
 }
 
 /// A proper tail call handed back to `call_with_inner`'s trampoline: what
@@ -193,6 +201,8 @@ impl Default for TierRuntime {
             suspended: None,
             deopt: None,
             tail: None,
+            site_req: 0,
+            site_memo: (0, usize::MAX),
         }
     }
 }
@@ -4813,6 +4823,8 @@ fn poll_layout() -> crate::jit::PollLayout {
         interval: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, poll_interval)),
         demote: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, demote)),
         leave_soon: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, leave_soon)),
+        site_req: site_poll_enabled()
+            .then(|| i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, site_req))),
     }
 }
 
@@ -5007,6 +5019,7 @@ pub(crate) extern "C" fn jit_helper_backedge(
     if !ctx.realm.agents_active
         && regs_addr != ctx.jit_rt.exit_regs
         && !ctx.jit_rt.demote
+        && ctx.jit_rt.site_req == 0
         && !super::vm_safepoint_due(ctx)
         && !ctx
             .realm
@@ -5059,6 +5072,11 @@ pub(crate) extern "C" fn jit_helper_backedge(
     if core::mem::take(&mut ctx.jit_rt.demote) {
         demote_poll(ctx, funcs, ops);
     }
+    // (A property site's request: `site_request`.)
+    let req = core::mem::take(&mut ctx.jit_rt.site_req);
+    if req != 0 {
+        site_request(ctx, funcs, req);
+    }
     ctx.jit_rt.poll_interval
 }
 
@@ -5099,6 +5117,45 @@ fn leave_soon(ctx: &mut Ctx) {
         ctx.jit_rt.leave_tries = u32::MAX;
     } else {
         ctx.jit_rt.leave_tries -= 1;
+    }
+}
+
+/// Whether a property site's cache path asks for its body's recompilation
+/// ([`site_request`]); `KATAAN_JIT_SITEPOLL=0` turns it off (read once per
+/// process).
+pub(crate) fn site_poll_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SITEPOLL").is_none_or(|v| v != "0"))
+}
+
+/// A back-edge poll that found a property site's request
+/// ([`TierRuntime::site_req`]): the body running bytecode `ops` took that
+/// site's cache path many times (a layout its code does not have compiled
+/// in). Nothing else may ever recompile it — a body compiled callers enter
+/// never leaves at a back-edge, so one compiled in one phase of a program
+/// would keep that phase's layouts — so when one of its sites has settled
+/// on a layout its code lacks (`JitProto::wants_site_recompile`), the
+/// function is recompiled now: its later calls run the new code, while
+/// running activations finish in the old one.
+fn site_request(ctx: &mut Ctx, funcs: &[FnProto], ops: u64) {
+    let body = |id: usize| match funcs.get(id).map(|p| p.tier.jit()) {
+        Some(Some(Some(j))) if j.runs(ops as usize as *const Op) => Some(j),
+        _ => None,
+    };
+    let (at, memo) = ctx.jit_rt.site_memo;
+    let found = if at == ops as usize {
+        body(memo).map(|j| (memo, j))
+    } else {
+        let f = (0..funcs.len()).find_map(|id| body(id).map(|j| (id, j)));
+        // (A body no function runs any longer, superseded: remembered as
+        // none, until another asks.)
+        ctx.jit_rt.site_memo = (ops as usize, f.as_ref().map_or(usize::MAX, |f| f.0));
+        f
+    };
+    if let Some((id, jit)) = found
+        && jit.wants_site_recompile()
+    {
+        let _ = recompile(ctx, funcs, id, &jit, &[]);
     }
 }
 

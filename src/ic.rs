@@ -53,6 +53,71 @@ pub struct PropertyCache {
     /// For a call site: which VM closure it calls ([`CalleeHint`]), the
     /// feedback the machine-code tier inlines a callee from.
     callee: CalleeHint,
+    /// The layouts the cache held before its current one ([`PolyHist`]),
+    /// once it has held two: the feedback a polymorphic site's compiled
+    /// code compares a short chain of layouts from.
+    hist: Option<alloc::boxed::Box<PolyHist>>,
+}
+
+/// The layouts a [`PropertyCache`] was armed with before its current one,
+/// most recent first and none of them the current one ([`Seen`]); how many
+/// distinct layouts fell off the end (a site that keeps evicting is
+/// megamorphic); and the current layout's hits before its present run (it
+/// may have been current before) and the hit count its run started at.
+#[derive(Default)]
+pub struct PolyHist {
+    seen: [Option<Seen>; POLY_HIST],
+    evictions: u32,
+    cur_tally: u32,
+    armed_at: u32,
+}
+
+/// A layout a [`PropertyCache`] held: the slot the site's key has there (a
+/// fact of that immutable layout), the hits the cache counted while it held
+/// it, and whether it was last armed by an add (its result: no object
+/// arrives with it at the add).
+#[derive(Clone)]
+pub struct Seen {
+    pub shape: Rc<Shape>,
+    pub slot: u32,
+    pub hits: u32,
+    pub by_add: bool,
+}
+
+/// How many earlier layouts a [`PolyHist`] keeps.
+pub const POLY_HIST: usize = 3;
+
+impl PolyHist {
+    /// Notes that the cache leaves `old` for `next`; returns the hits `next`
+    /// had counted when it was current before.
+    fn note(&mut self, old: Seen, next: &Rc<Shape>) -> u32 {
+        // (The one it goes to is current, not earlier.)
+        let mut next_hits = 0;
+        if let Some(i) = self
+            .seen
+            .iter()
+            .position(|e| e.as_ref().is_some_and(|e| Rc::ptr_eq(&e.shape, next)))
+        {
+            next_hits = self.seen[i].as_ref().map_or(0, |e| e.hits);
+            self.remove(i);
+        }
+        if self.seen[POLY_HIST - 1].is_some() {
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        for i in (1..POLY_HIST).rev() {
+            self.seen[i] = self.seen[i - 1].take();
+        }
+        self.seen[0] = Some(old);
+        next_hits
+    }
+
+    /// Removes entry `i`, closing the gap.
+    fn remove(&mut self, i: usize) {
+        for j in i..POLY_HIST - 1 {
+            self.seen[j] = self.seen[j + 1].take();
+        }
+        self.seen[POLY_HIST - 1] = None;
+    }
 }
 
 /// What a call site has called: nothing yet, always the one VM function
@@ -250,10 +315,61 @@ impl PropertyCache {
         }
         self.misses += 1;
         let slot = object_shape.lookup(key)?;
+        self.leave_for(object_shape);
         self.shape = Some(Rc::clone(object_shape));
         self.slot = slot;
         self.by_add = false;
         Some(slot)
+    }
+
+    /// Records the current layout (if any) in the history before the cache
+    /// is armed with `next` (see [`PolyHist`]).
+    fn leave_for(&mut self, next: &Rc<Shape>) {
+        let Some(old) = self.shape.take() else {
+            return;
+        };
+        if Rc::ptr_eq(&old, next) {
+            self.shape = Some(old);
+            return;
+        }
+        let (slot, by_add, hits) = (self.slot, self.by_add, self.hits);
+        let h = self.hist.get_or_insert_with(alloc::boxed::Box::default);
+        let seen = Seen {
+            shape: old,
+            slot,
+            hits: h.cur_tally.saturating_add(hits.wrapping_sub(h.armed_at)),
+            by_add,
+        };
+        h.cur_tally = h.note(seen, next);
+        h.armed_at = hits;
+    }
+
+    /// The layouts the cache held, the current one first (if any), each
+    /// with the hits counted while it was current; and how many the
+    /// history evicted (see [`PolyHist`]).
+    #[must_use]
+    pub fn seen(&self) -> (alloc::vec::Vec<Seen>, u32) {
+        let mut out = alloc::vec::Vec::new();
+        let (tally, evictions) = match &self.hist {
+            Some(h) => (
+                h.cur_tally
+                    .saturating_add(self.hits.wrapping_sub(h.armed_at)),
+                h.evictions,
+            ),
+            None => (self.hits, 0),
+        };
+        if let Some(s) = &self.shape {
+            out.push(Seen {
+                shape: Rc::clone(s),
+                slot: self.slot,
+                hits: tally,
+                by_add: self.by_add,
+            });
+        }
+        if let Some(h) = &self.hist {
+            out.extend(h.seen.iter().flatten().cloned());
+        }
+        (out, evictions)
     }
 
     /// The cached slot when `object_shape` is the cached shape, without
@@ -287,6 +403,7 @@ impl PropertyCache {
     /// Arms a transition cache (see [`transition_from`](Self::transition_from))
     /// with the shape an add produced.
     pub fn arm_transition(&mut self, to: Rc<Shape>) {
+        self.leave_for(&to);
         self.slot = to.len().saturating_sub(1);
         self.shape = Some(to);
         self.by_add = true;
@@ -319,12 +436,18 @@ impl PropertyCache {
     /// that starts its own copy of the site warm (see [`WarmEntry`]).
     #[must_use]
     pub fn warm_entry(&self) -> Option<WarmEntry> {
-        self.shape.as_ref().map(|s| WarmEntry {
-            shape: Rc::clone(s),
-            slot: self.slot,
+        let (mut seen, evictions) = self.seen();
+        self.shape.as_ref()?;
+        let cur = seen.remove(0);
+        Some(WarmEntry {
+            shape: cur.shape,
+            slot: cur.slot,
             hits: self.hits,
             misses: self.misses,
-            by_add: self.by_add,
+            by_add: cur.by_add,
+            tally: cur.hits,
+            others: seen,
+            evictions,
         })
     }
 
@@ -390,6 +513,16 @@ pub struct WarmEntry {
     /// Whether the memo was recorded by an add (a write site whose objects
     /// arrive *without* the key: `shape` is the add's result).
     pub by_add: bool,
+    /// The hits counted while the cache held `shape` (all of `hits` for a
+    /// cache that never held another).
+    pub tally: u32,
+    /// The other layouts the cache held, most recent first, with the hits
+    /// counted while it held each (`PropertyCache::seen`): a polymorphic
+    /// site's other layouts.
+    pub others: alloc::vec::Vec<Seen>,
+    /// How many distinct layouts the site's history evicted (a site that
+    /// keeps evicting is megamorphic).
+    pub evictions: u32,
 }
 
 impl WarmEntry {
@@ -512,6 +645,53 @@ mod tests {
         assert_eq!(ic.lookup(a.shape(), "k"), Some(0)); // miss (arm)
         assert_eq!(ic.lookup(b.shape(), "k"), Some(0)); // hit: shared shape
         assert_eq!((ic.hits(), ic.misses()), (1, 1));
+    }
+
+    #[test]
+    fn polymorphic_memo_is_the_most_used_layout() {
+        let root = Shape::root();
+        let mut a = Object::new(Rc::clone(&root));
+        a.set("p", crate::nanbox::NanBox::number(1.0));
+        let mut b = Object::new(Rc::clone(&root));
+        b.set("q", crate::nanbox::NanBox::number(1.0));
+        b.set("p", crate::nanbox::NanBox::number(1.0));
+        let mut c = Object::new(Rc::clone(&root));
+        c.set("r", crate::nanbox::NanBox::number(1.0));
+        c.set("s", crate::nanbox::NanBox::number(1.0));
+        c.set("p", crate::nanbox::NanBox::number(1.0));
+        let mut ic = PropertyCache::new();
+        // `b` mostly, `a` and `c` now and then; the cache ends on `a`.
+        for _ in 0..10 {
+            ic.lookup(a.shape(), "p");
+            for _ in 0..20 {
+                ic.lookup(b.shape(), "p");
+            }
+            ic.lookup(c.shape(), "p");
+            ic.lookup(c.shape(), "p");
+        }
+        ic.lookup(a.shape(), "p");
+        let w = ic.warm_entry().expect("warm");
+        // The memo is the current layout; the history says which is used most.
+        assert!(Rc::ptr_eq(&w.shape, a.shape()));
+        assert_eq!(w.tally, 0);
+        let hits: alloc::vec::Vec<(u32, u32)> = w.others.iter().map(|o| (o.slot, o.hits)).collect();
+        assert_eq!(hits, alloc::vec![(2, 10), (1, 190)]);
+        assert_eq!(w.evictions, 0);
+        // A fourth and fifth layout evict the oldest.
+        let mut d = Object::new(Rc::clone(&root));
+        d.set("t", crate::nanbox::NanBox::number(1.0));
+        d.set("p", crate::nanbox::NanBox::number(1.0));
+        let mut e = Object::new(Rc::clone(&root));
+        e.set("u", crate::nanbox::NanBox::number(1.0));
+        e.set("v", crate::nanbox::NanBox::number(1.0));
+        e.set("w", crate::nanbox::NanBox::number(1.0));
+        e.set("p", crate::nanbox::NanBox::number(1.0));
+        ic.lookup(d.shape(), "p");
+        ic.lookup(e.shape(), "p");
+        ic.lookup(a.shape(), "p");
+        let w = ic.warm_entry().expect("warm");
+        assert_eq!(w.others.len(), POLY_HIST);
+        assert!(w.evictions >= 1);
     }
 
     #[test]

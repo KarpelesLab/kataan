@@ -880,6 +880,10 @@ pub struct PollLayout {
     /// back-edges of loops enclosing an inlined callee's loop
     /// (`numeric::leave_head`) then poll.
     pub leave_soon: i32,
+    /// A word a property site's cache path sets (`poly`, its body's
+    /// bytecode address): the next poll then calls, to have that body
+    /// recompiled. `None`: no site asks.
+    pub site_req: Option<i32>,
 }
 
 /// Before a back-edge's countdown of a loop at `header` that encloses an
@@ -919,6 +923,11 @@ pub(crate) fn emit_quiet_poll(a: &mut X64Assembler, l: &CallLayout, countdown: i
     a.g_jcc(cc::E, call);
     a.g_cmp_byte_imm(r::R15, p.demote, 0);
     a.g_jcc(cc::NE, call);
+    if let Some(req) = p.site_req {
+        a.g_load(r::RAX, r::R15, req);
+        a.g_test(r::RAX);
+        a.g_jcc(cc::NE, call);
+    }
     a.g_load(r::RAX, r::R15, p.interval);
     a.g_store(RBP, countdown, r::RAX);
     a.jmp(quiet);

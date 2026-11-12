@@ -61,6 +61,10 @@ const ENTRY_SETTLE: u64 = 8;
 /// native-call entry's poll ([`JitProto::entry_poll`]).
 const ENTRY_RECOMPILE_SMALL: usize = 16 * 1024;
 
+/// The code size (bytes) up to which a body is recompiled at a property
+/// site's request ([`JitProto::wants_site_recompile`]).
+const SITE_RECOMPILE_MAX: usize = 48 * 1024;
+
 /// How many times a function's generic body may be recompiled.
 pub const MAX_GENERATION: u8 = 3;
 
@@ -102,6 +106,9 @@ pub(super) struct TierUp {
     pub(super) loops: Vec<(usize, Vec<(u16, bool)>)>,
     /// Per site: the layout compiled into its code, if any, and the slot.
     pub(super) baked: Vec<Option<(Rc<Shape>, u32)>>,
+    /// Per site: the further layouts compiled into its code (`poly`), with
+    /// their slots.
+    pub(super) poly: Vec<Vec<(Rc<Shape>, u32)>>,
     /// Per add site: the transition compiled into its code
     /// (`props::BakedAdd`), as the add's result shape and the new slot.
     pub(super) added: Vec<Option<(Rc<Shape>, u32)>>,
@@ -243,6 +250,84 @@ fn took_callee(
     })
 }
 
+/// The memo a recompilation compiles property site `site` (whose cache is
+/// `c`) from, and whether it is the cache's own stable memo: that memo, else
+/// the layout compiled in (which counts the hits the cache does not), else
+/// a compiled-in add (as an add memo: likewise), else whatever the cache
+/// holds. Its further layouts (`poly`) are those the body compiled in, the
+/// layout compiled in when the cache settled on another, the cache's own
+/// when it is no other's, and the layouts the cache held before, in that
+/// order (a layout that keeps arriving keeps its way across
+/// recompilations). The compiled-in layouts count no hits (their code
+/// counts none): a layout the cache counted many for may become the
+/// primary, as the cache's stable memo does.
+fn site_memo(
+    s: &super::GenericSites,
+    site: usize,
+    c: &core::cell::UnsafeCell<crate::ic::PropertyCache>,
+) -> Option<(crate::ic::WarmEntry, bool)> {
+    use crate::ic::{Seen, WarmEntry};
+    // SAFETY: as in `wants_recompile` (or the body is not running).
+    #[allow(unsafe_code)]
+    let w = unsafe { (*c.get()).warm_entry() };
+    let baked = s.tier_up.baked.get(site).cloned().flatten();
+    let added = s.tier_up.added.get(site).cloned().flatten();
+    let unseen = |(shape, slot): &(Rc<Shape>, u32)| Seen {
+        shape: Rc::clone(shape),
+        slot: *slot,
+        hits: 0,
+        by_add: false,
+    };
+    let had: Vec<Seen> = s
+        .tier_up
+        .poly
+        .get(site)
+        .map_or_else(Vec::new, |p| p.iter().map(unseen).collect());
+    let (others, evictions) = w
+        .as_ref()
+        .map_or((&[][..], 0), |w| (w.others.as_slice(), w.evictions));
+    let current: Vec<Seen> = w
+        .as_ref()
+        .map(|w| Seen {
+            shape: Rc::clone(&w.shape),
+            slot: w.slot,
+            hits: w.tally,
+            by_add: w.by_add,
+        })
+        .into_iter()
+        .collect();
+    let compiled: Vec<Seen> = baked.iter().map(unseen).collect();
+    let compiled_memo = |shape: Rc<Shape>, slot: u32, by_add: bool| WarmEntry {
+        shape,
+        slot,
+        hits: BAKED_HITS,
+        misses: 0,
+        by_add,
+        tally: BAKED_HITS,
+        others: super::poly::merge(&[&had, &current, others]),
+        evictions,
+    };
+    let (mut e, live) = match (w.clone(), baked, added) {
+        (Some(w), _, _) if w.is_stable() => {
+            let more = super::poly::merge(&[&had, &compiled, others]);
+            (WarmEntry { others: more, ..w }, true)
+        }
+        (_, Some((shape, slot)), _) => (compiled_memo(shape, slot, false), false),
+        // A compiled-in add counts no hits in the cache either (an inlined
+        // copy of the body, or its recompilation, then compiles it in
+        // again).
+        (_, None, Some((shape, slot))) => (compiled_memo(shape, slot, true), false),
+        (Some(w), None, None) => {
+            let more = super::poly::merge(&[others, &had]);
+            (WarmEntry { others: more, ..w }, false)
+        }
+        (None, None, None) => return None,
+    };
+    // (The primary is never one of its own further layouts.)
+    e.others.retain(|o| !Rc::ptr_eq(&o.shape, &e.shape));
+    Some((e, live))
+}
+
 impl TierUp {
     /// The checks' data for lowered `ops`, whose sites `baked` has compiled
     /// in.
@@ -300,6 +385,7 @@ impl TierUp {
             site_pc,
             loops,
             baked,
+            poly: Vec::new(),
             added,
             extents,
             num_slots: Vec::new(),
@@ -613,6 +699,18 @@ impl JitProto {
             .any(|&(site, write)| self.site_learned(site as usize, write))
     }
 
+    /// Whether a property site's request (`jit::poly`) should have the
+    /// function recompiled for its later calls: one of its property sites
+    /// learned a layout ([`Self::site_learned`]), while the recompilation
+    /// budget lasts, for a body of at most [`SITE_RECOMPILE_MAX`] bytes (a
+    /// large one's compilation costs more than a site or two gain).
+    #[must_use]
+    pub fn wants_site_recompile(&self) -> bool {
+        self.generation() < MAX_GENERATION
+            && self.code_len() <= SITE_RECOMPILE_MAX
+            && self.any_site_learned()
+    }
+
     /// Whether property site `site` (a write if `write`) learned something a
     /// recompilation would compile in: its compiled-in layout's slot, which
     /// the code relies on holding only Numbers, no longer does; or its cache
@@ -654,6 +752,11 @@ impl JitProto {
                 .baked
                 .get(site)
                 .is_some_and(|b| b.as_ref().is_some_and(|(s, _)| Rc::ptr_eq(s, shape)))
+            // (Nor is one of its further layouts, `poly`, anything new.)
+            && !t
+                .poly
+                .get(site)
+                .is_some_and(|p| p.iter().any(|(s, _)| Rc::ptr_eq(s, shape)))
             && shape.lookup(key) == Some(slot)
     }
 
@@ -819,35 +922,23 @@ impl JitProto {
             let (Some((f, fpc)), Some(c)) = (self.inl_src(pc), s.caches.get(site as usize)) else {
                 continue;
             };
-            // SAFETY: as in `wants_recompile` (or the body is not running).
-            #[allow(unsafe_code)]
-            let w = unsafe { (*c.get()).warm_entry() };
-            let baked = s.tier_up.baked.get(site as usize).cloned().flatten();
-            let added = s.tier_up.added.get(site as usize).cloned().flatten();
-            let (e, live) = match (w, baked, added) {
-                (Some(w), _, _) if w.is_stable() => (w, true),
-                (_, Some((shape, slot)), _) => (
-                    crate::ic::WarmEntry {
-                        shape,
-                        slot,
-                        hits: BAKED_HITS,
-                        misses: 0,
-                        by_add: false,
-                    },
-                    false,
-                ),
-                (_, None, Some((shape, slot))) => (
-                    crate::ic::WarmEntry {
-                        shape,
-                        slot,
-                        hits: BAKED_HITS,
-                        misses: 0,
-                        by_add: true,
-                    },
-                    false,
-                ),
-                _ => continue,
+            let Some((e, live)) = site_memo(s, site as usize, c) else {
+                continue;
             };
+            // (A cache that knows nothing stable, with nothing compiled in:
+            // left out.)
+            let compiled = s
+                .tier_up
+                .baked
+                .get(site as usize)
+                .is_some_and(Option::is_some)
+                || s.tier_up
+                    .added
+                    .get(site as usize)
+                    .is_some_and(Option::is_some);
+            if !live && !compiled {
+                continue;
+            }
             out.push((f, fpc, e, live));
         }
         out
@@ -878,32 +969,7 @@ impl JitProto {
             let Some(c) = s.caches.get(site as usize).filter(|_| pc != usize::MAX) else {
                 continue;
             };
-            // SAFETY: as in `wants_recompile` (or the body is not running).
-            #[allow(unsafe_code)]
-            let w = unsafe { (*c.get()).warm_entry() };
-            let baked = s.tier_up.baked.get(site as usize).cloned().flatten();
-            let added = s.tier_up.added.get(site as usize).cloned().flatten();
-            out[pc] = match (w, baked, added) {
-                (Some(w), _, _) if w.is_stable() => Some(w),
-                (_, Some((shape, slot)), _) => Some(crate::ic::WarmEntry {
-                    shape,
-                    slot,
-                    hits: BAKED_HITS,
-                    misses: 0,
-                    by_add: false,
-                }),
-                // A compiled-in add counts no hits in the cache either (an
-                // inlined copy of the body, or its recompilation, then
-                // compiles it in again).
-                (_, None, Some((shape, slot))) => Some(crate::ic::WarmEntry {
-                    shape,
-                    slot,
-                    hits: BAKED_HITS,
-                    misses: 0,
-                    by_add: true,
-                }),
-                (w, None, None) => w,
-            };
+            out[pc] = site_memo(s, site as usize, c).map(|(e, _)| e);
         }
         out
     }
