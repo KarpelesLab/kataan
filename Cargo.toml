@@ -59,8 +59,10 @@ intl-tz-names = ["intl", "intl/tz-names"]
 module = []
 # Host runtime: event loop, timers, console, encoding, URL, streams, process.
 host = ["std"]
-# `fetch` / Node http(s) transport over the pure-Rust `rsurl` crate.
-fetch = ["host", "dep:rsurl"]
+# Reserved for `fetch` / Node http(s) (ROADMAP.md §4.4), which is not built
+# yet. Its transport will be the pure-Rust `rsurl` crate, added back (on its
+# `purecrypto-tls` backend) together with the code that uses it.
+fetch = ["host"]
 # `crypto.getRandomValues` / `randomUUID` / WebCrypto `crypto.subtle` over the
 # pure-Rust `purecrypto` crate.
 crypto = ["host", "dep:purecrypto"]
@@ -81,9 +83,6 @@ cli = ["std", "regex", "module", "host"]
 # In line with the Karpelès Lab "pure Rust, no foreign code" charter, the only
 # dependencies are sibling pure-Rust crates, each behind an opt-in feature.
 [dependencies]
-# `rsurl` powers `fetch` / Node http(s); keep it on its pure-Rust TLS backend
-# (`purecrypto-tls`) so the "no foreign code" charter holds end to end.
-rsurl = { version = "0.1", optional = true, default-features = false, features = ["purecrypto-tls"] }
 purecrypto = { version = "0.6", optional = true, default-features = false, features = ["rng", "hash", "cipher", "linux-getrandom"] }
 # Pure-Rust, no_std Unicode/Intl primitives (a pure-Rust ICU analog). `full`
 # selects supplementary planes so JS strings (full Unicode) are covered.

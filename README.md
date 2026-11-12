@@ -203,7 +203,7 @@ assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
 | `module`  |   ✓     | ESM + CommonJS module loader.                                      |
 | `host`    |   ✓     | Host runtime: event loop, timers, console, encoding, URL, streams. |
 | `crypto`  |   ✓     | `crypto.getRandomValues` / WebCrypto over `purecrypto`.            |
-| `fetch`   |         | `fetch` / Node `http(s)` over `rsurl`.                             |
+| `fetch`   |         | Reserved: `fetch` / Node `http(s)` over `rsurl` (not built yet).   |
 | `jit`     |         | Machine-code JIT (x86-64/Linux): integer, float, and generic tiers.|
 | `ffi`     |         | The C ABI (the only place broad `unsafe` is allowed).              |
 | `cli`     |   ✓     | The `kataan` command-line tool.                                    |

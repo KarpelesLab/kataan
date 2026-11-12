@@ -18,9 +18,8 @@
 //!
 //! The language core is `#![no_std]` and needs only `alloc`. The `std` feature
 //! (default, implies `alloc`) adds the host runtime — the event loop, timers,
-//! file system, network (`fetch` over `rsurl`), and `crypto` (over
-//! `purecrypto`). Build the bare core with `--no-default-features --features
-//! alloc`.
+//! file system, and `crypto` (over `purecrypto`). Build the bare core with
+//! `--no-default-features --features alloc`.
 
 #![no_std]
 // `missing_docs` / `unreachable_pub` are warned at the crate level (see
