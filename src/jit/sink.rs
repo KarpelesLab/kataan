@@ -97,6 +97,18 @@ pub struct SinkMemo {
     pub proto: core::cell::Cell<u64>,
     /// The address of the stand-in's word.
     pub word: u64,
+    /// The prototype epoch at which compiled code last read the stand-in
+    /// from its word and walked it to its heap slot (`0`: never), which
+    /// [`Self::standin`] and [`Self::cell`] then hold: the word changes only
+    /// with the memo, and a cell moves only with the epoch, so the guard
+    /// takes both from here while the epoch is this one
+    /// (`call_seq::emit_inline_new_this_made`; `KATAAN_JIT_SINK_CELL=0`
+    /// turns it off).
+    pub cell_stamp: core::cell::Cell<u64>,
+    /// The stand-in's handle bits, at [`Self::cell_stamp`].
+    pub standin: core::cell::Cell<u64>,
+    /// The stand-in's heap slot address, at [`Self::cell_stamp`].
+    pub cell: core::cell::Cell<u64>,
 }
 
 impl SinkMemo {
@@ -107,8 +119,20 @@ impl SinkMemo {
             stamp: core::cell::Cell::new(0),
             proto: core::cell::Cell::new(0),
             word,
+            cell_stamp: core::cell::Cell::new(0),
+            standin: core::cell::Cell::new(0),
+            cell: core::cell::Cell::new(0),
         }
     }
+}
+
+/// Whether a sunk guard takes its stand-in and the stand-in's heap slot
+/// from its memo ([`SinkMemo::cell_stamp`]; `KATAAN_JIT_SINK_CELL=0` turns
+/// it off).
+#[must_use]
+pub(crate) fn cell_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SINK_CELL").is_none_or(|v| v != "0"))
 }
 
 /// One sunk `new` site.
@@ -605,6 +629,8 @@ impl Ctx<'_> {
         let mut succ: Vec<usize> = Vec::with_capacity(2);
         let mut dirty = vec![true; n];
         let mut changed = true;
+        // (The op's out-state, reused.)
+        let mut s = empty.clone();
         while changed {
             changed = false;
             for pc in 0..n {
@@ -612,7 +638,7 @@ impl Ctx<'_> {
                     continue;
                 }
                 dirty[pc] = false;
-                let Some(s) = states[pc].clone() else {
+                let Some(src) = states[pc].as_ref() else {
                     continue;
                 };
                 // (A fallback arm that leaves at its start: the interpreter
@@ -621,7 +647,8 @@ impl Ctx<'_> {
                 if before[pc] && arm == Some(pc) {
                     continue;
                 }
-                let mut s = s;
+                s.regs.copy_from_slice(&src.regs);
+                s.init.copy_from_slice(&src.init);
                 let mut leaves = false;
                 let f0 = fail;
                 self.transfer(
@@ -1062,9 +1089,16 @@ pub(crate) fn plan(
         // constructor got, or whose stored fields' registers were
         // poisoned, cannot be made there.
         for st in r.states.iter().flatten() {
+            let held = st
+                .regs
+                .iter()
+                .filter(|&&x| is_v(x))
+                .fold(0u64, |m, &x| m | 1u64 << site_of(x));
+            if held == 0 {
+                continue;
+            }
             for (k, &init) in st.init.iter().enumerate() {
-                let held = st.regs.contains(&(VTAG | k as u64));
-                if !held {
+                if held & (1u64 << k) == 0 {
                     continue;
                 }
                 if init == CONFLICT {

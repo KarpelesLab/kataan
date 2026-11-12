@@ -3137,7 +3137,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     }
     let this = e.caps.checked_add(n_caps)?;
     if let Some(ctor) = e.new_target {
-        emit_inline_new_this(a, e, ctor, this, miss, (by_record, cproved))?;
+        emit_inline_new_this(a, e, ctor, this, miss, (by_record, cproved, false))?;
     }
     if let (Some(_), Some(ctor)) = (cproved, e.new_target) {
         let made = a.new_label();
@@ -3149,7 +3149,7 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
             a.g_cmp(r::RAX, r::R11);
             a.g_jcc(cc::NE, miss);
         }
-        emit_inline_new_this(a, e, ctor, this, miss, (true, None))?;
+        emit_inline_new_this(a, e, ctor, this, miss, (true, None, true))?;
         a.bind(made);
     }
     a.dbg_mark("g-pend");
@@ -3397,14 +3397,16 @@ fn emit_guard_fill(a: &mut X64Assembler, e: &InlineEmit<'_>, w: usize) {
 /// the object is allocated (`p_alloc_object`, else `e.new_alloc`'s helper,
 /// else a miss), into register `this` (and `e.new_way`). Otherwise to
 /// `miss`, having changed nothing observable (the call op makes the
-/// construct). Keeps `r8` (the captures' pointer).
+/// construct). Keeps `r8` (the captures' pointer). `proven`: the guard's
+/// [`ConstructProof`] holds (no Rust code ran since this site's last full
+/// check, see `emit_inline_new_this_made`).
 fn emit_inline_new_this(
     a: &mut X64Assembler,
     e: &InlineEmit<'_>,
     (ctor, nt): (u16, u16),
     this: u16,
     miss: Label,
-    (checked, proof): (bool, Option<ConstructProof>),
+    (checked, proof, proven): (bool, Option<ConstructProof>, bool),
 ) -> Option<()> {
     use core::mem::offset_of;
     let reg = |x: u16| i32::from(x) * 8;
@@ -3428,7 +3430,7 @@ fn emit_inline_new_this(
         if !e.derived {
             a.g_movabs(r::R11, e.memo as u64);
         }
-        return emit_inline_new_this_made(a, e, this, miss, record);
+        return emit_inline_new_this_made(a, e, this, miss, record, proven);
     }
     a.g_movabs(r::R11, e.memo as u64);
     a.g_load(r::RAX, r::RBX, reg(ctor));
@@ -3452,7 +3454,7 @@ fn emit_inline_new_this(
         i32::try_from(offset_of!(CallTarget, key)).ok()?,
     );
     a.g_jcc(cc::NE, miss);
-    emit_inline_new_this_made(a, e, this, miss, record)
+    emit_inline_new_this_made(a, e, this, miss, record, false)
 }
 
 /// [`emit_inline_new_this`] once the record holds (`r11` the call site, but
@@ -3465,6 +3467,7 @@ fn emit_inline_new_this_made(
     this: u16,
     miss: Label,
     record: impl Fn(&mut X64Assembler),
+    proven: bool,
 ) -> Option<()> {
     use core::mem::offset_of;
     let reg = |x: u16| i32::from(x) * 8;
@@ -3484,6 +3487,9 @@ fn emit_inline_new_this_made(
         // the record's prototype at this epoch; the stand-in (the prototype
         // itself) goes into `this` and the site's own register.
         let m = |o: usize| i32::try_from(o).ok();
+        if super::sink::cell_enabled() {
+            return emit_sunk_this(a, e, (memo, preg), this, miss, record, proven);
+        }
         a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
         a.g_movabs(r::R9, memo as u64);
         a.g_cmp_mem(r::RSI, r::R9, m(offset_of!(super::sink::SinkMemo, proto))?);
@@ -3571,6 +3577,94 @@ fn emit_inline_new_this_made(
         a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
     }
     a.g_store(r::RBX, reg(this), r::RAX);
+    Some(())
+}
+
+/// The sunk object's `this` (`emit_inline_new_this_made` for a site of
+/// `super::sink`, `r11` the call site): no allocation. The memo vouches for
+/// the record's prototype at this epoch; the stand-in goes into `this`, the
+/// site's own register `preg` and the way of `this`, with its heap slot.
+///
+/// The stand-in and its heap slot come from the memo's copies
+/// ([`super::sink::SinkMemo::cell_stamp`]) while they are of this epoch,
+/// else from its word and a walk, which then refill them. With `proven` (the
+/// site's [`ConstructProof`] holds: no Rust code ran since a full check of
+/// this guard passed and recorded the proof, so the memo and its copies are
+/// as that check found them) nothing is checked again. Keeps `r8` (the
+/// captures' pointer, loaded from the record); `r11` ends as `e.memo`.
+fn emit_sunk_this(
+    a: &mut X64Assembler,
+    e: &InlineEmit<'_>,
+    (memo, preg): (*const super::sink::SinkMemo, u16),
+    this: u16,
+    miss: Label,
+    record: impl Fn(&mut X64Assembler),
+    proven: bool,
+) -> Option<()> {
+    use super::sink::SinkMemo;
+    use core::mem::offset_of;
+    let reg = |x: u16| i32::from(x) * 8;
+    let f = |o: usize| site_off(offset_of!(CallSite, fast) + o);
+    let m = |o: usize| i32::try_from(o).ok();
+    let have = a.new_label();
+    a.g_movabs(r::R9, memo as u64);
+    if proven {
+        a.g_load(r::RAX, r::R9, m(offset_of!(SinkMemo, standin))?);
+        a.g_load(r::RCX, r::R9, m(offset_of!(SinkMemo, cell))?);
+    } else {
+        a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
+        a.g_cmp_mem(r::RSI, r::R9, m(offset_of!(SinkMemo, proto))?);
+        a.g_jcc(cc::NE, miss);
+        load_proto_epoch(a, r::RSI);
+        a.g_cmp_mem(r::RSI, r::R9, m(offset_of!(SinkMemo, stamp))?);
+        a.g_jcc(cc::NE, miss);
+        let fill = a.new_label();
+        a.g_cmp_mem(r::RSI, r::R9, m(offset_of!(SinkMemo, cell_stamp))?);
+        a.g_jcc(cc::NE, fill);
+        a.g_load(r::RAX, r::R9, m(offset_of!(SinkMemo, standin))?);
+        a.g_load(r::RCX, r::R9, m(offset_of!(SinkMemo, cell))?);
+        // The copies' refill (once per epoch), out of line when it can be:
+        // the stand-in's word (emptied by a compaction, which also bumps
+        // the epoch), walked to its heap slot (a prototype that is no plain
+        // shaped object is a miss: later sites may take the way as filled).
+        let cold = a.cold_binds.is_none().then(|| a.cold_begin());
+        if cold.is_none() {
+            a.jmp(have);
+        }
+        a.bind(fill);
+        a.g_load(r::RAX, r::R9, m(offset_of!(SinkMemo, word))?);
+        a.g_load(r::RAX, r::RAX, 0);
+        a.g_test(r::RAX);
+        a.g_jcc(cc::E, miss);
+        a.g_store(r::RBX, reg(this), r::RAX);
+        a.p_walk_plain(
+            super::compute_jit_layout(),
+            e.layout.realm,
+            (r::RBX, reg(this)),
+            miss,
+        );
+        a.g_load(r::RAX, r::RBX, reg(this));
+        a.g_movabs(r::R9, memo as u64);
+        a.g_store(r::R9, m(offset_of!(SinkMemo, standin))?, r::RAX);
+        a.g_store(r::R9, m(offset_of!(SinkMemo, cell))?, r::RCX);
+        load_proto_epoch(a, r::RSI);
+        a.g_store(r::R9, m(offset_of!(SinkMemo, cell_stamp))?, r::RSI);
+        a.jmp(have);
+        if let Some(c) = cold {
+            a.cold_end(c);
+        }
+    }
+    a.bind(have);
+    a.g_store(r::RBX, reg(this), r::RAX);
+    a.g_store(r::RBX, reg(preg), r::RAX);
+    // (The way of `this` holds what the register does: the stand-in.)
+    if let Some(w) = e.new_way {
+        a.g_store(RBP, w.key, r::RAX);
+        a.g_store(RBP, w.cell, r::RCX);
+    }
+    a.g_movabs(r::R11, e.memo as u64);
+    a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+    record(a);
     Some(())
 }
 
