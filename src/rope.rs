@@ -731,6 +731,34 @@ impl Rope {
         total
     }
 
+    /// The UTF-16 length when it is already known (memoized, see
+    /// [`utf16_len`](Self::utf16_len)), without counting it.
+    #[must_use]
+    #[inline]
+    pub fn utf16_len_known(&self) -> Option<usize> {
+        match &*self.0 {
+            Node::Small { u16, .. } => {
+                let n = u16.get();
+                (n != SMALL_U16_UNKNOWN).then_some(usize::from(n))
+            }
+            Node::Leaf(_, c)
+            | Node::Slice { u16_len: c, .. }
+            | Node::Concat { u16_len: c, .. }
+            | Node::Build { u16_len: c, .. } => {
+                let n = c.get();
+                (n != U16_LEN_UNKNOWN).then_some(n)
+            }
+        }
+    }
+
+    /// A flat rope copying the WTF-8 `bytes`, whose UTF-16 length the caller
+    /// knows to be `units` (recorded, so `.length` needs no scan).
+    #[must_use]
+    pub fn from_bytes_units(bytes: &[u8], units: usize) -> Self {
+        debug_assert_eq!(wtf8::utf16_len(bytes), units);
+        Self::with_known_utf16(Node::flat(bytes), units)
+    }
+
     /// Whether every code point is ASCII — in which case byte index, code-point
     /// index and UTF-16 unit index all coincide, so an indexed read is O(1)
     /// instead of a scan from the start of the string.

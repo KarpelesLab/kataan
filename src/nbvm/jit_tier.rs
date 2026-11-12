@@ -2046,6 +2046,14 @@ pub(crate) extern "C" fn jit_helper_new_array(
         Op::NewArray { dst, len } if *len <= cx.realm.limits.max_array_len => {
             (*dst, alloc::vec![NanBox::undefined(); *len])
         }
+        // A regular expression literal's new object: the interpreter arm.
+        Op::NewRegExp { dst, source, flags } => {
+            file[*dst as usize] = match super::with_host(cx, |h| h.new_regexp(source, flags)) {
+                Some(v) => v,
+                None => NanBox::handle(cx.realm.new_regexp(source, flags).to_raw()),
+            };
+            return 0;
+        }
         _ => return jit_helper_exec_op(ctx, regs, n_regs, op),
     };
     file[dst as usize] = NanBox::handle(cx.realm.new_array(vals).to_raw());

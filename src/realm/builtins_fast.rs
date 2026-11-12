@@ -2012,6 +2012,9 @@ impl Realm {
     /// exactly as [`Rope::try_concat`](crate::rope::Rope::try_concat) does);
     /// anything longer, or with a `Concat` rope part, is a rope of the parts.
     pub fn concat_parts(&mut self, parts: &[NanBox]) -> Option<Option<Handle>> {
+        if let Some(rope) = self.concat_parts_flat(parts) {
+            return Some(Some(self.heap.alloc(Cell::Str(rope))));
+        }
         // A piece past this many bytes is shared, not copied.
         const FLAT_MAX: usize = 256;
         let mut bound = 0usize;
@@ -2070,6 +2073,107 @@ impl Realm {
             acc
         };
         Some(Some(self.heap.alloc(Cell::Str(rope))))
+    }
+
+    /// [`concat_parts`](Self::concat_parts) of a few parts making a short
+    /// result, each a flat string or a primitive with no conversion to run
+    /// (Number, Boolean, `null`, `undefined`): their text written once into
+    /// a buffer and copied into one new flat string, with its UTF-16 length
+    /// recorded when every string part's is known (joining a lone high
+    /// surrogate with a lone low one changes the bytes, not the units).
+    /// `None`, having done nothing, for anything else.
+    fn concat_parts_flat(&self, parts: &[NanBox]) -> Option<crate::rope::Rope> {
+        use crate::nanbox::Unpacked;
+        use crate::rope::Rope;
+        /// The most parts, and the longest result (bytes), served here.
+        const PARTS_MAX: usize = 16;
+        const FLAT_MAX: usize = 1024;
+        /// A result this short is written on the stack.
+        const STACK_MAX: usize = 64;
+        if parts.len() > PARTS_MAX {
+            return None;
+        }
+        // Each string part's rope (looked up once), and a bound on the
+        // result's length (a Number's text is at most 25 bytes).
+        let mut ropes: [Option<&Rope>; PARTS_MAX] = [None; PARTS_MAX];
+        let mut bound = 0usize;
+        for (slot, &p) in ropes.iter_mut().zip(parts) {
+            bound += match p.unpack() {
+                Unpacked::Number(_) => 25,
+                Unpacked::Bool(_) | Unpacked::Null | Unpacked::Undefined => 9,
+                Unpacked::Handle(raw) => {
+                    let r = self.heap.get(Handle::from_raw(raw))?.as_str()?;
+                    *slot = Some(r);
+                    r.len()
+                }
+            };
+        }
+        if bound > FLAT_MAX {
+            return None;
+        }
+        // (Room past the bound for a Number written as a whole buffer.)
+        let fill = |out: &mut [u8]| -> Option<(usize, Option<usize>)> {
+            let mut n = 0usize;
+            let mut units = Some(0usize);
+            for (r, &p) in ropes.iter().zip(parts) {
+                let at = n;
+                if let Some(r) = r {
+                    let b = r.as_leaf_bytes()?;
+                    if b.first() == Some(&0xED)
+                        && let Some(hi) = crate::wtf8::trailing_high_surrogate(&out[..n])
+                        && let Some(lo) = crate::wtf8::leading_low_surrogate(b)
+                    {
+                        // A lone high surrogate then a lone low one: the
+                        // astral code point they denote (four bytes for six).
+                        let cp =
+                            0x1_0000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
+                        let c = char::from_u32(cp)?;
+                        n -= 3;
+                        n += c.encode_utf8(&mut out[n..n + 4]).len();
+                        out[n..n + b.len() - 3].copy_from_slice(&b[3..]);
+                        n += b.len() - 3;
+                    } else {
+                        out[n..n + b.len()].copy_from_slice(b);
+                        n += b.len();
+                    }
+                    units = units.zip(r.utf16_len_known()).map(|(u, k)| u + k);
+                    continue;
+                }
+                let text: &[u8] = match p.unpack() {
+                    Unpacked::Number(x) => {
+                        let dst: &mut [u8; super::ryu::NUMBER_TEXT_MAX] = (&mut out
+                            [n..n + super::ryu::NUMBER_TEXT_MAX])
+                            .try_into()
+                            .ok()?;
+                        n += super::ryu::write_js_number(x, dst);
+                        units = units.map(|u| u + (n - at));
+                        continue;
+                    }
+                    Unpacked::Bool(true) => b"true",
+                    Unpacked::Bool(false) => b"false",
+                    Unpacked::Null => b"null",
+                    Unpacked::Undefined => b"undefined",
+                    Unpacked::Handle(_) => return None,
+                };
+                out[n..n + text.len()].copy_from_slice(text);
+                n += text.len();
+                units = units.map(|u| u + text.len());
+            }
+            Some((n, units))
+        };
+        let make = |bytes: &[u8], units: Option<usize>| match units {
+            Some(u) => Rope::from_bytes_units(bytes, u),
+            None => Rope::from_bytes(bytes),
+        };
+        if bound <= STACK_MAX {
+            let mut out = [0u8; STACK_MAX + super::ryu::NUMBER_TEXT_MAX];
+            let (n, units) = fill(&mut out)?;
+            Some(make(&out[..n], units))
+        } else {
+            let mut out = alloc::vec![0u8; bound + super::ryu::NUMBER_TEXT_MAX];
+            let (n, units) = fill(&mut out)?;
+            Some(make(&out[..n], units))
+        }
     }
 
     /// `a + b` for a string `a` held as one short leaf and a number `b` (or the

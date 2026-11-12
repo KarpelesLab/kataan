@@ -282,6 +282,21 @@ impl Interp {
         // `ToString(S)` is the identity on a string; then, for a template,
         // `ToString(replaceValue)` likewise.
         let str_v = o;
+        // A global one-character atom (`/[&<>"']/g`) over a flat ASCII
+        // subject it accepts no character of: no match, so the subject
+        // itself, read as its bytes (no code-unit copy, no replacer call).
+        // The collection loop's final, failing exec leaves `lastIndex` 0.
+        if global
+            && !sticky
+            && let Some(accepts) = re.single_atom_matcher()
+            && str_v
+                .as_handle()
+                .and_then(|s| self.realm.string_leaf_bytes(Handle::from_raw(s)))
+                .is_some_and(|b| b.iter().all(|&c| c < 0x80 && !accepts(u16::from(c))))
+        {
+            self.realm.set_regex_last_index(h, 0);
+            return Ok(Some(ReplaceStep::Done(str_v)));
+        }
         let Some(sub) = self.lean_subject(o) else {
             return Ok(None);
         };

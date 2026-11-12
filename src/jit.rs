@@ -14350,6 +14350,19 @@ impl JitFunction {
                             }
                             a.bind(done);
                         }
+                        // A regular expression literal: the array literals'
+                        // helper makes its object, without the one-op
+                        // interpreter.
+                        op @ crate::nbvm::Op::NewRegExp { .. } => {
+                            let op_ptr: *const crate::nbvm::Op = op;
+                            a.mov_rdi_r15();
+                            a.mov_rsi_rbx();
+                            a.movabs_argreg(2, n_regs as i64);
+                            a.movabs_argreg(3, op_ptr as i64);
+                            a.movabs_rax(helpers.new_array as usize as i64);
+                            a.call_rax();
+                            throw_check!();
+                        }
                         op @ crate::nbvm::Op::IterNext { .. } => {
                             let op_ptr: *const crate::nbvm::Op = op;
                             a.mov_rdi_r15();
