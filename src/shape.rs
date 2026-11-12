@@ -159,6 +159,12 @@ pub struct Shape {
     /// a hint the cache confirms against the entry's own shape, so a lookup
     /// is one probe whatever layouts share the cache.
     for_in_hint: Cell<u16>,
+    /// Where a realm's `Object.keys` key-String memo
+    /// (`Realm::plain_enumerable_key_slots`) last put this layout's entry,
+    /// as `for_in_hint` does for the `for-in` cache: so which layouts stay
+    /// remembered together depends on how many are in use, not on where
+    /// they were allocated.
+    keys_hint: Cell<u16>,
 }
 
 /// The most cached children a [`Transitions`] list holds before it becomes a
@@ -352,6 +358,7 @@ impl Shape {
             brands: 0,
             any: Cell::new(0),
             for_in_hint: Cell::new(0),
+            keys_hint: Cell::new(0),
         })
     }
 
@@ -395,6 +402,19 @@ impl Shape {
     #[inline]
     pub(crate) fn set_for_in_hint(&self, hint: u16) {
         self.for_in_hint.set(hint);
+    }
+
+    /// The `Object.keys` memo's hint for this layout (see `keys_hint`).
+    #[inline]
+    #[must_use]
+    pub(crate) fn keys_hint(&self) -> u16 {
+        self.keys_hint.get()
+    }
+
+    /// Records the `Object.keys` memo's hint for this layout.
+    #[inline]
+    pub(crate) fn set_keys_hint(&self, hint: u16) {
+        self.keys_hint.set(hint);
     }
 
     /// Whether some object with this layout may hold something other than a
@@ -567,6 +587,7 @@ impl Shape {
             // an object that adds a key keeps its other values.
             any: Cell::new(self.any.get()),
             for_in_hint: Cell::new(0),
+            keys_hint: Cell::new(0),
         });
         self.transitions.borrow_mut().insert(&key, &child);
         child
@@ -593,6 +614,7 @@ impl Shape {
             brands: (length.brands & !IMPLIED_ATTRS_BITS) | IMPLIED_FN_ATTRS_BIT,
             any: Cell::new(length.any.get()),
             for_in_hint: Cell::new(0),
+            keys_hint: Cell::new(0),
         })
     }
 
@@ -629,6 +651,7 @@ impl Shape {
             key: Some(key),
             any: Cell::new(parent.any.get()),
             for_in_hint: Cell::new(0),
+            keys_hint: Cell::new(0),
         })
     }
 

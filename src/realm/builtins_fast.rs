@@ -99,12 +99,17 @@ impl Realm {
     /// in key order (integer keys ascending first, then the rest in
     /// insertion order), with no key lookup.
     pub(crate) fn plain_enumerable_key_slots(&mut self, handle: Handle) -> Option<KeySlots> {
-        /// The number of layouts remembered (a power of two).
-        const WAYS: usize = 8;
+        // The entry is the one the layout's own hint names, confirmed by
+        // its layout (as the `for-in` cache finds its entries): any `CAP`
+        // layouts in use stay remembered together, whatever their addresses.
+        // (A memo indexed by the layout's address let two layouts in use
+        // evict each other or not depending on where they were allocated.)
+        /// The number of layouts remembered.
+        const CAP: usize = 16;
         let shape = Rc::clone(self.plain_keyed_shape(handle)?);
-        let way =
-            ((Rc::as_ptr(&shape) as usize >> 4) ^ (Rc::as_ptr(&shape) as usize >> 10)) & (WAYS - 1);
-        if let Some(Some((s, ks, slots))) = self.key_strings.get(way)
+        let hinted = usize::from(shape.keys_hint()).checked_sub(1);
+        if let Some(i) = hinted
+            && let Some(Some((s, ks, slots))) = self.key_strings.get(i)
             && Rc::ptr_eq(s, &shape)
         {
             return Some((Rc::clone(ks), Rc::clone(slots)));
@@ -133,9 +138,20 @@ impl Realm {
             .map(|k| NanBox::handle(self.new_string(k).to_raw()))
             .collect();
         if self.key_strings.is_empty() {
-            self.key_strings.resize(WAYS, None);
+            self.key_strings.resize(CAP, None);
         }
-        self.key_strings[way] = Some((shape, Rc::clone(&ks), Rc::clone(&slots)));
+        // An empty entry, else the next one round.
+        let i = self
+            .key_strings
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                let i = self.key_strings_next % CAP;
+                self.key_strings_next = (i + 1) % CAP;
+                i
+            });
+        shape.set_keys_hint(u16::try_from(i + 1).unwrap_or(0));
+        self.key_strings[i] = Some((shape, Rc::clone(&ks), Rc::clone(&slots)));
         Some((ks, slots))
     }
 

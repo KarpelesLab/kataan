@@ -14238,6 +14238,7 @@ impl JitFunction {
                             let done = a.new_label();
                             a.p_switch_memo(
                                 &layout,
+                                &key_probe,
                                 helpers.call_layout.realm,
                                 disp(*src),
                                 memo.jit_ways_addr() as u64,

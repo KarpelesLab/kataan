@@ -60,7 +60,9 @@ mod str_key_fast;
 mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;
-pub use str_switch::{SWITCH_MEMO_HASH, SwitchMemo, switch_key_order};
+pub use str_switch::{SwitchMemo, switch_key_order};
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use str_switch::{SwitchMemoLayout, jit_switch_memo_layout};
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use typed_fast::typed_elems_seen;
 mod handle_map;
@@ -440,6 +442,8 @@ pub struct Realm {
     /// are GC roots and the memo is dropped by a moving
     /// [`compact`](Realm::compact).
     key_strings: alloc::vec::Vec<Option<ShapeKeyStrings>>,
+    /// The `key_strings` entry the next layout replaces once all are taken.
+    key_strings_next: usize,
     /// The key String cells `Object.keys` last handed out per plain
     /// dictionary-mode object, valid while its key epoch is unchanged (see
     /// `builtins_fast::dict_enumerable_key_strings`). GC roots, dropped by a
@@ -1081,6 +1085,7 @@ impl Realm {
             lit_cells_prune: 16,
             key_ropes: core::cell::RefCell::new(None),
             key_strings: alloc::vec::Vec::new(),
+            key_strings_next: 0,
             dict_key_strings: alloc::vec::Vec::new(),
             merge_plans: alloc::vec::Vec::new(),
             assign_memo: assign_fast::AssignMemo::default(),

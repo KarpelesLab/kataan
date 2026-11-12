@@ -46,7 +46,7 @@ use core::cell::Cell as Slot;
 const CAP: usize = 512;
 
 /// The longest key text the memo records, in bytes.
-const TEXT_MAX: usize = 24;
+pub(super) const TEXT_MAX: usize = 24;
 
 /// [`Entry::slot`] of an absent entry.
 const ABSENT: u32 = u32::MAX;
@@ -57,15 +57,15 @@ const NO_PROTO: u64 = u64::MAX;
 /// A key text as the memo compares it: its bytes in three little-endian
 /// words (zero past the end) and its length.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-struct Text {
-    words: [u64; 3],
-    len: u32,
+pub(super) struct Text {
+    pub(super) words: [u64; 3],
+    pub(super) len: u32,
 }
 
 impl Text {
     /// The text of `b`, when it is short enough.
     #[inline]
-    fn of(b: &[u8]) -> Option<Self> {
+    pub(super) fn of(b: &[u8]) -> Option<Self> {
         let n = b.len();
         if n > TEXT_MAX {
             return None;
