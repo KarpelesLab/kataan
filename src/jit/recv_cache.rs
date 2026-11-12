@@ -35,7 +35,9 @@ use crate::nbvm::Op;
 /// time, often laid out in order. Other receivers (a method's `this`, a few
 /// objects taking turns, a register reused for another value) would mostly
 /// miss the prediction, and pay its instructions for nothing. (Only a guess
-/// of the profit: every prediction is checked.)
+/// of the profit: every prediction is checked.) An element read counts only
+/// when its index steps by one ([`stepped_regs`]): a binary heap's `a[2*i+1]`
+/// visits objects in no order.
 pub(super) fn walk_regs(bytecode: &[Op]) -> Vec<bool> {
     let (mut defs, mut uses) = (Vec::new(), Vec::new());
     let mut n = 0;
@@ -53,10 +55,14 @@ pub(super) fn walk_regs(bytecode: &[Op]) -> Vec<bool> {
     let mut link_of: Vec<(u16, u16)> = Vec::new();
     let mut other = vec![false; n];
     let mut walk = vec![false; n];
+    let stepped = stepped_regs(bytecode);
     for op in bytecode {
         super::numeric::def_use(op, &mut defs, &mut uses);
         match *op {
-            Op::GetKey { dst, .. } | Op::IterNext { dst, .. } => walk[usize::from(dst)] = true,
+            Op::GetKey { dst, key, .. } if stepped.get(usize::from(key)) != Some(&false) => {
+                walk[usize::from(dst)] = true;
+            }
+            Op::IterNext { dst, .. } => walk[usize::from(dst)] = true,
             Op::GetProp { dst, obj, .. } if dst == obj => walk[usize::from(dst)] = true,
             Op::GetProp { dst, obj, .. } => link_of.push((dst, obj)),
             _ => {}
@@ -98,6 +104,71 @@ pub(super) fn walk_regs(bytecode: &[Op]) -> Vec<bool> {
         *w &= !o;
     }
     walk
+}
+
+/// Per register of `bytecode`: whether the body steps it by one (`i++`, `i--`,
+/// `i += 1`: a `Step` of it or of its `ToNumeric`, or a `+`/`-` of it and a
+/// constant `1`, written back to it, maybe through a copy) — an index that
+/// walks an array in order. With `KATAAN_JIT_SEQPRED=0` (read once per
+/// process) every register counts, as before.
+pub(super) fn stepped_regs(bytecode: &[Op]) -> Vec<bool> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SEQPRED").is_none_or(|v| v != "0")) {
+        return Vec::new();
+    }
+    let mut n = 0usize;
+    for op in bytecode {
+        let top = core::cell::Cell::new(0usize);
+        crate::bytecode::op_for_each_reg(op, &|r| top.set(top.get().max(usize::from(r) + 1)));
+        n = n.max(top.get());
+    }
+    let mut out = vec![false; n];
+    // The registers some constant `1` is loaded into, the `ToNumeric`s.
+    let one: Vec<u16> = bytecode
+        .iter()
+        .filter_map(|o| match *o {
+            Op::LoadConst { dst, value } if value.as_number() == Some(1.0) => Some(dst),
+            _ => None,
+        })
+        .collect();
+    let numeric_of = |t: u16| {
+        bytecode.iter().find_map(|o| match *o {
+            Op::ToNumeric { dst, src } if dst == t => Some(src),
+            _ => None,
+        })
+    };
+    // Whether the value made in `t` is written back to `r` (`t` itself, or a
+    // copy of `t` into `r`).
+    let back = |t: u16, r: u16| {
+        t == r
+            || bytecode
+                .iter()
+                .any(|o| matches!(*o, Op::Move { dst, src } if src == t && dst == r))
+    };
+    for op in bytecode {
+        match *op {
+            Op::Step { dst, src, .. } => {
+                let base = numeric_of(src).unwrap_or(src);
+                if back(dst, base)
+                    && let Some(o) = out.get_mut(usize::from(base))
+                {
+                    *o = true;
+                }
+            }
+            Op::AddValue { dst, a, b } | Op::Add { dst, a, b } | Op::Sub { dst, a, b } => {
+                for (r, k) in [(a, b), (b, a)] {
+                    if one.contains(&k)
+                        && back(dst, r)
+                        && let Some(o) = out.get_mut(usize::from(r))
+                    {
+                        *o = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The most global binding addresses a body caches (each costs a frame slot
@@ -2012,9 +2083,33 @@ mod tests {
             get(22, 21, "link"),
             Op::Move { dst: 21, src: 22 },
             get(21, 3, "other"),
+            // `i++` of the index (an element read in order) ...
+            Op::ToNumeric { dst: 10, src: 9 },
+            Op::Step {
+                dst: 11,
+                src: 10,
+                dec: false,
+            },
+            Op::Move { dst: 9, src: 11 },
+            // ... but not of `a[2*i+1]`'s.
+            Op::GetKey {
+                dst: 30,
+                obj: 0,
+                key: 31,
+            },
+            Op::LoadConst {
+                dst: 32,
+                value: crate::nanbox::NanBox::number(2.0),
+            },
+            Op::Mul {
+                dst: 31,
+                a: 32,
+                b: 9,
+            },
         ];
         let w = walk_regs(&ops);
         assert!(w[14] && w[15]);
         assert!(!w[16] && !w[20] && !w[21] && !w[22]);
+        assert!(!w[30]);
     }
 }
