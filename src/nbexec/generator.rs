@@ -34,6 +34,11 @@ impl Interp {
             .and_then(|p| p.as_handle())
             .map(Handle::from_raw)?;
         let gp = self.realm.new_object_with_proto(Some(iter_proto));
+        // `constructor` (`%GeneratorFunction.prototype%`) is the first own key;
+        // `generator_function_prototype`, the only caller that creates this
+        // object, fills the slot right after.
+        self.realm
+            .set_property(gp, "constructor", NanBox::undefined());
         for (name, nid) in [
             ("next", N_GEN_NEXT),
             ("return", N_GEN_RETURN),
@@ -264,6 +269,11 @@ impl Interp {
         }
         let aip = self.async_iterator_prototype();
         let agp = self.realm.new_object_with_proto(aip);
+        // `constructor` (`%AsyncGeneratorFunction.prototype%`) is the first own
+        // key; `async_generator_function_prototype`, the only caller that
+        // creates this object, fills the slot right after.
+        self.realm
+            .set_property(agp, "constructor", NanBox::undefined());
         for (name, nid) in [
             ("next", N_ASYNC_GEN_NEXT),
             ("return", N_ASYNC_GEN_RETURN),

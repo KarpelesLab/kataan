@@ -181,6 +181,10 @@ impl Interp {
         // receiver (source → "(?:)", flags → "", flag getters → undefined).
         self.realm
             .set_hidden_property(proto, REGEXP_PROTO_BRAND, NanBox::boolean(true));
+        // `RegExp.prototype.constructor === RegExp` (non-enumerable), its first
+        // own key.
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         // First-class data-property methods.
         for &name in REGEXP_PROTO_METHODS {
             let name_h = self.realm.new_string(name);
@@ -228,9 +232,6 @@ impl Interp {
             );
             self.realm.mark_hidden(proto, name);
         }
-        // `RegExp.prototype.constructor === RegExp` (non-enumerable).
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         // Link the constructor's `prototype` (non-enumerable, non-writable,
         // non-configurable — a built-in constructor's `prototype`).
         self.realm

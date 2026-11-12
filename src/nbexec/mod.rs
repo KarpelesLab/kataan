@@ -3249,6 +3249,50 @@ impl Interp {
         }
     }
 
+    /// Installs `%Function.prototype%`'s `arguments` and `caller`: poisoned
+    /// accessors whose getter and setter are the realm's `%ThrowTypeError%`,
+    /// which this creates.
+    fn install_poisoned_caller_arguments(&mut self, func_proto: Handle) {
+        // `Function.prototype.caller` / `.arguments` are poisoned accessors
+        // (`%ThrowTypeError%` for both get and set), enumerable: false,
+        // configurable: true. Strict and bound functions inherit them, so
+        // `boundFn.caller` / `strictFn.arguments` throw a TypeError without a
+        // (forbidden) own property.
+        let thrower_h = self.realm.new_native(N_THROW_TYPE_ERROR);
+        // %ThrowTypeError% is a frozen function: own `name` "" / `length` 0
+        // that are uniquely NON-configurable (as well as non-writable/
+        // non-enumerable).
+        self.install_fn_name_length(thrower_h, "", 0);
+        self.realm.set_non_configurable_property(thrower_h, "name");
+        self.realm
+            .set_non_configurable_property(thrower_h, "length");
+        // …and it is created with [[Extensible]] false (ECMA-262 10.2.4
+        // step 6: "Perform ! SetIntegrityLevel(F, frozen)"), so
+        // `Object.isExtensible` is false and `Object.isFrozen` is true.
+        self.realm.freeze_object(thrower_h);
+        // Record it as the realm's single canonical `%ThrowTypeError%` so a
+        // strict `arguments` object's `callee` accessor is the *same* function
+        // object (ECMA-262: there is exactly one `%ThrowTypeError%` per realm).
+        self.realm.set_throw_type_error_intrinsic(thrower_h);
+        let thrower = NanBox::handle(thrower_h.to_raw());
+        for key in ["arguments", "caller"] {
+            self.realm
+                .define_accessor(func_proto, key, thrower, thrower);
+            self.realm.mark_hidden(func_proto, key);
+        }
+    }
+
+    /// Reserves the own `prototype` key of the built-in constructor `ctor`
+    /// right after its `length` and `name`, for a constructor whose static
+    /// methods are installed before its prototype object exists: own keys keep
+    /// creation order, and every engine lists a constructor's `prototype`
+    /// third (`Reflect.ownKeys(Array)` is `length, name, prototype, isArray,
+    /// …`). The prototype's installation later fills the slot in place.
+    fn reserve_ctor_prototype(&mut self, ctor: Handle) {
+        self.realm
+            .set_property(ctor, "prototype", NanBox::undefined());
+    }
+
     /// Creates a native function carrying its own `name`/`length` data properties,
     /// per the spec's named built-ins (`Math.max.name === "max"`,
     /// `Math.max.length === 2`), each with attributes `{ writable: false,
@@ -3420,6 +3464,16 @@ impl Interp {
         } else {
             self.realm.new_object_with_proto(obj_proto)
         };
+        // `%Function.prototype%` is itself a function with own `length` 0 and
+        // `name` "" (`{ w:false, e:false, c:true }`), which lead its own keys.
+        if ctor_name == "Function" {
+            self.install_fn_name_length(proto, "", 0);
+        }
+        // `constructor` is the prototype's first own key (after an Array
+        // prototype's `length`, or the function prototype's `length`/`name`),
+        // as in every engine.
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
         for &name in methods {
             let name_h = self.realm.new_string(name);
             let f = self.realm.new_bound_native(native_id, name_h);
@@ -3441,8 +3495,6 @@ impl Interp {
         self.realm.mark_hidden(ns, "prototype");
         self.realm.set_readonly_property(ns, "prototype");
         self.realm.set_non_configurable_property(ns, "prototype");
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
     }
 
     /// Builds `<ctor>.prototype` as a real object whose methods are *direct-id*
@@ -3462,6 +3514,8 @@ impl Interp {
         };
         let obj_proto = self.object_prototype();
         let proto = self.realm.new_object_with_proto(obj_proto);
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
         for &(name, id) in methods {
             let f = self.new_named_native(name, id);
             self.realm
@@ -3473,8 +3527,6 @@ impl Interp {
         self.realm.mark_hidden(ns, "prototype");
         self.realm.set_readonly_property(ns, "prototype");
         self.realm.set_non_configurable_property(ns, "prototype");
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ns.to_raw()));
     }
 
     /// Installs the shared abstract `%TypedArray%` intrinsic constructor and wires
@@ -3910,6 +3962,7 @@ impl Interp {
         let install_ctor_namespace =
             |this: &mut Self, global_name: &str, ctor_id: u16, methods: &[(&str, u16)]| {
                 let obj = this.new_named_native(global_name, ctor_id);
+                this.reserve_ctor_prototype(obj);
                 for (name, id) in methods {
                     let f = this.new_named_native(name, *id);
                     this.realm
@@ -4046,6 +4099,7 @@ impl Interp {
             .declare("Date", NanBox::handle(date_ctor.to_raw()));
         // `RegExp` is a native constructor.
         let regexp_ctor = self.new_named_native("RegExp", N_REGEXP);
+        self.reserve_ctor_prototype(regexp_ctor);
         self.current
             .declare("RegExp", NanBox::handle(regexp_ctor.to_raw()));
         // `RegExp.escape` (ES2025) — a static method on the constructor.
@@ -4058,6 +4112,7 @@ impl Interp {
         // subclasses are installed under the WebAssembly namespace below.
         for (i, name) in ERROR_NAMES.iter().enumerate().take(N_GLOBAL_ERROR_COUNT) {
             let ctor = self.new_named_native(name, N_ERROR_BASE + i as u16);
+            self.reserve_ctor_prototype(ctor);
             self.current.declare(name, NanBox::handle(ctor.to_raw()));
             // `Error.isError` (ES2025) — a static method on the base `Error`
             // constructor only (a `{writable, !enumerable, configurable}` data
@@ -4229,6 +4284,9 @@ impl Interp {
             ("DurationFormat", N_INTL_DURATION_FORMAT),
         ] {
             let f = self.new_named_native(name, id);
+            // Its `prototype` (built by `install_intl_prototypes`) is the third
+            // own key.
+            self.reserve_ctor_prototype(f);
             // `Intl.X.supportedLocalesOf(locales)` — static on every constructor.
             let sl = self.new_named_native("supportedLocalesOf", N_INTL_SUPPORTED_LOCALES);
             self.realm
@@ -4272,6 +4330,7 @@ impl Interp {
             // (`DataView.name === "DataView"`, `.length === 1`), each
             // `{ writable: false, enumerable: false, configurable: true }`.
             let f = self.new_named_native(name, id);
+            self.reserve_ctor_prototype(f);
             // `ArrayBuffer.isView(x)` — true for a typed array or a DataView.
             if id == N_ARRAY_BUFFER {
                 let isview = self.realm.new_native(N_ARRAY_BUFFER_IS_VIEW);
@@ -4333,10 +4392,25 @@ impl Interp {
         // (`%IteratorPrototype%`) carries `[Symbol.iterator]()` returning `this`,
         // so an object inheriting it is itself iterable.
         let iterator_ctor = self.new_named_native("Iterator", N_ITERATOR);
+        self.reserve_ctor_prototype(iterator_ctor);
         let from_fn = self.new_named_native("from", N_ITERATOR_FROM);
         self.realm
             .set_hidden_property(iterator_ctor, "from", NanBox::handle(from_fn.to_raw()));
         let iter_proto = self.realm.new_object();
+        // `%IteratorPrototype%.constructor` (its first own key) is a get/set accessor (get → %Iterator%;
+        // set = SetterThatIgnoresPrototypeProperties), enumerable: false,
+        // configurable: true — not a plain data property.
+        let ctor_get = self.realm.new_native(N_ITERATOR_CTOR_GET);
+        self.install_fn_name_length(ctor_get, "get constructor", 0);
+        let ctor_set = self.realm.new_native(N_ITERATOR_CTOR_SET);
+        self.install_fn_name_length(ctor_set, "set constructor", 1);
+        self.realm.define_accessor(
+            iter_proto,
+            "constructor",
+            NanBox::handle(ctor_get.to_raw()),
+            NanBox::handle(ctor_set.to_raw()),
+        );
+        self.realm.mark_hidden(iter_proto, "constructor");
         // `%IteratorPrototype%[Symbol.iterator]` returns `this` (a native bound to
         // the receiver at call time).
         let self_iter = self.realm.new_native(N_ITERATOR_PROTO_SELF);
@@ -4387,20 +4461,6 @@ impl Interp {
                 .set_property(iter_proto, name, NanBox::handle(f.to_raw()));
             self.realm.mark_hidden(iter_proto, name);
         }
-        // `%IteratorPrototype%.constructor` is a get/set accessor (get → %Iterator%;
-        // set = SetterThatIgnoresPrototypeProperties), enumerable: false,
-        // configurable: true — not a plain data property.
-        let ctor_get = self.realm.new_native(N_ITERATOR_CTOR_GET);
-        self.install_fn_name_length(ctor_get, "get constructor", 0);
-        let ctor_set = self.realm.new_native(N_ITERATOR_CTOR_SET);
-        self.install_fn_name_length(ctor_set, "set constructor", 1);
-        self.realm.define_accessor(
-            iter_proto,
-            "constructor",
-            NanBox::handle(ctor_get.to_raw()),
-            NanBox::handle(ctor_set.to_raw()),
-        );
-        self.realm.mark_hidden(iter_proto, "constructor");
         self.realm.set_hidden_property(
             iterator_ctor,
             "prototype",
@@ -4564,6 +4624,10 @@ impl Interp {
         // points at the *parent* realm's `Object.prototype` at this point — leaving
         // it would chain the child realm's whole object graph onto the parent's.
         self.realm.set_object_proto(obj_proto, None);
+        // `constructor` is the first own key (filled below, once `Object`'s
+        // `prototype` is linked).
+        self.realm
+            .set_property(obj_proto, "constructor", NanBox::undefined());
         for (name, id, arity) in [
             ("toString", N_OBJ_PROTO_TOSTRING, 0u32),
             ("toLocaleString", N_OBJ_PROTO_TOLOCALESTRING, 0),
@@ -4946,36 +5010,9 @@ impl Interp {
             .map(Handle::from_raw)
         {
             self.realm.set_function_proto_intrinsic(func_proto);
-            // `%Function.prototype%` is itself a function with own `name` "" and
-            // `length` 0 (`{ w:false, e:false, c:true }`).
-            self.install_fn_name_length(func_proto, "", 0);
-            // `Function.prototype.caller` / `.arguments` are poisoned accessors
-            // (`%ThrowTypeError%` for both get and set), enumerable: false,
-            // configurable: true. Strict and bound functions inherit them, so
-            // `boundFn.caller` / `strictFn.arguments` throw a TypeError without a
-            // (forbidden) own property.
-            let thrower_h = self.realm.new_native(N_THROW_TYPE_ERROR);
-            // %ThrowTypeError% is a frozen function: own `name` "" / `length` 0
-            // that are uniquely NON-configurable (as well as non-writable/
-            // non-enumerable).
-            self.install_fn_name_length(thrower_h, "", 0);
-            self.realm.set_non_configurable_property(thrower_h, "name");
-            self.realm
-                .set_non_configurable_property(thrower_h, "length");
-            // …and it is created with [[Extensible]] false (ECMA-262 10.2.4
-            // step 6: "Perform ! SetIntegrityLevel(F, frozen)"), so
-            // `Object.isExtensible` is false and `Object.isFrozen` is true.
-            self.realm.freeze_object(thrower_h);
-            // Record it as the realm's single canonical `%ThrowTypeError%` so a
-            // strict `arguments` object's `callee` accessor is the *same* function
-            // object (ECMA-262: there is exactly one `%ThrowTypeError%` per realm).
-            self.realm.set_throw_type_error_intrinsic(thrower_h);
-            let thrower = NanBox::handle(thrower_h.to_raw());
-            for key in ["caller", "arguments"] {
-                self.realm
-                    .define_accessor(func_proto, key, thrower, thrower);
-                self.realm.mark_hidden(func_proto, key);
-            }
+            // (Its `name`/`length` were installed with the prototype, by
+            // `setup_first_class_prototype_id`.)
+            self.install_poisoned_caller_arguments(func_proto);
             // `Function.prototype[Symbol.hasInstance]` — OrdinaryHasInstance,
             // non-writable, non-enumerable, non-configurable (a first-class
             // native so `instanceof` and explicit `.call` both work).
@@ -5092,6 +5129,8 @@ impl Interp {
             .and_then(|v| v.as_handle())
             .map(Handle::from_raw)
         {
+            // `prototype` is the constructor's third own key (filled below).
+            self.reserve_ctor_prototype(sym_ctor);
             // The well-known symbols are own data properties of `%Symbol%` with
             // attributes { writable:false, enumerable:false, configurable:false }.
             for name in [
@@ -5118,6 +5157,10 @@ impl Interp {
                 self.realm.set_non_configurable_property(sym_ctor, name);
             }
             let proto = self.realm.new_object_with_proto(Some(obj_proto));
+            // `constructor` — { writable:true, enumerable:false, configurable:true },
+            // the first own key.
+            self.realm
+                .set_hidden_property(proto, "constructor", NanBox::handle(sym_ctor.to_raw()));
             // `toString` / `valueOf` — { writable:true, enumerable:false, configurable:true }.
             for (name, nid) in [
                 ("toString", N_SYMBOL_PROTO_TOSTRING),
@@ -5147,9 +5190,6 @@ impl Interp {
             self.realm.set_readonly_property(proto, &to_prim_key);
             // `[Symbol.toStringTag]` === "Symbol".
             self.install_to_string_tag(proto, "Symbol");
-            // `constructor` — { writable:true, enumerable:false, configurable:true }.
-            self.realm
-                .set_hidden_property(proto, "constructor", NanBox::handle(sym_ctor.to_raw()));
             // Install on the constructor (read-only, non-enumerable, non-configurable)
             // and register as the intrinsic `[[Prototype]]` of Symbol primitives.
             self.realm

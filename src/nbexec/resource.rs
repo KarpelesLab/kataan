@@ -169,6 +169,8 @@ impl Interp {
         self.realm.set_readonly_property(ctor, "length");
         let obj_proto = self.object_prototype();
         let proto = self.realm.new_object_with_proto(obj_proto);
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         // First-class, brand-checked prototype methods.
         for &m in methods {
             let name_h = self.realm.new_string(m);
@@ -205,8 +207,6 @@ impl Interp {
         // `prototype[Symbol.toStringTag]`.
         self.install_to_string_tag(proto, tag);
         self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
-        self.realm
             .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
         self.realm.mark_hidden(ctor, "prototype");
         self.realm.set_readonly_property(ctor, "prototype");
@@ -223,6 +223,8 @@ impl Interp {
         self.realm.set_readonly_property(ctor, "length");
         let obj_proto = self.object_prototype();
         let proto = self.realm.new_object_with_proto(obj_proto);
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         for &(m, arity) in &[("evaluate", 1u32), ("importValue", 2)] {
             let name_h = self.realm.new_string(m);
             let f = self.realm.new_bound_native(N_SHADOW_REALM_PROTO, name_h);
@@ -232,8 +234,6 @@ impl Interp {
             self.realm.mark_hidden(proto, m);
         }
         self.install_to_string_tag(proto, "ShadowRealm");
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         self.realm
             .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
         self.realm.mark_hidden(ctor, "prototype");

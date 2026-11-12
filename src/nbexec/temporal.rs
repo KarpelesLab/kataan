@@ -164,6 +164,12 @@ impl Interp {
             let (methods, getters) = tables_for(kind);
             let op = self.object_prototype();
             let proto = self.realm.new_object_with_proto(op);
+            // Own-key order: the constructor's `length`, `name`, `prototype`,
+            // then its statics; the prototype's `constructor` first.
+            self.realm
+                .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
+            self.realm
+                .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
             // Static methods (`from`/`compare`/…): own non-enumerable function
             // properties of the constructor.
             for &(sname, slen) in statics_for(kind) {
@@ -207,12 +213,8 @@ impl Interp {
             }
             // `Class.prototype[Symbol.toStringTag] = "Temporal.<Type>"`.
             self.install_to_string_tag(proto, &alloc::format!("Temporal.{name}"));
-            // `constructor` back-link + prototype wiring (non-enumerable,
-            // prototype writable:false / configurable:false).
-            self.realm
-                .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
-            self.realm
-                .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
+            // The prototype link's attributes (non-enumerable, writable:false,
+            // configurable:false).
             self.realm.mark_hidden(ctor, "prototype");
             self.realm.set_readonly_property(ctor, "prototype");
             self.realm.set_non_configurable_property(ctor, "prototype");

@@ -2957,6 +2957,9 @@ impl Interp {
         let ctor = self.intl_ctor_handle(ctor_name)?;
         let obj_proto = self.object_prototype();
         let proto = self.realm.new_object_with_proto(obj_proto);
+        // `prototype.constructor` back-link (non-enumerable), the first own key.
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         for &m in svc.methods {
             // ListFormat/RelativeTimeFormat have distinct `format`/`formatToParts`
             // method natives; pick the underlying selector accordingly.
@@ -2991,9 +2994,6 @@ impl Interp {
         // `prototype[Symbol.toStringTag]` — a `{ w:false, e:false, c:true }` string
         // data property (ECMA-402 11.3.x etc.).
         self.install_to_string_tag(proto, svc.tag);
-        // `prototype.constructor` back-link (non-enumerable).
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         self.link_ctor_prototype(ctor, proto);
         self.realm.set_intl_prototype(svc.ctor_id, proto);
         Some(proto)
@@ -9862,6 +9862,8 @@ impl Interp {
         let ctor = self.intl_ctor_handle("Locale")?;
         let obj_proto = self.object_prototype();
         let proto = self.realm.new_object_with_proto(obj_proto);
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         for &name in LOCALE_ACCESSORS {
             let label = alloc::format!("get {name}");
             let target = self.new_str(name);
@@ -9897,8 +9899,6 @@ impl Interp {
             self.realm.mark_hidden(proto, m);
         }
         self.install_to_string_tag(proto, "Intl.Locale");
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         self.link_ctor_prototype(ctor, proto);
         self.realm.set_intl_prototype(N_INTL_LOCALE, proto);
         Some(proto)
@@ -10543,6 +10543,8 @@ impl Interp {
         let ctor = self.intl_ctor_handle("DurationFormat")?;
         let obj_proto = self.object_prototype();
         let proto = self.realm.new_object_with_proto(obj_proto);
+        self.realm
+            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         for &(m, arity) in &[
             ("resolvedOptions", 0u32),
             ("format", 1),
@@ -10557,8 +10559,6 @@ impl Interp {
             self.realm.mark_hidden(proto, m);
         }
         self.install_to_string_tag(proto, "Intl.DurationFormat");
-        self.realm
-            .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
         self.link_ctor_prototype(ctor, proto);
         self.realm.set_intl_prototype(N_INTL_DURATION_FORMAT, proto);
         Some(proto)
