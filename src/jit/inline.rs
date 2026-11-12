@@ -1152,20 +1152,20 @@ pub fn expand<'a>(
     // guard's, so a branch to the call enters the guard).
     let mut next = 0usize;
     let mut si = 0usize;
-    for pc in 0..proto.ops.len() {
+    for (pc, op) in proto.ops.iter().enumerate() {
         new_of.push(u32::try_from(next).ok()?);
         if si < sites.len() && sites[si].0 == pc {
             next += sites[si]
                 .1
                 .iter()
-                .map(|c| way_len(&c.proto, &proto.ops[pc], &mut windows))
+                .map(|c| way_len(&c.proto, op, &mut windows))
                 .sum::<usize>()
                 + 1;
-            if matches!(proto.ops[pc], Op::CallKey { .. }) {
+            if matches!(op, Op::CallKey { .. }) {
                 next += 1;
             }
             // (A spread's own two before its way, three after its call.)
-            if matches!(proto.ops[pc], Op::CallSpreadPlain { .. }) {
+            if matches!(op, Op::CallSpreadPlain { .. }) {
                 next += 5;
             }
             si += 1;

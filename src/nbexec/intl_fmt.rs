@@ -22,10 +22,10 @@ fn swap_letter_case(s: &str) -> String {
     }
     s.chars()
         .map(|c| {
-            let swapped = if c.is_lowercase() {
-                single(c.to_uppercase())
-            } else if c.is_uppercase() {
-                single(c.to_lowercase())
+            let swapped = if intl::unicode::is_lowercase(c) {
+                single(crate::unicode::to_uppercase(c))
+            } else if intl::unicode::is_uppercase(c) {
+                single(crate::unicode::to_lowercase(c))
             } else {
                 None
             };
@@ -1204,8 +1204,9 @@ fn compact_reround_grouped(
 /// in a multi-word suffix stays part of the `compact` token).
 #[cfg(feature = "intl")]
 fn split_compact_affix_parts(parts: &mut alloc::vec::Vec<(&'static str, String)>) {
+    use crate::unicode::is_white_space;
     let needs = parts.iter().any(|(k, v)| {
-        *k == "compact" && (v.starts_with(char::is_whitespace) || v.ends_with(char::is_whitespace))
+        *k == "compact" && (v.starts_with(is_white_space) || v.ends_with(is_white_space))
     });
     if !needs {
         return;
@@ -1213,12 +1214,12 @@ fn split_compact_affix_parts(parts: &mut alloc::vec::Vec<(&'static str, String)>
     let mut out: alloc::vec::Vec<(&'static str, String)> =
         alloc::vec::Vec::with_capacity(parts.len() + 2);
     for (k, v) in core::mem::take(parts) {
-        if k != "compact" || v.trim().is_empty() {
+        if k != "compact" || v.trim_matches(is_white_space).is_empty() {
             out.push((k, v));
             continue;
         }
-        let lead_len = v.len() - v.trim_start().len();
-        let core_end = v.trim_end().len();
+        let lead_len = v.len() - v.trim_start_matches(is_white_space).len();
+        let core_end = v.trim_end_matches(is_white_space).len();
         if lead_len > 0 {
             out.push(("literal", String::from(&v[..lead_len])));
         }
@@ -4639,7 +4640,7 @@ impl Interp {
                         Some((_, shown))
                             if key != "year"
                                 && matches!(v.as_str(), "numeric" | "2-digit")
-                                && shown.chars().all(char::is_numeric) =>
+                                && shown.chars().all(intl::unicode::is_numeric) =>
                         {
                             let two = shown.chars().count() == 2;
                             String::from(if two { "2-digit" } else { "numeric" })
@@ -8679,7 +8680,7 @@ impl Interp {
         } else {
             self.realm.string_value(h)?
         };
-        let s = raw.trim();
+        let s = raw.trim_matches(crate::unicode::is_white_space);
         let (neg, body) = match s.strip_prefix('-') {
             Some(r) => (true, r),
             None => (false, s.strip_prefix('+').unwrap_or(s)),
@@ -10492,7 +10493,7 @@ impl Interp {
                 // A leading separator (space/NBSP) is a `literal`; the rest is the
                 // unit/compact token.
                 let sep_end = suffix
-                    .find(|c: char| !c.is_whitespace())
+                    .find(|c: char| !crate::unicode::is_white_space(c))
                     .unwrap_or(suffix.len());
                 if sep_end > 0 {
                     suffix_parts.push(("literal", String::from(&suffix[..sep_end])));
@@ -10941,7 +10942,7 @@ impl Interp {
             ExecError::Throw(this.make_error(N_RANGE_ERROR, Some(m)))
         };
         let mut rec = [0.0f64; 10];
-        let bytes = s.trim();
+        let bytes = s.trim_matches(crate::unicode::is_white_space);
         let (sign, rest) = match bytes.strip_prefix('-') {
             Some(r) => (-1.0, r),
             None => (1.0, bytes.strip_prefix('+').unwrap_or(bytes)),

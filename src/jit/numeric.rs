@@ -2297,8 +2297,8 @@ impl NumGen {
             if r.spec_int
                 && let Some(p) = r.int.as_mut()
             {
-                for pc in r.head..=r.end {
-                    self.int_labels[pc] = Some(a.new_label());
+                for label in &mut self.int_labels[r.head..=r.end] {
+                    *label = Some(a.new_label());
                 }
                 // (Its entry is its header op's label.)
                 p.entry = self.int_labels[r.head];
@@ -2307,8 +2307,8 @@ impl NumGen {
         }
         for r in &self.regions {
             if r.spec.is_some() {
-                for pc in r.head..=r.end {
-                    self.copy_labels[pc] = Some(a.new_label());
+                for label in &mut self.copy_labels[r.head..=r.end] {
+                    *label = Some(a.new_label());
                 }
                 for &(h, _) in &r.loops {
                     if !self.inner_entries.iter().any(|e| e.0 == h) {

@@ -249,7 +249,9 @@ impl BigInt {
     /// Returns `None` on an invalid digit.
     #[must_use]
     pub fn from_str_radix(s: &str, radix: u32) -> Option<Self> {
-        Int::from_str_radix(s.trim(), radix).ok().map(Self)
+        Int::from_str_radix(s.trim_matches(crate::unicode::is_white_space), radix)
+            .ok()
+            .map(Self)
     }
 }
 

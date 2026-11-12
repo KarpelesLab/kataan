@@ -289,9 +289,9 @@ fn literals_in_block(
         }
     }
 
-    for pc in start..=end {
+    for (pc, slot) in p.ops.iter_mut().enumerate().take(end + 1).skip(start) {
         // A read of a fresh literal that its members answer.
-        let rewrite = match &p.ops[pc] {
+        let rewrite = match &*slot {
             Op::GetProp { dst, obj, key } => {
                 holds.get(*obj as usize).copied().flatten().and_then(|i| {
                     let l = &lits[i];
@@ -344,10 +344,10 @@ fn literals_in_block(
             _ => None,
         };
         if let Some(op) = rewrite {
-            p.ops[pc] = op;
+            *slot = op;
             changed = true;
         }
-        match &p.ops[pc] {
+        match &*slot {
             Op::LoadConst { dst, value } => {
                 let (dst, n) = (*dst, value.as_number());
                 kill(&mut lits, &mut holds, &mut consts, dst);

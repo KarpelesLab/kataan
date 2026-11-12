@@ -3280,7 +3280,7 @@ impl Interp {
 /// Whether a bare offset string (e.g. `-11:20:00`, `+0530`, `-11:20`) carries a
 /// seconds (sub-minute) component. Such offsets force `MATCH_EXACTLY`.
 fn offset_str_has_seconds(s: &str) -> bool {
-    let s = s.trim();
+    let s = s.trim_matches(crate::unicode::is_white_space);
     let body = s.strip_prefix(['+', '-', '\u{2212}']).unwrap_or(s);
     if body.contains('.') || body.contains(',') {
         return true;

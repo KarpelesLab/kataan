@@ -207,6 +207,11 @@ pub mod host;
 #[doc(hidden)]
 pub mod temporal_iso;
 
+/// Unicode properties and case mapping pinned to one UCD version (17.0.0), so
+/// JS string semantics do not drift with the toolchain's `char` tables.
+pub mod unicode;
+mod unicode_data;
+
 /// The in-house regular-expression engine (the `regex` feature). Pure Rust,
 /// `no_std`-compatible (`alloc` only).
 #[cfg(feature = "regex")]

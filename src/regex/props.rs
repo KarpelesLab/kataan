@@ -583,15 +583,16 @@ fn gc_sub_matches(code: [u8; 2], cp: u32) -> bool {
 
 #[cfg(not(feature = "intl"))]
 fn gc_group_matches(g: u8, cp: u32) -> bool {
+    use crate::unicode as u;
     let Some(c) = char::from_u32(cp) else {
         // Lone surrogate: only the `C` (Other) group claims it.
         return g == b'C';
     };
     match g {
-        b'L' => c.is_alphabetic(),
-        b'N' => c.is_numeric(),
-        b'Z' => c == ' ' || (c.is_whitespace() && !c.is_control()),
-        b'C' => c.is_control(),
+        b'L' => u::is_alphabetic(c),
+        b'N' => u::is_numeric(c),
+        b'Z' => u::is_space_separator(c) || matches!(c, '\u{2028}' | '\u{2029}'),
+        b'C' => u::is_control(c),
         b'P' => c.is_ascii_punctuation(),
         _ => false,
     }
@@ -599,16 +600,18 @@ fn gc_group_matches(g: u8, cp: u32) -> bool {
 
 #[cfg(not(feature = "intl"))]
 fn gc_sub_matches(code: [u8; 2], cp: u32) -> bool {
+    use crate::unicode as u;
     let Some(c) = char::from_u32(cp) else {
         return &code == b"Cs";
     };
     match &code {
-        b"Lu" => c.is_uppercase(),
-        b"Ll" => c.is_lowercase(),
+        b"Lu" => u::is_uppercase(c),
+        b"Ll" => u::is_lowercase(c),
         b"Lt" => false,
-        b"Lo" => c.is_alphabetic() && !c.is_uppercase() && !c.is_lowercase(),
+        b"Lo" => u::is_alphabetic(c) && !u::is_uppercase(c) && !u::is_lowercase(c),
         b"Nd" => c.is_ascii_digit(),
-        b"Cc" => c.is_control(),
+        b"Zs" => u::is_space_separator(c),
+        b"Cc" => u::is_control(c),
         // Finer categories need the Unicode tables (the `intl` feature).
         _ => false,
     }
@@ -699,7 +702,7 @@ impl BinProp {
         use super::props_data as d;
         use BinProp::*;
         Some(match self {
-            CaseIgnorable => d::CASE_IGNORABLE,
+            CaseIgnorable => crate::unicode_data::CASE_IGNORABLE,
             ChangesWhenNfkcCasefolded => d::CHANGES_WHEN_NFKC_CASEFOLDED,
             Deprecated => d::DEPRECATED,
             Emoji => d::EMOJI,
@@ -711,8 +714,8 @@ impl BinProp {
             Extender => d::EXTENDER,
             GraphemeBase => d::GRAPHEME_BASE,
             GraphemeExtend => d::GRAPHEME_EXTEND,
-            IdContinue => d::ID_CONTINUE,
-            IdStart => d::ID_START,
+            IdContinue => crate::unicode_data::ID_CONTINUE,
+            IdStart => crate::unicode_data::ID_START,
             IdsBinaryOperator => d::IDS_BINARY_OPERATOR,
             IdsTrinaryOperator => d::IDS_TRINARY_OPERATOR,
             Ideographic => d::IDEOGRAPHIC,
@@ -739,11 +742,12 @@ impl BinProp {
         let Some(c) = char::from_u32(cp) else {
             return matches!(self, Assigned);
         };
+        use crate::unicode as u;
         match self {
-            Alphabetic => c.is_alphabetic(),
-            Lowercase => c.is_lowercase(),
-            Uppercase => c.is_uppercase(),
-            WhiteSpace => c.is_whitespace(),
+            Alphabetic => u::is_alphabetic(c),
+            Lowercase => u::is_lowercase(c),
+            Uppercase => u::is_uppercase(c),
+            WhiteSpace => u::is_white_space(c),
             HexDigit => c.is_ascii_hexdigit(),
             // The generated UCD range tables carry their own data and need no
             // `intl` feature, so they stay exact here too.

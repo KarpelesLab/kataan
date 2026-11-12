@@ -8961,8 +8961,8 @@ fn link_roots(ctx: &mut Ctx, roots: &mut Vec<Handle>) {
             roots.push(Handle::from_raw(raw));
         }
     }
-    for i in 0..ctx.realm.host_roots.links.len() {
-        let addr = ctx.realm.host_roots.links[i].ctx;
+    for &link in &ctx.realm.host_roots.links {
+        let addr = link.ctx;
         // SAFETY: a link names a context that crossed into the host and is
         // suspended in that crossing (`with_host`) until the link is popped,
         // so it is alive and nothing mutates it while this runs; only fields
@@ -8977,7 +8977,6 @@ fn link_roots(ctx: &mut Ctx, roots: &mut Vec<Handle>) {
         {
             push(roots, *v);
         }
-        let link = ctx.realm.host_roots.links[i];
         if link.regs_len != 0 {
             // SAFETY: the crossing's running frame lent its register file
             // (`with_host_regs`) for as long as the link is on the stack, and
@@ -13583,8 +13582,16 @@ fn builtin_method(
     // --- string methods ---
     if let Some(s) = ctx.realm.string_value(h) {
         let result = match key {
-            "toUpperCase" => NanBox::handle(ctx.realm.new_string(&s.to_uppercase()).to_raw()),
-            "toLowerCase" => NanBox::handle(ctx.realm.new_string(&s.to_lowercase()).to_raw()),
+            "toUpperCase" => NanBox::handle(
+                ctx.realm
+                    .new_string(&crate::unicode::to_uppercase_str(&s))
+                    .to_raw(),
+            ),
+            "toLowerCase" => NanBox::handle(
+                ctx.realm
+                    .new_string(&crate::unicode::to_lowercase_str(&s))
+                    .to_raw(),
+            ),
             "trim" => NanBox::handle(
                 ctx.realm
                     .new_string(s.trim_matches(crate::realm::is_js_whitespace))
@@ -17114,7 +17121,6 @@ impl Compiler {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// [`Self::compile_fn_inner_impl`], retried with real parameter mapping
     /// when a mapped `arguments` object's aliasing turns out to be observable
     /// (a parameter write, or `arguments` escaping — here or in a nested

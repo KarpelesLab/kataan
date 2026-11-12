@@ -1997,30 +1997,10 @@ fn is_regexp_id_part(ch: char) -> bool {
     ch == '$' || ch == '_' || ch == '\u{200C}' || ch == '\u{200D}' || is_id_continue(ch)
 }
 
-/// `ID_Continue` (letters, marks, decimal digits, connector punctuation, and
-/// letter-numbers). With the `intl` feature this uses the Unicode property
-/// tables; otherwise a pragmatic `is_alphanumeric` approximation. ASCII is
-/// classified directly. Kept local to the regex crate so capture-group-name
-/// validation does not depend on lexer internals.
+/// `ID_Continue`, from the pinned in-house Unicode tables (ASCII classified
+/// directly).
 fn is_id_continue(ch: char) -> bool {
-    if ch.is_ascii() {
-        return ch.is_ascii_alphanumeric() || ch == '_';
-    }
-    #[cfg(feature = "intl")]
-    {
-        use intl::unicode::category::GeneralCategory as Gc;
-        let gc = intl::unicode::general_category(ch);
-        gc.is_letter()
-            || gc.is_mark()
-            || matches!(
-                gc,
-                Gc::LetterNumber | Gc::DecimalNumber | Gc::ConnectorPunctuation
-            )
-    }
-    #[cfg(not(feature = "intl"))]
-    {
-        ch.is_alphanumeric()
-    }
+    crate::unicode::is_id_continue(ch)
 }
 
 /// Whether `c` is a permitted `IdentityEscape` target under the `u` flag: a

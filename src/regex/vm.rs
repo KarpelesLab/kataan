@@ -1068,7 +1068,7 @@ fn char_fold_eq(a: char, b: char, flags: Flags) -> bool {
     }
     #[cfg(not(feature = "intl"))]
     {
-        a.eq_ignore_ascii_case(&b) || a.to_lowercase().eq(b.to_lowercase())
+        simple_fold(a as u32) == simple_fold(b as u32)
     }
 }
 
@@ -1076,7 +1076,7 @@ fn char_fold_eq(a: char, b: char, flags: Flags) -> bool {
 /// character, keep the result only if it is a *single* UTF-16 code unit (so `ß`
 /// → "SS" is rejected), and never map a non-ASCII character onto an ASCII one.
 fn canonicalize_legacy(ch: char) -> char {
-    let mut up = ch.to_uppercase();
+    let mut up = crate::unicode::to_uppercase(ch);
     let Some(first) = up.next() else {
         return ch;
     };
@@ -1244,8 +1244,8 @@ fn case_variants(ch: char, flags: Flags) -> impl Iterator<Item = u32> {
     // lie in its simple-fold class or among its own case mappings — e.g. `β`
     // and `ϐ` both uppercase to `Β`, which neither mapping of `β` reaches.
     let mut out = simple_fold_class(ch as u32);
-    out.extend(ch.to_uppercase().map(|u| u as u32));
-    out.extend(ch.to_lowercase().map(|l| l as u32));
+    out.extend(crate::unicode::to_uppercase(ch).map(|u| u as u32));
+    out.extend(crate::unicode::to_lowercase(ch).map(|l| l as u32));
     out.into_iter()
 }
 

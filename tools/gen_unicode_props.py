@@ -28,11 +28,8 @@ UNICODE_VERSION = "17.0.0"
 # property name -> (file, ucd property name). Order here is the emit order.
 PROPS = [
     # DerivedCoreProperties.txt
-    ("CASE_IGNORABLE", "DerivedCoreProperties.txt", "Case_Ignorable"),
     ("GRAPHEME_BASE", "DerivedCoreProperties.txt", "Grapheme_Base"),
     ("GRAPHEME_EXTEND", "DerivedCoreProperties.txt", "Grapheme_Extend"),
-    ("ID_CONTINUE", "DerivedCoreProperties.txt", "ID_Continue"),
-    ("ID_START", "DerivedCoreProperties.txt", "ID_Start"),
     # DerivedNormalizationProps.txt
     (
         "CHANGES_WHEN_NFKC_CASEFOLDED",
@@ -119,7 +116,8 @@ def main():
 //! ```
 //!
 //! Only the properties the `intl` crate does not expose a public predicate for
-//! live here; everything else in [`super::props`] delegates to `intl` (whose
+//! live here (`ID_Start`, `ID_Continue` and `Case_Ignorable`, which the engine
+//! also needs outside regex, are in `crate::unicode_data`); everything else in [`super::props`] delegates to `intl` (whose
 //! tables are the same UCD version) or to a closed form. Each table is a sorted,
 //! coalesced list of inclusive `(lo, hi)` code-point ranges, searched by
 //! [`in_ranges`].

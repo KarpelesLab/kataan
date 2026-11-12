@@ -10892,7 +10892,7 @@ fn parse_date_time_string(s: &str, strict: bool) -> Option<f64> {
 /// epoch. Returns `None` for anything it cannot parse (the caller yields `NaN`).
 #[must_use]
 pub fn parse_iso_date(s: &str) -> Option<f64> {
-    parse_date_time_string(s.trim(), true)
+    parse_date_time_string(s.trim_matches(crate::unicode::is_white_space), true)
 }
 
 /// Parses a date string for `Date.parse`/`new Date(string)`: the ISO-8601 form
@@ -10901,7 +10901,7 @@ pub fn parse_iso_date(s: &str) -> Option<f64> {
 /// `toUTCString`, both UTC). Returns `None` on failure.
 #[must_use]
 pub fn parse_date_string(s: &str) -> Option<f64> {
-    let s = s.trim();
+    let s = s.trim_matches(crate::unicode::is_white_space);
     if let Some(ms) = parse_date_time_string(s, true) {
         return Some(ms);
     }
@@ -10969,11 +10969,16 @@ fn parse_human_date(s: &str) -> Option<f64> {
     }
     // Strip a trailing parenthesized comment (`(Central European Time)`).
     let s = match s.find('(') {
-        Some(i) if s.trim_end().ends_with(')') => &s[..i],
+        Some(i)
+            if s.trim_end_matches(crate::unicode::is_white_space)
+                .ends_with(')') =>
+        {
+            &s[..i]
+        }
         _ => s,
     };
     let toks: alloc::vec::Vec<&str> = s
-        .split(|c: char| c.is_whitespace() || c == ',')
+        .split(|c: char| crate::unicode::is_white_space(c) || c == ',')
         .filter(|t| !t.is_empty())
         .collect();
     let mut month: Option<u32> = None;
@@ -11174,16 +11179,16 @@ pub(crate) fn date_to_iso(ms: f64) -> alloc::string::String {
     alloc::format!("{year}-{mo:02}-{d:02}T{h:02}:{min:02}:{s:02}.{milli:03}Z")
 }
 
-/// Whether `s` is a valid ECMAScript `IdentifierName` (approximated with the
-/// Rust Unicode alphabetic/alphanumeric predicates, which suffices for the
-/// Test262 `NativeFunction` syntax matcher). An empty string is not a name.
+/// Whether `s` is a valid ECMAScript `IdentifierName` (`ID_Start`/`ID_Continue`
+/// from the pinned Unicode tables, plus `$`, `_`, ZWNJ and ZWJ; escapes are not
+/// considered). An empty string is not a name.
 fn is_identifier_name(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
-        Some(c) if c == '$' || c == '_' || c.is_alphabetic() => {}
+        Some(c) if c == '$' || c == '_' || crate::unicode::is_id_start(c) => {}
         _ => return false,
     }
-    chars.all(|c| c == '$' || c == '_' || c.is_alphanumeric())
+    chars.all(|c| matches!(c, '$' | '\u{200C}' | '\u{200D}') || crate::unicode::is_id_continue(c))
 }
 
 /// Whether `s` is the bracketed form a symbol-keyed method's `name` takes

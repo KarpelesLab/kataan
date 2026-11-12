@@ -222,7 +222,11 @@ fn install_encoding(interp: &mut Interp) {
 }
 
 fn normalize_encoding_label(label: &str) -> Option<&'static str> {
-    match label.trim().to_ascii_lowercase().as_str() {
+    match label
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "utf-8" | "utf8" | "unicode-1-1-utf-8" | "unicode11utf8" | "unicode20utf8"
         | "x-unicode20utf8" => Some("utf-8"),
         "utf-16le" | "utf-16" | "ucs-2" | "csunicode" | "unicode" | "unicodefeff"

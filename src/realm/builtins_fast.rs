@@ -1369,8 +1369,7 @@ impl Realm {
                 }
                 cache.holder_props = aux.unwrap_or(h.to_raw());
                 cache.armed = true;
-                for i in 0..cache.links.len() {
-                    let (raw, aux, _) = cache.links[i];
+                for &(raw, aux, _) in &cache.links {
                     self.watch_link(raw, aux);
                 }
                 cache.stamp = crate::object::proto_epoch();

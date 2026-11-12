@@ -1811,92 +1811,35 @@ fn is_identifier_part_byte(c: u8) -> bool {
     is_identifier_start_byte(c) || c.is_ascii_digit()
 }
 
-/// Whether a non-ASCII char may *start* an identifier (`ID_Start`: letters and
-/// letter-numbers). With the `intl` feature this uses the Unicode property
-/// tables; otherwise it falls back to a pragmatic `is_alphabetic` approximation.
+/// Whether a char may *start* an identifier: ECMAScript `UnicodeIDStart`, the
+/// Unicode `ID_Start` property (which already includes the `Other_ID_Start`
+/// stability set and excludes `Pattern_Syntax`, e.g. U+2E2F VERTICAL TILDE),
+/// from the pinned in-house tables. ASCII is routed through the byte classifier.
 #[inline]
 pub(crate) fn is_identifier_start_char(ch: char) -> bool {
     if ch.is_ascii() {
         return is_identifier_start_byte(ch as u8);
     }
-    if is_other_id_start(ch) {
-        return true;
-    }
-    #[cfg(feature = "intl")]
-    {
-        // ECMAScript `UnicodeIDStart` is the Unicode `ID_Start` property. The
-        // `intl` crate exposes the UAX #31 `XID_Start` set, which differs from a
-        // bare general-category letter test in one crucial way: it excludes
-        // `Pattern_Syntax` characters. For example U+2E2F VERTICAL TILDE is a
-        // `Lm` (modifier letter) but is `Pattern_Syntax`, so it is NOT a valid
-        // identifier character — `gc.is_letter()` wrongly accepted it.
-        intl::unicode::is_xid_start(ch)
-    }
-    #[cfg(not(feature = "intl"))]
-    {
-        ch.is_alphabetic()
-    }
+    crate::unicode::is_id_start(ch)
 }
 
-/// The `Other_ID_Start` compatibility set — a small, Unicode-stability-fixed
-/// list of code points that are `ID_Start` despite not being letters/Nl (so the
-/// general-category test misses them). Required for spec-conformant identifiers.
-#[inline]
-fn is_other_id_start(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{1885}' | '\u{1886}' | '\u{2118}' | '\u{212E}' | '\u{309B}' | '\u{309C}'
-    )
-}
-
-/// The `Other_ID_Continue` compatibility set — code points that are
-/// `ID_Continue` despite not falling in the marks/digits/connector categories.
-/// Like `Other_ID_Start`, fixed by Unicode's identifier-stability guarantee.
-#[inline]
-fn is_other_id_continue(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{00B7}' | '\u{0387}' | '\u{1369}'..='\u{1371}' | '\u{19DA}'
-    )
-}
-
-/// Whether a non-ASCII char may continue an identifier (`ID_Continue`:
-/// `ID_Start` plus marks, decimal digits, connector punctuation, and ZWNJ/ZWJ).
-/// With the `intl` feature this uses the Unicode property tables; otherwise a
-/// pragmatic `is_alphanumeric` approximation. ASCII is routed through the byte
-/// classifiers.
+/// Whether a char may continue an identifier: `UnicodeIDContinue` (the Unicode
+/// `ID_Continue` property, pinned in-house) plus ZWNJ/ZWJ. ASCII is routed
+/// through the byte classifier.
 #[inline]
 fn is_identifier_part_char(ch: char) -> bool {
     if ch.is_ascii() {
         return is_identifier_part_byte(ch as u8);
     }
-    if ch == '\u{200C}' || ch == '\u{200D}' {
-        return true; // ZWNJ / ZWJ
-    }
-    // `ID_Continue` is a superset of `ID_Start`, so include the `Other_ID_Start`
-    // set as well as the `Other_ID_Continue` set.
-    if is_other_id_start(ch) || is_other_id_continue(ch) {
-        return true;
-    }
-    #[cfg(feature = "intl")]
-    {
-        // ECMAScript `UnicodeIDContinue` is the Unicode `ID_Continue` property.
-        // As with `ID_Start`, the `intl` `XID_Continue` set is the authoritative
-        // UAX #31 set and excludes `Pattern_Syntax` characters that a bare
-        // general-category test (letter/mark/Nd/Nl/Pc) would wrongly accept.
-        intl::unicode::is_xid_continue(ch)
-    }
-    #[cfg(not(feature = "intl"))]
-    {
-        ch.is_alphanumeric()
-    }
+    ch == '\u{200C}' || ch == '\u{200D}' || crate::unicode::is_id_continue(ch)
 }
 
 /// Whether a char is ECMAScript whitespace (the `WhiteSpace` production):
-/// TAB, VT, FF, SP, NBSP, ZWNBSP/BOM, and the Unicode `Zs` category.
+/// TAB, VT, FF, ZWNBSP/BOM, and the Unicode `Zs` category (SP and NBSP among
+/// them). Not Unicode `White_Space`: U+0085 NEL is `Cc`, not white space here.
 #[inline]
 fn is_unicode_whitespace(ch: char) -> bool {
-    matches!(ch, '\u{00A0}' | '\u{FEFF}') || ch.is_whitespace() && !is_unicode_line_terminator(ch)
+    matches!(ch, '\t' | '\u{B}' | '\u{C}' | '\u{FEFF}') || crate::unicode::is_space_separator(ch)
 }
 
 /// Whether a char is an ECMAScript `LineTerminator`: LF, CR, LS, PS.

@@ -8200,7 +8200,10 @@ fn segment_str(input: &str, granularity: &str) -> Vec<(alloc::string::String, Op
     match granularity {
         "word" => segment::words(input)
             .map(|w| {
-                let wl = Some(w.chars().any(char::is_alphanumeric));
+                let wl = Some(
+                    w.chars()
+                        .any(|c| intl::unicode::is_alphabetic(c) || intl::unicode::is_numeric(c)),
+                );
                 (alloc::string::String::from(w), wl)
             })
             .collect(),
@@ -8233,9 +8236,9 @@ fn segment_text_fallback(
     // whitespace, or other — so punctuation and spaces become distinct segments (matching the
     // `intl` crate, e.g. `","` and `" "` split apart).
     let class = |c: char| -> u8 {
-        if c.is_alphanumeric() {
+        if crate::unicode::is_alphanumeric(c) {
             0
-        } else if c.is_whitespace() {
+        } else if crate::unicode::is_white_space(c) {
             1
         } else {
             2
@@ -8261,7 +8264,7 @@ fn segment_text_fallback(
                 i += 1;
                 // End a sentence after `.`/`!`/`?` followed by whitespace (or end).
                 if matches!(c, '.' | '!' | '?') {
-                    while i < chars.len() && chars[i].is_whitespace() {
+                    while i < chars.len() && crate::unicode::is_white_space(chars[i]) {
                         i += 1;
                     }
                     out.push((chars[start..i].iter().collect(), None));
@@ -8626,43 +8629,13 @@ fn group_thousands_str(s: &str) -> String {
     out
 }
 
-/// Case-maps a WTF-8 string, preserving lone surrogates verbatim (a surrogate
-/// code point has no case). A surrogate-free string takes the `&str` fast path
-/// — byte-identical to `str::to_uppercase`/`to_lowercase`, including full
-/// (multi-`char`) mappings like `ß`→`SS`. A surrogate-bearing string maps each
-/// scalar code point with `char::to_uppercase`/`to_lowercase` and re-emits any
-/// surrogate code point unchanged, building the result as WTF-8.
+/// Case-maps a WTF-8 string (`String.prototype.toUpperCase`/`toLowerCase`):
+/// the locale-independent full mappings plus `Final_Sigma`, from the pinned
+/// in-house Unicode tables ([`crate::unicode::case_map_wtf8`]), so the result
+/// does not depend on the toolchain's Unicode version. Lone surrogates pass
+/// through unchanged (a surrogate code point has no case).
 pub(crate) fn case_map_wtf8(bytes: &[u8], upper: bool) -> alloc::vec::Vec<u8> {
-    // Fast path: no surrogates → valid UTF-8 → the standard `&str` mapping.
-    if let Some(s) = crate::wtf8::as_str(bytes) {
-        let mapped = if upper {
-            s.to_uppercase()
-        } else {
-            s.to_lowercase()
-        };
-        return mapped.into_bytes();
-    }
-    let mut out = alloc::vec::Vec::with_capacity(bytes.len());
-    for cp in crate::wtf8::code_points(bytes) {
-        match char::from_u32(cp) {
-            // A scalar value: apply the Unicode case mapping (a one-to-many
-            // mapping such as `ß`→`SS` expands here too).
-            Some(c) => {
-                if upper {
-                    for u in c.to_uppercase() {
-                        crate::wtf8::encode_code_point(u32::from(u), &mut out);
-                    }
-                } else {
-                    for u in c.to_lowercase() {
-                        crate::wtf8::encode_code_point(u32::from(u), &mut out);
-                    }
-                }
-            }
-            // A lone surrogate code point: no case — pass it through unchanged.
-            None => crate::wtf8::encode_code_point(cp, &mut out),
-        }
-    }
-    out
+    crate::unicode::case_map_wtf8(bytes, upper)
 }
 
 /// Unicode-normalizes a WTF-8 string (`form` is one of `NFC`/`NFD`/`NFKC`/
