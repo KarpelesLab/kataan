@@ -6437,6 +6437,7 @@ impl X64Assembler {
 
     /// Empties every [`entry_clear`](Self::set_entry_clear) slot but those
     /// of `keep`.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn clear_entry_slots_except(&mut self, keep: &[i32]) {
         for i in 0..self.entry_clear.len() {
             let d = self.entry_clear[i];
