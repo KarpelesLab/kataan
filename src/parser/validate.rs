@@ -47,8 +47,18 @@ use crate::ast::{
 use crate::common::Span;
 use crate::error::{Error, Result};
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
+
+/// The span of the first name in `names` that repeats an earlier one.
+fn first_duplicate<'a>(names: impl Iterator<Item = (&'a str, Span)>) -> Option<Span> {
+    let mut seen = BTreeSet::new();
+    names
+        .into_iter()
+        .find(|(n, _)| !seen.insert(*n))
+        .map(|(_, sp)| sp)
+}
 
 /// Validates a parsed [`Program`], returning the first early error found.
 pub(crate) fn validate_program(program: &Program) -> Result<()> {
@@ -1713,12 +1723,8 @@ impl Validator {
         for stmt in body {
             collect_module_top_lexical(stmt, &mut top_lex);
         }
-        for i in 0..top_lex.len() {
-            for j in (i + 1)..top_lex.len() {
-                if top_lex[i].0 == top_lex[j].0 {
-                    return Err(self.err(top_lex[j].1, "duplicate top-level declaration in module"));
-                }
-            }
+        if let Some(span) = first_duplicate(top_lex.iter().map(|(n, sp)| (&**n, *sp))) {
+            return Err(self.err(span, "duplicate top-level declaration in module"));
         }
         // A module top-level LexicallyDeclaredName (let/const/class, and — unlike
         // a script — a top-level function declaration) may not also be a
@@ -1727,8 +1733,9 @@ impl Validator {
         for stmt in body {
             collect_vars_only(stmt, &mut var_only);
         }
+        let var_only: BTreeSet<&str> = var_only.iter().map(|v| &**v).collect();
         for (name, span) in &top_lex {
-            if var_only.iter().any(|v| v == name) {
+            if var_only.contains(&**name) {
                 return Err(self.err(
                     *span,
                     "a module top-level lexical declaration conflicts with a `var` of the same name",
@@ -1830,16 +1837,13 @@ impl Validator {
         }
 
         // Duplicate ExportedNames.
-        for i in 0..exported.len() {
-            for j in (i + 1)..exported.len() {
-                if exported[i].0 == exported[j].0 {
-                    return Err(self.err(exported[j].1, "duplicate export name in module"));
-                }
-            }
+        if let Some(span) = first_duplicate(exported.iter().map(|(n, sp)| (n.as_str(), *sp))) {
+            return Err(self.err(span, "duplicate export name in module"));
         }
         // Every local export binding must be declared somewhere in the module.
+        let declared: BTreeSet<&str> = declared.iter().map(|d| &**d).collect();
         for (name, span) in &bindings {
-            if !declared.iter().any(|d| d.as_ref() == name.as_str()) {
+            if !declared.contains(name.as_str()) {
                 return Err(self.err(*span, "export of an undeclared identifier"));
             }
         }
@@ -1965,23 +1969,26 @@ impl Validator {
         for stmt in body {
             collect_top_level_decls(stmt, &mut lexical, &mut vars, top_level);
         }
-        for i in 0..lexical.len() {
-            for j in (i + 1)..lexical.len() {
-                if lexical[i].0 == lexical[j].0 {
-                    // The sole tolerated duplicate: two function declarations in
-                    // a sloppy block/switch scope (Annex B).
-                    let both_functions = lexical[i].2 && lexical[j].2;
-                    if both_functions && !strict {
-                        continue;
-                    }
-                    return Err(
-                        self.err(lexical[j].1, "duplicate lexical declaration in this scope")
-                    );
+        // Each name, and whether every declaration of it so far is a function
+        // (a set, not a pairwise scan: a scope with thousands of declarations —
+        // a bundle's top level — made this quadratic).
+        let mut seen: BTreeMap<&str, bool> = BTreeMap::new();
+        for (name, span, is_fn) in &lexical {
+            match seen.get_mut(&**name) {
+                None => {
+                    seen.insert(name, *is_fn);
+                }
+                // The sole tolerated duplicate: function declarations only, in
+                // a sloppy block/switch scope (Annex B).
+                Some(all_fns) if *all_fns && *is_fn && !strict => {}
+                Some(_) => {
+                    return Err(self.err(*span, "duplicate lexical declaration in this scope"));
                 }
             }
         }
+        let vars: BTreeSet<&str> = vars.iter().map(|v| &**v).collect();
         for (name, span, _) in &lexical {
-            if vars.iter().any(|v| v == name) {
+            if vars.contains(&**name) {
                 return Err(self.err(
                     *span,
                     "a lexical declaration conflicts with a `var` of the same name",

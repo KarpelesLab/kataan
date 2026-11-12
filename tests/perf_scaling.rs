@@ -343,3 +343,43 @@ fn dynamic_functions_are_linear() {
         });
     }
 }
+
+/// The early-error checks of a scope are linear in its declarations: the
+/// duplicate-lexical-name and lexical/var-clash checks compared every pair,
+/// so a scope with thousands of declarations (a bundle's top level, a big
+/// function, a module's exports) was quadratic. Wall clock around the whole
+/// run, since the checks run before any of the script does.
+#[test]
+fn scope_early_errors_are_linear() {
+    let run = |src: &str| -> f64 {
+        let t = std::time::Instant::now();
+        kataan::nbvm::execute_typed(src, Limits::default())
+            .unwrap_or_else(|e| panic!("workload threw: {e:?}"));
+        (t.elapsed().as_secs_f64() * 1000.0).max(1.0)
+    };
+    for (name, decl, open, close) in [
+        ("top-level let", "let", "", ""),
+        ("block const", "const", "{", "}"),
+        ("function-body let", "let", "(function () {", "})();"),
+    ] {
+        let make = |n: usize| {
+            let mut src = String::from(open);
+            for i in 0..n {
+                src.push_str(&format!("{decl} d{i} = {i};\n"));
+            }
+            src.push_str(close);
+            src
+        };
+        let best = |n: usize| {
+            let src = make(n);
+            (0..3).map(|_| run(&src)).fold(f64::INFINITY, f64::min)
+        };
+        let (small, large) = (best(4_000), best(16_000));
+        let ratio = large / small;
+        assert!(
+            ratio <= 8.0,
+            "{name}: scaling n x4 scaled the work x{ratio:.1} (bound 8.0) — \
+             {small:.0}ms at n=4000 vs {large:.0}ms at n=16000. Linear is ~4, quadratic ~16."
+        );
+    }
+}
