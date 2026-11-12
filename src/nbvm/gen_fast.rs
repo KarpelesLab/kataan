@@ -80,16 +80,50 @@ fn resume_state(
     mode: u8,
     v: NanBox,
 ) -> Result<GenOut, VmError> {
-    let (id, state, pc, dst, has_handlers) = match ctx.realm.vm_frame(fh) {
-        Some(f) => (
-            f.func as usize,
-            f.state,
-            f.pc as usize,
-            f.dst,
-            !f.handlers.is_empty(),
-        ),
-        None => return Err(VmError::NotAnObject),
-    };
+    let at = FrameAt::read(ctx, fh).ok_or(VmError::NotAnObject)?;
+    resume_state_at(ctx, funcs, fh, at, mode, v)
+}
+
+/// What a resumption reads of a generator's frame cell before it runs.
+#[derive(Clone, Copy)]
+struct FrameAt {
+    id: usize,
+    state: u8,
+    pc: usize,
+    dst: u16,
+    has_handlers: bool,
+}
+
+impl FrameAt {
+    #[inline]
+    fn read(ctx: &Ctx, fh: Handle) -> Option<Self> {
+        let f = ctx.realm.vm_frame(fh)?;
+        Some(FrameAt {
+            id: f.func as usize,
+            state: f.state,
+            pc: f.pc as usize,
+            dst: f.dst,
+            has_handlers: !f.handlers.is_empty(),
+        })
+    }
+}
+
+/// [`resume_state`] with the frame cell `fh`'s fields already read (`at`).
+fn resume_state_at(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    fh: Handle,
+    at: FrameAt,
+    mode: u8,
+    v: NanBox,
+) -> Result<GenOut, VmError> {
+    let FrameAt {
+        id,
+        state,
+        pc,
+        dst,
+        has_handlers,
+    } = at;
     if state == S_EXECUTING {
         let e = vm_error(ctx, "TypeError", "Generator is already running");
         return Err(VmError::Thrown(e));
@@ -627,17 +661,23 @@ pub(super) fn site_call(
         return None;
     }
     let gh = Handle::from_raw(recv.as_handle()?);
-    let proto = ctx.realm.generator_owns_only_state(gh)?;
+    // (A generator owning nothing but its state slot: `g[key]` is the
+    // `[[Get]]` from its prototype, and the slot names its frame cell.)
+    let (proto, fh) = ctx
+        .realm
+        .generator_proto_and_frame(gh, VM_GEN, &mut ctx.gen_ic)?;
     let raw = proto.to_raw();
     let epoch = crate::object::proto_epoch();
-    let found = match ctx
-        .gen_site_memo
-        .entries
-        .iter()
-        .flatten()
-        .find(|e| e.proto == raw && e.mode == mode && e.stamp == epoch)
-    {
-        Some(e) => ctx.realm.stamped_slot(&e.at)?,
+    let m = &ctx.gen_site_memo;
+    let mut hit = None;
+    for e in m.entries.iter().flatten() {
+        if e.proto == raw && e.mode == mode && e.stamp == epoch {
+            hit = Some(&e.at);
+            break;
+        }
+    }
+    let found = match hit {
+        Some(at) => ctx.realm.stamped_slot(at)?,
         None => {
             let at = ctx.realm.watch_get_chain(proto, key)??;
             let found = ctx.realm.stamped_slot(&at)?;
@@ -656,13 +696,13 @@ pub(super) fn site_call(
     if found.to_bits() != method {
         return None;
     }
-    let fh = state_of(ctx, gh)?;
-    if ctx.realm.vm_frame(fh)?.func as usize >= funcs.len() {
+    let at = FrameAt::read(ctx, fh)?;
+    if at.id >= funcs.len() {
         return None;
     }
     Some(
         nested(ctx, regs, recv, v, |ctx| {
-            resume_state(ctx, funcs, fh, mode, v)
+            resume_state_at(ctx, funcs, fh, at, mode, v)
         })
         .map(|o| result_object(ctx, o)),
     )

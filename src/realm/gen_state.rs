@@ -149,6 +149,33 @@ impl Realm {
         o.proto()
     }
 
+    /// [`generator_owns_only_state`](Self::generator_owns_only_state) and
+    /// [`generator_frame`](Self::generator_frame) of the same object in one
+    /// heap lookup: its `[[Prototype]]` and the frame cell its one own
+    /// property, the hidden slot `key`, names. `None` when either would be.
+    #[inline]
+    pub(crate) fn generator_proto_and_frame(
+        &self,
+        h: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<(Handle, Handle)> {
+        let o = self.heap.get(h)?.as_object()?;
+        let shape = o.shaped_shape()?;
+        if o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0
+            || shape.len() != 1
+            || !o.has_no_accessors()
+            || self.is_host_exotic(h)
+        {
+            return None;
+        }
+        let v = match cache.hit_slot(shape) {
+            Some(slot) => o.slot(slot),
+            None => o.cached_get(key, cache),
+        }?;
+        Some((o.proto()?, Handle::from_raw(v.as_handle()?)))
+    }
+
     /// The `[[Prototype]]` of the promise `h` when it owns no property (so
     /// a named lookup on it continues there).
     pub(crate) fn plain_promise_lookup_start(&self, h: Handle) -> Option<Handle> {

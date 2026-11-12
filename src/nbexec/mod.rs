@@ -1282,7 +1282,7 @@ pub(crate) const N_OBJECT_ASSIGN: u16 = 18;
 pub(crate) const N_OBJECT_ENTRIES: u16 = 19;
 const N_ARRAY_FROM: u16 = 20;
 const N_ARRAY_OF: u16 = 21;
-const N_PROMISE: u16 = 22;
+pub(crate) const N_PROMISE: u16 = 22;
 const N_DATE: u16 = 25;
 const N_REGEXP: u16 = 26;
 pub(crate) const N_MATH_POW: u16 = 28;
@@ -10169,6 +10169,15 @@ impl crate::nbvm::VmHost for Interp {
 
     fn pop_job(&mut self) {
         self.microtasks.pop_front();
+    }
+
+    fn batch_queue_empty(&self, table: &alloc::rc::Rc<[crate::nbvm::FnProto]>) -> bool {
+        self.async_batch
+            && self.microtasks.is_empty()
+            && self
+                .vm_table
+                .as_ref()
+                .is_some_and(|t| alloc::rc::Rc::ptr_eq(t, table))
     }
 
     fn await_resume(

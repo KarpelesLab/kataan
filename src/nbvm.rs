@@ -857,9 +857,9 @@ pub enum Op {
     /// `return callee.call(this, ...args)` spelled as a method call, a
     /// `super.m(…)`, a private method call, a member tag), whose `Return` of
     /// its value follows: when the realm's call depth is half its limit or
-    /// more ([`tail_deep`]) and `callee` is a VM function of this table in
+    /// more (`tail_deep`) and `callee` is a VM function of this table in
     /// the running realm, the activation ends in a tail call of it
-    /// ([`FrameExit::Tail`], so unbounded tail recursion runs in bounded
+    /// (`FrameExit::Tail`, so unbounded tail recursion runs in bounded
     /// space); otherwise nothing happens and the call op runs (the shallow
     /// case costs one depth compare, and keeps every fast path and the
     /// call site's feedback).
@@ -1604,6 +1604,13 @@ pub trait VmHost {
     }
     /// Dequeues the job [`peek_batch_job`](Self::peek_batch_job) named.
     fn pop_job(&mut self) {}
+    /// Whether the running job belongs to a plain microtask drain whose
+    /// function table is `table` (as for [`peek_batch_job`](Self::peek_batch_job))
+    /// and no job is queued: a job queued now would be the one the drain runs
+    /// next. Reads only the job queue: the realm may be out.
+    fn batch_queue_empty(&self, _table: &alloc::rc::Rc<[FnProto]>) -> bool {
+        false
+    }
     /// GetIterator(v, async) for `for await`: `(iterator, next, sync)` — a sync
     /// iterator (no callable `@@asyncIterator`) is stepped through
     /// [`VmHost::async_from_sync_next`].
@@ -3473,43 +3480,75 @@ fn resume_async_frame(
         // The body's inline caches persist across resumptions, as a
         // generator's do (see `gen_fast`).
         let body = proto.ops.as_ptr() as usize;
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        let (mut hot, mut resumes) = (false, 0);
         let mut ic = match proto.tier.0.try_borrow_mut() {
-            Ok(mut t) => {
-                #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            Ok(mut t) if t.ic_body == body => core::mem::take(&mut t.ic),
+            _ => Vec::new(),
+        };
+        let (mut pc, mut handlers, mut inject) = (pc, handlers, inject);
+        let r = loop {
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            let (mut hot, mut resumes) = (false, 0);
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
+                t.resumes = t.resumes.saturating_add(1);
                 {
-                    t.resumes = t.resumes.saturating_add(1);
                     resumes = t.resumes;
                     hot = inject.is_none()
                         && !matches!(t.jit, Some(None))
                         && jit_tier::resume_is_hot(t.resumes);
                 }
-                if t.ic_body == body {
-                    core::mem::take(&mut t.ic)
-                } else {
-                    Vec::new()
-                }
             }
-            _ => Vec::new(),
-        };
-        // A hot body resumes in native code, on the same register file (a
-        // rejection, thrown at the `await`, is the interpreter's).
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        let mut handlers = handlers;
-        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
-        let compiled = if hot {
-            jit_tier::resume_frame(ctx, table, id, &mut regs, pc, &mut handlers, &ic, resumes)
-        } else {
-            None
-        };
-        #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
-        let compiled = None;
-        let r = match compiled {
-            Some(r) => r,
-            None => run_frame_at_ic(
-                ctx, table, &proto.ops, &mut regs, pc, handlers, inject, &mut ic,
-            ),
+            // A hot body resumes in native code, on the same register file (a
+            // rejection, thrown at the `await`, is the interpreter's).
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            let compiled = if hot {
+                jit_tier::resume_frame(ctx, table, id, &mut regs, pc, &mut handlers, &ic, resumes)
+            } else {
+                None
+            };
+            #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+            let compiled = None;
+            let r = match compiled {
+                Some(r) => r,
+                None => run_frame_at_ic(
+                    ctx,
+                    table,
+                    &proto.ops,
+                    &mut regs,
+                    pc,
+                    core::mem::take(&mut handlers),
+                    inject,
+                    &mut ic,
+                ),
+            };
+            // An `await` whose resumption would be the very next job (the
+            // queue is empty) of a value already settled as fulfilled: that
+            // job's run, here and now (see `await_settled_now`).
+            break match r {
+                Ok(FrameExit::Yield {
+                    value,
+                    pc: at,
+                    handlers: hs,
+                    dst: d,
+                }) => match await_settled_now(ctx, table, value) {
+                    Some(w) => {
+                        if let Some(slot) = regs.get_mut(d as usize) {
+                            *slot = w;
+                        }
+                        pc = at;
+                        handlers = hs;
+                        inject = None;
+                        continue;
+                    }
+                    None => Ok(FrameExit::Yield {
+                        value,
+                        pc: at,
+                        handlers: hs,
+                        dst: d,
+                    }),
+                },
+                other => other,
+            };
         };
         if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
             t.ic = ic;
@@ -3523,6 +3562,44 @@ fn resume_async_frame(
             r
         }
     }
+}
+
+/// `Await(v)` in a resumption job of the collecting event loop, when its
+/// own resumption would be the very next job and runs no code first: the
+/// job queue is empty (the host's batch mode, `table` the host's, one realm,
+/// no collection due), and `v` is not an object (PromiseResolve makes a
+/// promise fulfilled with it) or is a promise of `%Promise%` owning nothing
+/// (so PromiseResolve returns it without running code) that is already
+/// fulfilled. Then PerformPromiseThen would queue the resumption at once as
+/// the only job, which the loop would run next: its value (`Some`), for the
+/// caller to resume with in place. `None` otherwise: the ordinary await.
+fn await_settled_now(ctx: &mut Ctx, table: &alloc::rc::Rc<[FnProto]>, v: NanBox) -> Option<NanBox> {
+    if ctx.realm.multi_realm || !ctx.microtasks.is_empty() {
+        return None;
+    }
+    let host = ctx.host.as_deref()?;
+    if !host.batch_queue_empty(table)
+        || (ctx.realm.gc_pressure() >= ctx.realm.gc_next_threshold() && host.batch_yields_to_gc())
+    {
+        return None;
+    }
+    if !is_object_value(&ctx.realm, v) {
+        return Some(v);
+    }
+    let h = Handle::from_raw(v.as_handle()?);
+    let s = ctx.realm.promise_state(h)?;
+    if s.status != crate::cell::PromiseStatus::Fulfilled {
+        return None;
+    }
+    let value = s.value;
+    let ctor = ctx
+        .realm
+        .plain_promise_constructor(h, &mut PropertyCache::default())?;
+    (ctor
+        .as_handle()
+        .and_then(|c| ctx.realm.native_at(Handle::from_raw(c)))
+        == Some(crate::nbexec::N_PROMISE))
+    .then_some(value)
 }
 
 /// The hidden slot of a VM async generator: its suspended frame's cell
@@ -5780,13 +5857,10 @@ fn call_with_inner(
     // Where this activation's published inputs start; reset on every tail-call
     // rebinding and truncated back to on return.
     let inputs_mark = ctx.frame_shadow.len();
-    // This activation's entry on the realm's callee stack and where its
-    // arguments start in `vm_args_buf` (`call_with` pushed both): a proper
-    // tail call rebinds them to the callee it runs next, so what reads the
-    // running function (its realm, the legacy `f.caller` / `f.arguments`)
-    // sees the activation that replaced this one.
-    let callee_slot = ctx.realm.vm_callee_stack.len().wrapping_sub(1);
-    let args_slot = ctx.realm.vm_callee_args.last().copied();
+    // (A proper tail call leaves this activation's callee-stack entry — the
+    // strict caller it replaced — as it is: a sloppy callee's legacy
+    // `f.caller` then sees a strict caller, `null`, as it would without the
+    // frame reuse.)
     loop {
         // `id` can originate from a runtime value (an indirect call reads it out of
         // a callee array's slot 0), so a hostile script can make it point past the
@@ -5973,7 +6047,6 @@ fn call_with_inner(
                     this_val = this;
                     callee = ctx.pending_callee.take();
                     new_target = None;
-                    rebind_tail_activation(ctx, callee_slot, args_slot, callee, &args);
                     continue;
                 }
                 FrameExit::Yield { .. } => return Err(VmError::Unsupported),
@@ -6086,30 +6159,8 @@ fn call_with_inner(
                 this_val = this;
                 callee = ctx.pending_callee.take();
                 new_target = None;
-                rebind_tail_activation(ctx, callee_slot, args_slot, callee, &args);
             }
         }
-    }
-}
-
-/// A proper tail call's rebinding of the activation `call_with` pushed onto
-/// the realm's callee stack (entry `slot`, arguments from `args_at` in
-/// `vm_args_buf`) to the callee that now runs in it.
-fn rebind_tail_activation(
-    ctx: &mut Ctx,
-    slot: usize,
-    args_at: Option<usize>,
-    callee: Option<NanBox>,
-    args: &[NanBox],
-) {
-    if let Some(e) = ctx.realm.vm_callee_stack.get_mut(slot) {
-        *e = callee.unwrap_or(NanBox::undefined());
-    }
-    if let Some(at) = args_at
-        && at <= ctx.realm.vm_args_buf.len()
-    {
-        ctx.realm.vm_args_buf.truncate(at);
-        ctx.realm.vm_args_buf.extend_from_slice(args);
     }
 }
 
