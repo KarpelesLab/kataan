@@ -3965,26 +3965,48 @@ impl Realm {
         a: NanBox,
         b: NanBox,
     ) -> Option<NanBox> {
+        self.bigint_binary_try(op, a, b).ok()
+    }
+
+    /// [`bigint_binary_fast`](Self::bigint_binary_fast), telling apart why
+    /// it declined: `Err(true)` when both operands are BigInts (the general
+    /// path then runs no user code), `Err(false)` otherwise.
+    pub(crate) fn bigint_binary_try(
+        &mut self,
+        op: crate::ast::BinaryOp,
+        a: NanBox,
+        b: NanBox,
+    ) -> Result<NanBox, bool> {
         use crate::ast::BinaryOp as B;
         use core::cmp::Ordering;
-        let x = self.bigint_ref(Handle::from_raw(a.as_handle()?))?;
-        let y = self.bigint_ref(Handle::from_raw(b.as_handle()?))?;
+        let (Some(ha), Some(hb)) = (a.as_handle(), b.as_handle()) else {
+            return Err(false);
+        };
+        let Some(x) = self.bigint_ref(Handle::from_raw(ha)) else {
+            return Err(false);
+        };
+        let Some(y) = self.bigint_ref(Handle::from_raw(hb)) else {
+            return Err(false);
+        };
         let n = match op {
             B::Add => x.add(y),
             B::Sub => x.sub(y),
             B::Mul => x.mul(y),
             B::Div | B::Mod => {
                 if y.is_zero() {
-                    return None;
+                    return Err(true);
                 }
-                let (q, r) = x.divmod(y)?;
+                let (q, r) = x.divmod(y).ok_or(true)?;
                 if op == B::Div { q } else { r }
             }
             B::BitAnd => x.bitand(y),
             B::BitOr => x.bitor(y),
             B::BitXor => x.bitxor(y),
             B::Shl | B::Shr => {
-                let count = i64::try_from(y.to_i128()?).ok()?;
+                let count = y
+                    .to_i128()
+                    .and_then(|c| i64::try_from(c).ok())
+                    .ok_or(true)?;
                 let left = (op == B::Shl) == (count >= 0);
                 let mag = count.unsigned_abs();
                 let projected = if left {
@@ -3993,24 +4015,24 @@ impl Realm {
                     mag
                 };
                 if projected > self.limits.max_bigint_bits {
-                    return None;
+                    return Err(true);
                 }
-                let k = u32::try_from(mag).ok()?;
+                let k = u32::try_from(mag).map_err(|_| true)?;
                 if left {
                     x.shl_bits(k)
                 } else {
                     x.shr_floor_bits(k)
                 }
             }
-            B::Lt => return Some(NanBox::boolean(x.cmp(y) == Ordering::Less)),
-            B::Gt => return Some(NanBox::boolean(x.cmp(y) == Ordering::Greater)),
-            B::LtEq => return Some(NanBox::boolean(x.cmp(y) != Ordering::Greater)),
-            B::GtEq => return Some(NanBox::boolean(x.cmp(y) != Ordering::Less)),
-            B::EqEq | B::EqEqEq => return Some(NanBox::boolean(x == y)),
-            B::NotEq | B::NotEqEq => return Some(NanBox::boolean(x != y)),
-            _ => return None,
+            B::Lt => return Ok(NanBox::boolean(x.cmp(y) == Ordering::Less)),
+            B::Gt => return Ok(NanBox::boolean(x.cmp(y) == Ordering::Greater)),
+            B::LtEq => return Ok(NanBox::boolean(x.cmp(y) != Ordering::Greater)),
+            B::GtEq => return Ok(NanBox::boolean(x.cmp(y) != Ordering::Less)),
+            B::EqEq | B::EqEqEq => return Ok(NanBox::boolean(x == y)),
+            B::NotEq | B::NotEqEq => return Ok(NanBox::boolean(x != y)),
+            _ => return Err(true),
         };
-        Some(NanBox::handle(self.new_bigint(n).to_raw()))
+        Ok(NanBox::handle(self.new_bigint(n).to_raw()))
     }
 
     /// Allocates a binding cell ([`Cell::Box`]) holding `undefined`.
@@ -8572,18 +8594,11 @@ impl Realm {
                 .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
         );
         // Register files VM frames lent to an accessor they run.
-        for &(at, len) in &self.host_roots.lent {
-            // SAFETY: a lent register file belongs to a VM frame suspended in
-            // the call that listed it, which unlists it before it resumes or
-            // returns (`nbvm::call_closure_pub`); it is neither freed nor
-            // written meanwhile.
-            #[allow(unsafe_code)]
-            let regs = unsafe { core::slice::from_raw_parts(at as *const NanBox, len) };
-            out.extend(
-                regs.iter()
-                    .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
-            );
-        }
+        self.host_roots.lent_values(|v| {
+            if let Some(h) = v.as_handle() {
+                out.push(Handle::from_raw(h));
+            }
+        });
         // What audited host segments made (`Heap::pins`, `Heap::pinned`).
         out.extend(self.heap.pinned().iter().copied());
         // Deliberately **not** included: `aux_props`, `fn_protos`, `fn_ctor` and

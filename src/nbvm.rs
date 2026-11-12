@@ -2111,14 +2111,16 @@ fn host_binary(
     }
     // Two BigInt primitives under an operator that cannot throw: the host's
     // answer, computed on the borrowed values.
-    if let Some(v) = ctx.realm.bigint_binary_fast(op, a, b) {
-        return Some(Ok(v));
-    }
+    let both_big = match ctx.realm.bigint_binary_try(op, a, b) {
+        Ok(v) => return Some(Ok(v)),
+        Err(both_big) => both_big,
+    };
     // From a VM frame's operation (`regs`, its register file): the frame
     // lends its registers, so the coercions the host runs may collect (see
-    // `crate::realm::host_roots`).
-    // (Two primitives — BigInts, a Symbol — run no user code: no link.)
-    let regs = regs.filter(|_| may_coerce(&ctx.realm, a) || may_coerce(&ctx.realm, b));
+    // `crate::realm::host_roots`). Two BigInts run no user code: no link,
+    // and no further look at the operands.
+    let regs =
+        regs.filter(|_| !both_big && (may_coerce(&ctx.realm, a) || may_coerce(&ctx.realm, b)));
     let r = with_host_in(ctx, regs, regs.is_some(), |h| h.binary(op, a, b));
     Some(r.unwrap_or(Err(HostError::Fault)).map_err(VmError::from))
 }
@@ -7204,7 +7206,7 @@ fn vm_value_bin(
 /// behalf of the frame whose register file is `regs` (`None`: a caller that
 /// is not a VM frame's operation, such as a JIT helper): that frame's
 /// registers published for the callee's collections, as a call's are.
-#[inline]
+#[inline(always)]
 fn call_closure_pub(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -7213,17 +7215,19 @@ fn call_closure_pub(
     args: &[NanBox],
     this: NanBox,
 ) -> Result<NanBox, VmError> {
-    let Some(regs) = regs else {
+    // (Only when the callee could collect at all: this context collects and
+    // every frame below this one is published.)
+    let Some(regs) = regs.filter(|_| ctx.gc_enabled && ctx.frames_published + 1 == ctx.call_depth)
+    else {
         return call_closure(ctx, funcs, f, args, this);
     };
     // (Lent by address, not copied: `HostRoots::lent`.)
-    let lent = &mut ctx.realm.host_roots.lent;
-    let mark = lent.len();
-    lent.push((regs.as_ptr() as usize, regs.len()));
+    let hr: *mut crate::realm::host_roots::HostRoots = &mut ctx.realm.host_roots;
     ctx.frames_published += 1;
-    let r = call_closure(ctx, funcs, f, args, this);
+    let r = crate::realm::host_roots::HostRoots::with_lent(hr, regs, || {
+        call_closure(ctx, funcs, f, args, this)
+    });
     ctx.frames_published -= 1;
-    ctx.realm.host_roots.lent.truncate(mark);
     r
 }
 
@@ -10081,7 +10085,17 @@ fn run_frame_at_ic(
                     };
                     // (Lending the frame only when a ToPrimitive may run
                     // code, as `host_binary` does.)
-                    let lend = may_coerce(&ctx.realm, x) || may_coerce(&ctx.realm, y);
+                    // Two BigInts: the answer on the borrowed values when
+                    // it cannot throw, else the host's with nothing lent.
+                    let both_big = match ctx.realm.bigint_binary_try(bop, x, y) {
+                        Ok(v) => {
+                            regs[*dst as usize] = v;
+                            continue;
+                        }
+                        Err(both_big) => both_big,
+                    };
+                    let lend =
+                        !both_big && (may_coerce(&ctx.realm, x) || may_coerce(&ctx.realm, y));
                     let r = with_host_in(ctx, lend.then_some(&regs[..]), lend, |h| {
                         h.binary(bop, x, y)
                     });

@@ -118,12 +118,78 @@ pub(crate) struct HostRoots {
     /// that same host call (its serial), never by a built-in it calls.
     pub(crate) audit: u32,
     /// Register files VM frames lent to a callee they called on behalf of an
-    /// operation (an accessor: `nbvm::call_closure_pub`), as `(address,
-    /// length)`: roots of every collection while listed, the frame suspended
-    /// (and its registers unwritten) until it unlists them. Publishing by
-    /// address, where a call copies its registers into its context's
-    /// `frame_shadow`.
-    pub(crate) lent: Vec<(usize, usize)>,
+    /// operation (an accessor: `nbvm::call_closure_pub`): the address of the
+    /// innermost [`LentRegs`] (0: none), a chain of nodes on the Rust stack
+    /// of the lending calls. Roots of every collection while listed, each
+    /// frame suspended (and its registers unwritten) until it unlists itself.
+    /// Publishing by address, where a call copies its registers into its
+    /// context's `frame_shadow`, and with no allocation.
+    pub(crate) lent: usize,
+}
+
+/// One frame's register file lent to a callee (see [`HostRoots::lent`]).
+#[repr(C)]
+pub(crate) struct LentRegs {
+    /// The register file's address and length.
+    pub(crate) at: usize,
+    pub(crate) len: usize,
+    /// The enclosing node's address (0: none).
+    pub(crate) prev: usize,
+}
+
+impl HostRoots {
+    /// Calls `f` with the register file `regs` listed in [`lent`](Self::lent)
+    /// (through `this`, a pointer to the `HostRoots` that stays put for the
+    /// call: the realm's box moves between contexts, its contents do not),
+    /// unlisting it when `f` returns or unwinds.
+    #[inline(always)]
+    pub(crate) fn with_lent<R>(this: *mut HostRoots, regs: &[NanBox], f: impl FnOnce() -> R) -> R {
+        struct Unlist(*mut HostRoots, usize);
+        impl Drop for Unlist {
+            #[inline(always)]
+            fn drop(&mut self) {
+                // SAFETY: see `with_lent`: the `HostRoots` outlives the call.
+                #[allow(unsafe_code)]
+                unsafe {
+                    (*self.0).lent = self.1;
+                }
+            }
+        }
+        // SAFETY: as above; no other reference to it is live here.
+        #[allow(unsafe_code)]
+        let prev = unsafe { (*this).lent };
+        let node = LentRegs {
+            at: regs.as_ptr() as usize,
+            len: regs.len(),
+            prev,
+        };
+        // SAFETY: as above. The node lives in this frame until `Unlist` puts
+        // `prev` back, on every path.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*this).lent = core::ptr::from_ref(&node) as usize;
+        }
+        let _unlist = Unlist(this, prev);
+        f()
+    }
+
+    /// The lent register files' values (see [`lent`](Self::lent)).
+    pub(crate) fn lent_values(&self, mut out: impl FnMut(NanBox)) {
+        let mut at = self.lent;
+        while at != 0 {
+            // SAFETY: a listed node lives in the frame of a call still running
+            // (it unlists itself before it returns or unwinds), and the
+            // register file it names belongs to a frame suspended in it.
+            #[allow(unsafe_code)]
+            let node = unsafe { &*(at as *const LentRegs) };
+            #[allow(unsafe_code)]
+            let regs = unsafe { core::slice::from_raw_parts(node.at as *const NanBox, node.len) };
+            for &v in regs {
+                out(v);
+            }
+            at = node.prev;
+        }
+    }
 }
 
 /// The flag of a [`HostRoots::scope`] / [`HostRoots::armed`] value (over the
