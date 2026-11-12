@@ -5051,6 +5051,9 @@ impl JitProto {
                 | crate::nbvm::Op::SuperCallArgs { .. }
                 | crate::nbvm::Op::CallSpreadPlain { .. }
                 | crate::nbvm::Op::CallKey { .. }
+                // (A tail call: an ordinary call where its body is inlined,
+                // `inline::untail`.)
+                | crate::nbvm::Op::TailCallValue { .. }
                 | crate::nbvm::Op::GetProp { .. }
                 | crate::nbvm::Op::SetProp { .. }
                 | crate::nbvm::Op::SetPropStrict { .. } => {

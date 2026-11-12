@@ -57,6 +57,11 @@
 //! with its own header and pops them with it, so they stay pending: see
 //! `call_seq::InlineCtx`.)
 //!
+//! A callee's proper tail call through a value (a getter's `return
+//! lowBit(this.dom)`) is an ordinary call in its spliced body, whose result
+//! is the body's (`untail`), when that call inlines its own callee in
+//! turn.
+//!
 //! An inlined callee's own call sites may be inlined into its spliced body
 //! in turn ([`Candidate::nested`], two more levels): such an inner
 //! activation runs inside the outer one, which may still be pending when the
@@ -227,8 +232,214 @@ fn third_level<'a>(n: &Candidate<'a>) -> Vec<(usize, Candidate<'a>)> {
         .collect()
 }
 
+/// Whether inlined bodies take proper tail calls as ordinary calls
+/// ([`untail`]; `KATAAN_JIT_INLTAIL=0` turns it off, read once per process).
+#[cfg(feature = "std")]
+fn inltail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INLTAIL").is_none_or(|v| v != "0"))
+}
+
+/// [`inltail_enabled`] without `std`: on.
+#[cfg(not(feature = "std"))]
+const fn inltail_enabled() -> bool {
+    true
+}
+
+/// Whether `op` is a proper tail call an inlined body makes as an ordinary
+/// call ([`untail`]).
+fn is_tail(op: &Op) -> bool {
+    matches!(op, Op::TailCallValue { .. }) && inltail_enabled()
+}
+
+/// `p` with each proper tail call through a value (`Op::TailCallValue`) as
+/// the ordinary call it is in an inlined body — `CallValue` into a fresh
+/// register (`p.n_regs`), then `Return` of it — with, per own pc (and one
+/// past the end), its pc there. An inlined body is no activation of its
+/// own: its frame is the caller's, which a tail call must not end, so its
+/// tail call is a call whose result is the body's result. Proper tail
+/// calls still hold: the site the body is inlined at, in tail position, is
+/// preceded by its caller's own tail call guard (which ends the caller's
+/// activation when the stack is deep), and inlining is at most three
+/// levels deep, so the calls an inlined body makes add a bounded number of
+/// activations; the callee's own body, compiled or interpreted, keeps its
+/// tail calls.
+fn untail(p: &FnProto) -> (FnProto, Vec<usize>) {
+    let r = p.n_regs as Reg;
+    let mut new_of = Vec::with_capacity(p.ops.len() + 1);
+    let mut n = 0usize;
+    for o in &p.ops {
+        new_of.push(n);
+        n += if is_tail(o) { 2 } else { 1 };
+    }
+    new_of.push(n);
+    let at = |t: usize| new_of[t.min(p.ops.len())];
+    let mut ops = Vec::with_capacity(n);
+    for o in &p.ops {
+        match o {
+            Op::TailCallValue { callee, args } if is_tail(o) => {
+                ops.push(Op::CallValue {
+                    dst: r,
+                    callee: *callee,
+                    args: args.clone(),
+                    name: None,
+                });
+                ops.push(Op::Return { src: r });
+            }
+            Op::Jump { target } => ops.push(Op::Jump {
+                target: at(*target),
+            }),
+            Op::JumpIfFalse { cond, target } => ops.push(Op::JumpIfFalse {
+                cond: *cond,
+                target: at(*target),
+            }),
+            _ => ops.push(o.clone()),
+        }
+    }
+    let mut q = p.clone();
+    q.ops = ops;
+    q.n_regs += 1;
+    (q, new_of)
+}
+
+/// `c` as [`untail`] rewrites its function: its warm caches, its own call
+/// sites' candidates, its demotion sites and its element feedback by the
+/// rewritten body's pc, and per op of that body the own pc it came from.
+/// `None` when its function makes no tail call.
+#[allow(clippy::type_complexity)]
+fn untail_candidate<'a>(
+    c: &Candidate<'a>,
+) -> Option<(
+    FnProto,
+    Vec<Option<WarmEntry>>,
+    Vec<(usize, Candidate<'a>)>,
+    Vec<(usize, Reg)>,
+    Vec<(usize, u8)>,
+    Vec<u64>,
+)> {
+    if !c.proto.ops.iter().any(is_tail) {
+        return None;
+    }
+    // (Only a body whose every tail call inlines its callee in turn: one
+    // that would make the call from its inlined frame, pushing the pending
+    // activation, costs about what the two calls it replaces did.)
+    if !c
+        .proto
+        .ops
+        .iter()
+        .enumerate()
+        .all(|(pc, o)| !is_tail(o) || c.nested.iter().any(|(p, _)| *p == pc))
+    {
+        return None;
+    }
+    let (q, new_of) = untail(c.proto);
+    let n = c.proto.ops.len();
+    let mut warm = alloc::vec![None; q.ops.len()];
+    for (pc, w) in c.warm.iter().enumerate().take(n) {
+        warm[new_of[pc]] = w.clone();
+    }
+    let nested = c
+        .nested
+        .iter()
+        .filter(|(p, _)| *p < n)
+        .map(|(p, m)| {
+            (
+                new_of[*p],
+                Candidate {
+                    key: m.key,
+                    proto: m.proto,
+                    warm: m.warm.clone(),
+                    nested: third_level(m),
+                    demote: m.demote.clone(),
+                    kinds: m.kinds.clone(),
+                },
+            )
+        })
+        .collect();
+    let demote = c
+        .demote
+        .iter()
+        .filter(|(p, _)| *p < n)
+        .map(|&(p, r)| (new_of[p], r))
+        .collect();
+    let kinds = c
+        .kinds
+        .iter()
+        .filter(|(p, _)| *p < n)
+        .map(|&(p, k)| (new_of[p], k))
+        .collect();
+    let fid = c.key & 0xffff_ffff;
+    // (Per op of the rewrite: the own pc it came from.)
+    let mut src = Vec::with_capacity(q.ops.len());
+    for (pc, o) in c.proto.ops.iter().enumerate() {
+        src.push(fid << 32 | pc as u64);
+        if is_tail(o) {
+            src.push(fid << 32 | pc as u64);
+        }
+    }
+    Some((q, warm, nested, demote, kinds, src))
+}
+
 /// `c`'s body as spliced (see [`Site`]).
 fn site_body(c: Candidate<'_>) -> Site<'_> {
+    if let Some((q, warm, nested, demote, kinds, src)) = untail_candidate(&c) {
+        let c2 = Candidate {
+            key: c.key,
+            proto: &q,
+            warm,
+            nested,
+            demote,
+            kinds,
+        };
+        let s = site_body(c2);
+        // Each call a tail call became must have inlined its callee (be the
+        // fallback of a guard), else the function is not inlined: its body
+        // as it is, whose tail call `expand` refuses.
+        let r = c.proto.n_regs as Reg;
+        let ops = &s.proto.ops;
+        let guarded = |pc: usize| {
+            ops.iter()
+                .any(|g| matches!(g, Op::InlineGuard { call, .. } if *call == pc))
+        };
+        if !ops
+            .iter()
+            .enumerate()
+            .all(|(pc, o)| !matches!(o, Op::CallValue { dst, .. } if *dst == r) || guarded(pc))
+        {
+            return Site {
+                key: c.key,
+                proto: alloc::borrow::Cow::Borrowed(c.proto),
+                warm: Vec::new(),
+                derived: Vec::new(),
+                legacy: Vec::new(),
+                demote: Vec::new(),
+                kinds: Vec::new(),
+                src: Vec::new(),
+            };
+        }
+        // (Owned either way: the rewritten function is this frame's. Its
+        // own ops' sources are the function's pcs, not the rewrite's; its
+        // inlined calls' are their own.)
+        let fid = c.key & 0xffff_ffff;
+        let src = s
+            .src
+            .iter()
+            .map(|&x| match src.get((x & 0xffff_ffff) as usize) {
+                Some(&o) if x != NO_SRC && x >> 32 == fid => o,
+                _ => x,
+            })
+            .collect();
+        return Site {
+            key: s.key,
+            proto: alloc::borrow::Cow::Owned(s.proto.into_owned()),
+            warm: s.warm,
+            derived: s.derived,
+            legacy: s.legacy,
+            demote: s.demote,
+            kinds: s.kinds,
+            src,
+        };
+    }
     let Candidate {
         key,
         proto,
@@ -391,6 +602,8 @@ fn callee_ok_sized(proto: &FnProto, spliced: bool) -> bool {
         | Op::InitFields { .. }
         | Op::DerivedResult { .. }
         | Op::SuperCallArgs { .. } => false,
+        // (A call whose result is the body's, as spliced: `untail`.)
+        _ if is_tail(op) => true,
         _ => {
             let mut o = op.clone();
             remap(&mut o, &|r| r, &|t| t)
@@ -1058,6 +1271,10 @@ pub fn expand<'a>(
         let poly = cands.len() > 1;
         for c in cands.into_iter().take(MAX_WAYS) {
             let c = site_body(c);
+            // (A tail call `untail` left: its callee would not inline.)
+            if c.proto.ops.iter().any(is_tail) {
+                continue;
+            }
             // A polymorphic site's way inlines only a body that calls
             // nothing but through its own inlined calls' guards (an inner
             // call's activation pushes cost about what the call saved). So

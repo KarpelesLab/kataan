@@ -4565,7 +4565,7 @@ impl NumGen {
                             fused,
                         )?;
                     }
-                    _ => self.bitwise(a, pc, reg, vop, dst, x, y, slow),
+                    _ => self.bitwise(a, (labels, ops), pc, reg, vop, dst, x, y, slow),
                 }
             }
             GenericOp::Lt { dst, a: x, b: y } => {
@@ -6317,6 +6317,7 @@ impl NumGen {
     fn bitwise(
         &mut self,
         a: &mut X64Assembler,
+        (labels, ops): (&[Label], &[GenericOp]),
         pc: usize,
         reg: Option<usize>,
         vop: u8,
@@ -6358,6 +6359,20 @@ impl NumGen {
             VB_SHR => a.raw(&[0xd3, 0xf8]),     // sar eax, cl
             VB_USHR => a.raw(&[0xd3, 0xe8]),    // shr eax, cl
             _ => {}
+        }
+        // `if (x & m)`, the result read by nothing but the test: the test
+        // of the integer itself (an integer is falsy exactly when zero:
+        // never NaN), the Number never made. The slow path stores the
+        // result and runs the test, compiled as ever.
+        if bit_test_enabled()
+            && let Some(f) = self.fused_branch(pc, ops, dst)
+            && let (Some(&past), Some(&test)) = (labels.get(f.past(pc)), labels.get(pc + 1))
+        {
+            a.raw(&[0x85, 0xc0]); // test eax, eax
+            self.jcc_to(a, labels, reg, CC_E, f.target);
+            a.jmp(past);
+            self.stub(stub, test, reg, slow);
+            return;
         }
         if vop == VB_USHR {
             a.raw(&[0x89, 0xc0]); // mov eax, eax (zero-extend: a uint32)
@@ -7398,6 +7413,14 @@ impl NumGen {
             }
         }
     }
+}
+
+/// Whether a bitwise op whose result only a test reads branches on the
+/// integer (`bitwise`; `KATAAN_JIT_BITTEST=0` turns it off, read once per
+/// process).
+fn bit_test_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_BITTEST").is_none_or(|v| v != "0"))
 }
 
 /// A comparison's fusion into the test after it ([`NumGen::fusable`]): the
@@ -12210,6 +12233,72 @@ mod tests {
             unreachable!()
         };
         assert!(r.slots.iter().any(|s| s.reg == args[0]));
+    }
+
+    #[test]
+    fn tail_calling_callees_inline_with_their_tail_callee() {
+        // `g`'s strict `return h(x + 1)` is a proper tail call; inlined into
+        // `f`, it is an ordinary call (`inline::untail`) whose result is
+        // `g`'s, and `h` is inlined into it in turn: no call op runs.
+        let src = "'use strict'; function h(y){ return y * 2; } function g(x){ return h(x + 1); } function f(n){ let t = 0; for (let i = 0; i < n; i = i + 1) { t = t + g(i); } return t; }";
+        let funcs = hosted_protos(src);
+        let by = |name: &str| funcs.iter().find(|p| p.name == name).expect("fn");
+        let (f, g, h) = (by("f"), by("g"), by("h"));
+        let tail = pc_of(g, |o| matches!(o, Op::TailCallValue { .. }));
+        assert!(crate::jit::inline::callee_ok(g));
+        let call = pc_of(f, |o| matches!(o, Op::CallValue { .. }));
+        let e = crate::jit::inline::expand(f, &[], &|pc, _| {
+            if pc != call {
+                return Vec::new();
+            }
+            alloc::vec![crate::jit::inline::Candidate {
+                key: 1,
+                proto: g,
+                warm: Vec::new(),
+                nested: alloc::vec![(
+                    tail,
+                    crate::jit::inline::Candidate {
+                        key: 2,
+                        proto: h,
+                        warm: Vec::new(),
+                        nested: Vec::new(),
+                        demote: Vec::new(),
+                        kinds: Vec::new(),
+                    }
+                )],
+                demote: Vec::new(),
+                kinds: Vec::new(),
+            }]
+        })
+        .expect("inlined");
+        assert!(!e.ops.iter().any(|o| matches!(o, Op::TailCallValue { .. })));
+        let guards: Vec<u64> = e
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::InlineGuard { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(guards, [1, 2]);
+        // Every op `g` and `h` brought maps back to their own pcs.
+        for (i, &s) in e.src_of.iter().enumerate() {
+            if s != crate::jit::inline::NO_SRC && e.orig_of[i] == u32::MAX {
+                let fid = (s >> 32) as usize;
+                let pc = (s & 0xffff_ffff) as usize;
+                let proto = if fid == 1 { g } else { h };
+                assert!(pc < proto.ops.len(), "op {i} from {fid}:{pc}");
+            }
+        }
+        assert!(
+            crate::jit::lower_nbvm_generic(&{
+                let mut p = f.clone();
+                p.ops = e.ops;
+                p.n_regs = e.n_regs;
+                p
+            })
+            .is_some()
+        );
     }
 
     #[test]

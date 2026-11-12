@@ -5931,6 +5931,30 @@ fn call_with(
     result
 }
 
+/// A proper tail call's callee `id`, a sloppy ordinary function: its
+/// activation gets an entry of its own in the realm's activation stack,
+/// above the strict caller's it replaced (which stays, so its legacy
+/// `f.caller` is still `null`: a strict caller), so its legacy
+/// `f.arguments` and its callees' `f.caller` see it running, as an ordinary
+/// call would show it. A sloppy function makes no tail call, so an
+/// activation gets at most one such entry; the call that pushed the
+/// activation's own entry truncates both.
+fn note_tail_legacy(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    args: &[NanBox],
+    callee: Option<NanBox>,
+) {
+    if let Some(c) = callee
+        && funcs.get(id).is_some_and(|p| p.legacy)
+    {
+        ctx.realm.vm_callee_args.push(ctx.realm.vm_args_buf.len());
+        ctx.realm.vm_callee_stack.push(c);
+        ctx.realm.vm_args_buf.extend_from_slice(args);
+    }
+}
+
 fn call_with_inner(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -6143,6 +6167,7 @@ fn call_with_inner(
                     captures = alloc::borrow::Cow::Owned(tcaps);
                     this_val = this;
                     callee = ctx.pending_callee.take();
+                    note_tail_legacy(ctx, funcs, id, &args, callee);
                     new_target = None;
                     continue;
                 }
@@ -6255,6 +6280,7 @@ fn call_with_inner(
                 captures = alloc::borrow::Cow::Owned(tcaps);
                 this_val = this;
                 callee = ctx.pending_callee.take();
+                note_tail_legacy(ctx, funcs, id, &args, callee);
                 new_target = None;
             }
         }
@@ -11736,6 +11762,13 @@ fn run_frame_at_ic(
                 let argv = ArgBuf::from_regs(regs, args);
                 match val.as_handle().map(Handle::from_raw) {
                     Some(h) if ctx.realm.is_vm_function(h) => {
+                        // The callee feedback the machine-code tier inlines
+                        // from, where this function is itself inlined (its
+                        // tail call is then an ordinary call:
+                        // `crate::jit::inline::untail`).
+                        if let Some((f, c)) = ctx.realm.vm_function(h) {
+                            site_cache!(site).note_callee(u64::from(f) | ((c.len() as u64) << 32));
+                        }
                         // (A function of a newer table — eval / `Function`
                         // code — is called the ordinary way below.)
                         if let Some((fid, caps)) = ctx
