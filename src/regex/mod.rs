@@ -317,6 +317,18 @@ impl Regex {
         })
     }
 
+    /// Whether this regex can match nowhere in the text `bytes` when every
+    /// byte is ASCII (each byte its code unit): no unit a match may begin
+    /// with occurs (see `linear::Linear::ascii_rejects`). `false` when that
+    /// is not known (a non-ASCII byte, no linear program, or a pattern that
+    /// may match the empty string or begin with anything).
+    #[must_use]
+    pub fn ascii_never_matches(&self, bytes: &[u8]) -> bool {
+        self.linear
+            .as_ref()
+            .is_some_and(|lin| bytes.is_ascii() && lin.ascii_rejects(bytes))
+    }
+
     /// Whether the linear matcher stands in for the VM on this regex.
     #[cfg(test)]
     pub(crate) fn is_linear(&self) -> bool {

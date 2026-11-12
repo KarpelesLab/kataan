@@ -319,6 +319,23 @@ fn alternation(prog: &[Inst], pc: usize) -> Option<(Vec<(usize, usize)>, usize)>
 }
 
 impl Linear {
+    /// Whether no match can begin anywhere in a subject of code units all
+    /// below 128, given as its bytes `ascii`: every match begins with a
+    /// unit of the start filter and none of them is there. `false` when the
+    /// filter takes anything (an empty match is possible).
+    pub(crate) fn ascii_rejects(&self, ascii: &[u8]) -> bool {
+        match self.first {
+            First::Unit(u) => u >= 0x80 || !ascii.contains(&(u as u8)),
+            First::Set(k) => {
+                let set = &self.sets[k].latin1;
+                !ascii
+                    .iter()
+                    .any(|&b| set[usize::from(b >> 6)] & (1u64 << (b & 63)) != 0)
+            }
+            First::Any => false,
+        }
+    }
+
     /// Builds the linear form of `prog` (compiled with `flags`), or `None` when
     /// the program is not one.
     pub(crate) fn build(prog: &[Inst], flags: Flags, slots: usize) -> Option<Linear> {
