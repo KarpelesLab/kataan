@@ -22,8 +22,14 @@
 //! epoch stale first takes the array's entries when the array's epoch is the
 //! current one, and a validation writes what it found back.
 //!
-//! Only reads persist: a write's validation is memoized per op instead
-//! (`StoreRefMemo`).
+//! A write's validation persists the same way when its code mirrors nothing
+//! onto the global object ([`writes_persist`]): `jit_helper_global_ref`
+//! validates a write's address (a plain, initialized, non-`const` binding
+//! with no like-named own property of the global object to mirror onto)
+//! under the same epoch rule, every change of those facts bumping it. A write
+//! whose code mirrors (`global_mirror`) needs its op's mirror target restored
+//! by each validation, and keeps validating per activation (through its
+//! per-op memo, `StoreRefMemo`).
 //!
 //! The array's invariant: every non-empty entry of a group was validated
 //! under (or after) the group's noted epoch. A group's entries are emptied
@@ -31,6 +37,14 @@
 
 use super::call_seq::r;
 use super::{Label, X64Assembler};
+
+/// Whether a global write's validated address persists like a read's (see
+/// the module docs); `KATAAN_JIT_GWPERSIST=0` turns it off (read once per
+/// process).
+pub(super) fn writes_persist() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GWPERSIST").is_none_or(|v| v != "0"))
+}
 
 /// The array's length (`u64` words).
 pub(super) const LEN: usize = 64;

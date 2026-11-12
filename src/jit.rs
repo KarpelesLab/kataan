@@ -8833,10 +8833,19 @@ impl JitFunction {
         // The global binding cache's read slots persist across activations
         // (`global_persist`): word `1 + k` of the array holds slot `k`'s
         // address, word `0` the epoch they were validated under.
+        // (So do a write's whose code mirrors nothing onto the global
+        // object, `global_persist::writes_persist`: its validated address,
+        // like a read's, stays right while the epoch is current.)
         let gc_reads: Vec<usize> = (0..gc_plan.slots.min(global_persist::BODY_WORDS - 1))
             .filter(|&k| {
                 let mut sites = (0..ops.len()).filter(|&pc| gc_plan.site.get(pc) == Some(&Some(k)));
-                sites.all(|pc| matches!(bytecode.get(pc), Some(crate::nbvm::Op::LoadGlobal { .. })))
+                sites.all(|pc| match bytecode.get(pc) {
+                    Some(crate::nbvm::Op::LoadGlobal { .. }) => true,
+                    Some(op @ crate::nbvm::Op::StoreGlobal { .. }) => {
+                        global_persist::writes_persist() && global_mirror::mirror_cell(op).is_none()
+                    }
+                    _ => false,
+                })
             })
             .collect();
         // (An integer version with element reads bails into its double
