@@ -61,6 +61,79 @@ use super::call_seq::{cc, r};
 use super::props::MethodSite;
 use super::{JitLayout, Label, X64Assembler};
 
+/// A body's **lookup memo**: the frame slots of the last lookup an inline
+/// `m.has(k)` / `m.get(k)` made on a `Map` (`recv`: the receiver's bits, or
+/// `RECV_CACHE_EMPTY`; `key`: the key's bits as the program passed them;
+/// `entry`: the address of the entry found, or `0` for none), so that the
+/// `m.get(k)` after an `m.has(k)` (or a repeated lookup) answers without a
+/// scan: `if (m.has(k)) return m.get(k)`.
+///
+/// The memo's receiver slot is one of the body's receiver-cache keys
+/// (`X64Assembler::recv_cache_keys`), emptied by the prologue, at every
+/// entry and after every `call`: only Rust code (behind a call) can
+/// reallocate a collection's entries, add a hash index, free or reuse a heap
+/// slot, or change its `[[Prototype]]`. The one inline code that changes
+/// entries, `coll_update`, empties it too. So while it holds a receiver's
+/// bits, that `Map`'s entry at `entry` is still the one found (its value
+/// read live), and `0` still means no entry has the key. A hit needs the
+/// site's own proof (the method is the built-in) of `Map` kind; it is
+/// filled only from a lookup on a `Map` (the proof's kind is the
+/// receiver's).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CollMemo {
+    pub(crate) recv: i32,
+    pub(crate) key: i32,
+    pub(crate) entry: i32,
+}
+
+/// Whether the lookup memo is used (`KATAAN_JIT_COLLMEMO=0` turns it off;
+/// read once per process).
+pub(crate) fn memo_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLMEMO").is_none_or(|v| v != "0"))
+}
+
+/// A lookup site's use of the memo ([`memo_plan`]): it answers from the
+/// memo first.
+pub(crate) const MEMO_CHECK: u8 = 1;
+/// See [`MEMO_CHECK`]: it notes its answer in the memo.
+pub(crate) const MEMO_FILL: u8 = 2;
+
+/// Per op of bytecode `ops`, how its `m.has(k)` / `m.get(k)` site (should
+/// it compile to an inline lookup) uses the lookup memo: a `get` checks it
+/// when an earlier `has` or `get` site takes its key from the same
+/// register, which then fills it (`if (m.has(k)) return m.get(k)`;
+/// `m.get(k) … m.get(k)`). Only a guess of where it pays (the memo is
+/// checked at run time). Empty when no site uses it.
+pub(crate) fn memo_plan(ops: &[crate::nbvm::Op]) -> alloc::vec::Vec<u8> {
+    use crate::nbvm::Op;
+    let site = |op: &Op| match op {
+        Op::CallMethod { key, args, .. } | Op::CallWithMethod { key, args, .. }
+            if args.len() == 1 && matches!(key.as_str(), "has" | "get") =>
+        {
+            Some((key.as_str() == "get", args[0]))
+        }
+        _ => None,
+    };
+    let mut plan = alloc::vec![0u8; ops.len()];
+    let mut any = false;
+    for (g, op) in ops.iter().enumerate() {
+        let Some((true, k)) = site(op) else { continue };
+        for (h, earlier) in ops[..g].iter().enumerate() {
+            if site(earlier).is_some_and(|(_, k2)| k2 == k) {
+                plan[h] |= MEMO_FILL;
+                plan[g] |= MEMO_CHECK;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        plan.clear();
+    }
+    plan
+}
+
 /// See the module docs.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -249,6 +322,7 @@ impl X64Assembler {
         (callee, recv, key, dst): (Option<i32>, i32, i32, i32),
         (fill, slow, done): (Label, Label, Label),
         probe_helper: u64,
+        memo_use: u8,
     ) {
         let c = coll_layout();
         let [stamp, ptr, method, is_set, tries] = MethodSite::coll_offsets();
@@ -282,6 +356,38 @@ impl X64Assembler {
             self.g_load(r::R9, r::R9, 0);
             self.g_cmp_mem(r::R9, r::R11, method);
             self.g_jcc(cc::NE, slow);
+        }
+        // The memo's answer (see `CollMemo`), under a proof of `Map` kind.
+        let memo = self.coll_memo;
+        if let Some(m) = memo.filter(|_| memo_use & MEMO_CHECK != 0) {
+            let miss = self.new_label();
+            let none = self.new_label();
+            self.g_mem(true, &[0x83], 7, r::R11, is_set); // cmp qword [r11+is_set], imm8
+            self.code.push(0);
+            self.g_jcc(cc::NE, miss);
+            let base = self.frame_base(recv);
+            self.g_load(r::RAX, base, recv);
+            self.g_cmp_mem(r::RAX, r::RBP, m.recv);
+            self.g_jcc(cc::NE, miss);
+            let base = self.frame_base(key);
+            self.g_load(r::R9, base, key);
+            self.g_cmp_mem(r::R9, r::RBP, m.key);
+            self.g_jcc(cc::NE, miss);
+            self.g_load(r::R9, r::RBP, m.entry);
+            self.g_test(r::R9);
+            self.g_jcc(cc::E, none);
+            if get {
+                self.g_load(r::RAX, r::R9, c.entry_val);
+            } else {
+                self.g_movabs(r::RAX, TRUE_BITS);
+            }
+            self.store_rax(dst);
+            self.jmp(done);
+            self.bind(none);
+            self.g_movabs(r::RAX, if get { UNDEF_BITS } else { FALSE_BITS });
+            self.store_rax(dst);
+            self.jmp(done);
+            self.bind(miss);
         }
         // The receiver: a strong collection of the proof's kind with the
         // default `[[Prototype]]` (so no own property), no index, few
@@ -327,12 +433,20 @@ impl X64Assembler {
         let found = self.new_label();
         let absent = self.new_label();
         self.coll_scan(l, (found, absent, probe));
-        // The answers.
+        // The answers (each noted in the memo, for a `Map`).
+        let memo = memo.filter(|_| memo_use & MEMO_FILL != 0);
         self.bind(absent);
+        if let Some(m) = memo {
+            self.g_movabs(r::RSI, 0);
+            self.coll_memo_fill(m, site, recv, key);
+        }
         self.g_movabs(r::RAX, if get { UNDEF_BITS } else { FALSE_BITS });
         self.store_rax(dst);
         self.jmp(done);
         self.bind(found);
+        if let Some(m) = memo {
+            self.coll_memo_fill(m, site, recv, key);
+        }
         if get {
             self.g_load(r::RAX, r::RSI, c.entry_val);
         } else {
@@ -372,6 +486,27 @@ impl X64Assembler {
         self.jmp(fill);
     }
 
+    /// Notes a lookup's answer in the memo `m` (the entry's address in
+    /// `rsi`, `0` for none) when the site's proof is of `Map` kind (the
+    /// receiver's): the receiver's and the key's bits from their frame
+    /// slots. Keeps `rsi`; clobbers `r9`, `r11`.
+    fn coll_memo_fill(&mut self, m: CollMemo, site: *const MethodSite, recv: i32, key: i32) {
+        let [_, _, _, is_set, _] = MethodSite::coll_offsets();
+        let skip = self.new_label();
+        self.g_movabs(r::R11, site as u64);
+        self.g_mem(true, &[0x83], 7, r::R11, is_set); // cmp qword [r11+is_set], imm8
+        self.code.push(0);
+        self.g_jcc(cc::NE, skip);
+        let base = self.frame_base(recv);
+        self.g_load(r::R9, base, recv);
+        self.g_store(r::RBP, m.recv, r::R9);
+        let base = self.frame_base(key);
+        self.g_load(r::R9, base, key);
+        self.g_store(r::RBP, m.key, r::R9);
+        self.g_store(r::RBP, m.entry, r::RSI);
+        self.bind(skip);
+    }
+
     /// `recv.set(key, val)` (`Map`), `recv.add(key)` (`Set`) or
     /// `recv.delete(key)` (either, as `w` says; see the module docs on
     /// writes): the result stored to the register at frame displacement
@@ -391,6 +526,11 @@ impl X64Assembler {
         let c = coll_layout();
         let [stamp, ptr, method, is_set, tries] = MethodSite::coll_offsets();
         let stale = self.new_label();
+        // (A change to any collection's entries empties the lookup memo.)
+        if let Some(m) = self.coll_memo {
+            self.g_movabs(r::R9, u64::MAX);
+            self.g_store(r::RBP, m.recv, r::R9);
+        }
         self.p_arena(realm_off, &l.props);
         // The receiver first (an indexed or larger collection, whose writes
         // are never inline, costs no more): a strong collection with the

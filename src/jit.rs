@@ -5408,6 +5408,10 @@ pub struct X64Assembler {
     /// updates (`recv_cache::survive_reload`).
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     recv_seen: Option<i32>,
+    /// The generic tier's collection lookup memo (`coll`'s
+    /// `CollMemo`), when the body has one: its frame slots.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) coll_memo: Option<coll::CollMemo>,
     /// Frame slots (`[rbp+disp]`) the frame prologue alone sets to
     /// [`RECV_CACHE_EMPTY`]: the generic tier's global binding cache, which
     /// a call does not empty (it is guarded by the global binding epoch).
@@ -9605,6 +9609,20 @@ impl JitFunction {
         let n_wp = wp_memos.len();
         let wp_base = gm_base - 16 * n_gm as i32;
         let wp_proof = |k: usize| wp_base - 8 * k as i32 - 8;
+        // The collection lookup memo (`coll::CollMemo`): for a body with a
+        // compiled `m.has(k)` / `m.get(k)` site.
+        let cm_plan = if coll::memo_enabled() {
+            coll::memo_plan(bytecode)
+        } else {
+            Vec::new()
+        };
+        let n_cm = usize::from(!cm_plan.is_empty());
+        let cm_base = wp_base - 8 * n_wp as i32;
+        let cm = (n_cm > 0).then(|| coll::CollMemo {
+            recv: cm_base - 8,
+            key: cm_base - 16,
+            entry: cm_base - 24,
+        });
         let wp_disps: Vec<Vec<Option<i32>>> = wp_slot
             .iter()
             .map(|v| v.iter().map(|s| s.map(wp_proof)).collect())
@@ -9803,7 +9821,8 @@ impl JitFunction {
                 + 3 * n_cproved
                 + forin::Memo::SLOTS as usize * n_forin
                 + 2 * n_gm
-                + n_wp) as u32
+                + n_wp
+                + 3 * n_cm) as u32
                 * 8)
             + 15)
             & !15;
@@ -10051,8 +10070,10 @@ impl JitFunction {
                 .chain((0..n_forin).map(|k| fi_memo(k).obj))
                 .chain((0..n_gm).map(|k| gm_proof(k).0))
                 .chain((0..n_wp).map(wp_proof))
+                .chain(cm.map(|m| m.recv))
                 .collect(),
         );
+        a.coll_memo = cm;
         // (Also the promoted loops' epoch slots: emptying them with the
         // global binding cache's merely makes the loops validate afresh.)
         let mut entry_clear = num.entry_clear_slots();
@@ -11698,6 +11719,7 @@ impl JitFunction {
                             (None, disp(recv), disp(k), disp(dst)),
                             (fill, slow, done),
                             helpers.coll_lookup as usize as u64,
+                            cm_plan.get(op_idx).copied().unwrap_or(0),
                         );
                         let cold = a.cold_begin();
                         a.bind(fill);
@@ -16649,6 +16671,7 @@ impl JitFunction {
                                     (Some(disp(callee)), disp(recv), disp(args[0]), disp(dst)),
                                     (fill, general, done),
                                     helpers.coll_lookup as usize as u64,
+                                    cm_plan.get(op_idx).copied().unwrap_or(0),
                                 );
                             }
                             let cold = a.cold_begin();
