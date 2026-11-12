@@ -63,6 +63,14 @@ fn inplace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INPLACE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the integer version's `*` computes in its result's GPR (or in
+/// place in its first factor's) instead of through `rax`
+/// (`KATAAN_JIT_IMULDIRECT=0` turns it off; read once).
+fn imul_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IMULDIRECT").is_none_or(|v| v != "0"))
+}
+
 /// Whether the slow paths of the integer version's inline element accesses
 /// go out of line (`NumGen::skip_cold`; `KATAAN_JIT_SKIPCOLD=0` turns it
 /// off; read once).
@@ -2211,6 +2219,16 @@ impl NumGen {
                 a.dec_frame8(super::COUNTDOWN);
                 a.jne(skip);
                 a.bind(poll);
+                // (Its appends' misses count as the speculative version's
+                // leaves, `StubKind::SpecBail`'s `push`: decayed alike, in a
+                // region that has any.)
+                let (h, e) = (self.regions[ri].head, self.regions[ri].end);
+                if self.regions[ri].spec_int
+                    && self.regions[ri].spec.is_some()
+                    && (h..=e).any(|q| self.bc(q).is_some_and(super::spec_push_op))
+                {
+                    self.decay_leaves(a, ri);
+                }
                 super::super::call_seq::emit_quiet_poll(
                     a,
                     &self.env.layout,
@@ -2400,7 +2418,7 @@ impl NumGen {
         let ok = inplace_enabled()
             && src == t
             && x != t
-            && self.mentions.get(t as usize) == Some(&2)
+            && self.mentions_at(t, pc) == 2
             && !self.is_target.get(pc + 1).copied().unwrap_or(true)
             && self.region_at(pc + 1) == self.region_at(pc)
             && self.is_int(x)
@@ -2431,8 +2449,8 @@ impl NumGen {
             && t1 != x
             && t2 != x
             && t1 != t2
-            && self.mentions.get(t1 as usize) == Some(&2)
-            && self.mentions.get(t2 as usize) == Some(&2)
+            && self.mentions_at(t1, pc) == 2
+            && self.mentions_at(t2, pc) == 2
             && !self.is_target.get(pc + 1).copied().unwrap_or(true)
             && !self.is_target.get(pc + 2).copied().unwrap_or(true)
             && self.region_at(pc + 2) == self.region_at(pc)
@@ -2543,18 +2561,53 @@ impl NumGen {
             a.imul32_rr(t, gy);
             return self.iput(a, dst, t);
         }
-        a.mov32_rr(RAX, gx);
-        a.imul32_rr(RAX, gy);
         let bail = self.ibail_ovf(a);
+        // (`*` commutes: a result in the second factor's GPR is the same case.)
+        let (gx, gy) = if d == gy && d != gx {
+            (gy, gx)
+        } else {
+            (gx, gy)
+        };
+        if imul_direct_enabled() && d == gx && gx != gy && gx != RDX && gx != RCX {
+            // Into the first factor's own GPR (its value is dead past the op,
+            // a bail must still see it): kept in `r11` first, put back
+            // before every bail; `r11` also serves the `-0` test.
+            let undo = a.new_label();
+            let ok = a.new_label();
+            a.mov32_rr(R11, gx);
+            a.imul32_rr(gx, gy);
+            a.jcc(CC_O, undo);
+            a.test32_rr(gx, gx);
+            a.jcc(CC_NE, ok);
+            a.alu32_rr(0x09, R11, gy); // or r11d, y
+            a.jcc(CC_S, undo);
+            a.jmp(ok);
+            let cold = a.cold_begin();
+            a.bind(undo);
+            a.mov32_rr(gx, R11);
+            a.jmp(bail);
+            a.cold_end(cold);
+            a.bind(ok);
+            return Some(());
+        }
+        // Computed in the result's GPR when no factor lives there (a bail
+        // must still see them), else in `rax`.
+        let t = if imul_direct_enabled() && d != gx && d != gy {
+            d
+        } else {
+            RAX
+        };
+        a.mov32_rr(t, gx);
+        a.imul32_rr(t, gy);
         a.jcc(CC_O, bail);
         let ok = a.new_label();
-        a.test32_rr(RAX, RAX);
+        a.test32_rr(t, t);
         a.jcc(CC_NE, ok);
         a.mov32_rr(R11, gx);
         a.alu32_rr(0x09, R11, gy); // or r11d, y
         a.jcc(CC_S, bail);
         a.bind(ok);
-        self.iput(a, dst, RAX)
+        self.iput(a, dst, t)
     }
 
     /// `dst = x % y` over int registers, bailing on a zero divisor (NaN) and on a
@@ -3386,10 +3439,20 @@ impl NumGen {
             .iter()
             .find(|x| x.0 == h)
             .map_or(&[], |x| x.1.as_slice());
+        // (And the invariant prefixes' registers of the loops around `h`,
+        // whose prefixes this entry skips: their every op the copy ran in
+        // this iteration of those loops, `plan_licm`.)
+        let outer = |r: u16| {
+            rg.licm
+                .iter()
+                .any(|l| l.head < h && h <= l.end && l.regs.contains(&r))
+        };
         let ints: Vec<(u16, IK)> = p
             .slots
             .iter()
-            .filter(|s| s.start <= h && h <= s.end && (s.carried || live.contains(&s.reg)))
+            .filter(|s| {
+                s.start <= h && h <= s.end && (s.carried || live.contains(&s.reg) || outer(s.reg))
+            })
             .map(|s| (s.reg, self.slot_ik(s)))
             .collect();
         let dbls: Vec<(u8, u16)> = rg

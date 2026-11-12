@@ -11907,8 +11907,18 @@ impl JitFunction {
                         a.cold_end(cold);
                         a.bind(general);
                     }
-                    // `a.push(x)` on an array without side-table state, with
-                    // no call when it needs no allocation (`arr_push`).
+                    // `a.push(x)` in a speculative region's fast version
+                    // (`numeric::spec_push_op`): the append in place below,
+                    // every other path a leave for the plain copy, nothing
+                    // done (an array without an element left, a receiver
+                    // one of the region's hoisted arrays holds, the method
+                    // not proved the built-in, ...).
+                    let push_on = numeric::spec_push_op(bytecode.get(op_idx)?);
+                    let push_bail = if push_on && num.in_spec(op_idx) {
+                        Some(num.spec_push_bail(&mut a, op_idx)?)
+                    } else {
+                        None
+                    };
                     if let crate::nbvm::Op::CallMethod {
                         key, args: margs, ..
                     } = bytecode.get(op_idx)?
@@ -11918,8 +11928,10 @@ impl JitFunction {
                         && ok(recv)
                         && ok(margs[0])
                         && !si.method_ptr.is_null()
-                        && !num.in_any_spec(op_idx)
+                        && (!num.in_any_spec(op_idx)
+                            || (push_on && (num.in_spec(op_idx) || num.is_copy())))
                         && num.result_xmm(op_idx, dst).is_none()
+                        && !num.is_int(dst)
                     {
                         // (A promoted argument is in the register file:
                         // `arg_x` above stored it.)
@@ -11933,23 +11945,38 @@ impl JitFunction {
                         a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
                         a.g_jcc(call_seq::cc::NE, general);
                         a.p_str_proof(si.method_ptr, prove, general);
+                        if push_bail.is_some() {
+                            num.push_held_checks(&mut a, op_idx, recv, general);
+                        }
                         walk_to_slot!(recv, general);
                         a.ap_push(&layout, cl.realm, disp(x), general);
-                        a.g_mov(call_seq::r::RAX, call_seq::r::R8);
-                        a.cvtsi2sd_xmm0_rax();
-                        numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
-                        a.store_rax(disp(dst));
+                        // (The new length, unless nothing reads it.)
+                        if push_bail.is_none() || !num.dead_after(op_idx, dst) {
+                            a.g_mov(call_seq::r::RAX, call_seq::r::R8);
+                            a.cvtsi2sd_xmm0_rax();
+                            numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                            a.store_rax(disp(dst));
+                        }
                         a.jmp(done);
                         let cold = a.cold_begin();
                         a.bind(prove);
-                        a.mov_rdi_r15();
-                        a.load_argreg(1, disp(recv));
-                        a.movabs_argreg(2, si.method_ptr as i64);
-                        a.movabs_rax(helpers.str_proof as usize as i64);
-                        a.call_rax();
-                        a.jmp(general);
+                        // (A fast version makes no call: the copy proves.)
+                        if let Some(b) = push_bail {
+                            a.jmp(b);
+                        } else {
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(recv));
+                            a.movabs_argreg(2, si.method_ptr as i64);
+                            a.movabs_rax(helpers.str_proof as usize as i64);
+                            a.call_rax();
+                            a.jmp(general);
+                        }
                         a.cold_end(cold);
                         a.bind(general);
+                    }
+                    // (Every other path of a fast version's push: a leave.)
+                    if let Some(b) = push_bail {
+                        a.jmp(b);
                     }
                     // `a.pop()` on an array without side-table state, with
                     // no call (`arr_push`).

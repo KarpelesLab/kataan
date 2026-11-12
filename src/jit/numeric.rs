@@ -1020,7 +1020,7 @@ pub(super) struct NumEnv {
     /// emission has a fast path that makes no call, and whose every other
     /// path the emitter turns into a leave for the plain copy in a fast
     /// version (`KATAAN_JIT_SPECALLOC`): it does not keep its loop from
-    /// having a speculative version ([`region_call`]). Empty: none.
+    /// having a speculative version ([`region_call_in`]). Empty: none.
     pub(super) alloc_inline: Vec<u8>,
 }
 
@@ -1126,7 +1126,13 @@ enum StubKind {
     /// outgrew the free slots a collection leaves), the leave is not
     /// counted ([`SPEC_LEAVE_LIMIT`]) and the copy's next back-edge polls,
     /// so a due collection runs there and refills the free list.
-    SpecBail { pc: u32, alloc: bool },
+    ///
+    /// `push`: an `a.push(x)` append's miss ([`spec_push_op`]), which leaves
+    /// now and then (the array's storage full): from the integer version
+    /// too it counts as a fast version's leave ([`SPEC_LEAVE_LIMIT`]),
+    /// which back-edge polls decay, not as one of its bails, whose count
+    /// only grows.
+    SpecBail { pc: u32, alloc: bool, push: bool },
     /// A speculative region's integer version found the value an op wrote
     /// to int register `dst` not an int32: it leaves for op `pc` (the next
     /// one) in the plain copy, `dst` holding the value (`rax`).
@@ -1194,6 +1200,10 @@ pub(super) struct NumGen {
     is_target: Vec<bool>,
     /// Per register: how many ops name it.
     mentions: Vec<u32>,
+    /// Per region: per register no value of which flows into or out of the
+    /// region, how many of its ops name it (else `u32::MAX`), see
+    /// [`region_mentions`].
+    rmentions: Vec<Vec<u32>>,
     stubs: Vec<Stub>,
     /// The lazily pending activations ([`NumGen::note_lazy`]): `(guard pc,
     /// leave pc, in the integer version, materialization stub, marker
@@ -1550,7 +1560,7 @@ pub(super) fn generic_region_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
 /// bracketed by the promoted registers' stores and reloads like every
 /// generic region op's), so a loop that makes objects or closures, or
 /// counts in a captured variable, still keeps its arithmetic in SSE
-/// registers. Its every call can run Rust code ([`region_call`]), so such a
+/// registers. Its every call can run Rust code ([`region_call_in`]), so such a
 /// loop has no speculative version.
 fn allocating_region_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
     match op {
@@ -1626,7 +1636,7 @@ fn spec_int_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
         | GenericOp::CellGet { .. } => true,
         // (`!x` of a boolean or Number inline, else the interpreter's op.)
         GenericOp::Not { .. } => true,
-        GenericOp::CallMethod { .. } => super::inline_math(bc).is_some(),
+        GenericOp::CallMethod { .. } => super::inline_math(bc).is_some() || spec_push_op(bc),
         GenericOp::CallWithMethod { .. } => super::inline_math_got(bc).is_some(),
         GenericOp::Interp { .. } => {
             matches!(
@@ -1641,6 +1651,33 @@ fn spec_int_op(op: &GenericOp, bc: &Op, sa: u8) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `bc` is an `a.push(x)` a speculative region's fast version runs
+/// as an append in place (`jit::compile_generic`, `arr_push`): one argument,
+/// every path but the append (no element left, a receiver that is no plain
+/// array, one of the region's hoisted arrays, the method not proved the
+/// built-in, ...) a leave for the plain copy before anything is done,
+/// unless `KATAAN_JIT_SPECPUSH=0`.
+pub(super) fn spec_push_op(bc: &Op) -> bool {
+    matches!(bc, Op::CallMethod { key, args, .. } if key == "push" && args.len() == 1)
+        && spec_push_enabled()
+}
+
+/// See [`spec_push_op`]. Read once.
+fn spec_push_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SPECPUSH").is_none_or(|v| v != "0"))
+}
+
+/// Whether `bc`, in a guard diamond's fallback arm, is the call of an
+/// `a.push(x)` whose fast arm is [`spec_push_op`]'s: a loop nest may keep
+/// it ([`plan_nests`]), as only the plain copy (or, without a speculative
+/// version, the double version, which stores and reloads around it) runs it.
+fn push_fallback_op(bc: &Op) -> bool {
+    matches!(bc, Op::CallWithMethod { key, args, .. } | Op::CallMethod { key, args, .. }
+        if key == "push" && args.len() == 1)
+        && spec_push_enabled()
 }
 
 /// A `Math.imul(a, b)` call (`CallMethod`), which a speculative region's
@@ -1691,9 +1728,18 @@ fn const_int32_bits<'a>(
 
 /// Whether region op `op` may run arbitrary code (a call that is not an
 /// inline `Math` function): a speculative version needs a call-free body.
-fn region_call(op: &GenericOp, bc: &Op, sa: u8) -> bool {
+/// In a loop nest's region (`nest`), an
+/// `a.push(x)` is no call: in a fast version an append in place, every
+/// other path a leave ([`spec_push_op`]). (Not in a single loop's: one
+/// whose fast version would leave on most of its few iterations per
+/// activation — a polymorphic read, a queue it empties — keeps its fast
+/// version all the same, each activation's first poll halving its leave
+/// count, and a push adds such loops by the hundred.)
+fn region_call_in(op: &GenericOp, bc: &Op, sa: u8, nest: bool) -> bool {
     match op {
-        GenericOp::CallMethod { .. } => super::inline_math(bc).is_none(),
+        GenericOp::CallMethod { .. } => {
+            super::inline_math(bc).is_none() && !(nest && spec_push_op(bc))
+        }
         // A `CallWithMethod` of a `Math` function computed inline
         // (`Math.min(a, Math.max(b, x))`, `Math.abs(p.x - q.x)`): in a
         // fast version every other case leaves for the plain copy
@@ -2185,7 +2231,9 @@ impl NumGen {
                 r.fills = fills;
             }
         }
+        let rmentions = region_mentions(bytecode, &regions, env.n_regs, entries, catches);
         let mut me = Self {
+            rmentions,
             ident: ident::identity_regs(bytecode, env.n_regs, env.first_local),
             demote_sites: Vec::new(),
             types,
@@ -2347,6 +2395,12 @@ impl NumGen {
     }
 
     /// Enters (or leaves) the emission of a speculative region's plain copy.
+    /// Whether the generic emitter is emitting a speculative region's plain
+    /// copy ([`Self::set_copy`]).
+    pub(super) fn is_copy(&self) -> bool {
+        self.copy
+    }
+
     pub(super) fn set_copy(&mut self, on: bool) {
         self.copy = on;
         if !on {
@@ -2756,6 +2810,45 @@ impl NumGen {
         })
     }
 
+    /// Whether register `r` is dead past region op `pc` (not live on entry
+    /// to `pc + 1`, its only successor): known only for a body that branches
+    /// inside itself ([`Region::live`]), else `false`.
+    pub(super) fn dead_after(&self, pc: usize, r: u16) -> bool {
+        let Some(ri) = self.region_at(pc) else {
+            return false;
+        };
+        let rg = &self.regions[ri];
+        rg.live_words != 0 && pc < rg.end && !rg.live_at(pc + 1, r)
+    }
+
+    /// For the append in place of an `a.push(x)` at op `pc` of a speculative
+    /// region's fast version ([`spec_push_op`]), receiver register `recv`:
+    /// to `miss` when the receiver is the array one of the region's hoisted
+    /// arrays holds ([`ArraySlots::held`]), whose count the append would
+    /// change under its slots. Clobbers `rax`.
+    pub(super) fn push_held_checks(&self, a: &mut X64Assembler, pc: usize, recv: u16, miss: Label) {
+        let Some(ri) = self.region_at(pc) else {
+            return;
+        };
+        let av = &self.regions[ri].aviews;
+        let mut loaded = false;
+        for (i, &(_, k, _)) in av.iter().enumerate() {
+            if av[..i].iter().any(|&(_, k2, _)| k2 == k) {
+                continue;
+            }
+            if !loaded {
+                a.load_rax(disp(recv));
+                loaded = true;
+            }
+            a.g_cmp_mem(
+                super::call_seq::r::RAX,
+                super::call_seq::r::RBP,
+                self.gslot_disp(k),
+            );
+            a.jcc(CC_E, miss);
+        }
+    }
+
     /// For an element read or `.length` op `pc` on a hoisted array
     /// ([`hoisted_array`](Self::hoisted_array)) in the fast version, whose
     /// receiver register `r` is known to hold the value the entry check
@@ -2836,7 +2929,7 @@ impl NumGen {
         let test_ok = na == done
             && cond == t
             && t != done
-            && self.mentions.get(t as usize).copied() == Some(2)
+            && self.mentions_at(t, pc) == 2
             && !self.is_target.get(pc + 1).copied().unwrap_or(true)
             && !self.is_target.get(pc + 2).copied().unwrap_or(true)
             && self.ty(pc, done) == T_BOOL
@@ -2898,7 +2991,7 @@ impl NumGen {
             _ => false,
         };
         used && self.region_at(pc + 1) == Some(ri)
-            && self.mentions.get(dst as usize) == Some(&2)
+            && self.mentions_at(dst, pc) == 2
             && !self.regions[ri].slots.iter().any(|s| s.reg == dst)
             && self.array_known_fast(pc + 1, dst)
     }
@@ -3747,7 +3840,7 @@ impl NumGen {
         else {
             return false;
         };
-        let once = |r: u16| self.mentions.get(r as usize).copied() == Some(2);
+        let once = |r: u16| self.mentions_at(r, pc) == 2;
         let entered = |q: usize| self.is_target.get(q).copied().unwrap_or(true);
         if s1 != t1 || s2 != t2 || x2 != x || t1 == x || t2 == x || t1 == t2 {
             return false;
@@ -3906,7 +3999,7 @@ impl NumGen {
 
     /// At a back-edge poll of speculative region `ri`'s fast version: its
     /// leave count halved. Clobbers `r11`.
-    fn decay_leaves(&self, a: &mut X64Assembler, ri: usize) {
+    pub(super) fn decay_leaves(&self, a: &mut X64Assembler, ri: usize) {
         if self.counts_leaves(ri) {
             a.g_movabs(super::call_seq::r::R11, self.env.persist);
             // shr qword [r11 + off], 1
@@ -4027,16 +4120,28 @@ impl NumGen {
     /// slow paths take instead of their own code. Taken before the op has
     /// done anything, it is the op from scratch.
     pub(super) fn spec_bail(&mut self, a: &mut X64Assembler, pc: usize) -> Option<Label> {
-        self.spec_bail_kind(a, pc, false)
+        self.spec_bail_kind(a, pc, false, false)
+    }
+
+    /// [`Self::spec_bail`] for an `a.push(x)` append's miss (see
+    /// [`StubKind::SpecBail`]'s `push`).
+    pub(super) fn spec_push_bail(&mut self, a: &mut X64Assembler, pc: usize) -> Option<Label> {
+        self.spec_bail_kind(a, pc, false, true)
     }
 
     /// [`Self::spec_bail`] for an inline allocation's miss (see
     /// [`StubKind::SpecBail`]'s `alloc`).
     pub(super) fn spec_alloc_bail(&mut self, a: &mut X64Assembler, pc: usize) -> Option<Label> {
-        self.spec_bail_kind(a, pc, true)
+        self.spec_bail_kind(a, pc, true, false)
     }
 
-    fn spec_bail_kind(&mut self, a: &mut X64Assembler, pc: usize, alloc: bool) -> Option<Label> {
+    fn spec_bail_kind(
+        &mut self,
+        a: &mut X64Assembler,
+        pc: usize,
+        alloc: bool,
+        push: bool,
+    ) -> Option<Label> {
         if !self.in_spec(pc) || self.copy_label(pc).is_none() {
             return None;
         }
@@ -4049,6 +4154,7 @@ impl NumGen {
             kind: StubKind::SpecBail {
                 pc: self.bail_pc(pc) as u32,
                 alloc,
+                push,
             },
             branch: None,
             ibranch: None,
@@ -4301,6 +4407,16 @@ impl NumGen {
                 if reg.is_some()
                     && matches!(ops.get(pc + 1), Some(GenericOp::StrictEq { .. }))
                     && self.const_only_bits(pc, dst) => {}
+            // A constant only the arithmetic right after it reads, as its
+            // memory operand (`const_float_folded`).
+            GenericOp::Const { dst, .. }
+                if reg.is_some()
+                    && ops.get(pc + 1).is_some_and(|o| {
+                        float_bin_folds(o).is_some_and(|(d, p, q, c)| {
+                            (p == dst || q == dst)
+                                && self.const_float_folded(pc + 1, d, p, q, c).is_some()
+                        })
+                    }) => {}
             // A constant only the `Move` right after it reads (an inlined
             // `return k`'s result): into the move's destination, which then
             // emits nothing.
@@ -5140,7 +5256,7 @@ impl NumGen {
         if a != done
             || cond != t
             || t == done
-            || self.mentions.get(t as usize).copied() != Some(2)
+            || self.mentions_at(t, pc) != 2
             || self.is_target.get(pc + 1).copied().unwrap_or(true)
             || self.is_target.get(pc + 2).copied().unwrap_or(true)
             || !self.is_bool_at(pc, done)
@@ -5343,7 +5459,7 @@ impl NumGen {
     /// `Not`, only when neither boolean is read by anything else (both dead
     /// past the test) and nothing branches to the `Not` or the test.
     fn fuse_shape(&self, pc: usize, ops: &[GenericOp], dst: u16) -> Option<Fused> {
-        let m = |r: u16| self.mentions.get(r as usize).copied().unwrap_or(u32::MAX);
+        let m = |r: u16| self.mentions_at(r, pc);
         let tgt = |q: usize| self.is_target.get(q).copied().unwrap_or(true);
         match ops.get(pc + 1) {
             Some(&GenericOp::JumpIfFalse { cond, target }) if cond == dst && target > pc + 1 => {
@@ -5399,7 +5515,7 @@ impl NumGen {
             && dst != x
             && target > pc + 1
             && (t == T_BOOL || t == T_NUM)
-            && self.mentions.get(dst as usize).copied() == Some(2)
+            && self.mentions_at(dst, pc) == 2
             && !self.is_target.get(pc + 1).copied().unwrap_or(true)
             && self.region_at(pc + 1) == self.region_at(pc))
         .then_some(target)
@@ -5416,7 +5532,7 @@ impl NumGen {
             && cond == dst
             && dst != x
             && target > pc + 1
-            && self.mentions.get(dst as usize).copied() == Some(2)
+            && self.mentions_at(dst, pc) == 2
             && !self.is_target.get(pc + 1).copied().unwrap_or(true)
             && self.region_at(pc + 1) == self.region_at(pc))
         .then_some(target)
@@ -5488,6 +5604,7 @@ impl NumGen {
                 StubKind::SpecBail {
                     pc: self.bail_pc(self.cur_pc) as u32,
                     alloc: false,
+                    push: false,
                 }
             }
             k => k,
@@ -5746,6 +5863,17 @@ impl NumGen {
                 }
             }
         }
+        // A constant operand only this op reads: its memory operand
+        // (`const_float_folded`), as the second one.
+        let kfold = if reg.is_some() {
+            self.const_float_folded(pc, dst, x, y, opc == 0x58 || opc == 0x59)
+        } else {
+            None
+        };
+        let (x, y) = match kfold {
+            Some((_, true)) => (y, x),
+            _ => (x, y),
+        };
         let guarded = self.ty(pc, x) != T_NUM || self.ty(pc, y) != T_NUM;
         let stub = a.new_label();
         // An operand not proven a Number is checked *after* the arithmetic,
@@ -5830,7 +5958,16 @@ impl NumGen {
             // the result's register.)
             Some(xd) if self.imode.is_none() || int_inplace_float() => {
                 let (xx, xy) = (self.xmm_of(reg, x), self.xmm_of(reg, y));
-                if xy == Some(xd) && xx != Some(xd) {
+                if let Some((k, _)) = kfold {
+                    // (The constant's SSE register, never loaded, may be
+                    // the result's: `x` is copied in first all the same.)
+                    match xx {
+                        Some(s) if s == xd => {}
+                        Some(s) => a.movapd_xx(xd, s),
+                        None => Self::xmm_from_slot(a, xd, x, RAX),
+                    }
+                    a.sse_rip_const(0xf2, opc, xd, k);
+                } else if xy == Some(xd) && xx != Some(xd) {
                     if opc == 0x58 || opc == 0x59 {
                         let xs = self.xmm_src(a, reg, x, 1);
                         a.sse_rr(0xf2, opc, xd, xs);
@@ -5859,6 +5996,9 @@ impl NumGen {
             _ => {
                 self.load_xmm0(a, reg, x);
                 match (self.xmm_of(reg, y), self.const_num_bits_at(pc, y)) {
+                    _ if kfold.is_some() => {
+                        a.sse_rip_const(0xf2, opc, 0, kfold.map_or(0, |f| f.0));
+                    }
                     // `x <op> k`: the constant as the memory operand.
                     (None, Some(k)) if y != x => a.sse_rip_const(0xf2, opc, 0, k),
                     _ => {
@@ -5926,6 +6066,72 @@ impl NumGen {
         Some(v.to_bits())
     }
 
+    /// For the region arithmetic op `pc` (`float_bin`'s, over two operands
+    /// proven Numbers, so with no slow path): whether its operand is the
+    /// constant the `LoadConst` right before it loads (no branch landing
+    /// between, the constant's register named by those two ops alone, not
+    /// an int register), which it then takes as its memory operand while
+    /// the `LoadConst` emits nothing. Its bits, and whether it is the first
+    /// operand (of a commuting op). Nothing leaves between the two ops: the
+    /// op has no slow path, and no merged-check stretch starts at it or
+    /// spans it, so no leave stores the register's (never loaded) SSE
+    /// register, nor resumes where the register is read.
+    /// How many ops name register `r`, for a test at op `pc` of whether ops
+    /// next to `pc` alone name it: in `pc`'s region only when no value of
+    /// `r` flows into or out of it ([`region_mentions`]), else in the body.
+    pub(super) fn mentions_at(&self, r: u16, pc: usize) -> u32 {
+        let g = self.mentions.get(r as usize).copied().unwrap_or(u32::MAX);
+        match self.region_at(pc).and_then(|ri| self.rmentions.get(ri)) {
+            Some(m) => match m.get(r as usize) {
+                Some(&c) if c != u32::MAX => c,
+                _ => g,
+            },
+            None => g,
+        }
+    }
+
+    /// (`dst = p <op> q`, `commutes` for `+` and `*`.)
+    fn const_float_folded(
+        &self,
+        pc: usize,
+        dst: u16,
+        p: u16,
+        q: u16,
+        commutes: bool,
+    ) -> Option<(u64, bool)> {
+        if !const_mem_enabled() || pc == 0 {
+            return None;
+        }
+        let ri = self.region_at(pc)?;
+        let Some(&Op::LoadConst { dst: r, .. }) = self.bc(pc - 1) else {
+            return None;
+        };
+        let k = self.const_num_bits_at(pc, r)?;
+        let first = if q == r && p != r {
+            false
+        } else if commutes && p == r && q != r {
+            true
+        } else {
+            return None;
+        };
+        let other = if first { q } else { p };
+        let d = &self.regions[ri].defer;
+        let ok = self.region_at(pc - 1) == Some(ri)
+            && self.mentions_at(r, pc) == 2
+            && dst != r
+            && !self.is_int(r)
+            && !self.is_int(dst)
+            && !self.is_int(other)
+            && self.ty(pc, other) == T_NUM
+            && self.ty(pc, r) == T_NUM
+            && self.defer_kind(pc) == 0
+            && !d
+                .spans
+                .iter()
+                .any(|&(f, l, s)| (f <= pc && pc <= l) || s == pc || s == pc - 1);
+        ok.then_some((k, first))
+    }
+
     /// The bits of an immediate constant (`undefined`, `null`, a boolean)
     /// when the op just before `pc` (not a jump target) loads it into `r`:
     /// a value strictly equal to nothing but the same word.
@@ -5952,7 +6158,7 @@ impl NumGen {
             .or_else(|| self.const_imm_bits_at(pc + 1, r))
             .is_some();
         konst
-            && self.mentions.get(r as usize) == Some(&2)
+            && self.mentions_at(r, pc) == 2
             && self.region_at(pc).is_some()
             && self.region_at(pc) == self.region_at(pc + 1)
             && !self.is_int(r)
@@ -5971,7 +6177,7 @@ impl NumGen {
         };
         let ok = src == t
             && dst != t
-            && self.mentions.get(t as usize) == Some(&2)
+            && self.mentions_at(t, pc) == 2
             && !self.is_target.get(pc + 1).copied().unwrap_or(true)
             && self.region_at(pc).is_some()
             && self.region_at(pc) == self.region_at(pc + 1)
@@ -6640,7 +6846,7 @@ impl NumGen {
 
     /// A [`StubKind::SpecBail`] leave of stub `s` for op `pc` in the plain
     /// copy (see there).
-    fn emit_spec_bail(&self, a: &mut X64Assembler, s: &Stub, pc: u32, alloc: bool) {
+    fn emit_spec_bail(&self, a: &mut X64Assembler, s: &Stub, pc: u32, alloc: bool, push: bool) {
         // (A leave of the fast version itself: counted — but
         // an allocation's for want of a free slot, which
         // has the copy's next back-edge poll instead.)
@@ -6661,7 +6867,7 @@ impl NumGen {
             a.jmp(counted);
             a.bind(count);
         }
-        if !s.int
+        if (!s.int || push)
             && !s.copy
             && let Some(ri) = s.region
         {
@@ -6673,6 +6879,7 @@ impl NumGen {
         // leaving there (a String key's element read) stops
         // entering it.
         if s.int
+            && !push
             && !s.copy
             && let Some(ri) = s.region
             && self.regions[ri].spec_int
@@ -6800,7 +7007,7 @@ impl NumGen {
             return;
         }
         if let Some(pc) = bail {
-            self.emit_spec_bail(a, s, pc, false);
+            self.emit_spec_bail(a, s, pc, false, false);
             return;
         }
         self.flush(a, s.region);
@@ -6849,7 +7056,9 @@ impl NumGen {
                         self.emit_post_bail(a, ri, pc as usize, dst);
                     }
                 }
-                StubKind::SpecBail { pc, alloc } => self.emit_spec_bail(a, s, pc, alloc),
+                StubKind::SpecBail { pc, alloc, push } => {
+                    self.emit_spec_bail(a, s, pc, alloc, push)
+                }
                 StubKind::StrictEq {
                     a: x,
                     b: y,
@@ -7439,6 +7648,74 @@ std::thread_local! {
         const { core::cell::RefCell::new(Vec::new()) };
 }
 
+/// Per region of `regions`: per register, how many of the region's ops name
+/// it (as `NumGen::mentions` counts), when no value of the register flows
+/// into the region or out of it — it is dead at the region's header, at
+/// every entry and `catch` entry, and at every pc outside the region a
+/// region op may go to — else `u32::MAX`. Such a register's every read in
+/// the region is of a write there, and no read elsewhere sees one, so
+/// "named by these two ops alone" may count in the region only: an inlined
+/// body's temporaries are named again by the body's other copies.
+fn region_mentions(
+    bytecode: &[Op],
+    regions: &[Region],
+    n_regs: usize,
+    entries: &[usize],
+    catches: &[usize],
+) -> Vec<Vec<u32>> {
+    if regions.is_empty() || !local_mentions_enabled() {
+        return Vec::new();
+    }
+    let Some((words, live)) = liveness(bytecode, n_regs, catches) else {
+        return Vec::new();
+    };
+    let n = bytecode.len();
+    let mut succ = Vec::with_capacity(2);
+    regions
+        .iter()
+        .map(|r| {
+            let mut out = vec![u32::MAX; n_regs];
+            if r.end >= n {
+                return out;
+            }
+            // The pcs where a value may flow in or out.
+            let mut edge: Vec<usize> = vec![r.head];
+            edge.extend(entries.iter().filter(|&&e| r.head <= e && e <= r.end));
+            edge.extend(catches.iter().copied());
+            for (pc, op) in bytecode.iter().enumerate().take(r.end + 1).skip(r.head) {
+                successors(op, pc, &mut succ);
+                edge.extend(succ.iter().filter(|&&t| t < r.head || t > r.end));
+            }
+            let mut counts = vec![0u32; n_regs];
+            for op in &bytecode[r.head..=r.end] {
+                for x in op_regs(op) {
+                    if let Some(c) = counts.get_mut(x as usize) {
+                        *c += 1;
+                    }
+                }
+            }
+            for (x, slot) in out.iter_mut().enumerate() {
+                let (w, bit) = (x / 64, 1u64 << (x % 64));
+                let flows = edge
+                    .iter()
+                    .any(|&q| q >= n || live[q * words + w] & bit != 0);
+                if !flows {
+                    *slot = counts[x];
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// Whether "named by these ops alone" counts a register's mentions in its
+/// region only ([`region_mentions`]): unless `KATAAN_JIT_LOCALMENT=0`. Read
+/// once.
+fn local_mentions_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LOCALMENT").is_none_or(|v| v != "0"))
+}
+
 /// Backward register liveness: the live-in set of every pc, as bitsets of
 /// `words` words. A `catch` entry's live-in is live out of every op (any op
 /// may throw to it). `None` if the table would be too large.
@@ -7891,9 +8168,10 @@ fn plan_regions_sa(
         // version goes with no speculative one, `plan_spec`). A call in a
         // guard diamond's fallback arm only ever runs in the plain copy.
         let gcarry = if generic
-            && !(head..=end)
-                .any(|pc| !in_arm(pc) && region_call(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
-        {
+            && !(head..=end).any(|pc| {
+                !in_arm(pc)
+                    && region_call_in(&ops[pc], &bytecode[pc], sa_at(sa, pc), !loops.is_empty())
+            }) {
             let target = |q: usize| {
                 ops.iter()
                     .any(|o| matches!(branch_target(o), Some(t) if t == q))
@@ -8001,6 +8279,42 @@ fn plan_regions_sa(
                         true
                     }
                 });
+                // An arithmetic op (`float_bin`'s) whose result only the `Move`
+                // right after it reads, into the op's first operand (or,
+                // commuting, its second), `s = s + t`: the result takes that
+                // operand's SSE register, which holds no value the region
+                // needs from the op's operand read to the move's write (two
+                // adjacent ops, no branch landing on the move). The op then
+                // computes in place, its slow paths as for the hand-on below,
+                // and the move emits nothing. Its slot is not active: the
+                // operand's keeps the register.
+                if generic
+                    && !is_carried
+                    && fold_float_enabled()
+                    && x.2 == x.1 + 1
+                    && let Op::Move { dst: m, src } = bytecode[x.2]
+                    && src == x.0
+                    && m != x.0
+                    && let Some((p, q, commutes)) = float_bin_operands(&ops[x.1], x.0)
+                    && (p == m || (commutes && q == m))
+                    && may_reuse(m, x.0)
+                    && !ops
+                        .iter()
+                        .any(|o| matches!(branch_target(o), Some(t) if t == x.2))
+                    && let Some(&(_, xm, ..)) = active
+                        .iter()
+                        .find(|&&(e, _, r, s0, _)| r == m && s0 <= x.1 && e >= x.2)
+                {
+                    slots.push(Slot {
+                        reg: x.0,
+                        xmm: xm,
+                        start,
+                        end: stop,
+                        carried: false,
+                        dirty: x.4,
+                    });
+                    continue;
+                }
                 // A `Move` that ends its source's interval hands the source's
                 // SSE register to its destination (the move then emits nothing).
                 // Generic regions only (no integer version shadows the slots).
@@ -8217,6 +8531,22 @@ fn plan_regions_sa(
     out
 }
 
+/// Whether an arithmetic result only moved into its operand by the next op
+/// (`s = s + t`) takes that operand's SSE register (`plan_regions`): unless
+/// `KATAAN_JIT_FFOLD=0`. Read once.
+fn fold_float_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FFOLD").is_none_or(|v| v != "0"))
+}
+
+/// Whether a region's arithmetic takes a constant only it reads as its
+/// memory operand, its `LoadConst` emitting nothing
+/// (`NumGen::const_float_folded`): unless `KATAAN_JIT_CONSTMEM=0`. Read once.
+fn const_mem_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONSTMEM").is_none_or(|v| v != "0"))
+}
+
 /// Whether speculative integer versions run their loops' invariant
 /// prefixes once per entry ([`plan_licm`]) and fill their inner loops' rows
 /// at their entries ([`Region::fills`]): unless `KATAAN_JIT_LICM=0`. Read
@@ -8224,6 +8554,14 @@ fn plan_regions_sa(
 fn licm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LICM").is_none_or(|v| v != "0"))
+}
+
+/// Whether the invariant prefixes ([`plan_licm`]) of loops that have loops
+/// inside them are run once per entry too: unless `KATAAN_JIT_OUTERLICM=0`.
+/// Read once.
+fn outer_licm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_OUTERLICM").is_none_or(|v| v != "0"))
 }
 
 /// Whether the row fills ([`Region::fills`]) are made (with
@@ -9852,9 +10190,16 @@ fn plan_nests(
         })
         .collect();
     let generic_loop = |h: usize, e: usize| {
+        // (A push's fallback call, in its guard diamond's fallback arm.)
+        let arms = cold_arms(ops, h, e);
+        let push_arm = |pc: usize| {
+            push_fallback_op(&bytecode[pc]) && arms.iter().any(|&(_, f, j)| (f..j).contains(&pc))
+        };
         (numnest_enabled()
             || (h..=e).any(|pc| generic_region_op(&ops[pc], &bytecode[pc], sa_at(sa, pc))))
-            && !(h..=e).any(|pc| region_call(&ops[pc], &bytecode[pc], sa_at(sa, pc)))
+            && !(h..=e).any(|pc| {
+                region_call_in(&ops[pc], &bytecode[pc], sa_at(sa, pc), true) && !push_arm(pc)
+            })
     };
     // Per back-edge (as in `backs`): the inner back-edges of the nest it heads.
     let mut nest: Vec<Option<Vec<(usize, usize)>>> = vec![None; backs.len()];
@@ -9957,6 +10302,17 @@ fn float_bin_operands(op: &GenericOp, dst: u16) -> Option<(u16, u16, bool)> {
     }
 }
 
+/// [`float_bin_operands`] whatever the result: `(dst, a, b, commutes)`.
+fn float_bin_folds(op: &GenericOp) -> Option<(u16, u16, u16, bool)> {
+    let dst = match *op {
+        GenericOp::Add { dst, .. }
+        | GenericOp::NumAdd { dst, .. }
+        | GenericOp::Arith { dst, .. } => dst,
+        _ => return None,
+    };
+    float_bin_operands(op, dst).map(|(a, b, c)| (dst, a, b, c))
+}
+
 /// A loop's **invariant prefix** ([`plan_licm`]): ops `head..stop` of the
 /// loop `head..=end` (its header's first ops, before any branch) compute
 /// the same values every iteration, into registers `regs` that no other op
@@ -10024,11 +10380,15 @@ fn plan_licm(
     let (mut d, mut u) = (Vec::new(), Vec::new());
     let mut out = Vec::new();
     for &(h, e) in loops {
-        // (Only an innermost loop: an entry at the header of a loop inside
-        // it, from the plain copy, would skip its prefix.)
-        if loops
-            .iter()
-            .any(|&(h2, e2)| (h2, e2) != (h, e) && h <= h2 && e2 <= e)
+        // (An outer loop's too, unless `KATAAN_JIT_OUTERLICM=0`: an entry at
+        // the header of a loop inside it, from the plain copy, skips its
+        // prefix, so that entry loads the prefix's registers, which the
+        // copy computed in this iteration of the outer loop and no op of
+        // the loop writes again, `int32::NumGen::int_inner_entry`.)
+        if !outer_licm_enabled()
+            && loops
+                .iter()
+                .any(|&(h2, e2)| (h2, e2) != (h, e) && h <= h2 && e2 <= e)
         {
             continue;
         }
@@ -10116,7 +10476,7 @@ fn plan_licm(
 ///
 /// Likewise a captured binding's read (`CellGet`) after one of the same cell
 /// register, with neither register written since: in that version nothing
-/// writes a binding cell (a `CellSet` is a call, `region_call`). And a
+/// writes a binding cell (a `CellSet` is a call, `region_call_in`). And a
 /// `CheckTdz` of a register already checked (or a copy of one, unwritten
 /// since) is listed as `(pc, src)` too: it has nothing to check.
 fn plan_reuse(ops: &[GenericOp], bytecode: &[Op], head: usize, end: usize) -> Vec<(usize, u16)> {
@@ -10483,7 +10843,7 @@ fn plan_spec_sa(
         if r.is_cold(pc) {
             continue;
         }
-        if region_call(op, &bytecode[pc], sa_at(sa, pc)) {
+        if region_call_in(op, &bytecode[pc], sa_at(sa, pc), !r.loops.is_empty()) {
             if specalloc_log() {
                 std::eprintln!(
                     "[specalloc] region {head}..={end}: no spec, op {pc} calls: {op:?} / {:?}",
@@ -10661,7 +11021,12 @@ fn plain_views_ok(r: &Region, ops: &[GenericOp], bytecode: &[Op]) -> bool {
                 Op::SetProp { key, .. } | Op::SetPropStrict { key, .. },
             ) => !index_like(key.as_str()),
             (GenericOp::SetProp { .. }, _) => false,
-            (GenericOp::CallMethod { .. }, bc) => super::inline_math(bc).is_some(),
+            // (An append in place leaves when its receiver is a hoisted
+            // array, `NumGen::push_held_checks`: it changes no hoisted
+            // array's count, and moves no array's elements.)
+            (GenericOp::CallMethod { .. }, bc) => {
+                super::inline_math(bc).is_some() || spec_push_op(bc)
+            }
             // An array iteration's step (by index, it reads the element;
             // anything else leaves for the plain copy).
             (GenericOp::Interp { .. }, Op::IterNext { iter, next, .. })
@@ -11561,10 +11926,16 @@ mod tests {
         for d in &products {
             assert!(promoted(*d), "inner product r{d} promoted");
         }
-        // The registers still fit: no two live slots share an SSE register.
+        // The registers still fit: no two live slots share an SSE register
+        // (but an arithmetic result only moved into its operand by the next
+        // op, `s = s + t`, which takes that operand's: `fold_float_enabled`).
+        let folded = |t: &Slot, m: &Slot| {
+            t.end == t.start + 1
+                && matches!(p.ops[t.end], Op::Move { dst, src } if dst == m.reg && src == t.reg)
+        };
         for x in &r.slots {
             for y in &r.slots {
-                if x.reg != y.reg && x.xmm == y.xmm {
+                if x.reg != y.reg && x.xmm == y.xmm && !folded(x, y) && !folded(y, x) {
                     assert!(
                         x.end < y.start || y.end < x.start || x.end == y.start || y.end == x.start
                     );
@@ -12028,9 +12399,9 @@ mod tests {
                 .expect("a CallWithMethod")
         };
         let min = with("min");
-        assert!(!region_call(&ops[min], &p.ops[min], 0));
+        assert!(!region_call_in(&ops[min], &p.ops[min], 0, false));
         let g = with("g");
-        assert!(region_call(&ops[g], &p.ops[g], 0));
+        assert!(region_call_in(&ops[g], &p.ops[g], 0, false));
     }
 
     #[test]
