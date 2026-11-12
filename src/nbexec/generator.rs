@@ -38,7 +38,7 @@ impl Interp {
         // `generator_function_prototype`, the only caller that creates this
         // object, fills the slot right after.
         self.realm
-            .set_property(gp, "constructor", NanBox::undefined());
+            .set_hidden_property(gp, "constructor", NanBox::undefined());
         for (name, nid) in [
             ("next", N_GEN_NEXT),
             ("return", N_GEN_RETURN),
@@ -273,7 +273,7 @@ impl Interp {
         // key; `async_generator_function_prototype`, the only caller that
         // creates this object, fills the slot right after.
         self.realm
-            .set_property(agp, "constructor", NanBox::undefined());
+            .set_hidden_property(agp, "constructor", NanBox::undefined());
         for (name, nid) in [
             ("next", N_ASYNC_GEN_NEXT),
             ("return", N_ASYNC_GEN_RETURN),

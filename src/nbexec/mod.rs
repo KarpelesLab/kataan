@@ -3295,7 +3295,7 @@ impl Interp {
     /// …`). The prototype's installation later fills the slot in place.
     fn reserve_ctor_prototype(&mut self, ctor: Handle) {
         self.realm
-            .set_property(ctor, "prototype", NanBox::undefined());
+            .set_hidden_property(ctor, "prototype", NanBox::undefined());
     }
 
     /// Creates a native function carrying its own `name`/`length` data properties,
@@ -4632,7 +4632,7 @@ impl Interp {
         // `constructor` is the first own key (filled below, once `Object`'s
         // `prototype` is linked).
         self.realm
-            .set_property(obj_proto, "constructor", NanBox::undefined());
+            .set_hidden_property(obj_proto, "constructor", NanBox::undefined());
         for (name, id, arity) in [
             ("toString", N_OBJ_PROTO_TOSTRING, 0u32),
             ("toLocaleString", N_OBJ_PROTO_TOLOCALESTRING, 0),

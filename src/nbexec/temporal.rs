@@ -169,7 +169,7 @@ impl Interp {
             self.realm
                 .set_hidden_property(proto, "constructor", NanBox::handle(ctor.to_raw()));
             self.realm
-                .set_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
+                .set_hidden_property(ctor, "prototype", NanBox::handle(proto.to_raw()));
             // Static methods (`from`/`compare`/…): own non-enumerable function
             // properties of the constructor.
             for &(sname, slen) in statics_for(kind) {
