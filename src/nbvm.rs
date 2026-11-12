@@ -7056,6 +7056,11 @@ pub(crate) const STR_EQ_LOOSE: u8 = 2;
 /// `==` anything else but `undefined`/`null` (equal to no string) goes
 /// through the ordinary loose equality with the literal materialized (an
 /// object's ToPrimitive may run code and throw).
+// (Only the JIT's one-op path calls it; the interpreter arm takes `_in`.)
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn vm_str_eq_const(
     ctx: &mut Ctx,
     funcs: &[FnProto],
