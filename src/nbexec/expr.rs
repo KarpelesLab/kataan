@@ -3296,6 +3296,11 @@ impl Interp {
             {
                 return Ok(true);
             }
+            // (Their constructors model no `prototype`: an unmarked object
+            // is no instance.)
+            if wasm_marker.is_some() {
+                return Ok(false);
+            }
             // `ArrayBuffer` / `DataView` are matched by OrdinaryHasInstance too: the
             // `ARRAY_BUFFER_BYTES` / `DATA_VIEW_BUF` marker slot records the internal
             // slot, not the owning realm, so a buffer or view built in a
