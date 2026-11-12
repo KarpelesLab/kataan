@@ -256,7 +256,12 @@ impl Realm {
                 _ => return None,
             }
         }
-        if self.aux_props.contains_key(&a.to_raw()) || self.aux_props.contains_key(&b.to_raw()) {
+        // (Only a string cell given an auxiliary object is no plain string;
+        // until one is, `str_special` stays clear and no lookup is needed.)
+        if self.str_special
+            && (self.aux_props.contains_key(&a.to_raw())
+                || self.aux_props.contains_key(&b.to_raw()))
+        {
             return None;
         }
         let x = self.heap.get(a)?.as_str()?.as_leaf_bytes()?;

@@ -972,7 +972,18 @@ impl Interp {
                 if !has_reviver {
                     return self.json_parse_wtf8(&text);
                 }
-                let (value, src) = self.json_parse_with_source(&text)?;
+                // A reviver that cannot observe its third argument (a VM
+                // function with at most two parameters, no rest parameter, no
+                // `arguments` object, no direct eval, no legacy
+                // `f.arguments`) never sees the `context` objects: the text
+                // is parsed without source records and none is made.
+                let context = !self.vm_cb_ignores_args_from(reviver, 2);
+                let (value, src) = if context {
+                    let (v, s) = self.json_parse_with_source(&text)?;
+                    (v, Some(s))
+                } else {
+                    (self.json_parse_wtf8(&text)?, None)
+                };
                 let holder = self.realm.new_object();
                 self.realm.set_property(holder, "", value);
                 // The holder and the reviver are rooted for the walk, in which
@@ -983,8 +994,9 @@ impl Interp {
                     text: &text,
                     source_ic: crate::ic::PropertyCache::new(),
                     reviver_vm: sc.cb_is_vm(reviver),
+                    context,
                 };
-                return sc.json_revive_ctx(holder, "", reviver, Some(&src), &mut cx);
+                return sc.json_revive_ctx(holder, "", reviver, src.as_ref(), &mut cx);
             }
             // `JSON.rawJSON(text)` — validates `ToString(text)` as a single JSON
             // primitive (number/string/boolean/null, no surrounding whitespace) and

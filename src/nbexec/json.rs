@@ -108,6 +108,18 @@ impl Interp {
                 }
             }
         }
+        if !cx.context {
+            let kb = self.new_key_str(key);
+            if let Some(m) = mark {
+                self.root_truncate(m);
+            }
+            let args = [kb, value];
+            let holder = NanBox::handle(holder.to_raw());
+            if cx.reviver_vm && self.created_realms.is_empty() {
+                return self.call_vm_cb(reviver, holder, &args);
+            }
+            return self.call_cb(reviver, holder, &args);
+        }
         // Build the `context` object. Only a primitive value that is *still* the
         // one the parser produced here (SameValue) exposes its `source`.
         let context = self.realm.new_object();
@@ -137,6 +149,36 @@ impl Interp {
             return self.call_vm_cb(reviver, holder, &args);
         }
         self.call_cb(reviver, holder, &args)
+    }
+
+    /// Whether a call of `f` cannot observe its arguments from the `n`th on:
+    /// `f` is a VM function of the current table with at most `n`
+    /// parameters, no rest parameter, no `arguments` object (its own or one
+    /// mapped), no dynamic-scope or direct-eval operation, and no legacy
+    /// `f.arguments` (a sloppy ordinary function's).
+    pub(crate) fn vm_cb_ignores_args_from(&self, f: NanBox, n: usize) -> bool {
+        use crate::nbvm::Op;
+        let Some((id, _)) = f
+            .as_handle()
+            .and_then(|h| self.realm.vm_function(Handle::from_raw(h)))
+        else {
+            return false;
+        };
+        let Some(p) = self.vm_table.as_ref().and_then(|t| t.get(id as usize)) else {
+            return false;
+        };
+        p.n_params <= n
+            && p.rest_from.is_none()
+            && !p.legacy
+            && !p.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::MakeArguments { .. }
+                        | Op::MapArguments { .. }
+                        | Op::DirectEval { .. }
+                        | Op::Env { .. }
+                )
+            })
     }
 
     /// `SameValue(pv, value)` of the primitive `pv` a source record holds
@@ -1551,6 +1593,9 @@ pub(crate) struct ReviveCx<'a> {
     /// The walk's root scope is active and the reviver is a VM function
     /// (`Interp::cb_is_vm`): each call may collect, made at once.
     pub(crate) reviver_vm: bool,
+    /// Whether the reviver is passed its `context` argument: not when it
+    /// cannot observe a third argument (`Interp::vm_cb_ignores_args_from`).
+    pub(crate) context: bool,
 }
 
 /// The state of one `JSON.stringify` run: the replacer, the gap, the cycle
