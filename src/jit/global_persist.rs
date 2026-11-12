@@ -46,6 +46,15 @@ pub(super) fn writes_persist() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GWPERSIST").is_none_or(|v| v != "0"))
 }
 
+/// Whether the global binding cache's reset takes the persistent entries
+/// before emptying the frame's slots, so that it empties only the others
+/// (`X64Assembler::gp_restore_first`); `KATAAN_JIT_GPFIRST=0` turns it off
+/// (read once per process).
+pub(super) fn restore_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GPFIRST").is_none_or(|v| v != "0"))
+}
+
 /// The array's length (`u64` words).
 pub(super) const LEN: usize = 64;
 
@@ -196,6 +205,37 @@ impl X64Assembler {
             self.g_load(r::RCX, r::R11, off(w));
             self.g_store(r::RBP, d, r::RCX);
         }
+        self.jmp(hit);
+        self.bind(miss);
+    }
+
+    /// The global binding cache's reset when the epoch changed, with `rax`
+    /// the current epoch: when the persistent group noted at word `noted`
+    /// was validated under it, copies its entries (`(word, frame
+    /// displacement)`) into the frame, empties the frame's other
+    /// entry-cleared slots, notes the epoch at `[rbp + frame_epoch]` and
+    /// jumps to `hit`; else falls through (to the full reset). Clobbers
+    /// `rcx`, `r11`.
+    pub(super) fn gp_restore_first(
+        &mut self,
+        persist: u64,
+        noted: usize,
+        entries: &[(usize, i32)],
+        frame_epoch: i32,
+        hit: Label,
+    ) {
+        let miss = self.new_label();
+        self.g_movabs(r::R11, persist);
+        self.g_cmp_mem(r::RAX, r::R11, off(noted));
+        self.g_jcc(super::call_seq::cc::NE, miss);
+        for &(w, d) in entries {
+            self.g_load(r::RCX, r::R11, off(w));
+            self.g_store(r::RBP, d, r::RCX);
+        }
+        let mut keep: alloc::vec::Vec<i32> = entries.iter().map(|&(_, d)| d).collect();
+        keep.push(frame_epoch);
+        self.clear_entry_slots_except(&keep);
+        self.g_store(r::RBP, frame_epoch, r::RAX);
         self.jmp(hit);
         self.bind(miss);
     }

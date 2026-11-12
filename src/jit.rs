@@ -6416,6 +6416,17 @@ impl X64Assembler {
         self.code.extend_from_slice(&RECV_CACHE_EMPTY.to_le_bytes());
     }
 
+    /// Empties every [`entry_clear`](Self::set_entry_clear) slot but those
+    /// of `keep`.
+    pub(crate) fn clear_entry_slots_except(&mut self, keep: &[i32]) {
+        for i in 0..self.entry_clear.len() {
+            let d = self.entry_clear[i];
+            if !keep.contains(&d) {
+                self.store_empty(d);
+            }
+        }
+    }
+
     /// Empties every [`entry_clear`](Self::set_entry_clear) slot (the frame
     /// prologue; and the generic tier's global cache reset).
     pub(crate) fn clear_entry_slots(&mut self) {
@@ -16943,9 +16954,14 @@ impl JitFunction {
             a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
             a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, gc_epoch);
             a.je(fetch);
+            if !gc_persisted.is_empty() && global_persist::restore_first() {
+                // The persistent entries first: on a hit only the other
+                // slots need emptying.
+                a.gp_restore_first(persist, 0, &gc_persisted, gc_epoch, recheck);
+            }
             a.clear_entry_slots();
             a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
-            if !gc_persisted.is_empty() {
+            if !gc_persisted.is_empty() && !global_persist::restore_first() {
                 a.gp_restore(persist, 0, &gc_persisted, recheck);
             }
             a.jmp(fetch);
