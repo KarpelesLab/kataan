@@ -3346,26 +3346,34 @@ impl Interp {
                 }
                 _ => {}
             }
-            // OrdinaryHasInstance fallback for any other built-in constructor (e.g.
+            // OrdinaryHasInstance fallback for any other built-in function (e.g.
             // `%Iterator%`, whose instances are recognized only by their prototype
-            // chain): walk `obj`'s `[[Prototype]]` chain for the ctor's `.prototype`.
-            if let Some(proto) = self
-                .realm
-                .get_property(ch, "prototype")
-                .and_then(|p| p.as_handle())
+            // chain): walk `obj`'s `[[Prototype]]` chain for its `.prototype`,
+            // which must be an Object — a built-in with none (`Math.max`) or a
+            // primitive one is a TypeError, as for any other function.
+            let proto_val = match self.realm.get_property(ch, "prototype") {
+                Some(v) => v,
+                None => self.read_member(ch, "prototype")?,
+            };
+            let Some(proto) = proto_val
+                .as_handle()
                 .map(Handle::from_raw)
-            {
-                let mut cur = oh;
-                for _ in 0..100_000 {
-                    let next = self.get_proto_of(cur)?;
-                    let Some(p) = next.as_handle().map(Handle::from_raw) else {
-                        return Ok(false);
-                    };
-                    if p == proto {
-                        return Ok(true);
-                    }
-                    cur = p;
+                .filter(|_| self.is_object_value(proto_val))
+            else {
+                return Err(
+                    self.type_error("Function has non-object prototype in instanceof check")
+                );
+            };
+            let mut cur = oh;
+            for _ in 0..100_000 {
+                let next = self.get_proto_of(cur)?;
+                let Some(p) = next.as_handle().map(Handle::from_raw) else {
+                    return Ok(false);
+                };
+                if p == proto {
+                    return Ok(true);
                 }
+                cur = p;
             }
             return Ok(false);
         }
