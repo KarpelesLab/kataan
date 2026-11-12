@@ -163,6 +163,12 @@ pub struct SinkPlan {
     /// Per pc: a fallback call op that leaves after it runs (at the next
     /// op, the join after its site).
     pub exit_after: Vec<bool>,
+    /// Per pc: a proper tail call guard (`Op::TailCallGuard` and kin) that
+    /// reads a virtual object, whose deep path leaves before it runs (the
+    /// interpreter then makes the tail call with the objects made). Its
+    /// shallow path does nothing, so the guarded call — inlined, reading
+    /// the virtual objects as any inlined call does — runs compiled.
+    pub deep_exit: Vec<bool>,
     /// Per pc: the objects to materialize at an exit at its start.
     pub mats: Vec<Vec<MatObj>>,
     /// Per pc of a fallback with [`Self::exit_after`]: the objects to
@@ -363,6 +369,148 @@ fn candidates(ops: &[Op]) -> Vec<Cand> {
     out
 }
 
+/// The guard diamonds' fallback arms (`numeric::guard_diamonds`): a
+/// `PlainPrims t` at `g`, `JumpIfFalse t → F` at `g + 1`, the fast arm's
+/// `Jump E` at `F - 1`, and nothing but that test branching into `F..E`
+/// (whose branches stay in it or go to `E`). Per pc of such an arm, its
+/// first pc `F` (the outermost arm's, for nested ones).
+///
+/// The arm runs only when the guard's speculation fails (an argument that
+/// is not a plain primitive), so an arm that would observe a virtual object
+/// leaves at `F` instead ([`SinkPlan::exit_before`]): the interpreter runs
+/// it, and the rest of the activation, with the objects made.
+fn arms(ops: &[Op]) -> Vec<Option<usize>> {
+    let n = ops.len();
+    let mut out = vec![None; n];
+    if !arms_enabled() {
+        return out;
+    }
+    for (g, op) in ops.iter().enumerate() {
+        let Op::PlainPrims { dst, .. } = op else {
+            continue;
+        };
+        let Some(&Op::JumpIfFalse { cond, target: f }) = ops.get(g + 1) else {
+            continue;
+        };
+        if cond != *dst || f <= g + 2 || f >= n {
+            continue;
+        }
+        let Some(&Op::Jump { target: e }) = ops.get(f - 1) else {
+            continue;
+        };
+        if e <= f || e > n || out[f..e].iter().any(Option::is_some) {
+            continue;
+        }
+        let ok = ops.iter().enumerate().all(|(pc, o)| match o {
+            Op::Jump { target } | Op::JumpIfFalse { target, .. } => {
+                if pc == g + 1 {
+                    true
+                } else if (f..e).contains(&pc) {
+                    (f + 1..=e).contains(target)
+                } else {
+                    !(f..e).contains(target)
+                }
+            }
+            Op::PushHandler { target, .. } => !(f..e).contains(target),
+            Op::InlineGuard { call, .. } => (f..e).contains(&pc) || !(f..e).contains(call),
+            _ => true,
+        });
+        if ok {
+            for x in &mut out[f..e] {
+                *x = Some(f);
+            }
+        }
+    }
+    out
+}
+
+/// Per pc, the tracked registers (`slot`, `nt` of them) live at its start:
+/// read on some path from there before being written, as bit masks by
+/// tracked index. A catch target's live registers count as live everywhere
+/// (any op may throw to it).
+fn liveness(ops: &[Op], slot: &[u32], nt: usize) -> Vec<Vec<u64>> {
+    let n = ops.len();
+    let words = nt.div_ceil(64).max(1);
+    let mut live = vec![vec![0u64; words]; n + 1];
+    let catches: Vec<usize> = ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::PushHandler { target, .. } if *target < n => Some(*target),
+            _ => None,
+        })
+        .collect();
+    let idx = |r: u16| slot.get(r as usize).copied().filter(|&i| i != u32::MAX);
+    let mut defs = Vec::new();
+    let mut uses = Vec::new();
+    let mut out = vec![0u64; words];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut caught = vec![0u64; words];
+        for &c in &catches {
+            for (a, b) in caught.iter_mut().zip(&live[c]) {
+                *a |= b;
+            }
+        }
+        for pc in (0..n).rev() {
+            out.copy_from_slice(&caught);
+            let succ = |t: usize, out: &mut [u64], live: &[Vec<u64>]| {
+                if let Some(l) = live.get(t) {
+                    for (a, b) in out.iter_mut().zip(l) {
+                        *a |= b;
+                    }
+                }
+            };
+            match &ops[pc] {
+                Op::Jump { target } => succ(*target, &mut out, &live),
+                Op::JumpIfFalse { target, .. } => {
+                    succ(pc + 1, &mut out, &live);
+                    succ(*target, &mut out, &live);
+                }
+                Op::Return { .. }
+                | Op::Throw { .. }
+                | Op::ThrowTypeError { .. }
+                | Op::ThrowReferenceError { .. }
+                | Op::TailCall { .. }
+                | Op::TailCallValue { .. }
+                | Op::TailCallThis { .. } => {}
+                _ => succ(pc + 1, &mut out, &live),
+            }
+            super::numeric::def_use(&ops[pc], &mut defs, &mut uses);
+            for &d in &defs {
+                if let Some(i) = idx(d) {
+                    out[i as usize / 64] &= !(1u64 << (i % 64));
+                }
+            }
+            for &u in &uses {
+                if let Some(i) = idx(u) {
+                    out[i as usize / 64] |= 1u64 << (i % 64);
+                }
+            }
+            if out != live[pc] {
+                live[pc].copy_from_slice(&out);
+                changed = true;
+            }
+        }
+    }
+    live
+}
+
+/// Whether a guard diamond's fallback arm may leave instead of observing a
+/// virtual object ([`arms`]; `KATAAN_JIT_SINK_ARMS=0` turns it off).
+fn arms_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SINK_ARMS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a proper tail call guard's deep path may leave instead of
+/// observing a virtual object ([`SinkPlan::deep_exit`];
+/// `KATAAN_JIT_SINK_TAIL=0` turns it off).
+fn tail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SINK_TAIL").is_none_or(|v| v != "0"))
+}
+
 /// What one dataflow round found.
 struct Round {
     /// Per pc: the in-state (`None`: unreached).
@@ -390,6 +538,10 @@ struct Ctx<'a> {
     store_of: &'a [Option<(usize, usize)>],
     /// Per pc: whether it is an inlined call's fallback op.
     fallback: &'a [bool],
+    /// Per pc in a guard diamond's fallback arm ([`arms`]): the arm's
+    /// first pc, where an exit is taken instead when an op of the arm
+    /// would observe a virtual object.
+    arm_of: &'a [Option<usize>],
     /// Per pc: an `Op::GetMethod` (the tier holds it as a `GetProp`).
     method_gets: &'a [bool],
     /// The sloppy ordinary callees' keys.
@@ -463,6 +615,12 @@ impl Ctx<'_> {
                 let Some(s) = states[pc].clone() else {
                     continue;
                 };
+                // (A fallback arm that leaves at its start: the interpreter
+                // runs it.)
+                let arm = self.arm_of[pc];
+                if before[pc] && arm == Some(pc) {
+                    continue;
+                }
                 let mut s = s;
                 let mut leaves = false;
                 let f0 = fail;
@@ -473,6 +631,16 @@ impl Ctx<'_> {
                     (&mut fail, &mut vget, &mut leaves),
                     (&mut defs, &mut uses),
                 );
+                // An op of a fallback arm that would observe an object: the
+                // arm leaves at its start instead.
+                if let Some(f) = arm
+                    && fail != f0
+                    && !before[f]
+                {
+                    fail = f0;
+                    new_before.push(f);
+                    continue;
+                }
                 if fail != f0 && debug() && fails.len() < 32 {
                     fails.push((pc, fail & !f0));
                 }
@@ -679,6 +847,21 @@ impl Ctx<'_> {
                 set(s, *dst, N);
             }
             Op::Jump { .. } | Op::InlineLeave => {}
+            // A proper tail call guard does nothing while the call depth is
+            // shallow; deeper, it leaves before it runs, the objects it
+            // reads made ([`SinkPlan::deep_exit`]). (A poisoned register is
+            // no object an exit could make.)
+            Op::TailCallGuard { .. } | Op::TailSpreadGuard { .. } | Op::TailMethodGuard { .. }
+                if tail_enabled() =>
+            {
+                super::numeric::def_use(op, defs, uses);
+                for &u in uses.iter() {
+                    let x = get(s, u);
+                    if !is_v(x) && x != N {
+                        *fail |= x;
+                    }
+                }
+            }
             _ => {
                 super::numeric::def_use(op, defs, uses);
                 if self.fallback[pc] {
@@ -837,6 +1020,7 @@ pub(crate) fn plan(
             }
         }
     }
+    let arm_of = arms(ops);
     let cx = Ctx {
         ops,
         n_regs: tracked.len(),
@@ -845,6 +1029,7 @@ pub(crate) fn plan(
         guard_of: &guard_of,
         store_of: &store_of,
         fallback: &fallback,
+        arm_of: &arm_of,
         method_gets,
         legacy,
         entries: &entries,
@@ -865,6 +1050,7 @@ pub(crate) fn plan(
         init: vec![DEAD; cands.len()],
     };
     let mut rounds = 0;
+    let mut live: Option<Vec<Vec<u64>>> = None;
     let r = loop {
         rounds += 1;
         if rounds > MAX_ROUNDS || active == 0 {
@@ -889,6 +1075,19 @@ pub(crate) fn plan(
                     let x = cx.at(st, f);
                     if x != N && !is_v(x) {
                         fail |= 1 << k;
+                    }
+                }
+            }
+        }
+        // A fallback arm that leaves at its start: the interpreter runs the
+        // arm and the rest, which the analysis did not follow from there,
+        // so no register live there may hold a stale stand-in.
+        for pc in (0..n).filter(|&pc| before[pc] && arm_of[pc] == Some(pc)) {
+            if let Some(st) = r.states[pc].as_ref() {
+                let live = live.get_or_insert_with(|| liveness(ops, &slot, tracked.len()));
+                for (i, &x) in st.regs.iter().enumerate() {
+                    if x != N && !is_v(x) && live[pc][i / 64] & (1u64 << (i % 64)) != 0 {
+                        fail |= x;
                     }
                 }
             }
@@ -1087,6 +1286,29 @@ pub(crate) fn plan(
             };
         }
     }
+    // The tail call guards that read a virtual object leave on their deep
+    // path.
+    let mut deep_exit = vec![false; n];
+    {
+        let mut d = Vec::new();
+        let mut u = Vec::new();
+        for pc in 0..n {
+            let Some(st) = r.states[pc].as_ref() else {
+                continue;
+            };
+            if !matches!(
+                ops[pc],
+                Op::TailCallGuard { .. } | Op::TailSpreadGuard { .. } | Op::TailMethodGuard { .. }
+            ) {
+                continue;
+            }
+            super::numeric::def_use(&ops[pc], &mut d, &mut u);
+            deep_exit[pc] = u.iter().any(|&x| {
+                let v = cx.at(st, x);
+                is_v(v) && active & (1 << site_of(v)) != 0
+            });
+        }
+    }
     let mut vget = vec![false; n];
     for pc in 0..n {
         let Some(st) = r.states[pc].as_ref() else {
@@ -1116,6 +1338,7 @@ pub(crate) fn plan(
         vget,
         exit_before: before,
         exit_after: after,
+        deep_exit,
         mats,
         mats_after,
         held_fregs,

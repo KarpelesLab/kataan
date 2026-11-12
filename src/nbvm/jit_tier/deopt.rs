@@ -60,6 +60,7 @@ pub(crate) extern "C" fn jit_helper_deopt(
     if let Some(sx) = info.sink.as_deref() {
         let forced = after
             || sx.plan.exit_before.get(pc) == Some(&true)
+            || sx.plan.deep_exit.get(pc) == Some(&true)
             || sx.plan.vget.get(pc) == Some(&true);
         refresh_memos(ctx, sx, regs, pc, after);
         if !after {

@@ -4513,7 +4513,7 @@ impl JitProto {
             && let Some(p) = &sink_plan
         {
             std::eprintln!(
-                "[jit] sink {}: {} sites at {:?}, exits before {:?} after {:?}, vget {:?}",
+                "[jit] sink {}: {} sites at {:?}, exits before {:?} after {:?} deep {:?}, vget {:?}",
                 proto.name,
                 p.sites.len(),
                 p.sites.iter().map(|s| s.guard).collect::<Vec<_>>(),
@@ -4522,6 +4522,9 @@ impl JitProto {
                     .collect::<Vec<_>>(),
                 (0..p.exit_after.len())
                     .filter(|&i| p.exit_after[i])
+                    .collect::<Vec<_>>(),
+                (0..p.deep_exit.len())
+                    .filter(|&i| p.deep_exit[i])
                     .collect::<Vec<_>>(),
                 (0..p.vget.len()).filter(|&i| p.vget[i]).collect::<Vec<_>>(),
             );
@@ -9749,7 +9752,7 @@ impl JitFunction {
             let mut bad = false;
             #[allow(clippy::needless_range_loop)]
             for pc in 0..ops.len() {
-                let ok = if p.exit_before[pc] || p.vget[pc] {
+                let ok = if p.exit_before[pc] || p.vget[pc] || p.deep_exit[pc] {
                     forced_ok(pc) && (!p.vget[pc] || matches!(ops[pc], GenericOp::GetMethod { .. }))
                 } else if p.exit_after[pc] {
                     forced_ok(pc + 1)
@@ -12549,6 +12552,33 @@ impl JitFunction {
                         call_seq::emit_tail_depth_check(&mut a, &helpers.call_layout, deep);
                         let cold = a.cold_begin();
                         a.bind(deep);
+                        // A guard that reads a sunk object (`sink`): the
+                        // interpreter runs it (and the tail call), the
+                        // objects made first.
+                        if sink_x.is_some_and(|x| x.plan.deep_exit[op_idx]) {
+                            if num.in_region(op_idx) && num.in_spec(op_idx) {
+                                let bail = num.spec_bail(&mut a, op_idx)?;
+                                a.jmp(bail);
+                            } else {
+                                let spill = if num.in_region(op_idx) {
+                                    num.exit_spill(op_idx)?
+                                } else {
+                                    Vec::new()
+                                };
+                                for (x, d) in spill {
+                                    a.movsd_mem_x(d, x);
+                                }
+                                let stub = a.new_label();
+                                a.jmp(stub);
+                                deopt_stubs.push((stub, op_idx, false));
+                                if !a.plain_lazy_now().is_empty() {
+                                    plain_stubs.insert(stub.0, a.plain_lazy_now());
+                                }
+                            }
+                            a.cold_end(cold);
+                            a.bind(cont);
+                            break 'interp;
+                        }
                         a.mov_rdi_r15();
                         a.mov_rsi_rbx();
                         a.movabs_argreg(2, n_regs as i64);
