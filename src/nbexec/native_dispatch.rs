@@ -1,6 +1,81 @@
 use super::*;
 
+/// Whether the built-in `id` runs as an **audited** host segment (see
+/// `crate::realm::host_roots`): the coercions, getters, setters, proxy traps
+/// and constructors it runs may collect. Each was checked to hold nothing
+/// across those calls that its arguments, `this`, what it allocates itself
+/// (pinned) and what those calls return (rooted) do not cover; a value read
+/// out of an object it keeps across one goes through `Interp::audit_hold`.
+fn audited_native(id: u16) -> bool {
+    matches!(
+        id,
+        N_MATH_ABS
+            | N_MATH_FLOOR
+            | N_MATH_CEIL
+            | N_MATH_ROUND
+            | N_MATH_SQRT
+            | N_MATH_POW
+            | N_MATH_SIGN
+            | N_MATH_TRUNC
+            | N_MATH_HYPOT
+            | N_MATH_CBRT
+            | N_MATH_LOG2
+            | N_MATH_LOG10
+            | N_MATH_EXP
+            | N_MATH_LOG
+            | N_MATH_FROUND
+            | N_MATH_F16ROUND
+            | N_MATH_CLZ32
+            | N_MATH_IMUL
+            | N_MATH_MAX
+            | N_MATH_MIN
+            | N_STRING
+            | N_NUMBER
+            | N_SYMBOL
+            | N_PARSE_INT
+            | N_PARSE_FLOAT
+            | N_IS_NAN
+            | N_IS_FINITE
+            | N_OBJECT_GET_PROTO
+            | N_OBJECT_DEFINE_PROP
+            | N_OBJECT_HAS_OWN
+            | N_OBJECT_GET_OWN_DESC
+            | N_OBJECT_ASSIGN
+            | N_OBJECT_VALUES
+            | N_OBJECT_ENTRIES
+            | N_REFLECT_GET
+            | N_REFLECT_SET
+            | N_REFLECT_HAS
+            | N_REFLECT_DELETE
+            | N_REFLECT_OWN_KEYS
+            | N_REFLECT_DEFINE_PROP
+            | N_REFLECT_GET_OWN_DESC
+            | N_REFLECT_GET_PROTO
+            | N_REFLECT_CONSTRUCT
+            | N_OBJECT_KEYS
+            | N_OBJ_PROTO_HASOWN
+            | N_OBJ_PROTO_PROPISENUM
+    ) || (N_MATH_SIN..=N_MATH_LOG1P).contains(&id)
+}
+
 impl Interp {
+    /// [`call_native`](Self::call_native) of a built-in called as one (the
+    /// dispatch of a call of the function, not a built-in's internal use of
+    /// another): an audited built-in, first host call since a crossing from a
+    /// fully published VM frame, runs as an audited segment over its
+    /// arguments (and `this`).
+    pub(crate) fn call_native_entry(
+        &mut self,
+        id: u16,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        if audited_native(id) && self.realm.host_roots.activation(self.call_serial) != 0 {
+            let mut sc = self.audited_scope(args);
+            return sc.call_native(id, args);
+        }
+        self.call_native(id, args)
+    }
+
     /// Invokes a built-in by id.
     pub(crate) fn call_native(&mut self, id: u16, args: &[NanBox]) -> Result<NanBox, ExecError> {
         // Every `Math` function applies `ToNumber` to each of its parameters, in
@@ -1608,7 +1683,7 @@ impl Interp {
                             if matches!(setter.unpack(), Unpacked::Undefined) {
                                 return Ok(NanBox::boolean(false));
                             }
-                            self.call_with_this(setter, receiver, &[value])?;
+                            self.call_audited(setter, receiver, &[value])?;
                             return Ok(NanBox::boolean(true));
                         }
                         if self.realm.has_own(c, &key) {
@@ -1879,7 +1954,7 @@ impl Interp {
                 if has_new_target {
                     self.reflect_new_target = Some(arg(2));
                 }
-                return self.construct(arg(0), &list);
+                return self.construct_audited(arg(0), &list);
             }
             N_OBJECT_GET_OWN_DESC => {
                 // ToObject(O) (a primitive is boxed; `null`/`undefined` throws),
@@ -2115,7 +2190,10 @@ impl Interp {
                             {
                                 continue;
                             }
-                            vals.push(self.read_member(h, &k)?);
+                            let v = self.read_member(h, &k)?;
+                            // (Kept across later getters, which may drop it.)
+                            self.audit_hold(v);
+                            vals.push(v);
                         }
                     }
                     let named = self
@@ -2130,7 +2208,9 @@ impl Interp {
                         if !self.realm.has_own(h, &k) || !self.realm.property_is_enumerable(h, &k) {
                             continue;
                         }
-                        vals.push(self.read_member(h, &k)?);
+                        let v = self.read_member(h, &k)?;
+                        self.audit_hold(v);
+                        vals.push(v);
                     }
                     // A class constructor's enumerable static fields are already
                     // mirrored as own enumerable aux properties (covered by `named`).
@@ -2189,6 +2269,11 @@ impl Interp {
                             // target (which runs the target's setters and throws on a
                             // read-only / frozen / non-extensible write).
                             let keys = self.own_property_keys_values(sh)?;
+                            // (A Symbol key is kept across the getters and
+                            // setters, which may delete its property.)
+                            for &key in &keys {
+                                self.audit_hold(key);
+                            }
                             for key in keys {
                                 let name = self.member_key(key);
                                 let desc = self.descriptor_of(sh, &name)?;
@@ -2256,6 +2341,8 @@ impl Interp {
                                 continue;
                             }
                             let v = self.read_member(h, &k)?;
+                            // (Kept across later getters, which may drop it.)
+                            self.audit_hold(v);
                             entries.push((k, v));
                         }
                     }
@@ -2271,6 +2358,7 @@ impl Interp {
                             continue;
                         }
                         let v = self.read_member(h, &k)?;
+                        self.audit_hold(v);
                         entries.push((k, v));
                     }
                     // A class constructor's enumerable static fields are already

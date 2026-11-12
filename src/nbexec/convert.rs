@@ -243,7 +243,7 @@ impl Interp {
             if m.as_handle()
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
             {
-                let r = self.call_with_this(m, v, &[])?;
+                let r = self.call_audited(m, v, &[])?;
                 if !self.is_object_value(r) {
                     return Ok(r);
                 }
@@ -321,7 +321,7 @@ impl Interp {
             if m.as_handle()
                 .is_some_and(|r| self.is_callable(Handle::from_raw(r)))
             {
-                let r = self.call_with_this(m, v, &[])?;
+                let r = self.call_audited(m, v, &[])?;
                 if !self.is_object_value(r) {
                     return Ok(r);
                 }

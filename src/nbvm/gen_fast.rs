@@ -573,11 +573,11 @@ pub(super) fn jit_for_of_step(
         GenOut::Yield(v) => Ok(Some(v)),
         GenOut::Done(_) => Ok(None),
         GenOut::Delegated(r) => (|| {
-            let d = host_get_str(ctx, r, "done")?;
+            let d = host_get_str(ctx, r, "done", None)?;
             if ctx.realm.truthy(d) {
                 return Ok(None);
             }
-            host_get_str(ctx, r, "value").map(Some)
+            host_get_str(ctx, r, "value", None).map(Some)
         })(),
     };
     regs[done as usize] = NanBox::boolean(!matches!(step, Ok(Some(_))));
@@ -941,11 +941,11 @@ pub(super) fn for_of_step(
         GenOut::Yield(v) => Ok(Some(v)),
         GenOut::Done(_) => Ok(None),
         GenOut::Delegated(r) => (|| {
-            let done = host_get_str(ctx, r, "done")?;
+            let done = host_get_str(ctx, r, "done", None)?;
             if ctx.realm.truthy(done) {
                 return Ok(None);
             }
-            host_get_str(ctx, r, "value").map(Some)
+            host_get_str(ctx, r, "value", None).map(Some)
         })(),
     })
 }

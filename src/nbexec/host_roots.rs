@@ -36,6 +36,10 @@ pub(crate) struct RootScope<'a> {
     /// The enclosing scope's crossing and relay, restored on close.
     prev_scope: u32,
     prev_relay: Option<(u32, u32)>,
+    /// The enclosing audited segment (`HostRoots::audit`), restored on close.
+    prev_audit: u32,
+    /// An audited scope's allocation pinning (`Heap::pins`), closed with it.
+    pin: Option<(bool, usize)>,
 }
 
 impl Interp {
@@ -45,7 +49,7 @@ impl Interp {
         let (this, nt, call) = (self.this_val, self.new_target, self.call_serial);
         let hr = &mut self.realm.host_roots;
         let mark = hr.vals.len();
-        let (prev_scope, prev_relay) = (hr.scope, hr.relay);
+        let (prev_scope, prev_relay, prev_audit) = (hr.scope, hr.relay, hr.audit);
         hr.scope = hr.activation(call);
         hr.vals.push(this);
         hr.vals.push(nt);
@@ -55,7 +59,201 @@ impl Interp {
             mark,
             prev_scope,
             prev_relay,
+            prev_audit,
+            pin: None,
         }
+    }
+
+    /// [`root_scope`](Self::root_scope) opening an **audited** segment (see
+    /// `crate::realm::host_roots`): while it is active, the user code the
+    /// engine runs through [`call_audited`](Self::call_audited) /
+    /// [`construct_audited`](Self::construct_audited) on this host call's
+    /// behalf may collect. The caller has checked that nothing it (or any
+    /// helper it calls) holds across such a call is unrooted, but for what
+    /// those calls root themselves: their `this`, arguments and result.
+    pub(crate) fn audited_scope(&mut self, vals: &[NanBox]) -> RootScope<'_> {
+        let call = self.call_serial;
+        let mut sc = self.root_scope(vals);
+        let realm = &mut *sc.interp.realm;
+        if realm.host_roots.scope != 0 {
+            realm.host_roots.audit = call;
+            // Everything the segment's own code makes is a root until it
+            // closes (the user code it runs allocates untracked).
+            sc.pin = Some(realm.alloc_segment_open());
+        }
+        sc
+    }
+
+    /// Runs the VM operation `f` the host performs for a VM frame (an
+    /// operator's coercions, a property access...) as an audited host call:
+    /// numbered as a built-in's call is ([`as_host_call`](Self::as_host_call)),
+    /// under an [`audited_scope`](Self::audited_scope) over `vals`.
+    pub(crate) fn audited_op<R>(&mut self, vals: &[NanBox], f: impl FnOnce(&mut Self) -> R) -> R {
+        self.as_host_call(|i| {
+            let mut sc = i.audited_scope(vals);
+            f(&mut sc)
+        })
+    }
+
+    /// Roots `v` until the audited segment this host call runs closes: a
+    /// value it made itself and holds across a [`call_audited`](Self::call_audited)
+    /// (a wrapper, a coerced key). Nothing outside an audited segment.
+    #[inline]
+    pub(crate) fn audit_hold(&mut self, v: NanBox) {
+        if v.as_handle().is_some() && self.audited() {
+            self.realm.host_roots.vals.push(v);
+        }
+    }
+
+    /// Runs the built-in body `f` (with receiver `recv` and arguments
+    /// `args`) as an audited segment when it may be one: when this host call
+    /// is the first since a crossing from a fully published VM frame, or —
+    /// for a built-in the host dispatches without numbering a call (a method
+    /// a VM call site names) — when the next one would be (numbered then, as
+    /// [`audited_op`](Self::audited_op) does). Else the plain `f`.
+    pub(crate) fn audited_entry<R>(
+        &mut self,
+        recv: NanBox,
+        args: &[NanBox],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let hr = &self.realm.host_roots;
+        if hr.activation(self.call_serial) != 0 {
+            let mut sc = self.audited_scope(&[recv]);
+            sc.realm.host_roots.vals.extend_from_slice(args);
+            return f(&mut sc);
+        }
+        if hr.activation(hr.serial.wrapping_add(1)) != 0 {
+            return self.as_host_call(|i| {
+                let mut sc = i.audited_scope(&[recv]);
+                sc.realm.host_roots.vals.extend_from_slice(args);
+                f(&mut sc)
+            });
+        }
+        f(self)
+    }
+
+    /// A mark of what the audited segment has rooted and pinned so far, for
+    /// [`audit_release`](Self::audit_release).
+    #[inline]
+    pub(crate) fn audit_mark(&mut self) -> (usize, usize) {
+        (self.realm.host_roots.vals.len(), self.realm.pinned_allocs())
+    }
+
+    /// Releases what was rooted and pinned since `mark` (an
+    /// [`audit_mark`](Self::audit_mark)), for a step of an audited segment
+    /// that keeps none of it (a coercion whose result it turned into bytes).
+    #[inline]
+    pub(crate) fn audit_release(&mut self, mark: (usize, usize)) {
+        self.realm.host_roots.vals.truncate(mark.0);
+        self.realm.unpin_allocs_to(mark.1);
+    }
+
+    /// Whether this host call runs an audited segment now.
+    #[inline]
+    pub(crate) fn audited(&self) -> bool {
+        self.realm.host_roots.audited(self.call_serial)
+    }
+
+    /// `Call(f, this, args)` of user code the engine runs on its own behalf —
+    /// a coercion's `valueOf` / `toString` / `@@toPrimitive`, a getter or
+    /// setter, a proxy trap. Inside an audited segment it is a
+    /// [`call_cb`](Self::call_cb) (a VM `f` may collect; a built-in one is
+    /// relayed to) that roots `this`, `args` and the result until the
+    /// segment closes; elsewhere the plain `call_with_this`.
+    #[inline]
+    pub(crate) fn call_audited(
+        &mut self,
+        f: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        if self.realm.host_roots.audit == 0 || !self.audited() {
+            return self.call_with_this(f, this, args);
+        }
+        self.call_audited_in(f, this, args)
+    }
+
+    /// [`call_audited`](Self::call_audited) inside an audited segment.
+    #[inline(never)]
+    fn call_audited_in(
+        &mut self,
+        f: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        let vals = &mut self.realm.host_roots.vals;
+        vals.push(this);
+        vals.extend_from_slice(args);
+        // (The callee's allocations are its own: not pinned.)
+        let pin = self.realm.alloc_segment_call();
+        let r = self.call_cb_scoped(f, this, args);
+        self.realm.alloc_segment_resume(pin);
+        let r = r?;
+        if r.as_handle().is_some() {
+            self.realm.host_roots.vals.push(r);
+        }
+        Ok(r)
+    }
+
+    /// `Construct(f, args)` (with a pending `Reflect.construct` `new.target`,
+    /// as [`construct`](Self::construct) takes it) of a constructor the
+    /// engine runs on its own behalf — a species constructor, `Reflect.construct`,
+    /// a bound constructor's target. Inside an audited segment a VM `f` is
+    /// constructed with collection on, `f`, `args`, `new.target` and the
+    /// result rooted until the segment closes; elsewhere the plain
+    /// `construct`.
+    pub(crate) fn construct_audited(
+        &mut self,
+        f: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        if self.realm.host_roots.audit == 0 || !self.audited() || !self.created_realms.is_empty() {
+            return self.construct(f, args);
+        }
+        if self.vm_table.is_none()
+            || !f
+                .as_handle()
+                .is_some_and(|h| self.realm.is_vm_function(Handle::from_raw(h)))
+        {
+            // A bound constructor or a proxy: relayed to, so its construction
+            // (numbered next) may run as an audited segment of its own.
+            let vals = &mut self.realm.host_roots.vals;
+            vals.push(f);
+            vals.extend_from_slice(args);
+            let pin = self.realm.alloc_segment_call();
+            let hr = &mut self.realm.host_roots;
+            let prev = hr.relay.replace((hr.scope, hr.serial));
+            let r = self.construct(f, args);
+            self.realm.host_roots.relay = prev;
+            self.realm.alloc_segment_resume(pin);
+            let r = r?;
+            self.realm.host_roots.vals.push(r);
+            return Ok(r);
+        }
+        if crate::stack::exhausted() {
+            return Err(self.stack_exhausted());
+        }
+        let table = self.vm_table.clone().expect("checked above");
+        let new_target = self.reflect_new_target.take().unwrap_or(f);
+        let vals = &mut self.realm.host_roots.vals;
+        vals.push(f);
+        vals.push(new_target);
+        vals.extend_from_slice(args);
+        // (What `construct` does for a VM function in one realm: numbered,
+        // then `construct_vm_function`, here with collection on.)
+        let outer = self.call_serial;
+        let hr = &mut self.realm.host_roots;
+        hr.serial = hr.serial.wrapping_add(1);
+        self.call_serial = hr.serial;
+        let pin = self.realm.alloc_segment_call();
+        let r = crate::nbvm::construct_vm_function_in(self, &table, f, args, new_target, true)
+            .map_err(vm_to_exec);
+        self.realm.alloc_segment_resume(pin);
+        self.call_serial = outer;
+        let r = r?;
+        self.realm.host_roots.vals.push(r);
+        Ok(r)
     }
 }
 
@@ -109,7 +307,9 @@ impl RootScope<'_> {
                     return Err(i.stack_exhausted());
                 }
                 i.realm.host_roots.arm();
+                let pin = i.realm.alloc_segment_call();
                 let r = crate::nbvm::host_generator_step(i, &table, NanBox::handle(it.to_raw()));
+                i.realm.alloc_segment_resume(pin);
                 i.realm.host_roots.armed = 0;
                 return match r.map_err(vm_to_exec)? {
                     Ok(v) => Ok(v),
@@ -120,7 +320,9 @@ impl RootScope<'_> {
             // `call_with_this` (no other re-entry first).
             if i.realm.is_vm_function(nh) {
                 i.realm.host_roots.arm();
+                let pin = i.realm.alloc_segment_call();
                 let r = i.iter_step(it, next);
+                i.realm.alloc_segment_resume(pin);
                 i.realm.host_roots.armed = 0;
                 return r;
             }
@@ -133,7 +335,9 @@ impl RootScope<'_> {
             return i.iter_step(it, next);
         }
         let prev = hr.relay.replace((hr.scope, hr.serial));
+        let pin = i.realm.alloc_segment_call();
         let r = i.iter_step(it, next);
+        i.realm.alloc_segment_resume(pin);
         i.realm.host_roots.relay = prev;
         r
     }
@@ -176,11 +380,13 @@ impl RootScope<'_> {
                 // (What the intrinsic `next` does, with nothing between the
                 // arm and the resumption.)
                 i.realm.host_roots.arm();
+                let pin = i.realm.alloc_segment_call();
                 let r = if sync {
                     crate::nbvm::resume_vm_generator(i, &table, itv, 0, sent)
                 } else {
                     crate::nbvm::vm_agen_request(i, &table, itv, 0, sent)
                 };
+                i.realm.alloc_segment_resume(pin);
                 i.realm.host_roots.armed = 0;
                 return r.map_err(vm_to_exec);
             }
@@ -268,8 +474,11 @@ impl Interp {
         let hr = &mut self.realm.host_roots;
         hr.serial = hr.serial.wrapping_add(1);
         self.call_serial = hr.serial;
+        // (Inside an audited segment, what it allocated so far is pinned.)
+        let pin = self.realm.alloc_segment_call();
         let r =
             crate::nbvm::call_vm_function_in(self, &table, f, this, args, true).map_err(vm_to_exec);
+        self.realm.alloc_segment_resume(pin);
         self.call_serial = outer;
         r
     }
@@ -336,8 +545,47 @@ impl Interp {
         }
         let hr = &mut self.realm.host_roots;
         let prev = hr.relay.replace((hr.scope, hr.serial));
+        let pin = self.realm.alloc_segment_call();
         let r = self.call_with_this(f, this, args);
+        self.realm.alloc_segment_resume(pin);
         self.realm.host_roots.relay = prev;
+        r
+    }
+
+    /// `Construct(f, args)` (with a pending `Reflect.construct` `new.target`)
+    /// of a constructor a built-in runs from inside its live root scope, which
+    /// roots everything it uses afterwards, as [`call_cb`](Self::call_cb)
+    /// calls a callback: a VM `f` is constructed with collection on, `f`,
+    /// `args` and `new.target` rooted in that scope. Elsewhere the plain
+    /// [`construct`](Self::construct).
+    pub(crate) fn construct_cb(&mut self, f: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        if !self.realm.host_roots.live()
+            || !self.created_realms.is_empty()
+            || self.vm_table.is_none()
+            || !f
+                .as_handle()
+                .is_some_and(|h| self.realm.is_vm_function(Handle::from_raw(h)))
+        {
+            return self.construct(f, args);
+        }
+        if crate::stack::exhausted() {
+            return Err(self.stack_exhausted());
+        }
+        let table = self.vm_table.clone().expect("checked above");
+        let new_target = self.reflect_new_target.take().unwrap_or(f);
+        let vals = &mut self.realm.host_roots.vals;
+        vals.push(f);
+        vals.push(new_target);
+        vals.extend_from_slice(args);
+        let outer = self.call_serial;
+        let hr = &mut self.realm.host_roots;
+        hr.serial = hr.serial.wrapping_add(1);
+        self.call_serial = hr.serial;
+        let pin = self.realm.alloc_segment_call();
+        let r = crate::nbvm::construct_vm_function_in(self, &table, f, args, new_target, true)
+            .map_err(vm_to_exec);
+        self.realm.alloc_segment_resume(pin);
+        self.call_serial = outer;
         r
     }
 
@@ -396,5 +644,9 @@ impl Drop for RootScope<'_> {
         hr.scope = self.prev_scope;
         hr.armed = 0;
         hr.relay = self.prev_relay;
+        hr.audit = self.prev_audit;
+        if let Some(pin) = self.pin {
+            self.interp.realm.alloc_segment_close(pin);
+        }
     }
 }

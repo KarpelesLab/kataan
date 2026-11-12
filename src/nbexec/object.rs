@@ -299,7 +299,7 @@ impl Interp {
             if let Some(trap) = self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
                 let key_v = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
-                let trap_result = self.call_with_this(
+                let trap_result = self.call_audited(
                     trap,
                     handler_box,
                     &[NanBox::handle(target.to_raw()), key_v],
@@ -430,8 +430,7 @@ impl Interp {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "isExtensible")? {
                 let handler_box = NanBox::handle(handler.to_raw());
-                let r =
-                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
+                let r = self.call_audited(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
                 let result = self.realm.truthy(r);
                 // Invariant (10.5.3 step 8): the boolean trap result must equal the
                 // target's actual `[[IsExtensible]]()` — else a TypeError. The
@@ -460,8 +459,7 @@ impl Interp {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "getPrototypeOf")? {
                 let handler_box = NanBox::handle(handler.to_raw());
-                let r =
-                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
+                let r = self.call_audited(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
                 // The trap result must be an Object or null (ECMA-262 step 7).
                 if !matches!(r.unpack(), Unpacked::Null) && !self.is_object_value(r) {
                     return Err(
@@ -509,7 +507,7 @@ impl Interp {
             if let Some(trap) = self.proxy_trap(handler, "setPrototypeOf")? {
                 let proto_box = proto.map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
                 let handler_box = NanBox::handle(handler.to_raw());
-                let r = self.call_with_this(
+                let r = self.call_audited(
                     trap,
                     handler_box,
                     &[NanBox::handle(target.to_raw()), proto_box],
@@ -935,7 +933,7 @@ impl Interp {
                 let desc_obj = self.descriptor_object_from(nd);
                 let key_v = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
-                let r = self.call_with_this(
+                let r = self.call_audited(
                     trap,
                     handler_box,
                     &[
@@ -2196,7 +2194,7 @@ impl Interp {
                 let kb = self.key_to_value(key);
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r =
-                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw()), kb])?;
+                    self.call_audited(trap, handler_box, &[NanBox::handle(target.to_raw()), kb])?;
                 if !self.realm.truthy(r) {
                     return Ok(false);
                 }
@@ -2349,8 +2347,7 @@ impl Interp {
             self.guard_revoked(obj)?;
             if let Some(trap) = self.proxy_trap(handler, "preventExtensions")? {
                 let handler_box = NanBox::handle(handler.to_raw());
-                let r =
-                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
+                let r = self.call_audited(trap, handler_box, &[NanBox::handle(target.to_raw())])?;
                 if self.realm.truthy(r) {
                     // Invariant: a successful trap requires the target to be
                     // non-extensible.
@@ -2418,7 +2415,10 @@ impl Interp {
         };
         let mut out = Vec::with_capacity(len.min(1 << 16));
         for i in 0..len {
-            out.push(self.read_member(h, &alloc::format!("{i}"))?);
+            let v = self.read_member(h, &alloc::format!("{i}"))?;
+            // (Kept across later getters, which may drop it.)
+            self.audit_hold(v);
+            out.push(v);
         }
         Ok(out)
     }
@@ -2442,7 +2442,7 @@ impl Interp {
         };
         let target_box = NanBox::handle(target.to_raw());
         let handler_box = NanBox::handle(handler.to_raw());
-        let result = self.call_with_this(trap, handler_box, &[target_box])?;
+        let result = self.call_audited(trap, handler_box, &[target_box])?;
         // CreateListFromArrayLike(result, « String, Symbol »): the trap result must
         // be an Object; each element must be a String or Symbol.
         if !self.is_object_value(result) {
@@ -2703,7 +2703,7 @@ impl Interp {
                 if let Some(trap) = self.proxy_trap(handler, "has")? {
                     let kb = self.key_to_value(key);
                     let handler_box = NanBox::handle(handler.to_raw());
-                    let r = self.call_with_this(
+                    let r = self.call_audited(
                         trap,
                         handler_box,
                         &[NanBox::handle(target.to_raw()), kb],
@@ -3064,7 +3064,13 @@ impl Interp {
             }
             return Ok(());
         }
-        for key in self.own_property_keys_values(source)? {
+        let keys = self.own_property_keys_values(source)?;
+        // (A Symbol key is kept across the getters, which may delete its
+        // property.)
+        for &key in &keys {
+            self.audit_hold(key);
+        }
+        for key in keys {
             let name = self.member_key(key);
             if excluded.contains(&name) {
                 continue;

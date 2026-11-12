@@ -2067,16 +2067,31 @@ fn read_needs_host(ctx: &Ctx, recv: NanBox) -> bool {
 }
 
 /// The host's `[[Get]]` of `recv[key]` (see [`VmHost::get_member`]).
-fn host_get(ctx: &mut Ctx, recv: NanBox, key: NanBox) -> Result<NanBox, VmError> {
-    with_host(ctx, |h| h.get_member(recv, key))
-        .unwrap_or(Err(HostError::Fault))
-        .map_err(VmError::from)
+/// From a VM frame's operation (`regs`, its register file), the frame lends
+/// its registers, so a getter or proxy trap the host runs may collect (see
+/// `crate::realm::host_roots`).
+fn host_get(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    key: NanBox,
+    regs: Option<&[NanBox]>,
+) -> Result<NanBox, VmError> {
+    let r = match regs {
+        Some(regs) => with_host_regs(ctx, regs, |h| h.get_member(recv, key)),
+        None => with_host(ctx, |h| h.get_member(recv, key)),
+    };
+    r.unwrap_or(Err(HostError::Fault)).map_err(VmError::from)
 }
 
 /// [`host_get`] for a static string key.
-fn host_get_str(ctx: &mut Ctx, recv: NanBox, key: &str) -> Result<NanBox, VmError> {
+fn host_get_str(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    key: &str,
+    regs: Option<&[NanBox]>,
+) -> Result<NanBox, VmError> {
     let k = ctx.realm.key_value(key);
-    host_get(ctx, recv, k)
+    host_get(ctx, recv, k, regs)
 }
 
 /// In a hosted run, an operator with an *object* operand is the host's: that is
@@ -2089,6 +2104,7 @@ fn host_binary(
     op: crate::ast::BinaryOp,
     a: NanBox,
     b: NanBox,
+    regs: Option<&[NanBox]>,
 ) -> Option<Result<NanBox, VmError>> {
     if ctx.host.is_none() || !(host_operand(&ctx.realm, a) || host_operand(&ctx.realm, b)) {
         return None;
@@ -2098,11 +2114,13 @@ fn host_binary(
     if let Some(v) = ctx.realm.bigint_binary_fast(op, a, b) {
         return Some(Ok(v));
     }
-    Some(
-        with_host(ctx, |h| h.binary(op, a, b))
-            .unwrap_or(Err(HostError::Fault))
-            .map_err(VmError::from),
-    )
+    // From a VM frame's operation (`regs`, its register file): the frame
+    // lends its registers, so the coercions the host runs may collect (see
+    // `crate::realm::host_roots`).
+    // (Two primitives — BigInts, a Symbol — run no user code: no link.)
+    let regs = regs.filter(|_| may_coerce(&ctx.realm, a) || may_coerce(&ctx.realm, b));
+    let r = with_host_in(ctx, regs, regs.is_some(), |h| h.binary(op, a, b));
+    Some(r.unwrap_or(Err(HostError::Fault)).map_err(VmError::from))
 }
 
 /// [`host_binary`] for a unary operator.
@@ -2110,18 +2128,35 @@ fn host_unary(
     ctx: &mut Ctx,
     op: crate::ast::UnaryOp,
     v: NanBox,
+    regs: Option<&[NanBox]>,
 ) -> Option<Result<NanBox, VmError>> {
     if ctx.host.is_none() || !host_operand(&ctx.realm, v) {
         return None;
     }
-    Some(host_unary_any(ctx, op, v))
+    Some(host_unary_any(ctx, op, v, regs))
 }
 
-/// The host's unary operator `op` on `v`, whatever `v` is.
-fn host_unary_any(ctx: &mut Ctx, op: crate::ast::UnaryOp, v: NanBox) -> Result<NanBox, VmError> {
-    with_host(ctx, |h| h.unary(op, v))
-        .unwrap_or(Err(HostError::Fault))
-        .map_err(VmError::from)
+/// The host's unary operator `op` on `v`, whatever `v` is (`regs`: as
+/// [`host_binary`]'s).
+fn host_unary_any(
+    ctx: &mut Ctx,
+    op: crate::ast::UnaryOp,
+    v: NanBox,
+    regs: Option<&[NanBox]>,
+) -> Result<NanBox, VmError> {
+    let regs = regs.filter(|_| may_coerce(&ctx.realm, v));
+    let r = with_host_in(ctx, regs, regs.is_some(), |h| h.unary(op, v));
+    r.unwrap_or(Err(HostError::Fault)).map_err(VmError::from)
+}
+
+/// Whether the host's ToPrimitive of the operand `v` may run user code: a
+/// heap value other than a string, a BigInt or a Symbol (decided cheaply).
+#[inline(always)]
+fn may_coerce(realm: &Realm, v: NanBox) -> bool {
+    v.as_handle().is_some_and(|h| {
+        let h = Handle::from_raw(h);
+        !realm.is_bigint(h) && !realm.typeof_is_string(h) && realm.symbol_at(h).is_none()
+    })
 }
 
 /// Whether a hosted operator with operand `v` is the host's: an object (its
@@ -2194,6 +2229,7 @@ fn host_set(
     key: NanBox,
     value: NanBox,
     strict: bool,
+    regs: Option<&[NanBox]>,
 ) -> Result<(), VmError> {
     // A number that is not an array index (2**32−1 and up, negative,
     // fractional) keys on its string form.
@@ -2204,9 +2240,13 @@ fn host_set(
         }
         _ => key,
     };
-    with_host(ctx, |h| h.set_member(recv, key, value, strict))
-        .unwrap_or(Err(HostError::Fault))
-        .map_err(VmError::from)
+    // (`regs`: as [`host_get`]'s; the key, when made here, is the host's
+    // argument, which its scope roots.)
+    let r = match regs {
+        Some(regs) => with_host_regs(ctx, regs, |h| h.set_member(recv, key, value, strict)),
+        None => with_host(ctx, |h| h.set_member(recv, key, value, strict)),
+    };
+    r.unwrap_or(Err(HostError::Fault)).map_err(VmError::from)
 }
 
 /// Whether a hosted write of `key` on the ordinary object `h` is one the VM's
@@ -2320,7 +2360,10 @@ fn vm_init_prop(
 /// receiver, or a write the VM's store would get wrong (read-only, a
 /// non-extensible target, a proxy on the chain), goes to the host's `[[Set]]`
 /// with `strict` deciding whether a failed write throws — as does any case the
-/// VM declines as descriptor-sensitive.
+/// VM declines as descriptor-sensitive. `regs`: the calling VM frame's
+/// register file (`None` from a JIT helper), published to a setter and lent
+/// to the host's `[[Set]]` so what they run may collect.
+#[allow(clippy::too_many_arguments)]
 fn vm_set_prop_mode(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -2329,6 +2372,7 @@ fn vm_set_prop_mode(
     value: NanBox,
     cache: &mut PropertyCache,
     strict: bool,
+    regs: Option<&[NanBox]>,
 ) -> Result<(), VmError> {
     // Inline-cache hit first: an in-place write to an existing own data slot of
     // an ordinary `Cell::Object` (`object_cached_set` declines a frozen object,
@@ -2394,7 +2438,7 @@ fn vm_set_prop_mode(
         return Ok(());
     }
     if ctx.host.is_none() {
-        return vm_set_prop(ctx, funcs, recv, key, value, cache);
+        return vm_set_prop(ctx, funcs, recv, key, value, cache, regs);
     }
     // A write to an existing plain data property of the running realm's
     // global object (`global_obj`), mirrored into a like-named `var`
@@ -2428,13 +2472,13 @@ fn vm_set_prop_mode(
             .as_handle()
             .is_some_and(|h| ctx.realm.is_dispatch_tracked_proto(Handle::from_raw(h)));
     if !to_host {
-        match vm_set_prop(ctx, funcs, recv, key, value, cache) {
+        match vm_set_prop(ctx, funcs, recv, key, value, cache, regs) {
             Err(VmError::Unsupported) => {}
             r => return r,
         }
     }
     let k = ctx.realm.key_value(key);
-    host_set(ctx, recv, k, value, strict)
+    host_set(ctx, recv, k, value, strict, regs)
 }
 
 /// [`vm_set_elem`] with the hosted write rules of [`vm_set_prop_mode`].
@@ -2445,6 +2489,7 @@ fn vm_set_elem_mode(
     key: NanBox,
     value: NanBox,
     strict: bool,
+    regs: Option<&[NanBox]>,
 ) -> Result<(), VmError> {
     // `o[k] = v` with a String `k` naming an existing own data property of
     // an ordinary object that nothing intercepts: the slot's store (what the
@@ -2467,7 +2512,7 @@ fn vm_set_elem_mode(
         return Ok(());
     }
     if ctx.host.is_none() {
-        return vm_set_elem(ctx, funcs, recv, key, value);
+        return vm_set_elem(ctx, funcs, recv, key, value, regs);
     }
     // An argument of a mapped `arguments` object, and the parameter it
     // aliases.
@@ -2540,22 +2585,22 @@ fn vm_set_elem_mode(
     if !to_host && key.as_number().is_none() {
         // A string (or symbol) key is an ordinary property write: the static-key
         // store handles its setter, read-only and host cases.
-        match vm_property_key(ctx, key) {
+        match vm_property_key(ctx, key, regs) {
             Ok(ks) => {
                 let mut cache = PropertyCache::new();
-                return vm_set_prop_mode(ctx, funcs, recv, &ks, value, &mut cache, strict);
+                return vm_set_prop_mode(ctx, funcs, recv, &ks, value, &mut cache, strict, regs);
             }
             Err(e @ VmError::Thrown(_)) => return Err(e),
             Err(_) => to_host = true,
         }
     }
     if !to_host {
-        match vm_set_elem(ctx, funcs, recv, key, value) {
+        match vm_set_elem(ctx, funcs, recv, key, value, regs) {
             Err(VmError::Unsupported) => {}
             r => return r,
         }
     }
-    host_set(ctx, recv, key, value, strict)
+    host_set(ctx, recv, key, value, strict, regs)
 }
 
 /// Whether a String wrapper is on `h`'s prototype chain: it owns `length`
@@ -2687,11 +2732,12 @@ fn vm_get_method(
     recv: NanBox,
     key: &str,
     cache: &mut PropertyCache,
+    regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
     if let Some(v) = native_call::try_get(ctx, recv, key, cache) {
         return Ok(v);
     }
-    vm_get_prop(ctx, funcs, recv, key, cache)
+    vm_get_prop(ctx, funcs, recv, key, cache, regs)
 }
 
 /// Whether `GetIterator(v)` would yield the built-in `%ArrayIterator%` over
@@ -3033,9 +3079,23 @@ fn make_generator(
         }) {
             Some(h) => match ctx.realm.get_property(h, "prototype") {
                 Some(v) => v,
-                None => vm_get_prop(ctx, funcs, c, "prototype", &mut PropertyCache::default())?,
+                None => vm_get_prop(
+                    ctx,
+                    funcs,
+                    c,
+                    "prototype",
+                    &mut PropertyCache::default(),
+                    None,
+                )?,
             },
-            None => vm_get_prop(ctx, funcs, c, "prototype", &mut PropertyCache::default())?,
+            None => vm_get_prop(
+                ctx,
+                funcs,
+                c,
+                "prototype",
+                &mut PropertyCache::default(),
+                None,
+            )?,
         },
         None => NanBox::undefined(),
     };
@@ -3147,7 +3207,7 @@ fn yield_delegate_step(
     let res = match mode {
         0 => call_closure(ctx, funcs, next, &[v], iter)?,
         1 => {
-            let m = host_get_str(ctx, iter, "throw")?;
+            let m = host_get_str(ctx, iter, "throw", None)?;
             if matches!(
                 m.unpack(),
                 crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
@@ -3168,7 +3228,7 @@ fn yield_delegate_step(
             call_closure(ctx, funcs, m, &[v], iter)?
         }
         _ => {
-            let m = host_get_str(ctx, iter, "return")?;
+            let m = host_get_str(ctx, iter, "return", None)?;
             if matches!(
                 m.unpack(),
                 crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
@@ -3182,11 +3242,11 @@ fn yield_delegate_step(
         let e = vm_error(ctx, "TypeError", "Iterator result is not an object");
         return Err(VmError::Thrown(e));
     }
-    let done = host_get_str(ctx, res, "done")?;
+    let done = host_get_str(ctx, res, "done", None)?;
     if !ctx.realm.truthy(done) {
         return Ok(DelegateStep::Yield(res));
     }
-    let value = host_get_str(ctx, res, "value")?;
+    let value = host_get_str(ctx, res, "value", None)?;
     Ok(if mode == 2 {
         DelegateStep::Return(value)
     } else {
@@ -4417,9 +4477,16 @@ fn make_class(ctx: &mut Ctx, f: NanBox, sup: Option<NanBox>) -> Result<NanBox, V
                 .as_handle()
                 .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
             {
-                vm_get_prop(ctx, &[], s, "prototype", &mut PropertyCache::default())?
+                vm_get_prop(
+                    ctx,
+                    &[],
+                    s,
+                    "prototype",
+                    &mut PropertyCache::default(),
+                    None,
+                )?
             } else {
-                host_get_str(ctx, s, "prototype")?
+                host_get_str(ctx, s, "prototype", None)?
             };
             match pp.unpack() {
                 crate::nanbox::Unpacked::Null => {
@@ -4605,9 +4672,9 @@ fn vm_construct(
         }
         return Ok(r);
     }
-    let obj = ctx.realm.new_object();
     // OrdinaryCreateFromConstructor: `new.target.prototype` (read through the
-    // host when `new.target` is not a VM function — it may be a getter).
+    // host when `new.target` is not a VM function — it may be a getter), then
+    // the object (made after the read, which may run code).
     let nt_is_vm = new_target
         .as_handle()
         .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)));
@@ -4631,16 +4698,27 @@ fn vm_construct(
         }
         None => None,
     };
+    let obj = ctx.realm.new_object();
     if let Some(p) = proto.and_then(|p| p.as_handle()) {
         ctx.realm.set_object_proto(obj, Some(Handle::from_raw(p)));
     }
     let this = NanBox::handle(obj.to_raw());
-    if class_ctor {
-        run_fields(ctx, funcs, f, this)?;
+    // The object is this frame's until the body returns: rooted (with the
+    // constructor, `new.target` and the arguments, which a field initializer
+    // may drop from wherever they came from) for a collection inside a field
+    // initializer or the body, neither of which need keep `this` in a
+    // register.
+    let mark = ctx.frame_shadow.len();
+    ctx.frame_shadow.extend_from_slice(&[this, new_target, f]);
+    ctx.frame_shadow.extend_from_slice(args);
+    if class_ctor && let Err(e) = run_fields(ctx, funcs, f, this) {
+        ctx.frame_shadow.truncate(mark);
+        return Err(e);
     }
     ctx.pending_new_target = Some(new_target);
     let r = call_closure(ctx, funcs, f, args, this);
     ctx.pending_new_target = None;
+    ctx.frame_shadow.truncate(mark);
     let r = r?;
     Ok(if is_object_value(&ctx.realm, r) {
         r
@@ -4711,7 +4789,24 @@ pub(crate) fn construct_vm_function(
     args: &[NanBox],
     new_target: NanBox,
 ) -> Result<NanBox, VmError> {
+    construct_vm_function_in(host, table, f, args, new_target, false)
+}
+
+/// [`construct_vm_function`]; `collect`: the caller is an audited host
+/// segment that roots `f`, `args` and `new_target` (`Interp::construct_audited`),
+/// so the constructor may collect.
+pub(crate) fn construct_vm_function_in(
+    host: &mut dyn VmHost,
+    table: &alloc::rc::Rc<[FnProto]>,
+    f: NanBox,
+    args: &[NanBox],
+    new_target: NanBox,
+    collect: bool,
+) -> Result<NanBox, VmError> {
     let mut ctx = hosted_ctx(host.take_realm(), host);
+    if collect {
+        enable_host_gc(&mut ctx);
+    }
     let result = {
         let r = vm_construct(&mut ctx, table, f, args, new_target);
         if r.is_ok() && !ctx.microtasks.is_empty() {
@@ -6657,11 +6752,25 @@ fn vm_concat(
             "Invalid string length",
         ))),
         None => {
-            // `"" + p0 + p1 + …`: string concatenation from the first part on.
+            // `"" + p0 + p1 + …`: string concatenation from the first part on,
+            // the frame's registers lent to each `+` (whose ToPrimitive may
+            // collect) and the partial result rooted between the parts.
             let mut acc = NanBox::handle(ctx.realm.new_string("").to_raw());
+            let mark = ctx.frame_shadow.len();
+            ctx.frame_shadow.push(acc);
             for &v in vals {
-                acc = vm_add(ctx, funcs, acc, v)?;
+                match vm_add(ctx, funcs, acc, v, Some(regs)) {
+                    Ok(r) => {
+                        acc = r;
+                        ctx.frame_shadow[mark] = acc;
+                    }
+                    Err(e) => {
+                        ctx.frame_shadow.truncate(mark);
+                        return Err(e);
+                    }
+                }
             }
+            ctx.frame_shadow.truncate(mark);
             Ok(acc)
         }
     }
@@ -6674,7 +6783,13 @@ fn vm_concat(
 /// Symbol-coercion guard, then `Realm::add` (which picks string concatenation vs
 /// numeric addition from the resulting primitives). Any observable side effect (a
 /// user `valueOf`) therefore runs exactly once per evaluation.
-fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+fn vm_add(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    a: NanBox,
+    b: NanBox,
+    regs: Option<&[NanBox]>,
+) -> Result<NanBox, VmError> {
     // Two numbers: ToPrimitive and the Symbol guard are identities.
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         return Ok(NanBox::number(x + y));
@@ -6693,7 +6808,7 @@ fn vm_add(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanB
     if (a.is_number() || prim_str(a)) && (b.is_number() || prim_str(b)) {
         return vm_add_prims(ctx, a, b);
     }
-    if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Add, a, b) {
+    if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Add, a, b, regs) {
         return r;
     }
     let x = to_primitive(ctx, funcs, a, true);
@@ -6729,6 +6844,7 @@ fn vm_call_native(
     funcs: &[FnProto],
     native: u16,
     args: &[NanBox],
+    regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
     if native == NB_JSON_STRINGIFY {
         json_stringify(ctx, funcs, args)
@@ -6775,7 +6891,7 @@ fn vm_call_native(
         let arg = args.first().copied().unwrap_or(NanBox::undefined());
         // Hosted: `+obj` is the host's ToNumber (`Symbol.toPrimitive`, inherited
         // `valueOf`, a throw that propagates).
-        if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::Plus, arg) {
+        if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::Plus, arg, regs) {
             return r;
         }
         let prim = to_primitive(ctx, funcs, arg, true);
@@ -6810,6 +6926,7 @@ fn vm_arith(
     a: NanBox,
     b: NanBox,
     op: u8,
+    regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
     if a.is_number() && b.is_number() {
         return Ok(match op {
@@ -6825,7 +6942,7 @@ fn vm_arith(
         GA_DIV => crate::ast::BinaryOp::Div,
         _ => crate::ast::BinaryOp::Mod,
     };
-    if let Some(r) = host_binary(ctx, bop, a, b) {
+    if let Some(r) = host_binary(ctx, bop, a, b, regs) {
         return r;
     }
     let x = to_primitive(ctx, funcs, a, true);
@@ -6848,14 +6965,20 @@ fn vm_arith(
 /// `>`, `<=`, `>=` are compiled to `Op::Lt` (with operand swap and/or `Op::Not`),
 /// so this single primitive backs all four relational operators. Returns a boolean
 /// `NanBox`.
-fn vm_lt(ctx: &mut Ctx, funcs: &[FnProto], a: NanBox, b: NanBox) -> Result<NanBox, VmError> {
+fn vm_lt(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    a: NanBox,
+    b: NanBox,
+    regs: Option<&[NanBox]>,
+) -> Result<NanBox, VmError> {
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         return Ok(NanBox::boolean(x < y));
     }
     if let Some(lt) = string_lt(&mut ctx.realm, a, b) {
         return Ok(NanBox::boolean(lt));
     }
-    if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Lt, a, b) {
+    if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Lt, a, b, regs) {
         return r;
     }
     let x = to_primitive(ctx, funcs, a, true);
@@ -6940,6 +7063,19 @@ fn vm_str_eq_const(
     lit: &[u8],
     kind: u8,
 ) -> Result<NanBox, VmError> {
+    vm_str_eq_const_in(ctx, funcs, v, lit, kind, None)
+}
+
+/// [`vm_str_eq_const`] from the VM frame whose register file is `regs`
+/// (lent to the loose comparison's coercion, the literal its operand).
+fn vm_str_eq_const_in(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    v: NanBox,
+    lit: &[u8],
+    kind: u8,
+    regs: Option<&[NanBox]>,
+) -> Result<NanBox, VmError> {
     let neg = kind & STR_EQ_NEGATE != 0;
     let eq = match ctx.realm.string_equals_bytes(v, lit) {
         Some(eq) => eq,
@@ -6947,7 +7083,7 @@ fn vm_str_eq_const(
         None => {
             let s = NanBox::handle(ctx.realm.new_string_wtf8(lit.to_vec()).to_raw());
             let op = if neg { VB_LOOSE_NEQ } else { VB_LOOSE_EQ };
-            return vm_value_bin(ctx, funcs, v, s, op);
+            return vm_value_bin(ctx, funcs, v, s, op, regs);
         }
     };
     Ok(NanBox::boolean(eq != neg))
@@ -6966,6 +7102,7 @@ fn vm_value_bin(
     a: NanBox,
     b: NanBox,
     op: u8,
+    regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
     // Two numbers: no coercion can run, so go straight to the arithmetic.
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
@@ -7000,7 +7137,7 @@ fn vm_value_bin(
             VB_LOOSE_EQ => B::EqEq,
             _ => B::NotEq,
         };
-        if let Some(r) = host_binary(ctx, bop, a, b) {
+        if let Some(r) = host_binary(ctx, bop, a, b, regs) {
             return r;
         }
     }
@@ -7058,6 +7195,33 @@ fn vm_value_bin(
     }
 }
 
+/// [`call_closure`] of an accessor (or other callee) a VM operation runs on
+/// behalf of the frame whose register file is `regs` (`None`: a caller that
+/// is not a VM frame's operation, such as a JIT helper): that frame's
+/// registers published for the callee's collections, as a call's are.
+#[inline]
+fn call_closure_pub(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: Option<&[NanBox]>,
+    f: NanBox,
+    args: &[NanBox],
+    this: NanBox,
+) -> Result<NanBox, VmError> {
+    let Some(regs) = regs else {
+        return call_closure(ctx, funcs, f, args, this);
+    };
+    // (Lent by address, not copied: `HostRoots::lent`.)
+    let lent = &mut ctx.realm.host_roots.lent;
+    let mark = lent.len();
+    lent.push((regs.as_ptr() as usize, regs.len()));
+    ctx.frames_published += 1;
+    let r = call_closure(ctx, funcs, f, args, this);
+    ctx.frames_published -= 1;
+    ctx.realm.host_roots.lent.truncate(mark);
+    r
+}
+
 /// The interpreter's real property **get** for a static string key
 /// (`Op::GetProp`'s semantics), factored out so the bytecode VM **and** the
 /// generic-JIT runtime helper ([`jit_helper_get_prop`]) share one code path and
@@ -7074,6 +7238,7 @@ fn vm_get_prop(
     recv: NanBox,
     key: &str,
     cache: &mut PropertyCache,
+    regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
     // Inline-cache hit first: it only ever matches an own data slot of an
     // ordinary `Cell::Object` (proxies, typed arrays, RegExps, functions and
@@ -7134,7 +7299,7 @@ fn vm_get_prop(
                     if let Some((f, c)) = ctx.realm.vm_function(Handle::from_raw(g)) {
                         cache.note_callee(u64::from(f) | ((c.len() as u64) << 32));
                     }
-                    return call_closure(ctx, funcs, getter, &[], recv);
+                    return call_closure_pub(ctx, funcs, regs, getter, &[], recv);
                 }
                 // An inherited accessor without a getter reads `undefined`; an
                 // own one is left to the slow path's own-property rules.
@@ -7160,7 +7325,7 @@ fn vm_get_prop(
                     .as_handle()
                     .is_some_and(|h| proto_has_string_wrapper(&ctx.realm, Handle::from_raw(h)))))
     {
-        return host_get_str(ctx, recv, key);
+        return host_get_str(ctx, recv, key, regs);
     }
     match recv.as_handle().map(Handle::from_raw) {
         None => {
@@ -7182,7 +7347,7 @@ fn vm_get_prop(
                 }
                 // Hosted: a primitive's property comes from its wrapper's
                 // prototype chain (a getter sees the primitive `this`).
-                _ if ctx.host.is_some() => host_get_str(ctx, recv, key),
+                _ if ctx.host.is_some() => host_get_str(ctx, recv, key, regs),
                 // Other primitives: a missing property reads `undefined`.
                 _ => Ok(NanBox::undefined()),
             }
@@ -7274,12 +7439,12 @@ fn vm_get_prop(
                 // Hosted, `source`/`flags`/the flag getters are the host's
                 // `RegExp.prototype` accessors (escaping, flag order, overrides).
                 if ctx.host.is_some() && key != "lastIndex" {
-                    return host_get_str(ctx, recv, key);
+                    return host_get_str(ctx, recv, key, regs);
                 }
                 match key {
                     // EscapeRegExpPattern (line terminators, `/`) is the host's.
                     "source" if ctx.host.is_some() => {
-                        return host_get_str(ctx, NanBox::handle(handle.to_raw()), "source");
+                        return host_get_str(ctx, NanBox::handle(handle.to_raw()), "source", regs);
                     }
                     "source" => {
                         let s = ctx.realm.new_string(&src);
@@ -7321,7 +7486,7 @@ fn vm_get_prop(
                 && getter.as_handle().is_some()
             {
                 // An own getter accessor takes precedence over a data slot.
-                call_closure(ctx, funcs, getter, &[], recv)
+                call_closure_pub(ctx, funcs, regs, getter, &[], recv)
             } else if ctx.realm.has_own(handle, key) {
                 Ok(ctx
                     .realm
@@ -7339,7 +7504,7 @@ fn vm_get_prop(
                     // An exotic object on the chain (a proxy's `get` trap) is the
                     // host's to read.
                     if ctx.host.is_some() && ctx.realm.proxy_at(p).is_some() {
-                        return host_get_str(ctx, recv, key);
+                        return host_get_str(ctx, recv, key, regs);
                     }
                     // So is an array's own `length` / element (its storage is
                     // not a property slot).
@@ -7347,11 +7512,11 @@ fn vm_get_prop(
                         && ctx.realm.array_length(p).is_some()
                         && ctx.realm.has_own(p, key)
                     {
-                        return host_get_str(ctx, recv, key);
+                        return host_get_str(ctx, recv, key, regs);
                     }
                     if let Some((getter, _)) = ctx.realm.accessor(p, key) {
                         if getter.as_handle().is_some() {
-                            found = call_closure(ctx, funcs, getter, &[], recv)?;
+                            found = call_closure_pub(ctx, funcs, regs, getter, &[], recv)?;
                         }
                         break;
                     }
@@ -7398,6 +7563,7 @@ fn vm_set_prop(
     key: &str,
     value: NanBox,
     cache: &mut PropertyCache,
+    regs: Option<&[NanBox]>,
 ) -> Result<(), VmError> {
     let handle = recv
         .as_handle()
@@ -7462,7 +7628,7 @@ fn vm_set_prop(
     };
     match chain_accessor {
         Some((getter, setter)) if setter.as_handle().is_some() => {
-            call_closure(ctx, funcs, setter, &[value], recv)?;
+            call_closure_pub(ctx, funcs, regs, setter, &[value], recv)?;
             let _ = getter;
         }
         Some((getter, _)) if getter.as_handle().is_some() => {
@@ -7523,7 +7689,7 @@ pub(crate) extern "C" fn jit_helper_get_prop(
     // A VM getter with a compiled body is entered directly (`jit_tier`).
     let r = match jit_tier::compiled_getter(ctx, funcs, NanBox::from_bits(obj), key, cache) {
         Some(r) => r,
-        None => vm_get_prop(ctx, funcs, NanBox::from_bits(obj), key, cache),
+        None => vm_get_prop(ctx, funcs, NanBox::from_bits(obj), key, cache, None),
     };
     match r {
         Ok(v) => v.to_bits(),
@@ -7643,6 +7809,7 @@ fn jit_set_prop_impl(
             NanBox::from_bits(val),
             cache,
             strict,
+            None,
         ),
     };
     match r {
@@ -7735,7 +7902,7 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
     {
         return v.to_bits();
     }
-    match vm_get_elem_from(ctx, funcs, recv, key, own_done) {
+    match vm_get_elem_from(ctx, funcs, recv, key, own_done, None) {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
@@ -7802,6 +7969,7 @@ pub(crate) extern "C" fn jit_helper_set_elem(
         NanBox::from_bits(key),
         NanBox::from_bits(val),
         strict != 0,
+        None,
     ) {
         Ok(()) => NanBox::undefined().to_bits(),
         Err(e) => {
@@ -8034,6 +8202,7 @@ pub(crate) extern "C" fn jit_helper_arith(
         NanBox::from_bits(a),
         NanBox::from_bits(b),
         op as u8,
+        None,
     );
     jit_finish(ctx, r)
 }
@@ -8063,6 +8232,7 @@ pub(crate) extern "C" fn jit_helper_value_bin(
         NanBox::from_bits(a),
         NanBox::from_bits(b),
         op as u8,
+        None,
     );
     jit_finish(ctx, r)
 }
@@ -8080,7 +8250,7 @@ pub(crate) extern "C" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    let r = vm_lt(ctx, funcs, NanBox::from_bits(a), NanBox::from_bits(b));
+    let r = vm_lt(ctx, funcs, NanBox::from_bits(a), NanBox::from_bits(b), None);
     jit_finish(ctx, r)
 }
 
@@ -8166,7 +8336,7 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    match vm_add(ctx, funcs, av, bv) {
+    match vm_add(ctx, funcs, av, bv, None) {
         Ok(v) => v.to_bits(),
         Err(VmError::Thrown(val)) => {
             ctx.jit_pending = Some(val);
@@ -8211,7 +8381,7 @@ pub(crate) extern "C" fn jit_helper_call_native(
         let raw = unsafe { core::slice::from_raw_parts(argv, argc) };
         raw.iter().map(|&w| NanBox::from_bits(w)).collect()
     };
-    match vm_call_native(ctx, funcs, native as u16, &args) {
+    match vm_call_native(ctx, funcs, native as u16, &args, None) {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
@@ -8976,25 +9146,53 @@ fn run_frame_at_ic(
             // `toString` is honored first via `to_primitive`. Shared with the
             // generic-JIT helper via `vm_arith` so the two tiers can't diverge.
             Op::Sub { dst, a, b } => {
-                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_SUB) {
+                match vm_arith(
+                    ctx,
+                    funcs,
+                    regs[*a as usize],
+                    regs[*b as usize],
+                    GA_SUB,
+                    Some(regs),
+                ) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
             }
             Op::Mul { dst, a, b } => {
-                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_MUL) {
+                match vm_arith(
+                    ctx,
+                    funcs,
+                    regs[*a as usize],
+                    regs[*b as usize],
+                    GA_MUL,
+                    Some(regs),
+                ) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
             }
             Op::Div { dst, a, b } => {
-                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_DIV) {
+                match vm_arith(
+                    ctx,
+                    funcs,
+                    regs[*a as usize],
+                    regs[*b as usize],
+                    GA_DIV,
+                    Some(regs),
+                ) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
             }
             Op::Mod { dst, a, b } => {
-                match vm_arith(ctx, funcs, regs[*a as usize], regs[*b as usize], GA_MOD) {
+                match vm_arith(
+                    ctx,
+                    funcs,
+                    regs[*a as usize],
+                    regs[*b as usize],
+                    GA_MOD,
+                    Some(regs),
+                ) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
@@ -9268,7 +9466,7 @@ fn run_frame_at_ic(
                 strict,
             } => {
                 let (o, k) = (regs[*obj as usize], regs[*key as usize]);
-                match with_host(ctx, |h| h.delete_member(o, k, *strict)) {
+                match with_host_regs(ctx, regs, |h| h.delete_member(o, k, *strict)) {
                     Some(Ok(b)) => regs[*dst as usize] = NanBox::boolean(b),
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
@@ -9295,7 +9493,7 @@ fn run_frame_at_ic(
                 if is_string {
                     regs[*dst as usize] = v;
                 } else if v.as_handle().is_some() {
-                    match with_host(ctx, |h| h.to_string(v)) {
+                    match with_host_regs(ctx, regs, |h| h.to_string(v)) {
                         Some(Ok(s)) => regs[*dst as usize] = s,
                         Some(Err(e)) => handle_throw!(VmError::from(e)),
                         None => return Err(VmError::Unsupported),
@@ -9310,7 +9508,7 @@ fn run_frame_at_ic(
                 if let Some(h) = v.as_handle()
                     && !ctx.realm.is_string_handle(Handle::from_raw(h))
                 {
-                    match with_host(ctx, |h| h.to_string(v)) {
+                    match with_host_regs(ctx, regs, |h| h.to_string(v)) {
                         Some(Ok(s)) => regs[*dst as usize] = s,
                         Some(Err(e)) => handle_throw!(VmError::from(e)),
                         None => return Err(VmError::Unsupported),
@@ -9353,7 +9551,7 @@ fn run_frame_at_ic(
                     // TypeError): the host's unary `-` performs ToNumeric, and
                     // negating its primitive result back is exact.
                     // (A BigInt primitive negates back as a BigInt.)
-                    match host_unary_any(ctx, crate::ast::UnaryOp::Minus, v) {
+                    match host_unary_any(ctx, crate::ast::UnaryOp::Minus, v, Some(regs)) {
                         Ok(r) => {
                             let big = r
                                 .as_handle()
@@ -9472,7 +9670,7 @@ fn run_frame_at_ic(
                         None => return Err(VmError::Unsupported),
                     }
                 } else {
-                    let r = host_get_str(ctx, it, "return").and_then(|m| {
+                    let r = host_get_str(ctx, it, "return", None).and_then(|m| {
                         if matches!(
                             m.unpack(),
                             crate::nanbox::Unpacked::Undefined | crate::nanbox::Unpacked::Null
@@ -9554,7 +9752,7 @@ fn run_frame_at_ic(
                         .map_err(VmError::from)
                 } else {
                     let name = if m == 1 { "throw" } else { "return" };
-                    match host_get_str(ctx, it, name) {
+                    match host_get_str(ctx, it, name, None) {
                         Ok(f)
                             if matches!(
                                 f.unpack(),
@@ -9844,7 +10042,7 @@ fn run_frame_at_ic(
             } => {
                 let mut ex = exclude.clone();
                 for k in keys {
-                    ex.push(vm_property_key(ctx, regs[*k as usize])?);
+                    ex.push(vm_property_key(ctx, regs[*k as usize], Some(regs))?);
                 }
                 let v = regs[*src as usize];
                 let t = NanBox::handle(ctx.realm.new_object().to_raw());
@@ -9852,7 +10050,7 @@ fn run_frame_at_ic(
                     regs[*dst as usize] = t;
                     continue;
                 }
-                match with_host(ctx, |h| h.copy_data_properties(t, v, &ex)) {
+                match with_host_regs(ctx, regs, |h| h.copy_data_properties(t, v, &ex)) {
                     Some(Ok(())) => regs[*dst as usize] = t,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
@@ -9876,7 +10074,13 @@ fn run_frame_at_ic(
                         2 => crate::ast::BinaryOp::LtEq,
                         _ => crate::ast::BinaryOp::GtEq,
                     };
-                    match with_host(ctx, |h| h.binary(bop, x, y)) {
+                    // (Lending the frame only when a ToPrimitive may run
+                    // code, as `host_binary` does.)
+                    let lend = may_coerce(&ctx.realm, x) || may_coerce(&ctx.realm, y);
+                    let r = with_host_in(ctx, lend.then_some(&regs[..]), lend, |h| {
+                        h.binary(bop, x, y)
+                    });
+                    match r {
                         Some(Ok(v)) => regs[*dst as usize] = v,
                         Some(Err(e)) => handle_throw!(VmError::from(e)),
                         None => return Err(VmError::Unsupported),
@@ -10035,11 +10239,13 @@ fn run_frame_at_ic(
             } => {
                 let (k, t) = (regs[*key as usize], regs[*this as usize]);
                 match super_base(ctx, regs[*home as usize]) {
-                    Ok(base) => match with_host(ctx, |h| h.get_with_receiver(base, k, t)) {
-                        Some(Ok(v)) => regs[*dst as usize] = v,
-                        Some(Err(e)) => handle_throw!(VmError::from(e)),
-                        None => return Err(VmError::Unsupported),
-                    },
+                    Ok(base) => {
+                        match with_host_regs(ctx, regs, |h| h.get_with_receiver(base, k, t)) {
+                            Some(Ok(v)) => regs[*dst as usize] = v,
+                            Some(Err(e)) => handle_throw!(VmError::from(e)),
+                            None => return Err(VmError::Unsupported),
+                        }
+                    }
                     Err(e) => handle_throw!(e),
                 }
             }
@@ -10057,7 +10263,9 @@ fn run_frame_at_ic(
                 );
                 match super_base(ctx, regs[*home as usize]) {
                     Ok(base) => {
-                        match with_host(ctx, |h| h.set_with_receiver(base, k, v, t, *strict)) {
+                        match with_host_regs(ctx, regs, |h| {
+                            h.set_with_receiver(base, k, v, t, *strict)
+                        }) {
                             Some(Ok(())) => {}
                             Some(Err(e)) => handle_throw!(VmError::from(e)),
                             None => return Err(VmError::Unsupported),
@@ -10091,7 +10299,7 @@ fn run_frame_at_ic(
             Op::ToKey { dst, src } => {
                 let v = regs[*src as usize];
                 if is_object_value(&ctx.realm, v) {
-                    match with_host(ctx, |h| h.to_property_key(v)) {
+                    match with_host_regs(ctx, regs, |h| h.to_property_key(v)) {
                         Some(Ok(k)) => regs[*dst as usize] = k,
                         Some(Err(e)) => handle_throw!(VmError::from(e)),
                         None => return Err(VmError::Unsupported),
@@ -10148,13 +10356,14 @@ fn run_frame_at_ic(
             } => {
                 let recv_val = regs[*recv as usize];
                 let argv = ArgBuf::from_regs(regs, args);
-                let method = match vm_get_elem(ctx, funcs, recv_val, regs[*key as usize]) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        handle_throw!(e);
-                        continue;
-                    }
-                };
+                let method =
+                    match vm_get_elem(ctx, funcs, recv_val, regs[*key as usize], Some(regs)) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            handle_throw!(e);
+                            continue;
+                        }
+                    };
                 // The callee feedback the machine-code tier inlines from.
                 if let Some((f, c)) = method
                     .as_handle()
@@ -10266,7 +10475,14 @@ fn run_frame_at_ic(
                 if c.as_handle()
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                 {
-                    match vm_construct(ctx, funcs, c, &argv, c) {
+                    // (This frame's registers published, as a call's are.)
+                    let pub_mark = ctx.frame_shadow.len();
+                    ctx.frame_shadow.extend_from_slice(regs);
+                    ctx.frames_published += 1;
+                    let r = vm_construct(ctx, funcs, c, &argv, c);
+                    ctx.frames_published -= 1;
+                    ctx.frame_shadow.truncate(pub_mark);
+                    match r {
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
@@ -10292,7 +10508,14 @@ fn run_frame_at_ic(
                 if c.as_handle()
                     .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
                 {
-                    match vm_construct(ctx, funcs, c, &argv, c) {
+                    // (This frame's registers published, as a call's are.)
+                    let pub_mark = ctx.frame_shadow.len();
+                    ctx.frame_shadow.extend_from_slice(regs);
+                    ctx.frames_published += 1;
+                    let r = vm_construct(ctx, funcs, c, &argv, c);
+                    ctx.frames_published -= 1;
+                    ctx.frame_shadow.truncate(pub_mark);
+                    match r {
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
                     }
@@ -10327,7 +10550,7 @@ fn run_frame_at_ic(
                     regs[*dst as usize] = NanBox::boolean(r);
                     continue;
                 }
-                match with_host(ctx, |h| h.relational(*instanceof, x, y)) {
+                match with_host_regs(ctx, regs, |h| h.relational(*instanceof, x, y)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
@@ -10363,7 +10586,12 @@ fn run_frame_at_ic(
             }
             #[cfg(feature = "std")]
             Op::BitNot { dst, a } => {
-                if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::BitNot, regs[*a as usize]) {
+                if let Some(r) = host_unary(
+                    ctx,
+                    crate::ast::UnaryOp::BitNot,
+                    regs[*a as usize],
+                    Some(regs),
+                ) {
                     match r {
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
@@ -10380,13 +10608,25 @@ fn run_frame_at_ic(
             Op::BitNot { dst, .. } => regs[*dst as usize] = NanBox::number(f64::NAN),
             Op::ValueBin { dst, op, a, b } => {
                 // Shared with the generic-JIT helper via `vm_value_bin`.
-                match vm_value_bin(ctx, funcs, regs[*a as usize], regs[*b as usize], *op) {
+                match vm_value_bin(
+                    ctx,
+                    funcs,
+                    regs[*a as usize],
+                    regs[*b as usize],
+                    *op,
+                    Some(regs),
+                ) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
             }
             Op::Neg { dst, a } => {
-                if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::Minus, regs[*a as usize]) {
+                if let Some(r) = host_unary(
+                    ctx,
+                    crate::ast::UnaryOp::Minus,
+                    regs[*a as usize],
+                    Some(regs),
+                ) {
                     match r {
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),
@@ -10407,7 +10647,7 @@ fn run_frame_at_ic(
                 // Use the realm's relational comparison so strings and objects
                 // (ToPrimitive) work natively instead of erroring into a fallback.
                 // Shared with the generic-JIT helper via `vm_lt`.
-                match vm_lt(ctx, funcs, regs[*a as usize], regs[*b as usize]) {
+                match vm_lt(ctx, funcs, regs[*a as usize], regs[*b as usize], Some(regs)) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
@@ -10416,7 +10656,7 @@ fn run_frame_at_ic(
                 // The general `+`: ToPrimitive each operand then string-concat or
                 // numeric add. Shared with the generic-JIT helper via `vm_add` so
                 // the two tiers can never diverge.
-                match vm_add(ctx, funcs, regs[*a as usize], regs[*b as usize]) {
+                match vm_add(ctx, funcs, regs[*a as usize], regs[*b as usize], Some(regs)) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
@@ -10504,10 +10744,12 @@ fn run_frame_at_ic(
                 src,
                 lit,
                 kind,
-            } => match vm_str_eq_const(ctx, funcs, regs[*src as usize], lit, *kind) {
-                Ok(v) => regs[*dst as usize] = v,
-                Err(e) => handle_throw!(e),
-            },
+            } => {
+                match vm_str_eq_const_in(ctx, funcs, regs[*src as usize], lit, *kind, Some(regs)) {
+                    Ok(v) => regs[*dst as usize] = v,
+                    Err(e) => handle_throw!(e),
+                }
+            }
             Op::NewArray { dst, len } => {
                 // Defence in depth: the verifier rejects oversized lengths, but the
                 // call-free `run` entrypoint runs unverified ops, so cap here too.
@@ -10644,7 +10886,7 @@ fn run_frame_at_ic(
                 // canonical numeric-string key / `length` / accessor / ordinary
                 // property), so the two tiers can never diverge.
                 let o = regs[*obj as usize];
-                match vm_get_elem(ctx, funcs, o, regs[*key as usize]) {
+                match vm_get_elem(ctx, funcs, o, regs[*key as usize], Some(regs)) {
                     Ok(v) => {
                         regs[*dst as usize] = v;
                         // (The site's element feedback, `ic::elem_fb`.)
@@ -10660,7 +10902,7 @@ fn run_frame_at_ic(
                 // index, non-writable `length`) returns `Err(Unsupported)` to fault
                 // to the interpreter, exactly as before.
                 let (o, v) = (regs[*obj as usize], regs[*src as usize]);
-                match vm_set_elem_mode(ctx, funcs, o, regs[*key as usize], v, false) {
+                match vm_set_elem_mode(ctx, funcs, o, regs[*key as usize], v, false, Some(regs)) {
                     Ok(()) => {
                         let k = ctx.realm.elem_feedback(o, v);
                         site_cache!(site).note_elem(k);
@@ -10670,7 +10912,7 @@ fn run_frame_at_ic(
             }
             Op::SetKeyStrict { obj, key, src } => {
                 let (o, v) = (regs[*obj as usize], regs[*src as usize]);
-                match vm_set_elem_mode(ctx, funcs, o, regs[*key as usize], v, true) {
+                match vm_set_elem_mode(ctx, funcs, o, regs[*key as usize], v, true, Some(regs)) {
                     Ok(()) => {
                         let k = ctx.realm.elem_feedback(o, v);
                         site_cache!(site).note_elem(k);
@@ -10692,7 +10934,7 @@ fn run_frame_at_ic(
                     regs[*dst as usize] = keys;
                     continue;
                 }
-                match with_host(ctx, |h| h.for_in_enumerate(o)) {
+                match with_host_regs(ctx, regs, |h| h.for_in_enumerate(o)) {
                     Some(Ok((keys, live))) => {
                         regs[*dst as usize] = keys;
                         regs[*obj as usize] = live;
@@ -10749,7 +10991,7 @@ fn run_frame_at_ic(
                 if spread_plain_vm(ctx, t, v, &[]) {
                     continue;
                 }
-                match with_host(ctx, |h| h.copy_data_properties(t, v, &[])) {
+                match with_host_regs(ctx, regs, |h| h.copy_data_properties(t, v, &[])) {
                     Some(Ok(())) => {}
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
@@ -10762,7 +11004,7 @@ fn run_frame_at_ic(
                     regs[*dst as usize] = t;
                     continue;
                 }
-                match with_host(ctx, |h| h.copy_data_properties(t, v, exclude)) {
+                match with_host_regs(ctx, regs, |h| h.copy_data_properties(t, v, exclude)) {
                     Some(Ok(())) => regs[*dst as usize] = t,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
                     None => return Err(VmError::Unsupported),
@@ -10928,7 +11170,7 @@ fn run_frame_at_ic(
                 // Shared with the generic-JIT helper via `vm_set_prop` so the two
                 // tiers can never diverge (regex lastIndex, array length/index,
                 // accessor setter, IC in-place write, descriptor-aware fault).
-                match vm_set_prop_mode(ctx, funcs, recv, key, value, cache, false) {
+                match vm_set_prop_mode(ctx, funcs, recv, key, value, cache, false, Some(regs)) {
                     Ok(()) => {}
                     Err(e) => handle_throw!(e),
                 }
@@ -10937,7 +11179,7 @@ fn run_frame_at_ic(
                 let recv = regs[*obj as usize];
                 let value = regs[*src as usize];
                 let cache = site_cache!(site);
-                match vm_set_prop_mode(ctx, funcs, recv, key, value, cache, true) {
+                match vm_set_prop_mode(ctx, funcs, recv, key, value, cache, true, Some(regs)) {
                     Ok(()) => {}
                     Err(e) => handle_throw!(e),
                 }
@@ -10960,7 +11202,7 @@ fn run_frame_at_ic(
                 // Shared with the generic-JIT helper via `vm_get_prop` so the two
                 // tiers can never diverge (synthetic name/prototype, RegExp members,
                 // IC slot load, accessor getter, prototype walk, throw).
-                match vm_get_prop(ctx, funcs, recv, key, cache) {
+                match vm_get_prop(ctx, funcs, recv, key, cache, Some(regs)) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
@@ -11114,7 +11356,16 @@ fn run_frame_at_ic(
                                 .and_then(|(id, _)| funcs.get(id as usize))
                                 .is_some_and(|p| p.legacy)
                         }))
-                    .then(|| vm_get_prop(ctx, funcs, recv_val, key, &mut PropertyCache::default()))
+                    .then(|| {
+                        vm_get_prop(
+                            ctx,
+                            funcs,
+                            recv_val,
+                            key,
+                            &mut PropertyCache::default(),
+                            None,
+                        )
+                    })
                     .and_then(Result::ok)
                     .filter(|f| {
                         f.as_handle()
@@ -11250,7 +11501,7 @@ fn run_frame_at_ic(
             }
             Op::GetMethod { dst, obj, key } => {
                 let recv = regs[*obj as usize];
-                match vm_get_method(ctx, funcs, recv, key, site_cache!(site)) {
+                match vm_get_method(ctx, funcs, recv, key, site_cache!(site), Some(regs)) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
@@ -11329,7 +11580,7 @@ fn run_frame_at_ic(
                 // tiers can't diverge (it handles the interpreter-aware natives —
                 // JSON/Array.from/Number — where `funcs` and the throw machinery are
                 // available, and defers the rest to `call_native`).
-                match vm_call_native(ctx, funcs, *native, &argv) {
+                match vm_call_native(ctx, funcs, *native, &argv, Some(regs)) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
@@ -11859,7 +12110,7 @@ fn vm_array_index_get(
     // Hosted: a hole or an index past the end (sparse storage, accessors,
     // the prototype chain) is the host's `[[Get]]`.
     if ctx.host.is_some() {
-        return host_get_str(ctx, recv, &alloc::format!("{i}"));
+        return host_get_str(ctx, recv, &alloc::format!("{i}"), None);
     }
     // An OWN accessor installed at this index (`defineProperty(arr, i, {get})`)
     // lives in the aux object over a hole — invoke its getter before the chain.
@@ -11925,7 +12176,7 @@ fn spread_plain_vm(ctx: &mut Ctx, target: NanBox, src: NanBox, excluded: &[Strin
 /// from `ToPrimitive(key, string)` — an `@@toPrimitive` / inherited `toString`
 /// only the interpreter resolves. (A Date, for one, keys on its
 /// `Date.prototype.toString` text, not the ISO form `to_display_string` produces.)
-fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
+fn vm_property_key(ctx: &mut Ctx, key: NanBox, regs: Option<&[NanBox]>) -> Result<String, VmError> {
     if let Some(raw) = key.as_handle() {
         let h = Handle::from_raw(raw);
         if let Some((_, id)) = ctx.realm.symbol_at(h) {
@@ -11933,7 +12184,13 @@ fn vm_property_key(ctx: &mut Ctx, key: NanBox) -> Result<String, VmError> {
         }
         if !ctx.realm.is_string_handle(h) {
             // Hosted: the host runs the full ToPrimitive(key, string) once.
-            let k = match with_host(ctx, |hst| hst.to_property_key(key)) {
+            // (From a VM frame's operation, `regs`: lent, so the coercion
+            // may collect.)
+            let k = match regs {
+                Some(regs) => with_host_regs(ctx, regs, |hst| hst.to_property_key(key)),
+                None => with_host(ctx, |hst| hst.to_property_key(key)),
+            };
+            let k = match k {
                 Some(r) => r.map_err(VmError::from)?,
                 None => return Err(VmError::Unsupported),
             };
@@ -12020,8 +12277,9 @@ fn vm_get_elem(
     funcs: &[FnProto],
     recv: NanBox,
     key: NanBox,
+    regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
-    vm_get_elem_from(ctx, funcs, recv, key, false)
+    vm_get_elem_from(ctx, funcs, recv, key, false, regs)
 }
 
 /// [`vm_get_elem`], where `own_done` says the caller already tried
@@ -12034,6 +12292,7 @@ fn vm_get_elem_from(
     recv: NanBox,
     key: NanBox,
     own_done: bool,
+    regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
     // A present element of a plain dense array: nothing can intercept it.
     if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
@@ -12084,7 +12343,7 @@ fn vm_get_elem_from(
                         .as_handle()
                         .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))))))
     {
-        return host_get(ctx, recv, key);
+        return host_get(ctx, recv, key, regs);
     }
     // So is one keyed by a String in an index's canonical form, as
     // `for (k in a) a[k]` reads it.
@@ -12114,10 +12373,10 @@ fn vm_get_elem_from(
             // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
             // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
             // may be inherited or user-written), which the interpreter owns.
-            let ks = match vm_property_key(ctx, key) {
+            let ks = match vm_property_key(ctx, key, regs) {
                 Ok(ks) => ks,
                 // A hosted run hands the whole read to the host.
-                Err(_) if ctx.host.is_some() => return host_get(ctx, recv, key),
+                Err(_) if ctx.host.is_some() => return host_get(ctx, recv, key, regs),
                 Err(e) => return Err(e),
             };
             // (A closure's owed `prototype` is made when first read.)
@@ -12145,7 +12404,7 @@ fn vm_get_elem_from(
             {
                 // A getter accessor under a (possibly numeric) string key — invoke
                 // it with the receiver as `this`.
-                call_closure(ctx, funcs, getter, &[], recv)
+                call_closure_pub(ctx, funcs, regs, getter, &[], recv)
             } else if let Some(v) = ctx.realm.get_property(handle, &ks) {
                 Ok(v)
             } else if ctx.host.is_some() {
@@ -12158,7 +12417,7 @@ fn vm_get_elem_from(
                 } else {
                     key
                 };
-                host_get(ctx, recv, key)
+                host_get(ctx, recv, key, regs)
             } else {
                 Ok(NanBox::undefined())
             }
@@ -12182,6 +12441,7 @@ fn vm_set_elem(
     recv: NanBox,
     key: NanBox,
     value: NanBox,
+    regs: Option<&[NanBox]>,
 ) -> Result<(), VmError> {
     let handle = recv
         .as_handle()
@@ -12228,7 +12488,7 @@ fn vm_set_elem(
             // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
             // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
             // may be inherited or user-written), which the interpreter owns.
-            let ks = vm_property_key(ctx, key)?;
+            let ks = vm_property_key(ctx, key, regs)?;
             // C1: a computed `arr["length"] = n` (numeric string key) on an array
             // resizes; `ToUint32(v)` must equal `ToNumber(v)` (else a catchable
             // `RangeError`).
@@ -12290,7 +12550,14 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
     // Hosted: a primitive receiver (`null.length` throws a TypeError,
     // `(5).length` reads Number.prototype) is an ordinary `[[Get]]`.
     if ctx.host.is_some() && recv.as_handle().is_none() {
-        return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+        return vm_get_prop(
+            ctx,
+            funcs,
+            recv,
+            "length",
+            &mut PropertyCache::default(),
+            None,
+        );
     }
     let handle = recv
         .as_handle()
@@ -12303,7 +12570,14 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
     // read from its slot only while nothing shadows or redefines it.
     if let Some(len) = ctx.realm.typed_len(handle) {
         if ctx.host.is_some() && !ctx.realm.typed_accessor_intact(handle, "length") {
-            return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+            return vm_get_prop(
+                ctx,
+                funcs,
+                recv,
+                "length",
+                &mut PropertyCache::default(),
+                None,
+            );
         }
         return Ok(NanBox::number(len as f64));
     }
@@ -12312,15 +12586,22 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
         && !ctx.realm.is_string_handle(handle)
     {
         if is_string_wrapper(&ctx.realm, recv) {
-            return host_get_str(ctx, recv, "length");
+            return host_get_str(ctx, recv, "length", None);
         }
         // An ordinary object's through the realm's shared `.length` cache (a
         // nested read, from a getter, makes its own).
         if ctx.realm.object_key_epoch(handle).is_none() {
-            return vm_get_prop(ctx, funcs, recv, "length", &mut PropertyCache::default());
+            return vm_get_prop(
+                ctx,
+                funcs,
+                recv,
+                "length",
+                &mut PropertyCache::default(),
+                None,
+            );
         }
         let mut cache = ctx.realm.len_cache.take().unwrap_or_default();
-        let r = vm_get_prop(ctx, funcs, recv, "length", &mut cache);
+        let r = vm_get_prop(ctx, funcs, recv, "length", &mut cache, None);
         ctx.realm.len_cache = Some(cache);
         return r;
     }
@@ -13597,7 +13878,7 @@ fn vm_object_kv(
                         // receiver's shape pointer (one property per call site), so
                         // reusing it across distinct keys would false-hit.
                         let mut cache = PropertyCache::new();
-                        let v = vm_get_prop(ctx, funcs, recv, &k, &mut cache)?;
+                        let v = vm_get_prop(ctx, funcs, recv, &k, &mut cache, None)?;
                         if native == NB_OBJECT_VALUES {
                             v
                         } else {

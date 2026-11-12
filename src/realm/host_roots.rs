@@ -48,6 +48,20 @@
 //!   root stack is live below it.
 //! * A built-in's callback (`Interp::call_cb`) is armed the same way as a
 //!   step: a VM function is the re-entry; anything else is relayed to.
+//! * The user code the engine runs on its own behalf — a `valueOf` /
+//!   `toString` / `@@toPrimitive` of a coercion, a getter or setter, a proxy
+//!   trap, a constructor (`Interp::call_audited`, `Interp::construct_audited`)
+//!   — collects only inside an **audited** segment ([`audit`](HostRoots::audit)):
+//!   one a built-in or VM operation opened (`Interp::audited_scope`) after
+//!   checking that nothing between it and those helpers holds an unrooted
+//!   value. Each such call roots its `this`, its arguments and its result
+//!   until the segment closes, so the helpers' callers need not, and
+//!   everything the segment's own code allocated so far is pinned before the
+//!   call (`Heap::pins`: read back off the free list, nothing on the
+//!   allocation path), so a wrapper, a key or a descriptor it made survives.
+//!   What remains for each audited built-in: a value it *read* out of an
+//!   object and keeps across such a call (user code may delete the
+//!   property) goes through `Interp::audit_hold`.
 //!
 //! The collector does not move objects, so a copy of a value is as good a
 //! root as the original, and nothing needs updating afterwards.
@@ -96,6 +110,20 @@ pub(crate) struct HostRoots {
     pub(crate) scope: u32,
     /// The crossing at which the next nested VM entry may collect (0: none).
     pub(crate) armed: u32,
+    /// The host call whose segment is **audited** (0: none): opened by a
+    /// built-in or VM operation whose every frame, from its own down to any
+    /// coercion, accessor, proxy trap or constructor it runs through
+    /// `Interp::call_audited` / `Interp::construct_audited`, holds no value
+    /// it has not rooted. Honoured only while its root scope is live and by
+    /// that same host call (its serial), never by a built-in it calls.
+    pub(crate) audit: u32,
+    /// Register files VM frames lent to a callee they called on behalf of an
+    /// operation (an accessor: `nbvm::call_closure_pub`), as `(address,
+    /// length)`: roots of every collection while listed, the frame suspended
+    /// (and its registers unwritten) until it unlists them. Publishing by
+    /// address, where a call copies its registers into its context's
+    /// `frame_shadow`.
+    pub(crate) lent: Vec<(usize, usize)>,
 }
 
 /// The flag of a [`HostRoots::scope`] / [`HostRoots::armed`] value (over the
@@ -157,6 +185,22 @@ impl HostRoots {
     #[inline]
     pub(crate) fn live(&self) -> bool {
         self.scope != 0 && self.scope & !LOOP == self.crossings
+    }
+
+    /// Whether the innermost crossing is linked (made from a fully published
+    /// or lending VM frame): only then may a root scope opened now be active.
+    #[inline]
+    pub(crate) fn crossing_linked(&self) -> bool {
+        self.links
+            .last()
+            .is_some_and(|l| l.crossing == self.crossings)
+    }
+
+    /// Whether the host call numbered `call` runs an audited segment now
+    /// (see [`audit`](Self::audit)).
+    #[inline]
+    pub(crate) fn audited(&self, call: u32) -> bool {
+        self.audit != 0 && self.audit == call && self.live()
     }
 
     /// Takes the arm for a nested VM entry made now: whether the entry may

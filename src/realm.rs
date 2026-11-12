@@ -8571,6 +8571,21 @@ impl Realm {
                 .chain(self.host_roots.vals.iter())
                 .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
         );
+        // Register files VM frames lent to an accessor they run.
+        for &(at, len) in &self.host_roots.lent {
+            // SAFETY: a lent register file belongs to a VM frame suspended in
+            // the call that listed it, which unlists it before it resumes or
+            // returns (`nbvm::call_closure_pub`); it is neither freed nor
+            // written meanwhile.
+            #[allow(unsafe_code)]
+            let regs = unsafe { core::slice::from_raw_parts(at as *const NanBox, len) };
+            out.extend(
+                regs.iter()
+                    .filter_map(|nb| nb.as_handle().map(Handle::from_raw)),
+            );
+        }
+        // What audited host segments made (`Heap::pins`, `Heap::pinned`).
+        out.extend(self.heap.pinned().iter().copied());
         // Deliberately **not** included: `aux_props`, `fn_protos`, `fn_ctor` and
         // `symbols_by_id`. Those are weak-key (ephemeron) tables that
         // [`collect`](Self::collect) expands and prunes itself; strong-rooting
@@ -8583,6 +8598,45 @@ impl Realm {
     /// allocation-pressure trigger. A safepoint compares it against
     /// [`gc_next_threshold`](Self::gc_next_threshold) before doing the (much more
     /// expensive) work of building a root set.
+    /// Opens an audited host segment's allocation pinning (`Heap::pins`);
+    /// returns what [`alloc_segment_close`](Self::alloc_segment_close) takes.
+    #[inline]
+    pub(crate) fn alloc_segment_open(&mut self) -> (bool, usize) {
+        self.heap.segment_open()
+    }
+
+    /// Closes [`alloc_segment_open`](Self::alloc_segment_open)'s segment.
+    #[inline]
+    pub(crate) fn alloc_segment_close(&mut self, s: (bool, usize)) {
+        self.heap.segment_close(s);
+    }
+
+    /// Before an audited segment runs user code that may collect (pins what
+    /// it allocated so far); returns what
+    /// [`alloc_segment_resume`](Self::alloc_segment_resume) takes.
+    #[inline]
+    pub(crate) fn alloc_segment_call(&mut self) -> bool {
+        self.heap.segment_call()
+    }
+
+    /// After [`alloc_segment_call`](Self::alloc_segment_call)'s user code.
+    #[inline]
+    pub(crate) fn alloc_segment_resume(&mut self, active: bool) {
+        self.heap.segment_resume(active);
+    }
+
+    /// How many allocations are pinned (a mark for [`unpin_allocs_to`](Self::unpin_allocs_to)).
+    #[inline]
+    pub(crate) fn pinned_allocs(&mut self) -> usize {
+        self.heap.pinned_len()
+    }
+
+    /// Releases the allocations pinned since `mark`.
+    #[inline]
+    pub(crate) fn unpin_allocs_to(&mut self, mark: usize) {
+        self.heap.unpin_to(mark);
+    }
+
     #[must_use]
     pub const fn gc_pressure(&self) -> usize {
         self.heap.allocs_since_gc()

@@ -239,7 +239,7 @@ impl Interp {
                 return Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))));
             }
             let hint_box = self.new_str(hint);
-            let r = self.call_with_this(f, v, &[hint_box])?;
+            let r = self.call_audited(f, v, &[hint_box])?;
             // `[Symbol.toPrimitive]` must return a primitive, else a TypeError.
             if self.is_object_value(r) {
                 let m = self.new_str("Cannot convert object to primitive value");
@@ -404,7 +404,7 @@ impl Interp {
                     Some(crate::realm::ChainHit::Accessor(g, ..)) if g.is_undefined() => {
                         Ok(NanBox::undefined())
                     }
-                    Some(crate::realm::ChainHit::Accessor(g, ..)) => self.call_with_this(g, v, &[]),
+                    Some(crate::realm::ChainHit::Accessor(g, ..)) => self.call_audited(g, v, &[]),
                     None => self.get_with_receiver(proto, name, v),
                 };
             }
@@ -512,7 +512,7 @@ impl Interp {
                 let kb = self.key_to_value(&name);
                 let handler_box = NanBox::handle(handler.to_raw());
                 let r =
-                    self.call_with_this(trap, handler_box, &[NanBox::handle(target.to_raw()), kb])?;
+                    self.call_audited(trap, handler_box, &[NanBox::handle(target.to_raw()), kb])?;
                 result = self.realm.truthy(r);
                 // Invariant (10.5.10): a true result is
                 // illegal if the property exists as a
@@ -588,6 +588,8 @@ impl Interp {
         let Some(wh) = wrapper.as_handle().map(Handle::from_raw) else {
             return Ok(());
         };
+        // (Held across a setter or trap an audited segment may collect in.)
+        self.audit_hold(wrapper);
         // `[[Set]]` runs on the transient wrapper, but the *Receiver* is the
         // primitive — an inherited (strict) setter must see `this` as the
         // primitive value, matching the getter path.
@@ -689,7 +691,7 @@ impl Interp {
                 if let Some(trap) = self.proxy_trap(p_handler, "set")? {
                     let key_box = self.key_to_value(key);
                     let handler_box = NanBox::handle(p_handler.to_raw());
-                    let r = self.call_with_this(
+                    let r = self.call_audited(
                         trap,
                         handler_box,
                         &[NanBox::handle(target.to_raw()), key_box, new, recv_value],
@@ -705,7 +707,7 @@ impl Interp {
                 if let Some((_, setter)) = self.realm.accessor(target, key)
                     && !matches!(setter.unpack(), Unpacked::Undefined)
                 {
-                    self.call_with_this(setter, recv_value, &[new])?;
+                    self.call_audited(setter, recv_value, &[new])?;
                     return Ok(Some(()));
                 }
                 return Ok(None);
@@ -736,7 +738,7 @@ impl Interp {
             }
             if let Some((_, setter)) = self.realm.accessor(c, key) {
                 if !matches!(setter.unpack(), Unpacked::Undefined) {
-                    self.call_with_this(setter, recv_value, &[new])?;
+                    self.call_audited(setter, recv_value, &[new])?;
                 } else if self.strict {
                     // OrdinarySetWithOwnDescriptor: an accessor descriptor whose
                     // [[Set]] is undefined makes the whole `[[Set]]` return false —
@@ -866,7 +868,7 @@ impl Interp {
                     if matches!(setter.unpack(), Unpacked::Undefined) {
                         return Ok(false);
                     }
-                    self.call_with_this(setter, receiver, &[value])?;
+                    self.call_audited(setter, receiver, &[value])?;
                     return Ok(true);
                 }
                 if self.realm.has_own(c, key) {
@@ -966,7 +968,7 @@ impl Interp {
         if let Some(trap) = self.proxy_trap(handler, "set")? {
             let key_box = self.key_to_value(key);
             let handler_box = NanBox::handle(handler.to_raw());
-            let r = self.call_with_this(
+            let r = self.call_audited(
                 trap,
                 handler_box,
                 &[NanBox::handle(target.to_raw()), key_box, value, receiver],
@@ -1154,7 +1156,7 @@ impl Interp {
         if let Some((_, setter)) = self.realm.accessor(handle, &name) {
             if !matches!(setter.unpack(), Unpacked::Undefined) {
                 let this = NanBox::handle(handle.to_raw());
-                self.call_with_this(setter, this, &[new])?;
+                self.call_audited(setter, this, &[new])?;
             } else if self.strict {
                 // A getter-only accessor cannot be written: the throwing form of
                 // `[[Set]]` raises a TypeError; sloppy assignment drops the write.
@@ -1363,7 +1365,7 @@ impl Interp {
             if let Some((_, setter)) = self.realm.accessor(handle, &key) {
                 if !matches!(setter.unpack(), Unpacked::Undefined) {
                     let this = NanBox::handle(handle.to_raw());
-                    self.call_with_this(setter, this, &[new])?;
+                    self.call_audited(setter, this, &[new])?;
                 } else if self.strict {
                     let m = self.new_str(&alloc::format!(
                         "Cannot assign to read only property '{}' (accessor has no setter)",
@@ -1487,7 +1489,7 @@ impl Interp {
             if let Some(trap) = self.proxy_trap(handler, "get")? {
                 let key = self.key_to_value(name);
                 let handler_box = NanBox::handle(handler.to_raw());
-                let result = self.call_with_this(
+                let result = self.call_audited(
                     trap,
                     handler_box,
                     &[NanBox::handle(target.to_raw()), key, receiver],
@@ -1510,7 +1512,7 @@ impl Interp {
                 if matches!(getter.unpack(), Unpacked::Undefined) {
                     return Ok(NanBox::undefined());
                 }
-                return self.call_with_this(getter, receiver, &[]);
+                return self.call_audited(getter, receiver, &[]);
             }
             if self.realm.has_own(c, name) {
                 break;
@@ -1678,7 +1680,7 @@ impl Interp {
                 if matches!(getter.unpack(), Unpacked::Undefined) {
                     return Ok(NanBox::undefined());
                 }
-                return self.call_with_this(getter, this, &[]);
+                return self.call_audited(getter, this, &[]);
             }
             if self.realm.has_own(handle, name) {
                 return Ok(self
@@ -1928,7 +1930,7 @@ impl Interp {
                 return Ok(NanBox::undefined());
             }
             let this = NanBox::handle(handle.to_raw());
-            return self.call_with_this(getter, this, &[]);
+            return self.call_audited(getter, this, &[]);
         }
         // `RegExp.prototype.lastIndex` — a real own *data* property of every
         // RegExp instance, stored in the cell (not in the shape), so it is read
@@ -2237,7 +2239,7 @@ impl Interp {
                     return Ok(NanBox::undefined());
                 }
                 let this = NanBox::handle(handle.to_raw());
-                return self.call_with_this(getter, this, &[]);
+                return self.call_audited(getter, this, &[]);
             }
             // A prototype that is itself an Array (or typed array) exposes its
             // elements and `length` as inherited indexed/`length` properties —
@@ -2404,7 +2406,7 @@ impl Interp {
                     Ok(NanBox::undefined())
                 } else {
                     let this = NanBox::handle(handle.to_raw());
-                    self.call_with_this(getter, this, &[])
+                    self.call_audited(getter, this, &[])
                 }
             }
             crate::realm::ChainHit::Absent => {

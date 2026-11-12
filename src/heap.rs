@@ -464,6 +464,43 @@ pub struct Heap<T> {
     /// one epoch holds no stale handle while the epoch is unchanged
     /// (`Realm::add_str_int`'s result memo).
     epoch: u32,
+    /// The audited host segments' allocation pinning (see [`Pins`]), boxed
+    /// to keep the heap's own fields, which the hot paths read, as they were.
+    pins: alloc::boxed::Box<Pins>,
+}
+
+/// [`Heap`]'s allocation pinning for audited host segments.
+#[derive(Debug, Default)]
+struct Pins {
+    /// Where the running audited host segment's own allocations start
+    /// (`Interp::audited_scope`): everything allocated since is the
+    /// segment's, pinned ([`pin_since`](Heap::pin_since)) before the user
+    /// code it runs may collect, the mark moving past that code once it
+    /// returns. `None` outside such a segment's own code. Allocation itself
+    /// does nothing for it: what was allocated since a mark is read back off
+    /// the free list (see [`AllocMark`]).
+    ckpt: Option<AllocMark>,
+    /// The handles pinned and not released yet: roots of every collection
+    /// (`Realm::gc_roots`).
+    pinned: Vec<Handle>,
+    /// Entries put into `free` at `free_top` outside a collection (a
+    /// top-up, a `free`), for [`AllocMark`]'s positions.
+    inserted: usize,
+    /// Sweeps so far (an [`AllocMark`] taken before one is stale).
+    sweeps: u32,
+}
+
+/// The allocation state at a point (see `Heap::pins`): the handles allocated
+/// since are `free[free_top .. top + inserted since]` (allocation pops the
+/// free list from `free_top` down; an insertion at `free_top` shifts what was
+/// popped up by one) plus the live slots pushed at or past `len`. After a
+/// sweep it means everything allocated since that sweep.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AllocMark {
+    sweeps: u32,
+    top: usize,
+    len: usize,
+    inserted: usize,
 }
 
 /// The bookkeeping behind [`Heap`]'s GC-verification mode (see `Heap::poison`).
@@ -501,7 +538,120 @@ impl<T> Heap<T> {
             poison: None,
             extra_pool: crate::object::ExtraPool::default(),
             epoch: 0,
+            pins: alloc::boxed::Box::default(),
         }
+    }
+
+    /// The allocation state now (see [`AllocMark`]).
+    #[inline]
+    fn alloc_mark(&self) -> AllocMark {
+        AllocMark {
+            sweeps: self.pins.sweeps,
+            top: self.free_top,
+            len: self.slots.len(),
+            inserted: self.pins.inserted,
+        }
+    }
+
+    /// Pins every live handle allocated since `m` (or since the last sweep,
+    /// when one ran after `m`).
+    fn pin_since(&mut self, m: AllocMark) {
+        let (free_end, len) = if m.sweeps == self.pins.sweeps {
+            (m.top + (self.pins.inserted - m.inserted), m.len)
+        } else {
+            (self.free.len(), self.young_floor)
+        };
+        let free_end = free_end.min(self.free.len());
+        for i in self.free_top..free_end {
+            let index = self.free[i];
+            let slot = &self.slots[index as usize];
+            if slot.is_live() {
+                self.pins.pinned.push(Handle {
+                    index,
+                    generation: slot.generation,
+                });
+            }
+        }
+        for index in len..self.slots.len() {
+            let slot = &self.slots[index];
+            if slot.is_live() {
+                self.pins.pinned.push(Handle {
+                    index: index as u32,
+                    generation: slot.generation,
+                });
+            }
+        }
+    }
+
+    /// Opens an audited host segment's allocation tracking (`Heap::pins`):
+    /// an enclosing segment's allocations so far pinned, this one's counted
+    /// from now. Returns what [`segment_close`](Heap::segment_close) restores.
+    pub(crate) fn segment_open(&mut self) -> (bool, usize) {
+        let outer = self.pins.ckpt.take();
+        if let Some(c) = outer {
+            self.pin_since(c);
+        }
+        self.pins.ckpt = Some(self.alloc_mark());
+        (outer.is_some(), self.pins.pinned.len())
+    }
+
+    /// Closes what [`segment_open`](Heap::segment_open) opened: its pins
+    /// released, an enclosing segment's allocations counted from now.
+    pub(crate) fn segment_close(&mut self, (outer, pinned): (bool, usize)) {
+        self.pins.pinned.truncate(pinned);
+        self.pins.ckpt = outer.then(|| self.alloc_mark());
+    }
+
+    /// Before an audited segment runs user code that may collect: its
+    /// allocations so far pinned, and none tracked while that code runs
+    /// (its allocations are its own). Returns what
+    /// [`segment_resume`](Heap::segment_resume) takes.
+    #[inline]
+    pub(crate) fn segment_call(&mut self) -> bool {
+        match self.pins.ckpt.take() {
+            Some(c) => {
+                self.pin_since(c);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// After the user code [`segment_call`](Heap::segment_call) let run: the
+    /// segment's allocations counted from now.
+    #[inline]
+    pub(crate) fn segment_resume(&mut self, active: bool) {
+        if active {
+            self.pins.ckpt = Some(self.alloc_mark());
+        }
+    }
+
+    /// How many handles are pinned: a mark for [`unpin_to`](Heap::unpin_to),
+    /// taken after pinning what the running segment allocated so far (so a
+    /// release to it keeps that).
+    #[inline]
+    pub(crate) fn pinned_len(&mut self) -> usize {
+        if let Some(c) = self.pins.ckpt {
+            self.pin_since(c);
+            self.pins.ckpt = Some(self.alloc_mark());
+        }
+        self.pins.pinned.len()
+    }
+
+    /// Releases the handles pinned since `mark` (a [`pinned_len`](Heap::pinned_len)),
+    /// what was allocated since it no longer tracked either.
+    #[inline]
+    pub(crate) fn unpin_to(&mut self, mark: usize) {
+        self.pins.pinned.truncate(mark);
+        if self.pins.ckpt.is_some() {
+            self.pins.ckpt = Some(self.alloc_mark());
+        }
+    }
+
+    /// The pinned handles (roots of every collection).
+    #[inline]
+    pub(crate) fn pinned(&self) -> &[Handle] {
+        &self.pins.pinned
     }
 
     /// The current handle epoch (see `Heap::epoch`): unchanged since a
@@ -701,6 +851,7 @@ impl<T> Heap<T> {
         self.free
             .splice(at..at, (start..start + add).rev().map(|i| i as u32));
         self.free_top += add;
+        self.pins.inserted += add;
         self.young_floor = self.slots.len();
     }
 
@@ -1006,6 +1157,7 @@ impl<T> Heap<T> {
     {
         self.bump_epoch();
         self.fold_allocs();
+        self.pins.sweeps = self.pins.sweeps.wrapping_add(1);
         let Self {
             slots,
             free,
@@ -1123,6 +1275,7 @@ impl<T> Heap<T> {
     {
         self.bump_epoch();
         self.fold_allocs();
+        self.pins.sweeps = self.pins.sweeps.wrapping_add(1);
         let Self {
             slots,
             free,
@@ -1367,6 +1520,7 @@ impl<T> Heap<T> {
         // sticky ones there.
         self.free_top = 0;
         self.young_floor = 0;
+        self.pins.sweeps = self.pins.sweeps.wrapping_add(1);
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.age >= crate::gc::OLD_AGE {
                 slot.dirty = DIRTY;
@@ -1423,6 +1577,7 @@ impl<T> Heap<T> {
                     // the record of what was allocated since the collection.
                     self.free.insert(self.free_top, handle.index);
                     self.free_top += 1;
+                    self.pins.inserted += 1;
                 }
                 self.live -= 1;
                 Some(value)

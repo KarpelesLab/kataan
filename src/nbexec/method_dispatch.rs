@@ -123,6 +123,73 @@ impl Interp {
         method: &str,
         args: &[NanBox],
     ) -> Result<Option<NanBox>, ExecError> {
+        self.call_method_body(recv, method, args)
+    }
+
+    /// [`call_method`](Self::call_method) of a built-in method called as one
+    /// (a `String.prototype` / `Array.prototype` function's own call, not a
+    /// built-in's internal use of another): an audited segment when the
+    /// method is one ([`audited_method`](Self::audited_method)) and the call
+    /// came straight from a VM frame.
+    pub(crate) fn call_method_entry(
+        &mut self,
+        recv: NanBox,
+        method: &str,
+        args: &[NanBox],
+    ) -> Result<Option<NanBox>, ExecError> {
+        if self.audited_method(recv, method) {
+            return self.audited_entry(recv, args, |i| i.call_method(recv, method, args));
+        }
+        self.call_method(recv, method, args)
+    }
+
+    /// Whether `recv.method(...)` runs as an **audited** host segment (see
+    /// `crate::realm::host_roots`): string and array methods whose only user
+    /// code is coercions of their arguments / elements and getters of an
+    /// array-like receiver, checked to hold nothing across them that their
+    /// receiver, arguments, own allocations (pinned) and those calls'
+    /// results (rooted) do not cover.
+    fn audited_method(&self, recv: NanBox, method: &str) -> bool {
+        let Some(h) = recv.as_handle().map(Handle::from_raw) else {
+            return false;
+        };
+        if self.realm.typeof_is_string(h) {
+            return matches!(
+                method,
+                "indexOf"
+                    | "lastIndexOf"
+                    | "includes"
+                    | "startsWith"
+                    | "endsWith"
+                    | "concat"
+                    | "padStart"
+                    | "padEnd"
+                    | "charAt"
+                    | "charCodeAt"
+                    | "codePointAt"
+                    | "at"
+                    | "slice"
+                    | "substring"
+                    | "substr"
+                    | "repeat"
+            );
+        }
+        if self.realm.typed_kind(h).is_some() {
+            return false;
+        }
+        matches!(
+            method,
+            "join" | "indexOf" | "lastIndexOf" | "includes" | "at"
+        ) || (method == "toString" && self.realm.is_array(h))
+    }
+
+    /// The body of [`Self::call_method_inner`].
+    fn call_method_body(
+        &mut self,
+        recv: NanBox,
+        method: &str,
+        args: &[NanBox],
+    ) -> Result<Option<NanBox>, ExecError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(NanBox::undefined());
 
         // Temporal statics: `Temporal.<Type>.from(...)` / `.compare(...)` — a
@@ -297,8 +364,10 @@ impl Interp {
         {
             let join = self.read_member(h, "join")?;
             if self.is_callable_value(join) {
-                // `Call(func, array)`: no arguments are forwarded.
-                return self.call_with_this(join, recv, &[]).map(Some);
+                // `Call(func, array)`: no arguments are forwarded. (The
+                // engine's call: inside an audited segment a built-in `join`
+                // is relayed to, so it may run as one too.)
+                return self.call_audited(join, recv, &[]).map(Some);
             }
             let tag = self.object_string_tag(h)?;
             return Ok(Some(self.new_str(&alloc::format!("[object {tag}]"))));
@@ -777,7 +846,10 @@ impl Interp {
                 "call" => {
                     let this = arg(0);
                     let rest: Vec<NanBox> = args.iter().skip(1).copied().collect();
-                    return self.call_with_this(recv, this, &rest).map(Some);
+                    // (A tail call, nothing held after it: a VM target may
+                    // collect, a built-in one is relayed to, see `host_roots`.)
+                    let mut sc = self.root_scope(&[recv, this]);
+                    return sc.call_cb(recv, this, &rest).map(Some);
                 }
                 "apply" => {
                     let this = arg(0);
@@ -827,7 +899,9 @@ impl Interp {
                             "CreateListFromArrayLike called on non-object",
                         ));
                     };
-                    return self.call_with_this(recv, this, &list).map(Some);
+                    // (A tail call, as `call`'s.)
+                    let mut sc = self.root_scope(&[recv, this]);
+                    return sc.call_cb(recv, this, &list).map(Some);
                 }
                 "bind" => {
                     let this = arg(0);
@@ -3252,11 +3326,14 @@ impl Interp {
                     let here =
                         is_string_like || !uses_has_property || self.has_property(handle, &key);
                     present.push(here);
-                    tmp.push(if here {
+                    let v = if here {
                         self.read_member(handle, &key)?
                     } else {
                         NanBox::undefined()
-                    });
+                    };
+                    // (Kept across later getters, which may drop it.)
+                    self.audit_hold(v);
+                    tmp.push(v);
                 }
                 array_like = Some(self.realm.new_array(tmp));
                 self.array_like_present = Some(present);
@@ -4273,7 +4350,12 @@ impl Interp {
                             // string would render `Symbol(x)` instead).
                             _ => {
                                 live |= self.is_object_value(e);
-                                let b = self.arg_string_bytes_fallible(e)?;
+                                // (Bytes once made: what the coercion rooted or
+                                // pinned in an audited segment is released.)
+                                let mark = self.audit_mark();
+                                let b = self.arg_string_bytes_fallible(e);
+                                self.audit_release(mark);
+                                let b = b?;
                                 self.check_str_len(out.len() + b.len())?;
                                 crate::wtf8::append(&mut out, &b);
                             }
@@ -6194,6 +6276,19 @@ impl Interp {
         original: Handle,
         length: usize,
     ) -> Result<NanBox, ExecError> {
+        self.array_species_create_in(original, length, false)
+    }
+
+    /// [`array_species_create`](Self::array_species_create); `cb`: the caller
+    /// runs inside its own root scope with nothing else unrooted (the
+    /// callback methods, before they gather anything), so a VM species
+    /// constructor is made with [`construct_cb`](Self::construct_cb).
+    pub(crate) fn array_species_create_in(
+        &mut self,
+        original: Handle,
+        length: usize,
+        cb: bool,
+    ) -> Result<NanBox, ExecError> {
         // A non-Array original (the generic-array-like concat path) → ArrayCreate.
         // IsArray is proxy-aware (a proxy whose target is an Array *is* an Array, and
         // a revoked proxy throws), so unwrap the proxy chain here. The subsequent
@@ -6257,6 +6352,9 @@ impl Interp {
         }
         if !self.is_constructor_value(c) {
             return Err(self.type_error("Array species is not a constructor"));
+        }
+        if cb {
+            return self.construct_cb(c, &[NanBox::number(length as f64)]);
         }
         self.construct(c, &[NanBox::number(length as f64)])
     }
@@ -6436,7 +6534,7 @@ impl Interp {
             self.require_callable(arg(0), "flatMap callback")?;
             (1, Some(arg(0)), arg(1))
         };
-        let a_v = self.array_species_create(handle, 0)?;
+        let a_v = self.array_species_create_in(handle, 0, true)?;
         self.root_hold(a_v);
         let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Array species did not return an object"));
@@ -6479,7 +6577,7 @@ impl Interp {
         let len = self.array_like_length(handle)?;
         self.require_callable(f, &alloc::format!("{method} callback"))?;
         let is_map = method == "map";
-        let a_v = self.array_species_create(handle, if is_map { len } else { 0 })?;
+        let a_v = self.array_species_create_in(handle, if is_map { len } else { 0 }, true)?;
         self.root_hold(a_v);
         let kv_slot = self.root_slot(NanBox::undefined());
         let Some(a_h) = a_v.as_handle().map(Handle::from_raw) else {

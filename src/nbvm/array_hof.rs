@@ -502,7 +502,7 @@ impl Loop<'_> {
                 return Ok(None);
             }
         }
-        host_get(ctx, self.recv, key).map(Some)
+        host_get(ctx, self.recv, key, None).map(Some)
     }
 
     /// `Call(callbackfn, thisArg, « kValue, k, O »)`.
@@ -816,7 +816,7 @@ impl Loop<'_> {
         let n = match r.as_number() {
             Some(n) => n,
             None => {
-                let n = super::host_unary_any(ctx, crate::ast::UnaryOp::Plus, r)?;
+                let n = super::host_unary_any(ctx, crate::ast::UnaryOp::Plus, r, None)?;
                 n.as_number().unwrap_or(f64::NAN)
             }
         };

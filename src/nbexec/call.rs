@@ -364,6 +364,35 @@ impl Interp {
         }
     }
 
+    /// A callable proxy's `[[Call]]` (its `apply` trap, else the target's
+    /// call), once the proxy is checked live and callable.
+    fn proxy_apply(
+        &mut self,
+        target: Handle,
+        handler: Handle,
+        this_val: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
+        // `GetMethod(handler, "apply")` is a full `[[Get]]` — the handler may
+        // itself be a proxy (its `get` trap must observe the "apply" read) or
+        // expose the trap through an inherited accessor. A present but
+        // non-callable trap is a TypeError.
+        if let Some(trap) = self.proxy_trap(handler, "apply")? {
+            let arr = self.realm.new_array(args.to_vec());
+            let handler_box = NanBox::handle(handler.to_raw());
+            return self.call_audited(
+                trap,
+                handler_box,
+                &[
+                    NanBox::handle(target.to_raw()),
+                    this_val,
+                    NanBox::handle(arr.to_raw()),
+                ],
+            );
+        }
+        self.call_with_this(NanBox::handle(target.to_raw()), this_val, args)
+    }
+
     fn call_with_this_inner(
         &mut self,
         callee: NanBox,
@@ -399,7 +428,7 @@ impl Interp {
             && !self.realm.is_function_proto_intrinsic(handle)
         {
             let saved = core::mem::replace(&mut self.this_val, this_val);
-            let r = self.call_native(id, args);
+            let r = self.call_native_entry(id, args);
             self.this_val = saved;
             return r;
         }
@@ -476,30 +505,22 @@ impl Interp {
             if !self.is_callable_value(NanBox::handle(target.to_raw())) {
                 return Err(self.type_error("proxy is not a function"));
             }
-            // `GetMethod(handler, "apply")` is a full `[[Get]]` — the handler may
-            // itself be a proxy (its `get` trap must observe the "apply" read) or
-            // expose the trap through an inherited accessor. A present but
-            // non-callable trap is a TypeError.
-            if let Some(trap) = self.proxy_trap(handler, "apply")? {
-                let arr = self.realm.new_array(args.to_vec());
-                let handler_box = NanBox::handle(handler.to_raw());
-                return self.call_with_this(
-                    trap,
-                    handler_box,
-                    &[
-                        NanBox::handle(target.to_raw()),
-                        this_val,
-                        NanBox::handle(arr.to_raw()),
-                    ],
-                );
+            // (Called straight from a VM frame: an audited segment, see
+            // `crate::realm::host_roots` — the trap's lookup and call hold the
+            // proxy, `this` and the arguments, all rooted here, and the
+            // arguments' array, pinned.)
+            if self.realm.host_roots.activation(self.call_serial) != 0 {
+                let mut sc = self.audited_scope(&[callee, this_val]);
+                sc.realm.host_roots.vals.extend_from_slice(args);
+                return sc.proxy_apply(target, handler, this_val, args);
             }
-            return self.call_with_this(NanBox::handle(target.to_raw()), this_val, args);
+            return self.proxy_apply(target, handler, this_val, args);
         }
         // A built-in function dispatches directly, with the receiver available as
         // `this` (for the `Object.prototype.*` methods called via `.call`).
         if let Some(id) = self.realm.native_at(handle) {
             let saved = core::mem::replace(&mut self.this_val, this_val);
-            let r = self.call_native(id, args);
+            let r = self.call_native_entry(id, args);
             self.this_val = saved;
             return r;
         }
@@ -721,7 +742,7 @@ impl Interp {
                         name.as_str(),
                         "match" | "matchAll" | "search" | "replace" | "replaceAll" | "split"
                     ) && args.first().is_some_and(|a| self.is_object_value(*a));
-                let r = self.call_method(str_recv, &name, args);
+                let r = self.call_method_entry(str_recv, &name, args);
                 self.string_symbol_checked = false;
                 return Ok(r?.unwrap_or(NanBox::undefined()));
             }
@@ -1256,7 +1277,7 @@ impl Interp {
                 // rather than unwrapped to its boxed primitive.
                 self.array_proto_generic = true;
                 return Ok(self
-                    .call_method(this_eff, &name, args)?
+                    .call_method_entry(this_eff, &name, args)?
                     .unwrap_or(NanBox::undefined()));
             }
             // A readable static method: `target` is `[constructor, name]`. Route to the
@@ -2141,8 +2162,50 @@ impl Interp {
         r
     }
 
-    /// [`construct`](Self::construct) once numbered.
+    /// [`construct`](Self::construct) once numbered: an audited segment
+    /// (see `crate::realm::host_roots`) when it came straight from a VM frame
+    /// and the constructor is one whose user code is a VM constructor's body,
+    /// a bound constructor's target, a proxy's `construct` trap, or the
+    /// argument coercions of `Date` / `Error` / `RegExp` (each holding
+    /// nothing those calls' roots do not cover).
     fn construct_serial(&mut self, callee: NanBox, args: &[NanBox]) -> Result<NanBox, ExecError> {
+        if self.realm.host_roots.activation(self.call_serial) != 0 && self.audited_ctor(callee) {
+            let mut sc = self.audited_scope(&[callee]);
+            sc.realm.host_roots.vals.extend_from_slice(args);
+            return sc.construct_serial_body(callee, args);
+        }
+        self.construct_serial_body(callee, args)
+    }
+
+    /// Whether [`construct_serial`](Self::construct_serial) of `callee` may
+    /// run as an audited segment.
+    fn audited_ctor(&self, callee: NanBox) -> bool {
+        let Some(h) = callee.as_handle().map(Handle::from_raw) else {
+            return false;
+        };
+        if self.realm.is_vm_function(h) || self.realm.proxy_at(h).is_some() {
+            return true;
+        }
+        match self.realm.native_at(h) {
+            Some(id) => {
+                id == N_DATE
+                    || id == N_REGEXP
+                    || (N_ERROR_BASE..N_ERROR_BASE + ERROR_NAMES.len() as u16).contains(&id)
+                        && id != N_ERROR_BASE + 5
+            }
+            None => {
+                self.realm.bound_native_at(h).is_none()
+                    && self.realm.get_property(h, BOUND_TARGET).is_some()
+            }
+        }
+    }
+
+    /// The body of [`construct_serial`](Self::construct_serial).
+    fn construct_serial_body(
+        &mut self,
+        callee: NanBox,
+        args: &[NanBox],
+    ) -> Result<NanBox, ExecError> {
         // Enter the constructor's realm for the duration of the construction, so a
         // cross-realm `new other.Function(...)` (whose body scope, sloppy-`this`,
         // and generated intrinsics come from *its* realm's globals) and a
@@ -2162,8 +2225,20 @@ impl Interp {
         {
             // `new.target`: a `Reflect.construct`/`super()` one, else the callee.
             let new_target = self.reflect_new_target.take().unwrap_or(callee);
-            return crate::nbvm::construct_vm_function(self, &table, callee, args, new_target)
-                .map_err(super::vm_to_exec);
+            // Inside an audited segment (whose scope roots the callee and the
+            // arguments) the body may collect, `new.target` rooted too.
+            let collect = self.audited();
+            if !collect {
+                return crate::nbvm::construct_vm_function(self, &table, callee, args, new_target)
+                    .map_err(super::vm_to_exec);
+            }
+            self.audit_hold(new_target);
+            let pin = self.realm.alloc_segment_call();
+            let r =
+                crate::nbvm::construct_vm_function_in(self, &table, callee, args, new_target, true)
+                    .map_err(super::vm_to_exec);
+            self.realm.alloc_segment_resume(pin);
+            return r;
         }
         let realm = if !self.is_constructor_value(callee)
             // See `call_with_this`: a Proxy's `[[Construct]]` runs in the caller's
@@ -2208,7 +2283,7 @@ impl Interp {
                 let arr = self.realm.new_array(args.to_vec());
                 let target_box = NanBox::handle(target.to_raw());
                 let handler_box = NanBox::handle(handler.to_raw());
-                let result = self.call_with_this(
+                let result = self.call_audited(
                     trap,
                     handler_box,
                     &[target_box, NanBox::handle(arr.to_raw()), new_target],
@@ -2245,7 +2320,7 @@ impl Interp {
             if nt.as_handle() == callee.as_handle() {
                 self.reflect_new_target = Some(target);
             }
-            return self.construct(target, &all);
+            return self.construct_audited(target, &all);
         }
         // `new Object(value)` — Object is a namespace object (matched by native id,
         // so a cross-realm `Object` is also handled). With no/`null`/`undefined`
@@ -3752,7 +3827,14 @@ impl Interp {
         // are rooted across its calls (`sort_compare` makes them with
         // `call_cb`), so an allocating comparator may collect (see
         // `host_roots`). The caller roots what else it holds.
-        let mut sc = self.root_scope(&[cmp]);
+        // The default order's `ToString` of each object element runs as an
+        // audited segment (see `crate::realm::host_roots`): what it roots and
+        // makes per comparison is released after it (`sort_compare`).
+        let mut sc = if has_cmp || numeric {
+            self.root_scope(&[cmp])
+        } else {
+            self.audited_scope(&[cmp])
+        };
         for e in &elems {
             sc.hold(*e);
         }
@@ -3809,8 +3891,14 @@ impl Interp {
             // The default comparator orders by `ToString` of each element
             // (which invokes a user `toString`/`valueOf`, so abrupt
             // completions propagate), compared by code units.
-            let a = self.coerce_to_string_bytes(x)?;
-            let b = self.coerce_to_string_bytes(y)?;
+            // (Both strings are bytes once made: what the two coercions
+            // rooted or pinned is released.)
+            let mark = self.audit_mark();
+            let ab = self
+                .coerce_to_string_bytes(x)
+                .and_then(|a| Ok((a, self.coerce_to_string_bytes(y)?)));
+            self.audit_release(mark);
+            let (a, b) = ab?;
             match crate::wtf8::cmp_utf16(&a, &b) {
                 core::cmp::Ordering::Less => -1.0,
                 core::cmp::Ordering::Greater => 1.0,

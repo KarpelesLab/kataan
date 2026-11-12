@@ -9811,7 +9811,7 @@ impl crate::nbvm::VmHost for Interp {
         } else {
             crate::ast::BinaryOp::In
         };
-        self.binary(op, a, b).map_err(exec_to_host)
+        crate::nbvm::VmHost::binary(self, op, a, b)
     }
 
     fn binary(
@@ -9820,11 +9820,25 @@ impl crate::nbvm::VmHost for Interp {
         a: NanBox,
         b: NanBox,
     ) -> Result<NanBox, crate::nbvm::HostError> {
-        Interp::binary(self, op, a, b).map_err(exec_to_host)
+        // Not lent the frame (two primitives — BigInts, a Symbol — which run
+        // no user code, or a caller that cannot lend): no segment to audit.
+        if !self.realm.host_roots.crossing_linked() {
+            return Interp::binary(self, op, a, b).map_err(exec_to_host);
+        }
+        // An audited operation (see `host_roots`): the operands are the
+        // frame's (and rooted here), what the coercions return is rooted by
+        // `call_audited`, and nothing else is held across them.
+        self.audited_op(&[a, b], |i| Interp::binary(i, op, a, b))
+            .map_err(exec_to_host)
     }
 
     fn unary(&mut self, op: UnaryOp, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
-        Interp::unary(self, op, v).map_err(exec_to_host)
+        if !self.realm.host_roots.crossing_linked() {
+            return Interp::unary(self, op, v).map_err(exec_to_host);
+        }
+        // (Audited: one coercion of `v`.)
+        self.audited_op(&[v], |i| Interp::unary(i, op, v))
+            .map_err(exec_to_host)
     }
 
     fn global_exists(&mut self, name: &str) -> bool {
@@ -9845,43 +9859,9 @@ impl crate::nbvm::VmHost for Interp {
     }
 
     fn get_member(&mut self, recv: NanBox, key: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
-        let target = match recv.as_handle().map(Handle::from_raw) {
-            Some(h) if !self.realm.is_string_handle(h) && self.realm.symbol_at(h).is_none() => h,
-            _ => {
-                if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
-                    let k = self.realm.message_key_text(key);
-                    let m = Realm::nullish_access_message(recv, k.as_deref(), false);
-                    let m = self.new_str(&m);
-                    return Err(crate::nbvm::HostError::Thrown(
-                        self.make_error(N_TYPE_ERROR, Some(m)),
-                    ));
-                }
-                let wrapper = match self.coerce_to_object(recv).as_handle() {
-                    Some(b) => Handle::from_raw(b),
-                    None => return Err(crate::nbvm::HostError::Fault),
-                };
-                // A primitive: `[[Get]]` on its wrapper with the primitive
-                // itself as the receiver (a getter's `this`) — except a
-                // string's own `length` / index properties.
-                let key = self.vm_object_key(key).map_err(exec_to_host)?;
-                let name = self.member_key(key);
-                let string_own = recv
-                    .as_handle()
-                    .is_some_and(|h| self.realm.is_string_handle(Handle::from_raw(h)))
-                    && (name == "length"
-                        || name
-                            .parse::<u32>()
-                            .is_ok_and(|n| alloc::format!("{n}") == name));
-                if !string_own {
-                    return self
-                        .get_with_receiver(wrapper, &name, recv)
-                        .map_err(exec_to_host);
-                }
-                wrapper
-            }
-        };
-        let key = self.vm_object_key(key).map_err(exec_to_host)?;
-        self.read_member_value(target, key).map_err(exec_to_host)
+        // An audited operation (see `host_roots`): the key's coercion, then a
+        // getter or proxy trap, the primitive's wrapper rooted between them.
+        self.audited_op(&[recv, key], |i| i.vm_get_member(recv, key))
     }
 
     fn collect_garbage(&mut self, vm_roots: &[Handle]) {
@@ -9979,9 +9959,13 @@ impl crate::nbvm::VmHost for Interp {
             // A property of a number/boolean primitive: nothing own to delete.
             return Ok(true);
         };
-        let name = self.coerce_property_key(key).map_err(exec_to_host)?;
+        // (Audited: the key's coercion, then a proxy's `deleteProperty`
+        // trap; the object and key are the frame's.)
         let result = self
-            .delete_named_on_handle(h, &name)
+            .audited_op(&[obj, key], |i| {
+                let name = i.coerce_property_key(key)?;
+                i.delete_named_on_handle(h, &name)
+            })
             .map_err(exec_to_host)?;
         if strict && !result {
             let m = self.new_str("Cannot delete property of a non-configurable object");
@@ -10676,10 +10660,14 @@ impl crate::nbvm::VmHost for Interp {
         let Some(o) = obj.as_handle().map(Handle::from_raw) else {
             return Err(crate::nbvm::HostError::Fault);
         };
-        let key = self.vm_object_key(key).map_err(exec_to_host)?;
-        let name = self.member_key(key);
-        self.get_with_receiver(o, &name, receiver)
-            .map_err(exec_to_host)
+        // (Audited: the key's coercion, then a getter or trap; `super`'s
+        // base rooted with the frame's key and receiver.)
+        self.audited_op(&[obj, key, receiver], |i| {
+            let key = i.vm_object_key(key)?;
+            let name = i.member_key(key);
+            i.get_with_receiver(o, &name, receiver)
+        })
+        .map_err(exec_to_host)
     }
 
     fn set_with_receiver(
@@ -10693,16 +10681,18 @@ impl crate::nbvm::VmHost for Interp {
         let Some(o) = obj.as_handle().map(Handle::from_raw) else {
             return Err(crate::nbvm::HostError::Fault);
         };
-        let key = self.vm_object_key(key).map_err(exec_to_host)?;
-        let name = self.member_key(key);
-        #[cfg(all(feature = "module", feature = "std"))]
-        self.vm_super_set_namespace(o, &name, receiver)
+        // (Audited: the key's coercion, then a setter or trap.)
+        let (name, ok) = self
+            .audited_op(&[obj, key, value, receiver], |i| {
+                let key = i.vm_object_key(key)?;
+                let name = i.member_key(key);
+                #[cfg(all(feature = "module", feature = "std"))]
+                i.vm_super_set_namespace(o, &name, receiver)?;
+                let ok = i.proxy_set_bool(o, &name, value, receiver)?;
+                Ok((name, ok))
+            })
             .map_err(exec_to_host)?;
-        if !self
-            .proxy_set_bool(o, &name, value, receiver)
-            .map_err(exec_to_host)?
-            && strict
-        {
+        if !ok && strict {
             let e = self.type_error(&alloc::format!(
                 "Cannot assign to read only property '{}' of super",
                 crate::realm::key_display(&name)
@@ -10721,16 +10711,19 @@ impl crate::nbvm::VmHost for Interp {
         if matches!(source.unpack(), Unpacked::Undefined | Unpacked::Null) {
             return Ok(());
         }
-        let (Some(t), Some(src)) = (
-            target.as_handle().map(Handle::from_raw),
-            self.coerce_to_object(source)
-                .as_handle()
-                .map(Handle::from_raw),
-        ) else {
-            return Err(crate::nbvm::HostError::Fault);
-        };
-        self.copy_data_properties(t, src, excluded)
-            .map_err(exec_to_host)
+        // An audited operation (see `host_roots`): getters and proxy traps of
+        // the source, the target and source rooted, a primitive source's
+        // wrapper pinned and the keys held (`copy_data_properties`).
+        self.audited_op(&[target, source], |i| {
+            let (Some(t), Some(src)) = (
+                target.as_handle().map(Handle::from_raw),
+                i.coerce_to_object(source).as_handle().map(Handle::from_raw),
+            ) else {
+                return Err(ExecError::Unsupported("copy_data_properties"));
+            };
+            i.copy_data_properties(t, src, excluded)
+        })
+        .map_err(exec_to_host)
     }
 
     fn template_object(&mut self, site: u64, cooked: &[Option<Vec<u8>>], raw: &[String]) -> NanBox {
@@ -10738,7 +10731,10 @@ impl crate::nbvm::VmHost for Interp {
     }
 
     fn to_string(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
-        let b = self.coerce_to_string_bytes(v).map_err(exec_to_host)?;
+        // (Audited: one coercion of `v`, the frame's.)
+        let b = self
+            .audited_op(&[v], |i| i.coerce_to_string_bytes(v))
+            .map_err(exec_to_host)?;
         Ok(self.new_str_bytes(b))
     }
 
@@ -10748,7 +10744,10 @@ impl crate::nbvm::VmHost for Interp {
     }
 
     fn to_property_key(&mut self, v: NanBox) -> Result<NanBox, crate::nbvm::HostError> {
-        let k = self.coerce_property_key(v).map_err(exec_to_host)?;
+        // (Audited: one coercion of `v`, the frame's.)
+        let k = self
+            .audited_op(&[v], |i| i.coerce_property_key(v))
+            .map_err(exec_to_host)?;
         Ok(self.key_to_value(&k))
     }
 
@@ -10768,20 +10767,10 @@ impl crate::nbvm::VmHost for Interp {
         strict: bool,
     ) -> Result<(), crate::nbvm::HostError> {
         let saved = core::mem::replace(&mut self.strict, strict);
-        let r = match recv.as_handle().map(Handle::from_raw) {
-            Some(h) if !self.realm.is_string_handle(h) => self
-                .vm_object_key(key)
-                .and_then(|key| self.assign_member_value(h, key, value)),
-            _ if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) => {
-                let k = self.realm.message_key_text(key);
-                let m = Realm::nullish_access_message(recv, k.as_deref(), true);
-                let m = self.new_str(&m);
-                Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
-            }
-            _ => self
-                .coerce_property_key(key)
-                .and_then(|k| self.write_primitive_member_key(recv, &k, value)),
-        };
+        // An audited operation (see `host_roots`): the key's coercion, then a
+        // setter, proxy trap or a typed array's value coercion; the coerced
+        // key (and a primitive's wrapper) rooted between them.
+        let r = self.audited_op(&[recv, key, value], |i| i.vm_set_member(recv, key, value));
         self.strict = saved;
         r.map_err(exec_to_host)
     }
@@ -11263,6 +11252,74 @@ impl Interp {
     /// A VM-supplied member key: an *object* key runs its full ToPropertyKey
     /// here (once), so the member operation sees the resulting string/symbol
     /// key; any other key is passed through.
+    /// [`crate::nbvm::VmHost::get_member`]'s body.
+    fn vm_get_member(
+        &mut self,
+        recv: NanBox,
+        key: NanBox,
+    ) -> Result<NanBox, crate::nbvm::HostError> {
+        let target = match recv.as_handle().map(Handle::from_raw) {
+            Some(h) if !self.realm.is_string_handle(h) && self.realm.symbol_at(h).is_none() => h,
+            _ => {
+                if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) {
+                    let k = self.realm.message_key_text(key);
+                    let m = Realm::nullish_access_message(recv, k.as_deref(), false);
+                    let m = self.new_str(&m);
+                    return Err(crate::nbvm::HostError::Thrown(
+                        self.make_error(N_TYPE_ERROR, Some(m)),
+                    ));
+                }
+                let wrapper = match self.coerce_to_object(recv).as_handle() {
+                    Some(b) => Handle::from_raw(b),
+                    None => return Err(crate::nbvm::HostError::Fault),
+                };
+                // (Held across the key's coercion and a getter.)
+                self.audit_hold(NanBox::handle(wrapper.to_raw()));
+                // A primitive: `[[Get]]` on its wrapper with the primitive
+                // itself as the receiver (a getter's `this`) — except a
+                // string's own `length` / index properties.
+                let key = self.vm_object_key(key).map_err(exec_to_host)?;
+                let name = self.member_key(key);
+                let string_own = recv
+                    .as_handle()
+                    .is_some_and(|h| self.realm.is_string_handle(Handle::from_raw(h)))
+                    && (name == "length"
+                        || name
+                            .parse::<u32>()
+                            .is_ok_and(|n| alloc::format!("{n}") == name));
+                if !string_own {
+                    return self
+                        .get_with_receiver(wrapper, &name, recv)
+                        .map_err(exec_to_host);
+                }
+                wrapper
+            }
+        };
+        let key = self.vm_object_key(key).map_err(exec_to_host)?;
+        self.read_member_value(target, key).map_err(exec_to_host)
+    }
+
+    /// [`crate::nbvm::VmHost::set_member`]'s body (strictness set).
+    fn vm_set_member(&mut self, recv: NanBox, key: NanBox, value: NanBox) -> Result<(), ExecError> {
+        match recv.as_handle().map(Handle::from_raw) {
+            Some(h) if !self.realm.is_string_handle(h) => {
+                let key = self.vm_object_key(key)?;
+                // (A key made by the coercion, held across a setter or trap.)
+                self.audit_hold(key);
+                self.assign_member_value(h, key, value)
+            }
+            _ if matches!(recv.unpack(), Unpacked::Undefined | Unpacked::Null) => {
+                let k = self.realm.message_key_text(key);
+                let m = Realm::nullish_access_message(recv, k.as_deref(), true);
+                let m = self.new_str(&m);
+                Err(ExecError::Throw(self.make_error(N_TYPE_ERROR, Some(m))))
+            }
+            _ => self
+                .coerce_property_key(key)
+                .and_then(|k| self.write_primitive_member_key(recv, &k, value)),
+        }
+    }
+
     fn vm_object_key(&mut self, key: NanBox) -> Result<NanBox, ExecError> {
         let is_object_key = key.as_handle().is_some_and(|raw| {
             let h = Handle::from_raw(raw);
