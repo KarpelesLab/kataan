@@ -95,6 +95,8 @@ pub(super) struct TierUp {
     pub(super) site_pcs: Vec<(usize, u16)>,
     /// Per site: whether it is a `SetProp`'s.
     pub(super) site_writes: Vec<bool>,
+    /// Per site: its pc (`usize::MAX` for a site number no op has).
+    pub(super) site_pc: Vec<usize>,
     /// Per loop header (ascending): the `(site, is a write)` of the property
     /// sites between it and its last back-edge.
     pub(super) loops: Vec<(usize, Vec<(u16, bool)>)>,
@@ -251,13 +253,16 @@ impl TierUp {
     ) -> Self {
         let mut site_pcs = Vec::new();
         let mut site_writes = Vec::new();
+        let mut site_pc = Vec::new();
         for (pc, op) in ops.iter().enumerate() {
             if let GenericOp::GetProp { site, .. } | GenericOp::SetProp { site, .. } = *op {
                 site_pcs.push((pc, site));
                 if site_writes.len() <= site as usize {
                     site_writes.resize(site as usize + 1, false);
+                    site_pc.resize(site as usize + 1, usize::MAX);
                 }
                 site_writes[site as usize] = matches!(op, GenericOp::SetProp { .. });
+                site_pc[site as usize] = pc;
             }
         }
         // Each header's extent: up to its last back-edge.
@@ -292,6 +297,7 @@ impl TierUp {
         Self {
             site_pcs,
             site_writes,
+            site_pc,
             loops,
             baked,
             added,
@@ -631,12 +637,9 @@ impl JitProto {
         // (An inlined callee's site whose origin is unknown: no
         // recompilation would compile what its cache learned in.)
         if inl_warm_enabled()
-            && t.site_pcs
-                .iter()
-                .find(|&&(_, x)| x as usize == site)
-                .is_some_and(|&(pc, _)| {
-                    self.orig_pc(pc) == usize::MAX && self.inl_src(pc).is_none()
-                })
+            && t.site_pc.get(site).is_some_and(|&pc| {
+                pc != usize::MAX && self.orig_pc(pc) == usize::MAX && self.inl_src(pc).is_none()
+            })
         {
             return false;
         }
