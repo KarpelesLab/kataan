@@ -115,6 +115,12 @@ pub(super) struct TierRuntime {
     /// make native calls, as one on the register stack (see
     /// `crate::jit::call_seq::emit_act_ok`).
     pub(super) rooted_regs: usize,
+    /// How many compiled activations run off the register stack on a
+    /// register file no Rust frame roots ([`run_compiled_at`]'s and
+    /// [`run_generator_window`]'s full-stack fallback): while any does, a
+    /// runtime helper does not let the code it runs collect (see
+    /// [`window_rooted`]).
+    off_stack: u32,
     /// The loop header such an activation left at.
     resume: Option<usize>,
     /// Where the activation that just left continues: that header and its
@@ -192,6 +198,7 @@ impl Default for TierRuntime {
             exit_regs: 0,
             exit_jit: core::ptr::null(),
             rooted_regs: 0,
+            off_stack: 0,
             resume: None,
             left: None,
             poll_interval: if exit_stress() { 1 } else { POLL_INTERVAL },
@@ -225,6 +232,7 @@ impl TierRuntime {
     pub(super) fn reset_hosted(&mut self) -> bool {
         if self.base != 0
             || self.exit_regs != 0
+            || self.off_stack != 0
             || !self.exit_jit.is_null()
             || self.resume.is_some()
             || self.left.is_some()
@@ -390,6 +398,27 @@ pub(super) fn on_register_stack(ctx: &Ctx, regs: &[NanBox]) -> bool {
     a >= base && a + regs.len() * 8 <= top
 }
 
+/// Whether a runtime helper the running compiled activation called may let
+/// the code it runs (a getter, a setter, a `valueOf`, a proxy trap, a
+/// constructor) collect, the activation's register window being a GC root
+/// already: it is on the register stack, which every collection roots from
+/// its base to its top, or it is a register file its Rust caller keeps
+/// rooted (`TierRuntime::rooted_regs`: a running generator's), and compiled
+/// code keeps every live boxed value of the activation in that window
+/// across a `call` (machine registers hold only raw addresses, unboxed
+/// numbers and caches every `call` drops or re-checks). The collector moves
+/// nothing, so the window needs no update afterwards.
+///
+/// The helper then passes the VM operation an empty register file to lend
+/// (`nbvm::jit_lent`), which counts the activation as a published frame
+/// (`frames_published + 1 == call_depth` below it, as for an interpreted
+/// frame lending its registers) with nothing more to root. `false` while an
+/// activation runs off the register stack on a file no one roots.
+#[inline(always)]
+pub(super) fn window_rooted(ctx: &Ctx) -> bool {
+    ctx.jit_rt.off_stack == 0
+}
+
 /// The live part of the register stack — every compiled activation's window
 /// and native-call header — as GC roots (empty before first use).
 pub(super) fn stack_roots<'c>(ctx: &'c Ctx<'_>) -> &'c [NanBox] {
@@ -514,7 +543,10 @@ fn run_compiled_at(
         // (The rare full stack: such an activation never leaves. A body
         // whose window is larger than `regs` does not run: `call_frame_raw`
         // refuses it.)
-        jit.call_frame_raw(ctx_ptr, regs, entry)
+        ctx.jit_rt.off_stack += 1;
+        let raw = jit.call_frame_raw(ctx_ptr, regs, entry);
+        ctx.jit_rt.off_stack -= 1;
+        raw
     };
     if raw == Some(NanBox::jit_exit_bits()) {
         return Some(left_at(ctx, base, outer_base, saved));
@@ -920,7 +952,10 @@ fn run_generator_window(
         }
         raw
     } else {
-        jit.call_frame_raw(ctx_ptr, regs, pc)
+        ctx.jit_rt.off_stack += 1;
+        let raw = jit.call_frame_raw(ctx_ptr, regs, pc);
+        ctx.jit_rt.off_stack -= 1;
+        raw
     }
 }
 
@@ -2488,7 +2523,7 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             lit,
             kind,
         } => Some(
-            super::vm_str_eq_const(ctx, funcs, regs[*src as usize], lit, *kind)
+            super::vm_str_eq_const_in(ctx, funcs, regs[*src as usize], lit, *kind, Some(regs))
                 .map(|v| regs[*dst as usize] = v),
         ),
         Op::SwitchStr {
@@ -2753,9 +2788,10 @@ fn call_compiled(
 
 /// [`call_compiled`] with the arguments `args`, and the caller's registers
 /// `publish` published for the GC — or, for a call from a Rust frame that
-/// holds values the collector cannot see (`None`: a getter call from a
-/// property helper), not, which declines collection inside the callee exactly
-/// as the ordinary call from there does.
+/// holds values the collector cannot see (`None`), not, which declines
+/// collection inside the callee exactly as the ordinary call from there does.
+/// (A property helper's getter or setter call publishes an empty file when
+/// the compiled caller's window is rooted already: [`window_rooted`].)
 ///
 /// A body with a native-call entry is entered there ([`enter_native`]), as a
 /// compiled caller's call sequence enters it: its window is laid out on the
@@ -3235,13 +3271,16 @@ pub(super) fn unboxed_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>
 /// ordinary object (not host-exotic, not an array `length`) without the key
 /// as a cached own data slot — and that getter is a [`call_compiled`] target,
 /// call it directly, `this` the receiver, no arguments. `None`: do the
-/// ordinary read.
+/// ordinary read. `publish` is what [`call_compiled_with`] publishes for the
+/// getter's collections (`nbvm::jit_lent`'s: the compiled caller's window is
+/// rooted already, or `None`, no collection).
 pub(crate) fn compiled_getter(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     recv: NanBox,
     key: &str,
     cache: &mut crate::ic::PropertyCache,
+    publish: Option<&[NanBox]>,
 ) -> Option<Result<NanBox, VmError>> {
     // Only a site whose chain cache is armed on an accessor can hit one (and
     // only there is the repeated lookup below worth it).
@@ -3268,7 +3307,7 @@ pub(crate) fn compiled_getter(
                 .as_handle()
                 .is_some_and(|g| ctx.realm.is_vm_function(Handle::from_raw(g))) =>
         {
-            call_compiled_with(ctx, funcs, None, getter, recv, &[])
+            call_compiled_with(ctx, funcs, publish, getter, recv, &[])
         }
         _ => None,
     }
@@ -3287,6 +3326,7 @@ pub(crate) fn compiled_setter(
     key: &str,
     value: NanBox,
     cache: &crate::ic::PropertyCache,
+    publish: Option<&[NanBox]>,
 ) -> Option<Result<NanBox, VmError>> {
     if !cache.chain.as_ref().is_some_and(|c| c.accessor) {
         return None;
@@ -3301,7 +3341,7 @@ pub(crate) fn compiled_setter(
                 .as_handle()
                 .is_some_and(|s| ctx.realm.is_vm_function(Handle::from_raw(s))) =>
         {
-            call_compiled_with(ctx, funcs, None, setter, recv, &[value])
+            call_compiled_with(ctx, funcs, publish, setter, recv, &[value])
         }
         _ => None,
     }

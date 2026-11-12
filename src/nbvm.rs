@@ -7083,24 +7083,8 @@ pub(crate) const STR_EQ_LOOSE: u8 = 2;
 /// A string compares by contents; for `===` anything else is unequal; for
 /// `==` anything else but `undefined`/`null` (equal to no string) goes
 /// through the ordinary loose equality with the literal materialized (an
-/// object's ToPrimitive may run code and throw).
-// (Only the JIT's one-op path calls it; the interpreter arm takes `_in`.)
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
-fn vm_str_eq_const(
-    ctx: &mut Ctx,
-    funcs: &[FnProto],
-    v: NanBox,
-    lit: &[u8],
-    kind: u8,
-) -> Result<NanBox, VmError> {
-    vm_str_eq_const_in(ctx, funcs, v, lit, kind, None)
-}
-
-/// [`vm_str_eq_const`] from the VM frame whose register file is `regs`
-/// (lent to the loose comparison's coercion, the literal its operand).
+/// object's ToPrimitive may run code and throw). `regs`: the register file
+/// of the frame it runs for, lent to the comparison's coercion.
 fn vm_str_eq_const_in(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -7230,8 +7214,9 @@ fn vm_value_bin(
 
 /// [`call_closure`] of an accessor (or other callee) a VM operation runs on
 /// behalf of the frame whose register file is `regs` (`None`: a caller that
-/// is not a VM frame's operation, such as a JIT helper): that frame's
-/// registers published for the callee's collections, as a call's are.
+/// is not a VM frame's operation; empty: a JIT helper whose compiled caller's
+/// window is rooted already, see `jit_lent`): that frame's registers
+/// published for the callee's collections, as a call's are.
 #[inline(always)]
 fn call_closure_pub(
     ctx: &mut Ctx,
@@ -7722,9 +7707,10 @@ pub(crate) extern "C" fn jit_helper_get_prop(
     #[allow(unsafe_code)]
     let cache = unsafe { &mut *(cache as *mut PropertyCache) };
     // A VM getter with a compiled body is entered directly (`jit_tier`).
-    let r = match jit_tier::compiled_getter(ctx, funcs, NanBox::from_bits(obj), key, cache) {
+    let lent = jit_lent(ctx);
+    let r = match jit_tier::compiled_getter(ctx, funcs, NanBox::from_bits(obj), key, cache, lent) {
         Some(r) => r,
-        None => vm_get_prop(ctx, funcs, NanBox::from_bits(obj), key, cache, None),
+        None => vm_get_prop(ctx, funcs, NanBox::from_bits(obj), key, cache, lent),
     };
     match r {
         Ok(v) => v.to_bits(),
@@ -7827,6 +7813,7 @@ fn jit_set_prop_impl(
     #[allow(unsafe_code)]
     let cache = unsafe { &mut *(cache as *mut PropertyCache) };
     // A VM setter with a compiled body is entered directly (`jit_tier`).
+    let lent = jit_lent(ctx);
     let r = match jit_tier::compiled_setter(
         ctx,
         funcs,
@@ -7834,6 +7821,7 @@ fn jit_set_prop_impl(
         key,
         NanBox::from_bits(val),
         cache,
+        lent,
     ) {
         Some(r) => r.map(|_| ()),
         None => vm_set_prop_mode(
@@ -7844,7 +7832,7 @@ fn jit_set_prop_impl(
             NanBox::from_bits(val),
             cache,
             strict,
-            None,
+            lent,
         ),
     };
     match r {
@@ -7937,7 +7925,7 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
     {
         return v.to_bits();
     }
-    match vm_get_elem_from(ctx, funcs, recv, key, own_done, None) {
+    match vm_get_elem_from(ctx, funcs, recv, key, own_done, jit_lent(ctx)) {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
@@ -8004,7 +7992,7 @@ pub(crate) extern "C" fn jit_helper_set_elem(
         NanBox::from_bits(key),
         NanBox::from_bits(val),
         strict != 0,
-        None,
+        jit_lent(ctx),
     ) {
         Ok(()) => NanBox::undefined().to_bits(),
         Err(e) => {
@@ -8191,6 +8179,22 @@ pub(crate) extern "C" fn jit_arena(
     }
 }
 
+/// The register file a generic-JIT runtime helper lends the VM operation it
+/// runs (`regs` of `vm_add`, `vm_get_prop`, …): an empty one when the calling
+/// compiled activation's window is a GC root already
+/// ([`jit_tier::window_rooted`]), which lets the coercion, accessor, proxy
+/// trap or constructor the operation runs collect as from an interpreted
+/// frame; `None` (no collection inside) otherwise.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[inline(always)]
+fn jit_lent(ctx: &Ctx) -> Option<&'static [NanBox]> {
+    if jit_tier::window_rooted(ctx) {
+        Some(&[])
+    } else {
+        None
+    }
+}
+
 /// Turns a helper `Result` into a raw generic-JIT return word: the value's `NanBox`
 /// bits on success, or — on a thrown/faulting error — the value stashed in
 /// `ctx.jit_pending` and the reserved throw sentinel returned (mirrors the tail of
@@ -8231,13 +8235,14 @@ pub(crate) extern "C" fn jit_helper_arith(
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
+    let lent = jit_lent(ctx);
     let r = vm_arith(
         ctx,
         funcs,
         NanBox::from_bits(a),
         NanBox::from_bits(b),
         op as u8,
-        None,
+        lent,
     );
     jit_finish(ctx, r)
 }
@@ -8261,13 +8266,14 @@ pub(crate) extern "C" fn jit_helper_value_bin(
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
+    let lent = jit_lent(ctx);
     let r = vm_value_bin(
         ctx,
         funcs,
         NanBox::from_bits(a),
         NanBox::from_bits(b),
         op as u8,
-        None,
+        lent,
     );
     jit_finish(ctx, r)
 }
@@ -8285,7 +8291,8 @@ pub(crate) extern "C" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    let r = vm_lt(ctx, funcs, NanBox::from_bits(a), NanBox::from_bits(b), None);
+    let lent = jit_lent(ctx);
+    let r = vm_lt(ctx, funcs, NanBox::from_bits(a), NanBox::from_bits(b), lent);
     jit_finish(ctx, r)
 }
 
@@ -8371,7 +8378,8 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
-    match vm_add(ctx, funcs, av, bv, None) {
+    let lent = jit_lent(ctx);
+    match vm_add(ctx, funcs, av, bv, lent) {
         Ok(v) => v.to_bits(),
         Err(VmError::Thrown(val)) => {
             ctx.jit_pending = Some(val);
@@ -8416,7 +8424,8 @@ pub(crate) extern "C" fn jit_helper_call_native(
         let raw = unsafe { core::slice::from_raw_parts(argv, argc) };
         raw.iter().map(|&w| NanBox::from_bits(w)).collect()
     };
-    match vm_call_native(ctx, funcs, native as u16, &args, None) {
+    let lent = jit_lent(ctx);
+    match vm_call_native(ctx, funcs, native as u16, &args, lent) {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
