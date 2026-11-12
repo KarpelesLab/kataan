@@ -280,18 +280,18 @@ impl Realm {
     ) -> Handle {
         if 1 < self.limits.object_dictionary_threshold {
             let i = usize::from(is_async);
+            // (A layout whose one key is non-enumerable by layout alone: no
+            // attribute record to allocate, nor to free with the object.)
             let shape = match &self.gen_shapes[i] {
                 Some(s) if s.last_key() == Some(key) => Rc::clone(s),
                 _ => {
-                    let s = self.root_shape.transition(key);
+                    let s = crate::shape::Shape::implied_ctor_layout(&self.root_shape, key);
                     self.gen_shapes[i] = Some(Rc::clone(&s));
                     s
                 }
             };
-            if let Some(mut obj) =
-                crate::object::Object::with_data_hidden_prefix(shape, &[frame], 1)
+            if let Some(obj) = crate::object::Object::with_implied_ctor_attrs(shape, [frame], proto)
             {
-                obj.set_proto(proto);
                 let h = self.heap.alloc(Cell::Object(obj));
                 if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
                     marker.mark_grey(p);

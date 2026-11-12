@@ -109,6 +109,12 @@ pub(super) struct TierRuntime {
     /// activation — whose caller can continue it — may ask it to leave.
     exit_regs: usize,
     exit_jit: *const crate::jit::JitProto,
+    /// The register file off the register stack that the activation about
+    /// to be entered on it runs on, rooted by its Rust caller
+    /// ([`run_generator_body_in_place`]; `0` for none): its entry lets it
+    /// make native calls, as one on the register stack (see
+    /// `crate::jit::call_seq::emit_act_ok`).
+    pub(super) rooted_regs: usize,
     /// The loop header such an activation left at.
     resume: Option<usize>,
     /// Where the activation that just left continues: that header and its
@@ -177,6 +183,7 @@ impl Default for TierRuntime {
             main_realm: true,
             exit_regs: 0,
             exit_jit: core::ptr::null(),
+            rooted_regs: 0,
             resume: None,
             left: None,
             poll_interval: if exit_stress() { 1 } else { POLL_INTERVAL },
@@ -459,11 +466,10 @@ fn run_compiled_at(
         #[allow(unsafe_code)]
         let window = unsafe {
             core::ptr::copy_nonoverlapping(regs.as_ptr().cast::<u64>(), top, regs.len());
-            for i in regs.len()..n {
-                top.add(i).write(NanBox::undefined().to_bits());
-            }
+            let window = core::slice::from_raw_parts_mut(top.cast::<NanBox>(), n);
+            window[regs.len()..].fill(NanBox::undefined());
             (*st).top = top.add(n);
-            core::slice::from_raw_parts_mut(top.cast::<NanBox>(), n)
+            window
         };
         let outer = (ctx.jit_rt.exit_regs, ctx.jit_rt.exit_jit);
         let outer_leave = (ctx.jit_rt.leave_soon, ctx.jit_rt.leave_tries);
@@ -790,6 +796,35 @@ pub(super) fn run_generator_body(
     pc: usize,
     handlers: &mut alloc::vec::Vec<(usize, Reg)>,
 ) -> GenRun {
+    run_generator_body_with(ctx, funcs, jit, regs, pc, handlers, false)
+}
+
+/// [`run_generator_body`] on `regs` itself — a register file the caller
+/// keeps rooted (a running generator's, left in its frame cell: see
+/// `gen_fast::run_in_cell`) and sizes to the body's register count — rather
+/// than on a window of the register stack, so with no copy in and out. The
+/// callees' windows still go on the register stack.
+pub(super) fn run_generator_body_in_place(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    jit: &crate::jit::JitProto,
+    regs: &mut [NanBox],
+    pc: usize,
+    handlers: &mut alloc::vec::Vec<(usize, Reg)>,
+) -> GenRun {
+    run_generator_body_with(ctx, funcs, jit, regs, pc, handlers, true)
+}
+
+#[inline(always)]
+fn run_generator_body_with(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    jit: &crate::jit::JitProto,
+    regs: &mut [NanBox],
+    pc: usize,
+    handlers: &mut alloc::vec::Vec<(usize, Reg)>,
+    in_place: bool,
+) -> GenRun {
     let saved = ctx.jit_funcs.replace(funcs as *const [FnProto]);
     let outer_base = ctx.jit_rt.base;
     let base = ctx.jit_rt.handlers.len();
@@ -798,35 +833,22 @@ pub(super) fn run_generator_body(
         ctx.jit_rt.handlers.extend_from_slice(handlers);
     }
     let ctx_ptr = ctx as *mut Ctx as *mut core::ffi::c_void;
-    let st = stack_of(ctx);
-    let n = regs.len().max(jit.n_regs());
-    // SAFETY: as `run_compiled_at`.
-    #[allow(unsafe_code)]
-    let (top, room) = unsafe { ((*st).top, reserve(st, n)) };
-    let raw = if n <= room {
-        // SAFETY: as `run_compiled_at`: `top..top + n` is free stack memory,
-        // claimed for exactly this activation.
-        #[allow(unsafe_code)]
-        let window = unsafe {
-            core::ptr::copy_nonoverlapping(regs.as_ptr().cast::<u64>(), top, regs.len());
-            for i in regs.len()..n {
-                top.add(i).write(NanBox::undefined().to_bits());
-            }
-            (*st).top = top.add(n);
-            core::slice::from_raw_parts_mut(top.cast::<NanBox>(), n)
-        };
-        let raw = jit.call_frame_raw(ctx_ptr, window, pc);
-        if raw.is_some() {
-            regs.copy_from_slice(&window[..regs.len()]);
-        }
-        // SAFETY: as above; the activation is over.
+    let raw = if in_place {
+        let st = stack_of(ctx);
+        // (Room for the callees' windows, as a window's own reservation
+        // leaves: emitted call sequences that find none take their slow
+        // path.)
+        // SAFETY: as `run_compiled_at`.
         #[allow(unsafe_code)]
         unsafe {
-            (*st).top = top;
+            reserve(st, STACK_CHUNK);
         }
+        let outer = core::mem::replace(&mut ctx.jit_rt.rooted_regs, regs.as_ptr() as usize);
+        let raw = jit.call_frame_raw(ctx_ptr, regs, pc);
+        ctx.jit_rt.rooted_regs = outer;
         raw
     } else {
-        jit.call_frame_raw(ctx_ptr, regs, pc)
+        run_generator_window(ctx, jit, regs, pc, ctx_ptr)
     };
     let Some(raw) = raw else {
         ctx.jit_rt.handlers.truncate(base);
@@ -848,6 +870,47 @@ pub(super) fn run_generator_body(
     ctx.jit_rt.base = outer_base;
     ctx.jit_funcs = saved;
     GenRun::Exit(finish_raw(ctx, raw))
+}
+
+/// [`run_generator_body`]'s run on a window of the register stack: `regs`
+/// copied in, and back out after the run.
+#[inline(always)]
+fn run_generator_window(
+    ctx: &mut Ctx,
+    jit: &crate::jit::JitProto,
+    regs: &mut [NanBox],
+    pc: usize,
+    ctx_ptr: *mut core::ffi::c_void,
+) -> Option<u64> {
+    let st = stack_of(ctx);
+    let n = regs.len().max(jit.n_regs());
+    // SAFETY: as `run_compiled_at`.
+    #[allow(unsafe_code)]
+    let (top, room) = unsafe { ((*st).top, reserve(st, n)) };
+    if n <= room {
+        // SAFETY: as `run_compiled_at`: `top..top + n` is free stack memory,
+        // claimed for exactly this activation.
+        #[allow(unsafe_code)]
+        let window = unsafe {
+            core::ptr::copy_nonoverlapping(regs.as_ptr().cast::<u64>(), top, regs.len());
+            let window = core::slice::from_raw_parts_mut(top.cast::<NanBox>(), n);
+            window[regs.len()..].fill(NanBox::undefined());
+            (*st).top = top.add(n);
+            window
+        };
+        let raw = jit.call_frame_raw(ctx_ptr, window, pc);
+        if raw.is_some() {
+            regs.copy_from_slice(&window[..regs.len()]);
+        }
+        // SAFETY: as above; the activation is over.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*st).top = top;
+        }
+        raw
+    } else {
+        jit.call_frame_raw(ctx_ptr, regs, pc)
+    }
 }
 
 /// [`resume_generator`] for a frame that owns its handler stack: a
@@ -4665,6 +4728,7 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
         hosted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, hosted)),
         main_realm: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, main_realm)),
         vmfn_plain: i(crate::realm::Realm::jit_vmfn_plain_offset()),
+        rooted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, rooted_regs)),
         poll: poll_layout(),
     }
 }

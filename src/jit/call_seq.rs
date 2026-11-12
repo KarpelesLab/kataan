@@ -848,6 +848,11 @@ pub struct CallLayout {
     /// realm: whether a new VM closure needs no `[[Prototype]]` record
     /// (`bool`, `Realm::jit_vmfn_plain`).
     pub vmfn_plain: i32,
+    /// `ctx`: the address of a register file outside the register stack
+    /// that its Rust caller roots (a running generator's, see
+    /// `nbvm::gen_fast::run_in_cell`), for the activation entered on it
+    /// (`usize`, `0` for none; see `emit_act_ok`).
+    pub rooted: i32,
     /// What the back-edge poll's inline do-nothing test reads (see
     /// `emit_quiet_poll`).
     pub poll: PollLayout,
@@ -1545,18 +1550,28 @@ const FALLOFF_DELTA: i32 = {
 
 /// The interpreter's entry into a body: sets [`ACT_OK`] for the activation.
 /// Clobbers `rax` and `r10` only.
+///
+/// A register file off the register stack counts as rooted when it is the
+/// one its Rust caller announced (`CallLayout::rooted`).
 pub(crate) fn emit_act_ok(a: &mut X64Assembler, l: &CallLayout) {
     let bad = a.new_label();
+    let off_stack = a.new_label();
+    let depth = a.new_label();
     a.g_store_imm32(RBP, ACT_OK, (FALLOFF_DELTA << 8) | 1);
     a.g_load(r::R10, r::R15, l.stack);
     a.g_cmp_mem(r::RBX, r::R10, STACK_TOP);
-    a.g_jcc(cc::AE, bad);
+    a.g_jcc(cc::AE, off_stack);
     a.g_cmp_mem(r::RBX, r::R10, STACK_BASE);
-    a.g_jcc(cc::B, bad);
+    a.g_jcc(cc::B, off_stack);
+    a.bind(depth);
     a.g_load(r::RAX, r::R15, l.call_depth);
     a.g_test(r::RAX);
     a.g_jcc(cc::E, bad);
     a.g_store_imm32(RBP, ACT_OK, FALLOFF_DELTA << 8);
+    a.jmp(bad);
+    a.bind(off_stack);
+    a.g_cmp_mem(r::RBX, r::R15, l.rooted);
+    a.g_jcc(cc::E, depth);
     a.bind(bad);
 }
 

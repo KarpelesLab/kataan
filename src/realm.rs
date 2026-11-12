@@ -89,6 +89,10 @@ type TypedLengthStamp = (u64, u64, u32, u32, u32);
 /// `.length` gives up (the intrinsic concrete prototypes plus a few
 /// subclasses').
 const TYPED_LEN_PROTOS_MAX: usize = 16;
+
+/// The longest array whose `shift()` scans its elements for a hole to skip
+/// the prototype-chain proof (`Realm::array_shift_fast`).
+const SHIFT_SCAN_MAX: usize = 16;
 use alloc::vec::Vec;
 
 /// Hidden `[[PromiseState]]` slot for a **Promise subclass** instance
@@ -682,6 +686,12 @@ pub struct Realm {
     /// eval code and host callbacks see the enclosing activations (the legacy
     /// `fn.caller`). Rooted by the VM's safepoints.
     pub vm_callee_stack: Vec<NanBox>,
+    /// The frame cells of the sync generators whose compiled body runs on
+    /// the register file left in its cell (`nbvm::gen_fast`), innermost
+    /// last. Compiled code stores into those registers under no write
+    /// barrier, so every collection roots their values and re-remembers the
+    /// cells ([`Self::root_running_frames`]).
+    pub(crate) vm_gen_running: Vec<Handle>,
     /// What host built-ins hold across a re-entry into JS, and whether a
     /// nested VM run may collect (see [`host_roots`]). Its `vals` are roots
     /// of every collection.
@@ -1006,6 +1016,7 @@ impl Realm {
             str_special: false,
             str_int_memo: None,
             vm_callee_stack: Vec::new(),
+            vm_gen_running: Vec::new(),
             host_roots: host_roots::HostRoots::default(),
             vm_args_buf: Vec::new(),
             vm_callee_args: Vec::new(),
@@ -6553,6 +6564,19 @@ impl Realm {
     /// otherwise (the general algorithm then runs). O(1) amortized for a
     /// long array (see [`crate::cell::ArrayElems::shift_front`]).
     pub fn array_shift_fast(&mut self, handle: Handle) -> Option<NanBox> {
+        // A short array that never had side-table state (its `length` is its
+        // dense count and writable, its elements plain data properties) and
+        // holds no hole: every step reads and writes its own elements, so no
+        // prototype is consulted and nothing else needs proving.
+        if let Some(Cell::Array(a)) = self.heap.get(handle)
+            && !a.has_side_state()
+            && !a.has_proto_set()
+            && a.len() <= SHIFT_SCAN_MAX
+            && !a.iter().any(|v| v.is_hole())
+        {
+            let a = self.heap.get_mut(handle).and_then(Cell::as_array_mut)?;
+            return Some(a.shift_front().unwrap_or(NanBox::undefined()));
+        }
         let dense = self.heap.get(handle)?.as_array()?.len();
         if self.proto_index_accessor_dirty
             || self.array_has_index_overrides(handle)
@@ -8599,6 +8623,9 @@ impl Realm {
             || self.heap.len() >= self.gc_major_limit
             || (pinned.is_some() && self.gc_cycles % 4 == 3);
         let mut all: Vec<Handle> = roots.to_vec();
+        if !self.vm_gen_running.is_empty() {
+            self.root_running_frames(&mut all);
+        }
         if major {
             self.gc_roots(&mut all);
         } else {
@@ -8909,6 +8936,26 @@ impl Realm {
     /// [`gc::mark_with_ephemerons`] and [`gc::sweep_full`].
     pub fn collect(&mut self, roots: &[Handle]) -> Stats {
         self.collect_with(roots, &mut |_, _| {}, &mut |_| {})
+    }
+
+    /// The running generators' frame cells ([`Self::vm_gen_running`]) and
+    /// their registers' values as roots, and the cells back in the
+    /// remembered set: compiled code stores into those registers without a
+    /// barrier, so a cell a previous collection left clean may reference
+    /// young objects now.
+    #[cold]
+    fn root_running_frames(&mut self, out: &mut Vec<Handle>) {
+        for i in 0..self.vm_gen_running.len() {
+            let h = self.vm_gen_running[i];
+            out.push(h);
+            if let Some(Cell::Frame(f)) = self.heap.peek_mut(h) {
+                out.extend(
+                    f.regs
+                        .iter()
+                        .filter_map(|v| v.as_handle().map(Handle::from_raw)),
+                );
+            }
+        }
     }
 
     /// [`collect`](Self::collect) with two hooks for **weak-key tables the realm
