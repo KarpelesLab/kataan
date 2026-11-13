@@ -570,6 +570,17 @@ pub struct Realm {
     /// VM run nests a fresh `Ctx` (call depth 0) for every host→VM call, so
     /// recursion bouncing between the tiers is bounded here, not per context.
     pub vm_total_depth: usize,
+    /// [`Self::vm_callee_stack`]'s length (low half, kept by
+    /// [`Self::sync_callee_mark`] at every push and truncate), and in the
+    /// high half how many of the live activations are compiled ones a
+    /// native call entered without a native-call header
+    /// (`jit::call_seq::emit_headerless`, which counts them in place). A
+    /// native-call header records the whole word, and each realm entry the
+    /// high half with its argument start (`vm_callee_args`): an activation
+    /// whose recorded count is above its predecessor's has one that no
+    /// record shows — strict, so its legacy `f.caller` is `null` — between
+    /// them.
+    pub vm_mark: u64,
     /// The realm's single `%ThrowTypeError%` intrinsic — the poisoned accessor
     /// shared by `Function.prototype.caller`/`.arguments` and a strict
     /// `arguments` object's `callee`. There is exactly one per realm (ECMA-262
@@ -712,7 +723,8 @@ pub struct Realm {
     /// Each [`Self::vm_callee_stack`] activation's arguments, concatenated;
     /// `vm_callee_args[i]` is where activation `i`'s start (`fn.arguments`).
     pub vm_args_buf: Vec<NanBox>,
-    /// See [`Self::vm_args_buf`].
+    /// See [`Self::vm_args_buf`]; each start combined with the high half of
+    /// [`Self::vm_mark`] at the activation's entry.
     pub vm_callee_args: Vec<usize>,
     /// Spare bytecode-VM register windows, reused across activations — and
     /// across the nested VM runs of host callbacks, which is why they live
@@ -1035,6 +1047,20 @@ impl Realm {
         Self::with_limits(crate::limits::Limits::default())
     }
 
+    /// Notes [`Self::vm_callee_stack`]'s length in [`Self::vm_mark`].
+    #[inline]
+    pub fn sync_callee_mark(&mut self) {
+        self.vm_mark = (self.vm_mark & !0xffff_ffff) | self.vm_callee_stack.len() as u64;
+    }
+
+    /// The high half of [`Self::vm_mark`] (the hidden activations' count,
+    /// times 2^32), as a realm entry records it with its argument start.
+    #[inline]
+    #[must_use]
+    pub fn callee_hidden(&self) -> usize {
+        (self.vm_mark & !0xffff_ffff) as usize
+    }
+
     /// Creates an empty realm with the given resource [`Limits`](crate::limits::Limits).
     #[must_use]
     pub fn with_limits(limits: crate::limits::Limits) -> Self {
@@ -1161,6 +1187,7 @@ impl Realm {
             vm_fn_meta: Vec::new(),
             vm_fn_source: Vec::new(),
             vm_total_depth: 0,
+            vm_mark: 0,
             throw_type_error_intrinsic: None,
             array_proto_intrinsic: None,
             root_array_proto: None,

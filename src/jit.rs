@@ -80,6 +80,7 @@ pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, FnCallMemo, HDR_CONSTRUCT,
     IdentMemo, JitStack, MethodHelper, PollLayout, SuperTwiceHelper, header_argc,
+    inline_hframe_enabled,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use deopt::DeoptInfo;
@@ -92,7 +93,9 @@ pub use props::MethodSite;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use props::shape_word;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-pub use tierup::{MAX_GENERATION, cold_inl_enabled, inl_warm_enabled, with_entry_poll};
+pub use tierup::{
+    MAX_GENERATION, cold_inl_enabled, inl_warm_enabled, with_call_hdr, with_entry_poll,
+};
 
 /// `2^53` — the largest magnitude an `f64` represents every integer below
 /// exactly. The integer JIT keeps a value only while it stays within ±this; a
@@ -3401,6 +3404,16 @@ pub struct NativeEntries {
     exact: usize,
     /// For such a site in a pinned body, when this body pins too.
     exact_pinned: Option<usize>,
+    /// For such a site's headerless call (`call_seq::emit_enter`), which
+    /// leaves the arguments in the window's parameter registers already —
+    /// `None` for a body whose activation needs its header (a sloppy
+    /// ordinary function's, which the legacy `f.caller` / `f.arguments`
+    /// find; one reading `new.target`, which the entry takes from the
+    /// header; one with `try` regions).
+    direct: Option<usize>,
+    /// [`NativeEntries::direct`] for a caller pinned as this body is
+    /// (as [`NativeEntries::exact_pinned`]).
+    direct_pinned: Option<usize>,
     /// The bytes the call sequence reserves above the register window for
     /// the inlined calls' headers (see `emit_native_entry`'s `inline_ok`).
     room: usize,
@@ -4949,7 +4962,7 @@ impl JitProto {
             &call_args,
             &osr_entries,
             &call_sites,
-            (proto.n_params, proto.n_captures, new_target),
+            (proto.n_params, proto.n_captures, new_target, proto.legacy),
             &inline_closures,
             pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
             &no_spec_body,
@@ -5324,6 +5337,33 @@ impl JitProto {
         Some((self.func.code_ptr() + off) as u64)
     }
 
+    /// The way a call sequence of `site` keeps for this body, function key
+    /// `key` (see [`CallTarget`]): its native-call entry, and its direct
+    /// entry when the site may call it headerless (`call_seq::emit_enter`:
+    /// a site passing exactly the parameter count, all of which fit in the
+    /// window). `None` if the body has no native-call entry.
+    #[must_use]
+    pub fn call_target(&self, key: u64, site: &CallSite) -> Option<CallTarget> {
+        let code = self.native_entry_for(site)?;
+        let frame = self.native_frame_bytes();
+        let mut t = CallTarget::plain(key, code, frame);
+        let e = self.native_entry?;
+        if call_seq::headerless_enabled()
+            && usize::try_from(site.entry_argc).ok() == Some(self.n_params)
+            && self.n_params <= self.n_regs
+        {
+            let off = match (e.direct_pinned, e.direct) {
+                (Some(p), _) if site.entry_pinned => Some(p),
+                (_, d) => d,
+            };
+            if let Some(off) = off {
+                t.hl_code = (self.func.code_ptr() + off) as u64;
+                t.hl_frame = frame;
+            }
+        }
+        Some(t)
+    }
+
     /// Whether `code` is one of this body's native-call entry addresses.
     fn is_native_entry(&self, code: u64) -> bool {
         let Some(e) = self.native_entry else {
@@ -5363,9 +5403,8 @@ impl JitProto {
                 {
                     continue;
                 }
-                if let Some(code) = new.native_entry_for(c) {
-                    c.targets[w].code = code;
-                    c.targets[w].frame_bytes = new.native_frame_bytes();
+                if let Some(t) = new.call_target(t.key, c) {
+                    c.targets[w] = t;
                 }
             }
         }
@@ -5502,6 +5541,16 @@ pub struct X64Assembler {
     /// own header while they are all still pending.
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     inline_ctx: Option<call_seq::InlineCtx>,
+    /// The body's frame slot where a headerless call keeps the register
+    /// stack's top it restores (`call_seq::emit_enter`); `None`: the body
+    /// makes no headerless calls.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) call_saved_top: Option<i32>,
+    /// Whether the call op being emitted makes only calls with a header
+    /// (its callee feedback names only callees that need one: see
+    /// `tierup::CALL_HDR`).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) call_hdr_only: bool,
     /// Out-of-line code moved off the hot path ([`cold_end`](Self::cold_end)),
     /// placed after everything else by [`finish`](Self::finish).
     #[cfg_attr(
@@ -8635,7 +8684,7 @@ impl JitFunction {
         call_args: &[Vec<u16>],
         osr_entries: &[usize],
         call_sites: &[*const CallSite],
-        (n_params, n_caps, new_target): (usize, usize, Option<usize>),
+        (n_params, n_caps, new_target, legacy): (usize, usize, Option<usize>, bool),
         inline_closures: &[bool],
         pc_orig: &[u32],
         no_spec: &[usize],
@@ -9890,9 +9939,12 @@ impl JitFunction {
                 return None;
             }
         }
-        // (The last 16 bytes: the caller's `r12`/`r13`, see `pin`.)
+        // (The last 16 bytes: the caller's `r12`/`r13`, see `pin`; the 8
+        // above them: a headerless call's saved stack top, see
+        // `call_seq::emit_enter`.)
         let frame = ((24
             + 16
+            + 8
             + max_argc as u32 * 8
             + (num.frame_slots()
                 + 4 * rc.ways
@@ -9919,6 +9971,26 @@ impl JitFunction {
         a.code.reserve(ops.len() * 1024 + 4096);
         a.fixups.reserve(ops.len() * 48 + 256);
         a.set_rbx_frame(true);
+        a.call_saved_top = call_seq::headerless_enabled().then(|| -(frame as i32));
+        // Per body op: whether its call sites make only calls with a header
+        // (`tierup::CALL_HDR`, by own pc; an inlined callee's sites try a
+        // headerless call).
+        let call_hdr: Vec<bool> = {
+            let by_own = tierup::CALL_HDR.with(|c| c.borrow().clone());
+            (0..ops.len())
+                .map(|i| {
+                    let own = if pc_orig.is_empty() {
+                        Some(i)
+                    } else {
+                        pc_orig
+                            .get(i)
+                            .filter(|&&p| p != u32::MAX)
+                            .map(|&p| p as usize)
+                    };
+                    own.and_then(|o| by_own.get(o).copied()).unwrap_or(false)
+                })
+                .collect()
+        };
         // Per polymorphic method site's first way, its later ways' guards'
         // entries for a callee its memos identified (`call_seq::InlineEmit::
         // poly_direct`), and per such later way, its entry: outside
@@ -10634,6 +10706,11 @@ impl JitFunction {
         let has_handlers = ops
             .iter()
             .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
+        // The direct entries a headerless call enters (`NativeEntries::
+        // direct`): not for a body whose activation needs its header.
+        let native_direct = (call_seq::headerless_enabled() && !legacy && new_target.is_none())
+            .then(|| a.new_label());
+        let native_direct_pinned = native_direct.and_then(|_| a.pinned().then(|| a.new_label()));
         let native_room = if has_inline && !has_handlers {
             inl_slots.levels() * (call_seq::FRAME_HEADER + inl_slots.max_argc) * 8
         } else {
@@ -10659,6 +10736,7 @@ impl JitFunction {
             new_target,
             (native, native_rust),
             (native_exact, native_exact_pinned),
+            (native_direct, native_direct_pinned),
             labels[0],
             (native_room > 0).then_some((
                 call_seq::InlineOk {
@@ -10804,6 +10882,7 @@ impl JitFunction {
             }
             num.set_plain_lazy(a.plain_lazy_now());
             a.set_inline_ctx(inl_ctx.get(op_idx).cloned().flatten());
+            a.call_hdr_only = call_hdr.get(op_idx).copied().unwrap_or(false);
             a.set_recv_survive(survive.get(op_idx).cloned().unwrap_or_default(), layout);
             // (The body, a speculative region's plain copy, or its integer
             // version: `numeric::NumGen::schedule`.)
@@ -17444,6 +17523,7 @@ impl JitFunction {
                 &mut a,
                 helpers.handler_frame as usize as u64,
                 native_rust,
+                &helpers.call_layout,
             );
             a.set_pin(pinned);
             a.bind(stub);
@@ -17464,6 +17544,31 @@ impl JitFunction {
         }
         want.push(exact.unwrap_or(entries.0));
         want.push(exact_pinned.or(exact).unwrap_or(entries.0));
+        let (direct, direct_pinned) = if !uses_handlers {
+            (native_direct, native_direct_pinned)
+        } else if call_seq::inline_hframe_enabled() {
+            // A headerless call's entries into a body with `try` regions:
+            // its direct entries inside a handler segment of their own
+            // (the context in `r15`, as the direct entry has it).
+            let pinned = a.pin();
+            a.set_pin(None);
+            let wrap = |a: &mut X64Assembler, inner: Option<Label>| {
+                inner.map(|inner| {
+                    let w = a.new_label();
+                    a.bind(w);
+                    call_seq::emit_handler_entry_inline(a, &helpers.call_layout, inner, false);
+                    w
+                })
+            };
+            let d = wrap(&mut a, native_direct);
+            let dp = wrap(&mut a, native_direct_pinned);
+            a.set_pin(pinned);
+            (d, dp)
+        } else {
+            (None, None)
+        };
+        want.push(direct.unwrap_or(entries.0));
+        want.push(direct_pinned.or(direct).unwrap_or(entries.0));
         let marks: Vec<(&'static str, Option<usize>)> =
             a.dbg_marks.iter().map(|m| (m.1, m.2)).collect();
         // (The profiling labels between the entries and the exact entries
@@ -17475,7 +17580,7 @@ impl JitFunction {
         {
             return None;
         }
-        let (code, at) = a.finish_reporting(&want, 2..want.len() - 2);
+        let (code, at) = a.finish_reporting(&want, 2..want.len() - 4);
         let f = Self::from_code(&code);
         if let (Some(path), Some(f)) = (opmap, f.as_ref()) {
             use std::io::Write as _;
@@ -17526,8 +17631,10 @@ impl JitFunction {
         let entries = NativeEntries {
             general: at[0],
             rust: at[1],
-            exact: at[n - 2],
-            exact_pinned: exact_pinned.map(|_| at[n - 1]),
+            exact: at[n - 4],
+            exact_pinned: exact_pinned.map(|_| at[n - 3]),
+            direct: direct.map(|_| at[n - 2]),
+            direct_pinned: direct_pinned.map(|_| at[n - 1]),
             room: native_room,
         };
         f.map(|f| (f, entries, spec_heads))

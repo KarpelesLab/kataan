@@ -1181,21 +1181,24 @@ fn recompile(
         alloc::vec::Vec::new()
     };
     let prev = INLINED_WARM.with(|iw| core::mem::replace(&mut *iw.borrow_mut(), inl));
+    let hdr = call_hdr_pcs(funcs, &hints);
     let new = crate::jit::typed::with_own_kinds(kinds, || {
         crate::jit::with_entry_poll(!cold.is_empty(), || {
-            crate::jit::JitProto::compile_generic_respec(
-                proto,
-                &super::jit_generic_helpers(),
-                &warm,
-                &|f| {
-                    funcs
-                        .get(f as usize)
-                        .is_some_and(|p| !(p.is_async && !p.is_generator))
-                },
-                &|pc, _| inline_candidate(funcs, id, &hints, pc),
-                &old.spec_off(),
-                &old.int_demote(),
-            )
+            crate::jit::with_call_hdr(hdr, || {
+                crate::jit::JitProto::compile_generic_respec(
+                    proto,
+                    &super::jit_generic_helpers(),
+                    &warm,
+                    &|f| {
+                        funcs
+                            .get(f as usize)
+                            .is_some_and(|p| !(p.is_async && !p.is_generator))
+                    },
+                    &|pc, _| inline_candidate(funcs, id, &hints, pc),
+                    &old.spec_off(),
+                    &old.int_demote(),
+                )
+            })
         })
     });
     INLINED_WARM.with(|iw| *iw.borrow_mut() = prev);
@@ -2872,7 +2875,10 @@ pub(super) fn call_compiled_with(
     let callee_mark = ctx.realm.vm_callee_stack.len();
     let args_mark = ctx.realm.vm_args_buf.len();
     ctx.realm.vm_callee_stack.push(callee_val);
-    ctx.realm.vm_callee_args.push(args_mark);
+    ctx.realm.sync_callee_mark();
+    ctx.realm
+        .vm_callee_args
+        .push(args_mark | ctx.realm.callee_hidden());
     ctx.realm.vm_args_buf.extend_from_slice(args);
     // The callee's register file: parameters, captures, `this` (undefined).
     let mut cregs: alloc::vec::Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
@@ -2904,6 +2910,7 @@ pub(super) fn call_compiled_with(
     proto.tier.bump();
     let outcome = run_compiled_fresh(ctx, funcs, &jit, &mut cregs);
     ctx.realm.vm_callee_stack.truncate(callee_mark);
+    ctx.realm.sync_callee_mark();
     ctx.realm.vm_callee_args.truncate(callee_mark);
     ctx.realm.vm_args_buf.truncate(args_mark);
     ctx.frames_published = published;
@@ -3022,7 +3029,7 @@ unsafe fn enter_native(
         }
         hdr.write((*st).frames as u64);
         hdr.add(1).write(callee.to_bits());
-        hdr.add(2).write(ctx.realm.vm_callee_stack.len() as u64);
+        hdr.add(2).write(ctx.realm.vm_mark);
         hdr.add(3).write(argc as u64);
         hdr.add(4).write(NanBox::undefined().to_bits());
         let argv = hdr.add(FRAME_HEADER);
@@ -3220,7 +3227,10 @@ impl CompiledCallback {
         let callee_mark = ctx.realm.vm_callee_stack.len();
         let args_mark = ctx.realm.vm_args_buf.len();
         ctx.realm.vm_callee_stack.push(self.callee);
-        ctx.realm.vm_callee_args.push(args_mark);
+        ctx.realm.sync_callee_mark();
+        ctx.realm
+            .vm_callee_args
+            .push(args_mark | ctx.realm.callee_hidden());
         ctx.realm.vm_args_buf.extend_from_slice(args);
         // The register file: parameters (missing ones `undefined`), captures,
         // `this`, the rest `undefined`.
@@ -3243,6 +3253,7 @@ impl CompiledCallback {
         proto.tier.bump();
         let outcome = run_compiled_fresh(ctx, funcs, &self.jit, regs);
         ctx.realm.vm_callee_stack.truncate(callee_mark);
+        ctx.realm.sync_callee_mark();
         ctx.realm.vm_callee_args.truncate(callee_mark);
         ctx.realm.vm_args_buf.truncate(args_mark);
         ctx.frames_published = published;
@@ -4012,7 +4023,7 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     let Some(jit) = direct_jit(ctx, proto, id) else {
         return;
     };
-    let Some(code) = jit.native_entry_for(site) else {
+    let Some(target) = jit.call_target(u64::from(fid) | ((n_caps as u64) << 32), site) else {
         return;
     };
     // (An inlining body's window is larger than the function's own.)
@@ -4021,11 +4032,7 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     }
     // The compiled body stays alive for the context's life (`direct` and the
     // JIT cache never drop one), so the raw entry address does too.
-    site.fill(crate::jit::CallTarget {
-        key: u64::from(fid) | ((n_caps as u64) << 32),
-        code,
-        frame_bytes: jit.native_frame_bytes(),
-    });
+    site.fill(target);
 }
 
 /// The call sequence's callee identification (`crate::jit::CalleeHelper`): a VM
@@ -4248,14 +4255,10 @@ fn fill_construct_site(ctx: &mut Ctx, ctor: NanBox, site: &mut CallSite) {
     if let Some(proto) = funcs.get(fid as usize)
         && n_caps >= proto.n_captures
         && let Some(jit) = construct_target(proto)
-        && let Some(code) = jit.native_entry_for(site)
+        && let Some(target) = jit.call_target(u64::from(fid) | ((n_caps as u64) << 32), site)
         && jit.n_regs() >= proto.n_regs
     {
-        site.fill(crate::jit::CallTarget {
-            key: u64::from(fid) | ((n_caps as u64) << 32),
-            code,
-            frame_bytes: jit.native_frame_bytes(),
-        });
+        site.fill(target);
     }
 }
 
@@ -4843,15 +4846,20 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
         call_depth: i(offset_of!(Ctx<'static>, call_depth)),
         realm: i(offset_of!(Ctx<'static>, realm)),
         total_depth: i(offset_of!(crate::realm::Realm, vm_total_depth)),
+        hl: i(offset_of!(crate::realm::Realm, vm_mark)),
         max_depth: i(offset_of!(crate::realm::Realm, limits)
             + offset_of!(crate::limits::Limits, max_call_depth)),
         multi_realm: i(offset_of!(crate::realm::Realm, multi_realm)),
         str_special: i(offset_of!(crate::realm::Realm, str_special)),
-        callee_len: i(offset_of!(crate::realm::Realm, vm_callee_stack) + len_off),
+        callee_len: i(offset_of!(crate::realm::Realm, vm_mark)),
         hosted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, hosted)),
         main_realm: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, main_realm)),
         vmfn_plain: i(crate::realm::Realm::jit_vmfn_plain_offset()),
         rooted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, rooted_regs)),
+        handlers_len: i(offset_of!(Ctx<'static>, jit_rt)
+            + offset_of!(TierRuntime, handlers)
+            + len_off),
+        handlers_base: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, base)),
         poll: poll_layout(),
     }
 }
@@ -4921,18 +4929,22 @@ fn vec_len_offset(v: &[NanBox]) -> usize {
 /// The realm's activation stack (`vm_callee_stack`, `vm_callee_args`,
 /// `vm_args_buf`) merged with the native-call headers on the register stack —
 /// the full innermost-last list of VM activations the legacy `f.caller` /
-/// `f.arguments` read. `None` when no native call is in flight (the realm's
-/// stacks are already the whole list).
+/// `f.arguments` read, with each one's recorded count of activations no
+/// record shows (`Realm::vm_mark`). `None` when no native call is in flight
+/// (the realm's stacks are already the whole list).
+#[allow(clippy::type_complexity)]
 pub(super) fn callee_view(
     ctx: &Ctx,
 ) -> Option<(
     alloc::vec::Vec<NanBox>,
     alloc::vec::Vec<usize>,
     alloc::vec::Vec<NanBox>,
+    alloc::vec::Vec<u32>,
 )> {
     let st = STACK.with(|o| o.stack);
-    // Native activations, innermost first: (stack mark, callee, arguments).
-    let mut natives: alloc::vec::Vec<(usize, NanBox, &[NanBox])> = alloc::vec::Vec::new();
+    // Native activations, innermost first: (stack mark, callee, arguments,
+    // hidden count).
+    let mut natives: alloc::vec::Vec<(usize, NanBox, &[NanBox], u32)> = alloc::vec::Vec::new();
     // SAFETY: this thread's stack; every header below `top` was written by a
     // call sequence and is linked from `frames`. No compiled code runs now.
     #[allow(unsafe_code)]
@@ -4940,10 +4952,13 @@ pub(super) fn callee_view(
         let mut f = (*st).frames;
         while !f.is_null() {
             let argc = crate::jit::header_argc(*f.add(3));
+            // (The mark and the count share a word: `Realm::vm_mark`.)
+            let mark = *f.add(2);
             natives.push((
-                *f.add(2) as usize,
+                (mark & 0xffff_ffff) as usize,
                 NanBox::from_bits(*f.add(1)),
                 core::slice::from_raw_parts(f.add(FRAME_HEADER).cast::<NanBox>(), argc),
+                (mark >> 32) as u32,
             ));
             f = (*f) as *mut u64;
         }
@@ -4957,29 +4972,36 @@ pub(super) fn callee_view(
     let mut callees = alloc::vec::Vec::new();
     let mut starts = alloc::vec::Vec::new();
     let mut buf = alloc::vec::Vec::new();
-    let mut push = |c: NanBox, a: &[NanBox]| {
+    let mut hidden = alloc::vec::Vec::new();
+    let mut push = |c: NanBox, a: &[NanBox], h: u32| {
         callees.push(c);
         starts.push(buf.len());
         buf.extend_from_slice(a);
+        hidden.push(h);
     };
+    // (A realm entry's argument start, without its hidden count.)
+    let start_of = |w: usize| w & 0xffff_ffff;
     let mut k = 0;
     for i in 0..=n {
         // A native activation whose call saw `i` realm entries sits above them.
         while k < natives.len() && (natives[k].0 <= i || i == n) {
-            push(natives[k].1, natives[k].2);
+            push(natives[k].1, natives[k].2, natives[k].3);
             k += 1;
         }
         if i < n {
-            let start = r.vm_callee_args[i];
+            let w = r.vm_callee_args[i];
             let end = r
                 .vm_callee_args
                 .get(i + 1)
-                .copied()
-                .unwrap_or(r.vm_args_buf.len());
-            push(r.vm_callee_stack[i], &r.vm_args_buf[start..end]);
+                .map_or(r.vm_args_buf.len(), |&e| start_of(e));
+            push(
+                r.vm_callee_stack[i],
+                &r.vm_args_buf[start_of(w)..end],
+                (w as u64 >> 32) as u32,
+            );
         }
     }
-    Some((callees, starts, buf))
+    Some((callees, starts, buf, hidden))
 }
 
 /// Whether the function `proto` may be entered by [`call_compiled`]: a plain
@@ -5282,6 +5304,36 @@ fn could_inline(funcs: &[FnProto], key: u64) -> bool {
 fn inline_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INLINE").is_none_or(|v| v != "0"))
+}
+
+/// Per pc of a body whose call sites' callee feedback is `hints`: whether
+/// every callee the site called needs a native-call header (`crate::jit::
+/// with_call_hdr`): a sloppy ordinary function (the legacy `f.caller` /
+/// `f.arguments` find its activation by it), one reading `new.target`, or
+/// one with `try` regions (entered through its handler-segment entry).
+pub(super) fn call_hdr_pcs(
+    funcs: &[FnProto],
+    hints: &[crate::ic::CalleeHint],
+) -> alloc::vec::Vec<bool> {
+    use crate::ic::CalleeHint;
+    let needs = |fid: u32| {
+        funcs.get(fid as usize).is_some_and(|p| {
+            p.legacy
+                || p.ops.iter().any(|o| {
+                    matches!(o, Op::LoadNewTarget { .. })
+                        || (!crate::jit::inline_hframe_enabled()
+                            && matches!(o, Op::PushHandler { .. } | Op::PopHandler))
+                })
+        })
+    };
+    hints
+        .iter()
+        .map(|h| match h {
+            CalleeHint::One(k) => needs(*k as u32),
+            CalleeHint::Poly(_) => h.poly_fns().into_iter().all(needs),
+            CalleeHint::None | CalleeHint::Mixed => false,
+        })
+        .collect()
 }
 
 /// The pcs of `proto`'s call sites with no callee feedback in `hints` (none

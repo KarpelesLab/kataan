@@ -5941,7 +5941,10 @@ fn call_with(
     ctx.realm
         .vm_callee_stack
         .push(ctx.pending_callee.unwrap_or(NanBox::undefined()));
-    ctx.realm.vm_callee_args.push(args_mark);
+    ctx.realm.sync_callee_mark();
+    ctx.realm
+        .vm_callee_args
+        .push(args_mark | ctx.realm.callee_hidden());
     ctx.realm.vm_args_buf.extend_from_slice(args);
     // The running realm follows the activation (one flag test while only one
     // realm exists): what the host does on this function's behalf — the
@@ -5958,6 +5961,7 @@ fn call_with(
         with_host(ctx, |h| h.leave_fn_realm());
     }
     ctx.realm.vm_callee_stack.truncate(callee_mark);
+    ctx.realm.sync_callee_mark();
     ctx.realm.vm_callee_args.truncate(callee_mark);
     ctx.realm.vm_args_buf.truncate(args_mark);
     ctx.frames_published = published;
@@ -5985,8 +5989,11 @@ fn note_tail_legacy(
     if let Some(c) = callee
         && funcs.get(id).is_some_and(|p| p.legacy)
     {
-        ctx.realm.vm_callee_args.push(ctx.realm.vm_args_buf.len());
+        ctx.realm
+            .vm_callee_args
+            .push(ctx.realm.vm_args_buf.len() | ctx.realm.callee_hidden());
         ctx.realm.vm_callee_stack.push(c);
+        ctx.realm.sync_callee_mark();
         ctx.realm.vm_args_buf.extend_from_slice(args);
     }
 }
@@ -6480,19 +6487,22 @@ fn ensure_jit(
             // (The running frame's element access feedback: its caches are
             // out of the function's tier while it runs.)
             let kinds = ic.map(elem_kinds_of).unwrap_or_default();
+            let hdr = jit_tier::call_hdr_pcs(funcs, &hints);
             crate::jit::typed::with_own_kinds(kinds, || {
                 crate::jit::with_entry_poll(!cold.is_empty(), || {
-                    crate::jit::JitProto::compile_generic_inlining(
-                        &funcs[id],
-                        &jit_generic_helpers(),
-                        &warm,
-                        &|f| {
-                            funcs
-                                .get(f as usize)
-                                .is_some_and(|p| !(p.is_async && !p.is_generator))
-                        },
-                        &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
-                    )
+                    crate::jit::with_call_hdr(hdr, || {
+                        crate::jit::JitProto::compile_generic_inlining(
+                            &funcs[id],
+                            &jit_generic_helpers(),
+                            &warm,
+                            &|f| {
+                                funcs
+                                    .get(f as usize)
+                                    .is_some_and(|p| !(p.is_async && !p.is_generator))
+                            },
+                            &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
+                        )
+                    })
                 })
             })
             .map(|mut j| {
@@ -7423,7 +7433,7 @@ fn vm_get_prop(
                 && let Some((id, _)) = ctx.realm.vm_function(handle)
                 && funcs.get(id as usize).is_some_and(|p| p.legacy)
             {
-                let (stack, starts, buf) = legacy_activations(ctx);
+                let (stack, starts, buf, _) = legacy_activations(ctx);
                 let Some(i) = stack
                     .iter()
                     .rposition(|c| c.as_handle() == Some(handle.to_raw()))
@@ -7443,11 +7453,12 @@ fn vm_get_prop(
                 && let Some((id, _)) = ctx.realm.vm_function(handle)
                 && funcs.get(id as usize).is_some_and(|p| p.legacy)
             {
-                let (stack, _, _) = legacy_activations(ctx);
+                let (stack, _, _, hidden) = legacy_activations(ctx);
+                // (Not past an activation no record shows: a strict one.)
                 let caller = stack
                     .iter()
                     .rposition(|c| c.as_handle() == Some(handle.to_raw()))
-                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| i.checked_sub(1).filter(|&p| hidden.get(p) == hidden.get(i)))
                     .map(|i| stack[i])
                     .filter(|c| {
                         c.as_handle()
@@ -8894,15 +8905,25 @@ fn fold2(dst: Reg, a: Option<f64>, b: Option<f64>, f: impl Fn(f64, f64) -> NanBo
 /// `f.arguments` see them: the callee values, where each one's arguments start
 /// in the third list, and the arguments. The realm's stacks, plus the
 /// activations the JIT's native call sequence entered without them.
-fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>) {
+///
+/// The fourth list is each activation's recorded count of activations no
+/// record shows (`Realm::vm_mark`): a count above its predecessor's says one
+/// of those lies between the two.
+#[allow(clippy::type_complexity)]
+fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>, Vec<u32>) {
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     if let Some(v) = jit_tier::callee_view(ctx) {
         return v;
     }
+    let r = &ctx.realm;
     (
-        ctx.realm.vm_callee_stack.clone(),
-        ctx.realm.vm_callee_args.clone(),
-        ctx.realm.vm_args_buf.clone(),
+        r.vm_callee_stack.clone(),
+        r.vm_callee_args.iter().map(|&w| w & 0xffff_ffff).collect(),
+        r.vm_args_buf.clone(),
+        r.vm_callee_args
+            .iter()
+            .map(|&w| (w as u64 >> 32) as u32)
+            .collect(),
     )
 }
 

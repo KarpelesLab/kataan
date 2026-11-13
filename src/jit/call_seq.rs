@@ -32,7 +32,14 @@
 //!   the realm's `vm_callee_stack`, each native activation leaves a header on
 //!   the register stack — the previous header, the callee, where the realm's
 //!   stack stood, and the arguments — and a reader merges the two stacks only
-//!   when it needs them (`jit_tier::callee_view`).
+//!   when it needs them (`jit_tier::callee_view`). An activation whose
+//!   callee no legacy read can name (not a sloppy ordinary function) needs
+//!   no header at all: it is entered **headerless** ([`emit_headerless`]),
+//!   its arguments laid straight into its window's parameter registers, and
+//!   only counted, in the realm's `vm_mark`, which every visible activation
+//!   records — so a legacy `f.caller` that would skip past an invisible
+//!   (strict) caller answers `null`, as that caller's own entry would have
+//!   made it.
 
 use super::{Label, X64Assembler};
 
@@ -157,6 +164,34 @@ pub struct CallTarget {
     pub code: u64,
     /// The callee's register-window size in bytes.
     pub frame_bytes: u64,
+    /// The callee's direct entry (see `emit_native_entry`), for a
+    /// headerless call ([`CallTarget::hl_frame`]); `0` when it has none.
+    pub hl_code: u64,
+    /// What a headerless call lays out at the stack top for the callee
+    /// (its window, whose parameter registers the call fills with the
+    /// arguments, and the inlined calls' room), or [`CallTarget::NO_HL`]
+    /// when the callee is not entered that way: that size never fits under
+    /// the stack's limit, so the call sequence's room test for it is also
+    /// its test of whether the way may be entered headerless (see
+    /// `emit_enter`).
+    pub hl_frame: u64,
+}
+
+impl CallTarget {
+    /// [`CallTarget::hl_frame`] for a way never entered headerless.
+    pub const NO_HL: u64 = 1 << 62;
+
+    /// A way entered with a native-call header only.
+    #[must_use]
+    pub const fn plain(key: u64, code: u64, frame_bytes: u64) -> Self {
+        Self {
+            key,
+            code,
+            frame_bytes,
+            hl_code: 0,
+            hl_frame: Self::NO_HL,
+        }
+    }
 }
 
 /// A call site's cache: up to [`CallSite::WAYS`] callees (a polymorphic site —
@@ -499,11 +534,7 @@ impl CallSite {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            targets: [CallTarget {
-                key: Self::EMPTY,
-                code: 0,
-                frame_bytes: 0,
-            }; Self::WAYS],
+            targets: [CallTarget::plain(Self::EMPTY, 0, 0); Self::WAYS],
             next: 0,
             fills: 0,
             memo: [CallMemo::empty(); Self::WAYS],
@@ -581,10 +612,20 @@ impl Default for CallSite {
 }
 
 /// [`CallTarget`]'s size.
-const TARGET_BYTES: i32 = 24;
+const TARGET_BYTES: i32 = core::mem::size_of::<CallTarget>() as i32;
 const SITE_KEY: i32 = 0;
 const SITE_CODE: i32 = 8;
 const SITE_FRAME: i32 = 16;
+const SITE_HL_CODE: i32 = 24;
+const SITE_HL_FRAME: i32 = 32;
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(CallTarget, key) == SITE_KEY as usize);
+    assert!(offset_of!(CallTarget, code) == SITE_CODE as usize);
+    assert!(offset_of!(CallTarget, frame_bytes) == SITE_FRAME as usize);
+    assert!(offset_of!(CallTarget, hl_code) == SITE_HL_CODE as usize);
+    assert!(offset_of!(CallTarget, hl_frame) == SITE_HL_FRAME as usize);
+};
 
 /// What [`CalleeHelper`] reports about a callee value: `key` is
 /// `function id | capture count << 32` for a VM closure (`u64::MAX`
@@ -833,13 +874,18 @@ pub struct CallLayout {
     pub realm: i32,
     /// realm: `vm_total_depth: usize`.
     pub total_depth: i32,
+    /// realm: `vm_mark: u64`, whose high half counts the headerless
+    /// activations (bumped in place, a dword at `hl + 4`).
+    pub hl: i32,
     /// realm: `limits.max_call_depth: usize`.
     pub max_depth: i32,
     /// realm: `multi_realm: bool`.
     pub multi_realm: i32,
     /// realm: `str_special: bool`.
     pub str_special: i32,
-    /// realm: `vm_callee_stack`'s length word.
+    /// realm: `vm_mark`, `vm_callee_stack`'s length with the headerless
+    /// activations' count in its high half (a native-call header's realm
+    /// mark word).
     pub callee_len: i32,
     /// `ctx`: whether the run is hosted (`bool`).
     pub hosted: i32,
@@ -853,6 +899,12 @@ pub struct CallLayout {
     /// `nbvm::gen_fast::run_in_cell`), for the activation entered on it
     /// (`usize`, `0` for none; see `emit_act_ok`).
     pub rooted: i32,
+    /// `ctx`: the compiled activations' handler stack's length word
+    /// (`TierRuntime::handlers`).
+    pub handlers_len: i32,
+    /// `ctx`: where the running activation's segment of it starts
+    /// (`TierRuntime::base`).
+    pub handlers_base: i32,
     /// What the back-edge poll's inline do-nothing test reads (see
     /// `emit_quiet_poll`).
     pub poll: PollLayout,
@@ -1221,6 +1273,11 @@ impl X64Assembler {
 /// whose `r12`/`r13` already hold the arena at its call, and which loads
 /// them afresh after every call, so needs nothing back (the epilogue's
 /// restore of the never-saved slots hands it garbage it overwrites).
+///
+/// And `direct` (`direct_pinned`, the pinned variant), for such a site's
+/// headerless call ([`emit_headerless`]): the window is where the call laid
+/// the arguments, so nothing is copied. `None` for a body whose activation
+/// needs its header (`NativeEntries::direct`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_native_entry(
     a: &mut X64Assembler,
@@ -1233,6 +1290,7 @@ pub(crate) fn emit_native_entry(
     new_target: Option<usize>,
     (native, rust): (Label, Label),
     (exact, exact_pinned): (Label, Option<Label>),
+    (direct, direct_pinned): (Option<Label>, Option<Label>),
     body: Label,
     inline_ok: Option<(InlineOk, &CallLayout)>,
 ) -> Option<()> {
@@ -1345,6 +1403,23 @@ pub(crate) fn emit_native_entry(
         a.g_load(r::RAX, r::RCX, slot(i)?);
         a.g_store(r::RBX, slot(i)?, r::RAX);
     }
+    // The direct entries (a headerless call's, see `emit_headerless`): the
+    // arguments are in their registers already (the window, `rsi`, is
+    // where they were laid out). Last, falling through: the pinned one
+    // when there is one (a pinned body's callers mostly pin too).
+    if let Some(direct) = direct {
+        a.jmp(args_done);
+        a.bind(direct);
+        native_prologue(a)?;
+        a.mov_rbx_rsi();
+        a.pin_enter();
+        if let Some(direct_pinned) = direct_pinned {
+            a.jmp(args_done);
+            a.bind(direct_pinned);
+            native_prologue(a)?;
+            a.mov_rbx_rsi();
+        }
+    }
     a.bind(args_done);
     let caps_end = (n_params + n_caps).min(n_regs);
     for (j, i) in (n_params..caps_end).enumerate() {
@@ -1434,6 +1509,67 @@ pub(crate) fn emit_native_entry(
     Some(())
 }
 
+/// Whether a body with `try` regions opens and closes its handler-stack
+/// segment in line when natively entered (`emit_handler_entry_inline`;
+/// `KATAAN_JIT_HFRAME=0` calls the helper instead, read once per process).
+#[must_use]
+pub fn inline_hframe_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_HFRAME").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// [`emit_handler_entry`]'s segment, opened and closed in line: the entry's
+/// frame keeps the caller's segment base while the body (`inner`, entered
+/// with every argument register as it came) runs in a segment of its own
+/// from the handler stack's top; then whatever the body left in its
+/// segment is dropped and the caller's base restored, as
+/// `jit_tier::jit_helper_handler_frame` does. With `from_rdi` the context
+/// comes in `rdi` (a Rust caller's entry, or the call sequence's stub that
+/// passes it there), else it is already in `r15` (a headerless call's
+/// direct entry, whose `rdi` is not the context). Clobbers `rax` and `rcx`
+/// (no argument register).
+pub(crate) fn emit_handler_entry_inline(
+    a: &mut X64Assembler,
+    l: &CallLayout,
+    inner: Label,
+    from_rdi: bool,
+) {
+    a.code.push(0x55); // push rbp
+    a.code.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
+    a.code.extend_from_slice(&[0x41, 0x57]); // push r15
+    a.code.push(0x53); // push rbx
+    a.sub_rsp_imm8(16);
+    if from_rdi {
+        a.mov_r15_rdi();
+    }
+    a.g_load(r::RAX, r::R15, l.handlers_base);
+    a.g_store(RBP, -24, r::RAX);
+    a.g_load(r::RAX, r::R15, l.handlers_len);
+    a.g_store(r::R15, l.handlers_base, r::RAX);
+    a.g_call_label(inner);
+    // len = min(len, base); base = the caller's.
+    a.g_load(r::RCX, r::R15, l.handlers_base);
+    a.g_cmp_mem(r::RCX, r::R15, l.handlers_len);
+    let keep = a.new_label();
+    a.g_jcc(cc::AE, keep);
+    a.g_store(r::R15, l.handlers_len, r::RCX);
+    a.bind(keep);
+    a.g_load(r::RCX, RBP, -24);
+    a.g_store(r::R15, l.handlers_base, r::RCX);
+    a.code.extend_from_slice(&[0x48, 0x8d, 0x65, 0xf0]); // lea rsp, [rbp-16]
+    a.code.push(0x5b); // pop rbx
+    a.code.extend_from_slice(&[0x41, 0x5f]); // pop r15
+    a.code.push(0x5d); // pop rbp
+    a.code.push(0xc3); // ret
+}
+
 /// Emits the native-call entry of a body with `try` regions: the same
 /// signature as `emit_native_entry`'s, calling that entry (`inner`) inside a
 /// segment of the context's handler stack of its own. `helper` is the
@@ -1443,7 +1579,11 @@ pub(crate) fn emit_native_entry(
 /// behind) and restores the caller's. The interpreter-entered activation gets
 /// this from its Rust caller (`jit_tier::run_compiled_at`); a body entered
 /// natively makes it itself.
-pub(crate) fn emit_handler_entry(a: &mut X64Assembler, helper: u64, inner: Label) {
+pub(crate) fn emit_handler_entry(a: &mut X64Assembler, helper: u64, inner: Label, l: &CallLayout) {
+    if inline_hframe_enabled() {
+        emit_handler_entry_inline(a, l, inner, true);
+        return;
+    }
     // Slots below the prologue's saved `r15`/`rbx`: the six arguments, the
     // caller's segment and the result.
     const ARGS: [u8; 6] = [r::RDI, r::RSI, r::RDX, r::RCX, r::R8, r::R9];
@@ -2218,9 +2358,25 @@ fn emit_enter(
     // 2. The activation may make native calls (`ACT_OK`), one realm, and
     //    room under the depth limit (for the pending activations too).
     emit_limit_checks_deep(a, l, levels, e.slow);
+    // 2b. A headerless call, when the way allows one (see `emit_headerless`);
+    //     else (to `header`, out of line) the call with its header.
+    let popped = a.new_label();
+    let saved = a
+        .call_saved_top
+        .filter(|_| !a.call_hdr_only && acts.is_empty() && e.spread.is_none());
+    let mut cold = None;
+    if let Some(saved) = saved {
+        let header = a.new_label();
+        emit_headerless(a, e, saved, header)?;
+        cold = Some(a.cold_begin());
+        a.bind(header);
+    }
     // 3. Room for the headers, the arguments and the callee's window:
-    //    rcx = the first header, rsi = window, rax = new top.
-    a.g_load(r::RCX, r::R10, STACK_TOP);
+    //    rcx = the first header, rsi = window, rax = new top. (From a
+    //    headerless try, `rcx` is the top already.)
+    if saved.is_none() {
+        a.g_load(r::RCX, r::R10, STACK_TOP);
+    }
     a.g_lea(r::RSI, r::RCX, hdr(below + FRAME_HEADER + argc)?);
     if let Some(sp) = e.spread {
         a.g_load(r::RDX, r::RBX, reg(sp.len));
@@ -2344,6 +2500,91 @@ fn emit_enter(
     } else {
         a.g_add_mem_imm8(r::R9, l.total_depth, -(levels + 1));
     }
+    if let Some(cold) = cold {
+        a.jmp(popped);
+        a.cold_end(cold);
+    }
+    a.bind(popped);
+    Some(())
+}
+
+/// Whether call sequences may call a way headerless (`emit_headerless`;
+/// `KATAAN_JIT_HDRLESS=0` turns it off, read once per process).
+#[must_use]
+pub(crate) fn headerless_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_HDRLESS").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// A **headerless** call (from [`emit_enter`]'s step 2, with no pending
+/// activations and a static argument count): for a way whose callee's
+/// activation needs no native-call header (`CallTarget::hl_frame`: not a
+/// sloppy ordinary function, which the legacy `f.caller` / `f.arguments`
+/// look for, nor one reading `new.target`, and called with exactly its
+/// parameter count), the arguments go straight into the parameter
+/// registers of the callee's window, laid out at the stack top, and the
+/// callee is entered at its direct entry, which copies none. The stack top
+/// before the call is kept in the frame slot `saved`, and the pop restores
+/// it (the header chain is left as it was: nothing links to this
+/// activation, which only the realm's hidden count in `vm_mark` notes, see
+/// [`CallLayout::hl`]). Any other way, or one with no room, goes to
+/// `header`, with nothing changed. Leaves `rax` the callee's result.
+///
+/// A body entered so reads its arguments only from its parameter
+/// registers (no native-call header's reader looks for it), and the GC
+/// roots its window, between the stack's base and top, as any other.
+fn emit_headerless(
+    a: &mut X64Assembler,
+    e: &CallEmit<'_>,
+    saved: i32,
+    header: Label,
+) -> Option<()> {
+    use crate::nanbox::NanBox;
+    let l = e.layout;
+    let reg = |x: u16| i32::from(x) * 8;
+    // rcx = the window (the stack top), rax = its end. A way without a
+    // direct entry asks for more room than any stack has.
+    a.g_load(r::RCX, r::R10, STACK_TOP);
+    a.g_mov(r::RAX, r::RCX);
+    a.g_add_mem(r::RAX, r::R11, SITE_HL_FRAME);
+    a.g_cmp_mem(r::RAX, r::R10, STACK_LIMIT);
+    a.g_jcc(cc::A, header);
+    a.dbg_mark("c-hl");
+    for (i, &ar) in e.args.iter().enumerate() {
+        a.g_load(r::RDX, r::RBX, reg(ar));
+        a.g_store(r::RCX, i32::try_from(i * 8).ok()?, r::RDX);
+    }
+    a.g_store(RBP, saved, r::RCX);
+    a.g_store(r::R10, STACK_TOP, r::RAX);
+    a.g_inc_mem(r::R9, l.total_depth);
+    a.g_mem(false, &[0xff], 0, r::R9, l.hl + 4); // inc dword: one more hidden
+    // direct(ctx, window, _, _, caps, this), `ctx` in `r15`, the stack in
+    // `r10` (for the entry's inlined calls' room).
+    a.g_mov(r::RSI, r::RCX);
+    match (&e.callee, e.this) {
+        (CalleeSrc::Construct { scratch, .. }, _) => a.g_load(r::R9, RBP, *scratch),
+        (_, Some(t)) => a.g_load(r::R9, r::RBX, reg(t)),
+        (_, None) => a.g_movabs(r::R9, NanBox::undefined().to_bits()),
+    }
+    // (The header path's call is emitted after this one, from the same
+    // state: what the post-call code consumes is put back for it.)
+    let survive = a.recv_survive.clone();
+    a.g_call_mem_unhooked(r::R11, SITE_HL_CODE);
+    a.recv_survive = survive;
+    a.dbg_mark("c-hlpop");
+    a.g_load(r::R10, r::R15, l.stack);
+    a.g_load(r::RCX, RBP, saved);
+    a.g_store(r::R10, STACK_TOP, r::RCX);
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_dec_mem(r::R9, l.total_depth);
+    a.g_mem(false, &[0xff], 1, r::R9, l.hl + 4); // dec dword
     Some(())
 }
 

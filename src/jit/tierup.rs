@@ -39,6 +39,24 @@ std::thread_local! {
     pub(crate) static ENTRY_POLL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
+std::thread_local! {
+    /// Per own pc of the generic body being compiled: whether its call
+    /// site's callee feedback names only callees whose activations need a
+    /// native-call header (`call_seq::emit_headerless`), so its call
+    /// sequence tries no headerless call first (which every such call
+    /// would fail). Empty: no feedback.
+    pub(crate) static CALL_HDR: core::cell::RefCell<Vec<bool>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` (a generic compile) with `CALL_HDR` set to `hdr`.
+pub fn with_call_hdr<R>(hdr: Vec<bool>, f: impl FnOnce() -> R) -> R {
+    let was = CALL_HDR.with(|c| c.replace(hdr));
+    let r = f();
+    CALL_HDR.with(|c| *c.borrow_mut() = was);
+    r
+}
+
 /// Runs `f` (a generic compile) with `ENTRY_POLL` set to `on`.
 pub fn with_entry_poll<R>(on: bool, f: impl FnOnce() -> R) -> R {
     let was = ENTRY_POLL.with(|e| e.replace(on));
