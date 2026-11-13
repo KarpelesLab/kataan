@@ -203,9 +203,9 @@ impl<'a> Reader<'a> {
             3 => Ok(NanBox::number(f64::from_le_bytes(
                 self.take(8)?.try_into().unwrap(),
             ))),
-            4 => Ok(NanBox::handle(u64::from_le_bytes(
-                self.take(8)?.try_into().unwrap(),
-            ))),
+            // (4, a heap handle, names an object of the run that wrote it, not
+            // of this one: no compiler makes such a constant, and the
+            // collector relies on there being none — `nbvm::vm_safepoint`.)
             t => Err(DecodeError::BadTag(t)),
         }
     }

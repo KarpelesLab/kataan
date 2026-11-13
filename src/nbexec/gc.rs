@@ -59,8 +59,17 @@ impl Interp {
         if !self.gc_world_is_simple(jobs_rooted) {
             return false;
         }
+        if !self.realm.gc_due() {
+            return true;
+        }
+        // A minor collection roots only the global bindings written since the
+        // last collection (`env::WriteLog`); a full one roots them all.
+        let minor = !self.realm.next_collection_is_major();
+        if minor && self.realm.gc_verify() {
+            self.verify_scope_logs();
+        }
         let mut roots: Vec<Handle> = extra.to_vec();
-        self.gc_roots(&mut roots);
+        self.gc_roots(&mut roots, minor);
         // `arg_maps` and `fn_realm` are keyed by an object handle and are **weak**:
         // an entry lives only while its arguments object / callable does. Moved out
         // for the cycle so the realm can run them through the ephemeron fixpoint
@@ -69,7 +78,7 @@ impl Interp {
         // rewrites it, and both are handed to the collector at once.)
         let arg_maps = core::cell::RefCell::new(core::mem::take(&mut self.arg_maps));
         let fn_realm = core::cell::RefCell::new(core::mem::take(&mut self.fn_realm));
-        self.realm.maybe_collect_with(
+        let ran = self.realm.maybe_collect_with(
             &roots,
             &mut |marked, extra| {
                 // A *live* mapped-`arguments` object keeps the parameter scope it
@@ -91,7 +100,37 @@ impl Interp {
         );
         self.arg_maps = arg_maps.into_inner();
         self.fn_realm = fn_realm.into_inner();
+        if ran.is_some() {
+            for s in self.rooted_scopes().into_iter().flatten() {
+                s.gc_log_reset();
+            }
+        }
         true
+    }
+
+    /// The scope chains [`gc_roots`](Self::gc_roots) roots.
+    fn rooted_scopes(&self) -> [Option<&crate::env::Scope>; 5] {
+        [
+            Some(&self.current),
+            Some(&self.var_scope),
+            Some(&self.global_scope),
+            Some(&self.main_global_scope),
+            self.eval_var_scope.as_ref(),
+        ]
+    }
+
+    /// `KATAAN_GC_VERIFY`, before a minor collection: every young object a
+    /// write-logged global binding holds must be listed in its log (else a
+    /// write path missed the barrier, and the minor collection would free a
+    /// live object).
+    fn verify_scope_logs(&self) {
+        for s in self.rooted_scopes().into_iter().flatten() {
+            if let Some((name, h)) = s.gc_log_violation(&|h| self.realm.is_young(h)) {
+                self.realm.report_gc_violation(format_args!(
+                    "global binding `{name}` holds young {h:?} outside its write log"
+                ));
+            }
+        }
     }
 
     /// Whether the interpreter's state is confined to what [`gc_roots`](Self::gc_roots)
@@ -159,10 +198,7 @@ impl Interp {
                 roots.push(Handle::from_raw(raw));
             }
         }
-        // (As the VM's safepoint does: its bytecode constants.)
-        for t in self.vm_table.iter().chain(self.vm_newest_table().iter()) {
-            crate::nbvm::table_const_roots(t, &mut roots);
-        }
+        // (Not the bytecode constants, as the VM's safepoint does not.)
         self.collect_with_roots_in(&roots, true);
     }
 
@@ -172,7 +208,11 @@ impl Interp {
     ///
     /// Only sound in combination with [`gc_world_is_simple`](Self::gc_world_is_simple),
     /// which rules out the state deliberately not enumerated here.
-    fn gc_roots(&self, out: &mut Vec<Handle>) {
+    ///
+    /// For a `minor` collection a write-logged root scope (the global
+    /// environment) contributes only the bindings written since the last
+    /// collection (`Scope::for_each_handle_minor`).
+    fn gc_roots(&self, out: &mut Vec<Handle>, minor: bool) {
         let push = |out: &mut Vec<Handle>, v: NanBox| {
             if let Some(raw) = v.as_handle() {
                 out.push(Handle::from_raw(raw));
@@ -180,15 +220,12 @@ impl Interp {
         };
 
         // --- scope chains (each walks to its root, so enclosing frames are covered) ---
-        let visit_scope = |s: &crate::env::Scope, out: &mut Vec<Handle>| {
-            s.for_each_handle(&mut |h| out.push(h));
-        };
-        visit_scope(&self.current, out);
-        visit_scope(&self.var_scope, out);
-        visit_scope(&self.global_scope, out);
-        visit_scope(&self.main_global_scope, out);
-        if let Some(s) = &self.eval_var_scope {
-            visit_scope(s, out);
+        for s in self.rooted_scopes().into_iter().flatten() {
+            if minor {
+                s.for_each_handle_minor(&mut |h| out.push(h));
+            } else {
+                s.for_each_handle(&mut |h| out.push(h));
+            }
         }
 
         // --- the collecting event loop's kept values ---

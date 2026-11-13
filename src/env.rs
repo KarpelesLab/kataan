@@ -39,6 +39,48 @@ const B_READONLY: u8 = 4;
 struct Binding {
     value: NanBox,
     flags: u8,
+    /// Listed in its frame's [`WriteLog::slots`] (each slot once).
+    logged: bool,
+}
+
+/// A root scope's **write log** for the minor collector (see
+/// [`Scope::for_each_handle_minor`]): which of its bindings may hold a young
+/// object, so that a minor collection roots those and not every binding (a
+/// script with tens of thousands of global functions made every minor
+/// collection walk them all).
+///
+/// After any collection every surviving object is old, so a binding can then
+/// hold a young object only through a write since. Every Rust write of a
+/// heap handle into the frame lists its slot (`slots`). Compiled code stores
+/// through a validated binding address ([`Scope::jit_binding_ptr`]) without
+/// running Rust: its slot is listed when the address is handed out for
+/// writing (`jit`), with the global binding epoch it was validated under.
+/// Compiled code uses the address only while that epoch is current, so the
+/// entry stays until a collection that scanned it finds the epoch changed.
+struct WriteLog {
+    /// The slots a heap handle was written into since the last collection.
+    slots: Vec<u32>,
+    /// Slots whose write address compiled code may hold, each with the
+    /// global binding epoch it was validated under.
+    jit: BTreeMap<u32, u64>,
+    /// Whether the next minor root walk must visit every binding: the log is
+    /// new (writes before it went unrecorded) or the bindings were relocated.
+    all: bool,
+}
+
+/// Whether root scopes keep a [`WriteLog`] for the minor collector:
+/// `KATAAN_GC_GLOBAL_LOG=0` turns it off (every minor collection then walks
+/// every global binding). Read once per process.
+fn write_log_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_GC_GLOBAL_LOG").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// The source of frame *generations* (`ScopeData::generation`): unique across every
@@ -168,9 +210,27 @@ struct ScopeData {
     /// like-named top-level `let`/`const`/`class` (which the spec keeps in a
     /// distinct lexical Environment Record). `None` on frames that carry none.
     lexical: Option<alloc::collections::BTreeSet<String>>,
+    /// A root scope's write log for the minor collector (see [`WriteLog`]);
+    /// `None` until a minor collection first roots the frame.
+    log: Option<alloc::boxed::Box<WriteLog>>,
 }
 
 impl ScopeData {
+    /// The write barrier of the binding at slot `i`, just assigned `value`:
+    /// lists the slot in the frame's write log, when it keeps one, if
+    /// `value` is a heap handle.
+    #[inline(always)]
+    fn note_write(&mut self, i: u32, value: NanBox) {
+        if let Some(log) = self.log.as_deref_mut()
+            && value.is_handle()
+            && let Some(b) = self.slots.get_mut(i as usize)
+            && !b.logged
+        {
+            b.logged = true;
+            log.slots.push(i);
+        }
+    }
+
     fn slot_of(&self, name: &str) -> Option<&Binding> {
         self.names.get(name).map(|&i| &self.slots[i as usize])
     }
@@ -193,9 +253,15 @@ impl ScopeData {
         let i = match self.names.get(name) {
             Some(&i) => i,
             None => {
-                let b = Binding { value, flags: 0 };
+                let mut b = Binding {
+                    value,
+                    flags: 0,
+                    logged: false,
+                };
                 let i = match self.free.pop() {
                     Some(i) => {
+                        // (A freed slot keeps its place in the write log.)
+                        b.logged = self.slots[i as usize].logged;
                         self.slots[i as usize] = b;
                         i
                     }
@@ -208,9 +274,9 @@ impl ScopeData {
                 i
             }
         };
-        let b = &mut self.slots[i as usize];
-        b.value = value;
-        b
+        self.slots[i as usize].value = value;
+        self.note_write(i, value);
+        &mut self.slots[i as usize]
     }
 
     /// The slot of `name` in this frame through `cache`, filling it on a miss.
@@ -229,9 +295,18 @@ impl ScopeData {
 }
 
 impl Scope {
-    /// A new root scope (no parent).
+    /// A new root scope (no parent). It keeps a write log from the start (see
+    /// [`WriteLog`]), so no write, and no write address handed to compiled
+    /// code, ever goes unlisted.
     #[must_use]
     pub fn root() -> Self {
+        let log = write_log_enabled().then(|| {
+            alloc::boxed::Box::new(WriteLog {
+                slots: Vec::new(),
+                jit: BTreeMap::new(),
+                all: false,
+            })
+        });
         Scope(Rc::new(RefCell::new(ScopeData {
             names: BTreeMap::new(),
             slots: Vec::new(),
@@ -244,7 +319,104 @@ impl Scope {
             module_imports: None,
             module_meta: None,
             lexical: None,
+            log,
         })))
+    }
+
+    /// [`for_each_handle`](Self::for_each_handle) for a **minor** collection's
+    /// roots: a root scope with a write log visits only the bindings it lists
+    /// (every other binding holds an old object or none: see [`WriteLog`]).
+    /// Every other frame of the chain is visited whole. After the collection
+    /// ran, [`gc_log_reset`](Self::gc_log_reset) must be called on the chain.
+    pub fn for_each_handle_minor(&self, visit: &mut dyn FnMut(Handle)) {
+        let data = self.0.borrow();
+        if let Some(log) = data.log.as_deref()
+            && !log.all
+        {
+            let mut one = |i: u32| {
+                if let Some(raw) = data.slots.get(i as usize).and_then(|b| b.value.as_handle()) {
+                    visit(Handle::from_raw(raw));
+                }
+            };
+            for &i in &log.slots {
+                one(i);
+            }
+            for &i in log.jit.keys() {
+                one(i);
+            }
+            for v in [data.with_obj, data.module_meta].into_iter().flatten() {
+                if let Some(raw) = v.as_handle() {
+                    visit(Handle::from_raw(raw));
+                }
+            }
+            if let Some(p) = &data.parent {
+                p.for_each_handle_minor(visit);
+            }
+            return;
+        }
+        for b in &data.slots {
+            if let Some(raw) = b.value.as_handle() {
+                visit(Handle::from_raw(raw));
+            }
+        }
+        for v in [data.with_obj, data.module_meta].into_iter().flatten() {
+            if let Some(raw) = v.as_handle() {
+                visit(Handle::from_raw(raw));
+            }
+        }
+        if let Some(p) = &data.parent {
+            p.for_each_handle_minor(visit);
+        }
+    }
+
+    /// After a collection (minor or full) that rooted this scope chain
+    /// ([`for_each_handle_minor`](Self::for_each_handle_minor) or
+    /// [`for_each_handle`](Self::for_each_handle)): every object its bindings
+    /// hold is now old, so the write logs start over. A compiled-code write
+    /// address stays listed while the epoch it was validated under is
+    /// current (compiled code may still store through it).
+    pub fn gc_log_reset(&self) {
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            let mut data = s.0.borrow_mut();
+            let ScopeData { slots, log, .. } = &mut *data;
+            if let Some(log) = log.as_deref_mut() {
+                for &i in &log.slots {
+                    if let Some(b) = slots.get_mut(i as usize) {
+                        b.logged = false;
+                    }
+                }
+                log.slots.clear();
+                let epoch = global_binding_epoch();
+                log.jit.retain(|_, e| *e == epoch);
+                log.all = false;
+            }
+            cur = data.parent.clone();
+        }
+    }
+
+    /// Under `KATAAN_GC_VERIFY`, before a minor collection: the first binding
+    /// of this chain's write-logged root scopes that holds an object `young`
+    /// reports young without being listed (a write that missed the barrier).
+    #[must_use]
+    pub fn gc_log_violation(&self, young: &dyn Fn(Handle) -> bool) -> Option<(String, Handle)> {
+        let data = self.0.borrow();
+        if let Some(log) = data.log.as_deref()
+            && !log.all
+        {
+            for (name, &i) in &data.names {
+                let Some(b) = data.slots.get(i as usize) else {
+                    continue;
+                };
+                if let Some(raw) = b.value.as_handle() {
+                    let h = Handle::from_raw(raw);
+                    if young(h) && !b.logged && !log.jit.contains_key(&i) {
+                        return Some((name.clone(), h));
+                    }
+                }
+            }
+        }
+        data.parent.as_ref().and_then(|p| p.gc_log_violation(young))
     }
 
     /// A new child scope nested inside `self`.
@@ -262,6 +434,7 @@ impl Scope {
             module_imports: None,
             module_meta: None,
             lexical: None,
+            log: None,
         })))
     }
 
@@ -345,9 +518,11 @@ impl Scope {
             Some(i) => {
                 // Clear the slot (it must hold no handle) and retire every cache
                 // that addresses this frame before the slot can be reused.
+                let logged = data.slots[i as usize].logged;
                 data.slots[i as usize] = Binding {
                     value: NanBox::undefined(),
                     flags: 0,
+                    logged,
                 };
                 data.free.push(i);
                 data.generation = 0;
@@ -549,12 +724,13 @@ impl Scope {
     /// is not declared anywhere in the chain.
     pub fn set(&self, name: &str, value: NanBox) -> bool {
         let mut data = self.0.borrow_mut();
-        if let Some(b) = data.slot_of_mut(name) {
+        if let Some(&i) = data.names.get(name) {
             if value.is_tdz() {
                 // Back into the temporal dead zone: no longer readable.
                 bump_global_binding_epoch();
             }
-            b.value = value;
+            data.slots[i as usize].value = value;
+            data.note_write(i, value);
             return true;
         }
         match &data.parent {
@@ -586,6 +762,7 @@ impl Scope {
             return false;
         }
         b.value = value;
+        data.note_write(i, value);
         true
     }
 
@@ -606,10 +783,17 @@ impl Scope {
     ) -> Option<*mut NanBox> {
         let mut data = self.0.borrow_mut();
         let i = data.cached_slot(name, cache)?;
-        let b = data.slots.get_mut(i as usize)?;
+        let b = data.slots.get(i as usize)?;
         if b.value.is_tdz() || (plain && b.flags != 0) {
             return None;
         }
+        // A write address (`plain`: the only kind compiled code stores
+        // through) is listed for the minor collector under the epoch it is
+        // valid in (see `WriteLog::jit`).
+        if plain && let Some(log) = data.log.as_deref_mut() {
+            log.jit.insert(i, global_binding_epoch());
+        }
+        let b = data.slots.get_mut(i as usize)?;
         Some(core::ptr::from_mut(&mut b.value))
     }
 
@@ -697,6 +881,11 @@ impl Scope {
     /// idempotent: `forward` maps an already-forwarded handle to itself.)
     pub fn relocate_handles(&self, forward: &dyn Fn(Handle) -> Handle) {
         let mut data = self.0.borrow_mut();
+        // (A compaction keeps ages: any relocated binding may hold a young
+        // object.)
+        if let Some(log) = data.log.as_deref_mut() {
+            log.all = true;
+        }
         for b in &mut data.slots {
             if let Some(raw) = b.value.as_handle() {
                 b.value = NanBox::handle(forward(Handle::from_raw(raw)).to_raw());

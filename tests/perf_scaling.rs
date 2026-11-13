@@ -440,3 +440,78 @@ fn module_loading_is_linear() {
          {small:.0}ms at n=2000 vs {large:.0}ms at n=8000. Linear is ~4, quadratic ~16."
     );
 }
+
+/// [`assert_scaling`] at `n`, `2n` and `4n`: doubling `n` must not scale the
+/// timed loop by more than `bound2`, nor quadrupling it by more than `bound4`.
+fn assert_scaling3(name: &str, n: usize, bounds: (f64, f64), make: impl Fn(usize) -> String) {
+    let (bound2, bound4) = bounds;
+    let t1 = best_ms(&make(n));
+    let t2 = best_ms(&make(n * 2));
+    let t4 = best_ms(&make(n * 4));
+    let (r2, r4) = (t2 / t1, t4 / t1);
+    assert!(
+        r2 <= bound2 && r4 <= bound4,
+        "{name}: n x2 scaled the work x{r2:.1} (bound {bound2:.1}), n x4 x{r4:.1} (bound \
+         {bound4:.1}) — {t1:.0}ms / {t2:.0}ms / {t4:.0}ms at n={n} / {} / {}.",
+        n * 2,
+        n * 4
+    );
+}
+
+/// A `switch` over integer cases dispatches in logarithmic time, not one
+/// compare per case: a 16 000-case switch called 16 000 times took 743 ms
+/// (node: 30 ms, with a jump table even when jitless). It now dispatches by a
+/// binary decision tree over the case values (1 000 / 2 000 / 4 000 cases:
+/// 214 / 1 872 / 3 896 ms before, 76 / 111 / 147 ms after — the growth left
+/// is the tree's depth and its bytecode's cache footprint). The number of
+/// calls is fixed; only the number of cases grows.
+#[test]
+fn switch_dispatch_is_not_linear_in_cases() {
+    // (`label` spells case `i`'s test, `value` the value it matches.)
+    for (name, label, value) in [
+        ("integer switch", "String(i*3-7)", "i*3-7"),
+        (
+            "sparse integer switch",
+            "String(i*7919-100000)",
+            "i*7919-100000",
+        ),
+    ] {
+        assert_scaling3(name, 1_000, (1.8, 2.8), |n| {
+            let setup = format!(
+                "let src='switch(x){{'; for(let i=0;i<{n};i++) src+='case '+{label}+': return '+i+';'; \
+                 const f=Function('x', src+'default: return -1; }}'); \
+                 const v=[]; for(let i=0;i<{n};i++) v.push({value}); \
+                 for(let i=0;i<2000;i++) f(v[i%{n}]);"
+            );
+            timed(
+                &setup,
+                &format!(
+                    "let s=0; for(let i=0;i<300000;i++) s+=f(v[(i*7919)%{n}]); if(s<0) console.log(s);"
+                ),
+            )
+        });
+    }
+}
+
+/// A minor collection costs what is young, not what the program declared:
+/// it rooted every global binding (and walked every op of the program for
+/// constants, and every function name ever registered), so a script with
+/// tens of thousands of global functions made each of its many minor
+/// collections that much slower (this loop: 111 / 197 / 342 ms beside
+/// 16 000 / 32 000 / 64 000 functions; 92 / 91 / 115 ms now, 88 / 106 /
+/// 149 ms with only the global bindings' write log off). Global bindings now
+/// keep a write log (`env::WriteLog`). The allocation loop is fixed; only the
+/// number of globals grows.
+#[test]
+fn minor_collections_ignore_old_globals() {
+    assert_scaling3("global functions", 16_000, (1.45, 1.6), |n| {
+        let mut decls = String::new();
+        for i in 0..n {
+            decls.push_str(&format!("function f{i}() {{ return {i}; }}\n"));
+        }
+        timed(
+            &decls,
+            "const ring=[]; for(let i=0;i<1000000;i++) ring[i&255]={i};",
+        )
+    });
+}

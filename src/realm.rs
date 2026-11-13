@@ -563,6 +563,11 @@ pub struct Realm {
     /// from which a VM closure's own `name`/`length` data properties are
     /// synthesized (no per-closure storage; see [`Realm::vm_fn_meta_value`]).
     vm_fn_meta: Vec<(Handle, u32)>,
+    /// How many `vm_fn_meta` entries were there at the last collection: their
+    /// names are old, so a minor collection roots only the entries after
+    /// them (rooting all made every minor collection cost as much as the
+    /// number of functions ever compiled).
+    vm_fn_meta_old: usize,
     /// The source text of each VM function id (`Function.prototype.toString`),
     /// parallel to `vm_fn_meta`.
     vm_fn_source: Vec<Option<crate::nbvm::FnSource>>,
@@ -1185,6 +1190,7 @@ impl Realm {
             function_proto_intrinsic: None,
             has_instance_key: None,
             vm_fn_meta: Vec::new(),
+            vm_fn_meta_old: 0,
             vm_fn_source: Vec::new(),
             vm_total_depth: 0,
             vm_mark: 0,
@@ -5326,6 +5332,13 @@ impl Realm {
     pub fn register_vm_fn_meta(&mut self, protos: &[crate::nbvm::FnProto]) {
         let have = self.vm_fn_meta.len();
         for p in protos.iter().skip(have) {
+            // (The collector roots no bytecode constant: `nbvm::vm_safepoint`.)
+            debug_assert!(
+                p.ops.iter().all(
+                    |op| !matches!(op, crate::nbvm::Op::LoadConst { value, .. } if value.is_handle())
+                ),
+                "a bytecode constant is a heap handle"
+            );
             let h = self.new_string(&p.name);
             self.vm_fn_meta.push((h, p.length as u32));
             self.vm_fn_source.push(p.source.clone());
@@ -8623,6 +8636,7 @@ impl Realm {
     pub fn gc_roots(&self, out: &mut Vec<Handle>) {
         self.gc_roots_but_native_protos(out);
         out.extend(self.native_protos.values().copied());
+        out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
     }
 
     /// [`gc_roots`](Self::gc_roots) for a **minor** collection: the same, but
@@ -8636,6 +8650,14 @@ impl Realm {
     /// young, asks for the whole table instead: `gc_side_walk_all`).
     fn gc_roots_minor(&self, out: &mut Vec<Handle>) {
         self.gc_roots_but_native_protos(out);
+        // (The function names registered since the last collection; all of
+        // them after a compaction, which keeps ages.)
+        let fresh = if self.gc_side_walk_all {
+            0
+        } else {
+            self.vm_fn_meta_old.min(self.vm_fn_meta.len())
+        };
+        out.extend(self.vm_fn_meta[fresh..].iter().map(|(n, _)| *n));
         if self.gc_side_walk_all {
             out.extend(self.native_protos.values().copied());
         } else {
@@ -8701,7 +8723,6 @@ impl Realm {
                 .flatten()
                 .flat_map(|&(c, p)| [c, p]),
         );
-        out.extend(self.vm_fn_meta.iter().map(|(n, _)| *n));
         out.extend(self.intl_protos.values().copied());
         // Host-pinned values and the JIT's spilled temporaries.
         out.extend(
@@ -8799,6 +8820,46 @@ impl Realm {
         self.maybe_collect_with(roots, &mut |_, _| {}, &mut |_| {})
     }
 
+    /// Whether [`maybe_collect_with`](Self::maybe_collect_with) would collect
+    /// now (allocation pressure reached the threshold).
+    #[must_use]
+    pub const fn gc_due(&self) -> bool {
+        self.heap.allocs_since_gc() >= self.gc_threshold
+    }
+
+    /// Whether the next collection [`maybe_collect_with`](Self::maybe_collect_with)
+    /// runs is a full one: always without generations, whenever an
+    /// incremental marking cycle is in flight, once the heap has outgrown the
+    /// last full collection's live set (old objects that died are reclaimed
+    /// only then), and every fourth under a pinned threshold. Otherwise it
+    /// is a minor one, whose roots need not include old objects.
+    #[must_use]
+    pub fn next_collection_is_major(&self) -> bool {
+        !self.gc_generational
+            || self.incremental.is_some()
+            || self.heap.len() >= self.gc_major_limit
+            || (self.gc_threshold_pinned.is_some() && self.gc_cycles % 4 == 3)
+    }
+
+    /// Whether `h` is a live object of the young generation (allocated since
+    /// the last collection).
+    #[must_use]
+    pub fn is_young(&self, h: Handle) -> bool {
+        self.heap.age(h).is_some_and(|a| a < gc::OLD_AGE)
+    }
+
+    /// Whether `KATAAN_GC_VERIFY` is on.
+    #[must_use]
+    pub fn gc_verify(&self) -> bool {
+        self.heap.gc_verify()
+    }
+
+    /// Reports a broken collector invariant (see `Heap::report_gc_violation`).
+    #[cold]
+    pub fn report_gc_violation(&self, what: core::fmt::Arguments<'_>) {
+        self.heap.report_gc_violation(what);
+    }
+
     /// [`maybe_collect`](Self::maybe_collect) with the external weak-key hooks of
     /// [`collect_with`](Self::collect_with).
     pub fn maybe_collect_with(
@@ -8811,13 +8872,7 @@ impl Realm {
             return None;
         }
         let pinned = self.gc_threshold_pinned;
-        // A full collection once the heap has outgrown the last full one's
-        // live set (old objects that died are reclaimed only then), and
-        // whenever an incremental marking cycle is in flight.
-        let major = !self.gc_generational
-            || self.incremental.is_some()
-            || self.heap.len() >= self.gc_major_limit
-            || (pinned.is_some() && self.gc_cycles % 4 == 3);
+        let major = self.next_collection_is_major();
         let mut all: Vec<Handle> = roots.to_vec();
         if !self.vm_gen_running.is_empty() {
             self.root_running_frames(&mut all);
@@ -8833,6 +8888,8 @@ impl Realm {
         } else {
             self.collect_minor_with(&all, extern_expand, extern_prune)
         };
+        // (Every function name rooted above is old now.)
+        self.vm_fn_meta_old = self.vm_fn_meta.len();
         self.heap.reset_alloc_pressure();
         let swept_words = self.heap.take_swept_words();
         if !major {

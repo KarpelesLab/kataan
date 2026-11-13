@@ -62,6 +62,7 @@ mod jit_tier;
 #[cfg(feature = "std")]
 mod math_fast;
 pub(crate) mod native_call;
+mod num_switch;
 pub mod objlit;
 mod private_ops;
 mod str_replace;
@@ -8945,8 +8946,8 @@ fn vm_safepoint_due(ctx: &Ctx) -> bool {
 /// collector can see. Hence the three guards:
 ///
 /// * `gc_enabled` — this `Ctx` came from a `run_program*` entry, whose bytecode
-///   was compiled before the realm existed (so no `LoadConst` can be a handle
-///   from a table we don't scan; we scan them anyway, belt and braces).
+///   was compiled before the realm existed (and no `LoadConst` is ever a
+///   heap handle: see the constants note below).
 /// * `frames_published + 1 == call_depth` — every frame below us is a plain
 ///   JS activation that published its register window into
 ///   [`Ctx::frame_shadow`]. A descent through anything else (a getter, a
@@ -8960,7 +8961,7 @@ fn vm_safepoint_due(ctx: &Ctx) -> bool {
 /// Roots handed over: this frame's registers, every published ancestor frame's
 /// registers and activation inputs ([`Ctx::frame_shadow`]), the outermost
 /// activation's `args`/`captures`/`this` ([`Ctx::top_frame_roots`]), the pending
-/// microtask queue, and every handle-valued bytecode constant. The realm adds
+/// microtask queue (no bytecode constant is a heap handle). The realm adds
 /// its own intrinsics in [`Realm::maybe_collect`].
 ///
 /// Collecting below the outermost frame is what keeps a long-running loop
@@ -9004,24 +9005,15 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
         push(&mut roots, t.value);
         roots.push(t.result);
     }
-    // Bytecode constants: `compile_program` runs before the realm exists so these
-    // are all immediates today, but rooting them costs one pass over the program
-    // per cycle and makes the safepoint independent of that invariant.
-    for op in program
-        .iter()
-        .chain(funcs.iter().flat_map(|f| f.ops.iter()))
-    {
-        if let Op::LoadConst { value, .. } = op {
-            push(&mut roots, *value);
-        }
-    }
-    for body in funcs.iter().filter_map(|f| f.tier.body()) {
-        for op in body.iter() {
-            if let Op::LoadConst { value, .. } = op {
-                push(&mut roots, *value);
-            }
-        }
-    }
+    // Not the bytecode constants: no compiler or rewrite pass makes a
+    // `LoadConst` of a heap handle (the constants are `undefined`, `null`,
+    // booleans, numbers, holes and TDZ marks; strings, BigInts, regexps and
+    // templates have their own ops; the bytecode codec decodes primitives
+    // only). Walking every op of the program for them, as this once did,
+    // made every collection cost as much as the program's size. (Debug
+    // builds check each function once, as the realm registers it:
+    // `Realm::register_vm_fn_meta`.)
+    let _ = (funcs, program);
     // A hosted run collects through the host, which adds the roots only it can
     // see (its global environment, class tables, …) and prunes its weak tables.
     if ctx.host.is_some() {
@@ -9088,24 +9080,6 @@ fn link_roots(ctx: &mut Ctx, roots: &mut Vec<Handle>) {
         #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
         if ctx.jit_rt.stack.0.is_null() {
             ctx.jit_rt.stack.0 = below.jit_rt.stack.0;
-        }
-    }
-}
-
-/// The handle-valued bytecode constants of `funcs` (and of their optimized
-/// bodies), as [`vm_safepoint`] roots them: for a collection the host makes
-/// outside any VM activation (the event loop's, `Interp::event_loop_safepoint`).
-pub(crate) fn table_const_roots(funcs: &[FnProto], roots: &mut Vec<Handle>) {
-    let bodies: Vec<_> = funcs.iter().filter_map(|f| f.tier.body()).collect();
-    for op in funcs
-        .iter()
-        .flat_map(|f| f.ops.iter())
-        .chain(bodies.iter().flat_map(|b| b.iter()))
-    {
-        if let Op::LoadConst { value, .. } = op
-            && let Some(raw) = value.as_handle()
-        {
-            roots.push(Handle::from_raw(raw));
         }
     }
 }
@@ -15466,6 +15440,65 @@ fn string_switch_table(cases: &[crate::ast::SwitchCase]) -> Option<Vec<(Vec<u8>,
     Some(table)
 }
 
+/// The fewest Number-constant case tests a `switch` dispatches by a
+/// decision tree (`Compiler::switch_dispatch`); a shorter one compares case
+/// by case (as cheap, and what compiled code turns into a few integer
+/// compares).
+const SWITCH_NUM_MIN: usize = 20;
+
+/// The fewest picks a string `switch`'s case index is dispatched on by a
+/// decision tree rather than pick by pick (compiled code compares a short
+/// list of small integers about as fast).
+const SWITCH_STR_TREE_MIN: usize = 32;
+
+/// The most keys a decision tree's leaf compares one by one.
+const SWITCH_TREE_LEAF: usize = 4;
+
+/// Whether `switch`es whose tests are all Number constants dispatch by a
+/// decision tree: unless `KATAAN_SWITCH_NUM=0`. Read once per process.
+fn switch_num_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_SWITCH_NUM").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether a long tabled `switch` dispatches by a decision tree: unless
+/// `KATAAN_SWITCH_TREE=0`. Read once per process.
+fn switch_tree_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_SWITCH_TREE").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// The keys of a `switch` whose case tests are all Number constants
+/// (`num_switch::static_number`: literals, signed or combined by arithmetic —
+/// evaluating them has no effect, so skipping them is unobservable), at
+/// least [`SWITCH_NUM_MIN`] of them: `num_switch::switch_keys`. `None` for
+/// any other `switch`.
+fn num_switch_keys(cases: &[crate::ast::SwitchCase]) -> Option<Vec<(f64, u32)>> {
+    if !switch_num_enabled() {
+        return None;
+    }
+    let mut tests: Vec<(f64, u32)> = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let Some(test) = &case.test else { continue };
+        tests.push((num_switch::static_number(test)?, u32::try_from(i).ok()?));
+    }
+    (tests.len() >= SWITCH_NUM_MIN).then(|| num_switch::switch_keys(&tests))
+}
+
 fn args_may_assign(arguments: &[crate::ast::Argument]) -> bool {
     arguments.iter().any(|a| match a {
         crate::ast::Argument::Item(x) | crate::ast::Argument::Spread(x) => may_assign(x),
@@ -17950,6 +17983,7 @@ impl Compiler {
                     && let Some(id) = &f.id
                     && let Some(&func) = c.fn_ids.get(&*id.name)
                 {
+                    let mark = c.next_reg;
                     let reg = c.alloc();
                     c.ops.push(Op::LoadFunc { dst: reg, func });
                     if hosted && !f.is_async && !f.is_generator {
@@ -17969,6 +18003,11 @@ impl Compiler {
                             resolved: None,
                             cache: Box::default(),
                         });
+                        // The closure lives in its global binding: one
+                        // register serves every declaration (a register
+                        // each kept every declared function in the frame,
+                        // which every collection scans).
+                        c.release_regs(mark);
                     } else {
                         c.fn_value_regs.insert(String::from(&*id.name), reg);
                     }
@@ -20184,8 +20223,23 @@ impl Compiler {
                     // `Op::SwitchStr`), then a Number compare per distinct
                     // literal picks its body. Literals have no effect, so not
                     // evaluating them is unobservable.
+                    // Many picks: a binary decision tree over them
+                    // (`switch_dispatch`), not a compare per pick.
+                    //
+                    // Every test a Number constant (at least
+                    // `SWITCH_NUM_MIN`): a binary decision tree over the
+                    // distinct case values, `<` then `===` on the
+                    // discriminant itself, once it is known to be a
+                    // primitive whose conversion has no effect (only a
+                    // Number is strictly equal to one; NaN fails every `===`).
+                    let mut misses: Vec<usize> = Vec::new();
                     let by_table = string_switch_table(cases);
-                    let tabled = by_table.is_some();
+                    let num_keys = if by_table.is_none() {
+                        num_switch_keys(cases)
+                    } else {
+                        None
+                    };
+                    let tabled = by_table.is_some() || num_keys.is_some();
                     if let Some(table) = by_table {
                         let idx = c.alloc();
                         let mut picks: Vec<u32> = table.iter().map(|(_, i)| *i).collect();
@@ -20196,23 +20250,29 @@ impl Compiler {
                             table,
                             memo: crate::realm::SwitchMemo::default(),
                         });
-                        for i in picks {
-                            let k = c.alloc();
-                            c.ops.push(Op::LoadConst {
-                                dst: k,
-                                value: NanBox::number(f64::from(i)),
-                            });
-                            let eq = c.alloc();
-                            c.ops.push(Op::StrictEq {
-                                dst: eq,
-                                a: idx,
-                                b: k,
-                            });
-                            let skip = c.emit_jump_if_false(eq);
-                            let to_body = c.emit_jump();
-                            case_jumps.push((i as usize, to_body));
-                            c.patch(skip);
-                        }
+                        let keys: Vec<(f64, u32)> =
+                            picks.iter().map(|&i| (f64::from(i), i)).collect();
+                        c.switch_dispatch(
+                            idx,
+                            &keys,
+                            SWITCH_STR_TREE_MIN,
+                            &mut case_jumps,
+                            &mut misses,
+                        );
+                    } else if let Some(keys) = num_keys {
+                        // The tree's `<` must not run code or throw: an
+                        // object, a BigInt or a Symbol (never equal to a
+                        // Number) goes straight to the miss. A String,
+                        // boolean, `null` or `undefined` converts without
+                        // effect, and its every leaf `===` fails.
+                        let plain = c.alloc();
+                        c.ops.push(Op::PlainPrims {
+                            dst: plain,
+                            regs: alloc::vec![d],
+                        });
+                        let not_plain = c.emit_jump_if_false(plain);
+                        misses.push(not_plain);
+                        c.switch_dispatch(d, &keys, 0, &mut case_jumps, &mut misses);
                     }
                     for (i, case) in cases.iter().enumerate() {
                         if tabled {
@@ -20244,9 +20304,15 @@ impl Compiler {
                     for (i, j) in case_jumps {
                         c.patch_to(j, entries[i]);
                     }
-                    match cases.iter().position(|c| c.test.is_none()) {
-                        Some(di) => c.patch_to(exit_dispatch, entries[di]),
-                        None => c.patch(exit_dispatch), // no default → end
+                    // (A dispatch tree's leaves that match nothing go where
+                    // the dispatch falls out.)
+                    misses.push(exit_dispatch);
+                    let default = cases.iter().position(|c| c.test.is_none());
+                    for j in misses {
+                        match default {
+                            Some(di) => c.patch_to(j, entries[di]),
+                            None => c.patch(j), // no default → end
+                        }
                     }
                     c.loop_frames.pop();
                     c.continue_sites.pop();
@@ -26464,6 +26530,89 @@ impl Compiler {
         let i = self.ops.len();
         self.ops.push(Op::Jump { target: 0 });
         i
+    }
+
+    /// A `switch`'s dispatch on the value in `on`, which is a Number, against
+    /// `keys`: the distinct values a case selects, each with that case's index,
+    /// ascending (no NaN; `-0` as `+0`). A jump to each key's body is left in
+    /// `case_jumps` as `(case index, jump)`. Fewer than `tree_min` keys (or
+    /// `KATAAN_SWITCH_TREE=0`) compare key by key and fall through when none
+    /// matches; more form a binary decision tree — `on < key` picks a half,
+    /// `on === key` a leaf's body — whose leaves end in jumps left in
+    /// `misses` (to where the dispatch falls out). The tree's compares reuse
+    /// two registers: each result is consumed at once.
+    fn switch_dispatch(
+        &mut self,
+        on: Reg,
+        keys: &[(f64, u32)],
+        tree_min: usize,
+        case_jumps: &mut Vec<(usize, usize)>,
+        misses: &mut Vec<usize>,
+    ) {
+        if keys.len() < tree_min.max(SWITCH_TREE_LEAF + 1) || !switch_tree_enabled() {
+            // (As a string switch always compiled: a register per compare.)
+            for &(key, i) in keys {
+                let k = self.alloc();
+                self.ops.push(Op::LoadConst {
+                    dst: k,
+                    value: NanBox::number(key),
+                });
+                let eq = self.alloc();
+                self.ops.push(Op::StrictEq {
+                    dst: eq,
+                    a: on,
+                    b: k,
+                });
+                let skip = self.emit_jump_if_false(eq);
+                let to_body = self.emit_jump();
+                case_jumps.push((i as usize, to_body));
+                self.patch(skip);
+            }
+            return;
+        }
+        let (k, t) = (self.alloc(), self.alloc());
+        // (An explicit stack: a tree over tens of thousands of cases must not
+        // recurse on the compiler's stack.)
+        let mut work: Vec<(usize, usize, Option<usize>)> = alloc::vec![(0, keys.len(), None)];
+        while let Some((lo, hi, enter)) = work.pop() {
+            if let Some(j) = enter {
+                self.patch(j);
+            }
+            if hi - lo <= SWITCH_TREE_LEAF {
+                for &(key, i) in &keys[lo..hi] {
+                    self.ops.push(Op::LoadConst {
+                        dst: k,
+                        value: NanBox::number(key),
+                    });
+                    self.ops.push(Op::StrictEq {
+                        dst: t,
+                        a: on,
+                        b: k,
+                    });
+                    let skip = self.emit_jump_if_false(t);
+                    let to_body = self.emit_jump();
+                    case_jumps.push((i as usize, to_body));
+                    self.patch(skip);
+                }
+                let j = self.emit_jump();
+                misses.push(j);
+                continue;
+            }
+            // `on < keys[mid]`: the lower half, else the upper.
+            let mid = lo + (hi - lo) / 2;
+            self.ops.push(Op::LoadConst {
+                dst: k,
+                value: NanBox::number(keys[mid].0),
+            });
+            self.ops.push(Op::Lt {
+                dst: t,
+                a: on,
+                b: k,
+            });
+            let upper = self.emit_jump_if_false(t);
+            work.push((mid, hi, Some(upper)));
+            work.push((lo, mid, None));
+        }
     }
 
     /// Backpatches the jump at `idx` to land at the current instruction.
