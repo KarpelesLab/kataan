@@ -461,10 +461,12 @@ fn assert_scaling3(name: &str, n: usize, bounds: (f64, f64), make: impl Fn(usize
 /// A `switch` over integer cases dispatches in logarithmic time, not one
 /// compare per case: a 16 000-case switch called 16 000 times took 743 ms
 /// (node: 30 ms, with a jump table even when jitless). It now dispatches by a
-/// binary decision tree over the case values (1 000 / 2 000 / 4 000 cases:
-/// 214 / 1 872 / 3 896 ms before, 76 / 111 / 147 ms after — the growth left
-/// is the tree's depth and its bytecode's cache footprint). The number of
-/// calls is fixed; only the number of cases grows.
+/// binary decision tree over the case values (this loop, 1 000 / 2 000 /
+/// 4 000 cases: 29 / 57 / 654 ms before, 17 / 16 / 17 ms after). Most case
+/// bodies are empty (falling through to every 50th): a body per case would
+/// give the function a register per case, and every call initializes its
+/// whole register file, which is linear in it whatever the dispatch costs.
+/// The number of calls is fixed; only the number of cases grows.
 #[test]
 fn switch_dispatch_is_not_linear_in_cases() {
     // (`label` spells case `i`'s test, `value` the value it matches.)
@@ -476,9 +478,9 @@ fn switch_dispatch_is_not_linear_in_cases() {
             "i*7919-100000",
         ),
     ] {
-        assert_scaling3(name, 1_000, (1.8, 2.8), |n| {
+        assert_scaling3(name, 1_000, (1.8, 2.5), |n| {
             let setup = format!(
-                "let src='switch(x){{'; for(let i=0;i<{n};i++) src+='case '+{label}+': return '+i+';'; \
+                "let src='switch(x){{'; for(let i=0;i<{n};i++) src+='case '+{label}+':'+(i%50===49?' return '+i+';':''); \
                  const f=Function('x', src+'default: return -1; }}'); \
                  const v=[]; for(let i=0;i<{n};i++) v.push({value}); \
                  for(let i=0;i<2000;i++) f(v[i%{n}]);"
@@ -501,8 +503,11 @@ fn switch_dispatch_is_not_linear_in_cases() {
 /// 16 000 / 32 000 / 64 000 functions; 92 / 91 / 115 ms now, 88 / 106 /
 /// 149 ms with only the global bindings' write log off). Global bindings now
 /// keep a write log (`env::WriteLog`). The allocation loop is fixed; only the
-/// number of globals grows.
+/// number of globals grows. (Release builds only: in a debug build the work
+/// that does grow with the heap, such as the full collections tracing it,
+/// weighs far more, x1.7 at 4n where a release build shows x1.25.)
 #[test]
+#[cfg_attr(debug_assertions, ignore = "a debug build's collector timing")]
 fn minor_collections_ignore_old_globals() {
     assert_scaling3("global functions", 16_000, (1.45, 1.6), |n| {
         let mut decls = String::new();

@@ -8652,7 +8652,7 @@ impl Realm {
         self.gc_roots_but_native_protos(out);
         // (The function names registered since the last collection; all of
         // them after a compaction, which keeps ages.)
-        let fresh = if self.gc_side_walk_all {
+        let fresh = if self.gc_side_walk_all || !fn_meta_watermark() {
             0
         } else {
             self.vm_fn_meta_old.min(self.vm_fn_meta.len())
@@ -12850,4 +12850,19 @@ fn dead_prefix_end(entries: &[(NanBox, NanBox)], from: usize) -> u32 {
         h += 1;
     }
     u32::try_from(h).unwrap_or(0)
+}
+
+/// Whether a minor collection roots only the function names registered
+/// since the last collection (`Realm::vm_fn_meta_old`): unless
+/// `KATAAN_GC_FNMETA_LOG=0`. Read once per process.
+fn fn_meta_watermark() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_GC_FNMETA_LOG").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }

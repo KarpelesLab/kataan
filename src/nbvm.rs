@@ -5625,6 +5625,7 @@ impl TierSlot {
     }
 
     /// The optimized body, if the function tiered up.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     fn body(&self) -> Option<alloc::rc::Rc<Vec<Op>>> {
         self.0.try_borrow().ok().and_then(|t| t.body.clone())
     }
@@ -15468,6 +15469,21 @@ fn switch_num_enabled() -> bool {
     }
 }
 
+/// Whether a hosted script's top-level function declarations share one
+/// register (their closures live in their global bindings): unless
+/// `KATAAN_FNDECL_SHARE=0`. Read once per process.
+fn fn_decl_regs_shared() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_FNDECL_SHARE").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether a long tabled `switch` dispatches by a decision tree: unless
 /// `KATAAN_SWITCH_TREE=0`. Read once per process.
 fn switch_tree_enabled() -> bool {
@@ -18007,7 +18023,9 @@ impl Compiler {
                         // register serves every declaration (a register
                         // each kept every declared function in the frame,
                         // which every collection scans).
-                        c.release_regs(mark);
+                        if fn_decl_regs_shared() {
+                            c.release_regs(mark);
+                        }
                     } else {
                         c.fn_value_regs.insert(String::from(&*id.name), reg);
                     }
