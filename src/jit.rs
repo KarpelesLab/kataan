@@ -10079,6 +10079,30 @@ impl JitFunction {
         // poly_direct`), and per such later way, its entry: outside
         // speculative loops (whose ops are emitted more than once), at one
         // level.
+        // Per polymorphic method site's first way, its later ways' callee
+        // keys (`call_seq::InlineEmit::poly_keys`).
+        let poly_keys: Vec<Vec<u64>> = ops
+            .iter()
+            .map(|op| match *op {
+                GenericOp::InlineGuard { call, poly, .. } if poly >> 8 >= 2 && poly & 0xff == 0 => {
+                    let ways = poly >> 8;
+                    (1..ways)
+                        .filter_map(|w| {
+                            ops.iter().find_map(|o| match *o {
+                                GenericOp::InlineGuard {
+                                    call: c,
+                                    poly: p,
+                                    key,
+                                    ..
+                                } if c == call && p == (ways << 8) | w => Some(key),
+                                _ => None,
+                            })
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
         let mut poly_entry: Vec<Option<Label>> = alloc::vec![None; ops.len()];
         let mut poly_direct: Vec<Vec<Option<(Label, bool)>>> = alloc::vec![Vec::new(); ops.len()];
         for (i, op) in ops.iter().enumerate() {
@@ -11486,6 +11510,7 @@ impl JitFunction {
                             cproved: cproof_slot[op_idx].map(inl_cproved),
                             wproof: &wp_disps[op_idx],
                             keep: &num.guard_keep(op_idx),
+                            poly_keys: &poly_keys[op_idx],
                             // (In a promoted loop `numeric` emits the test
                             // itself, reading the boolean, but in a
                             // speculative fast version's guard diamond.)

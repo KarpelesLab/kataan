@@ -3025,9 +3025,45 @@ pub(crate) struct InlineEmit<'a> {
     /// only the guard's identification does (the proved path touches
     /// `rax` alone); else the whole guard. A miss leaves with them saved.
     pub keep: &'a [(u8, i32)],
+    /// A polymorphic method site's first way: the callee keys of its later
+    /// ways (empty otherwise). A callee that is none of the ways' then
+    /// gets the site's **other** memo (see [`InlineEmit::other_memo`]).
+    pub poly_keys: &'a [u64],
+}
+
+/// Whether a polymorphic method site's first way remembers a receiver
+/// layout whose method is none of the ways' (`KATAAN_JIT_POLYMISS=0`: no).
+#[must_use]
+pub(crate) fn poly_miss_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_POLYMISS").is_none_or(|v| v != "0"))
 }
 
 impl InlineEmit<'_> {
+    /// A polymorphic method site's **other** memo, by its index in
+    /// [`CallSite::guard`] (the one after its ways'), kept by its first
+    /// way's guard: a [`GuardMemo`] whose lookup found a callee value
+    /// (`bits`) that is none of the ways' functions (`caps` unused). While
+    /// the epoch is still its stamp and the holder still holds that value,
+    /// a receiver of its layout calls none of the ways' functions — a miss
+    /// of every way, which the first way's guard then takes at once,
+    /// leaving `undefined` for the later ways (which identify no such
+    /// value) instead of looking the method up and decoding it in each.
+    /// (A miss is always correct: the call op calls whatever the receiver
+    /// has. Hence no accessor check: an own accessor is the call's too.)
+    fn other_memo(&self) -> Option<usize> {
+        let (way, ways) = (usize::from(self.poly & 0xff), usize::from(self.poly >> 8));
+        (poly_miss_enabled()
+            && way == 0
+            && ways >= 2
+            && ways < crate::ic::CalleeHint::POLY_MAX
+            && self.poly_keys.len() + 1 == ways
+            && !self.getter
+            && !self.setter
+            && self.new_target.is_none()
+            && matches!(self.callee, CalleeSrc::Method { .. }))
+        .then_some(ways)
+    }
     /// The guard's method proof, when it takes one: a monomorphic method
     /// or accessor guard without a receiver-cache way (whose fills the
     /// proved path would skip), no captures and no other proof.
@@ -3395,7 +3431,11 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
             // lookup, which leaves its entry in rdi (and rsi nonzero when
             // a memo may record it, see `p_method_lookup_from`).
             let slow = a.new_label();
-            emit_guard_fast(a, e, (way, ways.max(1)), slow, identified, miss)?;
+            let other = e
+                .other_memo()
+                .filter(|_| chain_first)
+                .map(|o| (o, lookup_miss));
+            emit_guard_fast(a, e, (way, ways.max(1)), (slow, other), identified, miss)?;
             a.bind(slow);
             a.dbg_mark("g-lookup");
             a.p_accessor_lookup_walked(jl, l.realm, site, lookup_miss, getter, e.setter);
@@ -3458,7 +3498,21 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.p_callee_info(jl, l.realm);
         a.g_movabs(r::R11, e.key);
         a.g_cmp(r::RAX, r::R11);
-        a.g_jcc(cc::NE, miss);
+        if let Some(other) = e.other_memo().filter(|_| chain_first) {
+            // (A callee none of the ways' is the other memo's.)
+            let own = a.new_label();
+            a.g_jcc(cc::E, own);
+            for &k in e.poly_keys {
+                a.g_movabs(r::R11, k);
+                a.g_cmp(r::RAX, r::R11);
+                a.g_jcc(cc::E, miss);
+            }
+            emit_other_fill(a, e, other);
+            a.jmp(lookup_miss);
+            a.bind(own);
+        } else {
+            a.g_jcc(cc::NE, miss);
+        }
         a.g_mov(r::R8, r::RDX);
         a.g_movabs(r::R11, e.memo as u64);
         a.g_load(r::RAX, RBP, e.slots.callee);
@@ -3622,12 +3676,16 @@ fn emit_construct_record_check(
 /// the way's callee when it equals the memo's — then, into `e.slots.callee`
 /// (and `rax`), to `identified` with its captures in `r8` for this guard's
 /// own way `own`, else to `miss` (a later way's guard identifies it).
-/// Otherwise to `slow`. Clobbers `rax`, `rdx`, `rdi`, `r8`, `r9`, `r11`.
+/// Otherwise to `slow` — but with `other` (the site's other memo's index,
+/// see [`InlineEmit::other_memo`], and the guard's miss that leaves
+/// `undefined` for the later ways), a receiver that memo records and
+/// that still holds goes there. Clobbers `rax`, `rdx`, `rdi`, `r8`, `r9`,
+/// `r11`.
 fn emit_guard_fast(
     a: &mut X64Assembler,
     e: &InlineEmit<'_>,
     (own, ways): (usize, usize),
-    slow: Label,
+    (slow, other): (Label, Option<(usize, Label)>),
     identified: Label,
     miss: Label,
 ) -> Option<()> {
@@ -3649,6 +3707,20 @@ fn emit_guard_fast(
         a.g_cmp_mem(r::RDX, r::R11, lk(w, offset_of!(LookupMemo, proto)));
         a.g_jcc(cc::E, f);
         a.bind(next);
+    }
+    if let Some((o, none)) = other {
+        a.dbg_mark("g-other");
+        a.g_cmp_mem(r::RAX, r::R11, lk(o, offset_of!(LookupMemo, shape)));
+        a.g_jcc(cc::NE, slow);
+        a.g_cmp_mem(r::RDX, r::R11, lk(o, offset_of!(LookupMemo, proto)));
+        a.g_jcc(cc::NE, slow);
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, g(o, offset_of!(GuardMemo, stamp)));
+        a.g_jcc(cc::NE, slow);
+        a.g_load(r::R9, r::R11, lk(o, offset_of!(LookupMemo, value)));
+        a.g_load(r::R9, r::R9, 0);
+        a.g_cmp_mem(r::R9, r::R11, g(o, offset_of!(GuardMemo, bits)));
+        a.g_jcc(cc::E, none);
     }
     a.jmp(slow);
     for (w, &f) in found.iter().enumerate() {
@@ -3754,6 +3826,28 @@ fn emit_guard_fill(a: &mut X64Assembler, e: &InlineEmit<'_>, w: usize) {
     if let Some(q) = e.wproof.get(w).copied().flatten() {
         a.store_empty(q);
     }
+    a.bind(skip);
+}
+
+/// Records the site's other memo (index `o`, see
+/// [`InlineEmit::other_memo`]) after a method lookup that hit (its entry
+/// in `rdi`, `rsi` nonzero when a memo may record it) found the callee
+/// value in `e.slots.callee`, none of the ways' functions; nothing when
+/// `rsi` is zero. Clobbers `rax`, `rdx`, `r9`, `r11`.
+fn emit_other_fill(a: &mut X64Assembler, e: &InlineEmit<'_>, o: usize) {
+    use core::mem::offset_of;
+    let g = |f: usize| {
+        site_off(offset_of!(CallSite, guard) + o * core::mem::size_of::<GuardMemo>() + f)
+    };
+    let skip = a.new_label();
+    a.g_test(r::RSI);
+    a.g_jcc(cc::E, skip);
+    a.g_movabs(r::R11, e.memo as u64);
+    emit_lookup_fill(a, r::R11, g(offset_of!(GuardMemo, lookup)));
+    a.g_load(r::RAX, RBP, e.slots.callee);
+    a.g_store(r::R11, g(offset_of!(GuardMemo, bits)), r::RAX);
+    load_proto_epoch(a, r::R9);
+    a.g_store(r::R11, g(offset_of!(GuardMemo, stamp)), r::R9);
     a.bind(skip);
 }
 
