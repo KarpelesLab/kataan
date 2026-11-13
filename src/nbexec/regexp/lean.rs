@@ -26,14 +26,21 @@ pub(crate) struct RegexpProtoProof {
     stamp: (usize, u64, u32, u32),
     /// Per method: where the prototype holds it (see
     /// `Realm::own_data_probe`) and the intrinsic function found there.
-    keys: [(u32, u64); 3],
+    keys: [(u32, u64); 4],
     /// Each method's storage key (a symbol's is its registered key string).
-    names: [alloc::rc::Rc<str>; 3],
+    names: [alloc::rc::Rc<str>; 4],
+    /// What [`Interp::regexp_species_default`] proved under this stamp: the
+    /// slot of the prototype's `constructor` and the value there (`%RegExp%`),
+    /// and the key epoch of the object holding `%RegExp%`'s own properties
+    /// (with that object), which every accessor (re)definition moves.
+    species: Option<(u32, u64, (u64, u32))>,
+    /// The key `constructor`, for rechecking that slot.
+    ctor_key: [alloc::rc::Rc<str>; 1],
 }
 
 /// The prototype's methods the protocol reads, by intrinsic name: `exec`,
-/// `[@@replace]`, `[@@match]`.
-const PROOF_METHODS: [&[u8]; 3] = [b"exec", b"replace", b"match"];
+/// `[@@replace]`, `[@@match]`, `[@@split]`.
+const PROOF_METHODS: [&[u8]; 4] = [b"exec", b"replace", b"match", b"split"];
 
 /// A one-step operation's subject code units: the subject memo's, or
 /// converted into the interpreter's reusable scratch buffer — no memo entry
@@ -59,6 +66,8 @@ pub(crate) const NEED_EXEC: u32 = 1;
 pub(crate) const NEED_REPLACE: u32 = 2;
 /// … for `[@@match]`.
 pub(crate) const NEED_MATCH: u32 = 4;
+/// … for `[@@split]`.
+pub(crate) const NEED_SPLIT: u32 = 8;
 
 impl Interp {
     /// Whether `h` is a RegExp whose every protocol read is an intrinsic's
@@ -104,12 +113,13 @@ impl Interp {
         if self.regexp_flags_check(proto).is_none() {
             return false;
         }
-        let names: [alloc::rc::Rc<str>; 3] = [
+        let names: [alloc::rc::Rc<str>; 4] = [
             alloc::rc::Rc::from("exec"),
             self.regexp_symbol_key(0),
             self.regexp_symbol_key(1),
+            self.regexp_symbol_key(2),
         ];
-        let mut keys = [(0u32, 0u64); 3];
+        let mut keys = [(0u32, 0u64); 4];
         for ((key, name), method) in keys.iter_mut().zip(&names).zip(PROOF_METHODS) {
             let Some((slot, v)) = self.realm.own_data_probe(proto, name) else {
                 return false;
@@ -128,8 +138,135 @@ impl Interp {
             }
             *key = (slot, v.to_bits());
         }
-        self.regexp_proto_proof = Some(RegexpProtoProof { stamp, keys, names });
+        self.regexp_proto_proof = Some(RegexpProtoProof {
+            stamp,
+            keys,
+            names,
+            species: None,
+            ctor_key: [alloc::rc::Rc::from("constructor")],
+        });
         true
+    }
+
+    /// Whether `SpeciesConstructor(R, %RegExp%)` of a pristine RegExp `R`
+    /// (see [`regexp_pristine`](Self::regexp_pristine)) is this realm's
+    /// `%RegExp%` with no user code run: `%RegExp.prototype%.constructor` is
+    /// a data property holding `%RegExp%`, whose `@@species` is the
+    /// intrinsic getter (which returns its receiver).
+    fn regexp_species_default(&mut self) -> bool {
+        let (Some(proto), Some(ctor)) = (self.current_regexp_proto(), self.regexp_ctor) else {
+            return false;
+        };
+        let ctor_epoch = self.realm.own_props_epoch(ctor);
+        // Proven under the current prototype proof (the caller's
+        // `regexp_pristine`, whose stamp pins the prototype's layout): the
+        // `constructor` slot still holds `%RegExp%` and `%RegExp%`'s keys
+        // and accessors are as they were.
+        if let Some(p) = &self.regexp_proto_proof
+            && let Some((slot, bits, epoch)) = p.species
+            && Some(epoch) == ctor_epoch
+            && self
+                .realm
+                .own_data_all_hold(proto, &[(slot, bits)], &p.ctor_key, 1)
+        {
+            return true;
+        }
+        let Some((slot, v)) = self.realm.own_data_probe(proto, "constructor") else {
+            return false;
+        };
+        if v.as_handle() != Some(ctor.to_raw()) {
+            return false;
+        }
+        let key = self.regexp_symbol_key(3);
+        let ok = self.realm.accessor(ctor, &key).is_some_and(|(g, _)| {
+            g.as_handle().map(Handle::from_raw).is_some_and(|g| {
+                self.realm
+                    .bound_native_at(g)
+                    .is_some_and(|(id, _)| id == N_REGEXP_SPECIES)
+                    && self.get_function_realm(g) == self.cur_realm
+            })
+        });
+        if ok
+            && let Some(epoch) = ctor_epoch
+            && let Some(p) = &mut self.regexp_proto_proof
+        {
+            p.species = Some((slot, v.to_bits(), epoch));
+        }
+        ok
+    }
+
+    /// `String.prototype.split` of the string `o` with the pristine RegExp
+    /// `h` (see [`regexp_pristine`](Self::regexp_pristine), which the caller
+    /// has checked for `exec`, `@@match` and `@@split`) and the limit
+    /// `limit`: the result array, or `None` (nothing done) when a step could
+    /// run user code (a limit that is not a number or `undefined`, a
+    /// user species) or the subject is empty.
+    ///
+    /// `@@split` constructs its splitter through `SpeciesConstructor`; with
+    /// the intrinsic `%RegExp%`, a pristine `R` (the constructor's
+    /// `Get(R, @@match)`, the splitter's `exec`) and a limit converted
+    /// without user code, nothing can observe that object, so its program
+    /// (`R`'s source with the new flags) runs alone.
+    pub(crate) fn regexp_split_pristine(
+        &mut self,
+        h: Handle,
+        o: NanBox,
+        limit: NanBox,
+    ) -> Result<Option<NanBox>, ExecError> {
+        let lim = match limit.unpack() {
+            Unpacked::Undefined => u32::MAX as usize,
+            _ => match limit.as_number() {
+                Some(n) => to_uint32(n) as usize,
+                None => return Ok(None),
+            },
+        };
+        if !self.regexp_species_default() {
+            return Ok(None);
+        }
+        let Some(unicode) = self
+            .realm
+            .regexp_flags(h)
+            .map(|f| f.contains('u') || f.contains('v'))
+        else {
+            return Ok(None);
+        };
+        let Some(own) = self.realm.regex_compiled(h) else {
+            return Ok(None);
+        };
+        let re = match &self.regexp_split_memo {
+            Some((k, re)) if alloc::rc::Rc::ptr_eq(k, &own) => re.clone(),
+            _ => {
+                let Some(re) = self
+                    .realm
+                    .regexp_flags(h)
+                    .map(|f| {
+                        if f.contains('y') {
+                            alloc::string::String::from(f)
+                        } else {
+                            alloc::format!("{f}y")
+                        }
+                    })
+                    .and_then(|new_flags| {
+                        let src = self.realm.regexp_source_bytes(h)?;
+                        self.realm.regex_program_for(&src, &new_flags)
+                    })
+                else {
+                    return Ok(None);
+                };
+                self.regexp_split_memo = Some((own, re.clone()));
+                re
+            }
+        };
+        let (_, units) = self.subject_units_cached(o)?;
+        if units.is_empty() {
+            return Ok(None);
+        }
+        let parts = if lim == 0 {
+            Vec::new()
+        } else {
+            self.regexp_split_run(&re, &units, lim, unicode)
+        };
+        Ok(Some(NanBox::handle(self.realm.new_array(parts).to_raw())))
     }
 
     /// The code units of the string `o` for a one-step operation (see

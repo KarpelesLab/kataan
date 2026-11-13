@@ -570,10 +570,18 @@ pub struct Interp {
     /// string/RegExp protocol reads (see `regexp_pristine`).
     #[cfg(feature = "regex")]
     regexp_proto_proof: Option<regexp::RegexpProtoProof>,
+    /// The last `@@split` splitter program made by
+    /// `regexp_split_pristine`: the RegExp's own program (held, so its
+    /// address names it) and the splitter's (its source with `y` added).
+    #[cfg(feature = "regex")]
+    regexp_split_memo: Option<(
+        alloc::rc::Rc<crate::regex::Regex>,
+        alloc::rc::Rc<crate::regex::Regex>,
+    )>,
     /// `RegExp.prototype[@@replace]` / `[@@match]` / `[@@split]` lookup memos
     /// (see `regexp_symbol_method`), and those keys' storage strings.
     regexp_symbol_lookup: [crate::realm::builtins_fast::MethodSiteCache; 3],
-    regexp_symbol_keys: [Option<(usize, alloc::rc::Rc<str>)>; 3],
+    regexp_symbol_keys: [Option<(usize, alloc::rc::Rc<str>)>; 4],
     /// The layout of a RegExp match array's `index`/`input`/`groups`.
     #[cfg(feature = "regex")]
     match_array_shape: crate::realm::builtins_fast::AuxShapeCache,
@@ -3081,8 +3089,10 @@ impl Interp {
             regexp_flags_proof: None,
             #[cfg(feature = "regex")]
             regexp_proto_proof: None,
+            #[cfg(feature = "regex")]
+            regexp_split_memo: None,
             regexp_symbol_lookup: Default::default(),
-            regexp_symbol_keys: [None, None, None],
+            regexp_symbol_keys: [None, None, None, None],
             #[cfg(feature = "regex")]
             match_array_shape: Default::default(),
             current: Scope::root(),
@@ -9766,6 +9776,32 @@ impl crate::nbvm::VmHost for Interp {
         #[cfg(not(feature = "regex"))]
         {
             let _ = (recv, rx);
+            None
+        }
+    }
+
+    fn string_split(
+        &mut self,
+        recv: NanBox,
+        rx: NanBox,
+        limit: NanBox,
+    ) -> Option<Result<NanBox, crate::nbvm::HostError>> {
+        #[cfg(feature = "regex")]
+        {
+            let h = Handle::from_raw(rx.as_handle()?);
+            if !self.regexp_pristine(
+                h,
+                regexp::NEED_EXEC | regexp::NEED_MATCH | regexp::NEED_SPLIT,
+            ) {
+                return None;
+            }
+            self.regexp_split_pristine(h, recv, limit)
+                .map_err(exec_to_host)
+                .transpose()
+        }
+        #[cfg(not(feature = "regex"))]
+        {
+            let _ = (recv, rx, limit);
             None
         }
     }

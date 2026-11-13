@@ -7831,6 +7831,20 @@ impl Realm {
             .map(crate::object::Object::key_epoch)
     }
 
+    /// The key epoch (see [`object_key_epoch`](Self::object_key_epoch)) of
+    /// the object holding the own properties of the cell at `handle` — the
+    /// cell itself, or a non-object cell's (a function's) auxiliary object —
+    /// with that object's raw handle: `None` when there is no such object.
+    #[must_use]
+    pub fn own_props_epoch(&self, handle: Handle) -> Option<(u64, u32)> {
+        if let Some(o) = self.heap.get(handle).and_then(Cell::as_object) {
+            return Some((handle.to_raw(), o.key_epoch()));
+        }
+        let aux = *self.aux_props.get(&handle.to_raw())?;
+        let o = self.heap.get(aux)?.as_object()?;
+        Some((aux.to_raw(), o.key_epoch()))
+    }
+
     /// How many times two heap cells have swapped contents (a stamp that,
     /// with an object's [`key epoch`](Self::object_key_epoch), shows the
     /// object still has the own properties it had).

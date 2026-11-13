@@ -1307,6 +1307,21 @@ pub trait VmHost {
     fn string_match(&mut self, _recv: NanBox, _rx: NanBox) -> Option<Result<NanBox, HostError>> {
         None
     }
+    /// `recv.split(rx, limit)` for a string `recv` and a RegExp `rx`, when
+    /// the host can run it in one step with no user code (a pristine RegExp,
+    /// the default species, a limit needing no conversion): the result
+    /// array; `None` to take the general call.
+    ///
+    /// # Errors
+    /// A host fault (a pristine split runs no user code).
+    fn string_split(
+        &mut self,
+        _recv: NanBox,
+        _rx: NanBox,
+        _limit: NanBox,
+    ) -> Option<Result<NanBox, HostError>> {
+        None
+    }
     /// `new ctor(...args)` with the host's `[[Construct]]`.
     ///
     /// # Errors

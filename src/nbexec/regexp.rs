@@ -3,7 +3,7 @@ use super::*;
 #[cfg(feature = "regex")]
 mod lean;
 #[cfg(feature = "regex")]
-pub(crate) use lean::{NEED_EXEC, NEED_MATCH, RegexpProtoProof};
+pub(crate) use lean::{NEED_EXEC, NEED_MATCH, NEED_SPLIT, RegexpProtoProof};
 
 impl Interp {
     /// Builds a match-result array from a `Captures` whose spans are **code-unit**
@@ -836,8 +836,8 @@ impl Interp {
         {
             // Validated (and later matched) through the `&str` engine — see the
             // `RegExp` constructor for how a lone surrogate survives that.
-            let lossy = crate::regex::pattern_from_wtf8(&pat_s, &flags_s);
-            if crate::regex::Regex::new(&lossy, &flags_s).is_err() {
+            if self.realm.regex_program_for(&pat_s, &flags_s).is_none() {
+                let lossy = crate::regex::pattern_from_wtf8(&pat_s, &flags_s);
                 let e = self.regexp_syntax_error(&lossy, &flags_s);
                 return Err(ExecError::Throw(e));
             }
@@ -1224,13 +1224,14 @@ impl Interp {
     }
 
     /// The storage key of `RegExp.prototype[@@replace]` (`which` 0),
-    /// `[@@match]` (1) or `[@@split]` (2), memoized per realm.
-    fn regexp_symbol_key(&mut self, which: usize) -> alloc::rc::Rc<str> {
+    /// `[@@match]` (1) or `[@@split]` (2), or of `RegExp[@@species]` (3),
+    /// memoized per realm.
+    pub(crate) fn regexp_symbol_key(&mut self, which: usize) -> alloc::rc::Rc<str> {
         let rp = core::ptr::from_ref::<Realm>(&self.realm) as usize;
         match &self.regexp_symbol_keys[which] {
             Some((p, k)) if *p == rp => alloc::rc::Rc::clone(k),
             _ => {
-                let name = ["replace", "match", "split"][which];
+                let name = ["replace", "match", "split", "species"][which];
                 let sym = self.well_known_symbol(name);
                 let k: alloc::rc::Rc<str> = self.member_key(sym).into();
                 self.regexp_symbol_keys[which] = Some((rp, alloc::rc::Rc::clone(&k)));
@@ -1593,6 +1594,31 @@ impl Interp {
         } else {
             alloc::format!("{flags}y")
         };
+        // The splitter `Construct(%RegExp%, «rx, newFlags»)` would make, when
+        // nothing can observe it: `C` is this realm's intrinsic `%RegExp%`,
+        // `rx` is pristine (so the constructor's `Get(rx, @@match)` and every
+        // splitter `exec` lookup read intrinsics) and `limit` needs no user
+        // conversion (so nothing runs between the construction and the
+        // loop). The loop then runs on the splitter's program alone, which is
+        // `rx`'s source compiled with the new flags; no object is made.
+        #[cfg(feature = "regex")]
+        if !units.is_empty()
+            && (matches!(limit.unpack(), Unpacked::Undefined) || limit.as_number().is_some())
+            && ctor.as_handle() == self.regexp_ctor.map(Handle::to_raw)
+            && self.regexp_pristine(h, lean::NEED_EXEC | lean::NEED_MATCH)
+            && let Some(source) = self.realm.regexp_source_bytes(h)
+            && let Some(re) = self.realm.regex_program_for(&source, &new_flags)
+        {
+            let lim = match limit.as_number() {
+                Some(n) => to_uint32(n) as usize,
+                None => u32::MAX as usize,
+            };
+            if lim == 0 {
+                return Ok(NanBox::handle(self.realm.new_array(Vec::new()).to_raw()));
+            }
+            let parts = self.regexp_split_run(&re, &units_rc, lim, unicode);
+            return Ok(NanBox::handle(self.realm.new_array(parts).to_raw()));
+        }
         let new_flags_v = self.new_str(&new_flags);
         let splitter_v = self.construct(ctor, &[rx, new_flags_v])?;
         let Some(splitter) = splitter_v.as_handle().map(Handle::from_raw) else {
@@ -1605,20 +1631,7 @@ impl Interp {
             // the modulo-2^32 wrap (computed inline so the no-`std` build, where
             // `Realm::to_uint32` is unavailable, still compiles).
             let nv = self.coerce_to_number(limit)?;
-            let n = self.realm.to_number(nv);
-            // ToUint32: a non-finite/NaN value is 0; otherwise truncate toward
-            // zero and reduce modulo 2^32 (the `%` operator is `core`, unlike the
-            // `std`-only `rem_euclid`).
-            let wrapped = if n.is_finite() {
-                let two32 = 4_294_967_296.0_f64;
-                let t = crate::common::FloatExt::trunc(n); // toward zero, unsaturated
-                let m = t % two32;
-                let m = if m < 0.0 { m + two32 } else { m };
-                m as u32
-            } else {
-                0
-            };
-            wrapped as usize
+            to_uint32(self.realm.to_number(nv)) as usize
         };
         let mut parts: Vec<NanBox> = Vec::new();
         if lim == 0 {
@@ -1712,6 +1725,19 @@ impl Interp {
         let Some(re) = self.realm.regex_compiled(splitter) else {
             return Ok(None);
         };
+        Ok(Some(self.regexp_split_run(&re, units_rc, lim, unicode)))
+    }
+
+    /// The `@@split` loop of [`regexp_split_fast`](Self::regexp_split_fast)
+    /// over the splitter's program `re`.
+    #[cfg(feature = "regex")]
+    fn regexp_split_run(
+        &mut self,
+        re: &crate::regex::Regex,
+        units_rc: &alloc::rc::Rc<Vec<u16>>,
+        lim: usize,
+        unicode: bool,
+    ) -> Vec<NanBox> {
         let units: &[u16] = units_rc;
         let size = units.len();
         let mut parts: Vec<NanBox> = Vec::new();
@@ -1750,7 +1776,7 @@ impl Interp {
             parts.push(self.units_str(units, p, at));
             if parts.len() == lim {
                 self.update_legacy_regexp(units_rc, &c);
-                return Ok(Some(parts));
+                return parts;
             }
             for g in 1..c.groups.len() {
                 parts.push(match c.group(g) {
@@ -1759,7 +1785,7 @@ impl Interp {
                 });
                 if parts.len() == lim {
                     self.update_legacy_regexp(units_rc, &c);
-                    return Ok(Some(parts));
+                    return parts;
                 }
             }
             p = e;
@@ -1770,7 +1796,7 @@ impl Interp {
             self.update_legacy_regexp(units_rc, c);
         }
         parts.push(self.units_str(units, p, usize::MAX));
-        Ok(Some(parts))
+        parts
     }
 
     /// `RegExp.prototype[@@replace](string, replaceValue)`.
@@ -2480,6 +2506,20 @@ fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 /// The UTF-16 code units of WTF-8 `bytes` (an ASCII string widens byte by byte).
+/// `ToUint32(n)` of a number: 0 for a non-finite value, else the integer
+/// toward zero reduced modulo 2^32 (computed inline: the no-`std` build has
+/// no `Realm::to_uint32`).
+fn to_uint32(n: f64) -> u32 {
+    if !n.is_finite() {
+        return 0;
+    }
+    let two32 = 4_294_967_296.0_f64;
+    let t = crate::common::FloatExt::trunc(n); // toward zero, unsaturated
+    let m = t % two32;
+    let m = if m < 0.0 { m + two32 } else { m };
+    m as u32
+}
+
 fn utf16_units_into(bytes: &[u8], out: &mut Vec<u16>) {
     if bytes.is_ascii() {
         out.extend(bytes.iter().map(|&b| u16::from(b)));

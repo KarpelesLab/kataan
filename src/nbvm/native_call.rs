@@ -1289,6 +1289,17 @@ fn run_op(
                 .map_err(VmError::from),
         );
     }
+    // A string split by a RegExp the host can split in one step.
+    if matches!(op, FastOp::StrSplit)
+        && let Some(r) = arg(0).as_handle()
+        && !ctx.realm.multi_realm
+        && ctx.realm.regexp_flags(Handle::from_raw(r)).is_some()
+        && ctx.realm.is_string_handle(h)
+        && ctx.realm.typeof_is_string(h)
+        && let Some(Some(r)) = with_host(ctx, |host| host.string_split(recv, arg(0), arg(1)))
+    {
+        return Some(r.map_err(VmError::from));
+    }
     if matches!(op, FastOp::ObjAssign) {
         if let Some(v) = obj_assign_fast(&mut ctx.realm, regs, args) {
             return Some(Ok(v));

@@ -1860,6 +1860,27 @@ impl Realm {
         progs.last().map(|p| Rc::clone(&p.program))
     }
 
+    /// The compiled program for the WTF-8 pattern `source` under `flags`:
+    /// the remembered one, else compiled now and remembered, so that
+    /// validating a pattern (the `RegExp` constructor, `compile`) and the
+    /// first match of the RegExp it makes share one compilation. `None` for
+    /// an invalid pattern or flags.
+    pub(crate) fn regex_program_for(
+        &self,
+        source: &[u8],
+        flags: &str,
+    ) -> Option<Rc<crate::regex::Regex>> {
+        if let Some(re) = self.regex_program_lookup(source, flags) {
+            return Some(re);
+        }
+        let re = Rc::new(
+            crate::regex::Regex::new(&crate::regex::pattern_from_wtf8(source, flags), flags)
+                .ok()?,
+        );
+        self.regex_program_remember(source, flags, &re);
+        Some(re)
+    }
+
     /// Remembers `program` as the compilation of `(source, flags)`, dropping
     /// the least recently used entry when full.
     pub(super) fn regex_program_remember(

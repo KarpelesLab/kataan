@@ -2776,9 +2776,9 @@ impl Interp {
             // engine parses `&str`, so a lone surrogate is rewritten to its `\u`
             // escape; only `.source` reports the exact original bytes.)
             #[cfg(feature = "regex")]
-            {
+            if self.realm.regex_program_for(&pat, &flags).is_none() {
                 let pat_s = crate::regex::pattern_from_wtf8(&pat, &flags);
-                if crate::regex::Regex::new(&pat_s, &flags).is_err() {
+                {
                     let m = self.new_str(&alloc::format!(
                         "Invalid regular expression: /{pat_s}/{flags}"
                     ));
