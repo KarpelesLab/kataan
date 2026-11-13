@@ -50,6 +50,12 @@ pub struct PropertyCache {
     /// interpreter saw it access ([`elem_fb`]), the feedback the
     /// machine-code tier orders its element kind tests by.
     elem_kind: u8,
+    /// For a call site: how often it called each function `callee` names
+    /// (by its index there; a [`CalleeHint::One`]'s at `0`, which stays
+    /// its index in the [`CalleeHint::Poly`] it may become), halved
+    /// whenever one would overflow: the order a polymorphic site's inlined
+    /// ways are tried in ([`ordered_callee_hint`](Self::ordered_callee_hint)).
+    callee_hits: [u8; CalleeHint::POLY_MAX],
     /// For a call site: which VM closure it calls ([`CalleeHint`]), the
     /// feedback the machine-code tier inlines a callee from.
     callee: CalleeHint,
@@ -132,7 +138,8 @@ pub enum CalleeHint {
     /// Always this key.
     One(u64),
     /// Two to [`CalleeHint::POLY_MAX`] VM functions, by function id in the
-    /// order first seen (unused entries [`CalleeHint::NO_FN`]); their keys'
+    /// order first seen (unused entries [`CalleeHint::NO_FN`]; but see
+    /// `PropertyCache::ordered_callee_hint`); their keys'
     /// capture counts are the functions' own (a guard compares the whole key
     /// anyway).
     Poly([u32; CalleeHint::POLY_MAX]),
@@ -466,6 +473,41 @@ impl PropertyCache {
     /// (see [`CalleeHint`]).
     pub fn note_callee(&mut self, key: u64) {
         self.callee = self.callee.with(key);
+        let at = match self.callee {
+            CalleeHint::One(_) => Some(0),
+            CalleeHint::Poly(f) => f.iter().position(|&x| x == key as u32),
+            _ => None,
+        };
+        if let Some(i) = at {
+            if self.callee_hits[i] == u8::MAX {
+                for h in &mut self.callee_hits {
+                    *h /= 2;
+                }
+            }
+            self.callee_hits[i] += 1;
+        }
+    }
+
+    /// [`callee_hint`](Self::callee_hint), a [`CalleeHint::Poly`]'s
+    /// functions most called first (of equally called ones, the first seen
+    /// first).
+    #[must_use]
+    pub fn ordered_callee_hint(&self) -> CalleeHint {
+        let CalleeHint::Poly(f) = self.callee else {
+            return self.callee;
+        };
+        let mut idx: [usize; CalleeHint::POLY_MAX] = core::array::from_fn(|i| i);
+        idx.sort_by_key(|&i| core::cmp::Reverse(self.callee_hits[i]));
+        let mut out = [CalleeHint::NO_FN; CalleeHint::POLY_MAX];
+        // (Unused entries are never counted: they stay after the used ones.)
+        let mut n = 0;
+        for &i in &idx {
+            if f[i] != CalleeHint::NO_FN {
+                out[n] = f[i];
+                n += 1;
+            }
+        }
+        CalleeHint::Poly(out)
     }
 
     /// The call site's callee feedback (see [`CalleeHint`]).

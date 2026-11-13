@@ -51,6 +51,26 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_POLY").is_none_or(|v| v != "0"))
 }
 
+/// Whether a polymorphic call site's inlined ways are tried most called
+/// first, as the interpreter counted them (`KATAAN_JIT_POLYORDER=0`: in the
+/// order first seen). The first way's guard is the cheapest to hit.
+#[must_use]
+pub(crate) fn order_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_POLYORDER").is_none_or(|v| v != "0"))
+}
+
+/// A call site's callee feedback for the compiler (see
+/// [`order_enabled`]).
+#[must_use]
+pub(crate) fn hint_of(c: &crate::ic::PropertyCache) -> crate::ic::CalleeHint {
+    if order_enabled() {
+        c.ordered_callee_hint()
+    } else {
+        c.callee_hint()
+    }
+}
+
 /// One further layout compiled into a property site: a receiver whose shape
 /// word is `shape` has the site's key as a data property in slot `slot`.
 #[derive(Clone, Copy, Debug)]

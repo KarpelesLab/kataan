@@ -6623,7 +6623,7 @@ pub(crate) fn elem_kinds_of(ic: &[PropertyCache]) -> Vec<(usize, u8)> {
 fn tier_hints(proto: &FnProto) -> Vec<crate::ic::CalleeHint> {
     proto.tier.0.try_borrow().map_or_else(
         |_| Vec::new(),
-        |t| t.ic.iter().map(PropertyCache::callee_hint).collect(),
+        |t| t.ic.iter().map(crate::jit::poly::hint_of).collect(),
     )
 }
 
@@ -6685,7 +6685,7 @@ fn ensure_jit(
             let (warm, hints) = match ic {
                 Some(ic) => (
                     ic.iter().map(PropertyCache::warm_entry).collect(),
-                    ic.iter().map(PropertyCache::callee_hint).collect(),
+                    ic.iter().map(crate::jit::poly::hint_of).collect(),
                 ),
                 None => (tier_warm(&funcs[id]), tier_hints(&funcs[id])),
             };

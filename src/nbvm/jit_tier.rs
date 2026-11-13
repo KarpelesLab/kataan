@@ -1227,7 +1227,7 @@ fn recompile(
     }
     for (h, c) in hints.iter_mut().zip(ic) {
         if *h == crate::ic::CalleeHint::None {
-            *h = c.callee_hint();
+            *h = crate::jit::poly::hint_of(c);
         }
     }
     // (And no speculative version for a loop whose fast version kept

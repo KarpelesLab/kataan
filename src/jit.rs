@@ -60,7 +60,7 @@ mod key_probe;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod pin;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-mod poly;
+pub(crate) mod poly;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod prologue;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
