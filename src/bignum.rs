@@ -174,14 +174,14 @@ impl BigInt {
     /// Returns `self * 2^k` (a left shift by `k` bits).
     #[must_use]
     pub fn shl_bits(&self, k: u32) -> Self {
-        Self(self.0.mul_2k(k))
+        Self(self.0.mul_2k(u64::from(k)))
     }
 
     /// Returns `floor(self / 2^k)` (an arithmetic right shift by `k` bits:
     /// a negative value with any of its low `k` bits set rounds down).
     #[must_use]
     pub fn shr_floor_bits(&self, k: u32) -> Self {
-        let q = self.0.div_2k_trunc(k);
+        let q = self.0.div_2k_trunc(u64::from(k));
         if self.0.is_negative() && self.0.trailing_zeros() < k {
             Self(q.sub(&Int::from(1i32)))
         } else {
@@ -218,7 +218,7 @@ impl BigInt {
         // overflow it is always rejected by `try_pow`'s `max_bits` guard first,
         // but fall back to binary exponentiation so any exponent stays correct.
         if let Ok(e) = u32::try_from(exp) {
-            return Self(self.0.pow(e));
+            return Self(self.0.pow(u64::from(e)));
         }
         let mut result = Self::from_i128(1);
         let mut base = self.clone();

@@ -83,13 +83,13 @@ cli = ["std", "regex", "module", "host"]
 # In line with the Karpelès Lab "pure Rust, no foreign code" charter, the only
 # dependencies are sibling pure-Rust crates, each behind an opt-in feature.
 [dependencies]
-purecrypto = { version = "0.6", optional = true, default-features = false, features = ["rng", "hash", "cipher", "linux-getrandom"] }
+purecrypto = { version = "0.10.6", optional = true, default-features = false, features = ["rng", "hash", "cipher", "linux-getrandom"] }
 # Pure-Rust, no_std Unicode/Intl primitives (a pure-Rust ICU analog). `full`
 # selects supplementary planes so JS strings (full Unicode) are covered.
 # 0.5 gates each formatter behind its own feature (the 0.4 `full` no longer
 # pulls them in). Enable the Intl-service formatters the engine uses (`plural`
 # and `calendar` are always-on and need no feature).
-intl = { version = "0.6.2", optional = true, default-features = false, features = [
+intl = { version = "0.6.5", optional = true, default-features = false, features = [
     "full", "alloc", "case", "collation", "identifiers",
     "number", "currency", "datetime", "calendars-extra", "list", "displaynames", "relative", "units", "locale",
     # 0.5.5 is the floor: it is the first release whose `DateTimeFormatOptions`
@@ -107,7 +107,7 @@ intl = { version = "0.6.2", optional = true, default-features = false, features 
 # `int` backs BigInt; `rational`/`decimal` give exact (non-f64) arithmetic for
 # Intl NumberFormat rounding and Temporal duration ratios (avoids the f64
 # round-trip that loses BigInt precision / mis-rounds at the ULP boundary).
-puremp = { version = "0.2", default-features = false, features = ["int", "rational", "decimal"] }
+puremp = { version = "0.3.3", default-features = false, features = ["int", "rational", "decimal"] }
 # IANA time-zone database (no_std, no-alloc) for Temporal.ZonedDateTime.
 timezone-data = "0.2"
 
