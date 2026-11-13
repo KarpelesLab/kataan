@@ -1400,8 +1400,7 @@ impl X64Assembler {
 
     /// `rax` = the prototype epoch (a plain load of its counter).
     fn p_load_proto_epoch(&mut self, dst: u8) {
-        self.g_movabs(dst, crate::object::proto_epoch_addr() as u64);
-        self.g_load(dst, dst, 0);
+        self.g_load_abs(dst, crate::object::proto_epoch_addr() as u64);
     }
 
     /// The read of a [`MethodSite`]'s [`NativeOwn`] memo on the receiver
@@ -2912,8 +2911,7 @@ impl X64Assembler {
         let base = core::mem::offset_of!(crate::realm::Realm, array_iter_jit);
         let off = |f: usize| i32::try_from(base + f).unwrap_or(i32::MAX);
         self.g_load(r::R9, r::R15, realm_off);
-        self.g_movabs(r::R11, crate::object::proto_epoch_addr() as u64);
-        self.g_load(r::RAX, r::R11, 0);
+        self.g_load_abs(r::RAX, crate::object::proto_epoch_addr() as u64);
         self.g_cmp_mem(r::RAX, r::R9, off(core::mem::offset_of!(J, stamp)));
         self.g_jcc(cc::NE, miss);
         for (ptr, f) in [
@@ -2944,8 +2942,7 @@ impl X64Assembler {
         self.g_movabs(r::R11, site);
         self.g_cmp_mem(r::RAX, r::R11, recv);
         self.g_jcc(cc::NE, miss);
-        self.g_movabs(r::RAX, crate::object::proto_epoch_addr() as u64);
-        self.g_load(r::RAX, r::RAX, 0);
+        self.g_load_abs(r::RAX, crate::object::proto_epoch_addr() as u64);
         self.g_cmp_mem(r::RAX, r::R11, stamp);
         self.g_jcc(cc::NE, miss);
         self.g_load(r::RAX, r::R11, ptr);

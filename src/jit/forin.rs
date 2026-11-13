@@ -536,8 +536,7 @@ impl X64Assembler {
         self.g_load(r::R9, r::RCX, l.props.off_proto);
         self.g_cmp_mem(r::R9, r::R11, table_off!(proto_raw));
         self.g_jcc(cc::NE, miss);
-        self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
-        self.g_load(r::R9, r::R9, 0);
+        self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
         self.g_cmp_mem(r::R9, r::R11, table_off!(stamp));
         self.g_jcc(cc::NE, miss);
         self.g_load(r::RAX, r::R11, table_off!(array));

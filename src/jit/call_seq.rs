@@ -795,8 +795,7 @@ impl X64Assembler {
 
 /// `mov dst, [PROTO_EPOCH]`.
 fn load_proto_epoch(a: &mut X64Assembler, dst: u8) {
-    a.g_movabs(dst, crate::object::proto_epoch_addr() as u64);
-    a.g_load(dst, dst, 0);
+    a.g_load_abs(dst, crate::object::proto_epoch_addr() as u64);
 }
 
 /// The [`ConstructFast`] record (at `[site + fast]`, the site's address in
@@ -1078,6 +1077,30 @@ impl X64Assembler {
     /// `mov dst, [base+disp]`.
     pub(crate) fn g_load(&mut self, dst: u8, base: u8, disp: i32) {
         self.g_mem(true, &[0x8b], dst, base, disp);
+    }
+
+    /// `mov dst, [addr]` of a static's address (the prototype epoch's, say):
+    /// one load through an absolute `disp32` when the address is below
+    /// 2 GiB (a static of a binary loaded low, as non-PIE executables are),
+    /// else a `movabs` of the address into `dst` and a load through it.
+    /// `KATAAN_JIT_ABSLOAD=0`: always the latter.
+    pub(crate) fn g_load_abs(&mut self, dst: u8, addr: u64) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ABSLOAD").is_none_or(|v| v != "0"));
+        match u32::try_from(addr) {
+            Ok(a32) if on && a32 < 0x8000_0000 => {
+                // REX.W 8B /r, ModRM mod=00 rm=100, SIB base=101 index=100:
+                // `[disp32]`.
+                let rex = 0x48 | (((dst >> 3) & 1) << 2);
+                self.code
+                    .extend_from_slice(&[rex, 0x8b, ((dst & 7) << 3) | 0x04, 0x25]);
+                self.code.extend_from_slice(&a32.to_le_bytes());
+            }
+            _ => {
+                self.g_movabs(dst, addr);
+                self.g_load(dst, dst, 0);
+            }
+        }
     }
 
     /// `mov [base+disp], src`.

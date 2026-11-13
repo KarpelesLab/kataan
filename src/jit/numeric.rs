@@ -3341,8 +3341,7 @@ impl NumGen {
         }
         let noted = self.gslot_disp((self.n_gslots + ri) as u32);
         let keep = a.new_label();
-        a.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
-        a.raw(&[0x4d, 0x8b, 0x1b]); // mov r11, [r11]
+        a.g_load_abs(super::call_seq::r::R11, crate::env::global_binding_epoch_addr() as u64);
         a.raw(&[0x4c, 0x3b, 0x9d]); // cmp r11, [rbp + noted]
         a.raw(&noted.to_le_bytes());
         a.jcc(CC_E, keep);
@@ -11436,8 +11435,7 @@ impl X64Assembler {
         };
         let slots = slots.to_vec();
         let keep = self.new_label();
-        self.movabs_r11(crate::env::global_binding_epoch_addr() as i64);
-        self.raw(&[0x4d, 0x8b, 0x1b]); // mov r11, [r11]
+        self.g_load_abs(super::call_seq::r::R11, crate::env::global_binding_epoch_addr() as u64);
         self.raw(&[0x4c, 0x3b, 0x9d]); // cmp r11, [rbp + noted]
         self.raw(&noted.to_le_bytes());
         self.jcc(CC_E, keep);

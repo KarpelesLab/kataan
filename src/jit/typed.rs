@@ -854,8 +854,7 @@ impl X64Assembler {
         let stamp =
             i32::try_from(crate::realm::Realm::jit_typed_len_stamp_offset()).unwrap_or(i32::MAX);
         self.g_load(r::R11, r::R15, realm);
-        self.g_movabs(tmp, crate::object::proto_epoch_addr() as u64);
-        self.g_load(tmp, tmp, 0);
+        self.g_load_abs(tmp, crate::object::proto_epoch_addr() as u64);
         self.g_cmp_mem(tmp, r::R11, stamp);
         self.g_jcc(cc::E, intact);
     }

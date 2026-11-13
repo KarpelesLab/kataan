@@ -212,8 +212,7 @@ impl X64Assembler {
         self.dv_slot(r::RAX, o.recv);
         self.g_cmp_mem(r::RAX, r::R11, recv);
         self.g_jcc(cc::NE, fill);
-        self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
-        self.g_load(r::R9, r::R9, 0);
+        self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
         self.g_cmp_mem(r::R9, r::R11, stamp);
         self.g_jcc(cc::NE, fill);
         // ... and the method's slot still holds the built-in (or the method

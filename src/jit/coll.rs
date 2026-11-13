@@ -339,16 +339,14 @@ impl X64Assembler {
             self.g_load(r::R9, base, c);
             self.g_cmp_mem(r::R9, r::R11, method);
             self.g_jcc(cc::E, proven);
-            self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
-            self.g_load(r::R9, r::R9, 0);
+            self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
             self.g_cmp_mem(r::R9, r::R11, stamp);
             self.g_jcc(cc::NE, stale);
             self.jmp(slow);
             self.bind(proven);
         } else {
             // The proof, at the current epoch ...
-            self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
-            self.g_load(r::R9, r::R9, 0);
+            self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
             self.g_cmp_mem(r::R9, r::R11, stamp);
             self.g_jcc(cc::NE, stale);
             // ... with the built-in still in the prototype's slot.
@@ -557,8 +555,7 @@ impl X64Assembler {
         // The proof, at the current epoch, with the built-in still in the
         // prototype's slot, for the receiver's kind.
         self.g_movabs(r::R11, site as u64);
-        self.g_movabs(r::R9, crate::object::proto_epoch_addr() as u64);
-        self.g_load(r::R9, r::R9, 0);
+        self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
         self.g_cmp_mem(r::R9, r::R11, stamp);
         self.g_jcc(cc::NE, stale);
         self.g_load(r::R9, r::R11, ptr);
