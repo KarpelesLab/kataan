@@ -46,6 +46,38 @@ const S_YIELD: u8 = GEN_SUSPENDED_YIELD as u8;
 const S_EXECUTING: u8 = GEN_EXECUTING as u8;
 const S_COMPLETED: u8 = GEN_COMPLETED as u8;
 
+/// Whether a hot generator's register file stays at its compiled body's size
+/// between resumptions (`KATAAN_JIT_GENKEEP`, default on): the registers past
+/// the function's own — its inlined callees' sub-windows, which every inlined
+/// call initializes itself before use, as a window's are — keep their last
+/// values (rooted by the cell, so they stay valid) instead of being cut off at
+/// each `yield` and refilled with `undefined` at each resumption. Every path
+/// that hands the file to the interpreter cuts it back to the function's own.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn keep_regs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENKEEP").is_none_or(|v| v != "0"))
+}
+
+/// Whether a hot resumption writes its frame back at a `yield` through the
+/// pointer its first borrow of the cell gave when no sweep ran meanwhile
+/// (`KATAAN_JIT_GENPTR`, default on), rather than looking the cell up again.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn reuse_frame_ptr() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENPTR").is_none_or(|v| v != "0"))
+}
+
+/// Whether compiled code's `g.next(v)` method call (`site_call` from
+/// `jit_helper_call_method`, whose register window is a GC root already)
+/// skips publishing its caller's registers: it only counts as published
+/// (`KATAAN_JIT_GENSITE`, default on).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn jit_site_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENSITE").is_none_or(|v| v != "0"))
+}
+
 /// The generator object `gh`'s frame cell, when it is a sync VM generator.
 #[inline]
 fn state_of(ctx: &mut Ctx, gh: Handle) -> Option<Handle> {
@@ -175,6 +207,8 @@ fn resume_state_at(
         }
         None => return Err(VmError::NotAnObject),
     };
+    // (A file a compiled run left at its body's size: the function's own.)
+    regs.truncate(proto.n_regs);
     let inject = if let Some((ddst, dmode)) = delegate {
         regs[ddst as usize] = v;
         regs[dmode as usize] = NanBox::number(f64::from(mode));
@@ -369,10 +403,16 @@ fn run_in_cell(
     use super::jit_tier::GenRun;
     let own = proto.n_regs;
     let n = jit.n_regs().max(own);
-    let (ptr, len, mut handlers) = match ctx.realm.vm_frame_mut(fh) {
-        Some(f) if f.regs.len() == own => {
+    let keep = keep_regs();
+    let epoch = ctx.realm.heap_epoch();
+    let (fp, ptr, len, mut handlers) = match ctx.realm.vm_frame_mut(fh) {
+        Some(f) if f.regs.len() == own || (keep && f.regs.len() == n) => {
             f.state = S_EXECUTING;
-            f.regs.resize(n, NanBox::undefined());
+            // (A file kept at the body's size since the last run — see
+            // `keep_regs` — is not refilled.)
+            if f.regs.len() != n {
+                f.regs.resize(n, NanBox::undefined());
+            }
             match land {
                 Some((d, Some(m))) => {
                     f.regs[d as usize] = v;
@@ -385,11 +425,9 @@ fn run_in_cell(
                 }
                 None => {}
             }
-            (
-                f.regs.as_mut_ptr(),
-                f.regs.len(),
-                core::mem::take(&mut f.handlers),
-            )
+            let (ptr, len) = (f.regs.as_mut_ptr(), f.regs.len());
+            let hs = core::mem::take(&mut f.handlers);
+            (f as *mut crate::cell::VmFrame, ptr, len, hs)
         }
         Some(_) => return run_on_window(ctx, funcs, proto, jit, fh, pc, land, v),
         None => return Err(VmError::NotAnObject),
@@ -406,8 +444,22 @@ fn run_in_cell(
         super::jit_tier::run_generator_body_in_place(ctx, funcs, jit, regs, pc, &mut handlers);
     ctx.realm.vm_gen_running.pop();
     if let GenRun::Yield { value, pc, dst } = run {
-        if let Some(f) = ctx.realm.vm_frame_mut(fh) {
-            f.regs.truncate(own);
+        // With no sweep since the borrow above, the cell is where it was and
+        // still remembered (or young): its frame is written through the
+        // pointer that borrow gave, with no second barrier.
+        let f = if ctx.realm.heap_epoch() == epoch && reuse_frame_ptr() {
+            // SAFETY: the frame cell is live (rooted by its generator, which
+            // the resumer holds) and unswept since `fp` was taken; its boxed
+            // frame does not move; nothing else borrows it here.
+            #[allow(unsafe_code)]
+            Some(unsafe { &mut *fp })
+        } else {
+            ctx.realm.vm_frame_mut(fh)
+        };
+        if let Some(f) = f {
+            if !keep {
+                f.regs.truncate(own);
+            }
             f.handlers = handlers;
             f.pc = pc as u32;
             f.dst = dst;
@@ -779,7 +831,10 @@ pub(super) fn site_call(
     mode: u8,
     method: u64,
     v: NanBox,
+    rooted: bool,
 ) -> Option<Result<NanBox, VmError>> {
+    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    let _ = rooted;
     if MODE_KEYS.get(usize::from(mode)) != Some(&key) || ctx.host.is_none() || ctx.realm.multi_realm
     {
         return None;
@@ -822,7 +877,7 @@ pub(super) fn site_call(
     }
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     if mode == 0
-        && let Some(r) = site_next_hot(ctx, funcs, regs, recv, fh, v)
+        && let Some(r) = site_next_hot(ctx, funcs, regs, rooted, recv, fh, v)
     {
         return Some(r);
     }
@@ -850,6 +905,7 @@ fn site_next_hot(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     caller: &[NanBox],
+    rooted: bool,
     g: NanBox,
     fh: Handle,
     v: NanBox,
@@ -892,13 +948,24 @@ fn site_next_hot(
         t.resumes = n;
         j
     };
-    let mark = publish(ctx, caller, g, v);
+    // (A caller whose registers — holding the generator and the sent value —
+    // are rooted already only counts as published.)
+    let mark = if rooted {
+        ctx.frames_published += 1;
+        usize::MAX
+    } else {
+        publish(ctx, caller, g, v)
+    };
     ctx.call_depth += 1;
     ctx.realm.vm_total_depth += 1;
     let out = run_in_cell(ctx, funcs, proto, &jit, fh, pc, land, v);
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
-    unpublish(ctx, mark);
+    if mark == usize::MAX {
+        ctx.frames_published -= 1;
+    } else {
+        unpublish(ctx, mark);
+    }
     Some(out.map(|o| result_object(ctx, o)))
 }
 

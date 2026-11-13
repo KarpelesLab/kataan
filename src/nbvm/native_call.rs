@@ -544,6 +544,26 @@ fn length_arg(v: NanBox) -> Option<usize> {
 /// site: a stale answer only sends a VM-function call down the host's
 /// general path, which is slower but exact (and the next [`try_call`] miss
 /// re-resolves or retires the site).
+/// The resumption mode and method of a site whose built-in is a generator's
+/// `next` / `throw` / `return` (`FastOp::GenResume`).
+#[inline]
+pub(super) fn gen_resume_site(cache: &PropertyCache) -> Option<(u8, u64)> {
+    match cache.native.as_deref() {
+        Some(NativeSite {
+            op: FastOp::GenResume(mode),
+            method,
+            ..
+        }) => Some((*mode, *method)),
+        _ => None,
+    }
+}
+
+/// [`gen_resume_site`]'s mode.
+#[inline]
+pub(super) fn gen_resume_mode(cache: &PropertyCache) -> Option<u8> {
+    gen_resume_site(cache).map(|(m, _)| m)
+}
+
 pub(super) fn is_native_site(cache: &PropertyCache) -> bool {
     cache
         .native
@@ -619,6 +639,7 @@ pub(super) fn try_call(
     regs: &[NanBox],
     args: &[Reg],
     cache: &mut PropertyCache,
+    rooted: bool,
 ) -> Option<Result<NanBox, VmError>> {
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
@@ -632,7 +653,7 @@ pub(super) fn try_call(
         let arg = args
             .first()
             .map_or(NanBox::undefined(), |r| regs[*r as usize]);
-        if let Some(r) = super::gen_fast::site_call(ctx, funcs, regs, recv, key, mode, method, arg)
+        if let Some(r) = super::gen_fast::site_call(ctx, funcs, regs, recv, key, mode, method, arg, rooted)
         {
             return Some(r);
         }

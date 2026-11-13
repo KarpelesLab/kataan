@@ -8134,6 +8134,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         handler_frame: jit_tier::jit_helper_handler_frame,
         call_method: jit_tier::jit_helper_call_method,
         coll_call: jit_tier::jit_helper_coll_call,
+        gen_call: jit_tier::jit_helper_gen_call,
         call_value: jit_tier::jit_helper_call_value,
         tail_call: jit_tier::jit_helper_tail_call,
         call_with_method: jit_tier::jit_helper_call_with_method,
@@ -11421,7 +11422,7 @@ fn run_frame_at_ic(
                 // A built-in method the site has resolved before (`arr.push`,
                 // `s.charCodeAt`, `map.get`, …): called directly.
                 if let Some(r) =
-                    native_call::try_call(ctx, funcs, recv_val, key, regs, args, site_cache!(site))
+                    native_call::try_call(ctx, funcs, recv_val, key, regs, args, site_cache!(site), false)
                 {
                     match r {
                         Ok(v) => regs[*dst as usize] = v,

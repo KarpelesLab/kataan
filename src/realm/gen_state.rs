@@ -64,6 +64,15 @@ impl Realm {
         }
     }
 
+    /// The heap's handle epoch (`Heap::epoch`), which every sweep ends: a
+    /// cell borrowed mutably (through the generational barrier) while it
+    /// stands is still in the remembered set, and its box still at the same
+    /// address.
+    #[inline]
+    pub(crate) fn heap_epoch(&self) -> u32 {
+        self.heap.epoch()
+    }
+
     /// After references were stored into the frame at `h` (its register
     /// file moving back in at a suspension): an incremental marking cycle's
     /// barrier shades them. (The generational barrier was the mutable

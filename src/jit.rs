@@ -3663,6 +3663,11 @@ pub struct GenericHelpers {
     /// (`jit_helper_coll_call(ctx, regs, n_regs, op, cache, _)`: `0` with the
     /// result stored, `1` to make the ordinary call).
     pub coll_call: JitCallMethodHelper,
+    /// A generator `next` call's lean form, tried first at a site that last
+    /// made one (`jit_helper_gen_call(ctx, regs, n_regs, op, cache,
+    /// call_site)`: `0` with the result stored, the throw sentinel with a
+    /// fault pending, `1` to make the ordinary call).
+    pub gen_call: JitCallMethodHelper,
     /// A method call's callee lookup (`jit_method_info`).
     pub method_info: MethodHelper,
     /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
@@ -8818,6 +8823,7 @@ impl JitFunction {
         let unwind_helper = helpers.unwind as usize as u64;
         let call_method_helper = helpers.call_method as usize as u64;
         let coll_call_helper = helpers.coll_call as usize as u64;
+        let gen_call_helper = helpers.gen_call as usize as u64;
         let call_value_helper = helpers.call_value as usize as u64;
         let tail_call_helper = helpers.tail_call as usize as u64;
         let method_helper = helpers.method_info as usize as u64;
@@ -12086,6 +12092,44 @@ impl JitFunction {
                         a.call_rax();
                         a.test_rax_rax();
                         a.je(done);
+                    }
+                    // `g.next(v)` at a site that last resumed a VM generator
+                    // (`CallSite::gen_next`): the lean resumption helper
+                    // (`jit_helper_gen_call`), else on to the call.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && key == "next"
+                        && margs.len() <= 1
+                        && call_seq::gen_call_enabled()
+                        && ok(dst)
+                        && ok(recv)
+                        && margs.iter().all(|&m| ok(m))
+                        && !num.in_any_spec(op_idx)
+                        && num.result_xmm(op_idx, dst).is_none()
+                        && let Some(&site_ptr) = call_sites.get(cache as usize)
+                    {
+                        let skip = a.new_label();
+                        // (Promoted operands into the register file, which
+                        // the helper reads.)
+                        for &r in core::iter::once(&recv).chain(margs.iter()) {
+                            num.operand_xmm(&mut a, op_idx, r, false);
+                        }
+                        a.movabs_r11(site_ptr as i64);
+                        a.g_cmp_byte_imm(call_seq::r::R11, call_seq::GEN_NEXT, 0);
+                        a.g_jcc(call_seq::cc::E, skip);
+                        a.mov_rdi_r15(); // rdi = ctx
+                        a.mov_rsi_rbx(); // rsi = regs
+                        a.movabs_argreg(2, n_regs as i64); // rdx = n_regs
+                        a.movabs_argreg(3, op_ptr as i64); // rcx = &op
+                        a.movabs_argreg(4, si.cache_ptr as i64); // r8 = the site cache
+                        a.movabs_argreg(5, site_ptr as i64); // r9 = the call cache
+                        a.movabs_rax(gen_call_helper as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.je(done);
+                        throw_check!();
+                        a.bind(skip);
                     }
                     // `f.call(thisArg, …args)` that the site's memo proves
                     // reaches `%Function.prototype.call%`: the call sequence

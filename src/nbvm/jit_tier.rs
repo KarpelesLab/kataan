@@ -3440,7 +3440,16 @@ pub(crate) extern "C" fn jit_helper_call_method(
                     .expect("jit_funcs set before generic dispatch")
             };
             if let Some(r) =
-                super::native_call::try_call(ctx, funcs, recv_val, key, regs, args, cache)
+                super::native_call::try_call(
+                    ctx,
+                    funcs,
+                    recv_val,
+                    key,
+                    regs,
+                    args,
+                    cache,
+                    super::gen_fast::jit_site_on() && window_rooted(ctx),
+                )
             {
                 if key == "call"
                     && r.is_ok()
@@ -3451,6 +3460,18 @@ pub(crate) extern "C" fn jit_helper_call_method(
                     #[allow(unsafe_code)]
                     let site = unsafe { &mut *call_site.cast::<CallSite>() };
                     fill_fncall_memo(ctx, site, recv_val, method);
+                }
+                // A generator's `next` resumed: the compiled sequence tries
+                // the lean helper first from now on (`jit_helper_gen_call`).
+                if r.is_ok()
+                    && !call_site.is_null()
+                    && args.len() <= 1
+                    && super::native_call::gen_resume_mode(cache) == Some(0)
+                {
+                    // SAFETY: the op's own `CallSite` (see the function contract).
+                    #[allow(unsafe_code)]
+                    let site = unsafe { &mut *call_site.cast::<CallSite>() };
+                    site.gen_next = true;
                 }
                 return match r {
                     Ok(v) => {
@@ -3539,6 +3560,91 @@ pub(crate) extern "C" fn jit_helper_coll_call(
             0
         }
         None => 1,
+    }
+}
+
+/// `Op::CallMethod` of a `next` key with at most one argument in compiled
+/// code, tried before the call sequence at a site whose last call resumed a
+/// VM generator (`crate::jit::CallSite::gen_next`): when the site's built-in
+/// is still `%GeneratorPrototype%.next` and the receiver a VM generator whose
+/// lookup of `next` finds it (`gen_fast::site_call`, exactly the interpreter
+/// arm's first step), the generator is resumed, its iterator result stored to
+/// the destination register and `0` returned (the throw sentinel, with the
+/// fault pending, when the resumption threw). Anything else returns `1`,
+/// having done nothing (and clears the site's flag): the compiled code takes
+/// its ordinary call.
+///
+/// # Safety
+/// As [`jit_helper_call_method`]; `call_site` is the op's own `CallSite`.
+pub(crate) extern "C" fn jit_helper_gen_call(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cache: *mut core::ffi::c_void,
+    call_site: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    let Op::CallMethod {
+        dst, recv, args, ..
+    } = op
+    else {
+        return 1;
+    };
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    // SAFETY: the activation's register file, live and unaliased here.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+    // SAFETY: the site's own cache (see the function contract).
+    #[allow(unsafe_code)]
+    let cache = unsafe { &*cache.cast::<crate::ic::PropertyCache>() };
+    let r = match super::native_call::gen_resume_site(cache) {
+        Some((0, method)) if ctx.host.is_some() && !ctx.realm.multi_realm => {
+            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+            #[allow(unsafe_code)]
+            let funcs = unsafe {
+                &*ctx
+                    .jit_funcs
+                    .expect("jit_funcs set before generic dispatch")
+            };
+            let arg = args
+                .first()
+                .map_or(NanBox::undefined(), |r| regs[*r as usize]);
+            super::gen_fast::site_call(
+                ctx,
+                funcs,
+                regs,
+                regs[*recv as usize],
+                "next",
+                0,
+                method,
+                arg,
+                window_rooted(ctx),
+            )
+        }
+        _ => None,
+    };
+    match r {
+        Some(Ok(v)) => {
+            regs[*dst as usize] = v;
+            0
+        }
+        Some(Err(e)) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+        None => {
+            // SAFETY: the op's own `CallSite` (see the function contract).
+            #[allow(unsafe_code)]
+            unsafe {
+                (*call_site.cast::<CallSite>()).gen_next = false;
+            }
+            1
+        }
     }
 }
 

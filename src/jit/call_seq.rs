@@ -252,10 +252,18 @@ pub struct CallSite {
     /// the compiled sequence sends that value straight to the lean
     /// collection helper (`emit_new_coll_check`), which checks it again.
     pub coll_ctor: u64,
+    /// Whether a method call site last resumed a VM generator through
+    /// `%GeneratorPrototype%.next` (set by its slow path): the compiled
+    /// sequence then tries the lean resumption helper first
+    /// (`jit_helper_gen_call`), which clears it when it does not apply.
+    pub gen_next: bool,
 }
 
 /// `CallSite`-relative offset of [`CallSite::coll_ctor`].
 pub(crate) const COLL_CTOR: i32 = core::mem::offset_of!(CallSite, coll_ctor) as i32;
+
+/// `CallSite`-relative offset of [`CallSite::gen_next`].
+pub(crate) const GEN_NEXT: i32 = core::mem::offset_of!(CallSite, gen_next) as i32;
 
 /// The guard misses after which a speculative loop's fast version is no
 /// longer entered ([`CallSite::spec_misses`]).
@@ -560,6 +568,7 @@ impl CallSite {
             entry_argc: Self::ENTRY_UNSET,
             entry_pinned: false,
             coll_ctor: u64::MAX,
+            gen_next: false,
         }
     }
 
@@ -1573,6 +1582,22 @@ pub(crate) fn new_coll_enabled() -> bool {
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("KATAAN_JIT_NEWCOLL").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether a method call site that last resumed a VM generator's `next`
+/// tries the lean resumption helper before its call sequence
+/// (`KATAAN_JIT_GENCALL=0` turns it off, read once per process).
+#[must_use]
+pub(crate) fn gen_call_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_GENCALL").map_or(true, |v| v != "0"))
     }
     #[cfg(not(feature = "std"))]
     {
