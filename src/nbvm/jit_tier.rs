@@ -354,6 +354,9 @@ impl StackOwner {
             // SAFETY: one past the end of the allocation.
             #[allow(unsafe_code)]
             end: unsafe { mem.add(STACK_WORDS) },
+            // Made on the thread's first compiled call, after the thread
+            // declared its stack (`crate::stack::set_thread_stack_size`).
+            sp_limit: crate::stack::limit_address(),
         }));
         Self { stack }
     }
@@ -426,7 +429,16 @@ impl Suspension {
 /// The running thread's register stack, recorded in `ctx`.
 fn stack_of(ctx: &mut Ctx) -> *mut JitStack {
     if ctx.jit_rt.stack.0.is_null() {
-        ctx.jit_rt.stack.0 = STACK.with(|o| o.stack);
+        let p = STACK.with(|o| o.stack);
+        // A context's first compiled call re-reads the thread's native-stack
+        // limit, which the thread may have declared since the stack was made.
+        // SAFETY: `p` is this thread's live register stack; nothing borrows it
+        // while no compiled code runs.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*p).sp_limit = crate::stack::limit_address();
+        }
+        ctx.jit_rt.stack.0 = p;
     }
     ctx.jit_rt.stack.0
 }
@@ -2899,6 +2911,8 @@ pub(super) fn call_compiled_with(
     // `call_with`'s recursion guard.
     if ctx.call_depth >= ctx.realm.limits.max_call_depth
         || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        || crate::stack::exhausted()
+        || super::args_exhausted(ctx, args.len())
     {
         let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
         return Some(Err(VmError::Thrown(e)));
@@ -3243,6 +3257,8 @@ impl CompiledCallback {
     ) -> Result<NanBox, VmError> {
         if ctx.call_depth >= ctx.realm.limits.max_call_depth
             || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+            || crate::stack::exhausted()
+            || super::args_exhausted(ctx, args.len())
         {
             let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
             return Err(VmError::Thrown(e));

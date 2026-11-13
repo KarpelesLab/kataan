@@ -124,6 +124,14 @@ fn init_default_limit() -> usize {
     l
 }
 
+/// This thread's limit address: the lowest stack address the engine's
+/// recursions may reach (deriving the default on first use). Compiled code
+/// that cannot call [`exhausted`] compares its stack pointer with it.
+#[must_use]
+pub fn limit_address() -> usize {
+    limit()
+}
+
 /// Whether the native stack is too deep to recurse further: the caller should
 /// fail with a recoverable error instead of descending.
 #[inline]

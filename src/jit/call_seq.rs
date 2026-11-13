@@ -49,6 +49,7 @@ pub(crate) mod r {
     pub(crate) const RCX: u8 = 1;
     pub(crate) const RDX: u8 = 2;
     pub(crate) const RBX: u8 = 3;
+    pub(crate) const RSP: u8 = 4;
     pub(crate) const RBP: u8 = 5;
     pub(crate) const RSI: u8 = 6;
     pub(crate) const RDI: u8 = 7;
@@ -113,6 +114,12 @@ pub struct JitStack {
     pub base: *mut u64,
     /// One past the last word of the allocation.
     pub end: *mut u64,
+    /// The lowest native stack address a native call may lay its activation
+    /// out from: this thread's limit address (`crate::stack`). A call
+    /// sequence whose `rsp` is below it takes its slow path, the
+    /// interpreter's call, whose native-stack check throws the catchable
+    /// `RangeError`.
+    pub sp_limit: usize,
 }
 
 /// [`JitStack::top`]'s offset.
@@ -123,12 +130,15 @@ pub(crate) const STACK_LIMIT: i32 = 8;
 pub(crate) const STACK_FRAMES: i32 = 16;
 /// [`JitStack::base`]'s offset.
 pub(crate) const STACK_BASE: i32 = 24;
+/// [`JitStack::sp_limit`]'s offset.
+pub(crate) const STACK_SP_LIMIT: i32 = 40;
 const _: () = {
     use core::mem::offset_of;
     assert!(offset_of!(JitStack, top) == STACK_TOP as usize);
     assert!(offset_of!(JitStack, limit) == STACK_LIMIT as usize);
     assert!(offset_of!(JitStack, frames) == STACK_FRAMES as usize);
     assert!(offset_of!(JitStack, base) == STACK_BASE as usize);
+    assert!(offset_of!(JitStack, sp_limit) == STACK_SP_LIMIT as usize);
 };
 /// Words in a native-call header (see [`JitStack::frames`]).
 pub const FRAME_HEADER: usize = 5;
@@ -1838,7 +1848,10 @@ pub(crate) fn emit_falloff_value(a: &mut X64Assembler) {
 /// activation may make native calls ([`ACT_OK`]), one realm, and the realm's
 /// call depth under the limit. (The context's own `call_depth` is never
 /// above the realm's `vm_total_depth`, which every activation counts, so its
-/// limit is implied.) Leaves `r10` = the register stack, `r9` = the realm;
+/// limit is implied.) And native-stack room: `rsp` at or above the
+/// thread's limit address ([`JitStack::sp_limit`]), the bound a count cannot
+/// give (the native stack a thread has, and an activation's frame, vary).
+/// Leaves `r10` = the register stack, `r9` = the realm;
 /// clobbers `rax`. The activation is `extra` levels above the next one
 /// (`extra` activations not yet counted in the depth come first).
 fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail: Label) {
@@ -1854,6 +1867,8 @@ fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail
     a.g_cmp_mem(r::RAX, r::R9, l.max_depth);
     a.g_jcc(cc::AE, fail);
     a.g_load(r::R10, r::R15, l.stack);
+    a.g_cmp_mem(r::RSP, r::R10, STACK_SP_LIMIT);
+    a.g_jcc(cc::B, fail);
 }
 
 /// A proper tail call's depth test (`GenericOp::CallValue::tail`): to

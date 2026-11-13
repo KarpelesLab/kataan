@@ -199,7 +199,7 @@ fn run_parse(source: &str, origin: &str) -> ExitCode {
 fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
     // The script's `console` output is printed on the error path too: an
     // uncaught throw does not un-print what ran before it.
-    let limits = kataan::limits::Limits::default();
+    let limits = cli_limits();
     let (output, outcome) = if origin == "<argv>" {
         kataan::nbvm::execute_capturing_then_exit(source, limits)
     } else {
@@ -218,6 +218,22 @@ fn run_eval_nb(source: &str, origin: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The engine limits the `run`/`eval` paths use: the defaults, except the JS
+/// call-depth limit, which `KATAAN_MAX_CALL_DEPTH` may set (the native-stack
+/// check still applies on top of it, so a large value cannot crash the
+/// process; it only lets recursion go as deep as the stack allows).
+fn cli_limits() -> kataan::limits::Limits {
+    let mut limits = kataan::limits::Limits::default();
+    if let Some(n) = std::env::var("KATAAN_MAX_CALL_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        limits.max_call_depth = n;
+    }
+    limits
 }
 
 /// The canonical path of the script or module file at `path` (the referrer its
@@ -279,7 +295,7 @@ fn run_module(path: &str) -> ExitCode {
     let (output, outcome) = kataan::nbvm::execute_module_capturing(
         &key,
         &kataan::nbexec::module::FileModuleHost,
-        kataan::limits::Limits::default(),
+        cli_limits(),
     );
     print!("{output}");
     match outcome {

@@ -20,7 +20,28 @@
 //! This module is `no_std`-friendly (plain `Copy` data, no allocation).
 
 /// Default maximum JS-level call/recursion depth before a `RangeError`.
-pub const DEFAULT_MAX_CALL_DEPTH: usize = 3500;
+///
+/// The count is not what keeps the process from crashing: every way an
+/// activation is entered — the interpreter's call, a compiled body's native
+/// call sequence, a built-in calling back — also checks the native stack
+/// pointer against the thread's limit ([`crate::stack`]) and throws the same
+/// catchable `RangeError` when the stack runs out first. The count is the
+/// limit while the stack is large enough, which makes the depth reached the
+/// same in every tier (an activation's native frame size differs between the
+/// interpreter and compiled code): on the CLI's 512 MiB stack an activation
+/// costs about 1.5 KiB (compiled) to 3 KiB (interpreted), and a level of
+/// callback recursion through a built-in (`map`, a getter, `toString`, a
+/// Proxy trap) 4 to 8 KiB, so 12 000 levels fit with room to spare. A thread
+/// with a small stack (an embedder's 2 MiB default) gets the depth its stack
+/// allows.
+pub const DEFAULT_MAX_CALL_DEPTH: usize = 12_000;
+/// Default maximum number of arguments held by the live activations together
+/// (the interpreter's record of each activation's arguments) before a call
+/// throws a `RangeError`: the part of a stack's size a depth count does not
+/// bound (a recursion that passes ever more arguments, `f(...a, x)`, holds a
+/// number quadratic in its depth). 4 Mi arguments (32 MiB of values) is far
+/// more than any call chain a real stack would hold.
+pub const DEFAULT_MAX_ARG_WORDS: usize = 1 << 22;
 /// Default maximum nesting of `eval` (and `$262.evalScript`) bodies before a
 /// `RangeError`.
 ///

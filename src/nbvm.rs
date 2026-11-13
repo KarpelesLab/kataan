@@ -5915,6 +5915,7 @@ fn call_with(
     if ctx.call_depth >= ctx.realm.limits.max_call_depth
         || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
         || crate::stack::exhausted()
+        || args_exhausted(ctx, args.len())
     {
         let e = vm_error(ctx, "RangeError", STACK_EXHAUSTED);
         return Err(VmError::Thrown(e));
@@ -5971,6 +5972,16 @@ fn call_with(
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
     result
+}
+
+/// Whether an activation passing `argc` more arguments would take the
+/// arguments of the live activations (the realm's `vm_args_buf`) past
+/// [`crate::limits::DEFAULT_MAX_ARG_WORDS`]: the part of a stack's size a
+/// depth count does not see (`function f(...a) { return f(...a, 1) }` holds
+/// a quadratic number of arguments), checked with the depth.
+#[inline]
+fn args_exhausted(ctx: &Ctx, argc: usize) -> bool {
+    ctx.realm.vm_args_buf.len().saturating_add(argc) > crate::limits::DEFAULT_MAX_ARG_WORDS
 }
 
 /// A proper tail call's callee `id`, a sloppy ordinary function: its

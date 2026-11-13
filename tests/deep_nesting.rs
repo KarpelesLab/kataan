@@ -288,3 +288,62 @@ fn register_exhaustion_is_a_catchable_range_error() {
     };
     assert_eq!(on_stack(512 << 20, || run(src)).as_deref(), Ok(want));
 }
+
+/// Runaway JS recursion through each way an activation is entered (direct,
+/// accessors, coercions, built-in callbacks, Proxy traps, generators,
+/// constructors, tagged templates, `call`/`apply`/`bind`, growing spreads,
+/// `eval`): each must be a catchable `RangeError`, never a native stack
+/// overflow, on any stack.
+const RUNAWAY_CASES: &str = r#"
+function k(f) { try { f(); return "none"; } catch (e) { return e instanceof RangeError ? "R" : e.name; } }
+[
+  k(() => { function f(n) { return f(n + 1) + 1; } f(0); }),
+  k(() => { var o = { get g() { return this.g + 1; } }; o.g; }),
+  k(() => { var o = { toString() { return "" + this; } }; String(o); }),
+  k(() => { var o = { valueOf() { return +this; } }; +o; }),
+  k(() => { (function f() { return [1].map(f); })(); }),
+  k(() => { [3, 1, 2].sort(function c(a, b) { return [a, b].sort(c).length; }); }),
+  k(() => { var p = new Proxy({}, { get(o, x, r) { return r[x]; } }); p.x; }),
+  k(() => { function* g() { yield g().next(); } g().next(); }),
+  k(() => { class C { constructor() { new C(); } } new C(); }),
+  k(() => { function t() { return t`x`; } t`y`; }),
+  k(() => { function f() { return f.apply(null, []); } f(); }),
+  k(() => { var g = function () { return g(); }.bind(null); g(); }),
+  k(() => { function f(...a) { return f(...a, 1); } f(); }),
+  k(() => { function f() { return eval("f()"); } f(); }),
+  k(() => { var o = { toJSON() { return JSON.stringify(this); } }; JSON.stringify(o); }),
+].join("")
+"#;
+
+/// Deep but bounded recursion: 10 000 activations of a plain function, and
+/// deep accessor / callback / constructor chains.
+const DEEP_CASES: &str = r#"
+function plain(n) { return n ? plain(n - 1) + 1 : 0; }
+var G = { k: 0, get g() { if (this.k <= 0) return 0; this.k--; return this.g + 1; } };
+function viaMap(n) { return n ? [n].map(function (x) { return viaMap(x - 1) + 1; })[0] : 0; }
+function Node(n) { this.d = n ? new Node(n - 1).d + 1 : 0; }
+[plain(10000), plain(10000), (G.k = 5000, G.g), viaMap(2500), new Node(5000).d].join(" ")
+"#;
+
+#[test]
+fn runaway_js_recursion_is_a_range_error_on_any_stack() {
+    let want = "R".repeat(15);
+    let big = on_stack(512 << 20, || run(RUNAWAY_CASES));
+    assert_eq!(big.as_deref(), Ok(want.as_str()));
+    let small = on_stack(4 << 20, || run(RUNAWAY_CASES));
+    assert_eq!(small.as_deref(), Ok(want.as_str()));
+    // An undeclared default-size thread: the engine assumes 2 MiB.
+    let undeclared = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| run(RUNAWAY_CASES))
+        .expect("spawn")
+        .join()
+        .expect("join");
+    assert_eq!(undeclared.as_deref(), Ok(want.as_str()));
+}
+
+#[test]
+fn deep_js_recursion_runs_on_the_cli_stack() {
+    let got = on_stack(512 << 20, || run(DEEP_CASES));
+    assert_eq!(got.as_deref(), Ok("10000 10000 5000 2500 5000"));
+}
