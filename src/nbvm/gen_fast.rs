@@ -475,11 +475,31 @@ fn run_in_cell(
             },
         );
     }
+    cell_exit(ctx, funcs, proto, fh, pc, handlers, run)
+}
+
+/// The end of an in-place run ([`run_in_cell`], [`lean_next`]) other than a
+/// `yield`: the register file moved out of the cell (cut back to the
+/// function's own) for [`finish`] — after the interpreter's run from `pc`
+/// for a body that refused to run.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cold]
+#[inline(never)]
+fn cell_exit(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    proto: &FnProto,
+    fh: Handle,
+    pc: usize,
+    handlers: Vec<(usize, super::Reg)>,
+    run: super::jit_tier::GenRun,
+) -> Result<GenOut, VmError> {
+    use super::jit_tier::GenRun;
     let mut regs = match ctx.realm.vm_frame_mut(fh) {
         Some(f) => core::mem::take(&mut f.regs),
         None => return Err(VmError::NotAnObject),
     };
-    regs.truncate(own);
+    regs.truncate(proto.n_regs);
     let r = match run {
         GenRun::Exit(r) => r,
         // (A body that refuses to run — no entry at `pc` — is interpreted,
@@ -496,6 +516,183 @@ fn run_in_cell(
         ),
     };
     finish(ctx, proto, fh, regs, r)
+}
+
+/// What [`lean_next`] did.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+enum Lean {
+    /// Nothing: the generator is not one it resumes (the general path does).
+    Untaken,
+    /// The body yielded this value (a plain `yield`).
+    Yield(NanBox),
+    /// Any other outcome of the resumption.
+    Other(Result<GenOut, VmError>),
+}
+
+/// Whether compiled code's `g.next(v)` resumes a hot generator through
+/// [`lean_next`] (`KATAAN_JIT_GENLEAN`, default on).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn lean_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENLEAN").is_none_or(|v| v != "0"))
+}
+
+/// [`site_next_hot`] + [`run_in_cell`] in one pass over the frame cell `fh`,
+/// for a caller whose registers are rooted already (compiled code's): the
+/// cell borrowed once (through the generational barrier) for every read and
+/// write before the run, and written back through that borrow at a `yield`
+/// when no sweep ran meanwhile; the same decisions otherwise — `Untaken`
+/// (nothing done) for a generator not suspended at its start or at a plain
+/// or capturing `yield`, one past the recursion limits, a body not compiled
+/// or not hot, a resumption that may recompile it, or a register file of
+/// another size.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[inline(always)]
+fn lean_next(ctx: &mut Ctx, funcs: &[FnProto], fh: Handle, v: NanBox) -> Lean {
+    use super::jit_tier::GenRun;
+    let epoch = ctx.realm.heap_epoch();
+    let Some(f) = ctx.realm.vm_frame_mut(fh) else {
+        return Lean::Untaken;
+    };
+    let fp: *mut crate::cell::VmFrame = f;
+    let (id, state, pc, fdst, len) = (f.func as usize, f.state, f.pc as usize, f.dst, f.regs.len());
+    let Some(proto) = funcs.get(id) else {
+        return Lean::Untaken;
+    };
+    // Where the sent value lands (as `hot_next`).
+    let land = match state {
+        S_START => None,
+        S_YIELD => {
+            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
+                return Lean::Untaken;
+            }
+            match pc.checked_sub(1).and_then(|i| proto.ops.get(i)) {
+                Some(Op::YieldResume { dst, mode, .. }) => Some((*dst, Some(*mode))),
+                _ => Some((fdst, None)),
+            }
+        }
+        _ => return Lean::Untaken,
+    };
+    if ctx.call_depth >= ctx.realm.limits.max_call_depth
+        || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        || crate::stack::exhausted()
+    {
+        return Lean::Untaken;
+    }
+    let own = proto.n_regs;
+    let keep = keep_regs();
+    let jit = {
+        let Ok(mut t) = proto.tier.0.try_borrow_mut() else {
+            return Lean::Untaken;
+        };
+        let n = t.resumes.saturating_add(1);
+        if !super::jit_tier::resume_is_hot(n) || super::jit_tier::resume_may_recompile(n) {
+            return Lean::Untaken;
+        }
+        let j = match &t.jit {
+            Some(Some(j)) if j.is_generic() => alloc::rc::Rc::clone(j),
+            _ => return Lean::Untaken,
+        };
+        let nr = j.n_regs().max(own);
+        if len != own && !(keep && len == nr) {
+            return Lean::Untaken;
+        }
+        t.resumes = n;
+        j
+    };
+    let n = jit.n_regs().max(own);
+    // SAFETY: `fp` is the frame cell's frame, borrowed just above; nothing
+    // else borrowed the realm since.
+    #[allow(unsafe_code)]
+    let f = unsafe { &mut *fp };
+    f.state = S_EXECUTING;
+    if len != n {
+        f.regs.resize(n, NanBox::undefined());
+    }
+    match land {
+        Some((d, Some(m))) => {
+            f.regs[d as usize] = v;
+            f.regs[m as usize] = NanBox::number(0.0);
+        }
+        Some((d, None)) => {
+            if let Some(slot) = f.regs.get_mut(d as usize) {
+                *slot = v;
+            }
+        }
+        None => {}
+    }
+    let (ptr, rlen) = (f.regs.as_mut_ptr(), f.regs.len());
+    let mut handlers = core::mem::take(&mut f.handlers);
+    // (The caller's registers — the generator, the sent value — are rooted:
+    // it only counts as published.)
+    ctx.frames_published += 1;
+    ctx.call_depth += 1;
+    ctx.realm.vm_total_depth += 1;
+    ctx.realm.vm_gen_running.push(fh);
+    // SAFETY: as `run_in_cell`.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(ptr, rlen) };
+    let run =
+        super::jit_tier::run_generator_body_in_place(ctx, funcs, &jit, regs, pc, &mut handlers);
+    ctx.realm.vm_gen_running.pop();
+    ctx.call_depth -= 1;
+    ctx.realm.vm_total_depth -= 1;
+    ctx.frames_published -= 1;
+    if let GenRun::Yield { value, pc, dst } = run {
+        let f = if ctx.realm.heap_epoch() == epoch && reuse_frame_ptr() {
+            // SAFETY: as `run_in_cell`'s.
+            #[allow(unsafe_code)]
+            Some(unsafe { &mut *fp })
+        } else {
+            ctx.realm.vm_frame_mut(fh)
+        };
+        if let Some(f) = f {
+            if !keep {
+                f.regs.truncate(own);
+            }
+            f.handlers = handlers;
+            f.pc = pc as u32;
+            f.dst = dst;
+            f.state = S_YIELD;
+        }
+        ctx.realm.vm_frame_stored(fh);
+        // A `yield*` step hands the inner result object through as is.
+        return if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
+            Lean::Other(Ok(GenOut::Delegated(value)))
+        } else {
+            Lean::Yield(value)
+        };
+    }
+    Lean::Other(cell_exit(ctx, funcs, proto, fh, pc, handlers, run))
+}
+
+/// Compiled code's `g.next(v)` (`jit_tier::jit_helper_gen_call`): the
+/// iterator result, or `None` (nothing done) for the site's ordinary call.
+/// [`site_call`] for mode 0, a hot generator resumed by [`lean_next`] when
+/// the caller's registers (`rooted`) are a GC root already.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn jit_next(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    recv: NanBox,
+    method: u64,
+    v: NanBox,
+    rooted: bool,
+) -> Option<Result<NanBox, VmError>> {
+    if !(rooted && lean_on()) {
+        return site_call(ctx, funcs, regs, recv, "next", 0, method, v, rooted);
+    }
+    let gh = Handle::from_raw(recv.as_handle()?);
+    let fh = site_frame(ctx, gh, "next", 0, method)?;
+    match lean_next(ctx, funcs, fh, v) {
+        Lean::Yield(value) => Some(Ok(NanBox::handle(
+            ctx.realm.new_iter_result(value, false).to_raw(),
+        ))),
+        Lean::Other(r) => Some(r.map(|o| result_object(ctx, o))),
+        Lean::Untaken => site_resume(ctx, funcs, regs, recv, fh, 0, v, rooted),
+    }
 }
 
 /// [`run_in_cell`] for a register file not of the function's own size:
@@ -595,6 +792,20 @@ pub(super) fn jit_for_of_step(
         return None;
     }
     let fh = state_of(ctx, gh)?;
+    // (A compiled caller's window is a GC root: the lean resumption.)
+    if super::jit_tier::window_rooted(ctx) && lean_on() {
+        let out = match lean_next(ctx, funcs, fh, NanBox::undefined()) {
+            Lean::Yield(v) => {
+                regs[done as usize] = NanBox::boolean(false);
+                return Some(Ok(Some(v)));
+            }
+            Lean::Other(r) => Some(r),
+            Lean::Untaken => None,
+        };
+        if let Some(r) = out {
+            return Some(for_of_outcome(ctx, regs, done, r));
+        }
+    }
     let (id, state, pc, dst) = {
         let f = ctx.realm.vm_frame(fh)?;
         (f.func as usize, f.state, f.pc as usize, f.dst)
@@ -614,11 +825,23 @@ pub(super) fn jit_for_of_step(
     ctx.call_depth -= 1;
     ctx.realm.vm_total_depth -= 1;
     unpublish(ctx, mark);
-    let out = match r? {
+    Some(for_of_outcome(ctx, regs, done, r?))
+}
+
+/// [`jit_for_of_step`]'s outcome of a resumption that ran: the step's value
+/// (`None` once done), with the loop's `done` register written.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn for_of_outcome(
+    ctx: &mut Ctx,
+    regs: &mut [NanBox],
+    done: super::Reg,
+    r: Result<GenOut, VmError>,
+) -> Result<Option<NanBox>, VmError> {
+    let out = match r {
         Ok(o) => o,
         Err(e) => {
             regs[done as usize] = NanBox::boolean(true);
-            return Some(Err(e));
+            return Err(e);
         }
     };
     let step = match out {
@@ -633,7 +856,7 @@ pub(super) fn jit_for_of_step(
         })(),
     };
     regs[done as usize] = NanBox::boolean(!matches!(step, Ok(Some(_))));
-    Some(step)
+    step
 }
 
 /// `GetIterator(g)` for a sync VM generator `g` of `funcs` when it runs no
@@ -806,6 +1029,8 @@ pub(super) struct SiteMemo {
     entries: [Option<SiteEntry>; 4],
     /// The entry the next fill replaces.
     next: usize,
+    /// The entry the last lookup found (tried first).
+    last: usize,
 }
 
 struct SiteEntry {
@@ -833,13 +1058,19 @@ pub(super) fn site_call(
     v: NanBox,
     rooted: bool,
 ) -> Option<Result<NanBox, VmError>> {
-    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
-    let _ = rooted;
     if MODE_KEYS.get(usize::from(mode)) != Some(&key) || ctx.host.is_none() || ctx.realm.multi_realm
     {
         return None;
     }
     let gh = Handle::from_raw(recv.as_handle()?);
+    let fh = site_frame(ctx, gh, key, mode, method)?;
+    site_resume(ctx, funcs, regs, recv, fh, mode, v, rooted)
+}
+
+/// [`site_call`]'s proof that `g[key]` is the intrinsic `method`, for the
+/// generator object `gh`: its frame cell, or `None`.
+#[inline]
+fn site_frame(ctx: &mut Ctx, gh: Handle, key: &str, mode: u8, method: u64) -> Option<Handle> {
     // (A generator owning nothing but its state slot: `g[key]` is the
     // `[[Get]]` from its prototype, and the slot names its frame cell.)
     let (proto, fh) = ctx
@@ -847,22 +1078,31 @@ pub(super) fn site_call(
         .generator_proto_and_frame(gh, VM_GEN, &mut ctx.gen_ic)?;
     let raw = proto.to_raw();
     let epoch = crate::object::proto_epoch();
-    let m = &ctx.gen_site_memo;
-    let mut hit = None;
-    for e in m.entries.iter().flatten() {
-        if e.proto == raw && e.mode == mode && e.stamp == epoch {
-            hit = Some(&e.at);
-            break;
+    let m = &mut ctx.gen_site_memo;
+    let is = |e: &Option<SiteEntry>| {
+        e.as_ref()
+            .is_some_and(|e| e.proto == raw && e.mode == mode && e.stamp == epoch)
+    };
+    // (The last hit first: a site mostly resumes the generators of one
+    // function at a time.)
+    let hit = if is(&m.entries[m.last]) {
+        Some(m.last)
+    } else {
+        let i = m.entries.iter().position(is);
+        if let Some(i) = i {
+            m.last = i;
         }
-    }
-    let found = match hit {
-        Some(at) => ctx.realm.stamped_slot(at)?,
+        i
+    };
+    let found = match hit.and_then(|i| m.entries[i].as_ref()) {
+        Some(e) => ctx.realm.stamped_slot(&e.at)?,
         None => {
             let at = ctx.realm.watch_get_chain(proto, key)??;
             let found = ctx.realm.stamped_slot(&at)?;
             let m = &mut ctx.gen_site_memo;
             let i = m.next;
             m.next = (i + 1) % m.entries.len();
+            m.last = i;
             m.entries[i] = Some(SiteEntry {
                 proto: raw,
                 mode,
@@ -872,9 +1112,24 @@ pub(super) fn site_call(
             found
         }
     };
-    if found.to_bits() != method {
-        return None;
-    }
+    (found.to_bits() == method).then_some(fh)
+}
+
+/// The rest of [`site_call`], once [`site_frame`] proved the method: the
+/// resumption of the generator `recv` (frame cell `fh`).
+#[allow(clippy::too_many_arguments)]
+fn site_resume(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    recv: NanBox,
+    fh: Handle,
+    mode: u8,
+    v: NanBox,
+    rooted: bool,
+) -> Option<Result<NanBox, VmError>> {
+    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    let _ = rooted;
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     if mode == 0
         && let Some(r) = site_next_hot(ctx, funcs, regs, rooted, recv, fh, v)

@@ -5298,10 +5298,14 @@ impl JitProto {
         regs: &mut [crate::nanbox::NanBox],
         entry: usize,
     ) -> Option<u64> {
-        if regs.len() < self.n_regs || !self.has_entry(entry) {
+        // (`has_entry`, with the body's pc looked up once.)
+        let entry = self.body_pc(entry);
+        if regs.len() < self.n_regs
+            || self.kind != JitKind::Generic
+            || (entry != 0 && self.osr_entries.binary_search(&entry).is_err())
+        {
             return None;
         }
-        let entry = self.body_pc(entry);
         Some(
             self.func
                 .call_generic(ctx, regs.as_mut_ptr().cast::<u64>(), entry as u64),
@@ -13008,6 +13012,36 @@ impl JitFunction {
                                 Some(_) => return None,
                                 None => pc as usize,
                             };
+                            // A plain suspension records itself in line
+                            // (`jit_tier::Suspension`, what the helper writes
+                            // for it) and leaves.
+                            let plain = match op {
+                                crate::nbvm::Op::YieldResume { dst, src, .. }
+                                | crate::nbvm::Op::Await { dst, src } => Some((Some(*src), *dst)),
+                                crate::nbvm::Op::GeneratorStart => Some((None, 0)),
+                                _ => None,
+                            };
+                            if let Some((src, sdst)) = plain
+                                && call_seq::inline_suspend_enabled()
+                                && src.is_none_or(ok)
+                                && let Ok(resume) = i32::try_from(own + 1)
+                            {
+                                use call_seq::r as R;
+                                let at = helpers.call_layout.susp;
+                                // (Promoted registers into the register file,
+                                // as before the helper's call: the resumption
+                                // reads it.)
+                                a.spill_before_call();
+                                match src {
+                                    Some(r) => a.load_rax(disp(r)),
+                                    None => a.movabs_rax(NanBox::undefined().to_bits() as i64),
+                                }
+                                a.g_store(R::R15, at + 8, R::RAX);
+                                a.g_store_imm32(R::R15, at + 16, i32::from(sdst));
+                                a.g_store_imm32(R::R15, at, resume);
+                                a.jmp(leave_exit);
+                                break 'interp;
+                            }
                             a.mov_rdi_r15();
                             a.mov_rsi_rbx();
                             a.movabs_argreg(2, n_regs as i64);

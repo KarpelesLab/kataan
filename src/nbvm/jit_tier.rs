@@ -144,10 +144,11 @@ pub(super) struct TierRuntime {
     leave_soon: bool,
     leave_tries: u32,
     /// A sync generator's compiled body that just suspended
-    /// ([`jit_helper_suspend`]): the pc its resumption continues at (the
-    /// function's own), the value it yields and the register a `next(v)`
-    /// lands `v` in.
-    suspended: Option<(usize, NanBox, Reg)>,
+    /// ([`jit_helper_suspend`], or the compiled suspension itself, which
+    /// writes it in line: `crate::jit::CallLayout::susp`): the pc its
+    /// resumption continues at (the function's own), the value it yields
+    /// and the register a `next(v)` lands `v` in.
+    pub(super) suspended: Suspension,
     /// An activation that just left its compiled body at a deoptimization
     /// exit (`crate::jit::deopt`, [`jit_helper_deopt`]): the function's own
     /// pc the interpreter continues it at and its handler stack there.
@@ -205,7 +206,7 @@ impl Default for TierRuntime {
             demote: false,
             leave_soon: false,
             leave_tries: 0,
-            suspended: None,
+            suspended: Suspension::NONE,
             deopt: None,
             tail: None,
             site_req: 0,
@@ -374,6 +375,52 @@ impl Drop for StackOwner {
 
 std::thread_local! {
     static STACK: StackOwner = StackOwner::new();
+}
+
+/// What a suspending compiled body records ([`TierRuntime::suspended`]):
+/// the resumption pc (the function's own; [`Suspension::NONE_PC`] while no
+/// suspension is pending), the yielded value and the register a `next(v)`
+/// lands `v` in. A plain C layout: compiled code writes it in line at a
+/// `yield` / `await` (`crate::jit::CallLayout::susp`, `pc` at `+0`, `value`
+/// at `+8`, `dst` at `+16`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct Suspension {
+    pc: usize,
+    value: NanBox,
+    dst: u64,
+}
+
+impl Suspension {
+    /// The `pc` of no pending suspension.
+    pub(super) const NONE_PC: usize = usize::MAX;
+    const NONE: Self = Suspension {
+        pc: Self::NONE_PC,
+        value: NanBox::undefined(),
+        dst: 0,
+    };
+
+    fn new(pc: usize, value: NanBox, dst: Reg) -> Self {
+        Suspension {
+            pc,
+            value,
+            dst: u64::from(dst),
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        self.pc != Self::NONE_PC
+    }
+
+    /// The pending suspension `(pc, value, dst)`, cleared.
+    #[inline]
+    pub(super) fn take(&mut self) -> Option<(usize, NanBox, Reg)> {
+        if self.pc == Self::NONE_PC {
+            return None;
+        }
+        let pc = core::mem::replace(&mut self.pc, Self::NONE_PC);
+        Some((pc, self.value, self.dst as Reg))
+    }
 }
 
 /// The running thread's register stack, recorded in `ctx`.
@@ -902,7 +949,9 @@ fn run_generator_body_with(
     if raw == NanBox::jit_exit_bits() {
         if let Some((pc, value, dst)) = ctx.jit_rt.suspended.take() {
             handlers.clear();
-            handlers.extend(ctx.jit_rt.handlers.drain(base..));
+            if ctx.jit_rt.handlers.len() > base {
+                handlers.extend(ctx.jit_rt.handlers.drain(base..));
+            }
             ctx.jit_rt.base = outer_base;
             ctx.jit_funcs = saved;
             return GenRun::Yield { value, pc, dst };
@@ -1039,11 +1088,11 @@ pub(crate) extern "C" fn jit_helper_suspend(
         // (An async function's `await` suspends as a `yield` does: its
         // resumption binds the awaited value to `dst`, or throws there.)
         Op::YieldResume { dst, src, .. } | Op::Await { dst, src } => {
-            ctx.jit_rt.suspended = Some((pc + 1, regs[*src as usize], *dst));
+            ctx.jit_rt.suspended = Suspension::new(pc + 1, regs[*src as usize], *dst);
             NanBox::jit_exit_bits()
         }
         Op::GeneratorStart => {
-            ctx.jit_rt.suspended = Some((pc + 1, NanBox::undefined(), 0));
+            ctx.jit_rt.suspended = Suspension::new(pc + 1, NanBox::undefined(), 0);
             NanBox::jit_exit_bits()
         }
         Op::YieldDelegate {
@@ -1061,7 +1110,7 @@ pub(crate) extern "C" fn jit_helper_suspend(
             };
             match super::yield_delegate_op(ctx, funcs, regs, *dst, *iter, *next, *mode) {
                 Ok(Some(res)) => {
-                    ctx.jit_rt.suspended = Some((pc, res, *dst));
+                    ctx.jit_rt.suspended = Suspension::new(pc, res, *dst);
                     NanBox::jit_exit_bits()
                 }
                 Ok(None) => 0,
@@ -3614,13 +3663,11 @@ pub(crate) extern "C" fn jit_helper_gen_call(
             let arg = args
                 .first()
                 .map_or(NanBox::undefined(), |r| regs[*r as usize]);
-            super::gen_fast::site_call(
+            super::gen_fast::jit_next(
                 ctx,
                 funcs,
                 regs,
                 regs[*recv as usize],
-                "next",
-                0,
                 method,
                 arg,
                 window_rooted(ctx),
@@ -5009,6 +5056,7 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
         main_realm: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, main_realm)),
         vmfn_plain: i(crate::realm::Realm::jit_vmfn_plain_offset()),
         rooted: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, rooted_regs)),
+        susp: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, suspended)),
         handlers_len: i(offset_of!(Ctx<'static>, jit_rt)
             + offset_of!(TierRuntime, handlers)
             + len_off),

@@ -917,6 +917,10 @@ pub struct CallLayout {
     /// `nbvm::gen_fast::run_in_cell`), for the activation entered on it
     /// (`usize`, `0` for none; see `emit_act_ok`).
     pub rooted: i32,
+    /// `ctx`: a suspending generator or async body's record
+    /// (`jit_tier::Suspension`, a C layout: the resumption pc at `+0`, the
+    /// yielded value at `+8`, the sent value's register at `+16`).
+    pub susp: i32,
     /// `ctx`: the compiled activations' handler stack's length word
     /// (`TierRuntime::handlers`).
     pub handlers_len: i32,
@@ -1598,6 +1602,22 @@ pub(crate) fn gen_call_enabled() -> bool {
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("KATAAN_JIT_GENCALL").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether a compiled `yield` / `await` records its suspension in line
+/// rather than through `jit_helper_suspend` (`KATAAN_JIT_GENSUSP=0` turns it
+/// off, read once per process).
+#[must_use]
+pub(crate) fn inline_suspend_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_GENSUSP").map_or(true, |v| v != "0"))
     }
     #[cfg(not(feature = "std"))]
     {
