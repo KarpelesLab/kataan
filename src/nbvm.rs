@@ -28618,6 +28618,30 @@ mod tests {
         );
     }
 
+    /// [`execute`] where the call-depth count, not the native stack, is
+    /// what stops a runaway recursion (a low count, on a large declared
+    /// stack): for tests that compare the depth reached at two moments,
+    /// which the stack's bound would make depend on what got compiled in
+    /// between (a compiled activation's native frame is smaller), above all
+    /// in a debug build on a test thread's small stack.
+    #[cfg(feature = "std")]
+    fn execute_at_fixed_depth(src: &'static str) -> Result<(String, String), String> {
+        const STACK: usize = 256 << 20;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(|| {
+                crate::stack::set_thread_stack_size(STACK);
+                let limits = crate::limits::Limits {
+                    max_call_depth: 1500,
+                    ..crate::limits::Limits::default()
+                };
+                execute_with_limits(src, limits)
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+    }
+
     /// Inlined callees that call (`f.caller` sees the inlined activation),
     /// and two levels of inlining (a method whose `new` the method's body
     /// inlines): the method replaced mid-loop, the inner constructor
@@ -28626,7 +28650,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn jit_inlined_calls_that_call_and_nest() {
-        let (out, _) = execute(
+        let (out, _) = execute_at_fixed_depth(
             "function maxDepth() { var d = 0; function r() { d++; r(); } try { r(); } catch (e) { return d; } return -1; }
              var d0 = maxDepth();
              class V { constructor(x, y) { this.x = x; this.y = y; } add(o) { return new V(this.x + o.x, this.y + o.y); } }
@@ -28660,7 +28684,7 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn jit_inlined_setters() {
-        let (out, _) = execute(
+        let (out, _) = execute_at_fixed_depth(
             "function maxDepth() { var d = 0; function r() { d++; r(); } try { r(); } catch (e) { return d; } return -1; }
              var d0 = maxDepth();
              class P { constructor() { this._x = 0; } get x() { return this._x; } set x(v) { this._x = v; return 99; } }
