@@ -642,7 +642,7 @@ pub(super) fn try_call(
     regs: &[NanBox],
     args: &[Reg],
     cache: &mut PropertyCache,
-    rooted: bool,
+    from_jit: bool,
 ) -> Option<Result<NanBox, VmError>> {
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
@@ -656,6 +656,15 @@ pub(super) fn try_call(
         let arg = args
             .first()
             .map_or(NanBox::undefined(), |r| regs[*r as usize]);
+        // (Compiled code's register window is a GC root already.)
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        let rooted =
+            from_jit && super::gen_fast::jit_site_on() && super::jit_tier::window_rooted(ctx);
+        #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+        let rooted = {
+            let _ = from_jit;
+            false
+        };
         if let Some(r) =
             super::gen_fast::site_call(ctx, funcs, regs, recv, key, mode, method, arg, rooted)
         {
