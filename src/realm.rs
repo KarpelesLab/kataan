@@ -82,6 +82,14 @@ use crate::rope::Rope;
 
 /// How many regex literal (source, flags) pairs `Realm::new_regexp` shares.
 const REGEXP_LITERAL_MEMOS: usize = 4;
+
+/// One `Realm::regexp_literal_memo` entry: a literal's source, its flags and
+/// the program they compile to once known.
+type RegexpLiteralMemo = (
+    alloc::rc::Rc<[u8]>,
+    alloc::rc::Rc<str>,
+    builtins_fast::MemoProgram,
+);
 use crate::shape::Shape;
 use alloc::rc::Rc;
 
@@ -512,11 +520,7 @@ pub struct Realm {
     /// The source and flags of the last RegExp `new_regexp` made, shared with
     /// the next one made from the same pair, and the program they compiled
     /// to once known (see `new_regexp`). Holds no heap handle.
-    regexp_literal_memo: [Option<(
-        alloc::rc::Rc<[u8]>,
-        alloc::rc::Rc<str>,
-        builtins_fast::MemoProgram,
-    )>; REGEXP_LITERAL_MEMOS],
+    regexp_literal_memo: [Option<RegexpLiteralMemo>; REGEXP_LITERAL_MEMOS],
     /// The entry of `regexp_literal_memo` the next new pair replaces.
     regexp_literal_next: usize,
     /// The `[[Prototype]]` of a Promise cell that carries no `native_protos`
@@ -4995,10 +4999,14 @@ impl Realm {
         // program it compiled to) rather than copying and looking them up.
         // A few pairs, so literals evaluated in turn (two regexes applied to
         // each line) do not evict each other.
-        let hit = self.regexp_literal_memo.iter().flatten().find_map(|(s, f, p)| {
-            (**s == *source && **f == *flags)
-                .then(|| (s.clone(), f.clone(), builtins_fast::memo_program(p)))
-        });
+        let hit = self
+            .regexp_literal_memo
+            .iter()
+            .flatten()
+            .find_map(|(s, f, p)| {
+                (**s == *source && **f == *flags)
+                    .then(|| (s.clone(), f.clone(), builtins_fast::memo_program(p)))
+            });
         let (source, flags, program) = match hit {
             Some(hit) => hit,
             None => {

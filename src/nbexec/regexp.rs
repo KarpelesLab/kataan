@@ -1885,9 +1885,11 @@ impl Interp {
     ) -> Result<crate::nbvm::ReplaceStep, ExecError> {
         use crate::nbvm::ReplaceStep;
         let method = if all { "replaceAll" } else { "replace" };
-        let Some(argh) = search.as_handle().map(Handle::from_raw).filter(|&h| {
-            self.realm.regexp_flags(h).is_some() || self.is_object_value(search)
-        }) else {
+        let Some(argh) = search
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|&h| self.realm.regexp_flags(h).is_some() || self.is_object_value(search))
+        else {
             return Err(ExecError::Unsupported("replace plan of a non-object"));
         };
         // A pristine RegExp: every read below lands on an intrinsic, so the

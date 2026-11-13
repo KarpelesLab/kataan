@@ -267,7 +267,7 @@ impl Interp {
             return Ok(None);
         };
         let empty = match &sub {
-            Subject::Ascii(rope) => rope.len() == 0,
+            Subject::Ascii(rope) => rope.is_empty(),
             _ => sub.units().is_empty(),
         };
         if empty {
