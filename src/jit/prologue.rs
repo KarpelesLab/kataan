@@ -74,7 +74,39 @@ fn writes(op: &Op) -> Option<Reg> {
         | Op::CallNative { dst, .. }
         | Op::PlainPrims { dst, .. }
         | Op::InlineGuard { dst, .. } => Some(*dst),
+        // (Every way these complete, in the interpreter, its one-op helper
+        // and their compiled forms, stores the destination; a `StrEqConst`
+        // tested only by the branch after it stores nothing, but nothing
+        // else reads its destination then either.)
+        Op::SwitchStr { dst, .. }
+        | Op::StrEqConst { dst, .. }
+        | Op::Relational { dst, .. }
+        | Op::NewObjectLit { dst, .. }
+        | Op::NewRegExp { dst, .. }
+        | Op::MakeClass { dst, .. }
+        | Op::TypeofGlobal { dst, .. }
+        | Op::LoadFunc { dst, .. }
+            if more_writes() =>
+        {
+            Some(*dst)
+        }
         _ => None,
+    }
+}
+
+/// Whether [`writes`] also knows the string-switch, string-compare,
+/// `in`/`instanceof`, literal, class, `typeof name` and function-value ops
+/// (`KATAAN_JIT_PFILL2=0` leaves them reads of their destination, read once
+/// per process).
+fn more_writes() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PFILL2").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
     }
 }
 
@@ -381,6 +413,27 @@ mod tests {
             Op::Return { src: 0 },
         ];
         assert_eq!(fill(&ops, 6, 1), [true, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn a_string_compare_writes_its_result() {
+        // r2 = (r1 === 'x') before any read of r2; r3 = (r2 in r1) likewise.
+        let ops = [
+            Op::StrEqConst {
+                dst: 2,
+                src: 1,
+                lit: b"x".to_vec(),
+                kind: 0,
+            },
+            Op::Relational {
+                dst: 3,
+                instanceof: false,
+                a: 2,
+                b: 1,
+            },
+            Op::Return { src: 3 },
+        ];
+        assert_eq!(fill(&ops, 4, 2), [true, true, false, false]);
     }
 
     #[test]
