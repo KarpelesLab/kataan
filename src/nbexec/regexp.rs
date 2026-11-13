@@ -559,6 +559,11 @@ impl Interp {
                 };
                 #[cfg(feature = "regex")]
                 {
+                    // `exec` is `RegExpBuiltinExec` whatever the prototype
+                    // holds: one step when the subject is a string.
+                    if let Some(v) = self.regexp_exec_lean(h, arg(0), true) {
+                        return Ok(v);
+                    }
                     self.regexp_builtin_exec(h, arg(0))
                 }
                 #[cfg(not(feature = "regex"))]
@@ -582,6 +587,16 @@ impl Interp {
                 // fresh cell handed `subject_units_cached` a new handle every call —
                 // so its memo missed every time and `re.test(s)` in a loop
                 // re-transcoded the whole subject on each iteration.
+                // A pristine RegExp: `RegExpExec` reads the intrinsic `exec`,
+                // so `test` is `RegExpBuiltinExec` without its result array.
+                #[cfg(feature = "regex")]
+                if let Some(h) = this_val.as_handle().map(Handle::from_raw)
+                    && self.realm.regexp_flags(h).is_some()
+                    && self.regexp_pristine(h, NEED_EXEC)
+                    && let Some(v) = self.regexp_exec_lean(h, arg(0), false)
+                {
+                    return Ok(v);
+                }
                 let str_v = match arg(0).as_handle().map(Handle::from_raw) {
                     Some(h) if self.realm.is_string_handle(h) => arg(0),
                     _ => {

@@ -1157,6 +1157,29 @@ fn obj_has_own_fast(realm: &mut Realm, h: Handle, k: NanBox) -> Option<bool> {
     Some(own)
 }
 
+/// `recv.split(sep, limit)` for a string `recv` (the cell `h`) and a RegExp
+/// `sep` the host can split by in one step (see `VmHost::string_split`):
+/// the result; `None` for anything else.
+#[inline(never)]
+fn split_by_regexp(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    h: Handle,
+    sep: NanBox,
+    limit: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    let r = sep.as_handle()?;
+    if ctx.realm.multi_realm
+        || ctx.realm.regexp_flags(Handle::from_raw(r)).is_none()
+        || !ctx.realm.is_string_handle(h)
+        || !ctx.realm.typeof_is_string(h)
+    {
+        return None;
+    }
+    let r = with_host(ctx, |host| host.string_split(recv, sep, limit))??;
+    Some(r.map_err(VmError::from))
+}
+
 /// The rest of [`try_call`] / [`try_call_got`] once the site knows its
 /// built-in `op` (the function cell `method`).
 #[allow(clippy::too_many_arguments)]
@@ -1288,17 +1311,6 @@ fn run_op(
                 .unwrap_or(Err(super::HostError::Fault))
                 .map_err(VmError::from),
         );
-    }
-    // A string split by a RegExp the host can split in one step.
-    if matches!(op, FastOp::StrSplit)
-        && let Some(r) = arg(0).as_handle()
-        && !ctx.realm.multi_realm
-        && ctx.realm.regexp_flags(Handle::from_raw(r)).is_some()
-        && ctx.realm.is_string_handle(h)
-        && ctx.realm.typeof_is_string(h)
-        && let Some(Some(r)) = with_host(ctx, |host| host.string_split(recv, arg(0), arg(1)))
-    {
-        return Some(r.map_err(VmError::from));
     }
     if matches!(op, FastOp::ObjAssign) {
         if let Some(v) = obj_assign_fast(&mut ctx.realm, regs, args) {
@@ -1878,12 +1890,15 @@ fn run_op(
             }
         }
         FastOp::StrSplit => {
+            // A string split by a RegExp the host can split in one step.
+            let Some(sep) = str_arg(realm, arg(0)) else {
+                return split_by_regexp(ctx, recv, h, arg(0), arg(1));
+            };
             // A non-empty string separator that cannot split a surrogate pair,
             // and no limit.
             if !arg(1).is_undefined() {
                 return None;
             }
-            let sep = str_arg(realm, arg(0))?;
             let sep_b = sep.as_leaf_bytes()?;
             if sep_b.is_empty() || crate::nbexec::split_sensitive(sep_b) {
                 return None;

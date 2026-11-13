@@ -654,6 +654,131 @@ impl Interp {
         LeanReplace::Out(out, stride)
     }
 
+    /// `RegExpBuiltinExec(h, o)` in one step for a RegExp `h` whose
+    /// `lastIndex` is its own plain slot and a string `o`: with `array`, the
+    /// result array (or null); without, whether there was a match (`test`,
+    /// whose array nobody sees). `None`, with nothing done, when the array
+    /// would need `indices` (the `d` flag), or `o` is not a string.
+    ///
+    /// Every step is the algorithm's: `lastIndex` read from the slot and
+    /// used only when global or sticky, a start past the end failing, a
+    /// failure resetting `lastIndex` to 0 and a success setting it to the
+    /// match's end (both only when global or sticky), the legacy match
+    /// record updated on success.
+    pub(crate) fn regexp_exec_lean(&mut self, h: Handle, o: NanBox, array: bool) -> Option<NanBox> {
+        let raw = o.as_handle()?;
+        let sh = Handle::from_raw(raw);
+        if !self.realm.is_string_handle(sh)
+            || !self.realm.typeof_is_string(sh)
+            || self.realm.regex_aux_last_index_defined(h)
+        {
+            return None;
+        }
+        let (global, sticky, indices) = self
+            .realm
+            .regexp_flags(h)
+            .map(|f| (f.contains('g'), f.contains('y'), f.contains('d')))?;
+        if array && indices {
+            return None;
+        }
+        let re = self.realm.regex_compiled(h)?;
+        let stateful = global || sticky;
+        let start = if stateful {
+            self.realm.regex_last_index(h)
+        } else {
+            0
+        };
+        let sub = self.lean_subject(o, &re)?;
+        let mut spans = core::mem::take(&mut self.lean_spans);
+        spans.clear();
+        let found = match &sub {
+            Subject::Ascii(rope) => {
+                let units = rope.as_leaf_bytes().unwrap_or_default();
+                start <= units.len() && re.captures_into_u16(units, start, &mut spans)
+            }
+            _ => {
+                let units = sub.units();
+                start <= units.len() && re.captures_into_u16(units, start, &mut spans)
+            }
+        };
+        if !found {
+            if stateful {
+                self.realm.set_regex_last_index(h, 0);
+            }
+            self.lean_subject_done(sub);
+            self.lean_spans = spans;
+            return Some(if array {
+                NanBox::null()
+            } else {
+                NanBox::boolean(false)
+            });
+        }
+        let (index, end) = spans[0].unwrap_or_default();
+        if stateful {
+            self.realm.set_regex_last_index(h, end);
+        }
+        let result = if array {
+            let names = re.group_names();
+            let (elems, groups) = match &sub {
+                Subject::Ascii(rope) => {
+                    let units = rope.as_leaf_bytes().unwrap_or_default();
+                    self.lean_match_parts(units, &spans, names)
+                }
+                _ => self.lean_match_parts(sub.units(), &spans, names),
+            };
+            let obj = self.realm.new_array_with_named(
+                elems,
+                &["index", "input", "groups"],
+                &[NanBox::number(index as f64), o, groups],
+                &mut self.match_array_shape,
+            );
+            NanBox::handle(obj.to_raw())
+        } else {
+            NanBox::boolean(true)
+        };
+        self.lean_record(o, sub, &spans);
+        self.lean_spans = spans;
+        Some(result)
+    }
+
+    /// A match result's elements (each group's text, `undefined` for one
+    /// that did not participate) and its `groups` object (`undefined`
+    /// without named groups) from the match's spans over `units`.
+    fn lean_match_parts<T: SubjectUnits>(
+        &mut self,
+        units: &[T],
+        spans: &[Option<(usize, usize)>],
+        names: &[(usize, alloc::string::String)],
+    ) -> (Vec<NanBox>, NanBox) {
+        let len = units.len();
+        let text = |realm: &mut Realm, g: Option<(usize, usize)>| match g {
+            Some((a, b)) => {
+                let a = a.min(len);
+                let b = b.min(len).max(a);
+                NanBox::handle(T::string(realm, &units[a..b]).to_raw())
+            }
+            None => NanBox::undefined(),
+        };
+        let elems: Vec<NanBox> = spans.iter().map(|&g| text(&mut self.realm, g)).collect();
+        if names.is_empty() {
+            return (elems, NanBox::undefined());
+        }
+        // A null-prototype object; of duplicate names (in disjoint
+        // alternatives) the participating occurrence wins, keeping the
+        // first occurrence's key position.
+        let g = self.realm.new_object_with_proto(None);
+        for (idx, name) in names {
+            let v = match spans.get(*idx).copied().flatten() {
+                Some(_) => elems[*idx],
+                None => NanBox::undefined(),
+            };
+            if !v.is_undefined() || self.realm.get_property(g, name).is_none() {
+                self.realm.set_property(g, name, v);
+            }
+        }
+        (elems, NanBox::handle(g.to_raw()))
+    }
+
     /// `String.prototype.match` of the string `o` with the pristine RegExp
     /// `h`: for a global RegExp the array of every match's text (or null),
     /// else `RegExpBuiltinExec`'s result.
@@ -670,6 +795,9 @@ impl Interp {
             return Ok(None);
         };
         if !global {
+            if let Some(v) = self.regexp_exec_lean(h, o, true) {
+                return Ok(Some(v));
+            }
             return self.regexp_builtin_exec(h, o).map(Some);
         }
         let Some(re) = self.realm.regex_compiled(h) else {

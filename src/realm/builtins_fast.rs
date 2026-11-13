@@ -304,18 +304,23 @@ impl Realm {
         let Some(Cell::Object(o)) = self.heap.get(handle) else {
             return false;
         };
-        at.iter()
-            .zip(keys)
-            .enumerate()
-            .all(|(i, (&(slot, bits), key))| {
-                mask & (1 << i) == 0
-                    || (if slot == u32::MAX {
-                        o.get(key)
-                    } else {
-                        o.slot(slot)
-                    })
-                    .is_some_and(|v| v.to_bits() == bits)
-            })
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let (Some(&(slot, bits)), Some(key)) = (at.get(i), keys.get(i)) else {
+                continue;
+            };
+            let v = if slot == u32::MAX {
+                o.get(key)
+            } else {
+                o.slot(slot)
+            };
+            if v.is_none_or(|v| v.to_bits() != bits) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The flags of the RegExp at `handle`, borrowed (no source rendering).
