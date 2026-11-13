@@ -3054,6 +3054,24 @@ pub(crate) struct InlineEmit<'a> {
     pub poly_keys: &'a [u64],
 }
 
+/// Whether an inlined accessor call's guard takes the getter (or setter)
+/// its memo recorded without reading it again at the holder
+/// (`KATAAN_JIT_ACCMEMO=0`: it compares the holder's). A memo records only
+/// a lookup through its entry's holder address at a prototype level, a
+/// watched object, and an accessor's functions change only with its
+/// object's key epoch (`Object::define_accessor` replacing one, an add or
+/// a removal, which may also move the list), a layout change that bumps
+/// the prototype epoch for a watched object; a cell move bumps it too.
+/// Compiled code stores data properties only. So while the epoch is the
+/// memo's stamp, the accessor at the memo's address still holds the memo's
+/// function: the read compares nothing (a data property's value, which
+/// compiled code may store, is still compared).
+#[must_use]
+pub(crate) fn acc_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ACCMEMO").is_none_or(|v| v != "0"))
+}
+
 /// Whether a polymorphic method site's first way remembers a receiver
 /// layout whose method is none of the ways' (`KATAAN_JIT_POLYMISS=0`: no).
 #[must_use]
@@ -3311,14 +3329,17 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.g_cmp_mem(r::RAX, RBP, p.shape);
         a.g_jcc(cc::NE, full);
         a.g_movabs(r::R11, e.memo as u64);
-        a.g_load(r::R9, r::R11, lk(offset_of!(LookupMemo, value)));
-        a.g_load(r::RAX, r::R9, 0);
-        a.g_cmp_mem(
-            r::RAX,
-            r::R11,
-            site_off(offset_of!(CallSite, guard) + offset_of!(GuardMemo, bits)),
-        );
-        a.g_jcc(cc::NE, full);
+        let bits = site_off(offset_of!(CallSite, guard) + offset_of!(GuardMemo, bits));
+        if e.getter && acc_memo_enabled() {
+            // (An accessor's function changes only with its holder's
+            // layout: see `acc_memo_enabled`.)
+            a.g_load(r::RAX, r::R11, bits);
+        } else {
+            a.g_load(r::R9, r::R11, lk(offset_of!(LookupMemo, value)));
+            a.g_load(r::RAX, r::R9, 0);
+            a.g_cmp_mem(r::RAX, r::R11, bits);
+            a.g_jcc(cc::NE, full);
+        }
         a.g_store(RBP, e.slots.callee, r::RAX);
         a.jmp(mproven);
         a.bind(full);
@@ -3779,11 +3800,17 @@ fn emit_guard_fast(
             emit_no_accessors(a, slow);
         }
         // (A data property for a call, a getter for a read: the memo's
-        // lookup was this guard's.)
-        a.g_load(r::R9, r::R11, lk(w, offset_of!(LookupMemo, value)));
-        a.g_load(r::RAX, r::R9, 0);
-        a.g_cmp_mem(r::RAX, r::R11, g(w, offset_of!(GuardMemo, bits)));
-        a.g_jcc(cc::NE, slow);
+        // lookup was this guard's. An accessor's function changes only
+        // with its holder's layout, which the epoch covers: see
+        // `acc_memo_enabled`.)
+        if e.getter && acc_memo_enabled() {
+            a.g_load(r::RAX, r::R11, g(w, offset_of!(GuardMemo, bits)));
+        } else {
+            a.g_load(r::R9, r::R11, lk(w, offset_of!(LookupMemo, value)));
+            a.g_load(r::RAX, r::R9, 0);
+            a.g_cmp_mem(r::RAX, r::R11, g(w, offset_of!(GuardMemo, bits)));
+            a.g_jcc(cc::NE, slow);
+        }
         if let Some(q) = wproof {
             a.g_store_imm32(RBP, q, 0);
             a.jmp(proven);
