@@ -247,7 +247,15 @@ pub struct CallSite {
     /// heap arena (`pin`): a pinned target is then entered at its
     /// `exact_pinned` entry.
     pub entry_pinned: bool,
+    /// A `new C()` site's last constructor that was a realm's default
+    /// `Map` or `Set` constructor (its value's bits; `u64::MAX` before):
+    /// the compiled sequence sends that value straight to the lean
+    /// collection helper (`emit_new_coll_check`), which checks it again.
+    pub coll_ctor: u64,
 }
+
+/// `CallSite`-relative offset of [`CallSite::coll_ctor`].
+pub(crate) const COLL_CTOR: i32 = core::mem::offset_of!(CallSite, coll_ctor) as i32;
 
 /// The guard misses after which a speculative loop's fast version is no
 /// longer entered ([`CallSite::spec_misses`]).
@@ -551,6 +559,7 @@ impl CallSite {
             spec_misses: 0,
             entry_argc: Self::ENTRY_UNSET,
             entry_pinned: false,
+            coll_ctor: u64::MAX,
         }
     }
 
@@ -1547,6 +1556,23 @@ pub fn inline_hframe_enabled() -> bool {
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("KATAAN_JIT_HFRAME").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether a `new C()` site with no arguments whose constructor was last a
+/// default `Map` / `Set` constructor makes the collection through the lean
+/// helper (`jit_helper_new_coll`) before its call sequence
+/// (`KATAAN_JIT_NEWCOLL=0` turns it off, read once per process).
+#[must_use]
+pub(crate) fn new_coll_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_NEWCOLL").map_or(true, |v| v != "0"))
     }
     #[cfg(not(feature = "std"))]
     {

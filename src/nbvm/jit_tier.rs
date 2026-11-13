@@ -4094,12 +4094,35 @@ pub(crate) extern "C" fn jit_helper_construct(
             let argv = super::ArgBuf::from_regs(regs, args);
             if let Some(v) = ctx.realm.new_default_collection(ctor_val, &argv) {
                 regs[*dst as usize] = v;
+                // (With no arguments, the compiled sequence's lean form
+                // takes this constructor next time: `jit_helper_new_coll`.)
+                if args.is_empty() {
+                    site.coll_ctor = ctor_val.to_bits();
+                }
                 return 0;
             }
         }
         fill_construct_site(ctx, ctor_val, site);
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// `new C()` with no arguments in compiled code, `C` (`ctor`) the value the
+/// site last saw be a default collection constructor
+/// (`crate::jit::CallSite::coll_ctor`): the new empty `Map` / `Set`, as
+/// [`jit_helper_construct`]'s first step makes it, or `0` (nothing done)
+/// when `ctor` is no longer such a constructor (the call sequence then
+/// runs). An allocation only: no call, no throw.
+///
+/// # Safety
+/// `ctx` must be the live `Ctx` the compiled body was entered with.
+pub(crate) extern "C" fn jit_helper_new_coll(ctx: *mut core::ffi::c_void, ctor: u64) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    ctx.realm
+        .new_default_collection(NanBox::from_bits(ctor), &[])
+        .map_or(0, NanBox::to_bits)
 }
 
 /// `Op::CallSpreadPlain`'s slow path in compiled code: point the site's

@@ -3636,6 +3636,10 @@ pub struct GenericHelpers {
     pub call_this: JitCallKeyHelper,
     /// A `new`'s callee check and object creation (`jit_construct_info`).
     pub construct_info: ConstructHelper,
+    /// `new Map()` / `new Set()` of a default collection constructor
+    /// (`jit_helper_new_coll(ctx, ctor)`): the new collection's bits, or `0`
+    /// (nothing done) for any other constructor. Never throws.
+    pub new_coll: JitTruthyHelper,
     /// A `new`'s result when the body returned a heap value
     /// (`jit_construct_result`).
     pub construct_result: ConstructResultHelper,
@@ -8806,6 +8810,7 @@ impl JitFunction {
             ))
         };
         let construct_slow_helper = helpers.construct as usize as u64;
+        let new_coll_helper = helpers.new_coll as usize as u64;
         let call_this_helper = helpers.call_this as usize as u64;
         // The catch entries of the body's `try` regions: where the throw exit
         // resumes after `jit_helper_unwind` binds a thrown value.
@@ -16690,6 +16695,19 @@ impl JitFunction {
                     let site_ptr = *call_sites.get(cache as usize)?;
                     let slow = a.new_label();
                     let done = a.new_label();
+                    // `new Map()` / `new Set()` (the site's last constructor a
+                    // default collection one): the lean helper, before the
+                    // call sequence (`CallSite::coll_ctor`).
+                    let coll = (args.is_empty() && call_seq::new_coll_enabled()).then(|| {
+                        let coll = a.new_label();
+                        let normal = a.new_label();
+                        a.load_rax(disp(ctor));
+                        a.movabs_r11(site_ptr as i64);
+                        a.cmp_rax_at_r11(call_seq::COLL_CTOR);
+                        a.je(coll);
+                        a.bind(normal);
+                        (coll, normal)
+                    });
                     call_seq::emit_call(
                         &mut a,
                         &call_seq::CallEmit {
@@ -16726,6 +16744,18 @@ impl JitFunction {
                     a.call_rax();
                     throw_check!();
                     a.jmp(done);
+                    if let Some((coll, normal)) = coll {
+                        // (The constructor's value is in `rax`.)
+                        a.bind(coll);
+                        a.mov_rdi_r15();
+                        a.g_mov(call_seq::r::RSI, call_seq::r::RAX);
+                        a.movabs_rax(new_coll_helper as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.je(normal);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                    }
                     a.cold_end(cold);
                     a.bind(done);
                 }
@@ -17154,6 +17184,7 @@ impl JitFunction {
         // Falling off the end of the stream (or branching to `len`): the
         // sentinel for the interpreter, `undefined` for a native call (see
         // `call_seq::ACT_OK`).
+        a.dbg_mark("o-falloff");
         a.bind(labels[ops.len()]);
         call_seq::emit_falloff_value(&mut a);
         a.frame_epilogue();
@@ -17164,6 +17195,7 @@ impl JitFunction {
         a.frame_epilogue();
         // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
         // falls through into them).
+        a.dbg_mark("o-num");
         num.finish(&mut a, &labels, throw_exit);
         // The global binding cache's resets: the epoch changed since the
         // slots were validated, so empty them all, note the current epoch
@@ -17173,6 +17205,7 @@ impl JitFunction {
         let gc_persisted: Vec<(usize, i32)> =
             gc_reads.iter().map(|&k| (1 + k, gc_slot(k))).collect();
         for (pre, fetch, recheck) in core::mem::take(&mut cold_epochs) {
+            a.dbg_mark("o-epoch");
             a.bind(pre);
             a.g_movabs(call_seq::r::R11, epoch_addr as u64);
             a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
@@ -17192,6 +17225,7 @@ impl JitFunction {
         }
         for (entry, back, pc) in core::mem::take(&mut cold_mirrors) {
             let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
+            a.dbg_mark("o-mirror");
             a.bind(entry);
             a.set_plain_lazy(plain_of(&plain_stubs, entry));
             a.mov_rdi_r15();
@@ -17211,6 +17245,7 @@ impl JitFunction {
         for (fetch, back, done, pc, slot, k) in core::mem::take(&mut cold_globals) {
             let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
             let slow = a.new_label();
+            a.dbg_mark("o-gfetch");
             a.bind(fetch);
             a.set_plain_lazy(plain_of(&plain_stubs, fetch));
             a.mov_rdi_r15();
@@ -17230,6 +17265,7 @@ impl JitFunction {
         }
         a.set_plain_lazy(Vec::new());
         if let Some(stub) = gc_stub {
+            a.dbg_mark("o-gcstub");
             let slots: Vec<i32> = (0..gc_plan.slots).map(gc_slot).collect();
             a.emit_body_globals_stub(stub, &slots);
         }
@@ -17430,6 +17466,7 @@ impl JitFunction {
         // off the end returns what the body's own end would).
         if let Some(info) = deopt_info {
             for (stub, pc, after) in core::mem::take(&mut deopt_stubs) {
+                a.dbg_mark("o-deopt");
                 a.bind(stub);
                 a.set_plain_lazy(plain_of(&plain_stubs, stub));
                 let at = pc as u64
@@ -17453,6 +17490,7 @@ impl JitFunction {
         // to the activation's innermost handler (exactly the interpreter's
         // `handle_throw!`): a caught throw resumes at its catch pc. Otherwise
         // return the sentinel so the caller reads the pending fault.
+        a.dbg_mark("o-throw");
         a.bind(throw_exit);
         if has_inline {
             // A throw out of an inlined body: its activation ends here (an
@@ -17489,6 +17527,7 @@ impl JitFunction {
         a.frame_epilogue();
         // (Out of line, called: see `call_seq::emit_inline_stub`.)
         for (stub, argv, nt, level) in core::mem::take(&mut inline_stubs) {
+            a.dbg_mark("o-istub");
             a.bind(stub);
             let s = inl_slots.level(level)?;
             call_seq::emit_inline_stub(&mut a, &helpers.call_layout, &s, &argv, nt)?;

@@ -8141,6 +8141,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         construct: jit_tier::jit_helper_construct,
         call_this: jit_tier::jit_helper_call_this,
         construct_info: jit_tier::jit_construct_info,
+        new_coll: jit_tier::jit_helper_new_coll,
         construct_result: jit_tier::jit_construct_result,
         construct_alloc: jit_tier::jit_construct_alloc,
         super_twice: jit_tier::jit_super_twice,
