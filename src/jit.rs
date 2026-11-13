@@ -3516,6 +3516,23 @@ struct GenericSites {
     deopt: Option<alloc::boxed::Box<deopt::DeoptInfo>>,
 }
 
+/// Whether `Op::PushHandler` / `Op::PopHandler` call their helpers as
+/// leaves (`call_rax_pure`: nothing the body caches is dropped after them;
+/// `KATAAN_JIT_PUREHANDLER=0` makes them ordinary calls, read once per
+/// process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn pure_handlers_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_PUREHANDLER").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether by-index array iteration steps keep a shadow integer cursor in
 /// the native frame (`KATAAN_JIT_ITERSHADOW=0` turns it off, read once per
 /// process).
@@ -3630,6 +3647,11 @@ pub struct GenericHelpers {
     pub push_handler: JitAddHelper,
     /// `Op::PopHandler` (`jit_helper_pop_handler(ctx, _)`): never throws.
     pub pop_handler: JitTruthyHelper,
+    /// `Op::PushHandler`'s lean form (`jit_helper_push_handler_fast(ctx,
+    /// target, reg)`): the push, or `1` (nothing done) where the push would
+    /// overflow. Neither allocates nor throws, so it is called as a leaf
+    /// (`call_rax_pure`).
+    pub push_handler_fast: JitAddHelper,
     /// The handler-stack segment of a natively entered body with `try`
     /// regions (`jit_helper_handler_frame(ctx, leave, saved)`, see
     /// `call_seq::emit_handler_entry`).
@@ -8790,6 +8812,8 @@ impl JitFunction {
         let backedge_helper = helpers.backedge as usize as u64;
         let suspend_helper = helpers.suspend as usize as u64;
         let push_handler_helper = helpers.push_handler as usize as u64;
+        let push_handler_fast_helper = helpers.push_handler_fast as usize as u64;
+        let pure_handlers = pure_handlers_enabled();
         let pop_handler_helper = helpers.pop_handler as usize as u64;
         let unwind_helper = helpers.unwind as usize as u64;
         let call_method_helper = helpers.call_method as usize as u64;
@@ -11091,17 +11115,51 @@ impl JitFunction {
                     if !ok(reg) || target > ops.len() {
                         return None;
                     }
-                    a.mov_rdi_r15();
-                    a.movabs_argreg(1, i64::try_from(orig_pc(target)).ok()?);
-                    a.movabs_argreg(2, i64::from(reg));
-                    a.movabs_rax(push_handler_helper as i64);
-                    a.call_rax();
-                    throw_check!();
+                    let at = i64::try_from(orig_pc(target)).ok()?;
+                    if pure_handlers {
+                        // The push as a leaf call (no allocation, no
+                        // throw, nothing moved: the receiver cache, the
+                        // arena and the global binding cache stand); an
+                        // overflow (`1`) is the full helper's, out of line,
+                        // which throws its `RangeError`.
+                        let full = a.new_label();
+                        let done = a.new_label();
+                        a.mov_rdi_r15();
+                        a.movabs_argreg(1, at);
+                        a.movabs_argreg(2, i64::from(reg));
+                        a.movabs_rax(push_handler_fast_helper as i64);
+                        a.call_rax_pure();
+                        a.test_rax_rax();
+                        a.jne(full);
+                        let cold = a.cold_begin();
+                        a.bind(full);
+                        a.mov_rdi_r15();
+                        a.movabs_argreg(1, at);
+                        a.movabs_argreg(2, i64::from(reg));
+                        a.movabs_rax(push_handler_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                        a.jmp(done);
+                        a.cold_end(cold);
+                        a.bind(done);
+                    } else {
+                        a.mov_rdi_r15();
+                        a.movabs_argreg(1, at);
+                        a.movabs_argreg(2, i64::from(reg));
+                        a.movabs_rax(push_handler_helper as i64);
+                        a.call_rax();
+                        throw_check!();
+                    }
                 }
                 GenericOp::PopHandler => {
                     a.mov_rdi_r15();
                     a.movabs_rax(pop_handler_helper as i64);
-                    a.call_rax();
+                    // (A leaf: the pop neither allocates nor throws.)
+                    if pure_handlers {
+                        a.call_rax_pure();
+                    } else {
+                        a.call_rax();
+                    }
                 }
                 GenericOp::InlineGuard {
                     dst,

@@ -1344,6 +1344,30 @@ pub(crate) extern "C" fn jit_helper_push_handler(
     0
 }
 
+/// [`jit_helper_push_handler`]'s lean form, which compiled code calls as a
+/// leaf: the push, else (the push would overflow) `1` with nothing done,
+/// for the full helper to throw. No allocation on the managed heap, no
+/// throw.
+///
+/// # Safety
+/// As [`jit_helper_push_handler`].
+pub(crate) extern "C" fn jit_helper_push_handler_fast(
+    ctx: *mut core::ffi::c_void,
+    target: u64,
+    reg: u64,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let h = &mut ctx.jit_rt;
+    if h.handlers.len() - h.base >= ctx.realm.limits.max_handler_depth {
+        return 1;
+    }
+    // Lossless: the emitter passes a bytecode pc and a register index.
+    h.handlers.push((target as usize, reg as Reg));
+    0
+}
+
 /// A natively entered body's handler-stack segment
 /// (`crate::jit::GenericHelpers::handler_frame`): with `leave == 0`, open a
 /// segment of its own (from the stack's current top) and return the caller's

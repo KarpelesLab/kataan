@@ -8130,6 +8130,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         arena: jit_arena,
         push_handler: jit_tier::jit_helper_push_handler,
         pop_handler: jit_tier::jit_helper_pop_handler,
+        push_handler_fast: jit_tier::jit_helper_push_handler_fast,
         handler_frame: jit_tier::jit_helper_handler_frame,
         call_method: jit_tier::jit_helper_call_method,
         coll_call: jit_tier::jit_helper_coll_call,
