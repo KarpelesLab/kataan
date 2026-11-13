@@ -42,18 +42,24 @@ pub(crate) struct RegexpProtoProof {
 /// `[@@replace]`, `[@@match]`, `[@@split]`.
 const PROOF_METHODS: [&[u8]; 4] = [b"exec", b"replace", b"match", b"split"];
 
-/// A one-step operation's subject code units: the subject memo's, or
-/// converted into the interpreter's reusable scratch buffer — no memo entry
-/// and no allocation, for the common case of an operation that finds
-/// nothing to keep them for (see [`Interp::lean_subject_rc`]).
+/// A one-step operation's subject: a flat all-ASCII string, matched as its
+/// bytes (each byte is the code unit at its index) — no conversion at all;
+/// else its code units, the subject memo's, or converted into the
+/// interpreter's reusable scratch buffer — no memo entry and no allocation,
+/// for the common case of an operation that finds nothing to keep them for
+/// (see [`Interp::lean_subject_rc`]).
 pub(crate) enum Subject {
+    Ascii(crate::rope::Rope),
     Memo(alloc::rc::Rc<Vec<u16>>),
     Scratch(Vec<u16>),
 }
 
 impl Subject {
+    /// The code units of a subject held as units (none for `Ascii`, whose
+    /// bytes the caller reads instead).
     fn units(&self) -> &[u16] {
         match self {
+            Subject::Ascii(_) => &[],
             Subject::Memo(rc) => rc,
             Subject::Scratch(v) => v,
         }
@@ -257,23 +263,58 @@ impl Interp {
                 re
             }
         };
-        let (_, units) = self.subject_units_cached(o)?;
-        if units.is_empty() {
+        let Some(sub) = self.lean_subject(o, &re) else {
+            return Ok(None);
+        };
+        let empty = match &sub {
+            Subject::Ascii(rope) => rope.len() == 0,
+            _ => sub.units().is_empty(),
+        };
+        if empty {
+            self.lean_subject_done(sub);
             return Ok(None);
         }
         let parts = if lim == 0 {
+            self.lean_subject_done(sub);
             Vec::new()
         } else {
-            self.regexp_split_run(&re, &units, lim, unicode)
+            use crate::realm::LegacySubject;
+            match sub {
+                Subject::Ascii(rope) => {
+                    let subject = LegacySubject::Ascii(rope.clone());
+                    let units = rope.as_leaf_bytes().unwrap_or_default();
+                    self.regexp_split_on(&re, units, &subject, lim, unicode)
+                }
+                Subject::Memo(rc) => {
+                    let subject = LegacySubject::Units(rc.clone());
+                    self.regexp_split_on(&re, &rc[..], &subject, lim, unicode)
+                }
+                Subject::Scratch(v) => {
+                    let rc = self.lean_subject_rc(o, v);
+                    let subject = LegacySubject::Units(rc.clone());
+                    self.regexp_split_on(&re, &rc[..], &subject, lim, unicode)
+                }
+            }
         };
         Ok(Some(NanBox::handle(self.realm.new_array(parts).to_raw())))
     }
 
-    /// The code units of the string `o` for a one-step operation (see
-    /// [`Subject`]): the memo's when it has them, else the scratch buffer
-    /// refilled.
-    fn lean_subject(&mut self, o: NanBox) -> Option<Subject> {
+    /// The subject `o` (a string) for a one-step operation with the program
+    /// `re` (see [`Subject`]): the flat string itself when it is all ASCII
+    /// and `re` matches bytes; else its code units, the memo's when it has
+    /// them, or the scratch buffer refilled.
+    fn lean_subject(&mut self, o: NanBox, re: &crate::regex::Regex) -> Option<Subject> {
         let raw = o.as_handle()?;
+        let h = Handle::from_raw(raw);
+        if re.matches_bytes() {
+            self.realm.flatten_string(h);
+            if let Some(rope) = self.realm.string_rope(h)
+                && rope.as_leaf_bytes().is_some()
+                && rope.is_ascii()
+            {
+                return Some(Subject::Ascii(rope));
+            }
+        }
         for entry in &self.subject_units_cache {
             if let Some((r, units)) = entry
                 && *r == raw
@@ -281,7 +322,6 @@ impl Interp {
                 return Some(Subject::Memo(units.clone()));
             }
         }
-        let h = Handle::from_raw(raw);
         self.realm.flatten_string(h);
         let mut units = core::mem::take(&mut self.lean_units);
         units.clear();
@@ -292,18 +332,13 @@ impl Interp {
     /// `sub` (the units of the string `o`) as a shared buffer a match can
     /// keep (the legacy match record, a replacer plan), remembered in the
     /// subject memo as `subject_units_cached` would have.
-    fn lean_subject_rc(&mut self, o: NanBox, sub: Subject) -> alloc::rc::Rc<Vec<u16>> {
-        match sub {
-            Subject::Memo(rc) => rc,
-            Subject::Scratch(v) => {
-                let rc = alloc::rc::Rc::new(v);
-                if let Some(raw) = o.as_handle() {
-                    self.subject_units_cache[1] = self.subject_units_cache[0].take();
-                    self.subject_units_cache[0] = Some((raw, rc.clone()));
-                }
-                rc
-            }
+    fn lean_subject_rc(&mut self, o: NanBox, units: Vec<u16>) -> alloc::rc::Rc<Vec<u16>> {
+        let rc = alloc::rc::Rc::new(units);
+        if let Some(raw) = o.as_handle() {
+            self.subject_units_cache[1] = self.subject_units_cache[0].take();
+            self.subject_units_cache[0] = Some((raw, rc.clone()));
         }
+        rc
     }
 
     /// Gives a scratch buffer back for the next operation (a long
@@ -316,23 +351,26 @@ impl Interp {
         }
     }
 
-    /// Records the last match of `spans` (`stride` per match) in the legacy
-    /// match record, the subject `o`'s units kept for it.
-    fn lean_legacy(
+    /// Records the match `last` (its spans: the whole match, then each
+    /// group) of the subject `sub` (of the string `o`) in the legacy match
+    /// record, which keeps the subject; returns it as a replacer plan's text.
+    fn lean_record(
         &mut self,
         o: NanBox,
         sub: Subject,
-        spans: &[Option<(usize, usize)>],
-        stride: usize,
-    ) -> alloc::rc::Rc<Vec<u16>> {
-        let rc = self.lean_subject_rc(o, sub);
-        if let Some(last) = spans.rchunks(stride).next() {
-            let caps = crate::regex::Captures {
-                groups: last.to_vec(),
-            };
-            self.update_legacy_regexp(&rc, &caps);
+        last: &[Option<(usize, usize)>],
+    ) -> crate::nbvm::PlanText {
+        use crate::realm::LegacySubject;
+        let subject = match sub {
+            Subject::Ascii(rope) => LegacySubject::Ascii(rope),
+            Subject::Memo(rc) => LegacySubject::Units(rc),
+            Subject::Scratch(v) => LegacySubject::Units(self.lean_subject_rc(o, v)),
+        };
+        self.legacy_record_spans(subject.clone(), last);
+        match subject {
+            LegacySubject::Ascii(rope) => crate::nbvm::PlanText::Ascii(rope),
+            LegacySubject::Units(rc) => crate::nbvm::PlanText::Units(rc),
         }
-        rc
     }
 
     /// Every match `RegExpBuiltinExec` would make on the pristine RegExp `h`
@@ -342,11 +380,11 @@ impl Interp {
     /// The spans (`group_count() + 1` per match) are appended to `spans`;
     /// the caller records the last one in the legacy match record.
     #[allow(clippy::too_many_arguments)]
-    fn pristine_matches(
+    fn pristine_matches<T: crate::regex::Unit>(
         &mut self,
         h: Handle,
         re: &crate::regex::Regex,
-        units: &[u16],
+        units: &[T],
         global: bool,
         sticky: bool,
         unicode: bool,
@@ -435,55 +473,131 @@ impl Interp {
             }
             return Ok(Some(ReplaceStep::Done(str_v)));
         }
-        let Some(sub) = self.lean_subject(o) else {
+        let Some(sub) = self.lean_subject(o, &re) else {
             return Ok(None);
         };
-        let repl: Vec<u8> = if func {
-            Vec::new()
+        // The template's text, shared rather than copied.
+        let repl = if func {
+            None
         } else {
             self.realm.flatten_string(rh);
-            self.realm
-                .string_leaf_bytes(rh)
-                .unwrap_or_default()
-                .to_vec()
+            self.realm.string_rope(rh)
         };
+        let repl_bytes: &[u8] = repl
+            .as_ref()
+            .and_then(crate::rope::Rope::as_leaf_bytes)
+            .unwrap_or_default();
+        let mut spans = core::mem::take(&mut self.lean_spans);
+        spans.clear();
+        let mode = LeanMode {
+            global,
+            sticky,
+            unicode,
+            func,
+        };
+        let r = match &sub {
+            Subject::Ascii(rope) => {
+                let units = rope.as_leaf_bytes().unwrap_or_default();
+                self.replace_pristine_on(h, &re, units, mode, repl_bytes, &mut spans, |out, run| {
+                    out.extend_from_slice(run);
+                })
+            }
+            _ => {
+                let units = sub.units();
+                // An ASCII subject's unmatched runs are its code units
+                // narrowed. (Only ASCII text has as many WTF-8 bytes as
+                // UTF-16 units.)
+                let ascii = str_v
+                    .as_handle()
+                    .and_then(|s| self.realm.string_leaf_bytes(Handle::from_raw(s)))
+                    .is_some_and(|b| b.len() == units.len());
+                self.replace_pristine_on(h, &re, units, mode, repl_bytes, &mut spans, |out, run| {
+                    if ascii {
+                        out.extend(run.iter().map(|&u| u as u8));
+                    } else {
+                        crate::wtf8::append_utf16(out, run);
+                    }
+                })
+            }
+        };
+        let too_long = matches!(r, LeanReplace::TooLong(..));
+        let step = match r {
+            LeanReplace::NoMatch => {
+                self.lean_subject_done(sub);
+                ReplaceStep::Done(str_v)
+            }
+            LeanReplace::Plan(stride) => {
+                let last = spans.rchunks(stride).next().unwrap_or_default();
+                let text = self.lean_record(o, sub, last);
+                return Ok(Some(ReplaceStep::Plan(ReplacePlan {
+                    subject: str_v,
+                    text,
+                    stride,
+                    spans,
+                })));
+            }
+            LeanReplace::Out(out, stride) | LeanReplace::TooLong(out, stride) => {
+                let last = spans.rchunks(stride).next().unwrap_or_default();
+                self.lean_record(o, sub, last);
+                if too_long {
+                    self.lean_spans = spans;
+                    let m = self.new_str("Invalid string length");
+                    return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                }
+                ReplaceStep::Done(self.new_str_bytes(out))
+            }
+        };
+        self.lean_spans = spans;
+        Ok(Some(step))
+    }
+
+    /// [`regexp_replace_pristine`](Self::regexp_replace_pristine)'s matches
+    /// and splice over the subject's units `units` (unmatched runs appended
+    /// by `push`), leaving every match's spans in `spans`.
+    #[allow(clippy::too_many_arguments)]
+    fn replace_pristine_on<T: crate::regex::Unit>(
+        &mut self,
+        h: Handle,
+        re: &crate::regex::Regex,
+        units: &[T],
+        mode: LeanMode,
+        repl: &[u8],
+        spans: &mut Vec<Option<(usize, usize)>>,
+        push: impl Fn(&mut Vec<u8>, &[T]),
+    ) -> LeanReplace {
+        let length = units.len();
+        let max_len = self.realm.limits.max_string_len;
         let plain = !repl.contains(&b'$');
-        let length = sub.units().len();
-        // An ASCII subject's unmatched runs are its code units narrowed.
-        // (Only ASCII text has as many WTF-8 bytes as UTF-16 units.)
-        let ascii = str_v
-            .as_handle()
-            .and_then(|s| self.realm.string_leaf_bytes(Handle::from_raw(s)))
-            .is_some_and(|b| b.len() == length);
-        let copy = |out: &mut Vec<u8>, run: &[u16]| {
-            if ascii {
-                out.extend(run.iter().map(|&u| u as u8));
+        // A template holding no surrogate (no `0xED` lead byte) cannot join
+        // with the text around it, so it is copied as it is.
+        let repl_simple = !repl.contains(&0xED);
+        let put_repl = |out: &mut Vec<u8>| {
+            if repl_simple {
+                out.extend_from_slice(repl);
             } else {
-                crate::wtf8::append_utf16(out, run);
+                crate::wtf8::append(out, repl);
             }
         };
         // A global one-character atom (`/[&<>]/g`, `/[^aeiou]/gi`) with a
         // plain template: every match is one unit the atom accepts, so the
         // result is one pass over the subject, with no match list.
-        if global
-            && !sticky
-            && !func
+        if mode.global
+            && !mode.sticky
+            && !mode.func
             && plain
             && let Some(accepts) = re.single_atom_matcher()
         {
-            let units: &[u16] = sub.units();
-            let max_len = self.realm.limits.max_string_len;
             let mut out: Vec<u8> = Vec::with_capacity(length);
             let (mut run, mut last) = (0usize, None);
             let mut too_long = false;
             for (i, &u) in units.iter().enumerate() {
-                if accepts(u) {
+                if accepts(u.u()) {
                     last = Some(i);
                     if too_long {
                         continue;
                     }
-                    copy(&mut out, &units[run..i]);
-                    crate::wtf8::append(&mut out, &repl);
+                    push(&mut out, &units[run..i]);
+                    put_repl(&mut out);
                     run = i + 1;
                     // Past the limit only the last match is still wanted
                     // (the collection completes before the splice throws).
@@ -493,35 +607,25 @@ impl Interp {
             // The collection loop's final, failing exec leaves `lastIndex` 0.
             self.realm.set_regex_last_index(h, 0);
             let Some(l) = last else {
-                self.lean_subject_done(sub);
-                return Ok(Some(ReplaceStep::Done(str_v)));
+                return LeanReplace::NoMatch;
             };
-            copy(&mut out, &units[run..]);
-            self.lean_legacy(o, sub, &[Some((l, l + 1))], 1);
-            if too_long {
-                let m = self.new_str("Invalid string length");
-                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-            }
-            return Ok(Some(ReplaceStep::Done(self.new_str_bytes(out))));
+            push(&mut out, &units[run..]);
+            spans.push(Some((l, l + 1)));
+            return if too_long {
+                LeanReplace::TooLong(out, 1)
+            } else {
+                LeanReplace::Out(out, 1)
+            };
         }
-        let mut spans = Vec::new();
-        self.pristine_matches(h, &re, sub.units(), global, sticky, unicode, &mut spans);
+        self.pristine_matches(h, re, units, mode.global, mode.sticky, mode.unicode, spans);
         let stride = re.group_count() + 1;
         // No match: the subject itself, with no replacer call.
         if spans.is_empty() {
-            self.lean_subject_done(sub);
-            return Ok(Some(ReplaceStep::Done(str_v)));
+            return LeanReplace::NoMatch;
         }
-        let units_rc = self.lean_legacy(o, sub, &spans, stride);
-        if func {
-            return Ok(Some(ReplaceStep::Plan(ReplacePlan {
-                subject: str_v,
-                units: units_rc,
-                stride,
-                spans,
-            })));
+        if mode.func {
+            return LeanReplace::Plan(stride);
         }
-        let units: &[u16] = &units_rc;
         let mut out: Vec<u8> = Vec::with_capacity(length + repl.len());
         let mut next = 0usize;
         for m in spans.chunks(stride) {
@@ -533,34 +637,21 @@ impl Interp {
             if pos < next {
                 continue;
             }
-            copy(&mut out, &units[next..pos]);
+            push(&mut out, &units[next..pos]);
             if plain {
-                crate::wtf8::append(&mut out, &repl);
-            } else {
-                let captures: Vec<Option<Vec<u8>>> = m[1..]
-                    .iter()
-                    .map(|g| g.map(|(a, b)| u16_slice(units, a, b)))
-                    .collect();
-                let r = self.get_substitution(
-                    &units[pos..end],
-                    units,
-                    pos,
-                    &captures,
-                    NanBox::undefined(),
-                    &repl,
-                )?;
-                crate::wtf8::append(&mut out, &r);
+                put_repl(&mut out);
+            } else if !expand_template(&mut out, repl, units, (pos, end), &m[1..], &push, max_len) {
+                return LeanReplace::TooLong(out, stride);
             }
             next = end;
-            if out.len() > self.realm.limits.max_string_len {
-                let m = self.new_str("Invalid string length");
-                return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+            if out.len() > max_len {
+                return LeanReplace::TooLong(out, stride);
             }
         }
         if next < length {
-            copy(&mut out, &units[next..]);
+            push(&mut out, &units[next..]);
         }
-        Ok(Some(ReplaceStep::Done(self.new_str_bytes(out))))
+        LeanReplace::Out(out, stride)
     }
 
     /// `String.prototype.match` of the string `o` with the pristine RegExp
@@ -584,25 +675,151 @@ impl Interp {
         let Some(re) = self.realm.regex_compiled(h) else {
             return Ok(None);
         };
-        let Some(sub) = self.lean_subject(o) else {
+        let Some(sub) = self.lean_subject(o, &re) else {
             return Ok(None);
         };
-        let mut spans = Vec::new();
-        self.pristine_matches(h, &re, sub.units(), true, false, unicode, &mut spans);
+        let mut spans = core::mem::take(&mut self.lean_spans);
+        spans.clear();
+        match &sub {
+            Subject::Ascii(rope) => {
+                let units = rope.as_leaf_bytes().unwrap_or_default();
+                self.pristine_matches(h, &re, units, true, false, unicode, &mut spans);
+            }
+            _ => self.pristine_matches(h, &re, sub.units(), true, false, unicode, &mut spans),
+        }
         if spans.is_empty() {
             self.lean_subject_done(sub);
+            self.lean_spans = spans;
             return Ok(Some(NanBox::null()));
         }
         let stride = re.group_count() + 1;
-        let units_rc = self.lean_legacy(o, sub, &spans, stride);
-        let units: &[u16] = &units_rc;
-        let results: Vec<NanBox> = spans
-            .chunks(stride)
-            .map(|g| {
-                let (a, b) = g[0].unwrap_or_default();
-                NanBox::handle(self.realm.new_string_units(&units[a..b]).to_raw())
-            })
-            .collect();
+        let results: Vec<NanBox> = match &sub {
+            Subject::Ascii(rope) => {
+                let units = rope.as_leaf_bytes().unwrap_or_default();
+                match_strings(&mut self.realm, units, &spans, stride)
+            }
+            _ => match_strings(&mut self.realm, sub.units(), &spans, stride),
+        };
+        let last = spans.rchunks(stride).next().unwrap_or_default();
+        self.lean_record(o, sub, last);
+        self.lean_spans = spans;
         Ok(Some(NanBox::handle(self.realm.new_array(results).to_raw())))
     }
+}
+
+/// The flags a one-step replace runs under.
+#[derive(Clone, Copy)]
+struct LeanMode {
+    global: bool,
+    sticky: bool,
+    unicode: bool,
+    /// The replacement is a function (its calls are the caller's).
+    func: bool,
+}
+
+/// What [`Interp::replace_pristine_on`] did.
+enum LeanReplace {
+    /// No match.
+    NoMatch,
+    /// The result text, and the spans per match.
+    Out(Vec<u8>, usize),
+    /// The result outgrew the string length limit (its text so far, and
+    /// the spans per match).
+    TooLong(Vec<u8>, usize),
+    /// Matches for the replacer calls (spans per match).
+    Plan(usize),
+}
+
+/// Each match's whole text (the first of every `stride` spans) as a new
+/// string.
+fn match_strings<T: SubjectUnits>(
+    realm: &mut Realm,
+    units: &[T],
+    spans: &[Option<(usize, usize)>],
+    stride: usize,
+) -> Vec<NanBox> {
+    spans
+        .chunks(stride)
+        .map(|g| {
+            let (a, b) = g[0].unwrap_or_default();
+            NanBox::handle(T::string(realm, &units[a..b]).to_raw())
+        })
+        .collect()
+}
+
+/// `GetSubstitution` of the template `repl` (WTF-8) for one match, in one
+/// pass over the template, appended to `out`: `whole` is the match's span
+/// in the subject `units` and `caps` each capture group's (no named groups:
+/// `$<` is literal). Unmatched text and spans are appended by `push`.
+/// `false` once `out` outgrows `max_len` (the caller throws).
+///
+/// `$$` is `$`; `$&`, `` $` `` and `$'` are the match, the text before it
+/// and the text after it; `$n`/`$nn` is group `n` (1..=99, the two-digit
+/// form when that group exists, an absent group empty); anything else
+/// after `$` leaves the `$` literal.
+fn expand_template<T: crate::regex::Unit>(
+    out: &mut Vec<u8>,
+    repl: &[u8],
+    units: &[T],
+    (pos, end): (usize, usize),
+    caps: &[Option<(usize, usize)>],
+    push: &impl Fn(&mut Vec<u8>, &[T]),
+    max_len: usize,
+) -> bool {
+    let n = caps.len();
+    let len = units.len();
+    let span = |s: Option<(usize, usize)>| {
+        s.map(|(a, b)| {
+            let a = a.min(len);
+            (a, b.min(len).max(a))
+        })
+    };
+    let mut lit = 0usize;
+    let mut i = 0usize;
+    while i + 1 < repl.len() {
+        if repl[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let (piece, used): (Option<Option<(usize, usize)>>, usize) = match repl[i + 1] {
+            b'$' => (None, 2),
+            b'&' => (Some(Some((pos, end))), 2),
+            b'`' => (Some(Some((0, pos))), 2),
+            b'\'' => (Some(Some((end, len))), 2),
+            d @ b'0'..=b'9' => {
+                let d1 = usize::from(d - b'0');
+                let two = repl
+                    .get(i + 2)
+                    .filter(|c| c.is_ascii_digit())
+                    .map(|&c| d1 * 10 + usize::from(c - b'0'));
+                match two {
+                    Some(t) if t >= 1 && t <= n => (Some(span(caps[t - 1])), 3),
+                    _ if d1 >= 1 && d1 <= n => (Some(span(caps[d1 - 1])), 2),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        crate::wtf8::append(out, &repl[lit..i]);
+        match piece {
+            // `$$`: the `$` itself.
+            None => out.push(b'$'),
+            Some(Some((a, b))) => push(out, &units[a..b]),
+            // An absent group.
+            Some(None) => {}
+        }
+        i += used;
+        lit = i;
+        if out.len() > max_len {
+            return false;
+        }
+    }
+    crate::wtf8::append(out, &repl[lit..]);
+    out.len() <= max_len
 }

@@ -41,13 +41,23 @@ pub enum ReplaceStep {
 pub struct ReplacePlan {
     /// `S`, the subject string (each call's last argument).
     pub(crate) subject: NanBox,
-    /// `S`'s code units.
-    pub(crate) units: Rc<Vec<u16>>,
+    /// `S`'s text, as the matches index it.
+    pub(crate) text: PlanText,
     /// Spans per match: the whole match, then each capture group.
     pub(crate) stride: usize,
     /// Every match's spans, `stride` per match (code-unit offsets; `None` for
     /// a group that did not participate).
     pub(crate) spans: Vec<Option<(usize, usize)>>,
+}
+
+/// The subject text of a [`ReplacePlan`]: its UTF-16 code units, or a flat
+/// all-ASCII string whose byte indices are its unit indices (a subject the
+/// host matched as bytes).
+pub enum PlanText {
+    /// The subject's code units.
+    Units(Rc<Vec<u16>>),
+    /// A flat, all-ASCII subject.
+    Ascii(crate::rope::Rope),
 }
 
 /// `recv.replace(regs[args[0]], regs[args[1]])` (`all`: `replaceAll`) once
@@ -114,7 +124,49 @@ fn replace_matches(
     replace: NanBox,
     plan: &ReplacePlan,
 ) -> Result<NanBox, VmError> {
-    let units: &[u16] = &plan.units;
+    match &plan.text {
+        PlanText::Units(units) => replace_matches_on(ctx, funcs, replace, plan, &units[..]),
+        PlanText::Ascii(rope) => {
+            let bytes = rope.as_leaf_bytes().ok_or(VmError::Unsupported)?;
+            replace_matches_on(ctx, funcs, replace, plan, bytes)
+        }
+    }
+}
+
+/// A run of a [`PlanText`]'s units: UTF-16 code units, or ASCII bytes.
+trait PlanUnits: Copy {
+    /// Appends the run's text to the WTF-8 buffer `out`.
+    fn append(out: &mut Vec<u8>, run: &[Self]);
+    /// The run as a new string.
+    fn string(realm: &mut crate::realm::Realm, run: &[Self]) -> Handle;
+}
+
+impl PlanUnits for u16 {
+    fn append(out: &mut Vec<u8>, run: &[u16]) {
+        crate::wtf8::append_utf16(out, run);
+    }
+    fn string(realm: &mut crate::realm::Realm, run: &[u16]) -> Handle {
+        realm.new_string_units(run)
+    }
+}
+
+impl PlanUnits for u8 {
+    fn append(out: &mut Vec<u8>, run: &[u8]) {
+        out.extend_from_slice(run);
+    }
+    fn string(realm: &mut crate::realm::Realm, run: &[u8]) -> Handle {
+        realm.new_string_ascii(run)
+    }
+}
+
+/// [`replace_matches`] over the subject's units `units`.
+fn replace_matches_on<T: PlanUnits>(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    replace: NanBox,
+    plan: &ReplacePlan,
+    units: &[T],
+) -> Result<NanBox, VmError> {
     let length = units.len();
     let mut callee = super::array_hof::Callee::new(ctx, funcs, replace);
     let mut out: Vec<u8> = Vec::with_capacity(length);
@@ -131,7 +183,7 @@ fn replace_matches(
                 Some((a, b)) => {
                     let a = a.min(length);
                     let b = b.min(length).max(a);
-                    NanBox::handle(ctx.realm.new_string_units(&units[a..b]).to_raw())
+                    NanBox::handle(T::string(&mut ctx.realm, &units[a..b]).to_raw())
                 }
                 None => NanBox::undefined(),
             });
@@ -140,7 +192,7 @@ fn replace_matches(
         argv.push(plan.subject);
         let r = callee.invoke(ctx, &argv, NanBox::undefined())?;
         if pos >= next {
-            crate::wtf8::append_utf16(&mut out, &units[next.min(pos)..pos]);
+            T::append(&mut out, &units[next.min(pos)..pos]);
             append_to_string(ctx, &mut out, r)?;
             next = pos + (end - start);
             if out.len() > ctx.realm.limits.max_string_len {
@@ -153,7 +205,7 @@ fn replace_matches(
         }
     }
     if next < length {
-        crate::wtf8::append_utf16(&mut out, &units[next..]);
+        T::append(&mut out, &units[next..]);
     }
     Ok(NanBox::handle(ctx.realm.new_string_wtf8(out).to_raw()))
 }

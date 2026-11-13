@@ -1276,17 +1276,24 @@ fn is_space(c: u32) -> bool {
     )
 }
 
-pub(crate) fn assert_ok(assert: &Assert, input: &[u16], sp: usize, flags: Flags) -> bool {
+pub(crate) fn assert_ok<T: super::Unit>(
+    assert: &Assert,
+    input: &[T],
+    sp: usize,
+    flags: Flags,
+) -> bool {
     match assert {
-        Assert::Start => sp == 0 || (flags.multiline && is_line_term(input[sp - 1] as u32)),
-        Assert::End => sp == input.len() || (flags.multiline && is_line_term(input[sp] as u32)),
+        Assert::Start => sp == 0 || (flags.multiline && is_line_term(u32::from(input[sp - 1].u()))),
+        Assert::End => {
+            sp == input.len() || (flags.multiline && is_line_term(u32::from(input[sp].u())))
+        }
         Assert::WordBoundary => is_boundary(input, sp, flags),
         Assert::NotWordBoundary => !is_boundary(input, sp, flags),
     }
 }
 
-fn is_boundary(input: &[u16], sp: usize, flags: Flags) -> bool {
-    let before = sp > 0 && is_word_flags(input[sp - 1] as u32, flags);
-    let after = sp < input.len() && is_word_flags(input[sp] as u32, flags);
+fn is_boundary<T: super::Unit>(input: &[T], sp: usize, flags: Flags) -> bool {
+    let before = sp > 0 && is_word_flags(u32::from(input[sp - 1].u()), flags);
+    let after = sp < input.len() && is_word_flags(u32::from(input[sp].u()), flags);
     before != after
 }

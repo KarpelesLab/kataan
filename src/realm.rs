@@ -830,32 +830,65 @@ const GC_NURSERY_GARBAGE_WORDS: usize = 1 << 21;
 /// in the subject length.
 #[derive(Default, Clone)]
 pub struct LegacyRegExpState {
-    /// The last subject matched against, as UTF-16 code units.
-    subject: alloc::rc::Rc<alloc::vec::Vec<u16>>,
+    /// The last subject matched against.
+    subject: LegacySubject,
     /// The whole match's `[start, end)` unit range within `subject`.
     whole: (usize, usize),
     /// `[start, end)` for capture groups 1..=9; `None` for an absent group.
     groups: [Option<(usize, usize)>; 9],
-    /// The highest-index group that participated (`RegExp.lastParen` / `$+`).
+    /// The last capture group's span (`RegExp.lastParen` / `$+`), `None` when
+    /// there is none or it did not participate.
     last_paren: Option<(usize, usize)>,
     /// An explicit `RegExp.input = …` assignment, which overrides the recorded
     /// subject for the `input`/`$_` accessor only.
     input_override: Option<alloc::vec::Vec<u8>>,
 }
 
+/// The subject of the last match the legacy record holds: its UTF-16 code
+/// units, or — for a subject whose bytes are all ASCII, matched as bytes —
+/// the flat string itself (whose byte indices are its unit indices). Either
+/// is shared, so recording one is a reference-count bump.
+#[derive(Clone)]
+pub enum LegacySubject {
+    /// The subject's code units.
+    Units(alloc::rc::Rc<alloc::vec::Vec<u16>>),
+    /// A flat, all-ASCII subject.
+    Ascii(Rope),
+}
+
+impl Default for LegacySubject {
+    fn default() -> Self {
+        LegacySubject::Units(alloc::rc::Rc::default())
+    }
+}
+
+impl LegacySubject {
+    /// The subject's length in code units.
+    fn len(&self) -> usize {
+        match self {
+            LegacySubject::Units(u) => u.len(),
+            LegacySubject::Ascii(r) => r.len(),
+        }
+    }
+}
+
 impl LegacyRegExpState {
     /// Records a successful match: the subject (shared) and the index ranges.
-    /// O(1) plus the group scan — no string is built here.
-    pub fn record(
+    /// O(1) — no string is built here.
+    ///
+    /// `last_paren` is the last capture group's span (`None` with no groups
+    /// or when that group did not participate).
+    pub fn record_subject(
         &mut self,
-        subject: alloc::rc::Rc<alloc::vec::Vec<u16>>,
+        subject: LegacySubject,
         whole: (usize, usize),
         groups: [Option<(usize, usize)>; 9],
+        last_paren: Option<(usize, usize)>,
     ) {
         self.subject = subject;
         self.whole = whole;
         self.groups = groups;
-        self.last_paren = groups.iter().rev().find_map(|g| *g);
+        self.last_paren = last_paren;
         self.input_override = None;
     }
 
@@ -866,7 +899,12 @@ impl LegacyRegExpState {
         if a >= b {
             return alloc::vec::Vec::new();
         }
-        crate::wtf8::from_utf16(&self.subject[a..b])
+        match &self.subject {
+            LegacySubject::Units(u) => crate::wtf8::from_utf16(&u[a..b]),
+            LegacySubject::Ascii(r) => r
+                .as_leaf_bytes()
+                .map_or_else(alloc::vec::Vec::new, |bytes| bytes[a..b].to_vec()),
+        }
     }
 
     /// `RegExp.input` / `$_` — the last subject, or the last explicitly assigned value.
@@ -890,7 +928,8 @@ impl LegacyRegExpState {
         self.slice(self.whole.0, self.whole.1)
     }
 
-    /// `RegExp.lastParen` / `$+` — the highest-index participating group.
+    /// `RegExp.lastParen` / `$+` — the last group's capture (empty when it
+    /// did not participate).
     #[must_use]
     pub fn last_paren(&self) -> alloc::vec::Vec<u8> {
         self.last_paren
@@ -2715,6 +2754,20 @@ impl Realm {
             }
         }
         self.new_string_wtf8(crate::wtf8::from_utf16(units))
+    }
+
+    /// A new string of the ASCII bytes `bytes` (each one code unit).
+    pub fn new_string_ascii(&mut self, bytes: &[u8]) -> Handle {
+        debug_assert!(bytes.is_ascii());
+        if let [b] = *bytes {
+            return self.unit_string(u16::from(b));
+        }
+        let rope = if bytes.len() <= crate::rope::SMALL_CAP {
+            Rope::from_bytes(bytes)
+        } else {
+            Rope::from_bytes_units(bytes, bytes.len())
+        };
+        self.heap.alloc(Cell::Str(rope))
     }
 
     /// The UTF-16 units `[start, end)` of the flat string `rope` (see

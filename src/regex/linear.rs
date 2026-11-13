@@ -27,8 +27,8 @@
 //! tabulated for Latin-1 and called directly above it, so the two engines
 //! cannot disagree about what a character class contains.
 
-use super::Flags;
 use super::vm::{self, Assert, ClassMember, Inst};
+use super::{Flags, Unit};
 use alloc::vec::Vec;
 use core::cell::Cell;
 
@@ -475,10 +475,10 @@ impl Linear {
     /// [`Linear::slots`] entries. `None` means no match, including when the
     /// shared step budget runs out (the VM gives up the same way).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn find(
+    pub(crate) fn find<T: Unit>(
         &self,
         prog: &[Inst],
-        units: &[u16],
+        units: &[T],
         start: usize,
         last: usize,
         flags: Flags,
@@ -509,15 +509,15 @@ impl Linear {
             budget,
         };
         if flags.unicode {
-            self.find_on::<true>(&ctx, start, last, saves, stack)
+            self.find_on::<true, T>(&ctx, start, last, saves, stack)
         } else {
-            self.find_on::<false>(&ctx, start, last, saves, stack)
+            self.find_on::<false, T>(&ctx, start, last, saves, stack)
         }
     }
 
-    fn find_on<const U: bool>(
+    fn find_on<const U: bool, T: Unit>(
         &self,
-        ctx: &Run,
+        ctx: &Run<'_, T>,
         start: usize,
         last: usize,
         saves: &mut [usize],
@@ -537,7 +537,7 @@ impl Linear {
                     if s >= end {
                         return None;
                     }
-                    s += find_unit(&units[s..end], u)?;
+                    s += T::find(&units[s..end], u)?;
                 }
                 First::Set(k) => {
                     if s >= end {
@@ -546,7 +546,7 @@ impl Linear {
                     let set = &self.sets[k];
                     s += units[s..end]
                         .iter()
-                        .position(|&x| set.may_start(x, prog, flags))?;
+                        .position(|&x| set.may_start(x.u(), prog, flags))?;
                 }
                 First::Any => {}
             }
@@ -557,12 +557,12 @@ impl Linear {
             }
             // An attempt here would fail within the opening literal (whose
             // units are never surrogates, so `s` is a character boundary).
-            if !self.lead_lit.is_empty() && !units[s..].starts_with(&self.lead_lit) {
+            if !self.lead_lit.is_empty() && !starts_with_units(&units[s..], &self.lead_lit) {
                 s += 1;
                 continue;
             }
             for steps in &self.branches {
-                match self.run_on::<U>(ctx, steps, s, saves, stack) {
+                match self.run_on::<U, T>(ctx, steps, s, saves, stack) {
                     Outcome::Match => return Some(()),
                     Outcome::Abort => return None,
                     Outcome::NoMatch => {}
@@ -598,9 +598,9 @@ impl Linear {
     /// from it fails from every later start up to `q` too (they all see the
     /// same steps from `q` on). The candidates come in increasing order, so the
     /// first match found is the leftmost, as in [`find_on`](Self::find_on).
-    fn find_lead_run(
+    fn find_lead_run<T: Unit>(
         &self,
-        ctx: &Run,
+        ctx: &Run<'_, T>,
         (a, b, x): (usize, usize, u16),
         start: usize,
         last: usize,
@@ -613,19 +613,19 @@ impl Linear {
         let mut s = start;
         while s <= last && s < len {
             // The next `x` that a start at `s` or later could reach.
-            let q = s + 1 + find_unit(units.get(s + 1..)?, x)?;
+            let q = s + 1 + T::find(units.get(s + 1..)?, x)?;
             let mut r = q;
-            while r > s + 1 && b.has(u32::from(units[r - 1]), prog, flags) {
+            while r > s + 1 && b.has(u32::from(units[r - 1].u()), prog, flags) {
                 r -= 1;
             }
-            let Some(p) = (r - 1..q).find(|&p| a.has(u32::from(units[p]), prog, flags)) else {
+            let Some(p) = (r - 1..q).find(|&p| a.has(u32::from(units[p].u()), prog, flags)) else {
                 s = q;
                 continue;
             };
             if p > last {
                 return None;
             }
-            match self.run_on::<false>(ctx, &self.branches[0], p, saves, stack) {
+            match self.run_on::<false, T>(ctx, &self.branches[0], p, saves, stack) {
                 Outcome::Match => return Some(()),
                 Outcome::Abort => return None,
                 Outcome::NoMatch => {}
@@ -640,7 +640,12 @@ impl Linear {
     /// [`Linear::skip_run`]): past the run of `b` the attempt began, or
     /// `s + 1` when the opening `a` did not even match.
     #[inline(never)]
-    fn skip_past_run(&self, ctx: &Run, (a, b): (Option<usize>, usize), s: usize) -> usize {
+    fn skip_past_run<T: Unit>(
+        &self,
+        ctx: &Run<'_, T>,
+        (a, b): (Option<usize>, usize),
+        s: usize,
+    ) -> usize {
         let (units, prog, flags) = (ctx.units, ctx.prog, ctx.flags);
         let set = &self.sets[b];
         let run_from = match a {
@@ -648,14 +653,14 @@ impl Linear {
             Some(a)
                 if units
                     .get(s)
-                    .is_some_and(|&u| self.sets[a].has(u32::from(u), prog, flags)) =>
+                    .is_some_and(|&u| self.sets[a].has(u32::from(u.u()), prog, flags)) =>
             {
                 s + 1
             }
             Some(_) => return s + 1,
         };
         let mut r = run_from;
-        while r < units.len() && set.has(u32::from(units[r]), prog, flags) {
+        while r < units.len() && set.has(u32::from(units[r].u()), prog, flags) {
             r += 1;
         }
         // With `A B*`, the start at the run's end is a fresh one (its unit
@@ -665,9 +670,9 @@ impl Linear {
     }
 
     /// One attempt of `steps` at `start`.
-    fn run_on<const U: bool>(
+    fn run_on<const U: bool, T: Unit>(
         &self,
-        ctx: &Run,
+        ctx: &Run<'_, T>,
         steps: &[Step],
         start: usize,
         saves: &mut [usize],
@@ -692,14 +697,14 @@ impl Linear {
                         i += 1;
                     }
                     Step::Unit(u) => {
-                        if p < len && units[p] == u {
+                        if p < len && units[p].u() == u {
                             p += 1;
                             i += 1;
                         } else {
                             break true;
                         }
                     }
-                    Step::One(k) => match read::<U>(units, p) {
+                    Step::One(k) => match read::<U, T>(units, p) {
                         Some((c, n)) if self.sets[k].has(c, prog, flags) => {
                             p = n;
                             i += 1;
@@ -712,7 +717,7 @@ impl Linear {
                         if U {
                             let mut left = max.unwrap_or(usize::MAX);
                             while left > 0
-                                && let Some((c, n)) = read::<true>(units, p)
+                                && let Some((c, n)) = read::<true, T>(units, p)
                                 && set.has(c, prog, flags)
                             {
                                 p = n;
@@ -720,7 +725,7 @@ impl Linear {
                             }
                         } else {
                             let limit = max.map_or(len, |m| len.min(p.saturating_add(m)));
-                            while p < limit && set.has(u32::from(units[p]), prog, flags) {
+                            while p < limit && set.has(u32::from(units[p].u()), prog, flags) {
                                 p += 1;
                             }
                         }
@@ -742,7 +747,7 @@ impl Linear {
                             if U {
                                 let mut left = max.unwrap_or(usize::MAX);
                                 while left > 0
-                                    && let Some((c, n)) = read::<true>(units, p)
+                                    && let Some((c, n)) = read::<true, T>(units, p)
                                     && set.has(c, prog, flags)
                                 {
                                     p = n;
@@ -750,16 +755,16 @@ impl Linear {
                                 }
                             } else {
                                 let limit = max.map_or(len, |m| len.min(p.saturating_add(m)));
-                                while p < limit && set.has(u32::from(units[p]), prog, flags) {
+                                while p < limit && set.has(u32::from(units[p].u()), prog, flags) {
                                     p += 1;
                                 }
                             }
                             work += (p - lo) as u64;
                             // Back off to where the continuation can start.
                             if let Some(c) = next_unit
-                                && units.get(p) != Some(&c)
+                                && units.get(p).map(|v| v.u()) != Some(c)
                             {
-                                match units[lo..p].iter().rposition(|&u| u == c) {
+                                match units[lo..p].iter().rposition(|&u| u.u() == c) {
                                     Some(k) => p = lo + k,
                                     None => break true,
                                 }
@@ -835,7 +840,7 @@ impl Linear {
                     let np = if let Some(c) = next_unit {
                         // `c` is never a surrogate, so each occurrence starts
                         // a character of the run.
-                        match units[ch.bound..ch.cur].iter().rposition(|&u| u == c) {
+                        match units[ch.bound..ch.cur].iter().rposition(|&u| u.u() == c) {
                             Some(k) => ch.bound + k,
                             None => {
                                 depth -= 1;
@@ -844,8 +849,8 @@ impl Linear {
                         }
                     } else if U
                         && ch.cur >= ch.bound + 2
-                        && (0xDC00..=0xDFFF).contains(&units[ch.cur - 1])
-                        && (0xD800..=0xDBFF).contains(&units[ch.cur - 2])
+                        && (0xDC00..=0xDFFF).contains(&units[ch.cur - 1].u())
+                        && (0xD800..=0xDBFF).contains(&units[ch.cur - 2].u())
                     {
                         ch.cur - 2
                     } else {
@@ -857,7 +862,7 @@ impl Linear {
                         depth -= 1;
                         continue;
                     }
-                    match read::<U>(units, ch.cur) {
+                    match read::<U, T>(units, ch.cur) {
                         Some((c, n)) if self.sets[set].has(c, prog, flags) => {
                             ch.cur = n;
                             ch.bound -= 1;
@@ -902,10 +907,29 @@ pub(super) fn find_unit(hay: &[u16], x: u16) -> Option<usize> {
         .map(|k| chunks.len() * 4 + k)
 }
 
+/// `hay.iter().position(|&b| b == x)`, eight bytes per step (the
+/// byte-lane form of [`find_unit`]).
+#[inline]
+pub(super) fn find_byte(hay: &[u8], x: u8) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let pat = ONES.wrapping_mul(u64::from(x));
+    let (chunks, rest) = hay.as_chunks::<8>();
+    for (i, c) in chunks.iter().enumerate() {
+        let w = u64::from_le_bytes(*c) ^ pat;
+        if w.wrapping_sub(ONES) & !w & HIGHS != 0 {
+            return c.iter().position(|&b| b == x).map(|k| i * 8 + k);
+        }
+    }
+    rest.iter()
+        .position(|&b| b == x)
+        .map(|k| chunks.len() * 8 + k)
+}
+
 /// The per-find context of [`Linear::run_on`].
-struct Run<'a> {
+struct Run<'a, T> {
     prog: &'a [Inst],
-    units: &'a [u16],
+    units: &'a [T],
     flags: Flags,
     steps_used: &'a Cell<u64>,
     budget: u64,
@@ -914,10 +938,10 @@ struct Run<'a> {
 /// The character at `p` and the position after it: one unit outside `u`
 /// mode; in `u` mode a well-formed surrogate pair is one code point.
 #[inline(always)]
-fn read<const U: bool>(units: &[u16], p: usize) -> Option<(u32, usize)> {
-    let u = *units.get(p)?;
+fn read<const U: bool, T: Unit>(units: &[T], p: usize) -> Option<(u32, usize)> {
+    let u = units.get(p)?.u();
     if U && (0xD800..=0xDBFF).contains(&u)
-        && let Some(&lo) = units.get(p + 1)
+        && let Some(lo) = units.get(p + 1).map(|v| v.u())
         && (0xDC00..=0xDFFF).contains(&lo)
     {
         let cp = 0x10000 + ((u32::from(u) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
@@ -927,18 +951,24 @@ fn read<const U: bool>(units: &[u16], p: usize) -> Option<(u32, usize)> {
 }
 
 /// The number of units the character at `s` spans in `u` mode (1 at the end).
-fn char_len(units: &[u16], s: usize) -> usize {
-    match read::<true>(units, s) {
+fn char_len<T: Unit>(units: &[T], s: usize) -> usize {
+    match read::<true, T>(units, s) {
         Some((_, n)) => n - s,
         None => 1,
     }
 }
 
-fn is_char_boundary(units: &[u16], s: usize) -> bool {
+fn is_char_boundary<T: Unit>(units: &[T], s: usize) -> bool {
     s == 0
         || s >= units.len()
-        || !(0xDC00..=0xDFFF).contains(&units[s])
-        || !(0xD800..=0xDBFF).contains(&units[s - 1])
+        || !(0xDC00..=0xDFFF).contains(&units[s].u())
+        || !(0xD800..=0xDBFF).contains(&units[s - 1].u())
+}
+
+/// Whether `units` begins with the code units `lit`.
+#[inline]
+fn starts_with_units<T: Unit>(units: &[T], lit: &[u16]) -> bool {
+    units.len() >= lit.len() && units.iter().zip(lit).all(|(a, &b)| a.u() == b)
 }
 
 fn is_consume(inst: Option<&Inst>) -> bool {

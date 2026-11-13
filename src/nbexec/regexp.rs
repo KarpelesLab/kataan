@@ -996,13 +996,7 @@ impl Interp {
         units: &alloc::rc::Rc<Vec<u16>>,
         c: &crate::regex::Captures,
     ) {
-        let mut groups: [Option<(usize, usize)>; 9] = [None; 9];
-        for (i, g) in groups.iter_mut().enumerate() {
-            *g = c.group(i + 1);
-        }
-        self.realm
-            .legacy_regexp_mut()
-            .record(units.clone(), c.whole(), groups);
+        self.legacy_record_spans(crate::realm::LegacySubject::Units(units.clone()), &c.groups);
     }
 
     /// The spec's internal `Set(rx, "lastIndex", n, true)` (Throw = true): always
@@ -1738,10 +1732,29 @@ impl Interp {
         lim: usize,
         unicode: bool,
     ) -> Vec<NanBox> {
-        let units: &[u16] = units_rc;
+        let subject = crate::realm::LegacySubject::Units(units_rc.clone());
+        self.regexp_split_on(re, &units_rc[..], &subject, lim, unicode)
+    }
+
+    /// [`regexp_split_run`](Self::regexp_split_run) over the subject's units
+    /// `units` (`subject`, as the legacy match record keeps it).
+    #[cfg(feature = "regex")]
+    pub(crate) fn regexp_split_on<T: SubjectUnits>(
+        &mut self,
+        re: &crate::regex::Regex,
+        units: &[T],
+        subject: &crate::realm::LegacySubject,
+        lim: usize,
+        unicode: bool,
+    ) -> Vec<NanBox> {
         let size = units.len();
         let mut parts: Vec<NanBox> = Vec::new();
         let mut last: Option<crate::regex::Captures> = None;
+        let piece = |this: &mut Self, a: usize, b: usize| -> NanBox {
+            let a = a.min(size);
+            let b = b.min(size).max(a);
+            NanBox::handle(T::string(&mut this.realm, &units[a..b]).to_raw())
+        };
         let (mut p, mut q) = (0usize, 0usize);
         while q < size {
             // The spec loop only execs at `q < size`.
@@ -1758,7 +1771,7 @@ impl Interp {
                         if let Some(c) = re.captures_in_u16(units, x) {
                             break Some(c);
                         }
-                        x = self.advance_string_index(units, x, unicode);
+                        x = T::advance(units, x, unicode);
                     }
                 }
             };
@@ -1769,22 +1782,22 @@ impl Interp {
             let e = end.min(size);
             if e == p {
                 // Only an empty match at `p` itself ends at `p`.
-                q = self.advance_string_index(units, at, unicode);
+                q = T::advance(units, at, unicode);
                 last = Some(c);
                 continue;
             }
-            parts.push(self.units_str(units, p, at));
+            parts.push(piece(self, p, at));
             if parts.len() == lim {
-                self.update_legacy_regexp(units_rc, &c);
+                self.legacy_record_spans(subject.clone(), &c.groups);
                 return parts;
             }
             for g in 1..c.groups.len() {
                 parts.push(match c.group(g) {
-                    Some((a, b)) => self.units_str(units, a, b),
+                    Some((a, b)) => piece(self, a, b),
                     None => NanBox::undefined(),
                 });
                 if parts.len() == lim {
-                    self.update_legacy_regexp(units_rc, &c);
+                    self.legacy_record_spans(subject.clone(), &c.groups);
                     return parts;
                 }
             }
@@ -1793,10 +1806,35 @@ impl Interp {
             last = Some(c);
         }
         if let Some(c) = &last {
-            self.update_legacy_regexp(units_rc, c);
+            self.legacy_record_spans(subject.clone(), &c.groups);
         }
-        parts.push(self.units_str(units, p, usize::MAX));
+        parts.push(piece(self, p, usize::MAX));
         parts
+    }
+
+    /// Records a successful match in the legacy match record: `subject`
+    /// and the match's spans `m` (the whole match, then each group).
+    #[cfg(feature = "regex")]
+    pub(crate) fn legacy_record_spans(
+        &mut self,
+        subject: crate::realm::LegacySubject,
+        m: &[Option<(usize, usize)>],
+    ) {
+        let mut groups: [Option<(usize, usize)>; 9] = [None; 9];
+        for (g, span) in groups.iter_mut().zip(m.iter().skip(1)) {
+            *g = *span;
+        }
+        let whole = m.first().copied().flatten().unwrap_or_default();
+        // `lastParen` is the last group's capture (empty when that group did
+        // not participate), not the last participating one's.
+        let last_paren = if m.len() > 1 {
+            m.last().copied().flatten()
+        } else {
+            None
+        };
+        self.realm
+            .legacy_regexp_mut()
+            .record_subject(subject, whole, groups, last_paren);
     }
 
     /// `RegExp.prototype[@@replace](string, replaceValue)`.
@@ -1952,7 +1990,7 @@ impl Interp {
             if plan && func_replace && re.group_names().is_empty() {
                 return Ok(crate::nbvm::ReplaceStep::Plan(crate::nbvm::ReplacePlan {
                     subject: str_v,
-                    units: units_rc.clone(),
+                    text: crate::nbvm::PlanText::Units(units_rc.clone()),
                     stride,
                     spans,
                 }));
@@ -2082,7 +2120,7 @@ impl Interp {
             }
             return Ok(crate::nbvm::ReplaceStep::Plan(crate::nbvm::ReplacePlan {
                 subject: str_v,
-                units: units_rc.clone(),
+                text: crate::nbvm::PlanText::Units(units_rc.clone()),
                 stride,
                 spans,
             }));
@@ -2506,6 +2544,37 @@ fn escape_regexp_source(source: &[u8]) -> alloc::vec::Vec<u8> {
 }
 
 /// The UTF-16 code units of WTF-8 `bytes` (an ASCII string widens byte by byte).
+/// A subject's code units as the one-step operations read them: UTF-16
+/// code units, or the bytes of an all-ASCII subject (see
+/// [`crate::regex::Unit`]).
+#[cfg(feature = "regex")]
+pub(crate) trait SubjectUnits: crate::regex::Unit {
+    /// The run as a new string.
+    fn string(realm: &mut Realm, run: &[Self]) -> Handle;
+    /// `AdvanceStringIndex(S, i, unicode)`.
+    fn advance(units: &[Self], i: usize, unicode: bool) -> usize;
+}
+
+#[cfg(feature = "regex")]
+impl SubjectUnits for u16 {
+    fn string(realm: &mut Realm, run: &[u16]) -> Handle {
+        realm.new_string_units(run)
+    }
+    fn advance(units: &[u16], i: usize, unicode: bool) -> usize {
+        advance_index_u16(units, i, unicode)
+    }
+}
+
+#[cfg(feature = "regex")]
+impl SubjectUnits for u8 {
+    fn string(realm: &mut Realm, run: &[u8]) -> Handle {
+        realm.new_string_ascii(run)
+    }
+    fn advance(_: &[u8], i: usize, _: bool) -> usize {
+        i + 1
+    }
+}
+
 /// `ToUint32(n)` of a number: 0 for a non-finite value, else the integer
 /// toward zero reduced modulo 2^32 (computed inline: the no-`std` build has
 /// no `Realm::to_uint32`).

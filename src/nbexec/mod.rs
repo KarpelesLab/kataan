@@ -560,6 +560,8 @@ pub struct Interp {
     /// The reusable code-unit buffer of the one-step string/RegExp
     /// operations (see `regexp::Subject`).
     lean_units: Vec<u16>,
+    /// The match spans buffer of the one-step RegExp operations, reused.
+    lean_spans: Vec<Option<(usize, usize)>>,
     /// `RegExpExec`'s `Get(R, "exec")` memo (see `regexp_exec_method`).
     regexp_exec_lookup: crate::realm::builtins_fast::MethodSiteCache,
     /// The `%RegExp.prototype%` (with its realm, key epoch and the realm's
@@ -3085,6 +3087,7 @@ impl Interp {
             realm_spares: Vec::new(),
             subject_units_cache: [None, None],
             lean_units: Vec::new(),
+            lean_spans: Vec::new(),
             regexp_exec_lookup: Default::default(),
             regexp_flags_proof: None,
             #[cfg(feature = "regex")]

@@ -12537,8 +12537,13 @@ fn legacy_regexp_statics_are_lazy_but_correct() {
         ),
         "[][b][]"
     );
-    // `lastParen` is the highest-index participating group.
-    assert_eq!(run(r#"/(a)(b)?/.exec("a"); RegExp.lastParen"#), "a");
+    // `lastParen` is the last group's capture, empty when it did not
+    // participate (not the last participating group's).
+    assert_eq!(
+        run(r#"/(a)(b)?/.exec("a"); "[" + RegExp.lastParen + "]""#),
+        "[]"
+    );
+    assert_eq!(run(r#"/(a)?(b)/.exec("b"); RegExp.lastParen"#), "b");
     // A failed match leaves the previous record intact.
     assert_eq!(
         run(r#"/a/.exec("xay"); /zzz/.exec("xay"); RegExp.lastMatch + RegExp.leftContext"#),

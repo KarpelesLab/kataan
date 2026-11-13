@@ -66,7 +66,7 @@ pub mod objlit;
 mod private_ops;
 mod str_replace;
 mod typeof_fast;
-pub use str_replace::{ReplacePlan, ReplaceStep};
+pub use str_replace::{PlanText, ReplacePlan, ReplaceStep};
 pub use typeof_fast::TypeofGlobalCache;
 mod vm_eval;
 #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]

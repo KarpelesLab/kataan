@@ -105,6 +105,46 @@ pub fn pattern_from_wtf8(bytes: &[u8], flags: &str) -> String {
     out
 }
 
+/// A subject code unit as the matchers read it: a UTF-16 code unit, or a
+/// byte of a subject whose bytes are all ASCII (where each byte is the code
+/// unit at its index, so positions and spans are the same either way).
+pub trait Unit: Copy + 'static {
+    /// The code unit.
+    fn u(self) -> u16;
+    /// The index of the first unit `x` in `hay`.
+    fn find(hay: &[Self], x: u16) -> Option<usize>;
+    /// The subject as UTF-16 code units (borrowed when it already is).
+    fn wide(units: &[Self]) -> alloc::borrow::Cow<'_, [u16]>;
+}
+
+impl Unit for u16 {
+    #[inline(always)]
+    fn u(self) -> u16 {
+        self
+    }
+    #[inline]
+    fn find(hay: &[u16], x: u16) -> Option<usize> {
+        linear::find_unit(hay, x)
+    }
+    fn wide(units: &[u16]) -> alloc::borrow::Cow<'_, [u16]> {
+        alloc::borrow::Cow::Borrowed(units)
+    }
+}
+
+impl Unit for u8 {
+    #[inline(always)]
+    fn u(self) -> u16 {
+        u16::from(self)
+    }
+    #[inline]
+    fn find(hay: &[u8], x: u16) -> Option<usize> {
+        linear::find_byte(hay, u8::try_from(x).ok()?)
+    }
+    fn wide(units: &[u8]) -> alloc::borrow::Cow<'_, [u16]> {
+        alloc::borrow::Cow::Owned(units.iter().map(|&b| u16::from(b)).collect())
+    }
+}
+
 /// A compiled regular expression.
 pub struct Regex {
     /// The program for the native UTF-16 entry points, compiled per `flags`
@@ -329,6 +369,15 @@ impl Regex {
             .is_some_and(|lin| bytes.is_ascii() && lin.ascii_rejects(bytes))
     }
 
+    /// Whether this regex matches an all-ASCII subject given as its bytes
+    /// (the generic entry points over [`Unit`] with `u8`) without widening
+    /// it: its program is one the linear matcher runs. Otherwise a byte
+    /// subject is widened to code units on every call.
+    #[must_use]
+    pub fn matches_bytes(&self) -> bool {
+        self.linear.is_some()
+    }
+
     /// Whether the linear matcher stands in for the VM on this regex.
     #[cfg(test)]
     pub(crate) fn is_linear(&self) -> bool {
@@ -407,8 +456,8 @@ impl Regex {
     /// reported as **code-unit** spans. This is the engine's native entry point;
     /// the `&str`/`&[char]` methods are adapters over it.
     #[must_use]
-    pub fn captures_in_u16(&self, units: &[u16], start: usize) -> Option<Captures> {
-        self.captures_at_u16(units, start)
+    pub fn captures_in_u16<T: Unit>(&self, units: &[T], start: usize) -> Option<Captures> {
+        self.scan(&self.prog, units, start, self.flags)
     }
 
     /// Like [`captures_in_u16`](Self::captures_in_u16) but returns only the whole
@@ -430,7 +479,11 @@ impl Regex {
     /// attempts would each have had their own, so the caller must not read
     /// that as "no sticky match anywhere".
     #[allow(clippy::result_unit_err)]
-    pub fn search_in_u16(&self, units: &[u16], start: usize) -> Result<Option<Captures>, ()> {
+    pub fn search_in_u16<T: Unit>(
+        &self,
+        units: &[T],
+        start: usize,
+    ) -> Result<Option<Captures>, ()> {
         let mut flags = self.flags;
         flags.sticky = false;
         let steps = core::cell::Cell::new(0);
@@ -493,10 +546,10 @@ impl Regex {
     /// sharing one step budget across all start positions (RE-8). All positions
     /// are code-unit indices. Used by both the native u16 path and the legacy
     /// adapters (which differ only in which program and flags they pass).
-    fn scan(
+    fn scan<T: Unit>(
         &self,
         prog: &[vm::Inst],
-        units: &[u16],
+        units: &[T],
         start: usize,
         flags: Flags,
     ) -> Option<Captures> {
@@ -505,10 +558,10 @@ impl Regex {
 
     /// [`scan`](Self::scan) with the caller's step counter, which ends above
     /// [`vm::budget_for`] the subject length when the find gave up.
-    fn scan_counted(
+    fn scan_counted<T: Unit>(
         &self,
         prog: &[vm::Inst],
-        units: &[u16],
+        units: &[T],
         start: usize,
         flags: Flags,
         steps: &core::cell::Cell<u64>,
@@ -522,9 +575,9 @@ impl Regex {
     /// `group_count() + 1` spans to `out` (leaving it untouched on no match)
     /// instead of allocating a [`Captures`]: for a caller that collects every
     /// match of a global scan into one buffer.
-    pub fn captures_into_u16(
+    pub fn captures_into_u16<T: Unit>(
         &self,
-        units: &[u16],
+        units: &[T],
         start: usize,
         out: &mut Vec<Option<(usize, usize)>>,
     ) -> bool {
@@ -546,9 +599,9 @@ impl Regex {
     /// exactly one code unit the atom accepts, never empty, so the scan is
     /// one pass over the units (stopping at the first miss when sticky).
     /// `false`, having appended nothing, for any other pattern.
-    pub fn single_atom_scan(
+    pub fn single_atom_scan<T: Unit>(
         &self,
-        units: &[u16],
+        units: &[T],
         from: usize,
         out: &mut Vec<Option<(usize, usize)>>,
     ) -> bool {
@@ -583,7 +636,7 @@ impl Regex {
             }
         };
         for (i, &u) in units.iter().enumerate().skip(from) {
-            if accepts(u) {
+            if accepts(u.u()) {
                 out.push(Some((i, i + 1)));
             } else if flags.sticky {
                 break;
@@ -601,9 +654,9 @@ impl Regex {
     /// budget, as each of those calls would. For a linear pattern the loop
     /// runs inside one matcher setup rather than one per match. `unicode` is
     /// the `fullUnicode` of the advance (from the `flags` the caller read).
-    pub fn global_scan_into(
+    pub fn global_scan_into<T: Unit>(
         &self,
-        units: &[u16],
+        units: &[T],
         from: usize,
         unicode: bool,
         out: &mut Vec<Option<(usize, usize)>>,
@@ -713,10 +766,10 @@ impl Regex {
 
     /// The scan behind [`scan_counted`](Self::scan_counted): on a match, appends
     /// its spans to `out` and returns `true`.
-    fn scan_into(
+    fn scan_into<T: Unit>(
         &self,
         prog: &[vm::Inst],
-        units: &[u16],
+        units: &[T],
         start: usize,
         flags: Flags,
         steps: &core::cell::Cell<u64>,
@@ -754,8 +807,6 @@ impl Regex {
         } else {
             self.first_unit
         };
-        // One set of working buffers for the whole scan (see `vm::Scratch`).
-        let mut scratch = vm::Scratch::default();
         // The linear matcher stands in for the VM (and its start filters) on
         // the program it was built from — never the scalar adapter program —
         // under the flags it was built with.
@@ -791,6 +842,11 @@ impl Regex {
             );
             return true;
         }
+        // The VM reads UTF-16 code units (a byte subject is only matched here
+        // by a program the linear matcher does not cover, widened once).
+        let units: &[u16] = &T::wide(units);
+        // One set of working buffers for the whole scan (see `vm::Scratch`).
+        let mut scratch = vm::Scratch::default();
         // Only offsets in `s..=last` are candidate starts, so both filters below
         // search *that* range, not the rest of the subject. An anchored or sticky
         // pattern has `last == start`, and scanning megabytes for a start unit
@@ -907,13 +963,13 @@ impl Regex {
 /// `AdvanceStringIndex(S, index, fullUnicode)`: the next position a match may
 /// begin at after a failed attempt at `s`. With `u` set a surrogate pair is one
 /// character, so the scan steps over both units and never starts inside a pair.
-fn advance_string_index(units: &[u16], s: usize, unicode: bool) -> usize {
+fn advance_string_index<T: Unit>(units: &[T], s: usize, unicode: bool) -> usize {
     if unicode
-        && let Some(&hi) = units.get(s)
+        && let Some(hi) = units.get(s).map(|v| v.u())
         && (0xD800..=0xDBFF).contains(&hi)
         && units
             .get(s + 1)
-            .is_some_and(|lo| (0xDC00..=0xDFFF).contains(lo))
+            .is_some_and(|lo| (0xDC00..=0xDFFF).contains(&lo.u()))
     {
         return s + 2;
     }
@@ -923,8 +979,10 @@ fn advance_string_index(units: &[u16], s: usize, unicode: bool) -> usize {
 /// Whether unit index `s` is the start of a character — false only for the low
 /// half of a surrogate pair. Used in `u` mode, where a match may not begin inside
 /// a pair.
-fn is_char_boundary(units: &[u16], s: usize) -> bool {
-    s == 0 || !(0xDC00..=0xDFFF).contains(&units[s]) || !(0xD800..=0xDBFF).contains(&units[s - 1])
+fn is_char_boundary<T: Unit>(units: &[T], s: usize) -> bool {
+    s == 0
+        || !(0xDC00..=0xDFFF).contains(&units[s].u())
+        || !(0xD800..=0xDBFF).contains(&units[s - 1].u())
 }
 
 /// Whether `prog` can only match at the position the scan starts from: every
