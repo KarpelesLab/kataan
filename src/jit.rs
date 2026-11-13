@@ -3516,6 +3516,22 @@ struct GenericSites {
     deopt: Option<alloc::boxed::Box<deopt::DeoptInfo>>,
 }
 
+/// Whether by-index array iteration steps keep a shadow integer cursor in
+/// the native frame (`KATAAN_JIT_ITERSHADOW=0` turns it off, read once per
+/// process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn iter_shadow_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_ITERSHADOW").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
 /// code calls for `+`, property get, and property set. Passed to
 /// [`JitProto::compile_generic`].
@@ -9763,6 +9779,33 @@ impl JitFunction {
             key: cm_base - 16,
             entry: cm_base - 24,
         });
+        // The array iteration steps' **shadow cursors** (`iter_shadow`): per
+        // by-index `IterNext`, the `iter` register's bits as the step last
+        // wrote them (emptied on entry) and their integer value, so that a
+        // step whose register still holds those bits takes its index from
+        // a GPR slot (an integer increment carried from step to step, not
+        // a Number's conversions).
+        let gi_pcs: Vec<usize> = if iter_shadow_enabled() {
+            bytecode
+                .iter()
+                .enumerate()
+                .filter(|(_, op)| {
+                    matches!(op, crate::nbvm::Op::IterNext { iter, next, .. }
+                        if usize::from(*next) == usize::from(*iter) + 1)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let n_gi = gi_pcs.len();
+        let gi_base = cm_base - 24 * n_cm as i32;
+        let gi_slots = |pc: usize| {
+            gi_pcs
+                .binary_search(&pc)
+                .ok()
+                .map(|k| (gi_base - 16 * k as i32 - 8, gi_base - 16 * k as i32 - 16))
+        };
         let wp_disps: Vec<Vec<Option<i32>>> = wp_slot
             .iter()
             .map(|v| v.iter().map(|s| s.map(wp_proof)).collect())
@@ -9965,7 +10008,8 @@ impl JitFunction {
                 + forin::Memo::SLOTS as usize * n_forin
                 + 2 * n_gm
                 + n_wp
-                + 3 * n_cm) as u32
+                + 3 * n_cm
+                + 2 * n_gi) as u32
                 * 8)
             + 15)
             & !15;
@@ -10240,6 +10284,7 @@ impl JitFunction {
         // (Also the promoted loops' epoch slots: emptying them with the
         // global binding cache's merely makes the loops validate afresh.)
         let mut entry_clear = num.entry_clear_slots();
+        entry_clear.extend(gi_pcs.iter().filter_map(|&pc| gi_slots(pc)).map(|s| s.0));
         if gc_plan.slots > 0 {
             entry_clear.extend((0..gc_plan.slots).map(gc_slot));
             entry_clear.push(gc_epoch);
@@ -13444,6 +13489,90 @@ impl JitFunction {
                                 a.bind(slow);
                                 let bail = num.spec_bail(&mut a, op_idx)?;
                                 a.jmp(bail);
+                                a.bind(fin);
+                            } else if let Some((sh_bits, sh_int)) = gi_slots(op_idx) {
+                                // The same step through its shadow cursor
+                                // (`gi_slots`): while `iter` holds the bits
+                                // the step last wrote, the index is the
+                                // integer beside them (their truncation, by
+                                // construction); else (an open, the
+                                // interpreter's step, a new activation) the
+                                // register is read as below and the shadow
+                                // refilled.
+                                use call_seq::r as R;
+                                a.load_rax(disp(done));
+                                a.movabs_r11(tag_true as i64);
+                                a.cmp_rax_r11();
+                                a.je(slow);
+                                recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
+                                let resync = a.new_label();
+                                let have = a.new_label();
+                                a.load_rax(disp(iter));
+                                a.g_cmp_mem(R::RAX, R::RBP, sh_bits);
+                                a.jne(resync);
+                                a.g_load(R::RAX, R::RBP, sh_int);
+                                a.bind(have);
+                                a.p_arr_len_ptr(&layout);
+                                a.cmp_rax_r8();
+                                let end = a.new_label();
+                                a.jae(end);
+                                a.mov_r8_rax();
+                                a.mov_rax_at_r11_rax8();
+                                a.movabs_r11(NanBox::hole().to_bits() as i64);
+                                a.cmp_rax_r11();
+                                a.je(slow);
+                                a.store_rax(disp(dst));
+                                // cursor = index + 1 (an exact Number below the
+                                // array's length), in the register and the
+                                // shadow.
+                                numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                a.g_store(R::RBP, sh_int, R::R8);
+                                a.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+                                a.store_rax(disp(iter));
+                                a.g_store(R::RBP, sh_bits, R::RAX);
+                                a.jmp(num.iter_step_body(&labels, op_idx).unwrap_or(fin));
+                                a.bind(end);
+                                a.test_rax_rax();
+                                a.g_jcc(0x8, slow); // js: a negative cursor is the interpreter's
+                                a.movabs_rax(tag_true as i64);
+                                a.store_rax(disp(done));
+                                a.movabs_rax(NanBox::undefined().to_bits() as i64);
+                                a.store_rax(disp(dst));
+                                a.jmp(fin);
+                                // The register not the shadow's bits: an
+                                // iterator object is the protocol's; a Number
+                                // is truncated as `iter_fast::step` takes it
+                                // (a NaN's "indefinite" is negative: the end
+                                // path's sign test sends it to the
+                                // interpreter) and becomes the shadow.
+                                let cold = a.cold_begin();
+                                a.bind(resync);
+                                a.movabs_r11(QNAN as i64);
+                                a.and_rax_r11();
+                                a.cmp_rax_r11();
+                                a.je(slow);
+                                a.load_rax(disp(iter));
+                                a.g_store(R::RBP, sh_bits, R::RAX);
+                                a.movsd_xmm0_mem(disp(iter));
+                                a.cvttsd2si_rax_xmm0();
+                                a.g_store(R::RBP, sh_int, R::RAX);
+                                a.jmp(have);
+                                a.cold_end(cold);
+                                a.bind(slow);
+                                match num.spec_bail(&mut a, op_idx) {
+                                    Some(bail) => a.jmp(bail),
+                                    None => {
+                                        let op_ptr: *const crate::nbvm::Op =
+                                            bytecode.get(pc as usize)?;
+                                        a.mov_rdi_r15();
+                                        a.mov_rsi_rbx();
+                                        a.movabs_argreg(2, n_regs as i64);
+                                        a.movabs_argreg(3, op_ptr as i64);
+                                        a.movabs_rax(helpers.iter_next as usize as i64);
+                                        a.call_rax();
+                                        throw_check!();
+                                    }
+                                }
                                 a.bind(fin);
                             } else {
                                 a.movabs_r11(QNAN as i64);
