@@ -11,3 +11,6 @@
 # Python bytecode caches (stray helper-script artifacts)
 __pycache__/
 *.pyc
+
+# Perf/conformance campaign workspace: gate scripts, differential corpus, reference binaries (own git repo, backed up separately)
+/campaign/
