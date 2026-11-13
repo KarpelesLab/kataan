@@ -1325,6 +1325,14 @@ pub(crate) fn emit_native_entry(
                 a.g_mem(true, &[0x81], 5, r::R10, STACK_TOP);
                 a.code
                     .extend_from_slice(&i32::try_from(io.room).ok()?.to_le_bytes());
+                if entry_depth_proved() && io.levels <= ENTRY_DEPTH_LEVELS {
+                    // The call sequence proved the depth for these levels
+                    // too (`emit_enter`): ok = hosted ? 0 : RECV_CACHE_EMPTY.
+                    a.g_cmp_byte_imm(r::R15, l.hosted, 1);
+                    a.code.extend_from_slice(&[0x4d, 0x19, 0xdb]); // sbb r11, r11
+                    a.g_store(RBP, io.ok, r::R11);
+                    return Some(());
+                }
                 // As `emit_limit_checks_deep`'s depth check, `levels - 1`
                 // activations above this one.
                 // ok = depth < max ? 0 : RECV_CACHE_EMPTY, without a branch.
@@ -1507,6 +1515,27 @@ pub(crate) fn emit_native_entry(
     }
     a.jmp(body);
     Some(())
+}
+
+/// The most inlined activations a body's native entry takes the depth limit
+/// as proved for (`InlineSlots::levels` is at most this).
+const ENTRY_DEPTH_LEVELS: usize = 3;
+
+/// Whether a call sequence checks the depth limit for the callee's inlined
+/// activations too ([`ENTRY_DEPTH_LEVELS`] above the callee), so that the
+/// callee's native entry sets its inlined guards' `ok` slot from the hosted
+/// flag alone; `KATAAN_JIT_ENTRYDEPTH=0` has the entry check the depth itself
+/// (read once per process).
+fn entry_depth_proved() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ENTRYDEPTH").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// Whether a body with `try` regions opens and closes its handler-stack
@@ -2357,7 +2386,15 @@ fn emit_enter(
     a.dbg_mark("c-limits");
     // 2. The activation may make native calls (`ACT_OK`), one realm, and
     //    room under the depth limit (for the pending activations too).
-    emit_limit_checks_deep(a, l, levels, e.slow);
+    //    (With `entry_depth_proved`, room for `ENTRY_DEPTH_LEVELS` more:
+    //    the callee's inlined activations, whose limits its native entry
+    //    then takes as checked.)
+    let proved = if entry_depth_proved() {
+        ENTRY_DEPTH_LEVELS as i32
+    } else {
+        0
+    };
+    emit_limit_checks_deep(a, l, levels + proved, e.slow);
     // 2b. A headerless call, when the way allows one (see `emit_headerless`);
     //     else (to `header`, out of line) the call with its header.
     let popped = a.new_label();
