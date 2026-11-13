@@ -219,6 +219,12 @@ pub fn decode_code_point(bytes: &[u8], i: usize) -> (u32, usize) {
 /// this rather than a plain `extend_from_slice`. `Rope::concat` applies the same
 /// rule for the string type.
 pub fn append(out: &mut Vec<u8>, add: &[u8]) {
+    // Only a piece opening with a surrogate's lead byte can pair with the
+    // end of `out`.
+    if add.first() != Some(&0xED) {
+        out.extend_from_slice(add);
+        return;
+    }
     if let Some(hi) = trailing_high_surrogate(out)
         && let Some(lo) = leading_low_surrogate(add)
     {

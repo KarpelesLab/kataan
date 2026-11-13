@@ -232,7 +232,9 @@ fn append_to_string(ctx: &mut Ctx, out: &mut Vec<u8>, v: NanBox) -> Result<(), V
                     Handle::from_raw(s.as_handle().ok_or(VmError::Unsupported)?)
                 }
             };
-            ctx.realm.flatten_string(s);
+            if ctx.realm.string_leaf_bytes(s).is_none() {
+                ctx.realm.flatten_string(s);
+            }
             let bytes = ctx.realm.string_leaf_bytes(s).ok_or(VmError::Unsupported)?;
             crate::wtf8::append(out, bytes);
         }

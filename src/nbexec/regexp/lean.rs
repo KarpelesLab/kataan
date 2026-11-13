@@ -440,15 +440,9 @@ impl Interp {
         if !re.group_names().is_empty() {
             return Ok(None);
         }
-        let Some((global, sticky, unicode)) = self.realm.regexp_flags(h).map(|f| {
-            (
-                f.contains('g'),
-                f.contains('y'),
-                f.contains('u') || f.contains('v'),
-            )
-        }) else {
-            return Ok(None);
-        };
+        // The program was compiled from the RegExp's own flags.
+        let flags = re.flags();
+        let (global, sticky, unicode) = (flags.global, flags.sticky, flags.unicode);
         if all && !global {
             return Err(self.type_error(
                 "String.prototype.replaceAll called with a non-global RegExp argument",
@@ -596,12 +590,18 @@ impl Interp {
                     if too_long {
                         continue;
                     }
-                    push(&mut out, &units[run..i]);
-                    put_repl(&mut out);
+                    if run < i {
+                        push(&mut out, &units[run..i]);
+                    }
                     run = i + 1;
-                    // Past the limit only the last match is still wanted
-                    // (the collection completes before the splice throws).
-                    too_long = out.len() > max_len;
+                    // (An empty template deletes: the result cannot outgrow
+                    // the subject.)
+                    if !repl.is_empty() {
+                        put_repl(&mut out);
+                        // Past the limit only the last match is still wanted
+                        // (the collection completes before the splice throws).
+                        too_long = out.len() > max_len;
+                    }
                 }
             }
             // The collection loop's final, failing exec leaves `lastIndex` 0.

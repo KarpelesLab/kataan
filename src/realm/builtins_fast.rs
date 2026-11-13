@@ -1824,10 +1824,10 @@ impl Realm {
     /// compiled.
     #[cfg(feature = "regex")]
     pub(crate) fn regexp_literal_memo_note(&self, source: &Rc<[u8]>, re: &Rc<crate::regex::Regex>) {
-        if let Some((s, _, p)) = &self.regexp_literal_memo
-            && Rc::ptr_eq(s, source)
-        {
-            *p.borrow_mut() = Some(re.clone());
+        for (s, _, p) in self.regexp_literal_memo.iter().flatten() {
+            if Rc::ptr_eq(s, source) {
+                *p.borrow_mut() = Some(re.clone());
+            }
         }
     }
 }

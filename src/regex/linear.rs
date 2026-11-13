@@ -319,18 +319,22 @@ fn alternation(prog: &[Inst], pc: usize) -> Option<(Vec<(usize, usize)>, usize)>
 }
 
 impl Linear {
-    /// Whether no match can begin anywhere in a subject of code units all
-    /// below 128, given as its bytes `ascii`: every match begins with a
-    /// unit of the start filter and none of them is there. `false` when the
-    /// filter takes anything (an empty match is possible).
+    /// Whether the bytes `ascii` are all ASCII (each byte its code unit) and
+    /// no match can begin anywhere in them: every match begins with a unit
+    /// of the start filter and none of them is there. `false` when the
+    /// filter takes anything (an empty match is possible) or a byte is not
+    /// ASCII.
     pub(crate) fn ascii_rejects(&self, ascii: &[u8]) -> bool {
         match self.first {
-            First::Unit(u) => u >= 0x80 || !ascii.contains(&(u as u8)),
+            First::Unit(u) => (u >= 0x80 || !ascii.contains(&(u as u8))) && ascii.is_ascii(),
             First::Set(k) => {
+                // One pass for both questions: a byte of the set, or any
+                // byte at or above 0x80 (not ASCII after all), stops it.
                 let set = &self.sets[k].latin1;
+                let stop = [set[0], set[1], !0, !0];
                 !ascii
                     .iter()
-                    .any(|&b| set[usize::from(b >> 6)] & (1u64 << (b & 63)) != 0)
+                    .any(|&b| stop[usize::from(b >> 6)] & (1u64 << (b & 63)) != 0)
             }
             First::Any => false,
         }

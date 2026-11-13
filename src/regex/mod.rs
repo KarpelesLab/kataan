@@ -366,7 +366,7 @@ impl Regex {
     pub fn ascii_never_matches(&self, bytes: &[u8]) -> bool {
         self.linear
             .as_ref()
-            .is_some_and(|lin| bytes.is_ascii() && lin.ascii_rejects(bytes))
+            .is_some_and(|lin| lin.ascii_rejects(bytes))
     }
 
     /// Whether this regex matches an all-ASCII subject given as its bytes
