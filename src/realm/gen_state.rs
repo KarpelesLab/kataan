@@ -68,6 +68,7 @@ impl Realm {
     /// cell borrowed mutably (through the generational barrier) while it
     /// stands is still in the remembered set, and its box still at the same
     /// address.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn heap_epoch(&self) -> u32 {
         self.heap.epoch()

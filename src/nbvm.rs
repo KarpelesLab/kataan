@@ -11421,9 +11421,16 @@ fn run_frame_at_ic(
                 }
                 // A built-in method the site has resolved before (`arr.push`,
                 // `s.charCodeAt`, `map.get`, …): called directly.
-                if let Some(r) =
-                    native_call::try_call(ctx, funcs, recv_val, key, regs, args, site_cache!(site), false)
-                {
+                if let Some(r) = native_call::try_call(
+                    ctx,
+                    funcs,
+                    recv_val,
+                    key,
+                    regs,
+                    args,
+                    site_cache!(site),
+                    false,
+                ) {
                     match r {
                         Ok(v) => regs[*dst as usize] = v,
                         Err(e) => handle_throw!(e),

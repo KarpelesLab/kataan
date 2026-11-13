@@ -3488,18 +3488,16 @@ pub(crate) extern "C" fn jit_helper_call_method(
                     .jit_funcs
                     .expect("jit_funcs set before generic dispatch")
             };
-            if let Some(r) =
-                super::native_call::try_call(
-                    ctx,
-                    funcs,
-                    recv_val,
-                    key,
-                    regs,
-                    args,
-                    cache,
-                    super::gen_fast::jit_site_on() && window_rooted(ctx),
-                )
-            {
+            if let Some(r) = super::native_call::try_call(
+                ctx,
+                funcs,
+                recv_val,
+                key,
+                regs,
+                args,
+                cache,
+                super::gen_fast::jit_site_on() && window_rooted(ctx),
+            ) {
                 if key == "call"
                     && r.is_ok()
                     && !call_site.is_null()

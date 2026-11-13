@@ -546,6 +546,7 @@ fn length_arg(v: NanBox) -> Option<usize> {
 /// re-resolves or retires the site).
 /// The resumption mode and method of a site whose built-in is a generator's
 /// `next` / `throw` / `return` (`FastOp::GenResume`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 #[inline]
 pub(super) fn gen_resume_site(cache: &PropertyCache) -> Option<(u8, u64)> {
     match cache.native.as_deref() {
@@ -559,6 +560,7 @@ pub(super) fn gen_resume_site(cache: &PropertyCache) -> Option<(u8, u64)> {
 }
 
 /// [`gen_resume_site`]'s mode.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 #[inline]
 pub(super) fn gen_resume_mode(cache: &PropertyCache) -> Option<u8> {
     gen_resume_site(cache).map(|(m, _)| m)
@@ -631,6 +633,7 @@ fn call_vm(
 /// `recv[key](args…)` with `this = recv` when the site's method is a built-in
 /// served here (see the module docs); `None` to take the ordinary path. The
 /// arguments are registers `args` of `regs`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn try_call(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -653,7 +656,8 @@ pub(super) fn try_call(
         let arg = args
             .first()
             .map_or(NanBox::undefined(), |r| regs[*r as usize]);
-        if let Some(r) = super::gen_fast::site_call(ctx, funcs, regs, recv, key, mode, method, arg, rooted)
+        if let Some(r) =
+            super::gen_fast::site_call(ctx, funcs, regs, recv, key, mode, method, arg, rooted)
         {
             return Some(r);
         }
