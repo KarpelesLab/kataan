@@ -2644,7 +2644,7 @@ const INTRINSIC_GLOBAL_OWNER: &str = "\u{0}intr-owner";
 const ARRAY_BUFFER_BYTES: &str = "\u{0}abytes";
 /// Marks an `ArrayBuffer` as detached (after `transfer()`): its `byteLength` reads 0 and its
 /// views have been emptied.
-const ARRAY_BUFFER_DETACHED: &str = "\u{0}abdetached";
+pub(crate) const ARRAY_BUFFER_DETACHED: &str = "\u{0}abdetached";
 /// An `ArrayBuffer`'s `maxByteLength` — present iff it was constructed resizable (via
 /// `new ArrayBuffer(n, { maxByteLength })`), bounding `resize`.
 const ARRAY_BUFFER_MAXLEN: &str = "\u{0}abmaxlen";

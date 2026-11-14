@@ -3375,6 +3375,15 @@ impl Interp {
                 .and_then(|v| v.as_handle().map(Handle::from_raw))
                 .filter(|h| self.realm.typed_kind(*h).is_some())
                 .and_then(|h| self.realm.elements_vec(h));
+            // InitializeTypedArrayFromList over a plain array of Numbers whose
+            // iteration is the built-in one: the values the iteration (which runs
+            // no code) would yield, taken directly; ToNumber of a Number is itself.
+            if src.is_none()
+                && !is_bigint_kind(kind)
+                && let Some(arg0) = args.first().copied()
+            {
+                src = crate::nbvm::plain_array_numbers(&mut self.realm, arg0);
+            }
             // InitializeTypedArrayFromArrayLike: a *plain object* with a `length`
             // property and no `Symbol.iterator` (typed arrays / buffers were already
             // handled above; the iterable path is handled elsewhere).

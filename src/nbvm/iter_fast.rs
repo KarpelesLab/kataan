@@ -136,6 +136,16 @@ pub(super) fn plain_spread_elems(realm: &Realm, v: NanBox) -> Option<&[NanBox]> 
     (ok && !elems.iter().any(|e| e.is_hole())).then_some(elems)
 }
 
+/// The values iterating `v` would yield, read without running code: `v` a
+/// plain array with no hole whose iteration is the built-in one ([`can_open`],
+/// [`plain_spread_elems`]). `None` for anything else.
+pub(super) fn plain_array_values(realm: &mut Realm, v: NanBox) -> Option<&[NanBox]> {
+    if plain_spread_elems(realm, v).is_none() && !can_open(realm, v) {
+        return None;
+    }
+    plain_spread_elems(realm, v)
+}
+
 /// Publishes the memo's open — found valid now for the first
 /// `%Array.prototype%`, with the values `f` (`@@iterator`) and `n` (`next`)
 /// — to compiled code ([`ArrayIterJit`](crate::realm::builtins_fast::ArrayIterJit)),

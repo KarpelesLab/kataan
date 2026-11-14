@@ -2211,6 +2211,26 @@ fn host_operand(realm: &Realm, v: NanBox) -> bool {
         .is_some_and(|h| !realm.typeof_is_string(Handle::from_raw(h)))
 }
 
+/// The Numbers iterating `v` would yield, when `v` is a plain array with no
+/// hole, holding only Numbers, whose iteration is the built-in one (no code
+/// runs: `@@iterator` and `next` are the intrinsics), copied out; `None` for
+/// anything else, or when `KATAAN_PLAIN_ARRAY_SOURCE=0`. (A typed array
+/// constructed from such an array reads its elements directly.)
+pub(crate) fn plain_array_numbers(realm: &mut Realm, v: NanBox) -> Option<Vec<NanBox>> {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON
+            .get_or_init(|| std::env::var_os("KATAAN_PLAIN_ARRAY_SOURCE").is_none_or(|v| v != "0"))
+        {
+            return None;
+        }
+    }
+    iter_fast::plain_array_values(realm, v)
+        .filter(|vals| vals.iter().all(|x| x.is_number()))
+        .map(<[NanBox]>::to_vec)
+}
+
 /// Whether `v` is a string (a heap handle, but a primitive).
 fn is_string_value(realm: &Realm, v: NanBox) -> bool {
     v.as_handle()
@@ -7504,6 +7524,54 @@ fn call_closure_pub(
 /// `PropertyCache` fed by the interpreter's per-pc IC and by the JIT's per-site
 /// IC, so a monomorphic site takes the shape-pointer-compare + slot-load fast
 /// path in both tiers.
+/// A hosted read of a typed array's `buffer`, `byteLength`, `byteOffset` or
+/// `length` that reaches the unmodified `%TypedArray%.prototype` getter
+/// (`Realm::typed_accessor_intact`: no own property of that name, no
+/// shadowing or redefined accessor on the chain): the getter's answer from
+/// the view's internal slots, as the host's `[[Get]]` computes it. `None`
+/// for anything else (or with `KATAAN_TYPED_ACCESSOR_FAST=0`).
+fn typed_view_accessor(ctx: &Ctx, h: Handle, key: &str) -> Option<NanBox> {
+    if ctx.host.is_none() || !matches!(key, "buffer" | "byteLength" | "byteOffset" | "length") {
+        return None;
+    }
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON
+            .get_or_init(|| std::env::var_os("KATAAN_TYPED_ACCESSOR_FAST").is_none_or(|v| v != "0"))
+        {
+            return None;
+        }
+    }
+    let realm = &ctx.realm;
+    let kind = realm.typed_kind(h)?;
+    if !realm.typed_accessor_intact(h, key) {
+        return None;
+    }
+    Some(match key {
+        "buffer" => NanBox::handle(realm.typed_array_object(h)?.to_raw()),
+        // (`typed_len` is 0 for an out-of-bounds view.)
+        "length" => NanBox::number(realm.typed_len(h)? as f64),
+        "byteLength" => {
+            NanBox::number((realm.typed_len(h)? * crate::realm::typed_elem_size(kind)) as f64)
+        }
+        // A detached or out-of-bounds view reports byteOffset 0.
+        _ => {
+            let detached = realm.typed_array_object(h).is_some_and(|b| {
+                realm
+                    .get_property(b, crate::nbexec::ARRAY_BUFFER_DETACHED)
+                    .is_some()
+            });
+            let off = if detached || realm.typed_array_out_of_bounds(h) {
+                0
+            } else {
+                realm.typed_byte_offset(h)?
+            };
+            NanBox::number(off as f64)
+        }
+    })
+}
+
 fn vm_get_prop(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -7534,6 +7602,9 @@ fn vm_get_prop(
             && let Some(n) = ctx.realm.plain_array_length(h)
         {
             return Ok(NanBox::number(n as f64));
+        }
+        if let Some(v) = typed_view_accessor(ctx, h, key) {
+            return Ok(v);
         }
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
             return Ok(v);
