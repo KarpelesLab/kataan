@@ -3668,6 +3668,10 @@ pub struct GenericHelpers {
     pub value_bin: JitBinHelper,
     /// The relational `<` helper (`jit_helper_lt`).
     pub lt: JitAddHelper,
+    /// `Op::Compare` of two strings (`jit_helper_str_compare(ctx, a, b,
+    /// op)`): the boolean, or the hole's bits for the interpreter's op —
+    /// runs no code, never throws.
+    pub str_compare: JitBinHelper,
     /// The strict-equality `===` helper (`jit_helper_strict_eq`) — never throws.
     pub strict_eq: JitAddHelper,
     /// `key in obj` for a key that is likely a `for-in`'s, decided from the
@@ -4107,6 +4111,15 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
 /// `VB_*` code). Used by both the arithmetic (`jit_helper_arith`) and the
 /// `Op::ValueBin` (`jit_helper_value_bin`) slow paths.
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+/// Whether a relational `Op::Compare` that is not of two Numbers tries
+/// `jit_helper_str_compare` before the interpreter's op
+/// (`KATAAN_JIT_STRCMP=0` turns it off; read once per process).
+pub(crate) fn str_compare_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_STRCMP").is_none_or(|v| v != "0"))
+}
+
 pub type JitBinHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
 
 /// The runtime-helper ABI for a static-key property read through its site:
@@ -9064,6 +9077,11 @@ impl JitFunction {
                 arith: arith_helper,
                 value_bin: value_bin_helper,
                 lt: lt_helper,
+                str_compare: if str_compare_enabled() {
+                    helpers.str_compare as usize as u64
+                } else {
+                    0
+                },
                 strict_eq: strict_eq_helper,
                 truthy: truthy_helper,
                 exec_op: exec_op_helper,
@@ -17124,6 +17142,23 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(slow);
+                    if str_compare_enabled() {
+                        // Two strings: `jit_helper_str_compare` (runs no
+                        // code); anything it declines, the interpreter's op.
+                        let declined = a.new_label();
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(ra));
+                        a.load_argreg(2, disp(rb));
+                        a.movabs_argreg(3, i64::from(op));
+                        a.movabs_rax(helpers.str_compare as usize as i64);
+                        a.call_rax();
+                        a.movabs_r11(NanBox::hole().to_bits() as i64);
+                        a.cmp_rax_r11();
+                        a.je(declined);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        a.bind(declined);
+                    }
                     exec_op!(pc);
                     a.bind(done);
                 }

@@ -981,6 +981,9 @@ pub(super) struct NumEnv {
     pub(super) arith: u64,
     pub(super) value_bin: u64,
     pub(super) lt: u64,
+    /// `jit_helper_str_compare`, or `0` when `Op::Compare` runs the
+    /// interpreter's op straight away (`KATAAN_JIT_STRCMP=0`).
+    pub(super) str_compare: u64,
     pub(super) strict_eq: u64,
     pub(super) truthy: u64,
     pub(super) exec_op: u64,
@@ -1069,6 +1072,9 @@ enum StubKind {
         extra: Option<u64>,
         dst: u16,
         throws: bool,
+        /// A helper that may decline (the hole's bits): the interpreter
+        /// then runs bytecode op `pc` (as [`StubKind::Exec`]).
+        refuse: Option<u32>,
     },
     /// The interpreter runs bytecode op `pc`.
     Exec { pc: u32 },
@@ -4495,6 +4501,7 @@ impl NumGen {
             GenericOp::Add { dst, a: x, b: y } => {
                 let helper = self.env.add;
                 self.float_bin(a, pc, reg, 0x58, dst, x, y, |_| StubKind::Helper {
+                    refuse: None,
                     helper,
                     a: x,
                     b: y,
@@ -4525,6 +4532,7 @@ impl NumGen {
                     extra: Some(u64::from(gop)),
                     dst,
                     throws: true,
+                    refuse: None,
                 };
                 match gop {
                     crate::nbvm::GA_SUB => self.float_bin(a, pc, reg, 0x5c, dst, x, y, slow),
@@ -4548,6 +4556,7 @@ impl NumGen {
                     extra: Some(u64::from(vop)),
                     dst,
                     throws: true,
+                    refuse: None,
                 };
                 match vop {
                     0 => return Some(false),
@@ -4584,6 +4593,7 @@ impl NumGen {
                     extra: None,
                     dst,
                     throws: true,
+                    refuse: None,
                 };
                 let fused = self.fusable(pc, ops, dst);
                 self.compare(a, labels, pc, reg, CmpKind::Rel(0), dst, x, y, slow, fused)?;
@@ -4605,7 +4615,19 @@ impl NumGen {
                     dst,
                     x,
                     y,
-                    StubKind::Exec { pc: opc },
+                    if self.env.str_compare != 0 {
+                        StubKind::Helper {
+                            helper: self.env.str_compare,
+                            a: x,
+                            b: y,
+                            extra: Some(u64::from(cop)),
+                            dst,
+                            throws: false,
+                            refuse: Some(opc),
+                        }
+                    } else {
+                        StubKind::Exec { pc: opc }
+                    },
                     fused,
                 )?;
             }
@@ -7151,6 +7173,7 @@ impl NumGen {
                     extra,
                     dst,
                     throws,
+                    refuse,
                 } => {
                     self.flush(a, s.region);
                     a.mov_rdi_r15();
@@ -7166,7 +7189,31 @@ impl NumGen {
                         a.cmp_rax_r11();
                         a.je(throw_exit);
                     }
-                    a.store_rax(disp(dst));
+                    if let Some(pc) = refuse {
+                        // Declined: the interpreter's op (which stores the
+                        // result itself).
+                        let served = a.new_label();
+                        let joined = a.new_label();
+                        a.movabs_r11(NanBox::hole().to_bits() as i64);
+                        a.cmp_rax_r11();
+                        a.jcc(CC_NE, served);
+                        let op_ptr = self.env.bytecode.wrapping_add(pc as usize);
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, self.env.n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_rax(self.env.exec_op as i64);
+                        a.call_rax();
+                        a.movabs_r11(NanBox::jit_throw_bits() as i64);
+                        a.cmp_rax_r11();
+                        a.je(throw_exit);
+                        a.jmp(joined);
+                        a.bind(served);
+                        a.store_rax(disp(dst));
+                        a.bind(joined);
+                    } else {
+                        a.store_rax(disp(dst));
+                    }
                     self.reload(a, s.region);
                     self.recheck_globals(a, s.region);
                     self.after_slow(a, labels, s);

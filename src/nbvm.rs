@@ -8453,6 +8453,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         arith: jit_helper_arith,
         value_bin: jit_helper_value_bin,
         lt: jit_helper_lt,
+        str_compare: jit_helper_str_compare,
         strict_eq: jit_helper_strict_eq,
         has_prop: jit_helper_has_prop,
         enum_keys: jit_tier::jit_helper_enum_keys,
@@ -8684,6 +8685,34 @@ pub(crate) extern "C" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u
     let lent = jit_lent(ctx);
     let r = vm_lt(ctx, funcs, NanBox::from_bits(a), NanBox::from_bits(b), lent);
     jit_finish(ctx, r)
+}
+
+/// Generic-JIT slow path for a relational `Op::Compare` (`op` 0 `<`, 1 `>`,
+/// 2 `<=`, 3 `>=`) of two strings, as the interpreter's arm decides it
+/// first ([`string_compare`]): the boolean's bits, or the hole's when that
+/// declines (the caller then runs the interpreter's op). Runs no code,
+/// never throws.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) extern "C" fn jit_helper_str_compare(
+    ctx: *mut core::ffi::c_void,
+    a: u64,
+    b: u64,
+    op: u64,
+) -> u64 {
+    // SAFETY: as `jit_helper_add`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let Ok(op) = u8::try_from(op) else {
+        return NanBox::hole().to_bits();
+    };
+    string_compare(
+        &mut ctx.realm,
+        NanBox::from_bits(a),
+        NanBox::from_bits(b),
+        op,
+    )
+    .map_or(NanBox::hole(), NanBox::boolean)
+    .to_bits()
 }
 
 /// Generic-JIT slow path for strict equality `===` (`Op::StrictEq`): runs the shared
