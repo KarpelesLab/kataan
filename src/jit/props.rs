@@ -627,6 +627,12 @@ impl MethodSite {
     /// the address (`%String.prototype%` is watched, and the slot array moving
     /// bumps it), and the value is read live, as `MethodEntry::value`'s is.
     /// `None`: not the built-in; the proof is one no value satisfies.
+    /// Whether the last [`set_str_proof`](Self::set_str_proof) found the
+    /// method.
+    pub(crate) fn str_proof_found(&self) -> bool {
+        self.str_proof.method != !self.str_proof.stamp
+    }
+
     /// The method bits [`set_str_proof`](Self::set_str_proof) recorded.
     pub(crate) fn str_proof_method(&self) -> u64 {
         self.str_proof.method
@@ -3364,6 +3370,26 @@ impl X64Assembler {
     /// through when the epoch is the proof's and the value is the proved one; a
     /// stale epoch goes to `stale`, another value to `other`. Clobbers `rax`,
     /// `r8`, `r11`.
+    /// [`p_str_proof`](Self::p_str_proof) for a method already read (in
+    /// `rax`): on when it is the very built-in the site's proof found; else
+    /// to `stale` when the proof is of another epoch (it may be made
+    /// again), to `other` otherwise. Clobbers `rax`, `r11`.
+    pub(crate) fn p_str_proof_rax(&mut self, site: *const MethodSite, stale: Label, other: Label) {
+        use core::mem::offset_of;
+        let at = |f: usize| {
+            i32::try_from(offset_of!(MethodSite, str_proof) + f).expect("site offset fits in i32")
+        };
+        let proven = self.new_label();
+        self.g_movabs(r::R11, site as u64);
+        self.g_cmp_mem(r::RAX, r::R11, at(offset_of!(StrProof, method)));
+        self.g_jcc(cc::E, proven);
+        self.p_load_proto_epoch(r::RAX);
+        self.g_cmp_mem(r::RAX, r::R11, at(offset_of!(StrProof, stamp)));
+        self.g_jcc(cc::NE, stale);
+        self.jmp(other);
+        self.bind(proven);
+    }
+
     pub(crate) fn p_str_proof(&mut self, site: *const MethodSite, stale: Label, other: Label) {
         use core::mem::offset_of;
         let at = |f: usize| {

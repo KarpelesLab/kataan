@@ -871,6 +871,10 @@ pub(crate) fn str_call_code(key: &str) -> Option<u8> {
         "padStart" => 12,
         "padEnd" => 13,
         "charAt" => 14,
+        "split" => 15,
+        "replace" => 16,
+        "match" => 17,
+        "replaceAll" => 18,
         _ => return None,
     })
 }
@@ -893,13 +897,18 @@ fn str_call_op(code: u8) -> Option<FastOp> {
         12 => FastOp::StrPad(true),
         13 => FastOp::StrPad(false),
         14 => FastOp::StrCharAt,
+        15 => FastOp::StrSplit,
+        16 => FastOp::StrReplace,
+        17 => FastOp::StrMatch,
+        18 => FastOp::StrReplaceAll,
         _ => return None,
     })
 }
 
 /// What compiled code's direct string call relies on, for `site` (whose
 /// key has a [`str_call_code`]): as [`prove_char_code_at`], of that
-/// built-in. Whether the site's key is one.
+/// built-in. Whether it was made (the site's key one and the method
+/// found).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn prove_str_method(realm: &mut Realm, site: &mut crate::jit::MethodSite) -> bool {
     let Some(want) = str_call_code(site.key()).and_then(str_call_op) else {
@@ -908,7 +917,7 @@ pub(super) fn prove_str_method(realm: &mut Realm, site: &mut crate::jit::MethodS
     let start = realm.string_proto_intrinsic;
     let key = alloc::string::String::from(site.key());
     prove_proto_method(realm, site, start, &key, want);
-    true
+    site.str_proof_found()
 }
 
 /// A direct string call from compiled code: `recv.key(args…)` with `recv`

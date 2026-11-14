@@ -2093,8 +2093,8 @@ pub(crate) extern "C" fn jit_helper_str_proof(
                 }),
         );
     }
-    if super::native_call::prove_str_method(&mut ctx.realm, site) {
-        return 0;
+    if super::native_call::str_call_code(site.key()).is_some() {
+        return u64::from(super::native_call::prove_str_method(&mut ctx.realm, site));
     }
     if site.key() == "push" {
         super::native_call::prove_array_push(&mut ctx.realm, site);
@@ -3689,11 +3689,14 @@ pub(crate) extern "C" fn jit_helper_str_call(
     // SAFETY: see the function contract (as `jit_helper_exec_op`).
     #[allow(unsafe_code)]
     let op = unsafe { &*op_raw };
-    let Op::CallMethod {
-        dst, recv, args, ..
-    } = op
-    else {
-        return 1;
+    let (dst, recv, args) = match op {
+        Op::CallMethod {
+            dst, recv, args, ..
+        }
+        | Op::CallWithMethod {
+            dst, recv, args, ..
+        } => (dst, recv, args),
+        _ => return 1,
     };
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]

@@ -4856,6 +4856,7 @@ impl JitProto {
             if let GenericOp::CallWithMethod { ic, .. } = *op
                 && let Some(k) = keys.get(ic as usize)
                 && (matches!(&**k, "get" | "has")
+                    || (str_call_enabled() && crate::nbvm::native_call::str_call_code(k).is_some())
                     || (matches!(&**k, "set" | "add" | "delete") && coll::write_enabled())
                     || crate::nbexec::dv_access_for(k.as_bytes()).is_some())
                 && let Some(w) = wants.get_mut(ic as usize)
@@ -17868,6 +17869,66 @@ impl JitFunction {
                             a.cold_end(cold);
                             a.bind(general);
                         }
+                    }
+                    // `s.match(re)`, `s.split(sep)`, … with the method read
+                    // before the arguments: when that method is the very
+                    // built-in the site's proof found, on a plain string
+                    // cell, called straight through `jit_helper_str_call`
+                    // (as the `CallMethod` arm's direct string call).
+                    if got.is_none()
+                        && bail.is_none()
+                        && str_call_enabled()
+                        && !num.in_spec(op_idx)
+                        && !si.method_ptr.is_null()
+                        && args.len() <= 2
+                        && let crate::nbvm::Op::CallWithMethod { key, .. } = bytecode.get(op_idx)?
+                        && let Some(code) = crate::nbvm::native_call::str_call_code(key)
+                    {
+                        for &r in [callee, recv].iter().chain(args.iter()) {
+                            num.operand_xmm(&mut a, op_idx, r, false);
+                        }
+                        let op_ptr: *const crate::nbvm::Op = bytecode.get(op_idx)?;
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let retry = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.bind(retry);
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.str_special, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.load_rax(disp(callee));
+                        a.p_str_proof_rax(si.method_ptr, prove, general);
+                        walk_to_slot!(recv, general);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_str_disc);
+                        a.jne(general);
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, si.method_ptr as i64);
+                        a.movabs_argreg(5, i64::from(code));
+                        a.movabs_rax(helpers.str_call as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.je(done);
+                        throw_check!();
+                        a.jmp(general);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.jne(retry);
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
                     }
                     if bail.is_some() {
                         a.bind(done);
