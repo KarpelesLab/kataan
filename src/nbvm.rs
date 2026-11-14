@@ -19490,7 +19490,10 @@ impl Compiler {
                 let Some(Op::NewArrayFrom { dst, elems }) = ops.last() else {
                     return;
                 };
-                if *dst != value || elems.len() != site.len() || elems.iter().zip(&site).any(|(e, s)| *e != s.1) {
+                if *dst != value
+                    || elems.len() != site.len()
+                    || elems.iter().zip(&site).any(|(e, s)| *e != s.1)
+                {
                     return;
                 }
                 site.push((end - 1, *dst));
@@ -19581,8 +19584,11 @@ impl Compiler {
         let [dr] = d.declarations.as_slice() else {
             return None;
         };
-        let (crate::ast::VarDeclKind::Let, BindingTarget::Ident(id), Some(Expr::Number { value: a, .. })) =
-            (d.kind, &dr.target, &dr.init)
+        let (
+            crate::ast::VarDeclKind::Let,
+            BindingTarget::Ident(id),
+            Some(Expr::Number { value: a, .. }),
+        ) = (d.kind, &dr.target, &dr.init)
         else {
             return None;
         };
@@ -19616,9 +19622,7 @@ impl Compiler {
             _ => false,
         };
         let (a, b) = (*a, b);
-        if !step_ok
-            || !(a.fract() == 0.0 && b.fract() == 0.0 && a.abs() <= 1e6 && b.abs() <= 1e6)
-        {
+        if !step_ok || !(a.fract() == 0.0 && b.fract() == 0.0 && a.abs() <= 1e6 && b.abs() <= 1e6) {
             return None;
         }
         let n = b - a + if inclusive { 1.0 } else { 0.0 };
@@ -29183,6 +29187,71 @@ mod tests {
         assert_eq!(value, "1");
     }
 
+    /// A small counted loop over a `const` key array compiles as straight
+    /// code (`Compiler::for_unrolled`): no back-edge, the array and the key
+    /// strings elided, the keys static — and an array some code reaches
+    /// otherwise keeps its real reads.
+    #[test]
+    fn bytecode_counted_loop_unrolls_and_folds() {
+        let compile = |src: &str| -> Vec<FnProto> {
+            let program = crate::parser::Parser::parse_program(src).expect("parse");
+            let mut table = Vec::new();
+            compile_program_into(&program, true, &mut table).expect("compile");
+            table
+        };
+        let f = |table: &[FnProto]| -> Vec<Op> {
+            table
+                .iter()
+                .find(|p| p.n_params == 1)
+                .expect("the function")
+                .ops
+                .clone()
+        };
+        let folded = compile(
+            "function sum(v) { const ks = ['x', 'y', 'z']; let s = 0; \
+             for (let i = 0; i < 3; i++) { const k = ks[i]; if (v[k] < 0) continue; s = s * 10 + v[k]; } \
+             return s; }",
+        );
+        let ops = f(&folded);
+        assert!(
+            !ops.iter()
+                .enumerate()
+                .any(|(pc, op)| matches!(op, Op::Jump { target } if *target <= pc)),
+            "no back-edge"
+        );
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            Op::NewArrayFrom { .. } | Op::NewString { .. } | Op::GetKey { .. }
+        )));
+        let keys: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::GetProp { key, .. } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, ["x", "x", "y", "y", "z", "z"]);
+        // A write through the array: compiled again without its folds.
+        let kept = compile(
+            "function sum(v) { const ks = ['x', 'y']; ks[1] = 'x'; let s = 0; \
+             for (let i = 0; i < 2; i++) s += v[ks[i]]; return s; }",
+        );
+        assert!(
+            f(&kept)
+                .iter()
+                .any(|op| matches!(op, Op::NewArrayFrom { .. }))
+        );
+        let (_, value) = execute(
+            "function sum(v) { const ks = ['x', 'y']; ks[1] = 'x'; let s = 0; \
+             for (let i = 0; i < 2; i++) s += v[ks[i]]; return s; } \
+             function sum2(v) { const ks = ['x', 'y']; let s = ''; \
+             for (let i = 0; i < 2; i++) { const k = ks[i]; if (k === 'y') break; s += k + v[k]; } return s; } \
+             sum({ x: 3, y: 4 }) + ':' + sum2({ x: 3, y: 4 })",
+        )
+        .expect("runs");
+        assert_eq!(value, "6:x3");
+    }
+
     /// A function past a size bound is a clean `RangeError` — from the script
     /// entry and from `new Function` — rather than unbounded compile work.
     #[test]
@@ -32899,10 +32968,10 @@ mod generic_jit_tests {
         let src = "
             function pairs(x, y) { const bs = [{ p: x, v: 0, m: y }, { p: y, v: 1, m: x }, { p: 0.5, v: -0, m: 2 }]; for (let i = 0; i < bs.length; i++) { const a = bs[i]; for (let j = i + 1; j < bs.length; j++) { const b = bs[j]; const d = a.p - b.p; const g = d / (d * d + 0.01); a.v -= d * b.m * g; b.v += d * a.m * Math.sqrt(g * g); } } return bs[0].v * 3 + bs[1].v * 5 + bs[2].v; }
             function acc(x, y) { const o = { a: x, b: y, c: 0 }; let s = 0; for (let i = 0; i < 6; i++) { o.c = o.a * o.b - o.c; s = s + o.c * 0.5; } return s + o.c; }
-            function getter(x, y) { let n = 0; const o = { get a() { n = n + 1; return x; }, b: y, c: 0 }; let s = 0; for (let i = 0; i < 4; i++) { s = s + o.a * o.b; o.c = s; } return s * 10 + n + o.c; }
-            function setter(x, y) { let w = 0; const o = { set c(v) { w = w + v; }, a: x, b: y }; for (let i = 0; i < 4; i++) { o.c = o.a - o.b * i; } return w; }
-            function strs(x, y) { const o = { a: x, c: \"s\" }; let s = 0; for (let i = 0; i < 4; i++) { s = s + o.c; o.c = o.a + i; s = s + o.c * y; } return s.length; }
-            function proto(x, y) { const o = { __proto__: { a: x }, b: y }; let s = 0; for (let i = 0; i < 4; i++) { s = s + o.a * 2 - o.b; } return s; }
+            function getter(x, y) { let n = 0; const o = { get a() { n = n + 1; return x; }, b: y, c: 0 }; let s = 0; for (let i = 0; i < 4; i = i + 1) { s = s + o.a * o.b; o.c = s; } return s * 10 + n + o.c; }
+            function setter(x, y) { let w = 0; const o = { set c(v) { w = w + v; }, a: x, b: y }; for (let i = 0; i < 4; i = i + 1) { o.c = o.a - o.b * i; } return w; }
+            function strs(x, y) { const o = { a: x, c: \"s\" }; let s = 0; for (let i = 0; i < 4; i = i + 1) { s = s + o.c; o.c = o.a + i; s = s + o.c * y; } return s.length; }
+            function proto(x, y) { const o = { __proto__: { a: x }, b: y }; let s = 0; for (let i = 0; i < 4; i = i + 1) { s = s + o.a * 2 - o.b; } return s; }
             function elems(x, y) { const arr = [x, y, x * 2, -0]; let s = 0; for (let i = 0; i < arr.length; i++) { s = s + arr[i] * 1.5; } return s; }
             function carried(x, y) { const o = { a: y }; let s = x; for (let i = 0; i < 5; i++) { s = s * 0.5 + o.a; } return s; }
         ";

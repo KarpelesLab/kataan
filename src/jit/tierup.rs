@@ -756,8 +756,7 @@ impl JitProto {
             .iter()
             .map(|t| t.key)
             .filter(|&k| {
-                k != super::call_seq::CallSite::EMPTY
-                    && !s.tier_up.guard_keys.contains(&(cache, k))
+                k != super::call_seq::CallSite::EMPTY && !s.tier_up.guard_keys.contains(&(cache, k))
             })
             .peekable();
         other.peek().is_none() || other.any(inlinable)
