@@ -3181,6 +3181,10 @@ pub(crate) struct ObjectLayout {
     pub acc_getter_off: usize,
     /// Byte offset of the setter within an accessor entry.
     pub acc_setter_off: usize,
+    /// Byte offsets of the name's data pointer and length words within an
+    /// accessor entry (the name a `Box<str>`).
+    pub acc_name_ptr_off: usize,
+    pub acc_name_len_off: usize,
     /// Offset from the shape word (the `Rc`'s stored pointer) to the shape's
     /// `brands` byte (bit 0: a primitive wrapper).
     pub shape_brands_off: isize,
@@ -3287,6 +3291,29 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         core::ptr::addr_of!(acc_probe.1) as usize - core::ptr::addr_of!(acc_probe) as usize;
     let acc_setter_off =
         core::ptr::addr_of!(acc_probe.2) as usize - core::ptr::addr_of!(acc_probe) as usize;
+    // The name's two words: which one is the data pointer, which the length.
+    let name_base = core::ptr::addr_of!(acc_probe.0) as usize;
+    let name_off = name_base - core::ptr::addr_of!(acc_probe) as usize;
+    let (want_name_ptr, want_name_len) = (acc_probe.0.as_ptr() as usize, acc_probe.0.len());
+    assert_eq!(
+        core::mem::size_of::<Box<str>>(),
+        2 * core::mem::size_of::<usize>()
+    );
+    let (mut acc_name_ptr_off, mut acc_name_len_off) = (usize::MAX, usize::MAX);
+    for i in 0..2 {
+        // SAFETY: reading the i-th usize-word of a live `Box<str>`, in bounds.
+        #[allow(unsafe_code)]
+        let w = unsafe { *((name_base + i * core::mem::size_of::<usize>()) as *const usize) };
+        if w == want_name_ptr {
+            acc_name_ptr_off = name_off + i * core::mem::size_of::<usize>();
+        } else if w == want_name_len {
+            acc_name_len_off = name_off + i * core::mem::size_of::<usize>();
+        }
+    }
+    assert!(
+        acc_name_ptr_off != usize::MAX && acc_name_len_off != usize::MAX,
+        "could not derive the accessor name's ptr/len offsets"
+    );
     let extra_acc_ptr_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_ptr_off;
     let extra_acc_len_off = core::mem::offset_of!(ObjectExtra, accessors) + vec_len_off;
     let extra_marks_len_off = [
@@ -3335,6 +3362,8 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         acc_stride: core::mem::size_of::<(Box<str>, NanBox, NanBox)>(),
         acc_getter_off,
         acc_setter_off,
+        acc_name_ptr_off,
+        acc_name_len_off,
         shape_brands_off,
     }
 }

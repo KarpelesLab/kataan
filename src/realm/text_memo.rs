@@ -58,6 +58,13 @@ const ABSENT: u32 = u32::MAX;
 /// `tp_probe`) bounds-checks it as a miss.
 const PROTO_ACC: u32 = u32::MAX - 1;
 
+/// [`Entry::slot`] of an own-accessor entry: the key is no data key of the
+/// layout, and a receiver read with it had an accessor of that name (which
+/// each read checks again: an entry says nothing of other receivers'
+/// accessors). Lets compiled code's probe (`tp_probe_acc`) find such a
+/// receiver's getter; anything else takes it for a miss.
+const OWN_ACC: u32 = u32::MAX - 2;
+
 /// [`Entry::proto`] for a `null` `[[Prototype]]` (no handle's bits).
 const NO_PROTO: u64 = u64::MAX;
 
@@ -154,6 +161,8 @@ pub(crate) struct KeyTextLayout {
     /// An inherited-accessor entry's slot ([`PROTO_ACC`]) as a sign-extended
     /// byte: compiled code takes it for a miss.
     pub(crate) proto_acc: i8,
+    /// An own-accessor entry's slot ([`OWN_ACC`]), likewise.
+    pub(crate) own_acc: i8,
 }
 
 /// Derives [`KeyTextLayout`].
@@ -181,6 +190,10 @@ pub(crate) fn jit_key_text_layout() -> KeyTextLayout {
         proto_acc: {
             const _: () = assert!(PROTO_ACC as i32 == -2);
             -2
+        },
+        own_acc: {
+            const _: () = assert!(OWN_ACC as i32 == -3);
+            -3
         },
     }
 }
@@ -289,7 +302,7 @@ impl Realm {
             return None;
         }
         let slot = e.slot.get();
-        if slot == PROTO_ACC {
+        if slot == PROTO_ACC || slot == OWN_ACC {
             return None;
         }
         if slot != ABSENT {
@@ -455,6 +468,7 @@ impl Realm {
         if !o.has_no_accessors()
             && let Some((g, _)) = o.accessor_bytes(b)
         {
+            self.key_text_note_own_acc(b, shape);
             return Some(AccHit::Getter(g));
         }
         let memo = self.key_text.get()?;
@@ -464,6 +478,9 @@ impl Realm {
             return None;
         }
         let slot = e.slot.get();
+        if slot == OWN_ACC {
+            return None;
+        }
         if slot != ABSENT && slot != PROTO_ACC {
             return Some(AccHit::Slot(o, slot));
         }
@@ -479,6 +496,31 @@ impl Realm {
             return None;
         };
         p.accessor_bytes(b).map(|(g, _)| AccHit::Getter(g))
+    }
+
+    /// Records that the key text `b` is no data key of `shape` (a layout of
+    /// a receiver found to have an accessor of that name: [`OWN_ACC`]), so
+    /// that compiled code's probe finds the next such receiver's getter.
+    /// (A layout with the key as data keeps or gets its slot's entry.)
+    fn key_text_note_own_acc(&self, b: &[u8], shape: &Rc<Shape>) {
+        let Some(t) = Text::of(b) else {
+            return;
+        };
+        let memo = self.key_text_memo();
+        let e = &memo.entries[t.index()];
+        let p = Rc::as_ptr(shape) as usize;
+        if e.text.get() == t && e.shape.get() == p && e.slot.get() == OWN_ACC {
+            return;
+        }
+        if core::str::from_utf8(b).is_ok_and(|k| shape.lookup(k).is_some()) || shape.is_wrapper() {
+            return;
+        }
+        e.text.set(t);
+        e.slot.set(OWN_ACC);
+        if e.shape.get() != p {
+            e.shape.set(p);
+            drop(e.hold.replace(Some(Rc::clone(shape))));
+        }
     }
 
     /// Records what [`key_text_probe_acc`](Self::key_text_probe_acc) missed

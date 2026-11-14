@@ -59,6 +59,10 @@ pub(crate) struct PropsLayout {
     pub acc_getter: i32,
     /// Entry-relative offset of an accessor's setter.
     pub acc_setter: i32,
+    /// Entry-relative offsets of an accessor's name's data pointer and
+    /// length words.
+    pub acc_name_ptr: i32,
+    pub acc_name_len: i32,
     /// Shape-word-relative offset of the shape's brand byte.
     pub shape_brands: i32,
     /// Shape-word-relative offset of the shape's may-be-non-Number slot
@@ -212,6 +216,8 @@ impl PropsLayout {
             acc_stride: i(obj.acc_stride),
             acc_getter: i(obj.acc_getter_off),
             acc_setter: i(obj.acc_setter_off),
+            acc_name_ptr: i(obj.acc_name_ptr_off),
+            acc_name_len: i(obj.acc_name_len_off),
             shape_brands: i32::try_from(obj.shape_brands_off)
                 .expect("jit layout offset fits in i32"),
             // (Both relative to the same `Shape`.)

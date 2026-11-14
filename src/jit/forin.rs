@@ -565,4 +565,27 @@ impl X64Assembler {
         self.g_cmp_byte_imm(r::R9, str_special, 0);
         self.g_jcc(cc::NE, miss);
     }
+
+    /// [`fi_plain_read`](Self::fi_plain_read), but a receiver with
+    /// accessors goes to `acc` (`KATAAN_JIT_GETKEY`: `tp_probe_acc`'s, whose
+    /// String-special check this makes first) rather than `miss`.
+    pub(super) fn fi_plain_read_acc(
+        &mut self,
+        l: &JitLayout,
+        (realm_off, str_special): (i32, i32),
+        acc: Label,
+        miss: Label,
+    ) {
+        let no_acc = self.new_label();
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R9, str_special, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_load(r::R9, r::RCX, l.props.off_extra);
+        self.g_test(r::R9);
+        self.g_jcc(cc::E, no_acc);
+        self.g_load(r::R9, r::R9, l.props.extra_acc_len);
+        self.g_test(r::R9);
+        self.g_jcc(cc::NE, acc);
+        self.bind(no_acc);
+    }
 }

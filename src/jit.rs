@@ -8959,6 +8959,9 @@ impl JitFunction {
         let construct_alloc_helper = helpers.construct_alloc as usize as u64;
         let super_twice_helper = helpers.super_twice as usize as u64;
         let interp_sites = interp_sites(bytecode, call_args.len(), call_sites.len())?;
+        // Keyed reads and `in` on receivers with accessors, inline
+        // (`KATAAN_JIT_GETKEY`, `key_probe::tp_probe_acc`).
+        let getkey_inline = crate::realm::getkey_enabled();
         // Each keyed read's getter call site (`KATAAN_JIT_GETKEY`).
         let key_sites: Vec<Option<u16>> = if crate::realm::getkey_enabled() {
             key_sites(bytecode, call_sites.len())?
@@ -14715,7 +14718,20 @@ impl JitFunction {
                             walk_to_slot!(*obj, slow);
                             a.p_object_not_exotic(&layout, slow);
                             let cl = &helpers.call_layout;
-                            a.fi_plain_read(&layout, (cl.realm, cl.str_special), slow);
+                            // A receiver with accessors (`KATAAN_JIT_GETKEY`,
+                            // as the keyed read's; not where `rsi`/`rdi`
+                            // must be kept, which `tp_probe_acc` clobbers).
+                            let acc =
+                                (getkey_inline && !num.keeps_si_di(op_idx)).then(|| a.new_label());
+                            match acc {
+                                Some(acc) => a.fi_plain_read_acc(
+                                    &layout,
+                                    (cl.realm, cl.str_special),
+                                    acc,
+                                    slow,
+                                ),
+                                None => a.fi_plain_read(&layout, (cl.realm, cl.str_special), slow),
+                            }
                             a.kp_slot(&layout, &key_probe, cl.realm, disp(*key), text);
                             a.jmp(found);
                             a.bind(text);
@@ -14727,6 +14743,20 @@ impl JitFunction {
                                 Some(absent),
                                 slow,
                             );
+                            if let Some(acc) = acc {
+                                a.jmp(found);
+                                a.bind(acc);
+                                // (An own accessor of the key's name: present.)
+                                a.tp_probe_acc(
+                                    &layout,
+                                    &key_probe,
+                                    cl.realm,
+                                    disp(*key),
+                                    absent,
+                                    Some(found),
+                                    slow,
+                                );
+                            }
                             a.bind(found);
                             a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
                             a.jmp(got);
@@ -16179,6 +16209,23 @@ impl JitFunction {
                     if num.keeps_si_di(op_idx) {
                         a.jmp(helper);
                     }
+                    // A getter the read finds is called through the op's
+                    // own call site (`KATAAN_JIT_GETKEY`): from the helper
+                    // path below (`jit_helper_get_elem_acc`), or at
+                    // `own_getter` from the inline probe of a receiver with
+                    // its own accessor of the key's name. (Not for an index
+                    // in an SSE register: the site helper re-reads the key
+                    // from the register file.)
+                    let forin_key = forin_keys.get(index as usize) == Some(&true);
+                    let acc_site = key_sites
+                        .get(op_idx)
+                        .copied()
+                        .flatten()
+                        .filter(|_| {
+                            bail.is_none() && !forin_key && num.result_xmm(op_idx, index).is_none()
+                        })
+                        .and_then(|k| call_sites.get(usize::from(k)).copied());
+                    let own_getter = acc_site.map(|_| a.new_label());
                     if (bail.is_none() || !typed::relied_on(&rc, op_idx))
                         && !num.is_number_at(op_idx, index)
                         && num.result_xmm(op_idx, index).is_none()
@@ -16207,6 +16254,11 @@ impl JitFunction {
                         // probe, whose answer is then noted.
                         // (A Number key goes on at once, before either.)
                         let km = km_plan.at[op_idx].map(km_memo);
+                        // A receiver with accessors (`KATAAN_JIT_GETKEY`):
+                        // the text memo's answer once none is of the key's
+                        // name (`tp_probe_acc`; not noted for `key_reuse`,
+                        // whose hit takes receivers without accessors only).
+                        let acc = getkey_inline.then(|| a.new_label());
                         a.load_rax(disp(index));
                         a.p_cmp_handle_floor(call_seq::r::RAX);
                         a.g_jcc(call_seq::cc::B, other);
@@ -16221,7 +16273,12 @@ impl JitFunction {
                         walk_to_slot!(obj, other);
                         a.p_object_not_exotic(&layout, other);
                         let cl = &helpers.call_layout;
-                        a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
+                        match acc {
+                            Some(acc) => {
+                                a.fi_plain_read_acc(&layout, (cl.realm, cl.str_special), acc, other)
+                            }
+                            None => a.fi_plain_read(&layout, (cl.realm, cl.str_special), other),
+                        }
                         a.kp_slot(&layout, &key_probe, cl.realm, disp(index), text);
                         let found = a.new_label();
                         a.bind(found);
@@ -16242,6 +16299,20 @@ impl JitFunction {
                             other,
                         );
                         a.jmp(found);
+                        if let Some(acc) = acc {
+                            a.bind(acc);
+                            // (The receiver's own getter: called below.)
+                            a.tp_probe_acc(
+                                &layout,
+                                &key_probe,
+                                cl.realm,
+                                disp(index),
+                                absent,
+                                own_getter,
+                                other,
+                            );
+                            a.jmp(slot);
+                        }
                         a.bind(absent);
                         a.movabs_rax(NanBox::undefined().to_bits() as i64);
                         a.jmp(got_any);
@@ -16439,21 +16510,11 @@ impl JitFunction {
                             Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
                             None => a.load_argreg(2, disp(index)),
                         }
-                        let forin_key = forin_keys.get(index as usize) == Some(&true);
-                        // A getter the read finds goes back here, called
-                        // through the op's own call site (`KATAAN_JIT_GETKEY`,
-                        // `jit_helper_get_elem_acc`: the method scratch slot
-                        // nonzero, the getter); when the call sequence cannot make the
-                        // call, `jit_helper_get_elem_site` reads again (a
-                        // pure lookup) and calls it. (Not for an index in
-                        // an SSE register: the site helper re-reads the key
-                        // from the register file.)
-                        let acc_site = key_sites
-                            .get(op_idx)
-                            .copied()
-                            .flatten()
-                            .filter(|_| !forin_key && index_x.is_none())
-                            .and_then(|k| call_sites.get(usize::from(k)).copied());
+                        // A getter the read finds goes back here (the
+                        // method scratch slot nonzero, the getter); when the
+                        // call sequence cannot make the call,
+                        // `jit_helper_get_elem_site` reads again (a pure
+                        // lookup) and calls it.
                         if let Some(site) = acc_site {
                             a.g_lea(call_seq::r::RCX, call_seq::r::RBP, method_scratch);
                             a.movabs_rax(get_elem_acc_helper as i64);
@@ -16466,6 +16527,10 @@ impl JitFunction {
                             a.store_rax(disp(dst));
                             a.jmp(done);
                             let cold = a.cold_begin();
+                            if let Some(g) = own_getter {
+                                a.bind(g);
+                                a.store_rax(method_scratch);
+                            }
                             a.bind(getter);
                             let gslow = a.new_label();
                             call_seq::emit_call(

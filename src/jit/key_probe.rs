@@ -211,6 +211,23 @@ impl X64Assembler {
         absent: Option<Label>,
         miss: Label,
     ) {
+        self.tp_probe_own(l, kp, realm_off, key_disp, absent, None, miss);
+    }
+
+    /// [`tp_probe`](Self::tp_probe), whose own-accessor entry (the key no
+    /// data key of the layout, `text_memo::OWN_ACC`) goes to `own` when
+    /// given (with `eax` = that entry's slot word), else is a miss.
+    #[allow(clippy::too_many_arguments)]
+    fn tp_probe_own(
+        &mut self,
+        l: &JitLayout,
+        kp: &KeyProbe,
+        realm_off: i32,
+        key_disp: i32,
+        absent: Option<Label>,
+        own: Option<Label>,
+        miss: Label,
+    ) {
         let t = &kp.text;
         let rl = l.rope;
         let w = |k: i32| rl.small_buf + 8 * k;
@@ -278,12 +295,122 @@ impl X64Assembler {
         self.g_cmp_mem(r::R9, r::R8, t.stamp);
         self.g_jcc(cc::NE, miss);
         self.jmp(absent);
-        // An inherited accessor's entry (the Rust probe's alone): a miss.
+        // An inherited accessor's entry (the Rust probe's alone): a miss;
+        // an own accessor's, `own` (else a miss).
         self.bind(other);
         self.code
             .extend_from_slice(&[0x83, 0xf8, t.proto_acc.to_le_bytes()[0]]); // cmp eax, -2
-        self.g_jcc(cc::NE, present);
-        self.jmp(miss);
+        self.g_jcc(cc::E, miss);
+        self.code
+            .extend_from_slice(&[0x83, 0xf8, t.own_acc.to_le_bytes()[0]]); // cmp eax, -3
+        self.g_jcc(cc::E, own.unwrap_or(miss));
         self.bind(present);
     }
+
+    /// [`tp_probe`](Self::tp_probe) for a receiver that may have accessors
+    /// (`KATAAN_JIT_GETKEY`; the caller checked the rest of what
+    /// `tp_probe` requires): the memo's answer for its layout holds unless
+    /// the receiver has an accessor of the key's name, so the receiver's
+    /// accessor names (at most [`ACC_SCAN`] of them, else a miss) are
+    /// compared with the key's text, a match being the key's own accessor:
+    /// to `own` with `rax` = its getter's bits (`undefined` for none), or
+    /// without `own` a miss (the ordinary path's). Falls through with `eax`
+    /// = the slot, else to `absent` or `miss` as `tp_probe` does. Clobbers
+    /// `rax`, `rdx`, `rsi`, `rdi`, `r8`–`r11` (what a helper call may),
+    /// keeping `rcx`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tp_probe_acc(
+        &mut self,
+        l: &JitLayout,
+        kp: &KeyProbe,
+        realm_off: i32,
+        key_disp: i32,
+        absent: Label,
+        own: Option<Label>,
+        miss: Label,
+    ) {
+        let rl = l.rope;
+        let p = &l.props;
+        let found_absent = self.new_label();
+        let found_own = self.new_label();
+        let names = self.new_label();
+        self.tp_probe_own(
+            l,
+            kp,
+            realm_off,
+            key_disp,
+            Some(found_absent),
+            Some(found_own),
+            miss,
+        );
+        // r10d = the slot, or -1 for an absent entry, or the own-accessor
+        // entry's -3; r11 = the key's node.
+        self.bind(found_own);
+        self.code.extend_from_slice(&[0x41, 0x89, 0xc2]); // mov r10d, eax
+        self.jmp(names);
+        self.bind(found_absent);
+        self.code
+            .extend_from_slice(&[0x41, 0xba, 0xff, 0xff, 0xff, 0xff]); // mov r10d, -1
+        self.bind(names);
+        // r8 = the accessor count, r9 = the first entry (a receiver here has
+        // its `extra` part: the caller found accessors).
+        self.g_load(r::R9, r::RCX, p.off_extra);
+        self.g_load(r::R8, r::R9, p.extra_acc_len);
+        self.code.extend_from_slice(&[0x49, 0x83, 0xf8, ACC_SCAN]); // cmp r8, ACC_SCAN
+        self.g_jcc(cc::A, miss);
+        self.g_load(r::R9, r::R9, p.extra_acc_ptr);
+        // edx = the key's length.
+        self.code.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x93]); // movzx edx, byte [r11 + len]
+        self.code.extend_from_slice(&rl.small_len.to_le_bytes());
+        let entry = self.new_label();
+        let next = self.new_label();
+        let bytes = self.new_label();
+        let pass = self.new_label();
+        self.bind(entry);
+        self.code.extend_from_slice(&[0x4d, 0x85, 0xc0]); // test r8, r8
+        self.g_jcc(cc::E, pass);
+        // A name of the key's length: compared byte by byte (both are
+        // storage keys: equal texts are equal bytes).
+        self.g_cmp_mem(r::RDX, r::R9, p.acc_name_len);
+        self.g_jcc(cc::NE, next);
+        self.g_load(r::RSI, r::R9, p.acc_name_ptr);
+        self.code.extend_from_slice(&[0x31, 0xff]); // xor edi, edi
+        self.bind(bytes);
+        let matched = self.new_label();
+        self.code.extend_from_slice(&[0x48, 0x39, 0xd7]); // cmp rdi, rdx
+        self.g_jcc(cc::AE, matched); // every byte equal: the key's own accessor
+        self.code.extend_from_slice(&[0x0f, 0xb6, 0x04, 0x3e]); // movzx eax, byte [rsi + rdi]
+        self.code.extend_from_slice(&[0x41, 0x3a, 0x84, 0x3b]); // cmp al, [r11 + rdi + buf]
+        self.code.extend_from_slice(&rl.small_buf.to_le_bytes());
+        self.g_jcc(cc::NE, next);
+        self.code.extend_from_slice(&[0x48, 0xff, 0xc7]); // inc rdi
+        self.jmp(bytes);
+        self.bind(next);
+        self.g_lea(r::R9, r::R9, p.acc_stride);
+        self.code.extend_from_slice(&[0x49, 0xff, 0xc8]); // dec r8
+        self.jmp(entry);
+        // No accessor of the key's name: the memo's answer (for an
+        // own-accessor entry, none: a miss).
+        self.bind(pass);
+        self.code.extend_from_slice(&[0x44, 0x89, 0xd0]); // mov eax, r10d
+        self.code.extend_from_slice(&[0x83, 0xf8, 0xff]); // cmp eax, -1
+        self.g_jcc(cc::E, absent);
+        self.code
+            .extend_from_slice(&[0x83, 0xf8, kp.text.own_acc.to_le_bytes()[0]]); // cmp eax, -3
+        self.g_jcc(cc::E, miss);
+        let past = self.new_label();
+        self.jmp(past);
+        self.bind(matched);
+        match own {
+            Some(own) => {
+                self.g_load(r::RAX, r::R9, p.acc_getter);
+                self.jmp(own);
+            }
+            None => self.jmp(miss),
+        }
+        self.bind(past);
+    }
 }
+
+/// The most accessors [`X64Assembler::tp_probe_acc`] compares names with.
+const ACC_SCAN: u8 = 4;
