@@ -649,10 +649,15 @@ impl ObjectExtra {
     #[inline]
     fn acc_pos(&self, key: &str) -> Option<usize> {
         match &self.index {
-            _ if self.accessors.len() <= ATTR_SCAN_MAX => self
-                .accessors
-                .iter()
-                .position(|(k, _, _)| k.as_ref() == key),
+            // (The first bytes compared inline before the call that compares
+            // the rest: a literal's keys are mostly short, many of a length.)
+            _ if self.accessors.len() <= ATTR_SCAN_MAX => {
+                self.accessors.iter().position(|(k, _, _)| {
+                    k.len() == key.len()
+                        && k.as_bytes().first() == key.as_bytes().first()
+                        && k.as_ref() == key
+                })
+            }
             Some(ix) => ix
                 .get(key)
                 .and_then(|e| (e.acc != 0).then(|| e.acc as usize - 1)),
