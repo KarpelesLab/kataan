@@ -136,6 +136,18 @@ pub(super) fn plain_spread_elems(realm: &Realm, v: NanBox) -> Option<&[NanBox]> 
     (ok && !elems.iter().any(|e| e.is_hole())).then_some(elems)
 }
 
+/// Whether `Get(iterator, "next")` on a fresh built-in `%ArrayIterator%`
+/// (one with no own properties) yields the intrinsic
+/// `%ArrayIteratorPrototype%.next`.
+pub(super) fn array_iter_next_intact(realm: &Realm) -> bool {
+    let ai = realm.vm_array_iter();
+    let (Some(proto), Some(next_fn)) = (ai.iter_proto, ai.next_fn) else {
+        return false;
+    };
+    matches!(plain_lookup_cached(realm, SLOT_NEXT, proto, "next"),
+        Some(Some(n)) if n.as_handle() == Some(next_fn.to_raw()))
+}
+
 /// The values iterating `v` would yield, read without running code: `v` a
 /// plain array with no hole whose iteration is the built-in one ([`can_open`],
 /// [`plain_spread_elems`]). `None` for anything else.

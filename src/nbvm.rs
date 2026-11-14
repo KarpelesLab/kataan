@@ -2231,6 +2231,22 @@ pub(crate) fn plain_array_numbers(realm: &mut Realm, v: NanBox) -> Option<Vec<Na
         .map(<[NanBox]>::to_vec)
 }
 
+/// Whether a fresh built-in `%ArrayIterator%`'s `next` is the intrinsic one
+/// (no code runs to step it), and the plain-source fast paths are on
+/// (`KATAAN_PLAIN_ARRAY_SOURCE`).
+pub(crate) fn array_iter_next_intact(realm: &Realm) -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON
+            .get_or_init(|| std::env::var_os("KATAAN_PLAIN_ARRAY_SOURCE").is_none_or(|v| v != "0"))
+        {
+            return false;
+        }
+    }
+    iter_fast::array_iter_next_intact(realm)
+}
+
 /// Whether `v` is a string (a heap handle, but a primitive).
 fn is_string_value(realm: &Realm, v: NanBox) -> bool {
     v.as_handle()

@@ -190,8 +190,13 @@ impl Interp {
         let target = if let Some(method) = using_iterator {
             // Steps 5.a–5.c: drain the iterator to a list first, then
             // `TypedArrayCreate(C, « len »)` — build the target after collecting.
-            let iterator = self.call_with_this(method, source, &[])?;
-            let values = self.drain_iterator_values(iterator, &[ctor, source, mapfn, this_arg])?;
+            let values = match self.from_source_numbers(source, method) {
+                Some(values) => values,
+                None => {
+                    let iterator = self.call_with_this(method, source, &[])?;
+                    self.drain_iterator_values(iterator, &[ctor, source, mapfn, this_arg])?
+                }
+            };
             let target = self.typed_array_create(ctor, values.len())?;
             // The arguments, the target and the values drained are rooted
             // across each `mapfn` call (`call_cb`): an allocating one may
@@ -248,6 +253,36 @@ impl Interp {
             target
         };
         Ok(NanBox::handle(target.to_raw()))
+    }
+
+    /// The Numbers `%TypedArray%.from`'s iteration of `source` with its
+    /// `@@iterator` `method` would collect, when that iteration runs no code
+    /// and so may be read directly: a plain array of Numbers with no hole
+    /// whose iteration is the built-in one, or a typed array of Numbers
+    /// (neither detached nor out of bounds) whose `method` is the intrinsic
+    /// `%TypedArray%.prototype.values` and whose iterator's `next` is the
+    /// intrinsic one. `None`: iterate.
+    fn from_source_numbers(&mut self, source: NanBox, method: NanBox) -> Option<Vec<NanBox>> {
+        if let Some(v) = crate::nbvm::plain_array_numbers(&mut self.realm, source) {
+            return Some(v);
+        }
+        let sh = source.as_handle().map(Handle::from_raw)?;
+        let kind = self.realm.typed_kind(sh)?;
+        let (id, name) = self
+            .realm
+            .bound_native_at(Handle::from_raw(method.as_handle()?))?;
+        if id != N_TYPED_ARRAY_PROTO_FN
+            || self.realm.string_value(name).as_deref() != Some("values")
+            || is_bigint_kind(kind)
+            || self.typed_array_detached(sh)
+            || self.realm.typed_array_out_of_bounds(sh)
+            || !crate::nbvm::array_iter_next_intact(&self.realm)
+        {
+            return None;
+        }
+        self.realm
+            .elements_vec(sh)
+            .filter(|v| v.iter().all(|x| x.is_number()))
     }
 
     /// `%TypedArray%.of(...items)` (23.2.2.2), generic over the `this` constructor
