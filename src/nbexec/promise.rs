@@ -28,6 +28,10 @@ await_toggle!(
 await_toggle!(
     /// Whether a hot async function resumed with a fulfilled value runs in
     /// place on its frame cell's registers (`KATAAN_AWAIT_LEAN`).
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     await_lean_on,
     "KATAAN_AWAIT_LEAN"
 );
@@ -35,6 +39,10 @@ await_toggle!(
 await_toggle!(
     /// Whether a call of a hot async function enters its compiled body
     /// directly (`KATAAN_ASYNC_CALL`).
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     async_call_lean_on,
     "KATAAN_ASYNC_CALL"
 );
@@ -750,6 +758,7 @@ impl Interp {
 
     /// Registers (or, on a settled promise, queues) a reaction whose outcome
     /// goes to `result` (or `cap`).
+    #[allow(clippy::too_many_arguments)]
     fn add_reaction(
         &mut self,
         handle: Handle,
