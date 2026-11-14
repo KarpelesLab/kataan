@@ -1186,6 +1186,9 @@ pub(crate) fn plan(
                     fail & active,
                     r.fails
                 );
+                for &(pc, m) in &r.fails {
+                    std::eprintln!("[sink]   {pc} {m:#x}: {:?}", ops.get(pc));
+                }
             }
             active &= !fail;
             before.fill(false);

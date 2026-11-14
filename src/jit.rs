@@ -9229,6 +9229,9 @@ impl JitFunction {
         // A run being emitted: `(its first op, its last, the pass, where
         // its fused adds resume, how many of its later ops were emitted)`.
         let mut pending_run: Option<(usize, usize, u8, Label, usize)> = None;
+        // Where pre-initialised `new`s resume past their fresh runs
+        // (`call_seq::PreInit`): `(op, pass, label)`, bound there.
+        let mut pre_resume: Vec<(usize, u8, Label)> = Vec::new();
         // The inlined calls' `JumpIfFalse`s the guard fuses (see
         // `call_seq::InlineEmit::fused_miss`): emitted as nothing.
         let fused_test = recv_cache::fused_guard_tests(ops, osr_entries, &catch_targets, |i| {
@@ -11065,6 +11068,12 @@ impl JitFunction {
                 a.bind(end);
                 pending_run = None;
             }
+            while let Some(k) = pre_resume
+                .iter()
+                .position(|&(at, p, _)| (at, p) == (op_idx, pass))
+            {
+                a.bind(pre_resume.swap_remove(k).2);
+            }
             a.dbg_op = Some(op_idx);
             // (A lazily pending activation's window is its body's ops in
             // the pass that emitted its guard.)
@@ -11583,6 +11592,101 @@ impl JitFunction {
                         }
                         None => None,
                     };
+                    // A base constructor's straight run of fresh adds, made
+                    // by the allocation itself (`call_seq::PreInit`): when
+                    // the body from the guard to the run's end is copies and
+                    // the run, emitted straight in this pass, outside any
+                    // promoted loop and any sinking exit, with every value
+                    // in its register at the guard.
+                    let derived = derived_keys.binary_search(&key).is_ok();
+                    let pre_init = (call_seq::preinit_enabled()
+                        && super_this.is_none()
+                        && !derived
+                        && new_way.is_some()
+                        && matches!(ops.get(call as usize), Some(GenericOp::Construct { .. }))
+                        && sink_x.and_then(|x| x.guard_emit(op_idx)).is_none()
+                        && num.guard_keep(op_idx).is_empty())
+                    .then(|| {
+                        let h = (op_idx + 1..ops.len()).find(|&q| {
+                            fresh_add[q].is_some_and(|f| f.guard == op_idx && f.k == 0)
+                        })?;
+                        let chain = fresh_chain[h].as_ref()?;
+                        let n = chain
+                            .iter()
+                            .enumerate()
+                            .take_while(|&(k, &q)| q == h + k)
+                            .count();
+                        let end = h + n;
+                        if n == 0 || end >= ops.len() {
+                            return None;
+                        }
+                        let mut vals = Vec::with_capacity(n);
+                        let mut run = Vec::with_capacity(n);
+                        for (k, &q) in chain[..n].iter().enumerate() {
+                            let GenericOp::SetProp { val, .. } = ops[q] else {
+                                return None;
+                            };
+                            let b = add_of(q)?;
+                            if !ok(val) || b.slot as usize != k {
+                                return None;
+                            }
+                            run.push((b, disp(val), num.is_number_at(q, val)));
+                            vals.push(val);
+                        }
+                        let mut moves = Vec::new();
+                        for q in op_idx + 1..h {
+                            match ops[q] {
+                                GenericOp::JumpIfFalse { cond, .. }
+                                    if q == op_idx + 1 && cond == dst => {}
+                                GenericOp::Move { dst: d, src }
+                                    if ok(d) && ok(src) && !vals.contains(&d) =>
+                                {
+                                    moves.push((d, src));
+                                }
+                                GenericOp::Nop => {}
+                                _ => return None,
+                            }
+                        }
+                        for k in 0..=end - op_idx {
+                            let q = op_idx + k;
+                            if sched.get(si + k) != Some(&(q, pass)) || num.in_any_region(q) {
+                                return None;
+                            }
+                            if let Some(x) = sink_x {
+                                let p = &x.plan;
+                                let at = |v: &[bool]| v.get(q).copied().unwrap_or(false);
+                                if at(&p.exit_before)
+                                    || at(&p.exit_after)
+                                    || at(&p.deep_exit)
+                                    || at(&p.vget)
+                                {
+                                    return None;
+                                }
+                            }
+                        }
+                        let mut chain_sites = Vec::with_capacity(chain.len());
+                        let mut max_slot = 0;
+                        for &q in chain {
+                            let GenericOp::SetProp { site: qs, .. } = ops[q] else {
+                                return None;
+                            };
+                            chain_sites.push(sites.get(qs as usize)?.method_ptr.cast_const());
+                            max_slot = max_slot.max(add_of(q)?.slot);
+                        }
+                        Some((chain_sites, max_slot, run, moves, end))
+                    })
+                    .flatten()
+                    .map(|(sites, max_slot, run, moves, end)| {
+                        let resume = a.new_label();
+                        pre_resume.push((end, pass, resume));
+                        call_seq::PreInit {
+                            sites,
+                            max_slot,
+                            run,
+                            moves,
+                            resume,
+                        }
+                    });
                     // (Its callee's load, when sunk into it, before its code
                     // reads the register: out of line with that code.)
                     num.materialize_callee(&mut a, op_idx);
@@ -11603,7 +11707,7 @@ impl JitFunction {
                             setter,
                             way,
                             new_target,
-                            derived: derived_keys.binary_search(&key).is_ok(),
+                            derived,
                             super_this,
                             new_alloc,
                             new_way,
@@ -11619,6 +11723,7 @@ impl JitFunction {
                             wproof: &wp_disps[op_idx],
                             keep: &num.guard_keep(op_idx),
                             poly_keys: &poly_keys[op_idx],
+                            pre_init: pre_init.as_ref(),
                             // (In a promoted loop `numeric` emits the test
                             // itself, reading the boolean, but in a
                             // speculative fast version's guard diamond.)
@@ -17584,7 +17689,8 @@ impl JitFunction {
             // back, `numeric::NumGen::int_save`.)
             num.after_generic_op(&mut a);
         }
-        if pending_run.is_some() || fb_open.is_some() || fb_back.is_some() {
+        if pending_run.is_some() || fb_open.is_some() || fb_back.is_some() || !pre_resume.is_empty()
+        {
             return None;
         }
         // (No inlined body's window reaches the out-of-line code.)

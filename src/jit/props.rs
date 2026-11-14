@@ -2207,6 +2207,27 @@ impl X64Assembler {
         max_slot: u32,
         miss: Label,
     ) {
+        if sites.is_empty() {
+            return;
+        }
+        self.g_load(r::RSI, r::RCX, l.props.off_proto);
+        self.p_add_fresh_proof(l, realm_off, sites, max_slot, miss);
+    }
+
+    /// [`Self::p_add_fresh_prelude`]'s checks for an object whose
+    /// `[[Prototype]]` (a raw handle) is in `rsi` (kept), before the object
+    /// exists: what the pre-initialised allocation of an inlined `new`
+    /// (`Self::p_alloc_object_preinit`) checks of the world outside it.
+    /// Otherwise to `miss`, having changed nothing. Clobbers `r8`, `r9`,
+    /// `r11`.
+    pub(crate) fn p_add_fresh_proof(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        sites: &[*const MethodSite],
+        max_slot: u32,
+        miss: Label,
+    ) {
         use core::mem::offset_of;
         let Some(&head) = sites.first() else {
             return;
@@ -2229,7 +2250,6 @@ impl X64Assembler {
         let proved = self.new_label();
         self.g_movabs(r::R11, head as u64);
         self.p_load_proto_epoch(r::R9);
-        self.g_load(r::RSI, r::RCX, p.off_proto);
         let validate = self.new_label();
         self.g_cmp_mem(r::R9, r::R11, proof_stamp);
         self.g_jcc(cc::NE, validate);
@@ -3401,6 +3421,80 @@ impl X64Assembler {
         self.g_store_imm32(r::RCX, p.off_extra, 0);
         // (No inline value: entries past the slot count are never read or
         // traced, `Object`'s docs.)
+        // The slot: its generation stays; age 0, occupied.
+        self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
+        self.p_store_slot_young(l);
+        // rax = NanBox::handle(generation << 32 | index).
+        self.shl_rax_imm(32);
+        self.p_or_rax_rdx();
+        self.p_or_handle_tag_rax();
+    }
+
+    /// [`Self::p_alloc_object`] **pre-initialised** with the adds of an
+    /// inlined base constructor's straight fresh run (`run`, as
+    /// [`Self::p_add_fresh_run`] takes it: per add in order its compiled-in
+    /// transition, the frame displacement of its value and whether that is
+    /// proven a Number), for the raw `[[Prototype]]` handle in `rsi`
+    /// (kept): the object is made directly in the run's last layout, its
+    /// values in slots `0..n`, the slot count and key epoch `n` — what the
+    /// allocation followed by the run's adds one by one leaves. Everything
+    /// the adds would check is checked first, before anything is written:
+    /// no incremental marking runs, the realm's root shape is the run's
+    /// first `from` (so the slots are `0..n`), the world outside the object
+    /// is as the chain's sites `sites` (largest slot `max_slot`) recorded
+    /// it ([`Self::p_add_fresh_proof`]), every value keeps the last
+    /// layout's record of its Number-only slots, and the heap has a free
+    /// slot. Then `rax` = the object's handle bits and `rcx` its heap slot;
+    /// otherwise to `miss`, having changed nothing (but the chain's proof,
+    /// a fact). Clobbers `rax`, `rcx`, `rdx`, `r8`, `r9`, `r11`.
+    pub(crate) fn p_alloc_object_preinit(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        (sites, max_slot): (&[*const MethodSite], u32),
+        run: &[(BakedAdd, i32, bool)],
+        miss: Label,
+    ) {
+        const INLINE: u32 = crate::object::INLINE_SLOTS as u32;
+        let (Some(&(first, _, _)), Some(&(last, _, _))) = (run.first(), run.last()) else {
+            return;
+        };
+        assert!(
+            run.iter()
+                .enumerate()
+                .all(|(k, &(b, _, _))| b.slot == k as u32 && b.slot < INLINE),
+            "a pre-initialised run fills inline slots 0..n in order"
+        );
+        let n = u32::try_from(run.len()).expect("a short run");
+        let p = &l.props;
+        self.g_load(r::R9, r::R15, realm_off);
+        self.g_cmp_byte_imm(r::R9, p.marking, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_movabs(r::R11, first.from);
+        self.g_cmp_mem(r::R11, r::R9, p.root_shape);
+        self.g_jcc(cc::NE, miss);
+        self.p_add_fresh_proof(l, realm_off, sites, max_slot, miss);
+        for &(b, d, number) in run {
+            if !number && b.slot < 64 && last.num_mask & (1 << b.slot) != 0 {
+                self.g_load(r::RAX, r::RBX, d);
+                self.p_field_rep_const(l, (r::RAX, r::RDX), last.to, b.slot, miss);
+            }
+        }
+        self.g_load(r::R9, r::R15, realm_off);
+        self.p_pop_free_slot(l, miss);
+        // `Cell::Object` in the run's last layout, field by field.
+        self.p_store_obj_header(l, n);
+        self.g_movabs(r::R11, last.to);
+        self.g_inc_mem(r::R11, p.rc_strong);
+        self.g_store(r::RCX, l.off_shape, r::R11);
+        self.g_store(r::RCX, p.off_proto, r::RSI);
+        self.g_store_imm32(r::RCX, p.off_extra, 0);
+        for &(b, d, _) in run {
+            let slot = i32::try_from(b.slot).expect("a small slot");
+            self.g_load(r::RAX, r::RBX, d);
+            self.g_store(r::RCX, l.off_inline + 8 * slot, r::RAX);
+        }
+        // (The inline entries past the values are never read or traced.)
         // The slot: its generation stays; age 0, occupied.
         self.p_load16(r::RAX, r::RCX, l.off_slot_gen);
         self.p_store_slot_young(l);

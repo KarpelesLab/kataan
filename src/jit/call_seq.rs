@@ -3053,6 +3053,47 @@ pub(crate) struct InlineEmit<'a> {
     /// ways (empty otherwise). A callee that is none of the ways' then
     /// gets the site's **other** memo (see [`InlineEmit::other_memo`]).
     pub poly_keys: &'a [u64],
+    /// A `new` of a base constructor whose body starts with a straight
+    /// fresh add run ([`PreInit`]): the guard tries to allocate `this`
+    /// already holding the run's values.
+    pub pre_init: Option<&'a PreInit>,
+}
+
+/// An inlined `new`'s **pre-initialised** allocation
+/// (`KATAAN_JIT_PREINIT`, see [`preinit_enabled`]): the constructor body,
+/// from its guard on, is copies between registers and then a straight run
+/// of fresh adds to `this` (`recv_cache::fresh_adds`), whose values are
+/// already in their registers at the guard. The guard then makes the object
+/// directly in the run's last layout with those values
+/// ([`X64Assembler::p_alloc_object_preinit`], which checks first all the
+/// run's adds would), does the copies and resumes after the run; when a
+/// check fails it allocates as usual and the body runs, its adds included.
+/// (An exit to the interpreter between the guard and the run finds the
+/// object complete: the run's stores then write the values it holds into
+/// its own plain data properties, which leaves it as it is.)
+#[derive(Debug)]
+pub(crate) struct PreInit {
+    /// The chain's sites (the run's first): the proof of the world
+    /// outside the object, as the run's first add would check it.
+    pub sites: alloc::vec::Vec<*const super::props::MethodSite>,
+    /// The largest slot any add of the chain makes.
+    pub max_slot: u32,
+    /// The run's adds: compiled-in transition, value displacement, proven a
+    /// Number.
+    pub run: alloc::vec::Vec<(super::props::BakedAdd, i32, bool)>,
+    /// The copies between the guard and the run, `(dst, src)` in order.
+    pub moves: alloc::vec::Vec<(u16, u16)>,
+    /// Where the body resumes after the run (bound by the emitter).
+    pub resume: Label,
+}
+
+/// Whether an inlined `new` allocates `this` pre-initialised with its
+/// constructor's straight run of adds ([`PreInit`];
+/// `KATAAN_JIT_PREINIT=0` turns it off).
+#[must_use]
+pub(crate) fn preinit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PREINIT").is_none_or(|v| v != "0"))
 }
 
 /// Whether an inlined accessor call's guard takes the getter (or setter)
@@ -3607,8 +3648,17 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.g_jcc(cc::NE, miss);
     }
     let this = e.caps.checked_add(n_caps)?;
+    // (A pre-initialised `this` goes on to its own copy of step 5.)
+    let pre_hit = e.pre_init.map(|_| a.new_label());
     if let Some(ctor) = e.new_target {
-        emit_inline_new_this(a, e, ctor, this, miss, (by_record, cproved, false))?;
+        emit_inline_new_this(
+            a,
+            e,
+            ctor,
+            this,
+            (miss, pre_hit),
+            (by_record, cproved, false),
+        )?;
     }
     if let (Some(_), Some(ctor)) = (cproved, e.new_target) {
         let made = a.new_label();
@@ -3620,36 +3670,53 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
             a.g_cmp(r::RAX, r::R11);
             a.g_jcc(cc::NE, miss);
         }
-        emit_inline_new_this(a, e, ctor, this, miss, (true, None, true))?;
+        emit_inline_new_this(a, e, ctor, this, (miss, pre_hit), (true, None, true))?;
         a.bind(made);
     }
     a.dbg_mark("g-pend");
     // 5. Pending, its captures in the inlined body's registers. (An inner
     //    level's activation keeps what `pend` held: the outer one's stub,
     //    or `0` when that one is materialized.)
-    if let Some(save) = e.slots.save.filter(|_| !e.lazy_pend) {
-        let keep = a.new_label();
-        a.g_load(r::RAX, RBP, e.slots.pend);
-        a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
-        a.g_jcc(cc::NE, keep);
-        a.g_movabs(r::RAX, 0);
-        a.bind(keep);
-        a.g_store(RBP, save, r::RAX);
-    }
-    if !e.lazy_pend {
-        a.g_lea_label(r::RAX, e.stub);
-        a.g_store(RBP, e.slots.pend, r::RAX);
-    }
-    for i in 0..n_caps {
-        a.g_load(r::RAX, r::R8, hdr(usize::from(i))?);
-        a.g_store(r::RBX, reg(e.caps.checked_add(i)?), r::RAX);
-    }
     let dst_dead = e.dst_dead && e.fused_miss.is_some();
-    if !dst_dead {
-        a.g_movabs(r::RAX, NanBox::boolean(true).to_bits());
-        a.g_store(r::RBX, reg(e.dst), r::RAX);
-    }
+    let pend = |a: &mut X64Assembler| -> Option<()> {
+        if let Some(save) = e.slots.save.filter(|_| !e.lazy_pend) {
+            let keep = a.new_label();
+            a.g_load(r::RAX, RBP, e.slots.pend);
+            a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
+            a.g_jcc(cc::NE, keep);
+            a.g_movabs(r::RAX, 0);
+            a.bind(keep);
+            a.g_store(RBP, save, r::RAX);
+        }
+        if !e.lazy_pend {
+            a.g_lea_label(r::RAX, e.stub);
+            a.g_store(RBP, e.slots.pend, r::RAX);
+        }
+        for i in 0..n_caps {
+            a.g_load(r::RAX, r::R8, hdr(usize::from(i))?);
+            a.g_store(r::RBX, reg(e.caps.checked_add(i)?), r::RAX);
+        }
+        if !dst_dead {
+            a.g_movabs(r::RAX, NanBox::boolean(true).to_bits());
+            a.g_store(r::RBX, reg(e.dst), r::RAX);
+        }
+        Some(())
+    };
+    pend(a)?;
     a.jmp(done);
+    // A pre-initialised `this` (`PreInit`): the same, then the body's
+    // copies up to its run, and on after the run. (No registers to keep:
+    // the emitter's condition.)
+    if let (Some(p), Some(hit)) = (e.pre_init, pre_hit) {
+        a.bind(hit);
+        a.dbg_mark("g-preinit");
+        pend(a)?;
+        for &(d, s) in &p.moves {
+            a.g_load(r::RAX, r::RBX, reg(s));
+            a.g_store(r::RBX, reg(d), r::RAX);
+        }
+        a.jmp(p.resume);
+    }
     // (Fused: the miss is out of line and takes the test's branch itself;
     // the jump over it is dropped once it is.)
     let cold = e.fused_miss.filter(|_| !e.in_cold).map(|_| a.cold_begin());
@@ -3922,7 +3989,7 @@ fn emit_inline_new_this(
     e: &InlineEmit<'_>,
     (ctor, nt): (u16, u16),
     this: u16,
-    miss: Label,
+    (miss, pre_hit): (Label, Option<Label>),
     (checked, proof, proven): (bool, Option<ConstructProof>, bool),
 ) -> Option<()> {
     use core::mem::offset_of;
@@ -3947,7 +4014,7 @@ fn emit_inline_new_this(
         if !e.derived {
             a.g_movabs(r::R11, e.memo as u64);
         }
-        return emit_inline_new_this_made(a, e, this, miss, record, proven);
+        return emit_inline_new_this_made(a, e, this, (miss, pre_hit), record, proven);
     }
     a.g_movabs(r::R11, e.memo as u64);
     a.g_load(r::RAX, r::RBX, reg(ctor));
@@ -3971,7 +4038,7 @@ fn emit_inline_new_this(
         i32::try_from(offset_of!(CallTarget, key)).ok()?,
     );
     a.g_jcc(cc::NE, miss);
-    emit_inline_new_this_made(a, e, this, miss, record, false)
+    emit_inline_new_this_made(a, e, this, (miss, pre_hit), record, false)
 }
 
 /// [`emit_inline_new_this`] once the record holds (`r11` the call site, but
@@ -3982,7 +4049,7 @@ fn emit_inline_new_this_made(
     a: &mut X64Assembler,
     e: &InlineEmit<'_>,
     this: u16,
-    miss: Label,
+    (miss, pre_hit): (Label, Option<Label>),
     record: impl Fn(&mut X64Assembler),
     proven: bool,
 ) -> Option<()> {
@@ -4042,6 +4109,32 @@ fn emit_inline_new_this_made(
         return Some(());
     }
     a.g_load(r::RSI, r::R11, f(offset_of!(ConstructFast, proto)));
+    if let (Some(p), Some(hit)) = (e.pre_init, pre_hit) {
+        // `this` made in the run's last layout, its values in place
+        // (`PreInit`); else, nothing changed, the plain allocation below.
+        let plain = a.new_label();
+        a.dbg_mark("g-prealloc");
+        a.p_alloc_object_preinit(
+            super::compute_jit_layout(),
+            e.layout.realm,
+            (&p.sites, p.max_slot),
+            &p.run,
+            plain,
+        );
+        if let Some(w) = e.new_way {
+            a.g_store(RBP, w.key, r::RAX);
+            a.g_store(RBP, w.cell, r::RCX);
+        }
+        a.g_store(r::RBX, reg(this), r::RAX);
+        a.g_movabs(r::R11, e.memo as u64);
+        a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+        record(a);
+        a.jmp(hit);
+        a.bind(plain);
+        // (The checks clobbered `r8` and `r11`; `rsi` is kept.)
+        a.g_movabs(r::R11, e.memo as u64);
+        a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+    }
     let made = a.new_label();
     let by_helper = a.new_label();
     a.p_alloc_object(
