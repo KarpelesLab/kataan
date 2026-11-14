@@ -12624,11 +12624,12 @@ impl JitFunction {
                         && ok(recv)
                         && margs.iter().all(|&m| ok(m))
                         && !si.method_ptr.is_null()
-                        && !num.in_any_spec(op_idx)
-                        && num.result_xmm(op_idx, dst).is_none()
+                        && !num.in_spec(op_idx)
                     {
                         // (Promoted operands into the register file, which
-                        // the helper reads.)
+                        // the helper reads; a promoted result is reloaded
+                        // after the op, from the register file the helper
+                        // wrote.)
                         for &r in core::iter::once(&recv).chain(margs.iter()) {
                             num.operand_xmm(&mut a, op_idx, r, false);
                         }
