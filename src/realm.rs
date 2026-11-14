@@ -5090,11 +5090,10 @@ impl Realm {
             .then(|| self.new_regexp(source, flags))
     }
 
-    /// Records that the host linked the regex literal `h` to `proto` (see
+    /// Records that the host linked a regex literal to `proto` (see
     /// [`regexp_literal_plain`](Realm::regexp_literal_plain)).
     pub(crate) fn note_regexp_literal(&mut self, proto: Handle) {
-        self.regexp_literal_plain =
-            !self.multi_realm && self.regexp_default_proto == Some(proto);
+        self.regexp_literal_plain = !self.multi_realm && self.regexp_default_proto == Some(proto);
     }
 
     /// Recompiles the `RegExp` at `handle` in place (`RegExp.prototype.compile`):

@@ -10111,7 +10111,7 @@ impl crate::nbvm::VmHost for Interp {
         self.realm
             .set_property(desc, "configurable", NanBox::boolean(true));
         if !self
-            .apply_descriptor(o, &name, desc, true)
+            .apply_descriptor(o, name, desc, true)
             .map_err(exec_to_host)?
         {
             let base = crate::wtf8::to_string_lossy(&self.realm.function_name_for_key(key, ""));

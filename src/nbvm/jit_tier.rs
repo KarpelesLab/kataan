@@ -2565,7 +2565,8 @@ pub(crate) extern "C" fn jit_helper_exec_op(
                 regs[*key as usize],
                 regs[*func as usize],
             );
-            super::with_host(ctx, |h| h.define_method(o, k, f, *kind)).map(|r| r.map_err(VmError::from))
+            super::with_host(ctx, |h| h.define_method(o, k, f, *kind))
+                .map(|r| r.map_err(VmError::from))
         }
         // An object literal with a constant key set (its interpreter arm).
         Op::NewObjectLit { dst, lit } => {
