@@ -8498,6 +8498,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         math_memo: jit_tier::jit_helper_math_memo,
         str_proof: jit_tier::jit_helper_str_proof,
         coll_lookup: jit_tier::jit_helper_coll_lookup,
+        coll_write: jit_tier::jit_helper_coll_write,
         direct_fill: jit_tier::jit_helper_direct_fill,
         direct_call: jit_tier::jit_helper_direct_call,
         direct_has_own: jit_tier::jit_helper_direct_has_own,

@@ -3824,6 +3824,9 @@ pub struct GenericHelpers {
     /// `jit_helper_coll_lookup(ctx, recv, key, op) -> bits | hole`: an
     /// inline `Map`/`Set` lookup's out-of-line probe (`coll`).
     pub coll_lookup: JitBinHelper,
+    /// `jit_helper_coll_write(ctx, recv, key, val) -> bits | hole`: an
+    /// inline `Map`/`Set` update's out-of-line write (`coll`).
+    pub coll_write: JitBinHelper,
     /// `jit_helper_str_proof(ctx, recv, site, _) -> 0`: proves
     /// `String.prototype`'s method for a `s.charCodeAt(i)` site.
     pub str_proof: JitBinHelper,
@@ -4826,6 +4829,7 @@ impl JitProto {
             if let GenericOp::CallWithMethod { ic, .. } = *op
                 && let Some(k) = keys.get(ic as usize)
                 && (matches!(&**k, "get" | "has")
+                    || (matches!(&**k, "set" | "add" | "delete") && coll::write_enabled())
                     || crate::nbexec::dv_access_for(k.as_bytes()).is_some())
                 && let Some(w) = wants.get_mut(ic as usize)
             {
@@ -12366,8 +12370,9 @@ impl JitFunction {
                             cl.realm,
                             si.method_ptr,
                             w,
-                            (disp(recv), disp(k), disp(v), disp(dst)),
+                            (None, disp(recv), disp(k), disp(v), disp(dst)),
                             (fill, slow, done),
+                            coll::write_enabled().then_some(helpers.coll_write as usize as u64),
                         );
                         let cold = a.cold_begin();
                         a.bind(fill);
@@ -17644,7 +17649,17 @@ impl JitFunction {
                             (if acc.set { 2..=3 } else { 1..=2 }).contains(&args.len())
                         });
                         let coll = matches!(key.as_str(), "get" | "has") && args.len() == 1;
-                        if dv.is_some() || coll {
+                        let cw = if coll::write_enabled() {
+                            match (key.as_str(), &args[..]) {
+                                ("set", &[k, v]) => Some((coll::CollWrite::MapSet, k, v)),
+                                ("add", &[k]) => Some((coll::CollWrite::SetAdd, k, k)),
+                                ("delete", &[k]) => Some((coll::CollWrite::Delete, k, k)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if dv.is_some() || coll || cw.is_some() {
                             for &r in [callee, recv].iter().chain(args.iter()) {
                                 num.operand_xmm(&mut a, op_idx, r, false);
                             }
@@ -17676,6 +17691,16 @@ impl JitFunction {
                                     acc,
                                     ops,
                                     (fill, general, done),
+                                );
+                            } else if let Some((w, k, v)) = cw {
+                                a.coll_update(
+                                    &layout,
+                                    cl.realm,
+                                    si.method_ptr,
+                                    w,
+                                    (Some(disp(callee)), disp(recv), disp(k), disp(v), disp(dst)),
+                                    (fill, general, done),
+                                    Some(helpers.coll_write as usize as u64),
                                 );
                             } else {
                                 a.coll_lookup(

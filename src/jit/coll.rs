@@ -94,6 +94,16 @@ pub(crate) fn memo_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLMEMO").is_none_or(|v| v != "0"))
 }
 
+/// Whether an inline `Map`/`Set` update serves an indexed or larger
+/// collection (and a method already read) through its out-of-line write
+/// (`jit_helper_coll_write`) rather than the call
+/// (`KATAAN_JIT_COLLWRITE=0` turns it off; read once per process).
+pub(crate) fn write_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLWRITE").is_none_or(|v| v != "0"))
+}
+
 /// A lookup site's use of the memo ([`memo_plan`]): it answers from the
 /// memo first.
 pub(crate) const MEMO_CHECK: u8 = 1;
@@ -518,60 +528,126 @@ impl X64Assembler {
         realm_off: i32,
         site: *const MethodSite,
         w: CollWrite,
-        (recv, key, val, dst): (i32, i32, i32, i32),
+        (callee, recv, key, val, dst): (Option<i32>, i32, i32, i32, i32),
         (fill, slow, done): (Label, Label, Label),
+        probe_helper: Option<u64>,
     ) {
         let c = coll_layout();
         let [stamp, ptr, method, is_set, tries] = MethodSite::coll_offsets();
         let stale = self.new_label();
+        // An indexed or larger collection, or a key compared out of line:
+        // the helper's update (`jit_helper_coll_write`), which runs no
+        // code, when there is one; else the call's.
+        let probe = if probe_helper.is_some() {
+            self.new_label()
+        } else {
+            slow
+        };
         // (A change to any collection's entries empties the lookup memo.)
         if let Some(m) = self.coll_memo {
             self.g_movabs(r::R9, u64::MAX);
             self.g_store(r::RBP, m.recv, r::R9);
         }
         self.p_arena(realm_off, &l.props);
-        // The receiver first (an indexed or larger collection, whose writes
-        // are never inline, costs no more): a strong collection with the
-        // default `[[Prototype]]`, no index, few entries.
         let rbase = self.frame_base(recv);
-        self.g_load(r::RAX, rbase, recv);
-        self.p_is_handle(r::RCX, slow);
-        self.p_slot_rooted(l, r::RCX, slow);
-        self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, c.disc);
-        self.g_jcc(cc::NE, slow);
-        self.g_mem(true, &[0x83], 7, r::RCX, c.index); // cmp qword [rcx+index], imm8
-        self.code.push(0);
-        self.g_jcc(cc::NE, slow);
-        self.g_load(r::RDI, r::RCX, c.entries_len);
-        self.g_cmp_imm(
-            r::RDI,
-            i32::try_from(crate::realm::COLL_SCAN_MAX).expect("small"),
-        );
-        self.g_jcc(cc::A, slow);
-        self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
-        self.g_jcc(cc::NE, slow);
-        self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
-        self.g_jcc(cc::NE, slow);
-        // The proof, at the current epoch, with the built-in still in the
-        // prototype's slot, for the receiver's kind.
-        self.g_movabs(r::R11, site as u64);
-        self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
-        self.g_cmp_mem(r::R9, r::R11, stamp);
-        self.g_jcc(cc::NE, stale);
-        self.g_load(r::R9, r::R11, ptr);
-        self.g_load(r::R9, r::R9, 0);
-        self.g_cmp_mem(r::R9, r::R11, method);
-        self.g_jcc(cc::NE, slow);
-        self.g_mem(false, &[0x0f, 0xb6], r::R9, r::RCX, c.is_set);
-        self.g_cmp_mem(r::R9, r::R11, is_set);
-        self.g_jcc(cc::NE, stale);
+        if probe_helper.is_none() && callee.is_none() {
+            // The receiver first (an indexed or larger collection, whose
+            // writes are never inline here, costs no more): a strong
+            // collection with the default `[[Prototype]]`, no index, few
+            // entries.
+            self.g_load(r::RAX, rbase, recv);
+            self.p_is_handle(r::RCX, slow);
+            self.p_slot_rooted(l, r::RCX, slow);
+            self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, c.disc);
+            self.g_jcc(cc::NE, slow);
+            self.g_mem(true, &[0x83], 7, r::RCX, c.index); // cmp qword [rcx+index], imm8
+            self.code.push(0);
+            self.g_jcc(cc::NE, slow);
+            self.g_load(r::RDI, r::RCX, c.entries_len);
+            self.g_cmp_imm(
+                r::RDI,
+                i32::try_from(crate::realm::COLL_SCAN_MAX).expect("small"),
+            );
+            self.g_jcc(cc::A, slow);
+            self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
+            self.g_jcc(cc::NE, slow);
+            self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
+            self.g_jcc(cc::NE, slow);
+            // The proof, at the current epoch, with the built-in still in
+            // the prototype's slot, for the receiver's kind.
+            self.g_movabs(r::R11, site as u64);
+            self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
+            self.g_cmp_mem(r::R9, r::R11, stamp);
+            self.g_jcc(cc::NE, stale);
+            self.g_load(r::R9, r::R11, ptr);
+            self.g_load(r::R9, r::R9, 0);
+            self.g_cmp_mem(r::R9, r::R11, method);
+            self.g_jcc(cc::NE, slow);
+            self.g_mem(false, &[0x0f, 0xb6], r::R9, r::RCX, c.is_set);
+            self.g_cmp_mem(r::R9, r::R11, is_set);
+            self.g_jcc(cc::NE, stale);
+        } else {
+            // The proof first (an indexed or larger collection is served
+            // by the helper under it too).
+            self.g_movabs(r::R11, site as u64);
+            if let Some(cd) = callee {
+                // The method read is the built-in the proof names; else a
+                // proof of this epoch is the answer (another method), and
+                // a stale one is made again.
+                let proven = self.new_label();
+                let base = self.frame_base(cd);
+                self.g_load(r::R9, base, cd);
+                self.g_cmp_mem(r::R9, r::R11, method);
+                self.g_jcc(cc::E, proven);
+                self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
+                self.g_cmp_mem(r::R9, r::R11, stamp);
+                self.g_jcc(cc::NE, stale);
+                self.jmp(slow);
+                self.bind(proven);
+            } else {
+                self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
+                self.g_cmp_mem(r::R9, r::R11, stamp);
+                self.g_jcc(cc::NE, stale);
+                self.g_load(r::R9, r::R11, ptr);
+                self.g_load(r::R9, r::R9, 0);
+                self.g_cmp_mem(r::R9, r::R11, method);
+                self.g_jcc(cc::NE, slow);
+            }
+            // The receiver: a strong collection of the proof's kind (with
+            // the default `[[Prototype]]` unless the method was read).
+            self.g_load(r::RAX, rbase, recv);
+            self.p_is_handle(r::RCX, slow);
+            self.p_slot_rooted(l, r::RCX, slow);
+            self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, c.disc);
+            self.g_jcc(cc::NE, slow);
+            self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
+            self.g_jcc(cc::NE, slow);
+            if callee.is_none() {
+                self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
+                self.g_jcc(cc::NE, slow);
+            }
+            self.g_mem(false, &[0x0f, 0xb6], r::R9, r::RCX, c.is_set);
+            self.g_cmp_mem(r::R9, r::R11, is_set);
+            // (A method read is the other kind's built-in only on a
+            // receiver of the wrong kind: the call's `TypeError`.)
+            self.g_jcc(cc::NE, if callee.is_some() { slow } else { stale });
+            self.g_mem(true, &[0x83], 7, r::RCX, c.index); // cmp qword [rcx+index], imm8
+            self.code.push(0);
+            self.g_jcc(cc::NE, probe);
+            self.g_load(r::RDI, r::RCX, c.entries_len);
+            self.g_cmp_imm(
+                r::RDI,
+                i32::try_from(crate::realm::COLL_SCAN_MAX).expect("small"),
+            );
+            self.g_jcc(cc::A, probe);
+        }
         self.g_load(r::RSI, r::RCX, c.entries_ptr);
         // r11 = the key's bits (`-0` as `+0`).
         let kbase = self.frame_base(key);
         self.coll_key_bits(kbase, key);
         let found = self.new_label();
         let absent = self.new_label();
-        self.coll_scan(l, (found, absent, slow));
+        self.coll_scan(l, (found, absent, probe));
         self.bind(absent);
         let vbase = self.frame_base(val);
         match w {
@@ -583,16 +659,16 @@ impl X64Assembler {
             CollWrite::MapSet | CollWrite::SetAdd => {
                 // Appended in the `Vec`'s spare capacity, when the write
                 // barrier has nothing to do for the key or the value.
-                self.coll_container(l, realm_off, rbase, recv, slow);
+                self.coll_container(l, realm_off, rbase, recv, probe);
                 self.g_load(r::R8, r::RCX, c.entries_len);
                 self.g_cmp_mem(r::R8, r::RCX, c.entries_cap);
-                self.g_jcc(cc::AE, slow);
+                self.g_jcc(cc::AE, probe);
                 if w == CollWrite::MapSet {
                     self.g_load(r::RAX, vbase, val);
-                    self.p_barrier_check(l, realm_off, slow);
+                    self.p_barrier_check(l, realm_off, probe);
                 }
                 self.g_load(r::RAX, kbase, key);
-                self.p_barrier_check(l, realm_off, slow);
+                self.p_barrier_check(l, realm_off, probe);
                 self.coll_key_bits(kbase, key);
                 self.g_load(r::R8, r::RCX, c.entries_len);
                 self.g_load(r::R9, r::RCX, c.entries_ptr);
@@ -622,16 +698,16 @@ impl X64Assembler {
             CollWrite::MapSet => {
                 // The entry's value replaced, when the write barrier has
                 // nothing to do for it (`rsi` is kept).
-                self.coll_container(l, realm_off, rbase, recv, slow);
+                self.coll_container(l, realm_off, rbase, recv, probe);
                 self.g_load(r::RAX, vbase, val);
-                self.p_barrier_check(l, realm_off, slow);
+                self.p_barrier_check(l, realm_off, probe);
                 self.g_load(r::RAX, vbase, val);
                 self.g_store(r::RSI, c.entry_val, r::RAX);
             }
             CollWrite::Delete => {
                 // A tombstone in place (a hole is no heap value: nothing for
                 // the barrier), one live entry fewer.
-                self.coll_container(l, realm_off, rbase, recv, slow);
+                self.coll_container(l, realm_off, rbase, recv, probe);
                 self.g_movabs(r::RAX, crate::nanbox::NanBox::hole().to_bits());
                 self.g_store(r::RSI, c.entry_key, r::RAX);
                 self.g_store(r::RSI, c.entry_val, r::RAX);
@@ -645,6 +721,31 @@ impl X64Assembler {
         self.g_load(r::RAX, rbase, recv);
         self.store_rax(dst);
         self.jmp(done);
+        if let Some(helper) = probe_helper {
+            // The helper's update (`jit_helper_coll_write`: the value, the
+            // key for an `add`, a hole for a `delete`), which runs no code;
+            // a miss (`hole`) is the call's, with nothing done.
+            let cold = self.cold_begin();
+            self.bind(probe);
+            self.mov_rdi_r15();
+            self.load_argreg(1, recv);
+            self.load_argreg(2, key);
+            match w {
+                CollWrite::MapSet => self.load_argreg(3, val),
+                CollWrite::SetAdd => self.load_argreg(3, key),
+                CollWrite::Delete => {
+                    self.movabs_argreg(3, crate::nanbox::NanBox::hole().to_bits() as i64);
+                }
+            }
+            self.g_movabs(r::RAX, helper);
+            self.call_rax();
+            self.g_movabs(r::R11, crate::nanbox::NanBox::hole().to_bits());
+            self.g_cmp(r::RAX, r::R11);
+            self.g_jcc(cc::E, slow);
+            self.store_rax(dst);
+            self.jmp(done);
+            self.cold_end(cold);
+        }
         // A stale proof: made again (by the caller's `fill`) while the
         // site may still try.
         self.bind(stale);

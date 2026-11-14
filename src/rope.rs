@@ -1193,6 +1193,26 @@ impl Rope {
         self.same_bytes_slow(other)
     }
 
+    /// The bytes of a rope held in its node (`Node::Small`) of at most 32
+    /// bytes, as `(len, the first four words of its buffer)`: the words
+    /// past `len` bytes are zero (every inline buffer is zero-padded), so a
+    /// word-at-a-time pass over the text needs no copy. `None` otherwise.
+    #[must_use]
+    #[inline]
+    pub fn small_words(&self) -> Option<(usize, [u64; 4])> {
+        match &*self.0 {
+            Node::Small { len, buf, .. } if *len <= 32 => {
+                let w = |k: usize| {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&buf[k * 8..k * 8 + 8]);
+                    u64::from_le_bytes(b)
+                };
+                Some((usize::from(*len), [w(0), w(1), w(2), w(3)]))
+            }
+            _ => None,
+        }
+    }
+
     /// [`same_bytes`](Self::same_bytes) of ropes not both inline (out of
     /// its line).
     #[inline(never)]

@@ -703,6 +703,13 @@ pub struct Realm {
     /// realm other than the host's current one, so only then does a host call
     /// from VM code check whose realm it runs in.
     pub multi_realm: bool,
+    /// The last `Map`/`Set` lookup's hit (`coll_fast`): the collection's
+    /// handle bits, the key's bits as passed, and the entry's position, so
+    /// the update that follows it (`m.set(k, (m.get(k) || 0) + 1)`) finds
+    /// the entry without a probe. Self-validating: used only when that
+    /// collection's entry there still holds a key of those very bits (a
+    /// collection's keys are distinct, so that entry is the key's).
+    pub(crate) coll_hint: (u64, u64, u32),
     /// Some string cell has an auxiliary object or is host-exotic, so a
     /// string's method lookup may not simply start at `%String.prototype%`
     /// (`plain_recv_lookup_start`). Never cleared.
@@ -1096,6 +1103,7 @@ impl Realm {
             interrupt: None,
             agents_active: false,
             multi_realm: false,
+            coll_hint: (u64::MAX, 0, 0),
             str_special: false,
             str_int_memo: None,
             vm_callee_stack: Vec::new(),
@@ -4304,55 +4312,63 @@ impl Realm {
     /// * every other reference (object, symbol, …) is identity-compared, so it
     ///   hashes its raw handle.
     fn collection_key_hash(&self, v: NanBox) -> u64 {
-        /// A 64-bit finalizer (xor-shift / multiply rounds), so keys that differ
-        /// only in a few bits still land far apart.
-        #[inline]
-        fn mix(mut x: u64) -> u64 {
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-            x ^= x >> 33;
-            x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-            x ^ (x >> 33)
-        }
-        /// Word-at-a-time over the bytes, seeded by a kind tag and the length.
-        fn bytes_hash(tag: u64, bytes: &[u8]) -> u64 {
-            const K: u64 = 0x9E37_79B9_7F4A_7C15;
-            let mut h = tag.wrapping_mul(K) ^ (bytes.len() as u64);
-            let (words, rest) = bytes.as_chunks::<8>();
-            for w in words {
-                h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(K).rotate_left(29);
-            }
-            if !rest.is_empty() {
-                let mut w = [0u8; 8];
-                w[..rest.len()].copy_from_slice(rest);
-                h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K).rotate_left(29);
-            }
-            mix(h)
-        }
         if let Some(n) = v.as_number() {
-            // `SameValueZero`: NaN ≡ NaN and -0 ≡ +0.
-            let bits = if n.is_nan() {
-                f64::NAN.to_bits()
-            } else if n == 0.0 {
-                0f64.to_bits()
-            } else {
-                n.to_bits()
-            };
-            return mix(bits);
+            return coll_num_hash(n);
         }
         if let Some(raw) = v.as_handle() {
-            let cell = self.heap.get(Handle::from_raw(raw));
+            let cell = self.heap.get_hot(Handle::from_raw(raw));
             if let Some(rope) = cell.and_then(Cell::as_str) {
-                return bytes_hash(1, &rope_bytes(rope));
+                return coll_str_hash(rope);
             }
             if let Some(b) = cell.and_then(Cell::as_bigint) {
-                return bytes_hash(2, alloc::string::ToString::to_string(b).as_bytes());
+                return coll_bytes_hash(2, alloc::string::ToString::to_string(b).as_bytes());
             }
-            return mix(raw ^ 0x3333_3333_0000_0000);
+            return coll_mix(raw ^ 0x3333_3333_0000_0000);
         }
         // The remaining primitives (bool/null/undefined) discriminate by their
         // own bits, which `strict_equals` compares directly.
-        mix(v.to_bits() ^ 0x4444_4444_0000_0000)
+        coll_mix(v.to_bits() ^ 0x4444_4444_0000_0000)
+    }
+
+    /// [`collection_find_ro`](Self::collection_find_ro) of a collection
+    /// with a hash index (`map`, over `entries`) for a String or Number
+    /// `key`, its cell read once for both the hash and the compares: the
+    /// position found (if any) and the key's hash. `None` for any other
+    /// key (the general path's).
+    #[inline]
+    pub(super) fn coll_probe_lean(
+        &self,
+        map: &coll_index::CollIndex,
+        entries: &[(NanBox, NanBox)],
+        key: NanBox,
+    ) -> Option<(Option<usize>, u64)> {
+        let bits = key.to_bits();
+        if let Some(n) = key.as_number() {
+            let hash = coll_num_hash(n);
+            let pos = map.find(hash, |i| {
+                entries.get(i).is_some_and(|(k, _)| {
+                    k.to_bits() == bits
+                        || k.as_number()
+                            .is_some_and(|m| m == n || (m.is_nan() && n.is_nan()))
+                })
+            });
+            return Some((pos, hash));
+        }
+        let Some(Cell::Str(r)) = self.heap.get_hot(Handle::from_raw(key.as_handle()?)) else {
+            return None;
+        };
+        let hash = coll_str_hash(r);
+        // (A String equals only a String; a tombstone's hole is no handle.)
+        let pos = map.find(hash, |i| {
+            entries.get(i).is_some_and(|(k, _)| {
+                k.to_bits() == bits
+                    || k.as_handle().is_some_and(|h| {
+                        matches!(self.heap.get_hot(Handle::from_raw(h)),
+                            Some(Cell::Str(e)) if r.same_bytes(e))
+                    })
+            })
+        });
+        Some((pos, hash))
     }
 
     /// The index of the entry whose key is `SameValueZero`-equal to `key`, using
@@ -10613,6 +10629,69 @@ fn retain_from(list: &mut Vec<u64>, from: usize, mut keep: impl FnMut(u64) -> bo
         }
     }
     list.truncate(from + w);
+}
+
+/// A 64-bit finalizer (xor-shift / multiply rounds), so `Map`/`Set` keys
+/// that differ only in a few bits still land far apart
+/// (`Realm::collection_key_hash`).
+#[inline]
+fn coll_mix(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^ (x >> 33)
+}
+
+/// The key hash of `bytes`: word-at-a-time over them (the last word
+/// zero-padded), seeded by a kind tag and the length.
+fn coll_bytes_hash(tag: u64, bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = tag.wrapping_mul(K) ^ (bytes.len() as u64);
+    let (words, rest) = bytes.as_chunks::<8>();
+    for w in words {
+        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(K).rotate_left(29);
+    }
+    if !rest.is_empty() {
+        // (Zero-padded, byte by byte: no `memcpy` call.)
+        let mut w = 0u64;
+        for (i, b) in rest.iter().enumerate() {
+            w |= u64::from(*b) << (8 * i);
+        }
+        h = (h ^ w).wrapping_mul(K).rotate_left(29);
+    }
+    coll_mix(h)
+}
+
+/// The key hash of a String: [`coll_bytes_hash`] of its text (tag 1), from
+/// its node's zero-padded words when it is held there (the same value).
+#[inline]
+fn coll_str_hash(rope: &Rope) -> u64 {
+    if coll_fast::lean_enabled()
+        && let Some((len, words)) = rope.small_words()
+    {
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut h = K ^ (len as u64);
+        for w in &words[..len.div_ceil(8)] {
+            h = (h ^ *w).wrapping_mul(K).rotate_left(29);
+        }
+        return coll_mix(h);
+    }
+    coll_bytes_hash(1, &rope_bytes(rope))
+}
+
+/// The key hash of a Number, consistent with `SameValueZero`: NaN ≡ NaN
+/// and -0 ≡ +0.
+#[inline]
+fn coll_num_hash(n: f64) -> u64 {
+    let bits = if n.is_nan() {
+        f64::NAN.to_bits()
+    } else if n == 0.0 {
+        0f64.to_bits()
+    } else {
+        n.to_bits()
+    };
+    coll_mix(bits)
 }
 
 /// Borrows a rope's WTF-8 bytes zero-copy when it is an unconcatenated leaf, and

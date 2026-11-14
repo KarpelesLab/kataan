@@ -2016,6 +2016,42 @@ pub(crate) extern "C" fn jit_helper_coll_lookup(
         .to_bits()
 }
 
+/// An inline `Map`/`Set` update's out-of-line write (`crate::jit::coll`):
+/// `Map.prototype.set(key, val)`, `Set.prototype.add(key)` (`val` is the
+/// key) or the kind's `delete(key)` (`val` is the hole) on the strong
+/// collection `recv`, whose method the compiled code proved that built-in
+/// and whose kind it checked (`Realm::coll_fast`, which may build the
+/// collection's hash index and does the write barrier). The result's bits,
+/// or the hole's when it is not served here. Runs no code.
+pub(crate) extern "C" fn jit_helper_coll_write(
+    ctx: *mut core::ffi::c_void,
+    recv: u64,
+    key: u64,
+    val: u64,
+) -> u64 {
+    use crate::realm::coll_fast::CollOp;
+    // SAFETY: see `jit_helper_site_fill` — a live, otherwise-unborrowed `Ctx`.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let Some(h) = NanBox::from_bits(recv).as_handle().map(Handle::from_raw) else {
+        return NanBox::hole().to_bits();
+    };
+    let Some(is_set) = ctx.realm.collection_kind(h) else {
+        return NanBox::hole().to_bits();
+    };
+    let val = NanBox::from_bits(val);
+    let op = match (val.is_hole(), is_set) {
+        (true, false) => CollOp::MapDelete,
+        (true, true) => CollOp::SetDelete,
+        (false, false) => CollOp::MapSet,
+        (false, true) => CollOp::SetAdd,
+    };
+    ctx.realm
+        .coll_fast(h, op, NanBox::from_bits(key), val)
+        .unwrap_or(NanBox::hole())
+        .to_bits()
+}
+
 /// Proves (or finds it cannot) what an inline `s.charCodeAt(i)` relies on:
 /// see [`MethodSite::set_str_proof`](crate::jit::MethodSite::set_str_proof).
 pub(crate) extern "C" fn jit_helper_str_proof(
