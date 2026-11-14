@@ -11634,8 +11634,8 @@ impl JitFunction {
                             vals.push(val);
                         }
                         let mut moves = Vec::new();
-                        for q in op_idx + 1..h {
-                            match ops[q] {
+                        for (q, op) in ops.iter().enumerate().take(h).skip(op_idx + 1) {
+                            match *op {
                                 GenericOp::JumpIfFalse { cond, .. }
                                     if q == op_idx + 1 && cond == dst => {}
                                 GenericOp::Move { dst: d, src }
