@@ -58,6 +58,8 @@ mod instof;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod key_probe;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod key_reuse;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod pin;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod poly;
@@ -9867,6 +9869,18 @@ impl JitFunction {
                 .ok()
                 .map(|k| (gi_base - 16 * k as i32 - 8, gi_base - 16 * k as i32 - 16))
         };
+        // The String-key read memos (`key_reuse`): per key register that
+        // several element reads use, the key's bits (a key, emptied as the
+        // receiver cache's are), the layout word and the slot the last
+        // probe found for it.
+        let km_plan = key_reuse::plan(ops);
+        let n_km = km_plan.count;
+        let km_base = gi_base - 16 * n_gi as i32;
+        let km_memo = |k: usize| key_reuse::Memo {
+            key: km_base - 8 * k as i32 - 8,
+            shape: km_base - 8 * n_km as i32 - 16 * k as i32 - 8,
+            slot: km_base - 8 * n_km as i32 - 16 * k as i32 - 16,
+        };
         let wp_disps: Vec<Vec<Option<i32>>> = wp_slot
             .iter()
             .map(|v| v.iter().map(|s| s.map(wp_proof)).collect())
@@ -10070,7 +10084,8 @@ impl JitFunction {
                 + 2 * n_gm
                 + n_wp
                 + 3 * n_cm
-                + 2 * n_gi) as u32
+                + 2 * n_gi
+                + 3 * n_km) as u32
                 * 8)
             + 15)
             & !15;
@@ -10363,6 +10378,7 @@ impl JitFunction {
                 .chain((0..n_gm).map(|k| gm_proof(k).0))
                 .chain((0..n_wp).map(wp_proof))
                 .chain(cm.map(|m| m.recv))
+                .chain((0..n_km).map(|k| km_memo(k).key))
                 .collect(),
         );
         a.coll_memo = cm;
@@ -15952,14 +15968,32 @@ impl JitFunction {
                         let other = a.new_label();
                         let spill = a.new_label();
                         let (text, slot, absent) = (a.new_label(), a.new_label(), a.new_label());
+                        // The slot an earlier read of this key register
+                        // found on this layout (`key_reuse`), else the
+                        // probe, whose answer is then noted.
+                        // (A Number key goes on at once, before either.)
+                        let km = km_plan.at[op_idx].map(km_memo);
                         a.load_rax(disp(index));
                         a.p_cmp_handle_floor(call_seq::r::RAX);
                         a.g_jcc(call_seq::cc::B, other);
+                        if let Some(m) = km {
+                            let probe = a.new_label();
+                            a.km_key(m, probe);
+                            walk_to_slot!(obj, probe);
+                            a.p_object_not_exotic(&layout, probe);
+                            a.km_hit(&layout, m, probe, slot);
+                            a.bind(probe);
+                        }
                         walk_to_slot!(obj, other);
                         a.p_object_not_exotic(&layout, other);
                         let cl = &helpers.call_layout;
                         a.fi_plain_read(&layout, (cl.realm, cl.str_special), other);
                         a.kp_slot(&layout, &key_probe, cl.realm, disp(index), text);
+                        let found = a.new_label();
+                        a.bind(found);
+                        if let Some(m) = km {
+                            a.km_fill(&layout, m, disp(index));
+                        }
                         a.bind(slot);
                         a.p_obj_slot_load_inline(&layout, other, spill);
                         a.jmp(got_any);
@@ -15973,7 +16007,7 @@ impl JitFunction {
                             Some(absent),
                             other,
                         );
-                        a.jmp(slot);
+                        a.jmp(found);
                         a.bind(absent);
                         a.movabs_rax(NanBox::undefined().to_bits() as i64);
                         a.jmp(got_any);
