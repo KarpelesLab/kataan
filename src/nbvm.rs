@@ -1632,14 +1632,16 @@ pub trait VmHost {
     /// decline (they are rooted, and the one job half run is the VM's,
     /// whose state `vm_roots` holds). A host without such a loop declines.
     fn collect_garbage_in_job(&mut self, _vm_roots: &[Handle]) {}
-    /// The next queued promise job's `(handler, value)`, when the running job
+    /// The next queued promise job's `(handler, value, direct)`, when the running job
     /// belongs to a plain microtask drain whose function table is `table` and
     /// the next one is a plain reaction (no thenable, `finally` or foreign
     /// capability): one the VM may run in the context it already holds,
     /// exactly as the drain would run it next. The job stays queued (see
     /// [`pop_job`](Self::pop_job)). Reads only the job queue: the realm may be
-    /// out.
-    fn peek_batch_job(&self, _table: &FnTable) -> Option<(NanBox, NanBox)> {
+    /// out. `direct`: the job is an `await`'s direct resumption of its holder
+    /// `handler` (see [`crate::cell::Reaction::resume`]), with whether it
+    /// fulfilled.
+    fn peek_batch_job(&self, _table: &FnTable) -> Option<(NanBox, NanBox, Option<bool>)> {
         None
     }
     /// Dequeues the job [`peek_batch_job`](Self::peek_batch_job) named.
@@ -3380,8 +3382,12 @@ fn drive_async(
                         let cv = NanBox::handle(fh.to_raw());
                         // (The new cell is rooted by nothing yet: no collection
                         // runs before it is reachable from the reactions.)
-                        let fns = with_host(ctx, |h| h.async_resume_fns(cv))
-                            .ok_or(VmError::Unsupported)?;
+                        let fns = if crate::nbexec::promise::await_direct_on() {
+                            (cv, cv)
+                        } else {
+                            with_host(ctx, |h| h.async_resume_fns(cv))
+                                .ok_or(VmError::Unsupported)?
+                        };
                         if let Some(f) = ctx.realm.vm_frame_mut(fh) {
                             f.resume_fns = fns;
                         }
@@ -3514,14 +3520,20 @@ fn next_batch_resume(
     {
         return None;
     }
-    let (handler, value) = ctx.host.as_deref()?.peek_batch_job(table)?;
-    let (id, target) = ctx
-        .realm
-        .bound_native_at(Handle::from_raw(handler.as_handle()?))?;
-    let fulfilled = match id {
-        crate::nbexec::N_ASYNC_RESUME_FULFILL => true,
-        crate::nbexec::N_ASYNC_RESUME_REJECT => false,
-        _ => return None,
+    let (handler, value, direct) = ctx.host.as_deref()?.peek_batch_job(table)?;
+    let (target, fulfilled) = match direct {
+        Some(fulfilled) => (Handle::from_raw(handler.as_handle()?), fulfilled),
+        None => {
+            let (id, target) = ctx
+                .realm
+                .bound_native_at(Handle::from_raw(handler.as_handle()?))?;
+            let fulfilled = match id {
+                crate::nbexec::N_ASYNC_RESUME_FULFILL => true,
+                crate::nbexec::N_ASYNC_RESUME_REJECT => false,
+                _ => return None,
+            };
+            (target, fulfilled)
+        }
     };
     let agen = match ctx.realm.vm_frame(target) {
         Some(f) if (f.func as usize) < table.len() => None,
@@ -3764,7 +3776,11 @@ fn agen_await(
 ) -> Option<Result<(), HostError>> {
     let mut fns = ctx.realm.vm_frame(sh)?.resume_fns;
     if fns.0.is_undefined() {
-        fns = with_host(ctx, |h| h.async_resume_fns(generator))?;
+        fns = if crate::nbexec::promise::await_direct_on() {
+            (generator, generator)
+        } else {
+            with_host(ctx, |h| h.async_resume_fns(generator))?
+        };
         if let Some(f) = ctx.realm.vm_frame_mut(sh) {
             f.resume_fns = fns;
         }
@@ -8731,6 +8747,7 @@ fn promise_then(ctx: &mut Ctx, p: Handle, on_f: NanBox, on_r: NanBox) -> Handle 
             on_rejected: on_r,
             result,
             finally: false,
+            resume: false,
             cap: None,
         }),
         PromiseStatus::Fulfilled => ctx.microtasks.push_back(Microtask {

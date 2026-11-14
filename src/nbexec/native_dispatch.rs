@@ -4184,6 +4184,7 @@ impl Interp {
                     // A `finally`-style job calls its handler with no
                     // arguments, as the callback is invoked.
                     finally: true,
+                    resume: false,
                     thenable: None,
                     cap: None,
                 });

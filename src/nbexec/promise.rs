@@ -1,5 +1,30 @@
 use super::*;
 
+/// A default-on optimisation switch read once from the environment variable
+/// `name` (`0` turns it off); always on without `std`.
+macro_rules! await_toggle {
+    ($(#[$m:meta])* $fn_name:ident, $var:literal) => {
+        $(#[$m])*
+        #[cfg(feature = "std")]
+        pub(crate) fn $fn_name() -> bool {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os($var).is_none_or(|v| v != "0"))
+        }
+        $(#[$m])*
+        #[cfg(not(feature = "std"))]
+        pub(crate) fn $fn_name() -> bool {
+            true
+        }
+    };
+}
+
+await_toggle!(
+    /// Whether an `await` resumes its frame by a reaction naming the frame's
+    /// holder itself, with no resume functions made (`KATAAN_AWAIT_DIRECT`).
+    await_direct_on,
+    "KATAAN_AWAIT_DIRECT"
+);
+
 /// A `PromiseCapability` record: the dependent promise plus its resolve/reject
 /// functions, as produced by `NewPromiseCapability(C)`.
 #[derive(Clone, Copy)]
@@ -385,6 +410,7 @@ impl Interp {
                 result: r.result,
                 fulfilled,
                 finally: r.finally,
+                resume: r.resume,
                 thenable: None,
                 cap: r.cap,
             });
@@ -454,6 +480,7 @@ impl Interp {
             result: handle,
             fulfilled: true,
             finally: false,
+            resume: false,
             thenable: Some((NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw()))),
             cap: None,
         });
@@ -661,23 +688,26 @@ impl Interp {
         cap: Option<(NanBox, NanBox)>,
     ) -> Handle {
         let result = self.fresh_promise();
-        self.add_reaction(handle, on_f, on_r, finally, cap, result);
+        self.add_reaction(handle, on_f, on_r, finally, cap, result, false);
         result
     }
 
     /// Await's PerformPromiseThen(`handle`, `on_f`, `on_r`), which has no
     /// result capability: the reaction's `result` is `sink`, a handle that is
     /// not a promise (the resume reaction itself), so the job's settling of
-    /// it is a no-op and no throwaway promise is made.
+    /// it is a no-op and no throwaway promise is made. `resume`: a direct
+    /// resumption (see [`crate::cell::Reaction::resume`]), whose handlers
+    /// and `sink` are the suspended frame's holder.
     pub(crate) fn register_await_reaction(
         &mut self,
         handle: Handle,
         on_f: NanBox,
         on_r: NanBox,
         sink: Handle,
+        resume: bool,
     ) {
         debug_assert!(!self.realm.is_promise(sink));
-        self.add_reaction(handle, on_f, on_r, false, None, sink);
+        self.add_reaction(handle, on_f, on_r, false, None, sink, resume);
     }
 
     /// Registers (or, on a settled promise, queues) a reaction whose outcome
@@ -690,6 +720,7 @@ impl Interp {
         finally: bool,
         cap: Option<(NanBox, NanBox)>,
         result: Handle,
+        resume: bool,
     ) {
         use crate::cell::PromiseStatus::{Fulfilled, Pending};
         let s = self.realm.promise_state_mut(handle).expect("a promise");
@@ -703,6 +734,7 @@ impl Interp {
                 on_rejected: on_r,
                 result,
                 finally,
+                resume,
                 cap,
             }),
             Some((fulfilled, value)) => {
@@ -713,6 +745,7 @@ impl Interp {
                     result,
                     fulfilled,
                     finally,
+                    resume,
                     thenable: None,
                     cap,
                 });
@@ -942,13 +975,23 @@ impl Interp {
         value: NanBox,
         gc: bool,
     ) -> Result<bool, ExecError> {
+        self.resume_async_target(target, id == N_ASYNC_RESUME_FULFILL, value, gc)
+    }
+
+    /// [`Self::run_async_resume`] with the settlement as `fulfilled`.
+    pub(crate) fn resume_async_target(
+        &mut self,
+        target: Handle,
+        fulfilled: bool,
+        value: NanBox,
+        gc: bool,
+    ) -> Result<bool, ExecError> {
         let Some(frame) = self.async_frame_of(target) else {
             return Ok(false);
         };
         let Some(table) = self.vm_table.clone() else {
             return Ok(true);
         };
-        let fulfilled = id == N_ASYNC_RESUME_FULFILL;
         let t = NanBox::handle(target.to_raw());
         match frame {
             Ok(state) => crate::nbvm::resume_vm_async(self, &table, t, state, fulfilled, value, gc),
@@ -969,6 +1012,15 @@ impl Interp {
         // the suspended frame, without the call machinery. A throw out of it
         // ends the job, as the ordinary path's settling of the reaction's
         // (unobservable) result does.
+        if job.resume {
+            let Some(target) = job.handler.as_handle().map(Handle::from_raw) else {
+                return Ok(());
+            };
+            return match self.resume_async_target(target, job.fulfilled, job.value, gc) {
+                Ok(_) | Err(ExecError::Throw(_)) => Ok(()),
+                Err(other) => Err(other),
+            };
+        }
         if job.thenable.is_none()
             && !job.finally
             && job.cap.is_none()

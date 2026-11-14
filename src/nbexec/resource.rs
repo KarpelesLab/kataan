@@ -1248,6 +1248,7 @@ impl Interp {
             result: p,
             fulfilled,
             finally: false,
+            resume: false,
             thenable: None,
             cap: None,
         });

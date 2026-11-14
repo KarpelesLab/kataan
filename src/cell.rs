@@ -46,6 +46,11 @@ pub struct Reaction {
     /// A `finally` reaction: the callback runs for side effects but the result
     /// mirrors the original promise (its value/rejection passes through).
     pub finally: bool,
+    /// An `await`'s resumption (`KATAAN_AWAIT_DIRECT`): both handlers and
+    /// `result` are the suspended VM frame's holder (an async function's
+    /// frame cell, or an async generator), which the job resumes directly —
+    /// no resume functions are made, and nothing is settled.
+    pub resume: bool,
     /// A foreign capability's `(resolve, reject)`: when set, the reaction
     /// job hands the outcome to these (NewPromiseReactionJob's
     /// `promiseCapability`) instead of settling `result`.

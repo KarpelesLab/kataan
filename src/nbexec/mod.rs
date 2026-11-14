@@ -1124,6 +1124,9 @@ struct Job {
     /// A `finally` job: run the handler for side effects, then pass the original
     /// value/rejection through to `result`.
     finally: bool,
+    /// An `await`'s resumption (see [`crate::cell::Reaction::resume`]):
+    /// `handler` is the suspended VM frame's holder, resumed directly.
+    resume: bool,
     /// A PromiseResolveThenableJob: `handler` is the thenable's `then` method, and
     /// the pair is `(resolve, reject)` to pass to it (with `this` = `value`, the
     /// thenable). When set, the job calls `then.call(thenable, resolve, reject)`
@@ -3026,7 +3029,7 @@ pub(crate) use dataview_fast::{DvAccess, dataview_fast, dv_access_for};
 pub mod module;
 mod native_dispatch;
 mod object;
-mod promise;
+pub(crate) mod promise;
 mod regexp;
 mod resource;
 pub(crate) mod str_rope;
@@ -10175,12 +10178,20 @@ impl crate::nbvm::VmHost for Interp {
         let Some(c) = controller.as_handle().map(Handle::from_raw) else {
             return (NanBox::undefined(), NanBox::undefined());
         };
+        // A direct resumption needs no functions: the pair is the holder
+        // twice (see `await_resume`).
+        if crate::nbexec::promise::await_direct_on() {
+            return (controller, controller);
+        }
         let on_f = self.realm.new_bound_native(N_ASYNC_RESUME_FULFILL, c);
         let on_r = self.realm.new_bound_native(N_ASYNC_RESUME_REJECT, c);
         (NanBox::handle(on_f.to_raw()), NanBox::handle(on_r.to_raw()))
     }
 
-    fn peek_batch_job(&self, table: &crate::nbvm::FnTable) -> Option<(NanBox, NanBox)> {
+    fn peek_batch_job(
+        &self,
+        table: &crate::nbvm::FnTable,
+    ) -> Option<(NanBox, NanBox, Option<bool>)> {
         if !self.async_batch
             || !self
                 .vm_table
@@ -10190,8 +10201,11 @@ impl crate::nbvm::VmHost for Interp {
             return None;
         }
         let job = self.microtasks.front()?;
-        (job.thenable.is_none() && !job.finally && job.cap.is_none())
-            .then_some((job.handler, job.value))
+        (job.thenable.is_none() && !job.finally && job.cap.is_none()).then_some((
+            job.handler,
+            job.value,
+            job.resume.then_some(job.fulfilled),
+        ))
     }
 
     fn batch_yields_to_gc(&self) -> bool {
@@ -10219,6 +10233,10 @@ impl crate::nbvm::VmHost for Interp {
         let Some(sink) = on_f.as_handle().map(Handle::from_raw) else {
             return Err(crate::nbvm::HostError::Fault);
         };
+        // The holder of the frame twice (`async_resume_fns`'s direct pair):
+        // the reaction resumes it directly. (Two resume functions are always
+        // distinct cells.)
+        let resume = on_f.to_bits() == on_r.to_bits();
         // A primitive: PromiseResolve makes a promise already fulfilled with
         // it, so PerformPromiseThen queues the reaction job at once.
         if v.as_handle().is_none() {
@@ -10228,13 +10246,14 @@ impl crate::nbvm::VmHost for Interp {
                 result: sink,
                 fulfilled: true,
                 finally: false,
+                resume,
                 thenable: None,
                 cap: None,
             });
             return Ok(());
         }
         let inner = self.promise_resolve_checked(v).map_err(exec_to_host)?;
-        self.register_await_reaction(inner, on_f, on_r, sink);
+        self.register_await_reaction(inner, on_f, on_r, sink, resume);
         Ok(())
     }
 
