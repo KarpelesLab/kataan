@@ -19444,7 +19444,9 @@ impl Compiler {
         let Known::Num(k) = self.known_value(key)? else {
             return None;
         };
-        if !(k >= 0.0 && k.fract() == 0.0 && k < items.len() as f64) {
+        // (An integer index in range, checked without `f64::fract`, which
+        // `no_std` lacks.)
+        if !(k >= 0.0 && k < items.len() as f64 && k == (k as usize) as f64) {
             return None;
         }
         Some(items[k as usize].clone())
@@ -19622,7 +19624,10 @@ impl Compiler {
             _ => false,
         };
         let (a, b) = (*a, b);
-        if !step_ok || !(a.fract() == 0.0 && b.fract() == 0.0 && a.abs() <= 1e6 && b.abs() <= 1e6) {
+        // (Integers of at most 1e6 in magnitude, checked without the `f64`
+        // methods `no_std` lacks.)
+        let small_int = |x: f64| (-1e6..=1e6).contains(&x) && x == (x as i64) as f64;
+        if !step_ok || !(small_int(a) && small_int(b)) {
             return None;
         }
         let n = b - a + if inclusive { 1.0 } else { 0.0 };
