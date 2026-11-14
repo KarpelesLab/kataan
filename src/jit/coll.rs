@@ -94,6 +94,15 @@ pub(crate) fn memo_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLMEMO").is_none_or(|v| v != "0"))
 }
 
+/// Whether an inline lookup probes a collection's hash index in line
+/// (`X64Assembler::coll_hash_probe`) rather than through the helper
+/// (`KATAAN_JIT_COLLHASH=0` turns it off; read once per process).
+fn hash_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLHASH").is_none_or(|v| v != "0"))
+}
+
 /// Whether an inline `Map`/`Set` update serves an indexed or larger
 /// collection (and a method already read) through its out-of-line write
 /// (`jit_helper_coll_write`) rather than the call
@@ -311,6 +320,9 @@ impl MethodSite {
 const TRUE_BITS: u64 = crate::nanbox::NanBox::boolean(true).to_bits();
 const FALSE_BITS: u64 = crate::nanbox::NanBox::boolean(false).to_bits();
 const UNDEF_BITS: u64 = crate::nanbox::NanBox::undefined().to_bits();
+/// The tag bits every non-Number `NanBox` has all set.
+const QNAN_MASK: u64 = 0x7ffc_0000_0000_0000;
+const _: () = assert!(crate::nanbox::NanBox::undefined().to_bits() & QNAN_MASK == QNAN_MASK);
 
 impl X64Assembler {
     /// `recv.get(key)` (`get`) or `recv.has(key)` (see the module docs):
@@ -418,9 +430,16 @@ impl X64Assembler {
         // (A method read is the other kind's built-in only on a receiver
         // of the wrong kind: the helper's `TypeError`.)
         self.g_jcc(cc::NE, if callee.is_some() { slow } else { stale });
+        let found = self.new_label();
+        let absent = self.new_label();
+        // (An indexed one probed in line, `coll_hash_probe`, when the body
+        // pins the arena; else by the helper.)
+        let hashed = self.new_label();
+        let slots =
+            crate::realm::jit_coll_index_layout().filter(|_| self.pinned() && hash_enabled());
         self.g_mem(true, &[0x83], 7, r::RCX, c.index); // cmp qword [rcx+index], imm8
         self.code.push(0);
-        self.g_jcc(cc::NE, probe);
+        self.g_jcc(cc::NE, if slots.is_some() { hashed } else { probe });
         // rdi = the entry count (at most `COLL_SCAN_MAX`), rsi = the first.
         self.g_load(r::RDI, r::RCX, c.entries_len);
         self.g_cmp_imm(
@@ -438,9 +457,24 @@ impl X64Assembler {
         self.g_jcc(cc::NE, normal);
         self.g_movabs(r::R11, crate::nanbox::NanBox::number(0.0).to_bits());
         self.bind(normal);
-        let found = self.new_label();
-        let absent = self.new_label();
         self.coll_scan(l, (found, absent, probe));
+        if let Some((sp, sl)) = slots {
+            // (The scan falls through to `absent`, bound next.)
+            self.jmp(absent);
+            let cold = self.cold_begin();
+            self.bind(hashed);
+            let base = self.frame_base(key);
+            self.coll_key_bits(base, key);
+            self.coll_hash_probe(
+                l,
+                (
+                    i32::try_from(sp).expect("small"),
+                    i32::try_from(sl).expect("small"),
+                ),
+                (found, absent, probe),
+            );
+            self.cold_end(cold);
+        }
         // The answers (each noted in the memo, for a `Map`).
         let memo = memo.filter(|_| memo_use & MEMO_FILL != 0);
         self.bind(absent);
@@ -945,6 +979,172 @@ impl X64Assembler {
         self.g_lea(r::RSI, r::RSI, c.entry_size);
         self.g_dec(r::RDI);
         self.g_jcc(cc::NE, tlp);
+    }
+
+    /// The probe of an inline `Map`/`Set` lookup on a collection with a
+    /// hash index, as `Realm::coll_probe_lean` makes it (pinned code only:
+    /// `rdx` and `r10` are free): for the key's bits in `r11` (`-0` already
+    /// `+0`) and the collection's heap slot in `rcx`, a Number key (not a
+    /// NaN) or a String key held in its node (at most [`KEY_MAX`] bytes)
+    /// hashed as `Realm::collection_key_hash` hashes it, its slots probed as
+    /// `CollIndex::find` probes them, each candidate entry's key compared
+    /// with the key by its bits or, for a String, its text: to `found` with
+    /// `rsi` = the entry whose key is the key, to `absent` when none is, to
+    /// `probe` for anything else (another key, an entry String not held in
+    /// its node). Clobbers `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r10`.
+    fn coll_hash_probe(
+        &mut self,
+        l: &JitLayout,
+        (slots_ptr, slots_len): (i32, i32),
+        (found, absent, probe): (Label, Label, Label),
+    ) {
+        debug_assert!(self.pinned());
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let c = coll_layout();
+        let rl = l.rope;
+        let string = self.new_label();
+        let mix = self.new_label();
+        // rdi = the collection, r8 = its index.
+        self.g_mov(r::RDI, r::RCX);
+        self.g_load(r::R8, r::RCX, c.index);
+        // The key: a heap value (a String), else a Number (not a NaN), else
+        // the helper's.
+        self.g_mov(r::RAX, r::R11);
+        self.p_cmp_handle_floor(r::RAX);
+        self.g_jcc(cc::AE, string);
+        self.g_movabs(r::R9, QNAN_MASK);
+        self.g_and(r::RAX, r::R9);
+        self.g_cmp(r::RAX, r::R9);
+        self.g_jcc(cc::E, probe);
+        // shl rax, 1 (of the bits; the sign dropped): above +Inf's is a NaN.
+        self.g_mov(r::RAX, r::R11);
+        self.raw(&[0x48, 0xd1, 0xe0]);
+        self.g_movabs(r::R9, 0xffe0_0000_0000_0000);
+        self.g_cmp(r::RAX, r::R9);
+        self.g_jcc(cc::A, probe);
+        // `coll_num_hash`: the bits themselves (a `-0` already `+0`).
+        self.g_mov(r::RDX, r::R11);
+        self.jmp(mix);
+        // A String held in its node: rcx = the node, rax = its length;
+        // `coll_str_hash`'s words, then the mix.
+        self.bind(string);
+        self.p_slot_rooted(l, r::RCX, probe);
+        self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, l.cell_str_disc);
+        self.g_jcc(cc::NE, probe);
+        self.g_load(r::RCX, r::RCX, l.off_str_rope);
+        self.g_cmp_byte_imm(r::RCX, rl.tag, rl.small_tag);
+        self.g_jcc(cc::NE, probe);
+        self.g_cmp_byte_imm_unsigned_above(r::RCX, rl.small_len, KEY_MAX, probe);
+        self.g_mem(false, &[0x0f, 0xb6], r::RAX, r::RCX, rl.small_len); // movzx eax, byte
+        self.g_movabs(r::RDX, K);
+        self.g_xor_rr(r::RDX, r::RAX);
+        self.g_movabs(r::R9, K);
+        for k in 0..3 {
+            // Word `k` while the length is past `8k`.
+            self.g_cmp_imm(r::RAX, 8 * k);
+            self.g_jcc(cc::BE, mix);
+            self.g_mem(true, &[0x33], r::RDX, r::RCX, rl.small_buf + 8 * k); // xor rdx, [..]
+            self.g_imul_rr(r::RDX, r::R9);
+            self.raw(&[0x48, 0xc1, 0xc2, 29]); // rol rdx, 29
+        }
+        // `coll_mix`, then `fold` (r10 = the 32 hash bits) and `home` (rdx).
+        self.bind(mix);
+        for m in [0xff51_afd7_ed55_8ccd_u64, 0xc4ce_b9fe_1a85_ec53] {
+            self.g_mov(r::RAX, r::RDX);
+            self.g_shr_imm(r::RAX, 33);
+            self.g_xor_rr(r::RDX, r::RAX);
+            self.g_movabs(r::R9, m);
+            self.g_imul_rr(r::RDX, r::R9);
+        }
+        self.g_mov(r::RAX, r::RDX);
+        self.g_shr_imm(r::RAX, 33);
+        self.g_xor_rr(r::RDX, r::RAX);
+        self.g_mov(r::R10, r::RDX);
+        self.g_shr_imm(r::R10, 32);
+        self.raw(&[0x41, 0x31, 0xd2]); // xor r10d, edx
+        self.raw(&[0x41, 0x69, 0xd2]); // imul edx, r10d, imm32
+        self.code.extend_from_slice(&0x9E37_79B9_u32.to_le_bytes());
+        // An empty table finds nothing; else rdx = home & mask.
+        self.g_load(r::RAX, r::R8, slots_len);
+        self.g_test(r::RAX);
+        self.g_jcc(cc::E, absent);
+        self.raw(&[0x48, 0xff, 0xc8]); // dec rax
+        self.g_and(r::RDX, r::RAX);
+        // The probe: an empty slot ends it, a removed one is passed over,
+        // a slot of the same hash bits names a candidate entry.
+        let lp = self.new_label();
+        let next = self.new_label();
+        self.bind(lp);
+        self.g_load(r::RAX, r::R8, slots_ptr);
+        self.raw(&[0x48, 0x8b, 0x04, 0xd0]); // mov rax, [rax + rdx*8]
+        self.g_test(r::RAX);
+        self.g_jcc(cc::E, absent);
+        self.raw(&[0x48, 0x83, 0xf8, 0xff]); // cmp rax, -1 (`GONE`)
+        self.g_jcc(cc::E, next);
+        self.g_mov(r::R9, r::RAX);
+        self.g_shr_imm(r::R9, 32);
+        self.raw(&[0x45, 0x39, 0xd1]); // cmp r9d, r10d
+        self.g_jcc(cc::NE, next);
+        // rsi = the entry at the slot's position (below the entry count).
+        self.raw(&[0x89, 0xc0]); // mov eax, eax
+        self.raw(&[0x48, 0xff, 0xc8]); // dec rax
+        self.g_cmp_mem(r::RAX, r::RDI, c.entries_len);
+        self.g_jcc(cc::AE, next);
+        debug_assert_eq!(c.entry_size, 16);
+        self.raw(&[0x48, 0xc1, 0xe0, 0x04]); // shl rax, 4
+        self.g_add_mem(r::RAX, r::RDI, c.entries_ptr);
+        self.g_mov(r::RSI, r::RAX);
+        self.g_load(r::RAX, r::RSI, c.entry_key);
+        self.g_cmp(r::RAX, r::R11);
+        self.g_jcc(cc::E, found);
+        // A String key: an entry String held in its node of the same text
+        // (an entry of any other kind is another key; an entry String not
+        // in its node is the helper's).
+        let num = self.new_label();
+        self.g_mov(r::R9, r::R11);
+        self.p_cmp_handle_floor(r::R9);
+        self.g_jcc(cc::B, num);
+        self.p_cmp_handle_floor(r::RAX);
+        self.g_jcc(cc::B, next);
+        self.p_slot_rooted(l, r::R9, probe);
+        self.g_cmp_byte_imm(r::R9, l.off_cell_tag, l.cell_str_disc);
+        self.g_jcc(cc::NE, next);
+        self.g_load(r::R9, r::R9, l.off_str_rope);
+        self.g_cmp_byte_imm(r::R9, rl.tag, rl.small_tag);
+        self.g_jcc(cc::NE, probe);
+        self.g_mem(false, &[0x0f, 0xb6], r::RAX, r::R9, rl.small_len);
+        self.g_mem(false, &[0x3a], r::RAX, r::RCX, rl.small_len); // cmp al, [rcx + len]
+        self.g_jcc(cc::NE, next);
+        for k in 0..3 {
+            self.g_load(r::RAX, r::R9, rl.small_buf + 8 * k);
+            self.g_cmp_mem(r::RAX, r::RCX, rl.small_buf + 8 * k);
+            self.g_jcc(cc::NE, next);
+        }
+        self.jmp(found);
+        self.bind(num);
+        // (A Number equals only an entry of its very bits.)
+        self.bind(next);
+        self.raw(&[0x48, 0xff, 0xc2]); // inc rdx
+        self.g_load(r::RAX, r::R8, slots_len);
+        self.raw(&[0x48, 0xff, 0xc8]); // dec rax
+        self.g_and(r::RDX, r::RAX);
+        self.jmp(lp);
+    }
+
+    /// `xor dst, src` (64-bit).
+    fn g_xor_rr(&mut self, dst: u8, src: u8) {
+        self.code
+            .push(0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1));
+        self.code
+            .extend_from_slice(&[0x31, 0xc0 | ((src & 7) << 3) | (dst & 7)]);
+    }
+
+    /// `imul dst, src` (64-bit).
+    fn g_imul_rr(&mut self, dst: u8, src: u8) {
+        self.code
+            .push(0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+        self.code
+            .extend_from_slice(&[0x0f, 0xaf, 0xc0 | ((dst & 7) << 3) | (src & 7)]);
     }
 
     /// `cmp byte [base + disp], imm; ja miss`.

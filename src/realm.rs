@@ -60,6 +60,8 @@ mod str_key_fast;
 mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use coll_index::jit_slots_layout as jit_coll_index_layout;
 pub use str_switch::{SwitchMemo, switch_key_order};
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use str_switch::{SwitchMemoLayout, jit_switch_memo_layout};

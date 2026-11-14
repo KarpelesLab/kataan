@@ -54,6 +54,37 @@ fn home(h: u32, mask: usize) -> usize {
     (h.wrapping_mul(0x9E37_79B9) as usize) & mask
 }
 
+/// Where compiled code finds an index's slots (`crate::jit::coll`'s inline
+/// probe, which follows [`CollIndex::find`]: [`fold`], [`home`], linear
+/// probing, `0` empty, [`GONE`] removed): the byte offsets, from the
+/// index, of its slot buffer's pointer word and its slot count word
+/// (`slots`, a `Vec<u64>`, whose words are found on a probe). `None` when
+/// they cannot be told apart.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn jit_slots_layout() -> Option<(usize, usize)> {
+    use core::mem::{offset_of, size_of};
+    if size_of::<Vec<u64>>() != 24 {
+        return None;
+    }
+    let mut v: Vec<u64> = Vec::with_capacity(16);
+    v.extend_from_slice(&[7, 8, 9]);
+    // SAFETY: a `Vec` is three initialized `usize` words (checked above).
+    #[allow(unsafe_code)]
+    let w: [usize; 3] = unsafe { core::ptr::read((&v as *const Vec<u64>).cast::<[usize; 3]>()) };
+    let one = |x: usize| {
+        let mut k = (0..3).filter(|&k| w[k] == x);
+        match (k.next(), k.next()) {
+            (Some(k), None) => Some(k * 8),
+            _ => None,
+        }
+    };
+    let (ptr, len) = (one(v.as_ptr() as usize)?, one(v.len())?);
+    one(v.capacity())?;
+    let s = offset_of!(CollIndex, slots);
+    Some((s + ptr, s + len))
+}
+
 impl CollIndex {
     /// An index with room for `n` entries before it grows.
     #[must_use]
