@@ -1608,8 +1608,11 @@ impl<T> Heap<T> {
 /// What [`settle_young_fast`] did with a young slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fate {
-    /// Still holds its value (a survivor, or a slot already free).
+    /// Already free.
     Kept,
+    /// Holds a marked (promoted) value — or the slot is listed twice — for
+    /// [`settle_survivor`].
+    Survivor,
     /// Freed, and goes back on the free list.
     Freed,
     /// Freed, but retired: its generation left the low range (see
@@ -1652,29 +1655,50 @@ fn sweep_young_fast<T: crate::gc::Trace, S: Fn(&T) -> bool>(
     };
     let kept = {
         let slots = slots.as_mut_slice();
+        let (base, n) = (slots.as_mut_ptr(), slots.len());
+        // Every free-list entry names a slot of the table (entries are only
+        // ever made from its indices, and it never shrinks but in a
+        // compaction, which empties the list): checked once, not per entry.
+        // (A max over the entries, which vectorizes: a fraction of the
+        // per-entry bounds check it replaces.)
+        let top = free[free_top..].iter().copied().max().unwrap_or(0);
+        assert!((top as usize) < n.max(1), "free list entry {top} past the slot table");
         // The consumed entries: `list[..r]` visited and freed again,
         // `list[r..]` not visited yet. An entry that leaves the list takes
         // the last unvisited one's place, and the list shrinks by one.
         let mut list: &mut [u32] = &mut free[free_top..];
         let mut r = 0;
         while let Some(&i) = list.get(r) {
-            let Some(slot) = slots.get_mut(i as usize) else {
-                unreachable!("free list entry {i} past the slot table");
-            };
-            if settle_young_fast(slot, i, &mut cx) == Fate::Freed {
-                r += 1;
-            } else {
-                let last = list.len() - 1;
-                list[r] = list[last];
-                list = &mut core::mem::take(&mut list)[..last];
+            // SAFETY: `i < n` (see above), and no other reference into the
+            // table is live while this one is.
+            #[allow(unsafe_code)]
+            let slot = unsafe { &mut *base.add(i as usize) };
+            match settle_young_fast(slot, &mut cx) {
+                Fate::Freed => r += 1,
+                fate => {
+                    // (The index read again, so the common path keeps
+                    // nothing of it live past the release.)
+                    let i = list[r];
+                    if fate == Fate::Survivor {
+                        // SAFETY: as above.
+                        #[allow(unsafe_code)]
+                        let slot = unsafe { &mut *base.add(i as usize) };
+                        settle_survivor(slot, i, &mut cx);
+                    }
+                    let last = list.len() - 1;
+                    list[r] = list[last];
+                    list = &mut core::mem::take(&mut list)[..last];
+                }
             }
         }
         free_top + list.len()
     };
     free.truncate(kept);
     for (i, slot) in slots.iter_mut().enumerate().skip(floor) {
-        if settle_young_fast(slot, i as u32, &mut cx) == Fate::Freed {
-            free.push(i as u32);
+        match settle_young_fast(slot, &mut cx) {
+            Fate::Freed => free.push(i as u32),
+            Fate::Survivor => settle_survivor(slot, i as u32, &mut cx),
+            Fate::Kept | Fate::Retired => {}
         }
     }
     free.len() - free_top + cx.retired
@@ -1694,15 +1718,13 @@ struct SweepCx<'a, S> {
 #[inline(always)]
 fn settle_young_fast<T: crate::gc::Trace, S: Fn(&T) -> bool>(
     slot: &mut Slot<T>,
-    i: u32,
     cx: &mut SweepCx<'_, S>,
 ) -> Fate {
     if !slot.is_live() {
         return Fate::Kept;
     }
     if slot.age >= crate::gc::OLD_AGE {
-        settle_survivor(slot, i, cx);
-        return Fate::Kept;
+        return Fate::Survivor;
     }
     if slot.vacate_release(cx.pool) {
         Fate::Freed
