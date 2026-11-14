@@ -365,6 +365,7 @@ impl Interp {
         // `main_regexp_proto` is recorded.
         if let Some(proto) = self.current_regexp_proto().or(self.regexp_proto) {
             self.realm.link_regexp_proto(h, proto);
+            self.realm.note_regexp_literal(proto);
         }
         h
     }

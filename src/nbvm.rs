@@ -11649,9 +11649,13 @@ fn run_frame_at_ic(
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(rest).to_raw());
             }
             Op::NewRegExp { dst, source, flags } => {
-                regs[*dst as usize] = match with_host(ctx, |h| h.new_regexp(source, flags)) {
-                    Some(v) => v,
-                    None => NanBox::handle(ctx.realm.new_regexp(source, flags).to_raw()),
+                regs[*dst as usize] = if let Some(h) = ctx.realm.new_regexp_literal(source, flags) {
+                    NanBox::handle(h.to_raw())
+                } else {
+                    match with_host(ctx, |h| h.new_regexp(source, flags)) {
+                        Some(v) => v,
+                        None => NanBox::handle(ctx.realm.new_regexp(source, flags).to_raw()),
+                    }
                 };
             }
             Op::NewObject { dst } => {

@@ -2179,6 +2179,10 @@ pub(crate) extern "C" fn jit_helper_new_array(
         }
         // A regular expression literal's new object: the interpreter arm.
         Op::NewRegExp { dst, source, flags } => {
+            if let Some(h) = cx.realm.new_regexp_literal(source, flags) {
+                file[*dst as usize] = NanBox::handle(h.to_raw());
+                return 0;
+            }
             file[*dst as usize] = match super::with_host(cx, |h| h.new_regexp(source, flags)) {
                 Some(v) => v,
                 None => NanBox::handle(cx.realm.new_regexp(source, flags).to_raw()),
@@ -2410,6 +2414,14 @@ pub(crate) extern "C" fn jit_helper_typeof_test(
     jit_helper_exec_op(ctx, regs, n_regs, unsafe { op.add(1) })
 }
 
+/// Whether compiled code's handed-back `Op::DefineMethod` runs its
+/// interpreter arm directly, without a one-op frame
+/// (`KATAAN_DIRECT_DEFINE=0` turns it off, read once per process).
+fn direct_define_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_DIRECT_DEFINE").is_none_or(|v| v != "0"))
+}
+
 pub(crate) extern "C" fn jit_helper_exec_op(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
@@ -2539,6 +2551,21 @@ pub(crate) extern "C" fn jit_helper_exec_op(
         Op::NewObject { dst } => {
             regs[*dst as usize] = NanBox::handle(ctx.realm.new_object().to_raw());
             Some(Ok(()))
+        }
+        // A method, getter or setter definition (an object literal's
+        // `get p() {}`, a class's methods): its interpreter arm.
+        Op::DefineMethod {
+            obj,
+            key,
+            func,
+            kind,
+        } if direct_define_on() => {
+            let (o, k, f) = (
+                regs[*obj as usize],
+                regs[*key as usize],
+                regs[*func as usize],
+            );
+            super::with_host(ctx, |h| h.define_method(o, k, f, *kind)).map(|r| r.map_err(VmError::from))
         }
         // An object literal with a constant key set (its interpreter arm).
         Op::NewObjectLit { dst, lit } => {

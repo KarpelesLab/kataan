@@ -524,6 +524,13 @@ pub struct Realm {
     /// [`link_regexp_proto`](Realm::link_regexp_proto) of a single-realm run,
     /// so that evaluating a regex literal inserts no side-table entry.
     regexp_default_proto: Option<Handle>,
+    /// Set by the host once a regex literal it made in a single-realm run
+    /// took [`regexp_default_proto`](Realm::regexp_default_proto) as its
+    /// `[[Prototype]]` (the main realm's `%RegExp.prototype%`, fixed for the
+    /// run): from then on, while the run stays single-realm, a literal is
+    /// made by [`new_regexp_literal`](Realm::new_regexp_literal) without the
+    /// host — linking it would change nothing.
+    regexp_literal_plain: bool,
     /// The source and flags of the last RegExp `new_regexp` made, shared with
     /// the next one made from the same pair, and the program they compiled
     /// to once known (see `new_regexp`). Holds no heap handle.
@@ -1195,6 +1202,7 @@ impl Realm {
             callable_null_protos: alloc::collections::BTreeSet::new(),
             vm_fn_default_proto: None,
             regexp_default_proto: None,
+            regexp_literal_plain: false,
             regexp_literal_memo: [const { None }; REGEXP_LITERAL_MEMOS],
             regexp_literal_next: 0,
             promise_default_proto: None,
@@ -5071,6 +5079,22 @@ impl Realm {
             #[cfg(feature = "regex")]
             compiled: core::cell::RefCell::new(program),
         })
+    }
+
+    /// A regex literal's RegExp made without the host: what the host's
+    /// `new_regexp` makes once [`regexp_literal_plain`](Realm::regexp_literal_plain)
+    /// holds in a single-realm run (`KATAAN_REGEXP_LIT=0` never does). `None`
+    /// otherwise.
+    pub(crate) fn new_regexp_literal(&mut self, source: &[u8], flags: &str) -> Option<Handle> {
+        (self.regexp_literal_plain && !self.multi_realm && regexp_lit_on())
+            .then(|| self.new_regexp(source, flags))
+    }
+
+    /// Records that the host linked the regex literal `h` to `proto` (see
+    /// [`regexp_literal_plain`](Realm::regexp_literal_plain)).
+    pub(crate) fn note_regexp_literal(&mut self, proto: Handle) {
+        self.regexp_literal_plain =
+            !self.multi_realm && self.regexp_default_proto == Some(proto);
     }
 
     /// Recompiles the `RegExp` at `handle` in place (`RegExp.prototype.compile`):
@@ -10662,6 +10686,20 @@ pub(crate) const HIDDEN_MEMOS: usize = 2;
 
 /// [`Vec::retain`] of `list[from..]` alone: the entries before `from` all
 /// stay, unvisited.
+/// Whether [`Realm::new_regexp_literal`] may make a literal without the host
+/// (`KATAAN_REGEXP_LIT=0` turns it off, read once per process).
+fn regexp_lit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_REGEXP_LIT").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether [`Realm::barrier_needed`] may answer `false` (`KATAAN_BULK_BARRIER=0`
 /// turns it off, read once per process).
 fn bulk_barrier_skip_on() -> bool {
