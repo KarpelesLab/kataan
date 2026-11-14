@@ -870,6 +870,19 @@ fn lit_bigint_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LIT_BIGINT").is_none_or(|v| v != "0"))
 }
 
+/// Whether compiled code makes an empty array literal (`NewArray` of
+/// length 0) inline, as it does a small one (`KATAAN_JIT_EMPTY_ARRAY=0`
+/// turns it off; read once per process).
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
+fn empty_array_inline_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_EMPTY_ARRAY").is_none_or(|v| v != "0"))
+}
+
 fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
     match *op {
         RegOp::Arg { dst, .. } | RegOp::Const { dst, .. } => (Some(dst), [None, None]),
@@ -15213,9 +15226,13 @@ impl JitFunction {
                                 // destination, which first holds `undefined`
                                 // (the op overwrites it, and nothing reads it
                                 // before: a miss's helper makes the array anew).
+                                // (`[]` too: the empty literal, `len` 0 —
+                                // `KATAAN_JIT_EMPTY_ARRAY=0` leaves it to the
+                                // helper.)
                                 crate::nbvm::Op::NewArray { dst, len }
                                     if ok(*dst)
-                                        && (1..=crate::cell::ARRAY_INLINE_CAP).contains(len) =>
+                                        && (empty_array_inline_on() || *len > 0)
+                                        && *len <= crate::cell::ARRAY_INLINE_CAP =>
                                 {
                                     Some((*dst, alloc::vec![disp(*dst); *len]))
                                 }
