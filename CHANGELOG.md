@@ -7,6 +7,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/KarpelesLab/kataan/compare/v0.0.10...v0.0.11) - 2026-11-14
+
+### Added
+
+- *(vm,jit)* deep recursion to 12000 activations, bounded by the native stack on every path
+- *(ptc)* proper tail calls for method, computed, super, private, spread and member-tag calls
+
+### Fixed
+
+- *(bigint)* shifts by counts past any representable shift; asUintN/asIntN of values within a huge width
+- *(vm)* cross-target dead code; toggles for the function-name watermark and shared declaration register; switch scaling test measures dispatch
+- *(realm)* built-in constructors list prototype third, prototypes list constructor first
+- *(gc)* collect inside coercions, accessors and proxy traps reached from compiled code
+- *(unicode)* pin JS string semantics to in-house Unicode 17.0 tables; rustc 1.100 clippy
+- *(nbvm)* allow vm_str_eq_const unused off the JIT targets
+- *(gc)* collect inside coercions, accessors, proxy traps and constructors the engine runs
+- *(instanceof)* WebAssembly constructors keep answering false for an unmarked object
+- *(jit)* gate clear_entry_slots_except to the JIT targets
+- *(instanceof)* a built-in function without an object `prototype` is a TypeError for an object operand
+- *(jit)* the in-place integer product's -0 test keeps the saved factor
+- *(gc)* collect inside callbacks of host built-ins and the paths 1f05370a left
+- *(gc)* collect inside generators drained by host built-ins
+- *(gc)* collect inside resumed generator and async bodies
+- module typeof/exists keep resolving through the module scope
+- global references resolve in the global scope, not the caller's eval/with scope
+- *(jit)* a plainly lazy window in a speculative loop's plain copy clears its marker
+- *(regex)* unquantifiable assertions in Annex B; literal astral characters are two units without u
+- *(jit)* keep a recompilation's replaced direct-entry body alive
+- *(object)* Object.hasOwn of an array hole is false
+- *(rope)* assembling a string from existing pieces never copies them into an append buffer
+- *(builtins)* Object.assign throws on an inherited read-only property or getter-only accessor
+
+### Other
+
+- clippy (needless range loop in the pre-initialised new's plan)
+- *(jit)* a pre-initialised new's proved path skips the checks only Rust code can change
+- *(jit)* an inlined new allocates this pre-initialised with its constructor's fresh add run
+- *(jit)* a direct-read body's prologue notes the epoch and points at its array
+- *(jit)* read persisted global bindings in the body's array, not frame copies
+- *(jit)* element reads sharing a String key register reuse its probed slot
+- clippy (question mark, from_* naming, is_multiple_of); lit-site helpers dead off x86-64 Linux
+- *(jit)* an integer region folds an inlined call's constant arithmetic
+- *(bigint)* a shift count's magnitude read from its limb
+- *(vm)* the typed view accessor test runs after the property caches miss
+- *(bigint)* a hosted binary operator on two BigInts tries the borrowed fast path first
+- *(iter)* a typed array's keys/values iterator steps on the realm, with no result object
+- *(typed)* %TypedArray%.from reads a plain Number array's or a typed array's elements directly
+- *(typed)* typed arrays from plain Number arrays read the elements directly; slot answers for the view accessors in the VM
+- *(bigint)* engine-side small-operand multiplication, division, remainder, shifts and bitwise ops
+- *(jit)* a BigInt literal shares one cell per compiled site
+- *(ic)* callee feedback orders a polymorphic site's functions by calls; style: fmt
+- *(jit)* an inlined accessor call's memo hit reads no accessor again
+- *(jit)* epoch checks load the epoch through an absolute address
+- *(jit)* a polymorphic method site remembers a layout whose method no way inlines
+- *(jit)* a polymorphic call site's inlined ways are tried most called first
+- clippy; the JIT-only await toggles allowed dead elsewhere
+- Revert "perf(vm): built-in functions given the same name share its string"
+- *(vm)* built-in functions given the same name share its string
+- *(vm)* a hot async generator's resumptions run in place on its frame cell
+- *(promise)* plain promises proved without side-table lookups; lean Promise.all / allSettled subscriptions and element jobs
+- *(vm)* a hot async function's call enters its compiled body directly; its promise made and fulfilled without the host
+- *(vm)* a hot async function's resumption runs in place on its frame cell
+- *(vm)* an await's reaction resumes its frame's holder directly, with no resume functions
+- *(vm)* depth-comparing JIT tests run where the count, not the stack, bounds recursion
+- decide a generator site's rootedness only on the generator path
+- fmt; gate the JIT-only generator helpers to the JIT build
+- *(jit)* lean hot generator resumption; compiled yield/await record their suspension in line
+- *(jit)* generator next() from compiled code takes a lean helper; hot resume keeps its file and frame pointer
+- *(jit)* handler pushes and pops are leaf calls
+- *(jit)* by-index array iteration steps keep a shadow integer cursor
+- *(jit)* new Map()/new Set() at a hot site takes a lean helper; opmap marks for out-of-line code
+- *(jit)* call sequences prove the callee's inlined depth; native entries set ok from the hosted flag
+- *(jit)* native entries skip the undefined fill for more first writes
+- *(vm,gc)* integer switches dispatch by a decision tree; minor collections root only the global bindings written since
+- *(jit)* headerless native calls, in-line handler segments, precise entry fill
+- *(regexp)* name the literal memo entry type; rustfmt; is_empty
+- *(regexp)* fewer per-call costs on the one-step paths
+- *(regexp)* exec and test of a string in one step; split hook out of the native-call hot path
+- *(regexp)* match all-ASCII subjects as bytes; one-pass replacement templates; lastParen is the last group
+- *(regexp)* split by a pristine RegExp without a splitter object; RegExp construction shares its validating compile
+- ignore the local campaign/ workspace
+- *(deps)* bump purecrypto 0.10.6, puremp 0.3.3, intl 0.6.5
+- *(switch)* no intra-doc link from public SwitchMemo docs to the crate-private layout
+- *(regexp)* replace over an ASCII subject holding no unit a match can begin with returns it after a byte scan
+- *(json,strings)* revivers that cannot see a context skip source records; string compares skip the auxiliary-object lookups
+- *(strings)* short templates in one copy, regexp literals without the one-op interpreter, no-match escapes as bytes
+- *(strings)* layout-independent string-switch and Object.keys memos
+- *(realm)* reserve the key-order placeholders as hidden properties
+- *(module)* queue untried modules instead of scanning every record per link
+- *(parser)* scope early-error checks use sets, not pairwise scans
+- *(symbol)* Symbol.keyFor and CanBeHeldWeakly look the registry up, not scan it
+- drop the unused rsurl dependency; fetch stays a reserved feature
+- *(nbvm)* the shared function table grows in place; Function()/eval no longer copy it
+- *(jit)* inline callees ending in a tail call; branch on the integer of a tested bitwise op
+- *(gc)* BigInt operands skip the host's coercion setup; getters lend registers only when they could collect
+- *(jit)* polymorphic property sites compile 2-4 layouts; a site whose cache path keeps hitting asks for its body's recompilation
+- *(jit)* stride prediction only for element reads whose index steps by one
+- *(jit)* a computed-key store whose key is always numeric no longer voids every method-read proof
+- *(jit)* `x instanceof F` answered in line from a per-site memo
+- *(jit)* the recompilation poll finds a property site's pc without a scan
+- *(jit)* the global cache reset takes the persistent entries before emptying the rest
+- *(jit)* a global write's validated binding address persists across activations
+- *(jit)* the frame prologue empties its slots two at a time through xmm15
+- *(jit)* a Map lookup memo answers `m.get(k)` after `m.has(k)` without a second scan
+- *(jit)* inlined callees' learned layouts reach the recompilation; no recompiles for callees nothing could inline
+- *(jit)* sunk guards take their stand-in and its heap slot from the memo
+- *(jit)* sunk objects survive tail call guards and guard diamonds' fallback arms
+- *(gen)* compiled generator bodies resume on the register file in their frame cell; one pass for gen.next sites; generator objects need no attribute record; plain short shift
+- *(jit)* appends in loop nests' fast versions, outer invariant prefixes, float folds, constant operands, region-local mentions
+- *(async,gen)* awaits of settled values resume in place when their job would run next; one lookup per generator resume
+- *(jit)* kind-specialised views, loop-invariant prefixes, row fills, copy coalescing, cheaper region entries
+- *(jit)* element access feedback through the inliner; integer versions skip division, moves and float copies
+- *(jit)* typed-array accesses test the kind their register held first; element reads feeding arithmetic are Numbers
+- *(jit)* call-free nests of numeric loops are one region with an integer version
+- *(jit)* an element copy is an int reader only when the arrays hold numbers
+- *(jit)* integer versions read a non-held array's element inline
+- *(jit)* `i >>> 5` is an int register in integer versions; nests hoist six views, inner loops' first
+- *(jit)* integer versions keep copied elements and `!x` tests as int32
+- generator next sites, generator creation and typeof tests
+- escape [[Environment]] in the global-reference doc comments
+- *(jit)* global read forwarding tracks primitives locally instead of inferring types
+- *(jit)* inline Map/Set writes test the receiver before the proof
+- *(jit)* inline Map.set / Set.add / delete on small collections in compiled code
+- *(jit)* forward script-binding reads in compiled code; carry bindings stored more than once
+- cheaper global writes, string switches, instanceof and read-only captured params
+- *(jit)* inline DataView accessors and small Map/Set lookups in compiled code
+- clippy (hidden slot memo type alias)
+- *(jit)* memoize a global write's validated binding address across activations
+- BigInt operators on borrowed values, shifts as bit shifts, literals parsed once; DataView hidden slots read by layout
+- *(jit)* for-of over arrays in the speculative tier; Math proofs kept across calls
+- *(jit)* recompile bodies only compiled code calls; retarget compiled call sites; Math entry proofs fill their cache; inline Array.prototype.pop
+- clippy (switch memo ways type, plain lazy store's start labels)
+- *(jit)* plainly lazy windows of out-of-line stubs by label in a map
+- *(jit)* plainly lazy activations in speculative fast versions too
+- *(jit)* plainly lazy inlined activations through inlined loops
+- *(jit)* inlined activations stay lazily pending in code that calls
+- *(switch)* two-choice string switch memo, boxed out of the op
+- *(jit)* speculative loops keep their fast version when a guard misses once per activation
+- *(jit)* scalar replacement of inlined `new` objects that never escape
+- *(regexp,vm)* one-step replace/match on pristine RegExps; linear-matcher shortcuts; string compares, flat, typeof, accessor names without the host
+- *(jit)* typed-array loops with compound element updates and copied receivers become promoted regions; integer-version demotions carry through inlining
+- *(vm)* cheap calls from built-ins back into JS closures; species for holey map/filter
+- *(json)* keep the reviver-less parser's number and string-value steps inline in its loop
+- *(json,regexp)* reviver walk without descriptor objects, byte-level source parse, regexp protocol proofs, single-atom global scans
+- *(jit)* guard elimination across ops: proved method reads and inlined guards' memo ways skip what no op since can change; an iteration's value walks at once
+- *(vm)* Map/Set method reads on fresh collections, Object.assign in the VM, cached `.length` getters; fix spread over an own accessor
+- *(jit)* cheaper generic-tier compile: threading and relaxation in one pass over a jump table, pre-sized code buffers, g_mem in one store, inline windows computed once
+- *(vm)* Object.keys/entries/values from layout slots, dictionary key memo, spread/assign merge into non-empty targets, leaner Map/Set call path
+- *(jit)* smaller generic-tier code: post-call key emptying two at a time, shared post-call stubs out of line, branch relaxation, short immediates, helper calls through constant words
+- *(jit)* integer versions for loop nests; int registers in frame slots; hoisted-view element ops of any kind inline in integer versions
+- *(jit)* inline big polymorphic callees by weight; fallback calls out of line; inlined `new` identified by its construct record; disp8 operands
+- *(jit,vm)* typed-array element access without the failed array try; test-position && / || compile to branches
+- *(vm)* wholesale object spread / rest / Object.assign copies, Object.values from the slots
+- *(async)* collect between event-loop jobs; promise then/resolve/all fast paths; generator open without the host
+- *(vm)* Map/Set calls on any receiver, `new Map()` without the host, string-switch memo, instanceof memo, captured-parameter cells inline
+- *(jit)* hoist loop-invariant reads and checks out of speculative loops
+- *(jit)* compile strict tail calls; two-way built-in method sites; two-entry regex subject memo; inline ToKey; bench/js2 suite
+- *(jit)* polymorphic call sites inline up to six callees
+- *(jit)* per-register demotion of int32 values that leave the range; `===` decided inline in integer versions and by words for object-only registers
+- *(jit)* integer versions for index and counter loops over arrays and properties; int element reads and stores inline
+- *(jit)* `===` of two distinct objects answers inline in every version; hoisted-array element stores
+- *(strings)* `+` of strings and integers builds in place, memoizes repeated `'k' + i`, and skips the general add
+- *(jit)* comparisons branch on their flags: through `!`, `== null`, `x === 'lit'`, `k in o`, `typeof v === 'lit'`, `if (!x)`
+- *(gc)* cheaper minor sweep of dead young cells
+- *(jit)* absent and keyed property ops stay in speculative fast versions; `k in o` and fresh String keys answer inline; run-proved answers
+- *(props)* the interpreter's o[k] with an absent String key asks the text memo too
+- *(jit)* `o[k] = v` with a String key stores in place when the slot memo names an existing own data slot
+- *(jit)* inline `s.charCodeAt(i)` also reads short strings held in their rope node
+- *(props)* String keys are memoized by text, and absent keys too: fresh 'k'+n keys hit, o[k] / k in o misses are cached
+- *(jit)* an absent property read is a cached chain entry: `o.x` of a missing key returns undefined inline
+- *(jit)* `v === 'lit'` compares inline; string literals may sit in promoted and speculative loops
+- *(props)* `o[k] = v` with a String key stores to the slot it names in place
+- *(rope)* `s += x` appends in place into a shared append buffer
+- *(jit)* a fast version makes a class chain's field adds at once, across levels
+- *(jit)* a fresh object's add chain proves its outside-world checks once per run
+- *(jit)* nested inlined activations stay lazily pending in speculative fast versions
+- *(jit)* numeric loops keep validated global addresses across slow paths; 32 body global slots
+- *(jit)* string literals load a rooted per-body word instead of calling out
+- *(jit)* direct `o.hasOwnProperty(k)`, and `hasOwn` / `getPrototypeOf` answered in line
+- *(jit)* static built-in calls the site proves are computed directly by compiled code
+- *(builtins)* Object.assign, JSON state, species memo and four statics take direct paths
+- *(builtins)* the `NativeOwn` fill turns ordinary receivers away first; `run_op` stays inline
+- *(builtins)* `Object.keys` of a plain array and one-unit `String.fromCharCode` skip the host
+- *(builtins)* `F.call(t, ...)` of a built-in and bound built-in receivers take the site caches
+- *(builtins)* built-in function receivers get per-site memos for own properties and static methods
+- *(jit)* speculative loops prove a plain call's guard once per run; its callee load, guard args and constant temps go out of the hot path
+- *(for-in)* `o.hasOwnProperty(k)` and `hop.call(o, k)` over a for-in's key answer inline
+- *(props)* a built-in function's own data property reads from its auxiliary object first
+- *(for-in)* a compiled for-in's key read and liveness check are loop-region ops
+- *(for-in)* arrays, dictionaries, `in` with indices and hasOwnProperty.call take fast paths
+- *(jit)* integer-version leaves from slow paths count; plain copies cache globals
+- *(object)* Object.keys hands out one layout's key Strings every time
+- *(jit)* speculative loops prove super-constructor, field-init and write-barrier checks once per run
+- *(jit)* walks predict the next object's heap slot from the last stride
+
 ## [0.0.10](https://github.com/KarpelesLab/kataan/compare/v0.0.9...v0.0.10) - 2026-11-07
 
 ### Added
