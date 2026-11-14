@@ -4003,7 +4003,7 @@ fn vm_agen_enqueue_at(
     kind: u8,
     v: NanBox,
 ) -> Result<NanBox, VmError> {
-    let p = with_host(ctx, |h| h.new_promise()).ok_or(VmError::Unsupported)?;
+    let p = vm_new_promise(ctx).ok_or(VmError::Unsupported)?;
     let req = ctx
         .realm
         .new_array(alloc::vec![NanBox::number(f64::from(kind)), v, p]);
@@ -4103,7 +4103,35 @@ fn agen_drain(
                 }
             }
         }
-        // Resume the body.
+        // Resume the body: a hot one resumed by `next(v)`, in place
+        // (`await_fast`).
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        let (lands, nland) = {
+            let u = (0, NanBox::undefined());
+            match captured {
+                Some((cdst, cmode)) => ([(cdst, v), (cmode, NanBox::number(f64::from(kind)))], 2),
+                None if status == GEN_SUSPENDED_YIELD => ([(st.dst, v), u], 1),
+                None => ([u, u], 0),
+            }
+        };
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if (captured.is_some() || kind != 1)
+            && crate::nbexec::promise::await_lean_on()
+            && let Some(r) = await_fast::agen_lean_run(
+                ctx,
+                funcs,
+                generator,
+                st.state,
+                st.id,
+                st.pc,
+                &lands[..nland],
+            )
+        {
+            if !r? {
+                return Ok(());
+            }
+            continue;
+        }
         let (mut regs, handlers) = load_frame(ctx, st.state);
         let inject = if let Some((cdst, cmode)) = captured {
             regs[cdst as usize] = v;
@@ -4392,6 +4420,30 @@ fn resume_agen_frame_inner(
                 agen_settle_front(ctx, st.state, st.queue, v, false);
             }
         } else {
+            // A hot body resumed fulfilled runs in place (`await_fast`).
+            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            if fulfilled
+                && crate::nbexec::promise::await_lean_on()
+                && let Some(r) = await_fast::agen_lean_run(
+                    ctx,
+                    table,
+                    generator,
+                    st.state,
+                    st.id,
+                    st.pc,
+                    &[(st.dst, v)],
+                )
+            {
+                if !r? {
+                    return Ok(());
+                }
+                agen_drain(ctx, table, generator, st.state)?;
+                return if ctx.microtasks.is_empty() {
+                    Ok(())
+                } else {
+                    Err(VmError::Unsupported)
+                };
+            }
             agen_set_status(ctx, st.state, GEN_EXECUTING);
             let (mut regs, handlers) = load_frame(ctx, st.state);
             let inject = if fulfilled {

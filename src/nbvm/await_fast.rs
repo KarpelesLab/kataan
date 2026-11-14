@@ -275,6 +275,117 @@ pub(super) fn call_lean(
     Some(drive_async(ctx, funcs, id, None, p, regs, r).map(|()| p))
 }
 
+/// One run of the hot async generator `generator`'s body (frame cell `sh`,
+/// function `id`) from its suspension at `pc`, with `land` (registers and
+/// the values resumed with) bound, in place on the cell's register file as
+/// [`lean_resume`] runs an async function's: a `yield` settles the front
+/// request (`Some(Ok(true))`: keep draining), an `await` parks the frame
+/// (`Some(Ok(false))`), and any other end is `agen_step`'s. `None`, with
+/// nothing done, for a body not compiled or not hot, a resumption that may
+/// recompile it, or a register file of another size.
+pub(super) fn agen_lean_run(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    generator: NanBox,
+    sh: Handle,
+    id: usize,
+    pc: usize,
+    land: &[(super::Reg, NanBox)],
+) -> Option<Result<bool, VmError>> {
+    let proto = funcs.get(id)?;
+    let own = proto.n_regs;
+    let epoch = ctx.realm.heap_epoch();
+    let f = ctx.realm.vm_frame_mut(sh)?;
+    let fp: *mut crate::cell::VmFrame = f;
+    let len = f.regs.len();
+    let jit = hot_body(proto, Some(len))?;
+    let n = jit.n_regs().max(own);
+    // SAFETY: as `lean_resume`'s.
+    #[allow(unsafe_code)]
+    let f = unsafe { &mut *fp };
+    f.state = super::GEN_EXECUTING as u8;
+    if len != n {
+        f.regs.resize(n, NanBox::undefined());
+    }
+    for &(d, v) in land {
+        if let Some(slot) = f.regs.get_mut(d as usize) {
+            *slot = v;
+        }
+    }
+    let (ptr, rlen) = (f.regs.as_mut_ptr(), f.regs.len());
+    let mut handlers = core::mem::take(&mut f.handlers);
+    ctx.realm.vm_gen_running.push(sh);
+    // SAFETY: as `lean_resume`'s: the generator (rooted by the caller) holds
+    // the cell, and a running async generator's resumptions only queue.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(ptr, rlen) };
+    let run = jit_tier::run_generator_body_in_place(ctx, funcs, &jit, regs, pc, &mut handlers);
+    ctx.realm.vm_gen_running.pop();
+    Some(match run {
+        GenRun::Yield { value, pc: at, dst } => {
+            let f = if ctx.realm.heap_epoch() == epoch {
+                // SAFETY: as `lean_resume`'s.
+                #[allow(unsafe_code)]
+                Some(unsafe { &mut *fp })
+            } else {
+                ctx.realm.vm_frame_mut(sh)
+            };
+            let Some(f) = f else {
+                return Some(Err(VmError::NotAnObject));
+            };
+            let is_await = at
+                .checked_sub(1)
+                .and_then(|i| proto.ops.get(i))
+                .is_some_and(|op| matches!(op, Op::Await { .. }));
+            // (The registers go back to the function's own count, as every
+            // other path of an async generator keeps them.)
+            f.regs.truncate(own);
+            f.handlers = handlers;
+            f.pc = at as u32;
+            f.dst = dst;
+            f.state = if is_await {
+                super::GEN_EXECUTING
+            } else {
+                super::GEN_SUSPENDED_YIELD
+            } as u8;
+            let queue = f.aux.as_handle().map(Handle::from_raw);
+            ctx.realm.vm_frame_stored(sh);
+            if is_await {
+                match super::agen_await(ctx, generator, sh, value) {
+                    Some(Ok(())) => Ok(false),
+                    // PromiseResolve threw: that throw happens at the
+                    // `await`, in the interpreter.
+                    Some(Err(HostError::Thrown(e))) => {
+                        let (mut rg, hs) = take_frame(ctx, sh, own);
+                        let r = super::run_suspended(ctx, funcs, id, &mut rg, at, hs, Some(e));
+                        super::agen_step(ctx, funcs, generator, sh, id, rg, r)
+                    }
+                    _ => Err(VmError::Unsupported),
+                }
+            } else {
+                let res = super::iter_result(ctx, value, false);
+                match queue {
+                    Some(q) => {
+                        super::agen_settle_front(ctx, sh, q, res, true);
+                        Ok(true)
+                    }
+                    None => Err(VmError::NotAnObject),
+                }
+            }
+        }
+        GenRun::Exit(r) => {
+            let (rg, _) = take_frame(ctx, sh, own);
+            super::agen_step(ctx, funcs, generator, sh, id, rg, r)
+        }
+        // (A body that refuses to run is interpreted, cold.)
+        GenRun::Refused => {
+            let (mut rg, _) = take_frame(ctx, sh, own);
+            let r = run_frame_at(ctx, funcs, &proto.ops, &mut rg, pc, handlers, None);
+            super::agen_step(ctx, funcs, generator, sh, id, rg, r)
+        }
+    })
+}
+
 /// Whether [`lean_resume`] would take the next resumption of a frame of
 /// `proto` whose register file has `len` registers (nothing counted).
 pub(super) fn lean_ready(proto: &FnProto, len: usize) -> bool {
