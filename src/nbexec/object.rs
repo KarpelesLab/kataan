@@ -863,9 +863,14 @@ impl Interp {
             } else {
                 (NanBox::undefined(), func)
             };
-            self.realm.ensure_key_order(o);
-            self.realm.clear_accessor(o, key);
-            self.realm.delete_data_slot(o, key);
+            // (No own property of this key: `define_method_fast` checked.
+            // The accessor's place in the key order is `define_accessor`'s.)
+            if self
+                .realm
+                .define_fresh_accessor(o, key, (getter, setter), enumerable)
+            {
+                return;
+            }
             self.realm.clear_readonly_property(o, key);
             self.realm.define_accessor(o, key, getter, setter);
         } else {

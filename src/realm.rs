@@ -37,6 +37,8 @@ pub use fn_chain::FnChain;
 pub(crate) use forin_cache::{ForInSite, KeyTable, NO_SLOT};
 mod gen_state;
 mod key_memo;
+mod method_names;
+use method_names::MethodNames;
 mod text_memo;
 pub(crate) use text_memo::{AccHit, TextHit, getkey_enabled};
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -418,6 +420,9 @@ pub struct Realm {
     /// The `for-in` key lists by receiver shape (`forin_cache`), made on
     /// first use. Boxed: the realm is moved by value on every host call.
     for_in_cache: Option<alloc::boxed::Box<forin_cache::ForInCache>>,
+    /// An object-literal method definition's names by key String
+    /// (`Realm::method_names`), made on first use.
+    method_names: Option<alloc::boxed::Box<MethodNames>>,
     /// The String-key slot memo (`key_memo`), made on first use.
     key_memo: core::cell::OnceCell<alloc::boxed::Box<key_memo::KeyMemo>>,
     /// The address of the memo's entries once it is made, else `0`: what
@@ -1162,6 +1167,7 @@ impl Realm {
             tree_slice: None,
             cell_swaps: 0,
             for_in_cache: None,
+            method_names: None,
             key_memo: core::cell::OnceCell::new(),
             key_memo_entries: core::cell::Cell::new(0),
             key_text: core::cell::OnceCell::new(),
@@ -8081,6 +8087,36 @@ impl Realm {
         let aux = self.aux_object(handle);
         if let Some(o) = self.heap.get_mut(aux).and_then(Cell::as_object_mut) {
             o.define_accessor(key, getter, setter);
+        }
+    }
+
+    /// A new configurable accessor `key` on the ordinary object at `handle`,
+    /// which has no own property of that name: clearing the key's attribute
+    /// marks, [`define_accessor`](Self::define_accessor) and marking its
+    /// enumerability, in one step ([`Object::define_new_accessor`]).
+    /// `false`, having done nothing, for any other cell or an integer-like
+    /// key (whose define may touch the array-prototype facts).
+    pub(crate) fn define_fresh_accessor(
+        &mut self,
+        handle: Handle,
+        key: &str,
+        (getter, setter): (NanBox, NanBox),
+        enumerable: bool,
+    ) -> bool {
+        // (What `define_accessor` parses as an index starts with a digit or `+`.)
+        if key
+            .as_bytes()
+            .first()
+            .is_some_and(|&b| b.is_ascii_digit() || b == b'+')
+        {
+            return false;
+        }
+        match self.heap.get_mut(handle) {
+            Some(Cell::Object(o)) => {
+                o.define_new_accessor(key, getter, setter, enumerable);
+                true
+            }
+            _ => false,
         }
     }
 

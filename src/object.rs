@@ -443,17 +443,26 @@ struct ObjectExtra {
     /// clears one of these marks.
     hidden_prefix: u32,
     /// Unified own-key insertion order across **both** data and accessor
-    /// properties. `None` on the fast path (a pure data object, or one that has
-    /// never held an accessor): enumeration then derives its order from the shape
-    /// (data keys) followed by the accessor side-list, which is correct when the
-    /// two never interleave. The first `define_accessor` seeds this to the current
-    /// data keys and every subsequent new key (data or accessor) is appended, so
-    /// `[[OwnPropertyKeys]]` reports the true chronological creation order even when
-    /// a getter/setter is defined between two data properties (or an accessor is
-    /// later redefined as data, keeping its original slot). Boxed, so
+    /// properties. `None` on the fast path: a pure data object, or one whose
+    /// order is still **implicit** (see `acc_at`). Once the implicit form
+    /// cannot describe it (a delete, an accessor turned into data or data
+    /// into an accessor, dictionary mode, more than [`ACC_AT_MAX`]
+    /// accessors), this is seeded with the merged order and every subsequent
+    /// new key (data or accessor) is appended, so `[[OwnPropertyKeys]]`
+    /// reports the true chronological creation order even when a
+    /// getter/setter is defined between two data properties (or an accessor
+    /// is later redefined as data, keeping its original slot). Boxed, so
     /// `None` is a null word (compiled code's inline adds test it).
     #[allow(clippy::box_collection)] // for the null word
     key_order: Option<Box<Vec<Box<str>>>>,
+    /// The **implicit** key order, while `key_order` is `None` and the
+    /// object (shaped) has accessors: accessor `i` was defined when the
+    /// object had `acc_at[i]` data keys, so it comes right before data key
+    /// `acc_at[i]` in the shape's order (or after them all). Valid because
+    /// in this state data keys are only ever appended and accessors only
+    /// added (an accessor literal: `{ a, get b() {}, c }`); everything else
+    /// writes the order out to `key_order` first (`Object::materialize_order`).
+    acc_at: [u32; ACC_AT_MAX],
     /// A by-name index over the lists above (see [`AttrIndex`]), built once
     /// one holds more than [`ATTR_INDEX_MIN`] entries and kept in step
     /// with them from then on; `None` while they are short enough to search.
@@ -478,6 +487,27 @@ const ATTR_INDEX_MIN: usize = 128;
 /// The key-order log length past which the object gets an [`AttrIndex`]
 /// (the log is only scanned when a key is added).
 const ORDER_INDEX_MIN: usize = 256;
+
+/// The most accessors an object's key order is kept implicit for (see
+/// `ObjectExtra::acc_at`).
+const ACC_AT_MAX: usize = 4;
+
+/// Whether an accessor-bearing object's key order may stay implicit
+/// (`ObjectExtra::acc_at`; `KATAAN_ACC_ORDER=0` turns it off, read once per
+/// process): an accessor defined among an object literal's data properties
+/// then costs no key-order log, and the data adds after it keep their
+/// cached transitions.
+fn implicit_order_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_ACC_ORDER").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
 
 /// A single attribute list this short is scanned even when indexed: a few
 /// string compares beat a tree walk (a built-in prototype with many hidden
@@ -747,6 +777,7 @@ static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
     class_tag: NO_CLASS_TAG,
     hidden_prefix: 0,
     key_order: None,
+    acc_at: [0; ACC_AT_MAX],
     index: None,
 };
 
@@ -762,6 +793,7 @@ impl Default for ObjectExtra {
             class_tag: NO_CLASS_TAG,
             hidden_prefix: 0,
             key_order: None,
+            acc_at: [0; ACC_AT_MAX],
             index: None,
         }
     }
@@ -1421,9 +1453,47 @@ impl Object {
     /// re-slots into that same position rather than being appended at the end.
     pub fn ensure_key_order(&mut self) {
         if self.ex().key_order.is_none() {
-            let order = self.keys().into_iter().map(Box::from).collect();
+            // (The implicit order, when there are accessors: the data keys
+            // with them interleaved.)
+            let order = self.implicit_keys().into_iter().map(Box::from).collect();
             self.extra_mut().set_order(order);
         }
+    }
+
+    /// Writes an implicit key order (see `ObjectExtra::acc_at`) out to the
+    /// key-order log, before a change that form cannot describe. A no-op
+    /// for any other object.
+    #[inline]
+    fn materialize_order(&mut self) {
+        if self
+            .extra
+            .as_deref()
+            .is_some_and(|x| x.key_order.is_none() && !x.accessors.is_empty())
+        {
+            self.ensure_key_order();
+        }
+    }
+
+    /// The own keys in the order the object holds them while it keeps no
+    /// key-order log: its data keys, each accessor right before the data key
+    /// it was defined ahead of (`ObjectExtra::acc_at`).
+    fn implicit_keys(&self) -> Vec<&str> {
+        let x = self.ex();
+        let data = self.keys();
+        if x.accessors.is_empty() {
+            return data;
+        }
+        debug_assert!(x.accessors.len() <= ACC_AT_MAX && !self.is_dict());
+        let mut out = Vec::with_capacity(data.len() + x.accessors.len());
+        let mut acc = x.accessors.iter().zip(x.acc_at).peekable();
+        for (j, k) in data.into_iter().enumerate() {
+            while let Some(((name, _, _), _)) = acc.next_if(|&(_, at)| at as usize <= j) {
+                out.push(name.as_ref());
+            }
+            out.push(k);
+        }
+        out.extend(acc.map(|((name, _, _), _)| name.as_ref()));
+        out
     }
 
     /// The unified own-key order (data + accessor) reconstructed from the
@@ -1464,9 +1534,7 @@ impl Object {
         if self.ex().key_order.is_some() {
             self.merged_key_order()
         } else {
-            let mut keys = self.keys();
-            keys.extend(self.ex().accessors.iter().map(|(k, _, _)| k.as_ref()));
-            keys
+            self.implicit_keys()
         }
     }
 
@@ -2022,14 +2090,83 @@ impl Object {
         Some(self.ex().class_tag).filter(|&t| t != NO_CLASS_TAG)
     }
 
+    /// A new configurable accessor property `name` (no own property of that
+    /// name exists), enumerable or not: what clearing its attribute marks,
+    /// [`define_accessor`](Self::define_accessor) and marking its
+    /// enumerability do — the marks' steps skipped when the object records
+    /// no mark at all (their usual state), as there is none to clear.
+    pub fn define_new_accessor(
+        &mut self,
+        name: &str,
+        getter: NanBox,
+        setter: NanBox,
+        enumerable: bool,
+    ) {
+        let unmarked = !self.implied_attrs()
+            && self.extra.as_deref().is_none_or(|x| {
+                x.readonly.is_empty()
+                    && x.hidden.is_empty()
+                    && x.non_configurable.is_empty()
+                    && x.hidden_prefix == 0
+            });
+        if unmarked {
+            self.define_accessor(name, getter, setter);
+            if !enumerable {
+                self.set_hidden(name);
+            }
+            return;
+        }
+        self.clear_readonly(name);
+        self.define_accessor(name, getter, setter);
+        if enumerable {
+            self.clear_hidden(name);
+        } else {
+            self.set_hidden(name);
+        }
+        self.clear_non_configurable(name);
+    }
+
     /// Defines an accessor property `name` with `getter`/`setter` (either may be
     /// `undefined`). Replaces an existing accessor of the same name.
     pub fn define_accessor(&mut self, name: &str, getter: NanBox, setter: NanBox) {
         self.global_attrs_changed();
         self.materialize_implied_attrs();
-        // Start tracking unified key order the moment an accessor is involved: seed
-        // the log with the current data keys (their chronological order) so this and
-        // every later new key slot into the correct interleaved position.
+        // A new accessor of a shaped object whose order is implicit (or has
+        // no accessor yet), under a name no data key has: its place in the
+        // order is the data-key count now (`ObjectExtra::acc_at`).
+        if implicit_order_on()
+            && !self.is_dict()
+            && self.ex().key_order.is_none()
+            && self.ex().accessors.len() < ACC_AT_MAX
+            && self.ex().acc_pos(name).is_none()
+            && self.shape.lookup(name).is_none()
+        {
+            let at = self.shape.len();
+            let x = self.extra_mut();
+            x.acc_at[x.accessors.len()] = at;
+            x.add_acc(name, getter, setter);
+            self.bump_key_epoch();
+            return;
+        }
+        // An implicit order's accessor redefined (`{ get a() {}, set a(v) {} }`):
+        // its place stays.
+        if self.ex().key_order.is_none()
+            && let Some(x) = self.extra.as_deref_mut()
+            && let Some(i) = x.acc_pos(name)
+        {
+            let a = &mut x.accessors[i];
+            if !matches!(getter.unpack(), crate::nanbox::Unpacked::Undefined) {
+                a.1 = getter;
+            }
+            if !matches!(setter.unpack(), crate::nanbox::Unpacked::Undefined) {
+                a.2 = setter;
+            }
+            self.bump_key_epoch();
+            return;
+        }
+        // Otherwise track the unified key order: seed the log with the current
+        // keys (their chronological order) so this and every later new key slot
+        // into the correct interleaved position.
         self.ensure_key_order();
         let x = self.extra_mut();
         if let Some(i) = x.acc_pos(name) {
@@ -2473,6 +2610,7 @@ impl Object {
             return;
         }
         self.materialize_implied_attrs();
+        self.materialize_order();
         self.write_out_hidden_prefix();
         let keys = self.shape.keys();
         let mut order: Vec<Option<DictKey>> = Vec::with_capacity(keys.len());
@@ -2959,6 +3097,8 @@ impl Object {
     /// intact — used when a `defineProperty` replaces an accessor with data.
     pub fn clear_accessor(&mut self, key: &str) {
         self.bump_key_epoch();
+        // (An accessor turned into data keeps its place: a logged one.)
+        self.materialize_order();
         if let Some(x) = self.extra.as_deref_mut() {
             x.remove_acc(key);
         }
@@ -2969,6 +3109,7 @@ impl Object {
     /// `defineProperty` converts a data property into an accessor.
     pub fn delete_data(&mut self, root: Rc<Shape>, key: &str) {
         self.materialize_implied_attrs();
+        self.materialize_order();
         self.write_out_hidden_prefix();
         self.bump_key_epoch();
         if self.is_dict() {
@@ -3010,6 +3151,7 @@ impl Object {
     /// removed.
     pub fn delete(&mut self, root: Rc<Shape>, key: &str) -> bool {
         self.materialize_implied_attrs();
+        self.materialize_order();
         self.write_out_hidden_prefix();
         self.bump_key_epoch();
         let had_accessor = self.extra.as_deref_mut().is_some_and(|x| x.remove_acc(key));

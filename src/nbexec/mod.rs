@@ -10042,17 +10042,26 @@ impl crate::nbvm::VmHost for Interp {
         ) else {
             return Err(crate::nbvm::HostError::Fault);
         };
-        let name = self.member_key(key);
         // Bit 4: an object literal's (enumerable) definition.
         let enumerable = kind & 4 != 0;
         let kind = kind & 3;
-        // SetFunctionName: a symbol key names the function `[description]`.
-        let prefix = match kind {
-            1 => "get",
-            2 => "set",
-            _ => "",
+        // The property key and (SetFunctionName: a symbol key names the
+        // function `[description]`) the function's name, each evaluation of
+        // a literal's definition under the same key String alike.
+        let (name, fname) = match self.realm.method_names(key, kind) {
+            Some(names) => names,
+            None => {
+                let name = self.member_key(key);
+                let prefix = match kind {
+                    1 => "get",
+                    2 => "set",
+                    _ => "",
+                };
+                let fname = self.realm.function_name_for_key(key, prefix);
+                self.realm.note_method_names(key, kind, &name, &fname)
+            }
         };
-        let fname = self.realm.function_name_for_key(key, prefix);
+        let (name, fname): (&str, &[u8]) = (&name, &fname);
         // A closure whose synthesized `name` already reads `fname` (a
         // method compiled under its static key's name) keeps it as it is.
         let named = self
@@ -10060,18 +10069,18 @@ impl crate::nbvm::VmHost for Interp {
             .vm_fn_meta_value(f, "name")
             .and_then(|m| m.as_handle())
             .and_then(|m| self.realm.string_leaf_bytes(Handle::from_raw(m)))
-            .is_some_and(|b| b == fname.as_slice());
+            .is_some_and(|b| b == fname);
         let nv = if named {
             None
         } else {
-            Some(self.new_str_bytes(fname.clone()))
+            Some(self.new_str_bytes(fname.to_vec()))
         };
-        if self.define_method_fast(o, f, &name, nv, kind, enumerable) {
+        if self.define_method_fast(o, f, name, nv, kind, enumerable) {
             return Ok(());
         }
         let nv = match nv {
             Some(v) => v,
-            None => self.new_str_bytes(fname),
+            None => self.new_str_bytes(fname.to_vec()),
         };
         let nd = self.realm.new_object();
         self.realm.set_property(nd, "value", nv);
