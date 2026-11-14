@@ -243,6 +243,43 @@ impl Realm {
         self.regexp_default_proto
     }
 
+    /// `a < b` for two plain string cells both held in their rope nodes
+    /// with at most 32 bytes (`Rope::small_words`), compared a word at a
+    /// time: their code-unit order, as `nbvm::string_lt` decides it (WTF-8
+    /// byte order at the first difference, unless an astral character's
+    /// lead byte is there: then `Some(None)`, for that function's answer).
+    /// `None` for any other operands.
+    #[inline]
+    pub(crate) fn small_string_lt(&self, a: Handle, b: Handle) -> Option<Option<bool>> {
+        if self.str_special {
+            return None;
+        }
+        let (Some(Cell::Str(x)), Some(Cell::Str(y))) = (self.heap.get_hot(a), self.heap.get_hot(b))
+        else {
+            return None;
+        };
+        let ((lx, wx), (ly, wy)) = (x.small_words()?, y.small_words()?);
+        for k in 0..4 {
+            let d = wx[k] ^ wy[k];
+            if d != 0 {
+                let i = k * 8 + (d.trailing_zeros() / 8) as usize;
+                if i >= lx.min(ly) {
+                    // (Past the shorter text: its zero padding against the
+                    // longer's bytes, so the shorter is a prefix.)
+                    return Some(Some(lx < ly));
+                }
+                let byte = |w: u64| (w >> (8 * (i % 8))) as u8;
+                let (p, q) = (byte(wx[k]), byte(wy[k]));
+                return Some(if p >= 0xF0 || q >= 0xF0 {
+                    None
+                } else {
+                    Some(p < q)
+                });
+            }
+        }
+        Some(Some(lx < ly))
+    }
+
     /// The WTF-8 bytes of two string values, each flattened first (a
     /// concatenation is joined once, then served as a leaf): `None` unless
     /// both are string cells with no auxiliary object (no function marker,

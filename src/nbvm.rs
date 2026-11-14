@@ -7324,6 +7324,21 @@ fn vm_lt(
 /// order as its unit does among the BMP's). Each operand is flattened
 /// first, so a concatenated key is joined once rather than at every
 /// comparison. `None`, having compared nothing, for anything else.
+/// Whether [`string_lt`] compares two short strings held in their nodes a
+/// word at a time (`Realm::small_string_lt`): `KATAAN_STRLT_SMALL=0` turns
+/// it off; read once per process.
+fn small_lt_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_STRLT_SMALL").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// `Op::Compare`'s relational operator `op` (0 `<`, 1 `>`, 2 `<=`, 3 `>=`)
 /// on two strings, by [`string_lt`]: `>` is `<` swapped, `<=` / `>=` the
 /// negation of the swapped `<` (no NaN among strings). `None` when
@@ -7342,6 +7357,12 @@ fn string_lt(realm: &mut Realm, a: NanBox, b: NanBox) -> Option<bool> {
         Handle::from_raw(a.as_handle()?),
         Handle::from_raw(b.as_handle()?),
     );
+    // Two short texts held in their nodes: a word at a time.
+    if small_lt_enabled()
+        && let Some(lt) = realm.small_string_lt(ha, hb)
+    {
+        return lt;
+    }
     let (x, y) = realm.plain_string_pair(ha, hb)?;
     // The first difference decides. Before it, both hold the same
     // characters; at it, WTF-8 byte order is code-unit order unless an
