@@ -3060,7 +3060,8 @@ pub(crate) struct InlineEmit<'a> {
 }
 
 /// An inlined `new`'s **pre-initialised** allocation
-/// (`KATAAN_JIT_PREINIT`, see [`preinit_enabled`]): the constructor body,
+/// (`KATAAN_JIT_PREINIT`, see [`preinit_enabled`]), outside promoted loops
+/// (whose versions would each emit the guard): the constructor body,
 /// from its guard on, is copies between registers and then a straight run
 /// of fresh adds to `this` (`recv_cache::fresh_adds`), whose values are
 /// already in their registers at the guard. The guard then makes the object
@@ -4117,7 +4118,7 @@ fn emit_inline_new_this_made(
         a.p_alloc_object_preinit(
             super::compute_jit_layout(),
             e.layout.realm,
-            (&p.sites, p.max_slot),
+            (&p.sites, p.max_slot, proven),
             &p.run,
             plain,
         );
@@ -4151,7 +4152,13 @@ fn emit_inline_new_this_made(
         a.g_store(RBP, w.key, r::RAX);
         a.g_store(RBP, w.cell, r::RCX);
     }
-    record(a);
+    // (A pre-initialised site's proof vouches for that path's checks of
+    // the world outside the object too: only that path records it. The
+    // guard is emitted once, outside any promoted loop, so no other copy
+    // of it records the proof without them.)
+    if e.pre_init.is_none() {
+        record(a);
+    }
     if let Some(alloc) = e.new_alloc {
         a.jmp(made);
         // The free list is empty: the allocation the call's sequence would

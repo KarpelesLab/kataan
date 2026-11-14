@@ -3444,14 +3444,17 @@ impl X64Assembler {
     /// is as the chain's sites `sites` (largest slot `max_slot`) recorded
     /// it ([`Self::p_add_fresh_proof`]), every value keeps the last
     /// layout's record of its Number-only slots, and the heap has a free
-    /// slot. Then `rax` = the object's handle bits and `rcx` its heap slot;
+    /// slot. (`proven`: no Rust code has run since these checks last passed
+    /// here, so what [`Self::p_add_fresh_proof`] reads, which only Rust
+    /// code changes, is as they found it: not checked again.)
+    /// Then `rax` = the object's handle bits and `rcx` its heap slot;
     /// otherwise to `miss`, having changed nothing (but the chain's proof,
     /// a fact). Clobbers `rax`, `rcx`, `rdx`, `r8`, `r9`, `r11`.
     pub(crate) fn p_alloc_object_preinit(
         &mut self,
         l: &JitLayout,
         realm_off: i32,
-        (sites, max_slot): (&[*const MethodSite], u32),
+        (sites, max_slot, proven): (&[*const MethodSite], u32, bool),
         run: &[(BakedAdd, i32, bool)],
         miss: Label,
     ) {
@@ -3473,7 +3476,9 @@ impl X64Assembler {
         self.g_movabs(r::R11, first.from);
         self.g_cmp_mem(r::R11, r::R9, p.root_shape);
         self.g_jcc(cc::NE, miss);
-        self.p_add_fresh_proof(l, realm_off, sites, max_slot, miss);
+        if !proven {
+            self.p_add_fresh_proof(l, realm_off, sites, max_slot, miss);
+        }
         for &(b, d, number) in run {
             if !number && b.slot < 64 && last.num_mask & (1 << b.slot) != 0 {
                 self.g_load(r::RAX, r::RBX, d);
