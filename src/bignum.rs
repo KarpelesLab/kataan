@@ -9,8 +9,193 @@
 //! foreign code; `no_std` + `alloc`.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 use puremp::Int;
+
+/// Whether the engine's own fast paths over the backend run (a remainder by
+/// one limb, bitwise ops of non-negatives; `KATAAN_BIGINT_FAST=0` turns them
+/// off, read once per process).
+#[cfg(feature = "std")]
+fn fast_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_BIGINT_FAST").is_none_or(|v| v != "0"))
+}
+
+#[cfg(not(feature = "std"))]
+fn fast_enabled() -> bool {
+    true
+}
+
+/// The largest operand (in 64-bit limbs) the engine's own multiplication and
+/// division take: values of a few hundred bits, the size of a modular
+/// exponentiation's or a hash's, where the backend's general dispatch and
+/// its scratch allocations cost more than the arithmetic. (A dividend may
+/// have twice as many: a product of two such values.)
+const SMALL_LIMBS: usize = 8;
+
+/// The sign of a non-zero result that is negative when `neg`.
+fn sign_of(neg: bool) -> puremp::Sign {
+    if neg {
+        puremp::Sign::Negative
+    } else {
+        puremp::Sign::Positive
+    }
+}
+
+/// The schoolbook product of two magnitudes (little-endian limbs), as
+/// `a.len() + b.len()` limbs (a top zero limb included when there is one).
+fn mul_limbs(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = alloc::vec![0u64; a.len() + b.len()];
+    for (i, &x) in a.iter().enumerate() {
+        let (row, rest) = out[i..].split_at_mut(b.len());
+        let mut carry = 0u64;
+        for (o, &y) in row.iter_mut().zip(b) {
+            // x*y + out + carry < 2^128: (2^64-1)^2 + 2(2^64-1) = 2^128 - 1.
+            let t = u128::from(x) * u128::from(y) + u128::from(*o) + u128::from(carry);
+            *o = t as u64;
+            carry = (t >> 64) as u64;
+        }
+        rest[0] = carry;
+    }
+    out
+}
+
+/// `(u1·2^64 + u0) / d` and its remainder, for a normalized `d` (top bit
+/// set) with reciprocal `v = ⌊(2^128 − 1) / d⌋ − 2^64` and `u1 < d` (so the
+/// quotient fits a limb), by two multiplications ("Improved division by
+/// invariant integers", Möller & Granlund, 2011, Algorithm 4).
+#[inline]
+fn div_2by1(u1: u64, u0: u64, d: u64, v: u64) -> (u64, u64) {
+    let q = (u128::from(v) * u128::from(u1)).wrapping_add((u128::from(u1) << 64) | u128::from(u0));
+    let mut q1 = ((q >> 64) as u64).wrapping_add(1);
+    let q0 = q as u64;
+    let mut r = u0.wrapping_sub(q1.wrapping_mul(d));
+    if r > q0 {
+        q1 = q1.wrapping_sub(1);
+        r = r.wrapping_add(d);
+    }
+    if r >= d {
+        q1 = q1.wrapping_add(1);
+        r -= d;
+    }
+    (q1, r)
+}
+
+/// The magnitude `a` modulo the non-zero limb `d`: a pass from the top limb
+/// down, scaled so the divisor is normalized (the remainder then scaled back).
+fn rem_1(a: &[u64], d: u64) -> u64 {
+    debug_assert!(d != 0);
+    let s = d.leading_zeros();
+    let dn = d << s;
+    let v = (u128::MAX / u128::from(dn) - (1u128 << 64)) as u64;
+    let Some(&top) = a.last() else {
+        return 0;
+    };
+    let mut rem = if s == 0 { 0 } else { top >> (64 - s) };
+    for i in (0..a.len()).rev() {
+        let lo = if s == 0 || i == 0 {
+            0
+        } else {
+            a[i - 1] >> (64 - s)
+        };
+        rem = div_2by1(rem, (a[i] << s) | lo, dn, v).1;
+    }
+    rem >> s
+}
+
+/// Knuth's long division (TAOCP vol. 2, §4.3.1, Algorithm D) of the
+/// magnitude `a` by the magnitude `b` (2..=[`SMALL_LIMBS`] limbs, top limb
+/// non-zero; `a` at most twice that), in place on stack buffers: the
+/// quotient's limbs (only when `want_q`, else empty) and the remainder's.
+fn div_limbs(a: &[u64], b: &[u64], want_q: bool) -> (Vec<u64>, Vec<u64>) {
+    let n = b.len();
+    debug_assert!((2..=SMALL_LIMBS).contains(&n) && b[n - 1] != 0);
+    debug_assert!(a.len() <= SMALL_LIMBS * 2);
+    if a.len() < n {
+        return (Vec::new(), a.to_vec());
+    }
+    let m = a.len() - n;
+    // Normalize: shift both left until the divisor's top bit is set; the
+    // dividend gains a top limb for the bits shifted out.
+    let s = b[n - 1].leading_zeros();
+    let shl = |x: &[u64], out: &mut [u64]| {
+        let mut prev = 0u64;
+        for (o, &v) in out.iter_mut().zip(x) {
+            *o = if s == 0 {
+                v
+            } else {
+                (v << s) | (prev >> (64 - s))
+            };
+            prev = v;
+        }
+        if s != 0 { prev >> (64 - s) } else { 0 }
+    };
+    let mut d = [0u64; SMALL_LIMBS];
+    shl(b, &mut d[..n]);
+    let mut u = [0u64; SMALL_LIMBS * 2 + 1];
+    u[a.len()] = shl(a, &mut u[..a.len()]);
+    let mut q = [0u64; SMALL_LIMBS * 2 + 1];
+    let (d1, d2) = (u128::from(d[n - 1]), u128::from(d[n - 2]));
+    const B: u128 = 1 << 64;
+    // The reciprocal of the normalized top limb, for two-by-one divisions by
+    // multiplication (Möller–Granlund): one 128-bit division per call.
+    let v = (u128::MAX / d1 - B) as u64;
+    for j in (0..=m).rev() {
+        // Estimate the quotient digit from the top two limbs (at most B - 1:
+        // the top limb never exceeds the divisor's), then correct it with
+        // the next one: it is then exact or one too large.
+        let (mut qhat, mut rhat) = if u[j + n] >= d[n - 1] {
+            (u64::MAX, u128::from(u[j + n - 1]) + d1)
+        } else {
+            let (q, r) = div_2by1(u[j + n], u[j + n - 1], d[n - 1], v);
+            (q, u128::from(r))
+        };
+        while rhat < B && u128::from(qhat) * d2 > ((rhat << 64) | u128::from(u[j + n - 2])) {
+            qhat -= 1;
+            rhat += d1;
+        }
+        // u[j..=j+n] -= qhat * d. The running carry also takes the borrow:
+        // qhat * d[i] + carry <= 2^128 - 2^64, so its high limb stays below
+        // 2^64 - 1 and one more fits.
+        let (window, top) = u[j..=j + n].split_at_mut(n);
+        let mut carry = 0u64;
+        for (ui, &di) in window.iter_mut().zip(&d[..n]) {
+            let p = u128::from(qhat) * u128::from(di) + u128::from(carry);
+            let (t, b) = ui.overflowing_sub(p as u64);
+            *ui = t;
+            carry = (p >> 64) as u64 + u64::from(b);
+        }
+        let (t, b) = top[0].overflowing_sub(carry);
+        top[0] = t;
+        if b {
+            // One too large: add the divisor back.
+            qhat -= 1;
+            let mut c = 0u64;
+            for (ui, &di) in window.iter_mut().zip(&d[..n]) {
+                let (t, c1) = ui.overflowing_add(di);
+                let (t, c2) = t.overflowing_add(c);
+                *ui = t;
+                c = u64::from(c1 | c2);
+            }
+            top[0] = top[0].wrapping_add(c);
+        }
+        q[j] = qhat;
+    }
+    // The remainder is u[..n], shifted back.
+    let mut r = Vec::with_capacity(n);
+    for i in 0..n {
+        let hi = if s == 0 || i + 1 == n {
+            0
+        } else {
+            u[i + 1] << (64 - s)
+        };
+        r.push(if s == 0 { u[i] } else { (u[i] >> s) | hi });
+    }
+    let q = if want_q { q[..=m].to_vec() } else { Vec::new() };
+    (q, r)
+}
 
 /// An arbitrary-precision signed integer.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -141,6 +326,11 @@ impl BigInt {
     /// Returns `self * other`.
     #[must_use]
     pub fn mul(&self, other: &Self) -> Self {
+        let (a, b) = (self.0.limbs(), other.0.limbs());
+        if fast_enabled() && a.len() >= 2 && b.len() >= 2 && a.len() + b.len() <= SMALL_LIMBS * 2 {
+            let neg = self.0.is_negative() != other.0.is_negative();
+            return Self(Int::from_limb_vec(sign_of(neg), mul_limbs(a, b)));
+        }
         Self(self.0.mul(&other.0))
     }
 
@@ -148,27 +338,114 @@ impl BigInt {
     /// the remainder takes the dividend's sign. Returns `None` on divide-by-zero.
     #[must_use]
     pub fn divmod(&self, other: &Self) -> Option<(Self, Self)> {
+        if let Some((q, r)) = self.small_div(other, true) {
+            let qneg = self.0.is_negative() != other.0.is_negative();
+            return Some((
+                Self(Int::from_limb_vec(sign_of(qneg), q)),
+                Self(Int::from_limb_vec(sign_of(self.0.is_negative()), r)),
+            ));
+        }
         // `div_rem` is truncated (toward-zero): the remainder takes the
         // dividend's sign, matching BigInt `/` and `%`. `None` on divide-by-zero.
         self.0.div_rem(&other.0).map(|(q, r)| (Self(q), Self(r)))
     }
 
+    /// The magnitudes' quotient (empty unless `want_q`) and remainder by
+    /// [`div_limbs`], when the divisor has 2..=[`SMALL_LIMBS`] limbs and the
+    /// dividend at most twice that (and the fast paths are on); `None` for
+    /// anything else, the backend's division then deciding.
+    fn small_div(&self, other: &Self, want_q: bool) -> Option<(Vec<u64>, Vec<u64>)> {
+        let (a, b) = (self.0.limbs(), other.0.limbs());
+        (fast_enabled() && (2..=SMALL_LIMBS).contains(&b.len()) && a.len() <= SMALL_LIMBS * 2)
+            .then(|| div_limbs(a, b, want_q))
+    }
+
+    /// `self % other` (truncated: the remainder takes the dividend's sign),
+    /// `None` on divide-by-zero. A divisor of one limb is a Horner pass over
+    /// the dividend's limbs, with no quotient built.
+    #[must_use]
+    pub fn rem(&self, other: &Self) -> Option<Self> {
+        if fast_enabled()
+            && let [d] = other.0.limbs()
+        {
+            // A zero remainder is the (unsigned) zero.
+            let r = Int::from_u64(rem_1(self.0.limbs(), *d));
+            return Some(Self(if self.0.is_negative() { r.neg() } else { r }));
+        }
+        if let Some((_, r)) = self.small_div(other, false) {
+            return Some(Self(Int::from_limb_vec(sign_of(self.0.is_negative()), r)));
+        }
+        self.divmod(other).map(|(_, r)| r)
+    }
+
     /// Bitwise AND (two's-complement).
     #[must_use]
     pub fn bitand(&self, other: &Self) -> Self {
+        if fast_enabled() {
+            let (a, b) = (&self.0, &other.0);
+            match (a.is_negative(), b.is_negative()) {
+                // Two non-negatives: the limbs ANDed, as long as the shorter.
+                (false, false) => {
+                    let v: alloc::vec::Vec<u64> = a
+                        .limbs()
+                        .iter()
+                        .zip(b.limbs())
+                        .map(|(x, y)| x & y)
+                        .collect();
+                    return Self(Int::from_limb_vec(puremp::Sign::Positive, v));
+                }
+                // A non-negative of one limb (or zero) and a negative: the
+                // negative's low two's-complement limb (`-m mod 2^64`) masked.
+                (false, true) | (true, false) => {
+                    let (p, n) = if b.is_negative() { (a, b) } else { (b, a) };
+                    if p.limbs().len() <= 1 {
+                        let low = n.least_significant_limb().wrapping_neg();
+                        return Self(Int::from_u64(low & p.least_significant_limb()));
+                    }
+                }
+                (true, true) => {}
+            }
+        }
         Self(self.0.bitand(&other.0))
     }
 
     /// Bitwise OR (two's-complement).
     #[must_use]
     pub fn bitor(&self, other: &Self) -> Self {
+        if let Some(v) = self.nonneg_limbwise(other, |x, y| x | y) {
+            return v;
+        }
         Self(self.0.bitor(&other.0))
     }
 
     /// Bitwise XOR (two's-complement).
     #[must_use]
     pub fn bitxor(&self, other: &Self) -> Self {
+        if let Some(v) = self.nonneg_limbwise(other, |x, y| x ^ y) {
+            return v;
+        }
         Self(self.0.bitxor(&other.0))
+    }
+
+    /// `op` limb by limb over two non-negatives, the shorter one zero-extended
+    /// (an OR or XOR, for which `op(x, 0) == x`); `None` when either operand
+    /// is negative.
+    fn nonneg_limbwise(&self, other: &Self, op: impl Fn(u64, u64) -> u64) -> Option<Self> {
+        let (a, b) = (&self.0, &other.0);
+        if !fast_enabled() || a.is_negative() || b.is_negative() {
+            return None;
+        }
+        let (long, short) = if a.limbs().len() >= b.limbs().len() {
+            (a.limbs(), b.limbs())
+        } else {
+            (b.limbs(), a.limbs())
+        };
+        let v: alloc::vec::Vec<u64> = long
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| op(x, short.get(i).copied().unwrap_or(0)))
+            .collect();
+        Some(Self(Int::from_limb_vec(puremp::Sign::Positive, v)))
     }
 
     /// Returns `self * 2^k` (a left shift by `k` bits).
@@ -181,6 +458,38 @@ impl BigInt {
     /// a negative value with any of its low `k` bits set rounds down).
     #[must_use]
     pub fn shr_floor_bits(&self, k: u32) -> Self {
+        let a = self.0.limbs();
+        if fast_enabled() && a.len() >= 2 && (k as usize) < a.len() * 64 {
+            // The magnitude shifted right by whole limbs then bits; a negative
+            // value that loses a set bit rounds away from zero (floor).
+            let (w, s) = ((k / 64) as usize, k % 64);
+            let mut lost = a[..w].iter().any(|&l| l != 0) || (s != 0 && a[w] << (64 - s) != 0);
+            let mut v: Vec<u64> = (w..a.len())
+                .map(|i| {
+                    let hi = if s == 0 || i + 1 == a.len() {
+                        0
+                    } else {
+                        a[i + 1] << (64 - s)
+                    };
+                    (a[i] >> s) | hi
+                })
+                .collect();
+            let neg = self.0.is_negative();
+            if neg && lost {
+                for l in &mut v {
+                    let (t, c) = l.overflowing_add(1);
+                    *l = t;
+                    lost = c;
+                    if !c {
+                        break;
+                    }
+                }
+                if lost {
+                    v.push(1);
+                }
+            }
+            return Self(Int::from_limb_vec(sign_of(neg), v));
+        }
         let q = self.0.div_2k_trunc(u64::from(k));
         if self.0.is_negative() && self.0.trailing_zeros() < k {
             Self(q.sub(&Int::from(1i32)))
@@ -359,6 +668,88 @@ mod tests {
         // Beyond i128 width.
         let big = b("2").pow(200);
         assert_eq!(big.bitor(&BigInt::from_i128(1)).sub(&big).to_string(), "1");
+    }
+
+    /// The engine's own small-operand paths (multiplication, Knuth division,
+    /// one-limb remainder, shifts, bitwise ops of non-negatives) agree with
+    /// the backend's general algorithms on random and edge-pattern operands
+    /// of every sign.
+    #[test]
+    fn fast_paths_match_backend() {
+        use alloc::vec::Vec;
+        use puremp::{Int, Sign};
+        let mut st = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let gen_limb = |rnd: &mut dyn FnMut() -> u64| match rnd() % 6 {
+            0 => 0,
+            1 => u64::MAX,
+            2 => 1u64 << (rnd() % 64),
+            3 => u64::MAX >> (rnd() % 64),
+            _ => rnd(),
+        };
+        for _ in 0..20000 {
+            let make = |rnd: &mut dyn FnMut() -> u64| {
+                let len = (rnd() % 18) as usize;
+                let limbs: Vec<u64> = (0..len).map(|_| gen_limb(rnd)).collect();
+                let sign = if rnd() % 2 == 0 {
+                    Sign::Positive
+                } else {
+                    Sign::Negative
+                };
+                BigInt(Int::from_limbs(sign, &limbs))
+            };
+            let x = make(&mut rnd);
+            let y = make(&mut rnd);
+            assert_eq!(x.mul(&y).0, x.0.mul(&y.0), "{x} * {y}");
+            if !y.is_zero() {
+                let (q, r) = x.0.div_rem(&y.0).unwrap();
+                let (fq, fr) = x.divmod(&y).unwrap();
+                assert_eq!((fq.0, fr.0), (q, r.clone()), "{x} divmod {y}");
+                assert_eq!(x.rem(&y).unwrap().0, r, "{x} % {y}");
+            }
+            assert_eq!(x.bitand(&y).0, x.0.bitand(&y.0), "{x} & {y}");
+            assert_eq!(x.bitor(&y).0, x.0.bitor(&y.0), "{x} | {y}");
+            assert_eq!(x.bitxor(&y).0, x.0.bitxor(&y.0), "{x} ^ {y}");
+            let k = (rnd() % 1200) as u32;
+            let q = x.0.div_2k_trunc(u64::from(k));
+            let want = if x.0.is_negative() && x.0.trailing_zeros() < k {
+                q.sub(&Int::from(1i32))
+            } else {
+                q
+            };
+            assert_eq!(x.shr_floor_bits(k).0, want, "{x} >> {k}");
+        }
+    }
+
+    /// The reciprocal two-by-one division agrees with `u128` division.
+    #[test]
+    fn div_2by1_matches_u128() {
+        let mut st = 0x2545_f491_4f6c_dd1du64;
+        for i in 0..200_000u64 {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            let d = (st | (1 << 63)) >> (i % 3 == 0) as u32 | (1 << 63);
+            let u1 = if i % 5 == 0 {
+                d - 1
+            } else {
+                st.rotate_left(17) % d
+            };
+            let u0 = if i % 7 == 0 {
+                u64::MAX
+            } else {
+                st.rotate_left(31)
+            };
+            let v = (u128::MAX / u128::from(d) - (1u128 << 64)) as u64;
+            let n = (u128::from(u1) << 64) | u128::from(u0);
+            let want = ((n / u128::from(d)) as u64, (n % u128::from(d)) as u64);
+            assert_eq!(super::div_2by1(u1, u0, d, v), want, "{u1:x}:{u0:x} / {d:x}");
+        }
     }
 
     #[test]

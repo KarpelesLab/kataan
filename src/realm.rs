@@ -4102,8 +4102,11 @@ impl Realm {
                 if y.is_zero() {
                     return Err(true);
                 }
-                let (q, r) = x.divmod(y).ok_or(true)?;
-                if op == B::Div { q } else { r }
+                if op == B::Mod {
+                    x.rem(y).ok_or(true)?
+                } else {
+                    x.divmod(y).ok_or(true)?.0
+                }
             }
             B::BitAnd => x.bitand(y),
             B::BitOr => x.bitor(y),
