@@ -3179,6 +3179,13 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
         };
         out.push(lowered);
     }
+    // Each keyed read's call site for a getter it calls (`key_sites`),
+    // before the interpreter ops' own.
+    n_calls += proto
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::GetKey { .. }))
+        .count();
     // The interpreter ops compiled with a call site of their own, in pc order
     // after every other site (see `interp_sites`).
     for op in &proto.ops {
@@ -3243,6 +3250,37 @@ fn interp_sites(
             _ => None,
         };
         out.push(here);
+    }
+    Some(out)
+}
+
+/// Per bytecode op, the call site of an `Op::GetKey` (a keyed read's getter
+/// call, `KATAAN_JIT_GETKEY`): the sites `lower_nbvm_generic` puts just before
+/// the interpreter ops' own (`interp_sites`), in pc order.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn key_sites(bytecode: &[crate::nbvm::Op], n_sites: usize) -> Option<Vec<Option<u16>>> {
+    use crate::nbvm::Op;
+    let (mut keys, mut extra) = (0usize, 0usize);
+    for op in bytecode {
+        match op {
+            Op::GetKey { .. } => keys += 1,
+            Op::SuperCallArgs { .. }
+            | Op::CallSpreadPlain { .. }
+            | Op::SuperCtor { .. }
+            | Op::InitFields { .. } => extra += 1,
+            _ => {}
+        }
+    }
+    let mut site = n_sites.checked_sub(extra)?.checked_sub(keys)?;
+    let mut out = Vec::with_capacity(bytecode.len());
+    for op in bytecode {
+        out.push(if matches!(op, Op::GetKey { .. }) {
+            let v = u16::try_from(site).ok()?;
+            site += 1;
+            Some(v)
+        } else {
+            None
+        });
     }
     Some(out)
 }
@@ -3612,6 +3650,12 @@ pub struct GenericHelpers {
     /// [`get_elem`](Self::get_elem) for a key that is likely a `for-in`'s
     /// (`jit_helper_get_elem_key`): that case first.
     pub get_elem_key: JitAddHelper,
+    /// [`get_elem`](Self::get_elem) that hands a VM-function getter back
+    /// to compiled code to call (`jit_helper_get_elem_acc`, `KATAAN_JIT_GETKEY`).
+    pub get_elem_acc: JitElemAccHelper,
+    /// [`get_elem_acc`](Self::get_elem_acc)'s getter call made by the helper,
+    /// filling the op's call site (`jit_helper_get_elem_site`).
+    pub get_elem_site: JitElemSiteHelper,
     /// The computed element-set helper (`jit_helper_set_elem`) — `obj[key] = v`.
     pub set_elem: JitSetElemHelper,
     /// The `.length` helper (`jit_helper_array_len`) — `Op::ArrayLen`.
@@ -4182,6 +4226,18 @@ enum JitKind {
 /// `NanBox::jit_throw_bits`(crate::nanbox::NanBox::jit_throw_bits).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub type JitAddHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
+
+/// The ABI of `nbvm::jit_tier::getkey::jit_helper_get_elem_acc`:
+/// `(ctx, recv, key, out) -> value`, `*out` the getter compiled code calls
+/// with the receiver as `this` (`KATAAN_JIT_GETKEY`), or `0` when the
+/// result is the read's value (or the throw sentinel).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitElemAccHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, *mut u64) -> u64;
+
+/// The ABI of `nbvm::jit_tier::getkey::jit_helper_get_elem_site`:
+/// `(ctx, recv, key, call site) -> value`.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub type JitElemSiteHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, *mut CallSite) -> u64;
 
 /// The runtime-helper ABI for running one bytecode op on the body's register
 /// file: `(ctx, regs, n_regs, op) -> 0` (or the throw sentinel, with the fault in
@@ -8824,6 +8880,8 @@ impl JitFunction {
         let init_prop_helper = helpers.init_prop as usize as u64;
         let get_elem_helper = helpers.get_elem as usize as u64;
         let get_elem_key_helper = helpers.get_elem_key as usize as u64;
+        let get_elem_acc_helper = helpers.get_elem_acc as usize as u64;
+        let get_elem_site_helper = helpers.get_elem_site as usize as u64;
         // The registers that hold a `for-in`'s keys (an element of an
         // `EnumKeys` list, or a copy of one): an element read keyed by one
         // takes the helper that tries a `for-in` key first. (A guess only:
@@ -8901,6 +8959,12 @@ impl JitFunction {
         let construct_alloc_helper = helpers.construct_alloc as usize as u64;
         let super_twice_helper = helpers.super_twice as usize as u64;
         let interp_sites = interp_sites(bytecode, call_args.len(), call_sites.len())?;
+        // Each keyed read's getter call site (`KATAAN_JIT_GETKEY`).
+        let key_sites: Vec<Option<u16>> = if crate::realm::getkey_enabled() {
+            key_sites(bytecode, call_sites.len())?
+        } else {
+            Vec::new()
+        };
         // An inlined `super(…)`'s call op (`inline`'s construct sites: an
         // interpreter op with a call site of its own): its constructor,
         // `new.target` and `this` registers, its argument registers and its
@@ -16375,15 +16439,75 @@ impl JitFunction {
                             Some(x) => numeric::NumGen::gpr_from_xmm(&mut a, 2, x), // rdx
                             None => a.load_argreg(2, disp(index)),
                         }
-                        let h = if forin_keys.get(index as usize) == Some(&true) {
-                            get_elem_key_helper
+                        let forin_key = forin_keys.get(index as usize) == Some(&true);
+                        // A getter the read finds goes back here, called
+                        // through the op's own call site (`KATAAN_JIT_GETKEY`,
+                        // `jit_helper_get_elem_acc`: the method scratch slot
+                        // nonzero, the getter); when the call sequence cannot make the
+                        // call, `jit_helper_get_elem_site` reads again (a
+                        // pure lookup) and calls it. (Not for an index in
+                        // an SSE register: the site helper re-reads the key
+                        // from the register file.)
+                        let acc_site = key_sites
+                            .get(op_idx)
+                            .copied()
+                            .flatten()
+                            .filter(|_| !forin_key && index_x.is_none())
+                            .and_then(|k| call_sites.get(usize::from(k)).copied());
+                        if let Some(site) = acc_site {
+                            a.g_lea(call_seq::r::RCX, call_seq::r::RBP, method_scratch);
+                            a.movabs_rax(get_elem_acc_helper as i64);
+                            a.call_rax();
+                            throw_check!();
+                            let getter = a.new_label();
+                            a.g_load(call_seq::r::R11, call_seq::r::RBP, method_scratch);
+                            a.g_test(call_seq::r::R11);
+                            a.g_jcc(call_seq::cc::NE, getter);
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                            let cold = a.cold_begin();
+                            a.bind(getter);
+                            let gslow = a.new_label();
+                            call_seq::emit_call(
+                                &mut a,
+                                &call_seq::CallEmit {
+                                    dst,
+                                    callee: call_seq::CalleeSrc::Frame {
+                                        scratch: method_scratch,
+                                    },
+                                    this: Some(obj),
+                                    args: &[],
+                                    spread: None,
+                                    site,
+                                    layout: &helpers.call_layout,
+                                    throw_exit,
+                                    slow: gslow,
+                                    done,
+                                },
+                            )?;
+                            // jit_helper_get_elem_site(ctx, recv, key, site).
+                            a.bind(gslow);
+                            a.mov_rdi_r15();
+                            a.load_argreg(1, disp(obj));
+                            a.load_argreg(2, disp(index));
+                            a.movabs_argreg(3, site as i64);
+                            a.movabs_rax(get_elem_site_helper as i64);
+                            a.call_rax();
+                            throw_check!();
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                            a.cold_end(cold);
                         } else {
-                            get_elem_helper
-                        };
-                        a.movabs_rax(h as i64);
-                        a.call_rax();
-                        throw_check!();
-                        a.store_rax(disp(dst));
+                            let h = if forin_key {
+                                get_elem_key_helper
+                            } else {
+                                get_elem_helper
+                            };
+                            a.movabs_rax(h as i64);
+                            a.call_rax();
+                            throw_check!();
+                            a.store_rax(disp(dst));
+                        }
                     }
                     a.bind(done);
                 }

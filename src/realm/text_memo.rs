@@ -51,6 +51,13 @@ pub(super) const TEXT_MAX: usize = 24;
 /// [`Entry::slot`] of an absent entry.
 const ABSENT: u32 = u32::MAX;
 
+/// [`Entry::slot`] of an inherited-accessor entry: the key is on no object
+/// of the chain below [`Entry::holder`], which has it as an accessor (an
+/// absent entry's proof up to the holder). Past any slot count, so code
+/// that reads an entry's slot without knowing this kind (compiled code's
+/// `tp_probe`) bounds-checks it as a miss.
+const PROTO_ACC: u32 = u32::MAX - 1;
+
 /// [`Entry::proto`] for a `null` `[[Prototype]]` (no handle's bits).
 const NO_PROTO: u64 = u64::MAX;
 
@@ -183,6 +190,9 @@ struct Entry {
     /// the prototype epoch.
     proto: Slot<u64>,
     stamp: Slot<u64>,
+    /// For an inherited-accessor entry ([`PROTO_ACC`]): the holder's raw
+    /// handle (it carries its generation).
+    holder: Slot<u64>,
     /// What keeps the layout's address from being reused.
     hold: Slot<Option<Rc<Shape>>>,
 }
@@ -272,6 +282,9 @@ impl Realm {
             return None;
         }
         let slot = e.slot.get();
+        if slot == PROTO_ACC {
+            return None;
+        }
         if slot != ABSENT {
             return Some(TextHit::Slot(o, slot));
         }
@@ -307,52 +320,61 @@ impl Realm {
     /// so, recorded (flagging the chain's prototypes watched). `false`: it
     /// is present, or this cannot tell.
     pub(crate) fn key_text_note_absent(&mut self, obj: NanBox, key: NanBox) -> bool {
+        matches!(
+            self.key_text_note_chain(obj, key, false),
+            Some(ChainNote::Absent)
+        )
+    }
+
+    /// [`key_text_note_absent`](Self::key_text_note_absent), which also
+    /// records (when `acc`) a key that the chain's first holder has as an
+    /// accessor ([`PROTO_ACC`]): the walk proves the levels below it as an
+    /// absent entry proves them all, and flags them and the holder watched
+    /// (a watched object's accessor list changing bumps the epoch too). The
+    /// receiver may have accessors (`KATAAN_JIT_GETKEY`), but not one of the
+    /// key's name.
+    fn key_text_note_chain(&mut self, obj: NanBox, key: NanBox, acc: bool) -> Option<ChainNote> {
         const LEVELS: usize = 8;
-        let Some(t) = self.key_text_of(key) else {
-            return false;
-        };
-        let Some(kh) = key.as_handle() else {
-            return false;
-        };
-        let Some(k) = self
+        let t = self.key_text_of(key)?;
+        let k = self
             .heap
-            .get(Handle::from_raw(kh))
+            .get(Handle::from_raw(key.as_handle()?))
             .and_then(Cell::as_str)
             .and_then(|r| r.as_leaf_bytes())
             .filter(|b| b.first() != Some(&0))
-            .and_then(|b| core::str::from_utf8(b).ok())
-        else {
-            return false;
-        };
-        let Some((o, shape)) = self.key_text_receiver(obj) else {
-            return false;
-        };
-        if shape.is_wrapper() || shape.lookup(k).is_some() {
-            return false;
+            .and_then(|b| core::str::from_utf8(b).ok())?;
+        let (o, shape) = self.key_text_receiver_any(obj)?;
+        if shape.is_wrapper()
+            || shape.lookup(k).is_some()
+            || (!o.has_no_accessors() && (!getkey_enabled() || o.accessor(k).is_some()))
+        {
+            return None;
         }
         let (shape, proto) = (Rc::clone(shape), o.proto());
         let mut levels = [None; LEVELS];
         let mut cur = proto;
         let mut n = 0;
+        let mut holder = None;
         while let Some(h) = cur {
             if n == LEVELS {
-                return false;
+                return None;
             }
             let Some(Cell::Object(p)) = self.heap.get(h) else {
-                return false;
+                return None;
             };
-            let Some(ps) = p.shaped_shape() else {
-                return false;
-            };
-            if ps.is_wrapper()
-                || self.is_host_exotic(h)
-                || ps.lookup(k).is_some()
-                || (!p.has_no_accessors() && p.accessor(k).is_some())
-            {
-                return false;
+            let ps = p.shaped_shape()?;
+            if ps.is_wrapper() || self.is_host_exotic(h) || ps.lookup(k).is_some() {
+                return None;
             }
             levels[n] = Some(h);
             n += 1;
+            if !p.has_no_accessors() && p.accessor(k).is_some() {
+                if !acc || p.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0 {
+                    return None;
+                }
+                holder = Some(h);
+                break;
+            }
             cur = p.proto();
         }
         for h in levels.iter().flatten() {
@@ -363,7 +385,9 @@ impl Realm {
         let memo = self.key_text_memo();
         let e = &memo.entries[t.index()];
         e.text.set(t);
-        e.slot.set(ABSENT);
+        e.slot
+            .set(if holder.is_some() { PROTO_ACC } else { ABSENT });
+        e.holder.set(holder.map_or(0, Handle::to_raw));
         e.proto.set(proto.map_or(NO_PROTO, Handle::to_raw));
         e.stamp.set(crate::object::proto_epoch());
         let p = Rc::as_ptr(&shape) as usize;
@@ -371,6 +395,124 @@ impl Realm {
             e.shape.set(p);
             drop(e.hold.replace(Some(shape)));
         }
+        Some(if holder.is_some() {
+            ChainNote::Accessor
+        } else {
+            ChainNote::Absent
+        })
+    }
+
+    /// The receiver at `obj` when [`key_text_probe_acc`](Self::key_text_probe_acc)
+    /// may answer for it: a shaped ordinary object without the exotic flag
+    /// (which every host-exotic object carries, `Realm::mark_host_exotic`)
+    /// and no wrapper layout, accessors allowed when `KATAAN_JIT_GETKEY` is
+    /// on (each answer then checks the receiver has none of the key's
+    /// name). A mapped `arguments` object's layout carries its internal key,
+    /// so no entry names it, and its own accessor is an accessor like any.
+    #[inline]
+    fn key_text_receiver_any(&self, obj: NanBox) -> Option<(&Object, &Rc<Shape>)> {
+        let Some(Cell::Object(o)) = self.heap.get(Handle::from_raw(obj.as_handle()?)) else {
+            return None;
+        };
+        let shape = o.shaped_shape()?;
+        if o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0
+            || shape.is_wrapper()
+            || (!o.has_no_accessors() && !getkey_enabled())
+        {
+            return None;
+        }
+        Some((o, shape))
+    }
+
+    /// `obj[key]` for the String key `key` decided without running
+    /// anything but a getter, for a receiver that may have accessors
+    /// (`KATAAN_JIT_GETKEY`): the receiver's own accessor of the key's name
+    /// (its getter), else what the memo knows for the receiver's layout —
+    /// an own data slot's value, `undefined` for a key on no object of the
+    /// chain, or the getter of the inherited accessor an entry records.
+    /// `None`: the ordinary lookup decides.
+    pub(crate) fn key_text_probe_acc(&self, obj: NanBox, key: NanBox) -> Option<AccHit> {
+        if !getkey_enabled() {
+            return None;
+        }
+        let raw = key.as_handle()?;
+        let b = self
+            .heap
+            .get(Handle::from_raw(raw))?
+            .as_str()?
+            .as_leaf_bytes()?;
+        if b.first() == Some(&0) || (self.str_special && self.aux_props.contains_key(&raw)) {
+            return None;
+        }
+        let (o, shape) = self.key_text_receiver_any(obj)?;
+        if !o.has_no_accessors()
+            && let Some((g, _)) = o.accessor_bytes(b)
+        {
+            return Some(AccHit::Getter(g));
+        }
+        let memo = self.key_text.get()?;
+        let t = Text::of(b)?;
+        let e = &memo.entries[t.index()];
+        if e.text.get() != t || Rc::as_ptr(shape) as usize != e.shape.get() {
+            return None;
+        }
+        let slot = e.slot.get();
+        if slot != ABSENT && slot != PROTO_ACC {
+            return o.slot(slot).map(AccHit::Value);
+        }
+        if o.proto().map_or(NO_PROTO, Handle::to_raw) != e.proto.get()
+            || crate::object::proto_epoch() != e.stamp.get()
+        {
+            return None;
+        }
+        if slot == ABSENT {
+            return Some(AccHit::Absent);
+        }
+        let Some(Cell::Object(p)) = self.heap.get(Handle::from_raw(e.holder.get())) else {
+            return None;
+        };
+        p.accessor_bytes(b).map(|(g, _)| AccHit::Getter(g))
+    }
+
+    /// Records what [`key_text_probe_acc`](Self::key_text_probe_acc) missed
+    /// for `obj[key]` (`own_data_lookup` records an own data slot): a key on
+    /// no object of the chain, or one a prototype has as an accessor.
+    pub(crate) fn key_text_note_acc(&mut self, obj: NanBox, key: NanBox) {
+        if getkey_enabled() {
+            let _ = self.key_text_note_chain(obj, key, true);
+        }
+    }
+}
+
+/// What [`Realm::key_text_note_chain`] recorded.
+enum ChainNote {
+    Absent,
+    Accessor,
+}
+
+/// What [`Realm::key_text_probe_acc`] found.
+pub(crate) enum AccHit {
+    /// An own data property's value.
+    Value(NanBox),
+    /// On no object of the receiver's chain (`undefined`).
+    Absent,
+    /// An accessor's getter (`undefined` for none): the read calls it with
+    /// the receiver as `this`.
+    Getter(NanBox),
+}
+
+/// Whether keyed reads decide accessor-bearing receivers and inherited
+/// accessors from the text memo (`KATAAN_JIT_GETKEY=0` turns it off, read
+/// once per process).
+#[must_use]
+pub(crate) fn getkey_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GETKEY").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
         true
     }
 }

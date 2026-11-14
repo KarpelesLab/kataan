@@ -2069,6 +2069,27 @@ impl Object {
         })
     }
 
+    /// [`accessor`](Self::accessor) for a key given by its UTF-8 bytes: a
+    /// short list is scanned by bytes (no UTF-8 check of the key), an
+    /// indexed one looked up by the key's text.
+    #[must_use]
+    #[inline]
+    pub(crate) fn accessor_bytes(&self, name: &[u8]) -> Option<(NanBox, NanBox)> {
+        let x = self.ex();
+        if x.accessors.is_empty() {
+            return None;
+        }
+        let i = if x.index.is_none() || x.accessors.len() <= ATTR_SCAN_MAX {
+            x.accessors
+                .iter()
+                .position(|(k, _, _)| k.as_bytes() == name)?
+        } else {
+            x.acc_pos(core::str::from_utf8(name).ok()?)?
+        };
+        let (_, g, s) = &x.accessors[i];
+        Some((*g, *s))
+    }
+
     /// The object's shape when it is in shaped (non-dictionary) mode.
     #[inline]
     #[must_use]

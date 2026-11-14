@@ -38,7 +38,7 @@ pub(crate) use forin_cache::{ForInSite, KeyTable, NO_SLOT};
 mod gen_state;
 mod key_memo;
 mod text_memo;
-pub(crate) use text_memo::TextHit;
+pub(crate) use text_memo::{AccHit, TextHit, getkey_enabled};
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use text_memo::{KeyTextLayout, jit_key_text_layout};
 mod lit_cells;

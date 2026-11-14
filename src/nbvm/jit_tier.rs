@@ -20,6 +20,8 @@ use alloc::rc::Rc;
 
 mod deopt;
 pub(crate) use deopt::{jit_helper_deopt, jit_helper_get_virtual};
+mod getkey;
+pub(crate) use getkey::{jit_helper_get_elem_acc, jit_helper_get_elem_site};
 
 /// Back-edges an interpreted activation runs before it tries to continue in
 /// native code (on-stack replacement).

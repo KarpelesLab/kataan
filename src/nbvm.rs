@@ -8231,6 +8231,16 @@ pub(crate) extern "C" fn jit_helper_get_elem(
         {
             return v.to_bits();
         }
+        // A receiver with accessors (`KATAAN_JIT_GETKEY`): a data or absent
+        // key decided by the text memo (a getter: the general read calls it).
+        match c
+            .realm
+            .key_text_probe_acc(NanBox::from_bits(recv), NanBox::from_bits(key))
+        {
+            Some(crate::realm::AccHit::Value(v)) => return v.to_bits(),
+            Some(crate::realm::AccHit::Absent) => return NanBox::undefined().to_bits(),
+            _ => {}
+        }
     }
     jit_get_elem_general(ctx, recv, key)
 }
@@ -8419,6 +8429,8 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         init_prop: jit_helper_init_prop,
         get_elem: jit_helper_get_elem,
         get_elem_key: jit_helper_get_elem_key,
+        get_elem_acc: jit_tier::jit_helper_get_elem_acc,
+        get_elem_site: jit_tier::jit_helper_get_elem_site,
         set_elem: jit_helper_set_elem,
         array_len: jit_helper_array_len,
         arith: jit_helper_arith,

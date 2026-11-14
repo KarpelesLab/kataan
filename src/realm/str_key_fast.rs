@@ -205,6 +205,10 @@ impl Realm {
             if o.has_no_accessors() {
                 self.key_memo_note(key, shape, slot);
                 self.key_text_note(key, shape, slot);
+            } else if super::getkey_enabled() && !shape.is_wrapper() {
+                // (A layout's slot, whatever accessors the receiver has: a
+                // probe that allows them checks the key is none of them.)
+                self.key_text_note(key, shape, slot);
             }
             return o.slot(slot);
         }
@@ -274,6 +278,12 @@ impl Realm {
         if self.key_memo_probe(obj, key).is_some() {
             return Some(true);
         }
+        // A receiver with accessors (`text_memo::key_text_probe_acc`).
+        match self.key_text_probe_acc(obj, key) {
+            Some(super::AccHit::Value(_) | super::AccHit::Getter(_)) => return Some(true),
+            Some(super::AccHit::Absent) => return Some(false),
+            None => {}
+        }
         // A key of the same text, memoized (`text_memo`), present or absent.
         match self.key_text_probe(obj, key) {
             Some(super::TextHit::Slot(o, slot)) => {
@@ -295,9 +305,13 @@ impl Realm {
         };
         if let Some(shape) = o.shaped_shape() {
             if let Some(slot) = shape.lookup(k) {
-                if o.has_no_accessors() && !shape.is_wrapper() && !self.has_argument_map_marker(h) {
-                    self.key_memo_note(key, shape, slot);
-                    self.key_text_note(key, shape, slot);
+                if !shape.is_wrapper() && !self.has_argument_map_marker(h) {
+                    if o.has_no_accessors() {
+                        self.key_memo_note(key, shape, slot);
+                        self.key_text_note(key, shape, slot);
+                    } else if super::getkey_enabled() {
+                        self.key_text_note(key, shape, slot);
+                    }
                 }
                 return Some(true);
             }
@@ -322,7 +336,11 @@ impl Realm {
         key: NanBox,
         obj: NanBox,
     ) -> Option<bool> {
-        if matches!(self.key_text_probe(obj, key), Some(super::TextHit::Absent)) {
+        // (The accessor-aware probe, `KATAAN_JIT_GETKEY`, answers whatever
+        // this one would, and `has_property_by_string` asks it first.)
+        if !super::getkey_enabled()
+            && matches!(self.key_text_probe(obj, key), Some(super::TextHit::Absent))
+        {
             return Some(false);
         }
         let r = self.has_property_by_string(key, obj);
