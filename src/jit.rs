@@ -55,6 +55,7 @@ mod handle;
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod instof;
+mod iter_reuse;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod key_probe;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -3754,6 +3755,9 @@ pub struct GenericHelpers {
     /// call_site)`: `0` with the result stored, the throw sentinel with a
     /// fault pending, `1` to make the ordinary call).
     pub gen_call: JitCallMethodHelper,
+    /// [`gen_call`](Self::gen_call) for a site whose iterator results never
+    /// escape (`jit_helper_gen_call_reuse`: see [`iter_noescape`]).
+    pub gen_call_reuse: JitCallMethodHelper,
     /// A method call's callee lookup (`jit_method_info`).
     pub method_info: MethodHelper,
     /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
@@ -8998,6 +9002,7 @@ impl JitFunction {
         let call_method_helper = helpers.call_method as usize as u64;
         let coll_call_helper = helpers.coll_call as usize as u64;
         let gen_call_helper = helpers.gen_call as usize as u64;
+        let gen_call_reuse_helper = helpers.gen_call_reuse as usize as u64;
         let call_value_helper = helpers.call_value as usize as u64;
         let tail_call_helper = helpers.tail_call as usize as u64;
         let method_helper = helpers.method_info as usize as u64;
@@ -9526,6 +9531,9 @@ impl JitFunction {
                 })
                 .collect()
         };
+        // The `g.next(v)` sites whose iterator results never escape: one
+        // reused result object each (`iter_reuse`).
+        let iter_noescape = iter_reuse::plan(bytecode, n_regs, &catch_targets);
         // A compiled `for-in`'s liveness check `cur in obj` branches on its
         // result itself (`forin`): the `JumpIfFalse` right after it, which
         // nothing else reaches, is emitted as nothing.
@@ -12486,7 +12494,11 @@ impl JitFunction {
                         a.movabs_argreg(3, op_ptr as i64); // rcx = &op
                         a.movabs_argreg(4, si.cache_ptr as i64); // r8 = the site cache
                         a.movabs_argreg(5, site_ptr as i64); // r9 = the call cache
-                        a.movabs_rax(gen_call_helper as i64);
+                        a.movabs_rax(if iter_noescape.get(op_idx) == Some(&true) {
+                            gen_call_reuse_helper as i64
+                        } else {
+                            gen_call_helper as i64
+                        });
                         a.call_rax();
                         a.test_rax_rax();
                         a.je(done);

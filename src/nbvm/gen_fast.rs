@@ -818,6 +818,7 @@ pub(super) fn jit_next(
     method: u64,
     v: NanBox,
     rooted: bool,
+    reuse: Option<&mut u64>,
 ) -> Option<Result<NanBox, VmError>> {
     if !(rooted && lean_on()) {
         return site_call(ctx, funcs, regs, recv, "next", 0, method, v, rooted);
@@ -825,9 +826,28 @@ pub(super) fn jit_next(
     let gh = Handle::from_raw(recv.as_handle()?);
     let fh = site_frame(ctx, gh, "next", 0, method)?;
     match lean_next(ctx, funcs, fh, v) {
-        Lean::Yield(value) => Some(Ok(NanBox::handle(
-            ctx.realm.new_iter_result(value, false).to_raw(),
-        ))),
+        Lean::Yield(value) => Some(Ok(match reuse {
+            // (A site whose results never escape: its one result object,
+            // while it lives.)
+            Some(slot) => {
+                let held = NanBox::from_bits(*slot);
+                match held.as_handle() {
+                    Some(h)
+                        if ctx
+                            .realm
+                            .reuse_iter_result(Handle::from_raw(h), value, false) =>
+                    {
+                        held
+                    }
+                    _ => {
+                        let r = NanBox::handle(ctx.realm.new_iter_result(value, false).to_raw());
+                        *slot = r.to_bits();
+                        r
+                    }
+                }
+            }
+            None => NanBox::handle(ctx.realm.new_iter_result(value, false).to_raw()),
+        })),
         Lean::Other(r) => Some(r.map(|o| result_object(ctx, o))),
         Lean::Untaken => site_resume(ctx, funcs, regs, recv, fh, 0, v, rooted),
     }

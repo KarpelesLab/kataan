@@ -267,6 +267,11 @@ pub struct CallSite {
     /// sequence then tries the lean resumption helper first
     /// (`jit_helper_gen_call`), which clears it when it does not apply.
     pub gen_next: bool,
+    /// The iterator result a `g.next(v)` site whose results never escape
+    /// (`jit_helper_gen_call_reuse`) stores each yielded value in (its
+    /// value's bits; `0`, no handle, before one is made). Not a root: a result
+    /// swept since (its handle stale) is replaced by a fresh one.
+    pub iter_reuse: u64,
 }
 
 /// `CallSite`-relative offset of [`CallSite::coll_ctor`].
@@ -579,6 +584,7 @@ impl CallSite {
             entry_pinned: false,
             coll_ctor: u64::MAX,
             gen_next: false,
+            iter_reuse: 0,
         }
     }
 

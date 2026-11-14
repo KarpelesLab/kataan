@@ -3804,6 +3804,37 @@ pub(crate) extern "C" fn jit_helper_gen_call(
     cache: *mut core::ffi::c_void,
     call_site: *mut core::ffi::c_void,
 ) -> u64 {
+    gen_call(ctx_raw, regs_raw, n_regs, op_raw, cache, call_site, false)
+}
+
+/// [`jit_helper_gen_call`] for a site whose iterator results never escape
+/// (`crate::jit`'s `iter_noescape`): a yield's result is the site's one
+/// reused object ([`CallSite::iter_reuse`]) while it lives.
+///
+/// # Safety
+/// As [`jit_helper_gen_call`].
+pub(crate) extern "C" fn jit_helper_gen_call_reuse(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cache: *mut core::ffi::c_void,
+    call_site: *mut core::ffi::c_void,
+) -> u64 {
+    gen_call(ctx_raw, regs_raw, n_regs, op_raw, cache, call_site, true)
+}
+
+/// The body of [`jit_helper_gen_call`] / [`jit_helper_gen_call_reuse`].
+#[inline(always)]
+fn gen_call(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    cache: *mut core::ffi::c_void,
+    call_site: *mut core::ffi::c_void,
+    reuse: bool,
+) -> u64 {
     // SAFETY: see the function contract (as `jit_helper_exec_op`).
     #[allow(unsafe_code)]
     let op = unsafe { &*op_raw };
@@ -3834,6 +3865,9 @@ pub(crate) extern "C" fn jit_helper_gen_call(
             let arg = args
                 .first()
                 .map_or(NanBox::undefined(), |r| regs[*r as usize]);
+            // SAFETY: the op's own `CallSite` (see the function contract).
+            #[allow(unsafe_code)]
+            let slot = reuse.then(|| unsafe { &mut (*call_site.cast::<CallSite>()).iter_reuse });
             super::gen_fast::jit_next(
                 ctx,
                 funcs,
@@ -3842,6 +3876,7 @@ pub(crate) extern "C" fn jit_helper_gen_call(
                 method,
                 arg,
                 window_rooted(ctx),
+                slot,
             )
         }
         _ => None,

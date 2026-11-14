@@ -956,6 +956,24 @@ impl<T> Heap<T> {
         self.peek_mut(handle)
     }
 
+    /// [`get_mut`](Heap::get_mut) of a handle its holder keeps without
+    /// rooting it (a weak reference): `None` once the collector freed the
+    /// object — in verification mode too, where a freed object stays in its
+    /// slot, listed (see `Heap::poison`), and resolving it here is not a
+    /// use of a collected handle but the holder finding it gone.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[inline]
+    pub fn get_mut_weak(&mut self, handle: Handle) -> Option<&mut T> {
+        if self
+            .poison
+            .as_ref()
+            .is_some_and(|p| p.freed.contains(&handle))
+        {
+            return None;
+        }
+        self.peek_mut(handle)
+    }
+
     /// The mutable counterpart of [`peek`](Heap::peek): exempt from the
     /// GC-verification poison check, for code driven by a heap enumeration.
     /// Applies the write barrier as [`get_mut`](Heap::get_mut) does.

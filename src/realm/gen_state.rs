@@ -356,6 +356,37 @@ impl Realm {
     /// CreateIterResultObject(`value`, `done`): a fresh ordinary object with
     /// the data properties `value` and `done`, in that order — built in its
     /// final layout at once.
+    /// Stores `value` and `done` into the iterator result `h` that
+    /// [`new_iter_result`](Self::new_iter_result) made, when it is still
+    /// live and still has that layout: for a call site whose results never
+    /// escape (nothing but its own `done` / `value` reads ever sees one, and
+    /// no code runs while one is live: `crate::jit`'s `iter_noescape`), the
+    /// one object serves every call. Whether it was stored (else the caller
+    /// makes a fresh one).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn reuse_iter_result(&mut self, h: Handle, value: NanBox, done: bool) -> bool {
+        let Some(shape) = self.iter_result_shape.as_ref().map(Rc::as_ptr) else {
+            return false;
+        };
+        // (The mutable borrow is the generational barrier; the incremental
+        // marking's shades the stored value.)
+        // (A weak handle: the site holding it does not root it.)
+        let stored = match self.heap.get_mut_weak(h) {
+            Some(Cell::Object(o))
+                if o.shaped_shape()
+                    .is_some_and(|s| core::ptr::eq(Rc::as_ptr(s), shape)) =>
+            {
+                o.set_slot(0, value) && o.set_slot(1, NanBox::boolean(done))
+            }
+            _ => false,
+        };
+        if stored && self.incremental.is_some() {
+            self.shade_stored(value);
+        }
+        stored
+    }
+
     pub fn new_iter_result(&mut self, value: NanBox, done: bool) -> Handle {
         // The usual case, the layout made: `new_object_in_shape`'s steps for
         // exactly these two slots (the second never holds a reference).

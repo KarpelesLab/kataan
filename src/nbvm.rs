@@ -8501,6 +8501,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         str_call: jit_tier::jit_helper_str_call,
         concat: jit_tier::jit_helper_concat,
         gen_call: jit_tier::jit_helper_gen_call,
+        gen_call_reuse: jit_tier::jit_helper_gen_call_reuse,
         call_value: jit_tier::jit_helper_call_value,
         tail_call: jit_tier::jit_helper_tail_call,
         call_with_method: jit_tier::jit_helper_call_with_method,
