@@ -14,6 +14,22 @@ use crate::nanbox::NanBox;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
+/// Whether a resolution with any ordinary object whose layout has no `then`
+/// key is proved thenless as an iterator result's is
+/// ([`Realm::iter_result_thenless`]; `KATAAN_THENLESS=0` turns it off, read
+/// once per process).
+fn thenless_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_THENLESS").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 impl Realm {
     /// Allocates the suspended-frame cell holding `frame`.
     pub(crate) fn new_vm_frame(&mut self, frame: VmFrame) -> Handle {
@@ -232,7 +248,8 @@ impl Realm {
     /// Whether `Get(h, "then")` is `undefined` without running any code,
     /// for an iterator-result object: `h` is an ordinary object whose own
     /// properties are exactly the data properties `value` and `done` (the
-    /// layout [`new_iter_result`](Self::new_iter_result) makes) and whose
+    /// layout [`new_iter_result`](Self::new_iter_result) makes) — or, with
+    /// [`thenless_on`], any shaped layout without a `then` key — and whose
     /// `[[Prototype]]` is the default object prototype, and no object on
     /// that prototype's chain has a `then` property. The chain is proved
     /// once per prototype epoch: each object on it is watched
@@ -246,10 +263,11 @@ impl Realm {
         let Some(o) = self.heap.get(h).and_then(Cell::as_object) else {
             return false;
         };
-        if !o
-            .shaped_shape()
-            .is_some_and(|s| alloc::rc::Rc::ptr_eq(s, shape))
-            || !o.has_no_accessors()
+        // (Any other shaped layout without a `then` key, too: `{ i, score }`
+        // returned from an async function, `KATAAN_THENLESS`.)
+        if !o.shaped_shape().is_some_and(|s| {
+            alloc::rc::Rc::ptr_eq(s, shape) || (thenless_on() && s.lookup("then").is_none())
+        }) || !o.has_no_accessors()
             || o.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0
             || o.proto().is_none()
             || o.proto() != self.default_object_proto
