@@ -55,6 +55,42 @@ pub(super) fn restore_first() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GPFIRST").is_none_or(|v| v != "0"))
 }
 
+/// Whether the body's persisted global slots are read in the array itself,
+/// through a frame word pointing at it once this activation found it
+/// current, instead of being copied into the frame on each activation's
+/// first global access ([`EMPTY_WORDS`]); `KATAAN_JIT_GDIRECT=0` turns it
+/// off (read once per process).
+///
+/// The frame word starts at [`EMPTY_WORDS`] (every entry empty, so a read
+/// takes the epoch path) and points at the array only while the array's
+/// noted epoch is the frame's noted epoch and that is the current one: it
+/// is set so after the epoch check, and every `call` that finds the epoch
+/// changed (`X64Assembler::recheck_body_globals`'s stub), like a `catch`
+/// entry, points it back at [`EMPTY_WORDS`]. Another activation of the body
+/// changes the array only by adding entries validated under the same epoch,
+/// or by emptying it under a new one, which this activation's next epoch
+/// re-check (after the call that ran it) sees.
+pub(super) fn direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GDIRECT").is_none_or(|v| v != "0"))
+}
+
+/// The fewest persisted slots a body reads directly (see
+/// [`direct_enabled`]): with fewer, the copies saved at the first global
+/// access of each activation do not pay for the extra load of every read
+/// (measured: `fib`, one global read twice a call, lost 3%).
+pub(super) const DIRECT_MIN: usize = 4;
+
+/// The words a body's direct global reads go through before the array is
+/// known current (see [`direct_enabled`]): every one empty, laid out as the
+/// array's first [`BODY_WORDS`].
+pub(super) static EMPTY_WORDS: [u64; BODY_WORDS] = [EMPTY; BODY_WORDS];
+
+/// The address of [`EMPTY_WORDS`].
+pub(super) fn empty_words_addr() -> u64 {
+    EMPTY_WORDS.as_ptr() as usize as u64
+}
+
 /// The array's length (`u64` words).
 pub(super) const LEN: usize = 64;
 

@@ -5572,6 +5572,10 @@ pub struct X64Assembler {
     /// [`RECV_CACHE_EMPTY`]: the generic tier's global binding cache, which
     /// a call does not empty (it is guarded by the global binding epoch).
     entry_clear: Vec<i32>,
+    /// Frame slots the frame prologue sets to a 64-bit word (through `r11`,
+    /// which no entry passes anything in): the global binding cache's
+    /// direct-read base (`global_persist::direct_enabled`).
+    entry_init: Vec<(i32, u64)>,
     /// Where the most recent [`bind`](Self::bind) bound its label (no label
     /// is bound past it, as `bind` binds at the end of the code).
     last_bind: usize,
@@ -6485,10 +6489,22 @@ impl X64Assembler {
     /// the frame (its caller's `rbp` is the body's) and keeps every register
     /// and the stack.
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-    pub(crate) fn emit_body_globals_stub(&mut self, stub: Label, slots: &[i32]) {
+    pub(crate) fn emit_body_globals_stub(
+        &mut self,
+        stub: Label,
+        slots: &[i32],
+        direct: Option<i32>,
+    ) {
         self.bind(stub);
         for &d in slots {
             self.store_empty(d);
+        }
+        // The direct-read base back at the empty words (`r11` kept).
+        if let Some(d) = direct {
+            self.code.extend_from_slice(&[0x41, 0x53]); // push r11
+            self.g_movabs(call_seq::r::R11, global_persist::empty_words_addr());
+            self.g_store(call_seq::r::RBP, d, call_seq::r::R11);
+            self.code.extend_from_slice(&[0x41, 0x5b]); // pop r11
         }
         self.code.push(0xc3); // ret
     }
@@ -6501,6 +6517,13 @@ impl X64Assembler {
     )]
     pub(crate) fn set_entry_clear(&mut self, slots: Vec<i32>) {
         self.entry_clear = slots;
+    }
+
+    /// Sets the slots the frame prologue sets to a word (see the
+    /// `entry_init` field).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn set_entry_init(&mut self, slots: Vec<(i32, u64)>) {
+        self.entry_init = slots;
     }
 
     /// Empties every receiver-cache key slot (after a `call`, in the
@@ -7681,6 +7704,12 @@ impl X64Assembler {
         self.code.push(0x53); // push rbx
         self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
         self.code.extend_from_slice(&frame.to_le_bytes());
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        for i in 0..self.entry_init.len() {
+            let (d, w) = self.entry_init[i];
+            self.g_movabs(call_seq::r::R11, w);
+            self.g_store(call_seq::r::RBP, d, call_seq::r::R11);
+        }
         // (The entry empties every way.)
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         if prologue_sse_clear() {
@@ -9873,7 +9902,7 @@ impl JitFunction {
         // several element reads use, the key's bits (a key, emptied as the
         // receiver cache's are), the layout word and the slot the last
         // probe found for it.
-        let km_plan = key_reuse::plan(ops);
+        let km_plan = key_reuse::plan(ops, |pc, r| num.is_number_at(pc, r));
         let n_km = km_plan.count;
         let km_base = gi_base - 16 * n_gi as i32;
         let km_memo = |k: usize| key_reuse::Memo {
@@ -9881,6 +9910,14 @@ impl JitFunction {
             shape: km_base - 8 * n_km as i32 - 16 * k as i32 - 8,
             slot: km_base - 8 * n_km as i32 - 16 * k as i32 - 16,
         };
+        // The global binding cache's direct-read base (`global_persist::
+        // direct_enabled`): the persisted slots are read in the body's
+        // array through this word once it points there. (Only for a body
+        // with several: each read then costs a load more, and the entry's
+        // copies it saves are few for a body with one or two.)
+        let gd = global_persist::direct_enabled() && gc_reads.len() >= global_persist::DIRECT_MIN;
+        let gd_slot = km_base - 24 * n_km as i32 - 8;
+        let gdirect = |k: usize| gd && gc_reads.contains(&k);
         let wp_disps: Vec<Vec<Option<i32>>> = wp_slot
             .iter()
             .map(|v| v.iter().map(|s| s.map(wp_proof)).collect())
@@ -10085,7 +10122,8 @@ impl JitFunction {
                 + n_wp
                 + 3 * n_cm
                 + 2 * n_gi
-                + 3 * n_km) as u32
+                + 3 * n_km
+                + usize::from(gd)) as u32
                 * 8)
             + 15)
             & !15;
@@ -10387,8 +10425,11 @@ impl JitFunction {
         let mut entry_clear = num.entry_clear_slots();
         entry_clear.extend(gi_pcs.iter().filter_map(|&pc| gi_slots(pc)).map(|s| s.0));
         if gc_plan.slots > 0 {
-            entry_clear.extend((0..gc_plan.slots).map(gc_slot));
+            entry_clear.extend((0..gc_plan.slots).filter(|&k| !gdirect(k)).map(gc_slot));
             entry_clear.push(gc_epoch);
+        }
+        if gd {
+            a.set_entry_init(alloc::vec![(gd_slot, global_persist::empty_words_addr())]);
         }
         if has_inline {
             // (Emptied by the prologue only: `entry_clear` is also the
@@ -10411,7 +10452,7 @@ impl JitFunction {
         // The global binding cache's refills: (entry, resume, done, op, slot).
         let mut cold_globals: Vec<(Label, Label, Label, usize, i32, usize)> = Vec::new();
         // The global binding cache's resets on a changed epoch: (entry, refill).
-        let mut cold_epochs: Vec<(Label, Label, Label)> = Vec::new();
+        let mut cold_epochs: Vec<(Label, Label, Label, bool)> = Vec::new();
         // A global `var` write's mirror of a heap handle (`global_mirror`):
         // (entry, resume, pc), the value in `rcx`.
         let mut cold_mirrors: Vec<(Label, Label, usize)> = Vec::new();
@@ -11100,11 +11141,22 @@ impl JitFunction {
                 // as do the prologue and a `catch` entry. An empty one is
                 // filled out of line, the epoch checked first (a changed
                 // one empties them all).
+                // (A persisted slot read directly: its word in the body's
+                // array, through the frame's base word.)
                 a.bind(recheck);
-                a.g_load(call_seq::r::RAX, call_seq::r::RBP, slot);
+                if gdirect(k) {
+                    a.g_load(call_seq::r::R11, call_seq::r::RBP, gd_slot);
+                    a.g_load(
+                        call_seq::r::RAX,
+                        call_seq::r::R11,
+                        global_persist::off(1 + k),
+                    );
+                } else {
+                    a.g_load(call_seq::r::RAX, call_seq::r::RBP, slot);
+                }
                 a.g_cmp_imm(call_seq::r::RAX, RECV_CACHE_EMPTY);
                 a.je(pre);
-                cold_epochs.push((pre, fetch, recheck));
+                cold_epochs.push((pre, fetch, recheck, gdirect(k)));
                 a.bind(back);
                 match *bytecode.get(op_idx)? {
                     crate::nbvm::Op::LoadGlobal { dst, .. } if ok(dst) => {
@@ -17554,14 +17606,37 @@ impl JitFunction {
         // (in `rax`) and refill this one.
         // (When the persistent cache holds the read slots validated under
         // the current epoch, the frame takes them and the op looks again.)
-        let gc_persisted: Vec<(usize, i32)> =
-            gc_reads.iter().map(|&k| (1 + k, gc_slot(k))).collect();
-        for (pre, fetch, recheck) in core::mem::take(&mut cold_epochs) {
+        // (Read directly, `gd`, the persisted slots have no frame copies:
+        // the frame's base word is pointed at the array, when it is current,
+        // and the op looks again.)
+        let gc_persisted: Vec<(usize, i32)> = if gd {
+            Vec::new()
+        } else {
+            gc_reads.iter().map(|&k| (1 + k, gc_slot(k))).collect()
+        };
+        for (pre, fetch, recheck, direct) in core::mem::take(&mut cold_epochs) {
             a.dbg_mark("o-epoch");
             a.bind(pre);
             a.g_movabs(call_seq::r::R11, epoch_addr as u64);
             a.g_load(call_seq::r::RAX, call_seq::r::R11, 0);
             a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, gc_epoch);
+            if direct {
+                let same = a.new_label();
+                a.je(same);
+                a.clear_entry_slots();
+                a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
+                a.bind(same);
+                // The array current, and not yet the base: the base, and
+                // look again. (Already the base: the entry is empty.)
+                a.g_movabs(call_seq::r::R11, persist);
+                a.g_cmp_mem(call_seq::r::RAX, call_seq::r::R11, global_persist::off(0));
+                a.jne(fetch);
+                a.g_cmp_mem(call_seq::r::R11, call_seq::r::RBP, gd_slot);
+                a.je(fetch);
+                a.g_store(call_seq::r::RBP, gd_slot, call_seq::r::R11);
+                a.jmp(recheck);
+                continue;
+            }
             a.je(fetch);
             if !gc_persisted.is_empty() && global_persist::restore_first() {
                 // The persistent entries first: on a hit only the other
@@ -17606,11 +17681,24 @@ impl JitFunction {
             a.call_rax();
             a.test_rax_rax();
             a.je(slow);
-            a.g_store(call_seq::r::RBP, slot, call_seq::r::RAX);
-            if gc_reads.contains(&k) {
+            if gdirect(k) {
+                // Into the array (noted under the frame's epoch), which
+                // becomes the base while that epoch is current.
                 a.gp_save_one(persist, 0, &gc_group, 1 + k, gc_epoch);
+                a.g_movabs(call_seq::r::R11, epoch_addr as u64);
+                a.g_load(call_seq::r::RCX, call_seq::r::R11, 0);
+                a.g_cmp_mem(call_seq::r::RCX, call_seq::r::RBP, gc_epoch);
+                a.jne(back);
+                a.g_movabs(call_seq::r::R11, persist);
+                a.g_store(call_seq::r::RBP, gd_slot, call_seq::r::R11);
+                a.jmp(back);
+            } else {
+                a.g_store(call_seq::r::RBP, slot, call_seq::r::RAX);
+                if gc_reads.contains(&k) {
+                    a.gp_save_one(persist, 0, &gc_group, 1 + k, gc_epoch);
+                }
+                a.jmp(back);
             }
-            a.jmp(back);
             a.bind(slow);
             exec_op!(pc);
             a.jmp(done);
@@ -17618,8 +17706,11 @@ impl JitFunction {
         a.set_plain_lazy(Vec::new());
         if let Some(stub) = gc_stub {
             a.dbg_mark("o-gcstub");
-            let slots: Vec<i32> = (0..gc_plan.slots).map(gc_slot).collect();
-            a.emit_body_globals_stub(stub, &slots);
+            let slots: Vec<i32> = (0..gc_plan.slots)
+                .filter(|&k| !gdirect(k))
+                .map(gc_slot)
+                .collect();
+            a.emit_body_globals_stub(stub, &slots, gd.then_some(gd_slot));
         }
         // The out-of-line halves of promoted-loop `GetProp`s: the spill-array
         // read, and the slow paths' reload of the promoted result.
@@ -17865,8 +17956,12 @@ impl JitFunction {
             // (Its slots are read with no epoch check: emptied too.)
             if gc_plan.slots > 0 {
                 a.store_empty(gc_epoch);
-                for k in 0..gc_plan.slots {
+                for k in (0..gc_plan.slots).filter(|&k| !gdirect(k)) {
                     a.store_empty(gc_slot(k));
+                }
+                if gd {
+                    a.g_movabs(call_seq::r::R11, global_persist::empty_words_addr());
+                    a.g_store(call_seq::r::RBP, gd_slot, call_seq::r::R11);
                 }
             }
             for &t in &catch_targets {

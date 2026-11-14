@@ -58,19 +58,34 @@ pub(super) struct Plan {
 }
 
 /// The plan for `ops`: a memo per key register that at least two element
-/// reads use (one read alone would only fill it).
-pub(super) fn plan(ops: &[GenericOp]) -> Plan {
+/// reads use (one read alone would only fill it), not counting reads whose
+/// key `is_num(pc, reg)` proves a Number, nor any read of a register some
+/// op loads with a Number constant (a temporary holding `r[0]`, then
+/// `r[1]`): their String-key path is never taken, and each memo costs a
+/// store at entry and after every call.
+pub(super) fn plan(ops: &[GenericOp], is_num: impl Fn(usize, u16) -> bool) -> Plan {
     let mut at = vec![None; ops.len()];
     if !enabled() {
         return Plan { count: 0, at };
     }
-    let key_of = |op: &GenericOp| match *op {
-        GenericOp::GetElem { index, .. } => Some(index),
+    let num_const: Vec<u16> = ops
+        .iter()
+        .filter_map(|op| match *op {
+            GenericOp::Const { dst, imm } if crate::nanbox::NanBox::from_bits(imm).is_number() => {
+                Some(dst)
+            }
+            _ => None,
+        })
+        .collect();
+    let key_at = |pc: usize| match ops[pc] {
+        GenericOp::GetElem { index, .. } if !is_num(pc, index) && !num_const.contains(&index) => {
+            Some(index)
+        }
         _ => None,
     };
     let mut regs: Vec<(u16, usize)> = Vec::new();
-    for op in ops {
-        if let Some(k) = key_of(op) {
+    for pc in 0..ops.len() {
+        if let Some(k) = key_at(pc) {
             match regs.iter_mut().find(|(r, _)| *r == k) {
                 Some(e) => e.1 += 1,
                 None => regs.push((k, 1)),
@@ -78,9 +93,9 @@ pub(super) fn plan(ops: &[GenericOp]) -> Plan {
         }
     }
     regs.retain(|&(_, n)| n >= 2);
-    for (i, op) in ops.iter().enumerate() {
-        if let Some(k) = key_of(op) {
-            at[i] = regs.iter().position(|&(r, _)| r == k);
+    for (pc, a) in at.iter_mut().enumerate() {
+        if let Some(k) = key_at(pc) {
+            *a = regs.iter().position(|&(r, _)| r == k);
         }
     }
     Plan {
