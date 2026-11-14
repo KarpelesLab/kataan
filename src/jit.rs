@@ -6441,7 +6441,10 @@ impl X64Assembler {
             return;
         };
         let keep = self.new_label();
-        self.g_load_abs(call_seq::r::R11, crate::env::global_binding_epoch_addr() as u64);
+        self.g_load_abs(
+            call_seq::r::R11,
+            crate::env::global_binding_epoch_addr() as u64,
+        );
         self.code.extend_from_slice(&[0x4c, 0x3b, 0x9d]); // cmp r11, [rbp + noted]
         self.code.extend_from_slice(&noted.to_le_bytes());
         self.je(keep);

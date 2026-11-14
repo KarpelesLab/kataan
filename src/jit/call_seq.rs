@@ -1086,7 +1086,8 @@ impl X64Assembler {
     /// `KATAAN_JIT_ABSLOAD=0`: always the latter.
     pub(crate) fn g_load_abs(&mut self, dst: u8, addr: u64) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ABSLOAD").is_none_or(|v| v != "0"));
+        let on =
+            *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ABSLOAD").is_none_or(|v| v != "0"));
         match u32::try_from(addr) {
             Ok(a32) if on && a32 < 0x8000_0000 => {
                 // REX.W 8B /r, ModRM mod=00 rm=100, SIB base=101 index=100:
@@ -3096,8 +3097,7 @@ impl InlineEmit<'_> {
         let (way, ways) = (usize::from(self.poly & 0xff), usize::from(self.poly >> 8));
         (poly_miss_enabled()
             && way == 0
-            && ways >= 2
-            && ways < crate::ic::CalleeHint::POLY_MAX
+            && (2..crate::ic::CalleeHint::POLY_MAX).contains(&ways)
             && self.poly_keys.len() + 1 == ways
             && !self.getter
             && !self.setter

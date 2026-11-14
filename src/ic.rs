@@ -613,6 +613,34 @@ mod tests {
     use crate::object::Object;
 
     #[test]
+    fn callee_feedback_orders_by_calls() {
+        let mut ic = PropertyCache::new();
+        let key = |f: u64| f | (2 << 32);
+        // `a` first, then `b` called most, `c` once.
+        ic.note_callee(key(7));
+        ic.note_callee(key(7));
+        for _ in 0..200 {
+            ic.note_callee(key(9));
+        }
+        ic.note_callee(key(4));
+        assert_eq!(ic.callee_hint().poly_fns(), alloc::vec![7, 9, 4]);
+        assert_eq!(ic.ordered_callee_hint().poly_fns(), alloc::vec![9, 7, 4]);
+        for _ in 0..3 {
+            ic.note_callee(key(4));
+        }
+        assert_eq!(ic.ordered_callee_hint().poly_fns(), alloc::vec![9, 4, 7]);
+        // (The counts halve rather than saturate: the order holds.)
+        for _ in 0..100 {
+            ic.note_callee(key(9));
+        }
+        assert_eq!(ic.ordered_callee_hint().poly_fns(), alloc::vec![9, 4, 7]);
+        // A monomorphic site's hint is unchanged.
+        let mut one = PropertyCache::new();
+        one.note_callee(key(3));
+        assert_eq!(one.ordered_callee_hint(), CalleeHint::One(key(3)));
+    }
+
+    #[test]
     fn element_feedback_merges() {
         use elem_fb::*;
         let mut ic = PropertyCache::new();
