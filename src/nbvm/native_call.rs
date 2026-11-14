@@ -587,7 +587,7 @@ pub(super) fn is_native_site(cache: &PropertyCache) -> bool {
 /// calls do: any call op inlined is compiled with its full slow path.
 /// `false` when neither knows anything (a copy of the function, whose tier
 /// state starts empty).
-#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn no_script_callee(proto: &FnProto, pc: usize) -> bool {
     use crate::ic::CalleeHint;
     let mut known = false;
@@ -599,7 +599,6 @@ pub(crate) fn no_script_callee(proto: &FnProto, pc: usize) -> bool {
         }
         known = true;
     }
-    #[cfg(feature = "jit")]
     if let Some(Some(j)) = proto.tier.jit()
         && j.is_generic()
         && let Some(h) = j.call_hints().get(pc)
