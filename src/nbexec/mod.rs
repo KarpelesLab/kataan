@@ -3229,13 +3229,7 @@ impl Interp {
     /// `defineProperty` redefinitions behave per spec — exactly what Test262's
     /// `verifyProperty` exercises.
     pub(crate) fn install_fn_name_length(&mut self, f: Handle, name: &str, length: u32) {
-        // (A name's string may be shared by every function given it, as a
-        // literal's is: `new_literal_string` re-checks a hit's text.)
-        let name_v = if crate::nbexec::promise::pall_lean_on() {
-            NanBox::handle(self.realm.new_literal_string(name).to_raw())
-        } else {
-            self.new_str(name)
-        };
+        let name_v = self.new_str(name);
         self.install_fn_name_length_value(f, name_v, length);
     }
 
