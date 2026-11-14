@@ -3745,6 +3745,10 @@ pub struct GenericHelpers {
     /// `String.prototype` method call on a plain string (`0` served, `1`
     /// declined, or the throw sentinel).
     pub str_call: JitCallMethodHelper,
+    /// `jit_helper_concat(ctx, regs, n_regs, op, _, _)`: `Op::Concat` of
+    /// parts that convert without running code (`0`, the result stored),
+    /// else `1` for the interpreter's op.
+    pub concat: JitCallMethodHelper,
     /// A generator `next` call's lean form, tried first at a site that last
     /// made one (`jit_helper_gen_call(ctx, regs, n_regs, op, cache,
     /// call_site)`: `0` with the result stored, the throw sentinel with a
@@ -4132,6 +4136,15 @@ pub(crate) fn str_call_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_STRCALL").is_none_or(|v| v != "0"))
+}
+
+/// Whether a template literal's `Op::Concat` joins its parts through
+/// `jit_helper_concat` before the interpreter's op (`KATAAN_JIT_CONCAT=0`
+/// turns it off; read once per process).
+pub(crate) fn concat_fast_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONCAT").is_none_or(|v| v != "0"))
 }
 
 pub type JitBinHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
@@ -13355,6 +13368,27 @@ impl JitFunction {
                         a.frame_epilogue();
                         a.cold_end(cold);
                         a.bind(cont);
+                        break 'interp;
+                    }
+                    // A template literal's concatenation (`Op::Concat`):
+                    // parts that convert without running code joined by
+                    // `jit_helper_concat`; anything else the interpreter's.
+                    if concat_fast_enabled()
+                        && let Some(crate::nbvm::Op::Concat { .. }) = bytecode.get(pc as usize)
+                    {
+                        let done = a.new_label();
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, 0);
+                        a.movabs_argreg(5, 0);
+                        a.movabs_rax(helpers.concat as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.je(done);
+                        exec_op!(pc);
+                        a.bind(done);
                         break 'interp;
                     }
                     // `ToPropertyKey` of a computed key (`a[i] -= x`): a

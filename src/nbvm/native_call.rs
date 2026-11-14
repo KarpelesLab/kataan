@@ -836,8 +836,9 @@ pub(super) fn prove_array_pop(realm: &mut Realm, site: &mut crate::jit::MethodSi
 }
 
 /// Whether `toUpperCase` / `toLowerCase` of an ASCII string map it in place
-/// into its new node (or answer the receiver when nothing changes)
-/// (`KATAAN_ASCII_CASE=0` turns it off; read once per process).
+/// into its new node (or answer the receiver when nothing changes), and a
+/// `split` that finds no separator answers the receiver as its one piece
+/// (`KATAAN_ASCII_CASE=0` turns them off; read once per process).
 fn ascii_case_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -2068,7 +2069,12 @@ fn run_op(
             // string (inline when short).
             let bytes = rope.as_leaf_bytes()?;
             let n = sep_b.len();
-            let mut parts = alloc::vec::Vec::new();
+            let lean = ascii_case_enabled();
+            let mut parts = if lean {
+                alloc::vec::Vec::with_capacity(4)
+            } else {
+                alloc::vec::Vec::new()
+            };
             let (mut start, mut i) = (0usize, 0usize);
             while i + n <= bytes.len() {
                 if bytes[i] == sep_b[0] && &bytes[i..i + n] == sep_b {
@@ -2080,8 +2086,15 @@ fn run_op(
                     i += 1;
                 }
             }
-            let piece = crate::rope::Rope::from_bytes(&bytes[start..]);
-            parts.push(NanBox::handle(realm.new_string_from_rope(piece).to_raw()));
+            if lean && start == 0 {
+                // No separator: the one piece is the receiver's whole text
+                // (a string is a value: which cell holds it is not
+                // observable).
+                parts.push(recv);
+            } else {
+                let piece = crate::rope::Rope::from_bytes(&bytes[start..]);
+                parts.push(NanBox::handle(realm.new_string_from_rope(piece).to_raw()));
+            }
             NanBox::handle(realm.new_array(parts).to_raw())
         }
         FastOp::StrReplace => {

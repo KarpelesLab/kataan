@@ -3669,6 +3669,50 @@ pub(crate) extern "C" fn jit_helper_coll_call(
     }
 }
 
+/// `Op::Concat` in compiled code: the parts joined by
+/// `Realm::concat_parts` when it serves them (each a string, Number,
+/// boolean, `null` or `undefined`: no conversion runs code), the result
+/// stored to the op's `dst` and `0`; `1`, having done nothing, for the
+/// interpreter's op.
+///
+/// # Safety
+/// As [`jit_helper_coll_call`].
+pub(crate) extern "C" fn jit_helper_concat(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    _: *mut core::ffi::c_void,
+    _: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    let Op::Concat { dst, parts } = op else {
+        return 1;
+    };
+    let mut vals = [NanBox::undefined(); 16];
+    if parts.len() > vals.len() {
+        return 1;
+    }
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    // SAFETY: the activation's register file, live and unaliased here.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+    for (v, r) in vals.iter_mut().zip(parts.iter()) {
+        *v = regs[*r as usize];
+    }
+    match ctx.realm.concat_parts(&vals[..parts.len()]) {
+        Some(Some(h)) => {
+            regs[*dst as usize] = NanBox::handle(h.to_raw());
+            0
+        }
+        _ => 1,
+    }
+}
+
 /// A direct string call from compiled code (`crate::jit`): `Op::CallMethod`
 /// of a `String.prototype` method on a plain string cell whose site
 /// (`site`, a `MethodSite`) proves the method the built-in of `code`

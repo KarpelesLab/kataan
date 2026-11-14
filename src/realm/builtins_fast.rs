@@ -2186,6 +2186,20 @@ impl Realm {
             for (r, &p) in ropes.iter().zip(parts) {
                 let at = n;
                 if let Some(r) = r {
+                    // A short piece held in its node, not beginning a lone
+                    // low surrogate: its zero-padded words stored whole
+                    // (the buffer has room past the bound), no copy call.
+                    if let Some((len, words)) = r.small_words()
+                        && words[0] as u8 != 0xED
+                        && n + 32 <= out.len()
+                    {
+                        for (k, w) in words.iter().enumerate() {
+                            out[n + 8 * k..n + 8 * k + 8].copy_from_slice(&w.to_le_bytes());
+                        }
+                        n += len;
+                        units = units.zip(r.utf16_len_known()).map(|(u, k)| u + k);
+                        continue;
+                    }
                     let b = r.as_leaf_bytes()?;
                     if b.first() == Some(&0xED)
                         && let Some(hi) = crate::wtf8::trailing_high_surrogate(&out[..n])
@@ -2233,12 +2247,19 @@ impl Realm {
             Some(u) => Rope::from_bytes_units(bytes, u),
             None => Rope::from_bytes(bytes),
         };
+        // (Past the bound: room for a Number written as a whole buffer, and
+        // for a short piece's whole words.)
+        const SLACK: usize = if super::ryu::NUMBER_TEXT_MAX > 32 {
+            super::ryu::NUMBER_TEXT_MAX
+        } else {
+            32
+        };
         if bound <= STACK_MAX {
-            let mut out = [0u8; STACK_MAX + super::ryu::NUMBER_TEXT_MAX];
+            let mut out = [0u8; STACK_MAX + SLACK];
             let (n, units) = fill(&mut out)?;
             Some(make(&out[..n], units))
         } else {
-            let mut out = alloc::vec![0u8; bound + super::ryu::NUMBER_TEXT_MAX];
+            let mut out = alloc::vec![0u8; bound + SLACK];
             let (n, units) = fill(&mut out)?;
             Some(make(&out[..n], units))
         }
