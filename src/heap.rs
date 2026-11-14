@@ -1655,24 +1655,17 @@ fn sweep_young_fast<T: crate::gc::Trace, S: Fn(&T) -> bool>(
     };
     let kept = {
         let slots = slots.as_mut_slice();
-        let (base, n) = (slots.as_mut_ptr(), slots.len());
-        // Every free-list entry names a slot of the table (entries are only
-        // ever made from its indices, and it never shrinks but in a
-        // compaction, which empties the list): checked once, not per entry.
-        // (A max over the entries, which vectorizes: a fraction of the
-        // per-entry bounds check it replaces.)
-        let top = free[free_top..].iter().copied().max().unwrap_or(0);
-        assert!((top as usize) < n.max(1), "free list entry {top} past the slot table");
         // The consumed entries: `list[..r]` visited and freed again,
         // `list[r..]` not visited yet. An entry that leaves the list takes
         // the last unvisited one's place, and the list shrinks by one.
         let mut list: &mut [u32] = &mut free[free_top..];
         let mut r = 0;
         while let Some(&i) = list.get(r) {
-            // SAFETY: `i < n` (see above), and no other reference into the
-            // table is live while this one is.
-            #[allow(unsafe_code)]
-            let slot = unsafe { &mut *base.add(i as usize) };
+            // (The failure path takes nothing of the entry, so the common
+            // one keeps no copy of it.)
+            let Some(slot) = slots.get_mut(i as usize) else {
+                bad_free_entry()
+            };
             match settle_young_fast(slot, &mut cx) {
                 Fate::Freed => r += 1,
                 fate => {
@@ -1680,10 +1673,7 @@ fn sweep_young_fast<T: crate::gc::Trace, S: Fn(&T) -> bool>(
                     // nothing of it live past the release.)
                     let i = list[r];
                     if fate == Fate::Survivor {
-                        // SAFETY: as above.
-                        #[allow(unsafe_code)]
-                        let slot = unsafe { &mut *base.add(i as usize) };
-                        settle_survivor(slot, i, &mut cx);
+                        settle_survivor(&mut slots[i as usize], i, &mut cx);
                     }
                     let last = list.len() - 1;
                     list[r] = list[last];
@@ -1702,6 +1692,15 @@ fn sweep_young_fast<T: crate::gc::Trace, S: Fn(&T) -> bool>(
         }
     }
     free.len() - free_top + cx.retired
+}
+
+/// A free-list entry past the slot table: never (entries are only ever
+/// made from its indices, and it never shrinks but in a compaction, which
+/// empties the list).
+#[cold]
+#[inline(never)]
+fn bad_free_entry() -> ! {
+    unreachable!("free list entry past the slot table")
 }
 
 /// What [`settle_young_fast`] needs besides the slot, off its common path.
