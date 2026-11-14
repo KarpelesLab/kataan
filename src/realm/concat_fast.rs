@@ -65,6 +65,21 @@ fn memo_index(s: u64, key: u64) -> usize {
     (h >> (64 - MEMO_LEN.trailing_zeros())) as usize
 }
 
+/// Whether `+` of two short strings held in their rope nodes joins them in
+/// one step (`Rope::try_concat_small`): `KATAAN_SMALL_JOIN=0` turns it off;
+/// read once per process.
+fn small_join_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_SMALL_JOIN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 impl Realm {
     /// `a + b` for two plain strings, or a string and an integer
     /// ([`add_str_str`](Self::add_str_str), [`add_str_int`](Self::add_str_int)):
@@ -86,13 +101,21 @@ impl Realm {
     #[inline]
     pub(crate) fn add_str_str(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
         let (x, y) = (a.as_handle()?, b.as_handle()?);
-        let ra = self.heap.get(Handle::from_raw(x))?.as_str()?;
-        let rb = self.heap.get(Handle::from_raw(y))?.as_str()?;
+        let ra = self.heap.get_hot(Handle::from_raw(x))?.as_str()?;
+        let rb = self.heap.get_hot(Handle::from_raw(y))?.as_str()?;
         if self.str_special && (self.aux_props.contains_key(&x) || self.aux_props.contains_key(&y))
         {
             return None;
         }
-        let joined = ra.try_concat(rb)?;
+        let small = if small_join_enabled() {
+            ra.try_concat_small(rb)
+        } else {
+            None
+        };
+        let joined = match small {
+            Some(j) => j,
+            None => ra.try_concat(rb)?,
+        };
         Some(NanBox::handle(self.heap.alloc(Cell::Str(joined)).to_raw()))
     }
 

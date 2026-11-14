@@ -833,6 +833,55 @@ impl Rope {
         self.concat_with(other, true)
     }
 
+    /// [`try_concat`](Self::try_concat) of two texts held in their nodes
+    /// whose join fits one (and is at most 32 bytes per side): written
+    /// straight into one new inline node, its UTF-16 length the sum of
+    /// both sides'. `None` for anything else, or when `other`
+    /// begins with a lone low surrogate (which could pair at the seam).
+    #[must_use]
+    #[inline]
+    pub fn try_concat_small(&self, other: &Rope) -> Option<Rope> {
+        let (
+            Node::Small {
+                len: la,
+                u16: ua,
+                buf: ba,
+            },
+            Node::Small {
+                len: lb,
+                u16: ub,
+                buf: bb,
+            },
+        ) = (&*self.0, &*other.0)
+        else {
+            return None;
+        };
+        let (la, lb) = (usize::from(*la), usize::from(*lb));
+        if la + lb > SMALL_CAP || lb > 32 || bb[0] == 0xED {
+            return None;
+        }
+        // (Each side's memo, counted now when unknown: a short scan, which
+        // then stays memoized there too.)
+        let units = |memo: u8, r: &Rope| match memo {
+            SMALL_U16_UNKNOWN => r.utf16_len() as u8,
+            m => m,
+        };
+        let u16 = units(ua.get(), self) + units(ub.get(), other);
+        let mut buf = *ba;
+        // The right side's zero-padded words, stored whole where they fit
+        // (bytes past the join stay zero: the padding of either side).
+        if la + 32 <= SMALL_CAP {
+            buf[la..la + 32].copy_from_slice(&bb[..32]);
+        } else {
+            buf[la..la + lb].copy_from_slice(&bb[..lb]);
+        }
+        Some(Rope(Rc::new(Node::Small {
+            len: (la + lb) as u8,
+            u16: core::cell::Cell::new(u16),
+            buf,
+        })))
+    }
+
     /// [`try_concat`](Self::try_concat) without append buffers: long sides
     /// are always shared by a `Concat`, so building a string from `k`
     /// pieces costs O(k) however long they are (`try_concat` could copy a
