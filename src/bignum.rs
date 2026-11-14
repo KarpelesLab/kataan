@@ -508,9 +508,11 @@ impl BigInt {
     pub fn shift(&self, shl: bool, count: &Self, max_bits: u64) -> Option<Self> {
         let left = shl != count.is_negative();
         // The count's magnitude, `None` beyond any representable shift.
-        let mag = count
-            .to_i128()
-            .and_then(|c| u64::try_from(c.unsigned_abs()).ok());
+        let mag = match count.0.limbs() {
+            [] => Some(0),
+            [m] => Some(*m),
+            _ => None,
+        };
         if self.is_zero() {
             return Some(Self::zero());
         }
