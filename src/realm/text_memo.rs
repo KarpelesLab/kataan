@@ -151,6 +151,9 @@ pub(crate) struct KeyTextLayout {
     pub(crate) mask: i32,
     /// The longest text recorded, in bytes.
     pub(crate) text_max: u8,
+    /// An inherited-accessor entry's slot ([`PROTO_ACC`]) as a sign-extended
+    /// byte: compiled code takes it for a miss.
+    pub(crate) proto_acc: i8,
 }
 
 /// Derives [`KeyTextLayout`].
@@ -175,6 +178,10 @@ pub(crate) fn jit_key_text_layout() -> KeyTextLayout {
         mul: HASH_MUL,
         mask: i(CAP - 1),
         text_max: TEXT_MAX as u8,
+        proto_acc: {
+            const _: () = assert!(PROTO_ACC as i32 == -2);
+            -2
+        },
     }
 }
 
@@ -431,7 +438,7 @@ impl Realm {
     /// an own data slot's value, `undefined` for a key on no object of the
     /// chain, or the getter of the inherited accessor an entry records.
     /// `None`: the ordinary lookup decides.
-    pub(crate) fn key_text_probe_acc(&self, obj: NanBox, key: NanBox) -> Option<AccHit> {
+    pub(crate) fn key_text_probe_acc(&self, obj: NanBox, key: NanBox) -> Option<AccHit<'_>> {
         if !getkey_enabled() {
             return None;
         }
@@ -458,7 +465,7 @@ impl Realm {
         }
         let slot = e.slot.get();
         if slot != ABSENT && slot != PROTO_ACC {
-            return o.slot(slot).map(AccHit::Value);
+            return Some(AccHit::Slot(o, slot));
         }
         if o.proto().map_or(NO_PROTO, Handle::to_raw) != e.proto.get()
             || crate::object::proto_epoch() != e.stamp.get()
@@ -500,9 +507,10 @@ enum ChainNote {
     not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
     allow(dead_code)
 )]
-pub(crate) enum AccHit {
-    /// An own data property's value.
-    Value(NanBox),
+pub(crate) enum AccHit<'a> {
+    /// An own data property: the receiver and the key's slot in its
+    /// layout.
+    Slot(&'a Object, u32),
     /// On no object of the receiver's chain (`undefined`).
     Absent,
     /// An accessor's getter (`undefined` for none): the read calls it with

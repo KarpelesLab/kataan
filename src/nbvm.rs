@@ -8231,13 +8231,18 @@ pub(crate) extern "C" fn jit_helper_get_elem(
         {
             return v.to_bits();
         }
-        // A receiver with accessors (`KATAAN_JIT_GETKEY`): a data or absent
-        // key decided by the text memo (a getter: the general read calls it).
-        match c
-            .realm
-            .key_text_probe_acc(NanBox::from_bits(recv), NanBox::from_bits(key))
-        {
-            Some(crate::realm::AccHit::Value(v)) => return v.to_bits(),
+        // A data or absent key decided by the text memo, accessor-bearing
+        // receivers included (`KATAAN_JIT_GETKEY`; a getter: the general
+        // read calls it).
+        match NanBox::from_bits(key).as_handle().and_then(|_| {
+            c.realm
+                .key_text_probe_acc(NanBox::from_bits(recv), NanBox::from_bits(key))
+        }) {
+            Some(crate::realm::AccHit::Slot(o, slot)) => {
+                if let Some(v) = o.slot(slot) {
+                    return v.to_bits();
+                }
+            }
             Some(crate::realm::AccHit::Absent) => return NanBox::undefined().to_bits(),
             _ => {}
         }
@@ -8258,8 +8263,13 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
     let own_done = !key.is_number();
     if own_done {
         // A key of a memoized text (`realm::text_memo`): an own data slot,
-        // or a key on no object of an ordinary chain (`undefined`).
-        match ctx.realm.key_text_probe(recv, key) {
+        // or a key on no object of an ordinary chain (`undefined`). (Every
+        // caller asked the accessor-aware probe already, which answers all
+        // this one does, when `KATAAN_JIT_GETKEY` is on.)
+        match (!crate::realm::getkey_enabled())
+            .then(|| ctx.realm.key_text_probe(recv, key))
+            .flatten()
+        {
             Some(crate::realm::TextHit::Slot(o, slot)) => {
                 if let Some(v) = o.slot(slot) {
                     return v.to_bits();
@@ -8293,7 +8303,14 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
         return v.to_bits();
     }
     match vm_get_elem_from(ctx, funcs, recv, key, own_done, jit_lent(ctx)) {
-        Ok(v) => v.to_bits(),
+        Ok(v) => {
+            // A String key found up the chain (an inherited accessor, which
+            // the text memo can record for the next read: `KATAAN_JIT_GETKEY`).
+            if own_done {
+                ctx.realm.key_text_note_acc(recv, key);
+            }
+            v.to_bits()
+        }
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
             NanBox::jit_throw_bits()

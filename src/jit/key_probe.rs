@@ -201,7 +201,7 @@ impl X64Assembler {
     /// it: falls through with `eax` = the key's slot in the receiver's
     /// layout (an own data property); goes to `absent` (when given, else
     /// `miss`) when the key is on no object of the receiver's chain; else
-    /// to `miss`. Clobbers `rax`, `r8`, `r9`, `r11`.
+    /// (an inherited accessor's entry included) to `miss`. Clobbers `rax`, `r8`, `r9`, `r11`.
     pub(super) fn tp_probe(
         &mut self,
         l: &JitLayout,
@@ -266,8 +266,9 @@ impl X64Assembler {
         self.g_jcc(cc::NE, miss);
         self.g_mem(false, &[0x8b], r::RAX, r::R8, t.slot); // mov eax, [slot]
         let present = self.new_label();
+        let other = self.new_label();
         self.code.extend_from_slice(&[0x83, 0xf8, 0xff]); // cmp eax, -1
-        self.g_jcc(cc::NE, present);
+        self.g_jcc(cc::NE, other);
         // An absent entry: the receiver's `[[Prototype]]` and the epoch.
         let absent = absent.unwrap_or(miss);
         self.g_load(r::R9, r::RCX, l.props.off_proto);
@@ -277,6 +278,12 @@ impl X64Assembler {
         self.g_cmp_mem(r::R9, r::R8, t.stamp);
         self.g_jcc(cc::NE, miss);
         self.jmp(absent);
+        // An inherited accessor's entry (the Rust probe's alone): a miss.
+        self.bind(other);
+        self.code
+            .extend_from_slice(&[0x83, 0xf8, t.proto_acc.to_le_bytes()[0]]); // cmp eax, -2
+        self.g_jcc(cc::NE, present);
+        self.jmp(miss);
         self.bind(present);
     }
 }

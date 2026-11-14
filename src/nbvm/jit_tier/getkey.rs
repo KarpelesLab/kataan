@@ -31,7 +31,7 @@ fn probe(ctx: &Ctx, recv: u64, key: u64) -> Option<Result<NanBox, NanBox>> {
         return Some(Ok(v));
     }
     match ctx.realm.key_text_probe_acc(recv, key)? {
-        AccHit::Value(v) => Some(Ok(v)),
+        AccHit::Slot(o, slot) => o.slot(slot).map(Ok),
         AccHit::Absent => Some(Ok(NanBox::undefined())),
         AccHit::Getter(g) if g.is_undefined() => Some(Ok(g)),
         AccHit::Getter(g) => g
@@ -39,20 +39,6 @@ fn probe(ctx: &Ctx, recv: u64, key: u64) -> Option<Result<NanBox, NanBox>> {
             .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
             .then_some(Err(g)),
     }
-}
-
-/// The general read, then a note of what the accessor-aware probe could
-/// answer next time (a key absent from the chain, an inherited accessor).
-fn general(ctx_raw: *mut core::ffi::c_void, recv: u64, key: u64) -> u64 {
-    let v = jit_get_elem_general(ctx_raw, recv, key);
-    if v != NanBox::jit_throw_bits() {
-        // SAFETY: the general read's borrow of the context has ended.
-        #[allow(unsafe_code)]
-        let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
-        ctx.realm
-            .key_text_note_acc(NanBox::from_bits(recv), NanBox::from_bits(key));
-    }
-    v
 }
 
 /// `recv[key]` for compiled code that can call a getter itself: `*out`
@@ -69,6 +55,11 @@ pub(crate) extern "C" fn jit_helper_get_elem_acc(
     out: *mut u64,
 ) -> u64 {
     let (v, g) = 'read: {
+        // (A key that is no String, a Number most often: neither memo
+        // knows it.)
+        if NanBox::from_bits(key).as_handle().is_none() {
+            break 'read (jit_get_elem_general(ctx_raw, recv, key), 0);
+        }
         // SAFETY: as `jit_helper_get_elem`; this borrow ends before the
         // general read runs.
         #[allow(unsafe_code)]
@@ -78,7 +69,7 @@ pub(crate) extern "C" fn jit_helper_get_elem_acc(
             Some(Err(g)) => break 'read (g.to_bits(), g.to_bits()),
             None => {}
         }
-        (general(ctx_raw, recv, key), 0)
+        (jit_get_elem_general(ctx_raw, recv, key), 0)
     };
     // SAFETY: the caller's frame slot (see the function contract).
     #[allow(unsafe_code)]
@@ -108,7 +99,7 @@ pub(crate) extern "C" fn jit_helper_get_elem_site(
     let g = match probe(ctx, recv, key) {
         Some(Ok(v)) => return v.to_bits(),
         Some(Err(g)) => g,
-        None => return general(ctx_raw, recv, key),
+        None => return jit_get_elem_general(ctx_raw, recv, key),
     };
     // SAFETY: the site's own cache (see the function contract).
     #[allow(unsafe_code)]

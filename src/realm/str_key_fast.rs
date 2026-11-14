@@ -278,14 +278,28 @@ impl Realm {
         if self.key_memo_probe(obj, key).is_some() {
             return Some(true);
         }
-        // A receiver with accessors (`text_memo::key_text_probe_acc`).
+        // The text memo, accessor-bearing receivers included
+        // (`text_memo::key_text_probe_acc`).
         match self.key_text_probe_acc(obj, key) {
-            Some(super::AccHit::Value(_) | super::AccHit::Getter(_)) => return Some(true),
+            Some(super::AccHit::Slot(o, slot)) => {
+                // (The slot memo, as the text memo's hit below notes it.)
+                if o.has_no_accessors()
+                    && let Some(shape) = o.shaped_shape()
+                {
+                    self.key_memo_note(key, shape, slot);
+                }
+                return Some(true);
+            }
+            Some(super::AccHit::Getter(_)) => return Some(true),
             Some(super::AccHit::Absent) => return Some(false),
             None => {}
         }
         // A key of the same text, memoized (`text_memo`), present or absent.
-        match self.key_text_probe(obj, key) {
+        // (What the probe above answers when `KATAAN_JIT_GETKEY` is on.)
+        match (!super::getkey_enabled())
+            .then(|| self.key_text_probe(obj, key))
+            .flatten()
+        {
             Some(super::TextHit::Slot(o, slot)) => {
                 if let Some(shape) = o.shaped_shape() {
                     self.key_memo_note(key, shape, slot);
