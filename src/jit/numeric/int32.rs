@@ -63,6 +63,14 @@ fn inplace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INPLACE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a speculative region's plan folds the sum or difference of two
+/// constant temporaries into a constant temporary (`KATAAN_JIT_CONSTFOLD=0`
+/// turns it off; read once).
+fn fold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONSTFOLD").is_none_or(|v| v != "0"))
+}
+
 /// Whether the integer version's `*` computes in its result's GPR (or in
 /// place in its first factor's) instead of through `rax`
 /// (`KATAAN_JIT_IMULDIRECT=0` turns it off; read once).
@@ -779,6 +787,36 @@ pub(super) fn plan(
                     {
                         consts.push((x.0, -c.1, x.1, x.2));
                     }
+                    // (Or a live range whose one def loads a constant -- a
+                    // literal in an inlined body, which each inlined copy
+                    // loads into the same register.)
+                    if fold_enabled()
+                        && let [d] = ds[..]
+                        && let Op::LoadConst { value, .. } = bytecode[d]
+                        && let Some(v) = const_i32(value)
+                        && !consts.iter().any(|c| c.0 == x.0 && c.2 == x.1)
+                    {
+                        consts.push((x.0, v, x.1, x.2));
+                    }
+                    // (Or the sum or difference of two constants that fits
+                    // an int32 -- an inlined `32 - r` -- which is never
+                    // `-0`: the int32 sum of two int32s is exact.)
+                    if fold_enabled()
+                        && let [d] = ds[..]
+                        && let Op::Add { a: p, b: q, .. }
+                        | Op::AddValue { a: p, b: q, .. }
+                        | Op::Sub { a: p, b: q, .. } = bytecode[d]
+                        && let Some(cp) = consts.iter().find(|c| c.0 == p && c.2 <= d && d <= c.3)
+                        && let Some(cq) = consts.iter().find(|c| c.0 == q && c.2 <= d && d <= c.3)
+                        && let Some(v) = if matches!(bytecode[d], Op::Sub { .. }) {
+                            cp.1.checked_sub(cq.1)
+                        } else {
+                            cp.1.checked_add(cq.1)
+                        }
+                        && !consts.iter().any(|c| c.0 == x.0 && c.2 == x.1)
+                    {
+                        consts.push((x.0, v, x.1, x.2));
+                    }
                 }
                 if consts.len() == before {
                     break;
@@ -1106,7 +1144,14 @@ pub(super) fn plan(
                         && inn(*dst)
                         && inn(*a)
                         && a != b
-                        && cval(*b).is_some_and(|c| c & 31 != 0)
+                        && (cval(*b).is_some_and(|c| c & 31 != 0)
+                            // (Or the count's live range at this `>>>` is a
+                            // constant: each inlined copy's own.)
+                            || (fold_enabled()
+                                && consts
+                                    .iter()
+                                    .find(|c| c.0 == *b && c.2 <= head + i && head + i <= c.3)
+                                    .is_some_and(|c| c.1 & 31 != 0)))
                         && !wrap_bits.contains(&(head + i)) =>
                 {
                     Some(head + i)
@@ -2108,6 +2153,12 @@ impl NumGen {
                     self.iput(a, dst, t)?;
                 }
             }
+            // (A folded constant's live range: nothing, `plan`.)
+            GenericOp::Add { dst, .. }
+            | GenericOp::NumAdd { dst, .. }
+            | GenericOp::Arith {
+                dst, op: GA_SUB, ..
+            } if ii(self, dst) && matches!(self.ik(dst), Some(IK::Imm(_))) => {}
             GenericOp::Add { dst, a: x, b: y }
             | GenericOp::NumAdd {
                 dst, a: x, b: y, ..
