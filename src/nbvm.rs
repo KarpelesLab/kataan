@@ -2147,9 +2147,7 @@ fn host_binary(
     b: NanBox,
     regs: Option<&[NanBox]>,
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() {
-        return None;
-    }
+    ctx.host.as_ref()?;
     // Two BigInt primitives under an operator that cannot throw: the host's
     // answer, computed on the borrowed values. (Two BigInts are host
     // operands, so trying them first changes nothing but the order of the

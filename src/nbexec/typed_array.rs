@@ -190,7 +190,7 @@ impl Interp {
         let target = if let Some(method) = using_iterator {
             // Steps 5.a–5.c: drain the iterator to a list first, then
             // `TypedArrayCreate(C, « len »)` — build the target after collecting.
-            let values = match self.from_source_numbers(source, method) {
+            let values = match self.iterated_source_numbers(source, method) {
                 Some(values) => values,
                 None => {
                     let iterator = self.call_with_this(method, source, &[])?;
@@ -262,7 +262,7 @@ impl Interp {
     /// (neither detached nor out of bounds) whose `method` is the intrinsic
     /// `%TypedArray%.prototype.values` and whose iterator's `next` is the
     /// intrinsic one. `None`: iterate.
-    fn from_source_numbers(&mut self, source: NanBox, method: NanBox) -> Option<Vec<NanBox>> {
+    fn iterated_source_numbers(&mut self, source: NanBox, method: NanBox) -> Option<Vec<NanBox>> {
         if let Some(v) = crate::nbvm::plain_array_numbers(&mut self.realm, source) {
             return Some(v);
         }

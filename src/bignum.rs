@@ -729,7 +729,7 @@ mod tests {
             let make = |rnd: &mut dyn FnMut() -> u64| {
                 let len = (rnd() % 18) as usize;
                 let limbs: Vec<u64> = (0..len).map(|_| gen_limb(rnd)).collect();
-                let sign = if rnd() % 2 == 0 {
+                let sign = if rnd().is_multiple_of(2) {
                     Sign::Positive
                 } else {
                     Sign::Negative

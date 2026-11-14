@@ -842,6 +842,10 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
 /// table: a string literal, or a BigInt literal (an immutable value whose
 /// identity no operation observes either: `===`, `SameValueZero` and every
 /// other comparison look at its value) unless `KATAAN_JIT_LIT_BIGINT=0`.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn lit_site(op: &crate::nbvm::Op) -> bool {
     match op {
         crate::nbvm::Op::NewString { .. } => true,
@@ -852,6 +856,10 @@ fn lit_site(op: &crate::nbvm::Op) -> bool {
 
 /// Whether BigInt literals share one cell per site in compiled code
 /// (`KATAAN_JIT_LIT_BIGINT=0` turns it off; read once per process).
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn lit_bigint_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
