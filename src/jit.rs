@@ -838,6 +838,26 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
 }
 
 /// The registers an op reads or writes (`dst` first if it has one).
+/// Whether `op` is a literal site with a word in the body's `LitCells`
+/// table: a string literal, or a BigInt literal (an immutable value whose
+/// identity no operation observes either: `===`, `SameValueZero` and every
+/// other comparison look at its value) unless `KATAAN_JIT_LIT_BIGINT=0`.
+fn lit_site(op: &crate::nbvm::Op) -> bool {
+    match op {
+        crate::nbvm::Op::NewString { .. } => true,
+        crate::nbvm::Op::NewBigInt { .. } => lit_bigint_enabled(),
+        _ => false,
+    }
+}
+
+/// Whether BigInt literals share one cell per site in compiled code
+/// (`KATAAN_JIT_LIT_BIGINT=0` turns it off; read once per process).
+fn lit_bigint_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LIT_BIGINT").is_none_or(|v| v != "0"))
+}
+
 fn op_regs(op: &RegOp) -> (Option<u8>, [Option<u8>; 2]) {
     match *op {
         RegOp::Arg { dst, .. } | RegOp::Const { dst, .. } => (Some(dst), [None, None]),
@@ -4910,10 +4930,7 @@ impl JitProto {
             .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
         // One word per string literal (`crate::realm::LitCells`), then one per
         // sunk site (its stand-in, `sink::SinkMemo::word`).
-        let n_strings = bytecode
-            .iter()
-            .filter(|op| matches!(op, crate::nbvm::Op::NewString { .. }))
-            .count();
+        let n_strings = bytecode.iter().filter(|op| lit_site(op)).count();
         let lits = alloc::rc::Rc::new(crate::realm::LitCells::new(
             n_strings + sink_plan.as_ref().map_or(0, |p| p.sites.len()),
         ));
@@ -8809,7 +8826,7 @@ impl JitFunction {
             bytecode
                 .iter()
                 .map(|op| {
-                    matches!(op, crate::nbvm::Op::NewString { .. }).then(|| {
+                    lit_site(op).then(|| {
                         n += 1;
                         n - 1
                     })
@@ -13357,6 +13374,7 @@ impl JitFunction {
                         // one load; the first evaluation fills the word out
                         // of line (`jit_helper_lit_string`).
                         crate::nbvm::Op::NewString { dst, .. }
+                        | crate::nbvm::Op::NewBigInt { dst, .. }
                             if ok(*dst)
                                 && lit_word.get(pc as usize).copied().flatten().is_some() =>
                         {

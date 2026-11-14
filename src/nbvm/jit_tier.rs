@@ -2244,8 +2244,17 @@ pub(crate) extern "C" fn jit_helper_lit_string(
             Rc::from_raw(p),
         )
     };
-    if let Op::NewString { dst, value } = op {
-        regs[*dst as usize] = ctx.realm.fill_lit_cell(&cells, index as usize, value);
+    match op {
+        Op::NewString { dst, value } => {
+            regs[*dst as usize] = ctx.realm.fill_lit_cell(&cells, index as usize, value);
+        }
+        // A BigInt literal (`crate::jit::lit_site`): one cell for the site.
+        Op::NewBigInt { dst, value } => {
+            let v = NanBox::handle(ctx.realm.new_bigint((**value).clone()).to_raw());
+            ctx.realm.fill_lit_word(&cells, index as usize, v);
+            regs[*dst as usize] = v;
+        }
+        _ => {}
     }
     0
 }
