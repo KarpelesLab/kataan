@@ -111,6 +111,9 @@ enum FastOp {
     NumPred(NumPred),
     /// `Array.isArray`.
     ArrayIsArray,
+    /// `Promise.resolve` (served for a primitive argument, see
+    /// `promise_resolve_fast`; anything else is the host's call).
+    PromiseResolve,
     /// `Function.prototype.call` on a VM function.
     FnCall,
     /// `Function.prototype.apply` on a VM function.
@@ -362,6 +365,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
             }
             Some(b"isFinite") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::Finite),
             Some(b"isNaN") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::NaN),
+            Some(b"resolve") if ctor == Some(crate::nbexec::N_PROMISE) => FastOp::PromiseResolve,
             _ => FastOp::HostDirect,
         };
     }
@@ -1252,6 +1256,41 @@ fn run_op_out_of_line(
     run_op(ctx, funcs, op, method, recv, h, false, regs, args)
 }
 
+/// Whether `Promise.resolve(x)` of a primitive is served without the host
+/// ([`promise_resolve_fast`], `KATAAN_PROMISE_RESOLVE`, default on).
+fn promise_resolve_lean_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_PROMISE_RESOLVE").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// `Promise.resolve(x)` ([`FastOp::PromiseResolve`]) with the receiver `h`
+/// the intrinsic `%Promise%` (with one realm, the only cell of that native)
+/// and `x` a primitive held in the value itself (no string, symbol or
+/// BigInt): PromiseResolve's `IsPromise(x)` is false, and
+/// NewPromiseCapability(%Promise%) then resolving with a non-object only
+/// makes a promise of the intrinsic `%Promise.prototype%` fulfilled with
+/// `x` — no code runs, nothing is queued (it has no reactions yet). That
+/// promise, made as the host makes it; `None`, having done nothing
+/// observable, otherwise.
+fn promise_resolve_fast(ctx: &mut Ctx, h: Handle, x: NanBox) -> Option<NanBox> {
+    if !promise_resolve_lean_on()
+        || ctx.realm.multi_realm
+        || x.as_handle().is_some()
+        || ctx.realm.native_at(h) != Some(crate::nbexec::N_PROMISE)
+    {
+        return None;
+    }
+    let p = super::vm_new_promise(ctx)?;
+    super::settle_unwatched(ctx, p, x).then_some(p)
+}
+
 /// `Object.prototype.hasOwnProperty` on the receiver `h` for the key value
 /// `k` ([`FastOp::ObjHasOwn`]) when that runs no code; `None`, having done
 /// nothing observable, otherwise.
@@ -1467,6 +1506,18 @@ fn run_op(
                 .map_err(VmError::from),
         );
     }
+    if matches!(op, FastOp::PromiseResolve) {
+        if let Some(p) = promise_resolve_fast(ctx, h, arg(0)) {
+            return Some(Ok(p));
+        }
+        let method = NanBox::from_bits(method);
+        let argv = super::ArgBuf::from_regs(regs, args);
+        return Some(
+            with_host_regs(ctx, regs, |host| host.call(method, recv, &argv))
+                .unwrap_or(Err(super::HostError::Fault))
+                .map_err(VmError::from),
+        );
+    }
     if matches!(op, FastOp::ObjAssign) {
         if let Some(v) = obj_assign_fast(&mut ctx.realm, regs, args) {
             return Some(Ok(v));
@@ -1482,6 +1533,7 @@ fn run_op(
     let realm = &mut ctx.realm;
     let v = match op {
         FastOp::None
+        | FastOp::PromiseResolve
         | FastOp::ObjAssign
         | FastOp::ArrayHof(_)
         | FastOp::StrReplaceAll
