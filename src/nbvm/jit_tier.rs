@@ -2455,12 +2455,7 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             dst, callee, args, ..
         } => {
             let callee = regs[*callee as usize];
-            // A hot generator function with a plain prologue: its generator
-            // made directly (`gen_fast::create`).
-            let made = super::gen_fast::create(ctx, funcs, regs, callee, args);
-            match made
-                .or_else(|| call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined()))
-            {
+            match call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined()) {
                 Some(r) => Some(r.map(|v| regs[*dst as usize] = v)),
                 // Any other VM closure (an interpreted, async or generator
                 // function): the interpreter arm's call, without a one-op
@@ -4172,10 +4167,13 @@ pub(crate) extern "C" fn jit_helper_call_value(
         // SAFETY: the activation's register file, live and unaliased here.
         #[allow(unsafe_code)]
         let callee_val = unsafe { *regs_raw.add(*callee as usize) };
-        // A hot generator function with a plain prologue: its generator made
-        // directly (`gen_fast::create`), no call site to fill (a generator
-        // function has no direct entry).
-        {
+        // SAFETY: the site's own cache (see the function contract).
+        #[allow(unsafe_code)]
+        let site = unsafe { &mut *site.cast::<CallSite>() };
+        // A generator function (which has no direct entry, so no site to
+        // fill): when hot with a plain prologue, its generator made
+        // directly (`gen_fast::create`).
+        if fill_call_site_or_gen(ctx, NanBox::from_bits(callee_val), site) {
             // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
             #[allow(unsafe_code)]
             let funcs = unsafe {
@@ -4202,10 +4200,6 @@ pub(crate) extern "C" fn jit_helper_call_value(
                 };
             }
         }
-        // SAFETY: the site's own cache (see the function contract).
-        #[allow(unsafe_code)]
-        let site = unsafe { &mut *site.cast::<CallSite>() };
-        fill_call_site(ctx, NanBox::from_bits(callee_val), site);
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
 }
@@ -4412,15 +4406,23 @@ pub(crate) extern "C" fn jit_helper_tail_call(
 /// closure whose function [`direct_jit`] accepts and whose compiled body has
 /// a native-call entry over the function's own register count.
 fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
+    fill_call_site_or_gen(ctx, callee, site);
+}
+
+/// [`fill_call_site`], answering whether the callee is a VM generator
+/// function (whose site it then leaves as it is: such a function has no
+/// direct entry).
+#[inline(always)]
+fn fill_call_site_or_gen(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) -> bool {
     let Some(raw) = callee.as_handle() else {
-        return;
+        return false;
     };
     let Some((fid, n_caps)) = ctx
         .realm
         .vm_function(Handle::from_raw(raw))
         .map(|(f, caps)| (f, caps.len()))
     else {
-        return;
+        return false;
     };
     // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
     #[allow(unsafe_code)]
@@ -4431,24 +4433,28 @@ fn fill_call_site(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) {
     };
     let id = fid as usize;
     let Some(proto) = funcs.get(id) else {
-        return;
+        return false;
     };
+    if proto.is_generator {
+        return true;
+    }
     if n_caps < proto.n_captures {
-        return;
+        return false;
     }
     let Some(jit) = direct_jit(ctx, proto, id) else {
-        return;
+        return false;
     };
     let Some(target) = jit.call_target(u64::from(fid) | ((n_caps as u64) << 32), site) else {
-        return;
+        return false;
     };
     // (An inlining body's window is larger than the function's own.)
     if jit.n_regs() < proto.n_regs {
-        return;
+        return false;
     }
     // The compiled body stays alive for the context's life (`direct` and the
     // JIT cache never drop one), so the raw entry address does too.
     site.fill(target);
+    false
 }
 
 /// The call sequence's callee identification (`crate::jit::CalleeHelper`): a VM

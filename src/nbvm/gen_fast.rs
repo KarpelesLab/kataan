@@ -120,6 +120,7 @@ fn plain_prologue(ops: &[Op]) -> Option<usize> {
 /// for anything else, including a call at the recursion limits (whose
 /// `RangeError` the general path throws).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[inline(never)]
 pub(super) fn create(
     ctx: &mut Ctx,
     funcs: &[FnProto],
