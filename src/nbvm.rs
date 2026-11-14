@@ -7561,6 +7561,7 @@ fn call_closure_pub(
 /// shadowing or redefined accessor on the chain): the getter's answer from
 /// the view's internal slots, as the host's `[[Get]]` computes it. `None`
 /// for anything else (or with `KATAAN_TYPED_ACCESSOR_FAST=0`).
+#[inline(never)]
 fn typed_view_accessor(ctx: &Ctx, h: Handle, key: &str) -> Option<NanBox> {
     if ctx.host.is_none() || !matches!(key, "buffer" | "byteLength" | "byteOffset" | "length") {
         return None;
@@ -7634,9 +7635,6 @@ fn vm_get_prop(
         {
             return Ok(NanBox::number(n as f64));
         }
-        if let Some(v) = typed_view_accessor(ctx, h, key) {
-            return Ok(v);
-        }
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
             return Ok(v);
         }
@@ -7685,6 +7683,12 @@ fn vm_get_prop(
             None if closure => {}
             None => ctx.realm.chain_cache_fill(h, key, cache),
         }
+    }
+    // A typed array's view accessor, answered from its slots.
+    if let Some(h) = recv.as_handle()
+        && let Some(v) = typed_view_accessor(ctx, Handle::from_raw(h), key)
+    {
+        return Ok(v);
     }
     // A static-key read of an array's `length` or an index (`let {length} = a`,
     // `{0: x} = a`) lives in the element store, not the named properties.
