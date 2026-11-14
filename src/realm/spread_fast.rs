@@ -81,6 +81,7 @@ impl Realm {
             return false;
         }
         let threshold = self.limits.object_dictionary_threshold;
+        let barrier = self.barrier_needed(target);
         let Some(Cell::Object(t)) = self.heap.get_mut(target) else {
             return false;
         };
@@ -88,11 +89,13 @@ impl Realm {
             return true;
         }
         let mut vals: Vec<NanBox> = Vec::new();
-        copy.for_each_value(|v| {
-            if v.as_handle().is_some() {
-                vals.push(v);
-            }
-        });
+        if barrier {
+            copy.for_each_value(|v| {
+                if v.as_handle().is_some() {
+                    vals.push(v);
+                }
+            });
+        }
         match t.adopt_plain(copy, threshold) {
             Ok(()) => {
                 for v in vals {
@@ -170,9 +173,11 @@ impl Realm {
             return false;
         };
         t.merge_planned(&plan.0, &plan.1, &values);
-        for v in values {
-            if v.as_handle().is_some() {
-                self.write_barrier(target, v);
+        if self.barrier_needed(target) {
+            for v in values {
+                if v.as_handle().is_some() {
+                    self.write_barrier(target, v);
+                }
             }
         }
         true
@@ -222,11 +227,13 @@ impl Realm {
         }
         let threshold = self.limits.object_dictionary_threshold;
         let mut vals: Vec<NanBox> = Vec::new();
-        copy.for_each_value(|v| {
-            if v.as_handle().is_some() {
-                vals.push(v);
-            }
-        });
+        if self.barrier_needed(target) {
+            copy.for_each_value(|v| {
+                if v.as_handle().is_some() {
+                    vals.push(v);
+                }
+            });
+        }
         let Some(Cell::Object(t)) = self.heap.get_mut(target) else {
             return Err(copy);
         };

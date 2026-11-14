@@ -8622,6 +8622,17 @@ impl Realm {
         }
     }
 
+    /// Whether a store into `container` needs [`write_barrier`](Self::write_barrier)
+    /// at all: it is old (an old-to-young edge would need recording) or an
+    /// incremental marking is running. A copy of many values into a young
+    /// object — a spread's or `Object.assign`'s fresh target — skips
+    /// gathering them for the barrier (`KATAAN_BULK_BARRIER=0` never skips).
+    pub(crate) fn barrier_needed(&self, container: Handle) -> bool {
+        self.incremental.is_some()
+            || !bulk_barrier_skip_on()
+            || self.heap.age(container).is_none_or(|a| a >= gc::OLD_AGE)
+    }
+
     fn write_barrier(&mut self, container: Handle, value: NanBox) {
         if let Some(raw) = value.as_handle() {
             let target = Handle::from_raw(raw);
@@ -10651,6 +10662,20 @@ pub(crate) const HIDDEN_MEMOS: usize = 2;
 
 /// [`Vec::retain`] of `list[from..]` alone: the entries before `from` all
 /// stay, unvisited.
+/// Whether [`Realm::barrier_needed`] may answer `false` (`KATAAN_BULK_BARRIER=0`
+/// turns it off, read once per process).
+fn bulk_barrier_skip_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_BULK_BARRIER").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 fn retain_from(list: &mut Vec<u64>, from: usize, mut keep: impl FnMut(u64) -> bool) {
     let from = from.min(list.len());
     let tail = &mut list[from..];

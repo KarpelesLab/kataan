@@ -119,11 +119,13 @@ impl Realm {
         }
         let copy = if target_empty {
             let mut vals: Vec<NanBox> = Vec::new();
-            copy.for_each_value(|v| {
-                if v.as_handle().is_some() {
-                    vals.push(v);
-                }
-            });
+            if self.barrier_needed(target) {
+                copy.for_each_value(|v| {
+                    if v.as_handle().is_some() {
+                        vals.push(v);
+                    }
+                });
+            }
             let threshold = self.limits.object_dictionary_threshold;
             let Some(Cell::Object(t)) = self.heap.get_mut(target) else {
                 return false;
