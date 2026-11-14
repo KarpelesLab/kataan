@@ -4132,6 +4132,7 @@ pub(crate) fn str_compare_enabled() -> bool {
 /// built-in directly when the site proves it (`jit_helper_str_call`)
 /// rather than through the general call (`KATAAN_JIT_STRCALL=0` turns it
 /// off; read once per process).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn str_call_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -4141,6 +4142,7 @@ pub(crate) fn str_call_enabled() -> bool {
 /// Whether a template literal's `Op::Concat` joins its parts through
 /// `jit_helper_concat` before the interpreter's op (`KATAAN_JIT_CONCAT=0`
 /// turns it off; read once per process).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn concat_fast_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
