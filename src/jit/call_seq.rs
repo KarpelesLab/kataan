@@ -942,6 +942,15 @@ pub struct CallLayout {
     /// `ctx`: where the running activation's segment of it starts
     /// (`TierRuntime::base`).
     pub handlers_base: i32,
+    /// `ctx`: the handler stack's buffer pointer word and capacity word.
+    pub handlers_ptr: i32,
+    pub handlers_cap: i32,
+    /// realm: `limits.max_handler_depth: usize`.
+    pub max_handlers: i32,
+    /// A handler entry `(catch_pc: usize, catch_reg: Reg)`: its size and
+    /// its two fields' offsets (`Some` only for the 16-byte layout an
+    /// inline push writes, see `X64Assembler::emit_push_handler_inline`).
+    pub handler_entry: Option<(i32, i32)>,
     /// What the back-edge poll's inline do-nothing test reads (see
     /// `emit_quiet_poll`).
     pub poll: PollLayout,

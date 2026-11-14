@@ -3603,6 +3603,23 @@ fn pure_handlers_enabled() -> bool {
     }
 }
 
+/// Whether leaf `Op::PushHandler` / `Op::PopHandler` ([`pure_handlers_enabled`])
+/// push and pop the compiled activations' handler stack in line, calling
+/// the lean helper only to grow it (`KATAAN_JIT_INLHANDLER=0` keeps the
+/// calls, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn inline_handlers_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_INLHANDLER").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether by-index array iteration steps keep a shadow integer cursor in
 /// the native frame (`KATAAN_JIT_ITERSHADOW=0` turns it off, read once per
 /// process).
@@ -11403,6 +11420,44 @@ impl JitFunction {
                         // which throws its `RangeError`.
                         let full = a.new_label();
                         let done = a.new_label();
+                        let cl = &helpers.call_layout;
+                        let inline = cl
+                            .handler_entry
+                            .filter(|_| inline_handlers_enabled())
+                            .zip(i32::try_from(at).ok());
+                        let grow = a.new_label();
+                        if let Some(((pc_off, reg_off), at32)) = inline {
+                            // In line, as the lean helper: below the depth
+                            // limit (else the full helper's `RangeError`)
+                            // and with room (else the lean helper, which
+                            // grows the stack), the entry written at the
+                            // stack's end and the length bumped. Clobbers
+                            // `rax`, `rcx`, `rdx`, as the call would.
+                            use call_seq::r as R;
+                            a.g_load(R::RAX, R::R15, cl.handlers_len);
+                            a.g_mov(R::RCX, R::RAX);
+                            a.g_mem(true, &[0x2b], R::RCX, R::R15, cl.handlers_base); // sub
+                            a.g_load(R::RDX, R::R15, cl.realm);
+                            a.g_cmp_mem(R::RCX, R::RDX, cl.max_handlers);
+                            a.g_jcc(call_seq::cc::AE, full);
+                            a.g_cmp_mem(R::RAX, R::R15, cl.handlers_cap);
+                            a.g_jcc(call_seq::cc::AE, grow);
+                            a.g_load(R::RCX, R::R15, cl.handlers_ptr);
+                            a.raw(&[0x48, 0xc1, 0xe0, 0x04]); // shl rax, 4
+                            a.g_add(R::RCX, R::RAX);
+                            a.g_store_imm32(R::RCX, pc_off, at32);
+                            a.raw(&[0x66, 0xc7, 0x81]); // mov word [rcx + disp32], imm16
+                            a.raw(&reg_off.to_le_bytes());
+                            a.raw(&reg.to_le_bytes());
+                            a.g_inc_mem(R::R15, cl.handlers_len);
+                        }
+                        // (In line, the lean helper is the cold path of a
+                        // full stack.)
+                        let cold_grow = inline.is_some().then(|| {
+                            let c = a.cold_begin();
+                            a.bind(grow);
+                            c
+                        });
                         a.mov_rdi_r15();
                         a.movabs_argreg(1, at);
                         a.movabs_argreg(2, i64::from(reg));
@@ -11410,6 +11465,10 @@ impl JitFunction {
                         a.call_rax_pure();
                         a.test_rax_rax();
                         a.jne(full);
+                        if let Some(c) = cold_grow {
+                            a.jmp(done);
+                            a.cold_end(c);
+                        }
                         let cold = a.cold_begin();
                         a.bind(full);
                         a.mov_rdi_r15();
@@ -11431,13 +11490,29 @@ impl JitFunction {
                     }
                 }
                 GenericOp::PopHandler => {
-                    a.mov_rdi_r15();
-                    a.movabs_rax(pop_handler_helper as i64);
-                    // (A leaf: the pop neither allocates nor throws.)
-                    if pure_handlers {
-                        a.call_rax_pure();
+                    if pure_handlers
+                        && helpers.call_layout.handler_entry.is_some()
+                        && inline_handlers_enabled()
+                    {
+                        // In line, as the helper: the innermost handler of
+                        // the activation's segment dropped, if it has one.
+                        use call_seq::r as R;
+                        let cl = &helpers.call_layout;
+                        let none = a.new_label();
+                        a.g_load(R::RAX, R::R15, cl.handlers_len);
+                        a.g_cmp_mem(R::RAX, R::R15, cl.handlers_base);
+                        a.g_jcc(call_seq::cc::BE, none);
+                        a.g_dec_mem(R::R15, cl.handlers_len);
+                        a.bind(none);
                     } else {
-                        a.call_rax();
+                        a.mov_rdi_r15();
+                        a.movabs_rax(pop_handler_helper as i64);
+                        // (A leaf: the pop neither allocates nor throws.)
+                        if pure_handlers {
+                            a.call_rax_pure();
+                        } else {
+                            a.call_rax();
+                        }
                     }
                 }
                 GenericOp::InlineGuard {

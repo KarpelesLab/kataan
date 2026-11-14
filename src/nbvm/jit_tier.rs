@@ -5286,6 +5286,19 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
     // A `Vec`'s length word sits at the same offset whatever its element type.
     let probe: alloc::vec::Vec<NanBox> = alloc::vec::Vec::with_capacity(5);
     let len_off = vec_len_offset(&probe);
+    // The handler stack's other two words and its entries' layout, for the
+    // inline push (`None`, and no inline push, unless both are known).
+    let words = handler_vec_words(len_off);
+    let (h_ptr, h_cap) = words.unwrap_or((0, 0));
+    let handler_entry = (words.is_some()
+        && core::mem::size_of::<(usize, Reg)>() == 16
+        && core::mem::align_of::<(usize, Reg)>() == 8)
+        .then(|| {
+            (
+                i(offset_of!((usize, Reg), 0)),
+                i(offset_of!((usize, Reg), 1)),
+            )
+        });
     crate::jit::CallLayout {
         stack: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, stack)),
         call_depth: i(offset_of!(Ctx<'static>, call_depth)),
@@ -5306,8 +5319,47 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
             + offset_of!(TierRuntime, handlers)
             + len_off),
         handlers_base: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, base)),
+        handlers_ptr: i(offset_of!(Ctx<'static>, jit_rt)
+            + offset_of!(TierRuntime, handlers)
+            + h_ptr),
+        handlers_cap: i(offset_of!(Ctx<'static>, jit_rt)
+            + offset_of!(TierRuntime, handlers)
+            + h_cap),
+        max_handlers: i(offset_of!(crate::realm::Realm, limits)
+            + offset_of!(crate::limits::Limits, max_handler_depth)),
+        handler_entry,
         poll: poll_layout(),
     }
+}
+
+/// The byte offsets of the buffer pointer and capacity words inside a
+/// handler stack `Vec<(usize, Reg)>` (three words in an unspecified order),
+/// found on a probe whose three words all differ; `None` when they could
+/// not be told apart, or its length word is not where `len_off` says (the
+/// inline handler push is then not used).
+fn handler_vec_words(len_off: usize) -> Option<(usize, usize)> {
+    type V = alloc::vec::Vec<(usize, Reg)>;
+    if core::mem::size_of::<V>() != 3 * 8 {
+        return None;
+    }
+    let mut v: V = alloc::vec::Vec::with_capacity(7);
+    v.extend_from_slice(&[(1, 1), (2, 2), (3, 3)]);
+    // SAFETY: a `Vec` is exactly three `usize`-sized words (checked above).
+    #[allow(unsafe_code)]
+    let w = unsafe { core::ptr::read((&v as *const V).cast::<[usize; 3]>()) };
+    let (ptr, cap, len) = (v.as_ptr() as usize, v.capacity(), v.len());
+    if ptr == cap || cap == len || ptr == len {
+        return None;
+    }
+    let at = |x: usize| {
+        let mut k = (0..3).filter(|&k| w[k] == x);
+        match (k.next(), k.next()) {
+            (Some(k), None) => Some(k * 8),
+            _ => None,
+        }
+    };
+    (at(len)? == len_off).then_some(())?;
+    Some((at(ptr)?, at(cap)?))
 }
 
 /// [`crate::jit::PollLayout`]: where the inline back-edge poll reads the
