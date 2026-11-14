@@ -1670,6 +1670,12 @@ pub(super) fn spec_push_op(bc: &Op) -> bool {
         && spec_push_enabled()
 }
 
+/// See [`NumGen::tonum_step`]. Read once.
+fn tonum_step_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_TONUMSTEP").is_none_or(|v| v != "0"))
+}
+
 /// See [`spec_push_op`]. Read once.
 fn spec_push_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3874,6 +3880,69 @@ impl NumGen {
         true
     }
 
+    /// `x++` / `x--` outside a promoted region — `ToNumeric t1 ← x; Step t2
+    /// ← t1`, with no entry into the `Step` — when `x` may be other than a
+    /// Number: the `ToNumeric`'s Number test also proves `t1` one for the
+    /// step, so its path goes on through the step with no second test; the
+    /// `ToNumeric`'s slow path (a BigInt, an object) comes back to the
+    /// `Step`'s own test and slow path, emitted here after it, and the
+    /// `Step` then emits nothing. `true` if emitted. `KATAAN_JIT_TONUMSTEP=0`
+    /// turns it off (read once per process).
+    fn tonum_step(
+        &mut self,
+        a: &mut X64Assembler,
+        reg: Option<usize>,
+        pc: usize,
+        ops: &[GenericOp],
+    ) -> bool {
+        if reg.is_some() || self.imode.is_some() || !tonum_step_enabled() {
+            return false;
+        }
+        let (
+            Some(&GenericOp::ToNumeric {
+                dst: t1,
+                src: x,
+                pc: to_pc,
+            }),
+            Some(&GenericOp::Step {
+                dst: t2,
+                src: s1,
+                dec,
+                pc: step_pc,
+            }),
+        ) = (ops.get(pc), ops.get(pc + 1))
+        else {
+            return false;
+        };
+        let entered = |q: usize| self.is_target.get(q).copied().unwrap_or(true);
+        if s1 != t1 || entered(pc + 1) || self.ty(pc, x) == T_NUM {
+            return false;
+        }
+        let step = |g: &mut Self, a: &mut X64Assembler| {
+            g.load_xmm0(a, reg, t1);
+            // addsd / subsd xmm0, [rip + 1.0] (`NaN ± 1` is that NaN.)
+            a.sse_rip_const(0xf2, if dec { 0x5c } else { 0x58 }, 0, 1.0f64.to_bits());
+            g.store_xmm0(a, reg, t2);
+        };
+        let (to_stub, to_back) = (a.new_label(), a.new_label());
+        let done = a.new_label();
+        self.num_guard(a, reg, x, to_stub);
+        self.copy_reg(a, reg, t1, x);
+        step(self, a);
+        a.jmp(done);
+        self.stub(to_stub, to_back, reg, StubKind::Exec { pc: to_pc });
+        // The `ToNumeric`'s slow path's result: the `Step` as it compiles.
+        a.bind(to_back);
+        let (st_stub, st_back) = (a.new_label(), a.new_label());
+        self.num_guard(a, reg, t1, st_stub);
+        step(self, a);
+        a.bind(st_back);
+        self.stub(st_stub, st_back, reg, StubKind::Exec { pc: step_pc });
+        a.bind(done);
+        self.skip[pc + 1] = true;
+        true
+    }
+
     /// After the generic emitter's code for op `pc` of a speculative
     /// region's fast version (either one): a carried field's store sets its
     /// flag, and its read, when the flag is set, takes the stored register's
@@ -4658,6 +4727,9 @@ impl NumGen {
             }
             GenericOp::ToNumeric { dst, src, pc: opc } => {
                 if self.fused_step(a, reg, pc, ops) {
+                    return Some(true);
+                }
+                if self.tonum_step(a, reg, pc, ops) {
                     return Some(true);
                 }
                 let resume = a.new_label();
