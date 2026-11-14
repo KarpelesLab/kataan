@@ -17587,6 +17587,91 @@ struct Compiler {
     /// Per enclosing hosted `for-of` being compiled (innermost last): its
     /// `break_sites` index and its **out-of-line exits** ([`OutExit`]).
     out_exits: Vec<(usize, Vec<OutExit>)>,
+    /// The compile-time values of bindings ([`Known`]), by binding register
+    /// (a binding's register is never reused: [`Self::alloc`] only grows,
+    /// but for temporaries [`Self::release_regs`] frees). Only for a
+    /// non-cell, non-global, non-TDZ binding that no code writes after its
+    /// initialization: a `const` (see [`Self::note_known`]) or an unrolled
+    /// loop's counter while one copy of the body compiles
+    /// ([`Self::for_unrolled`]).
+    known: alloc::collections::BTreeMap<Reg, Known>,
+    /// The `const` bindings whose initializer only made strings (and an
+    /// array of them): unless some code reads the binding other than
+    /// through a compile-time fold, those ops are rewritten to nothing at
+    /// the end ([`Self::apply_elisions`]).
+    elidable: Vec<ElideSite>,
+    /// Nonzero while a `switch` compiles: its case bodies share one scope
+    /// and are entered by jumps, so a declaration compiled before a read
+    /// need not have run before it; no compile-time value is recorded there.
+    no_known: u32,
+    /// No string array folds (a retry: some code read one otherwise, see
+    /// [`Self::apply_elisions`]).
+    no_arr_fold: bool,
+}
+
+/// The compile error that retries a function without folding string arrays
+/// ([`Compiler::apply_elisions`]).
+const ARR_FOLD_RETRY: &str = "a folded string array is read otherwise";
+
+/// A binding's value known at compile time ([`Compiler::known`]).
+#[derive(Clone)]
+enum Known {
+    /// A Number.
+    Num(f64),
+    /// A string (WTF-8 bytes), and its [`Compiler::elidable`] site.
+    Str(alloc::rc::Rc<[u8]>, Option<usize>),
+    /// A fresh array of strings no code writes (its elements as WTF-8
+    /// bytes), and its [`Compiler::elidable`] site.
+    StrArr(alloc::rc::Rc<[alloc::rc::Rc<[u8]>]>, usize),
+}
+
+/// A `const` initialization the compiler may rewrite to nothing
+/// ([`Compiler::elidable`]): the ops that made its value, each with its
+/// destination, checked again before the rewrite.
+struct ElideSite {
+    ops: Vec<(usize, Reg)>,
+    /// A string array's ([`Known::StrArr`]): its folded reads are right
+    /// only when no code reaches the array otherwise.
+    arr: bool,
+    /// Some code read the binding's register (`read_var`).
+    needed: bool,
+}
+
+/// The most times a `for` loop is unrolled ([`Compiler::for_unrolled`]).
+const UNROLL_MAX_TRIPS: usize = 4;
+/// The largest loop body unrolled, in source bytes, once and over all its
+/// copies.
+const UNROLL_MAX_BODY: usize = 800;
+const UNROLL_MAX_TOTAL: usize = 2400;
+/// The most elements of a string array literal a `const` folds.
+const KNOWN_ARR_MAX: usize = 16;
+
+/// Whether small counted `for` loops are unrolled and `const` strings and
+/// string arrays fold into the reads of them (`Compiler::for_unrolled`,
+/// `Compiler::note_known`): unless `KATAAN_JIT_UNROLL=0`. Read once per
+/// process.
+fn unroll_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_UNROLL").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether `s` (WTF-8) is a property name a static member read names the
+/// same way a computed one does: an ASCII identifier (no array index, no
+/// escaping: `realm::is_internal_key`).
+fn plain_key_name(s: &[u8]) -> Option<&str> {
+    let (&first, rest) = s.split_first()?;
+    let start = |c: u8| c.is_ascii_alphabetic() || c == b'_' || c == b'$';
+    if !start(first) || !rest.iter().all(|&c| start(c) || c.is_ascii_digit()) {
+        return None;
+    }
+    core::str::from_utf8(s).ok()
 }
 
 /// A `break`/`continue`/`return` leaving a hosted `for-of` whose unwinding is
@@ -17715,54 +17800,42 @@ impl Compiler {
         is_generator: bool,
         real_mapping: bool,
     ) -> Result<FnProto, CompileError> {
-        let r = Self::compile_fn_inner_impl(
-            fn_ids,
-            classes,
-            protos,
-            params,
-            captures,
-            body,
-            is_main,
-            super_ctor,
-            fields,
-            super_class.clone(),
-            is_async,
-            strict,
-            hosted,
-            is_arrow,
-            cap_flags,
-            class_ctor,
-            field_defs,
-            is_generator,
-            real_mapping,
-        );
-        match r {
-            Err(CompileError::Unsupported("mapped arguments with parameters"))
-                if !real_mapping && hosted =>
-            {
-                Self::compile_fn_inner_impl(
-                    fn_ids,
-                    classes,
-                    protos,
-                    params,
-                    captures,
-                    body,
-                    is_main,
-                    super_ctor,
-                    fields,
-                    super_class,
-                    is_async,
-                    strict,
-                    hosted,
-                    is_arrow,
-                    cap_flags,
-                    class_ctor,
-                    field_defs,
-                    is_generator,
-                    true,
-                )
+        // (And retried without folding string arrays when one of them
+        // turns out to be read otherwise: `Compiler::apply_elisions`.)
+        let (mut real_mapping, mut no_arr_fold) = (real_mapping, false);
+        loop {
+            let r = Self::compile_fn_inner_impl(
+                fn_ids,
+                classes,
+                protos,
+                params,
+                captures,
+                body,
+                is_main,
+                super_ctor,
+                fields,
+                super_class.clone(),
+                is_async,
+                strict,
+                hosted,
+                is_arrow,
+                cap_flags,
+                class_ctor,
+                field_defs,
+                is_generator,
+                (real_mapping, no_arr_fold),
+            );
+            match r {
+                Err(CompileError::Unsupported("mapped arguments with parameters"))
+                    if !real_mapping && hosted =>
+                {
+                    real_mapping = true;
+                }
+                Err(CompileError::Unsupported(ARR_FOLD_RETRY)) if !no_arr_fold => {
+                    no_arr_fold = true;
+                }
+                other => return other,
             }
-            other => other,
         }
     }
 
@@ -17786,7 +17859,7 @@ impl Compiler {
         class_ctor: Option<bool>,
         field_defs: &[FieldDef<'_>],
         is_generator: bool,
-        real_mapping: bool,
+        (real_mapping, no_arr_fold): (bool, bool),
     ) -> Result<FnProto, CompileError> {
         // The VM's `async` functions settle its *own* promise implementation,
         // which is not yet unified with the host's (`ROADMAP.md` §2.0 stage 5):
@@ -17939,6 +18012,7 @@ impl Compiler {
             strict,
             hosted,
             is_main,
+            no_arr_fold,
             ..Compiler::default()
         };
         c.scopes.push(alloc::collections::BTreeMap::new());
@@ -18527,6 +18601,7 @@ impl Compiler {
             .iter()
             .take_while(|p| !p.rest && p.default.is_none())
             .count();
+        c.apply_elisions()?;
         Ok(FnProto {
             n_regs: c.next_reg.max(c.reg_high) as usize,
             n_params: params.len(),
@@ -18921,6 +18996,7 @@ impl Compiler {
             .iter()
             .take_while(|p| !p.rest && p.default.is_none())
             .count();
+        c.apply_elisions()?;
         Ok(FnProto {
             n_regs: c.next_reg.max(c.reg_high) as usize,
             n_params: params.len(),
@@ -19317,6 +19393,301 @@ impl Compiler {
     fn release_regs(&mut self, mark: Reg) {
         self.reg_high = self.reg_high.max(self.next_reg);
         self.next_reg = mark;
+    }
+
+    /// The compile-time value of the binding `name` resolves to, if any
+    /// ([`Self::known`]).
+    fn known_binding(&self, name: &str) -> Option<Known> {
+        if self.known.is_empty() {
+            return None;
+        }
+        let b = self.lookup(name)?;
+        if b.cell || b.global.is_some() || b.tdz {
+            return None;
+        }
+        self.known.get(&b.reg).cloned()
+    }
+
+    /// The value of `e` known at compile time (a Number or a string), when
+    /// evaluating it runs no code and cannot throw: a literal, a known
+    /// binding, or an element read of a known string array
+    /// ([`Self::fold_elem`]).
+    fn known_value(&self, e: &Expr) -> Option<Known> {
+        match e {
+            Expr::Number { value, .. } => Some(Known::Num(*value)),
+            Expr::Str { value, .. } => Some(Known::Str(alloc::rc::Rc::from(&value[..]), None)),
+            Expr::Ident(id) => match self.known_binding(&id.name)? {
+                k @ (Known::Num(_) | Known::Str(..)) => Some(k),
+                Known::StrArr(..) => None,
+            },
+            Expr::Member {
+                object,
+                property: PropertyKey::Computed(k),
+                optional: false,
+                ..
+            } => self.fold_elem(object, k).map(|s| Known::Str(s, None)),
+            _ => None,
+        }
+    }
+
+    /// `object[key]` when `object` names a known string array
+    /// ([`Known::StrArr`]: a fresh array of strings no code can reach but
+    /// such reads) and `key` is a known index in it: that element (an own
+    /// data property of the array, whatever the prototypes hold).
+    fn fold_elem(&self, object: &Expr, key: &Expr) -> Option<alloc::rc::Rc<[u8]>> {
+        let Expr::Ident(id) = object else {
+            return None;
+        };
+        let Known::StrArr(items, _) = self.known_binding(&id.name)? else {
+            return None;
+        };
+        let Known::Num(k) = self.known_value(key)? else {
+            return None;
+        };
+        if !(k >= 0.0 && k.fract() == 0.0 && k < items.len() as f64) {
+            return None;
+        }
+        Some(items[k as usize].clone())
+    }
+
+    /// Records the compile-time value of `const name = e` (just bound), whose
+    /// initializer's ops are `start..end` and value `value`: a Number or a
+    /// string [`Self::known_value`] knows, or an array literal of string
+    /// literals (no code can reach the array but through the binding, and
+    /// every read of it through [`Self::fold_elem`] is folded; any other
+    /// read marks it needed, see `read_var`). A string or array made by its
+    /// own ops is an [`ElideSite`].
+    fn note_known(&mut self, name: &str, e: &Expr, start: usize, end: usize, value: Reg) {
+        if self.no_known > 0 || self.dyn_fn || self.completion.is_some() || !unroll_enabled() {
+            return;
+        }
+        let Some(b) = self.scopes.last().and_then(|s| s.get(name)).copied() else {
+            return;
+        };
+        if b.cell || b.global.is_some() || b.tdz || end > self.ops.len() || start > end {
+            return;
+        }
+        let ops = &self.ops[start..end];
+        let known = match e {
+            Expr::Array { elements, .. } => {
+                if self.no_arr_fold
+                    || !(1..=KNOWN_ARR_MAX).contains(&elements.len())
+                    || ops.len() != elements.len() + 1
+                {
+                    return;
+                }
+                let mut items = Vec::with_capacity(elements.len());
+                let mut site = Vec::with_capacity(elements.len() + 1);
+                for (i, (el, op)) in elements.iter().zip(ops).enumerate() {
+                    let (ArrayElement::Item(Expr::Str { value: s, .. }), Op::NewString { dst, .. }) =
+                        (el, op)
+                    else {
+                        return;
+                    };
+                    items.push(alloc::rc::Rc::<[u8]>::from(&s[..]));
+                    site.push((start + i, *dst));
+                }
+                let Some(Op::NewArrayFrom { dst, elems }) = ops.last() else {
+                    return;
+                };
+                if *dst != value || elems.len() != site.len() || elems.iter().zip(&site).any(|(e, s)| *e != s.1) {
+                    return;
+                }
+                site.push((end - 1, *dst));
+                self.elidable.push(ElideSite {
+                    ops: site,
+                    arr: true,
+                    needed: false,
+                });
+                Known::StrArr(items.into(), self.elidable.len() - 1)
+            }
+            _ => match self.known_value(e) {
+                Some(Known::Num(n)) => Known::Num(n),
+                Some(Known::Str(s, _)) => {
+                    let site = match ops {
+                        [Op::NewString { dst, .. }] if *dst == value => {
+                            self.elidable.push(ElideSite {
+                                ops: alloc::vec![(start, *dst)],
+                                arr: false,
+                                needed: false,
+                            });
+                            Some(self.elidable.len() - 1)
+                        }
+                        _ => None,
+                    };
+                    Known::Str(s, site)
+                }
+                _ => return,
+            },
+        };
+        self.known.insert(b.reg, known);
+    }
+
+    /// Rewrites the ops of every [`ElideSite`] no code needed to load
+    /// `undefined` instead (their values are never read), once the body is
+    /// complete (each op checked again: nothing moved it). A string array
+    /// some code read other than through a fold (which may have written
+    /// it, or let it escape) refuses the body ([`ARR_FOLD_RETRY`]): it is
+    /// compiled again without string array folds.
+    fn apply_elisions(&mut self) -> Result<(), CompileError> {
+        if self.elidable.iter().any(|s| s.arr && s.needed) {
+            return Err(CompileError::Unsupported(ARR_FOLD_RETRY));
+        }
+        for site in core::mem::take(&mut self.elidable) {
+            if site.needed
+                || !site.ops.iter().all(|&(i, r)| {
+                    matches!(
+                        self.ops.get(i),
+                        Some(Op::NewString { dst, .. } | Op::NewArrayFrom { dst, .. }) if *dst == r
+                    )
+                })
+            {
+                continue;
+            }
+            for (i, r) in site.ops {
+                self.ops[i] = Op::LoadConst {
+                    dst: r,
+                    value: NanBox::undefined(),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// A `for (let i = a; i < b; i++) body` (or `<=`, `++i`, `i += 1`) run
+    /// 1 to [`UNROLL_MAX_TRIPS`] times, whose body no code writes `i` in
+    /// and no closure captures it (so no iteration's binding is observable
+    /// but through its value): the counter's name, start and trip count.
+    /// Not in a script or eval body (whose completion value loops shape),
+    /// a dynamic-scope function, a generator or an async body.
+    fn unroll_plan(
+        &self,
+        init: &Option<ForInit>,
+        test: &Option<Box<Expr>>,
+        update: &Option<Box<Expr>>,
+        body: &Stmt,
+    ) -> Option<(String, f64, usize)> {
+        if !unroll_enabled()
+            || self.dyn_fn
+            || self.completion.is_some()
+            || self.in_generator
+            || self.in_async
+        {
+            return None;
+        }
+        let Some(ForInit::Var(d)) = init else {
+            return None;
+        };
+        let [dr] = d.declarations.as_slice() else {
+            return None;
+        };
+        let (crate::ast::VarDeclKind::Let, BindingTarget::Ident(id), Some(Expr::Number { value: a, .. })) =
+            (d.kind, &dr.target, &dr.init)
+        else {
+            return None;
+        };
+        let name = &*id.name;
+        if self.cell_names.contains(name) {
+            return None;
+        }
+        let is_i = |e: &Expr| matches!(e, Expr::Ident(x) if &*x.name == name);
+        let (inclusive, b) = match test.as_deref() {
+            Some(Expr::Binary {
+                op, left, right, ..
+            }) if is_i(left) => match (op, &**right) {
+                (crate::ast::BinaryOp::Lt, Expr::Number { value, .. }) => (false, *value),
+                (crate::ast::BinaryOp::LtEq, Expr::Number { value, .. }) => (true, *value),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let step_ok = match update.as_deref() {
+            Some(Expr::Update {
+                op: crate::ast::UpdateOp::Inc,
+                argument,
+                ..
+            }) => is_i(argument),
+            Some(Expr::Assign {
+                op: crate::ast::AssignOp::AddAssign,
+                target,
+                value,
+                ..
+            }) => is_i(target) && matches!(&**value, Expr::Number { value: 1.0, .. }),
+            _ => false,
+        };
+        let (a, b) = (*a, b);
+        if !step_ok
+            || !(a.fract() == 0.0 && b.fract() == 0.0 && a.abs() <= 1e6 && b.abs() <= 1e6)
+        {
+            return None;
+        }
+        let n = b - a + if inclusive { 1.0 } else { 0.0 };
+        if !(1.0..=UNROLL_MAX_TRIPS as f64).contains(&n) {
+            return None;
+        }
+        let n = n as usize;
+        let span = body.span();
+        let len = span.end.saturating_sub(span.start) as usize;
+        if len > UNROLL_MAX_BODY || len * n > UNROLL_MAX_TOTAL {
+            return None;
+        }
+        // No write of the counter in the body (nested functions included).
+        let mut w: Writes = Some(BTreeSet::new());
+        let (mut direct, mut nested) = (BTreeSet::new(), BTreeSet::new());
+        refs_stmt_w(body, &mut direct, &mut nested, &mut w);
+        if w.is_none_or(|w| w.contains(name)) || nested.contains(name) {
+            return None;
+        }
+        Some((String::from(name), a, n))
+    }
+
+    /// Compiles the `for` loop [`Self::unroll_plan`] planned as `n` copies of
+    /// its body, the counter set to its iteration's value before each (and
+    /// known to be it while the copy compiles: [`Self::known`]). Each copy
+    /// is a loop of its own for `break` and `continue`: a `continue` goes to
+    /// the next copy, a `break` past the last.
+    fn for_unrolled(
+        &mut self,
+        decl: &crate::ast::VarDecl,
+        plan: (String, f64, usize),
+        body: &Stmt,
+    ) -> Result<Option<Reg>, CompileError> {
+        let (name, a, n) = plan;
+        self.scopes.push(alloc::collections::BTreeMap::new());
+        let st = Stmt::Var(decl.clone());
+        self.prebind_block_lexicals(&[&st], &BTreeSet::new(), false)?;
+        self.stmt(&st)?;
+        let Some(b) = self.scopes.last().and_then(|s| s.get(&*name)).copied() else {
+            return Err(CompileError::Unsupported("unrolled loop counter"));
+        };
+        if b.cell || b.global.is_some() || b.tdz {
+            return Err(CompileError::Unsupported("unrolled loop counter"));
+        }
+        let mut breaks = Vec::new();
+        for k in 0..n {
+            let v = a + k as f64;
+            if k > 0 {
+                let r = self.constant(NanBox::number(v))?;
+                self.write_var(b, r);
+            }
+            self.known.insert(b.reg, Known::Num(v));
+            self.enter_loop();
+            let r = self.stmt(body);
+            self.known.remove(&b.reg);
+            r?;
+            let cont = self.ops.len();
+            self.loop_frames.pop();
+            breaks.extend(self.break_sites.pop().unwrap_or_default());
+            for c in self.continue_sites.pop().unwrap_or_default() {
+                self.patch_to(c, cont);
+            }
+        }
+        let end = self.ops.len();
+        for j in breaks {
+            self.patch_to(j, end);
+        }
+        self.scopes.pop();
+        Ok(None)
     }
 
     /// Gives up as soon as the function outgrows what it can be: compiling on
@@ -20295,6 +20666,12 @@ impl Compiler {
     }
 
     fn read_var(&mut self, b: Binding) -> Reg {
+        if !self.elidable.is_empty()
+            && let Some(Known::StrArr(_, s) | Known::Str(_, Some(s))) = self.known.get(&b.reg)
+        {
+            let s = *s;
+            self.elidable[s].needed = true;
+        }
         if let Some((idx, _)) = b.global
             && let Some(site) = self.env_sites.get(&idx).copied()
         {
@@ -20438,11 +20815,17 @@ impl Compiler {
         self.check_code_size()?;
         // The capture set is by name, function-wide: a loop's `let i` would be
         // a cell whenever *any* closure in the function reads *some* `i`.
-        let Some(saved) = self.uncapture_loop_head(stmt) else {
-            return self.stmt_completion(stmt);
+        let switch = matches!(stmt, Stmt::Switch { .. });
+        self.no_known += u32::from(switch);
+        let r = match self.uncapture_loop_head(stmt) {
+            None => self.stmt_completion(stmt),
+            Some(saved) => {
+                let r = self.stmt_completion(stmt);
+                self.cell_names = saved;
+                r
+            }
         };
-        let r = self.stmt_completion(stmt);
-        self.cell_names = saved;
+        self.no_known -= u32::from(switch);
         r
     }
 
@@ -21059,16 +21442,21 @@ impl Compiler {
                         self.write_var(b, value);
                         continue;
                     }
+                    let init_start = self.ops.len();
                     let value = match &d.init {
                         Some(e) => self.expr_named(e, &d.target)?,
                         None => self.constant(NanBox::undefined())?,
                     };
+                    let init_end = self.ops.len();
                     let saved_kind = self.decl_kind.replace(decl.kind);
                     let bound = self.bind_pattern(&d.target, value);
                     self.decl_kind = saved_kind;
                     bound?;
                     if matches!(decl.kind, crate::ast::VarDeclKind::Const) {
                         self.mark_pattern_const(&d.target);
+                        if let (BindingTarget::Ident(id), Some(e)) = (&d.target, &d.init) {
+                            self.note_known(&id.name, e, init_start, init_end, value);
+                        }
                     }
                 }
                 Ok(None)
@@ -21442,6 +21830,11 @@ impl Compiler {
                         c.stmt(stmt).map(|_| ())
                     })?;
                     return Ok(None);
+                }
+                if let Some(ForInit::Var(decl)) = init
+                    && let Some(plan) = self.unroll_plan(init, test, update, body)
+                {
+                    return self.for_unrolled(decl, plan, body);
                 }
                 self.scopes.push(alloc::collections::BTreeMap::new());
                 match init {
@@ -22469,6 +22862,17 @@ impl Compiler {
                     }
                 }
                 Ok(dst)
+            }
+            // An element of a known string array at a known index: that
+            // string (`Compiler::fold_elem`).
+            Expr::Member {
+                object,
+                property: PropertyKey::Computed(k),
+                optional: false,
+                ..
+            } if !self.known.is_empty() && self.fold_elem(object, k).is_some() => {
+                let s = self.fold_elem(object, k).expect("checked");
+                Ok(self.wtf8_string(&s))
             }
             // `super.x` / `super[k]` in a hosted class element.
             Expr::Member {
@@ -25095,6 +25499,18 @@ impl Compiler {
                 cache: crate::realm::PrivCache::default(),
             });
             return Ok(dst);
+        }
+        // A key a known `const` string names, as a static key (reading the
+        // binding runs no code).
+        let named;
+        let mut property = property;
+        if let PropertyKey::Computed(e) = property
+            && matches!(&**e, Expr::Ident(_))
+            && let Some(Known::Str(s, _)) = self.known_value(e)
+            && let Some(n) = plain_key_name(&s)
+        {
+            named = PropertyKey::Ident(n.into());
+            property = &named;
         }
         let dst = self.alloc();
         match property {
