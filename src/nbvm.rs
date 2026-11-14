@@ -5782,6 +5782,11 @@ struct TierState {
     /// see `jit_tier::resume_is_hot`).
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     resumes: u32,
+    /// A generator function's plain prologue (see `gen_fast::create`): `0`
+    /// until looked at, then its `Op::GeneratorStart`'s index plus one, or
+    /// `u32::MAX` when the prologue is not plain.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    gen_plain: u32,
 }
 
 /// How many spare inline-cache vectors a function keeps for its recursive

@@ -2455,7 +2455,12 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             dst, callee, args, ..
         } => {
             let callee = regs[*callee as usize];
-            match call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined()) {
+            // A hot generator function with a plain prologue: its generator
+            // made directly (`gen_fast::create`).
+            let made = super::gen_fast::create(ctx, funcs, regs, callee, args);
+            match made
+                .or_else(|| call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined()))
+            {
                 Some(r) => Some(r.map(|v| regs[*dst as usize] = v)),
                 // Any other VM closure (an interpreted, async or generator
                 // function): the interpreter arm's call, without a one-op
@@ -4122,13 +4127,46 @@ pub(crate) extern "C" fn jit_helper_call_value(
     // SAFETY: see the function contract (as `jit_helper_exec_op`).
     #[allow(unsafe_code)]
     let op = unsafe { &*op_raw };
-    if let Op::CallValue { callee, .. } = op {
+    if let Op::CallValue {
+        callee, dst, args, ..
+    } = op
+    {
         // SAFETY: see the function contract.
         #[allow(unsafe_code)]
         let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
         // SAFETY: the activation's register file, live and unaliased here.
         #[allow(unsafe_code)]
         let callee_val = unsafe { *regs_raw.add(*callee as usize) };
+        // A hot generator function with a plain prologue: its generator made
+        // directly (`gen_fast::create`), no call site to fill (a generator
+        // function has no direct entry).
+        {
+            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+            #[allow(unsafe_code)]
+            let funcs = unsafe {
+                &*ctx
+                    .jit_funcs
+                    .expect("jit_funcs set before generic dispatch")
+            };
+            // SAFETY: as `jit_helper_exec_op`'s register file.
+            #[allow(unsafe_code)]
+            let regs =
+                unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+            if let Some(r) =
+                super::gen_fast::create(ctx, funcs, regs, NanBox::from_bits(callee_val), args)
+            {
+                return match r {
+                    Ok(v) => {
+                        regs[*dst as usize] = v;
+                        0
+                    }
+                    Err(e) => {
+                        ctx.jit_pending_fault = Some(e);
+                        NanBox::jit_throw_bits()
+                    }
+                };
+            }
+        }
         // SAFETY: the site's own cache (see the function contract).
         #[allow(unsafe_code)]
         let site = unsafe { &mut *site.cast::<CallSite>() };

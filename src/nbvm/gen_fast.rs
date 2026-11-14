@@ -78,6 +78,144 @@ pub(super) fn jit_site_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENSITE").is_none_or(|v| v != "0"))
 }
 
+/// Whether compiled code's call of a sync generator function whose prologue
+/// is plain makes the generator directly ([`create`], `KATAAN_JIT_GENNEW`,
+/// default on).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn create_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENNEW").is_none_or(|v| v != "0"))
+}
+
+/// The most ops a plain prologue ([`create`]) runs before its
+/// `Op::GeneratorStart`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+const PLAIN_PROLOGUE_MAX: usize = 8;
+
+/// The index of the `Op::GeneratorStart` that ends a plain prologue at the
+/// start of `ops` (see [`create`]), if it is one.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn plain_prologue(ops: &[Op]) -> Option<usize> {
+    ops.iter()
+        .take(PLAIN_PROLOGUE_MAX + 1)
+        .position(|op| {
+            !matches!(
+                op,
+                Op::BindThis { .. } | Op::LoadConst { .. } | Op::Move { .. }
+            )
+        })
+        .filter(|&i| matches!(ops[i], Op::GeneratorStart))
+}
+
+/// `f(...args)` from compiled code (`Op::CallValue`, `this` undefined) when
+/// `f` is a VM closure of a hot sync generator function whose prologue —
+/// the ops before its `Op::GeneratorStart` — is plain: only `BindThis`,
+/// `LoadConst` and `Move`, none of which runs code, allocates or can
+/// throw (`BindThis` of the undefined `this` is the global `this` of the one
+/// realm). The call's outcome is then exactly the general call's
+/// (`call_with`: the register window filled from the arguments, captures and
+/// `this`, the prologue interpreted, `make_generator` at its suspension):
+/// the window is filled, the prologue's effects done here, and the
+/// generator made, with nothing else of an activation. `None` (nothing done)
+/// for anything else, including a call at the recursion limits (whose
+/// `RangeError` the general path throws).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn create(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    callee: NanBox,
+    args: &[super::Reg],
+) -> Option<Result<NanBox, VmError>> {
+    if !create_on() || ctx.host.is_none() || ctx.realm.multi_realm {
+        return None;
+    }
+    let ch = Handle::from_raw(callee.as_handle()?);
+    let (fid, n_caps) = ctx.realm.vm_function(ch).map(|(f, c)| (f, c.len()))?;
+    let id = fid as usize;
+    let proto = funcs.get(id)?;
+    if !proto.is_generator
+        || proto.is_async
+        || proto.class_ctor
+        || proto.rest_from.is_some()
+        || n_caps < proto.n_captures
+    {
+        return None;
+    }
+    if ctx.call_depth >= ctx.realm.limits.max_call_depth
+        || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+        || crate::stack::exhausted()
+        || super::args_exhausted(ctx, args.len())
+    {
+        return None;
+    }
+    // Hot (already past the general path's tier-up), counted as it counts;
+    // the prologue looked at once.
+    let start = {
+        let mut t = proto.tier.0.try_borrow_mut().ok()?;
+        if t.calls < super::TIER_UP_THRESHOLD {
+            return None;
+        }
+        if t.gen_plain == 0 {
+            t.gen_plain = plain_prologue(&proto.ops)
+                .and_then(|i| u32::try_from(i + 1).ok())
+                .unwrap_or(u32::MAX);
+        }
+        if t.gen_plain == u32::MAX {
+            return None;
+        }
+        t.calls = t.calls.saturating_add(1);
+        t.gen_plain as usize - 1
+    };
+    let mut w: Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
+    w.clear();
+    w.resize(proto.n_regs, NanBox::undefined());
+    for (i, &a) in args.iter().enumerate().take(proto.n_params) {
+        if let (Some(slot), Some(&v)) = (w.get_mut(i), regs.get(a as usize)) {
+            *slot = v;
+        }
+    }
+    if let Some((_, caps)) = ctx.realm.vm_function(ch) {
+        for (i, &c) in caps.iter().enumerate().take(proto.n_captures) {
+            if let Some(slot) = w.get_mut(proto.n_params + i) {
+                *slot = c;
+            }
+        }
+    }
+    // (The `this` slot, after the captures, holds `undefined`, as the
+    // resize left it.)
+    let global_this = ctx.host.as_deref().map(|h| h.global_this());
+    for op in &proto.ops[..start] {
+        match *op {
+            Op::BindThis { this } => {
+                if let (Some(slot), Some(g)) = (w.get_mut(this as usize), global_this)
+                    && (slot.is_undefined() || slot.is_null())
+                {
+                    *slot = g;
+                } else {
+                    // (A `this` slot that is not the undefined one: the
+                    // general path.)
+                    recycle(ctx, w);
+                    return None;
+                }
+            }
+            Op::LoadConst { dst, value } => w[dst as usize] = value,
+            Op::Move { dst, src } => w[dst as usize] = w[src as usize],
+            // (Nothing else is in a plain prologue: see `start`.)
+            _ => {}
+        }
+    }
+    Some(super::make_generator(
+        ctx,
+        funcs,
+        id,
+        Some(callee),
+        w,
+        start + 1,
+        Vec::new(),
+    ))
+}
+
 /// The generator object `gh`'s frame cell, when it is a sync VM generator.
 #[inline]
 fn state_of(ctx: &mut Ctx, gh: Handle) -> Option<Handle> {
