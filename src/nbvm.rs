@@ -8472,6 +8472,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         handler_frame: jit_tier::jit_helper_handler_frame,
         call_method: jit_tier::jit_helper_call_method,
         coll_call: jit_tier::jit_helper_coll_call,
+        str_call: jit_tier::jit_helper_str_call,
         gen_call: jit_tier::jit_helper_gen_call,
         call_value: jit_tier::jit_helper_call_value,
         tail_call: jit_tier::jit_helper_tail_call,

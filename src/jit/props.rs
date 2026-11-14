@@ -627,6 +627,11 @@ impl MethodSite {
     /// the address (`%String.prototype%` is watched, and the slot array moving
     /// bumps it), and the value is read live, as `MethodEntry::value`'s is.
     /// `None`: not the built-in; the proof is one no value satisfies.
+    /// The method bits [`set_str_proof`](Self::set_str_proof) recorded.
+    pub(crate) fn str_proof_method(&self) -> u64 {
+        self.str_proof.method
+    }
+
     pub(crate) fn set_str_proof(&mut self, found: Option<(u64, u64)>) {
         let stamp = crate::object::proto_epoch();
         self.str_proof.stamp = stamp;

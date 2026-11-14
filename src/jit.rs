@@ -3741,6 +3741,10 @@ pub struct GenericHelpers {
     /// (`jit_helper_coll_call(ctx, regs, n_regs, op, cache, _)`: `0` with the
     /// result stored, `1` to make the ordinary call).
     pub coll_call: JitCallMethodHelper,
+    /// `jit_helper_str_call(ctx, regs, n_regs, op, site, code)`: a direct
+    /// `String.prototype` method call on a plain string (`0` served, `1`
+    /// declined, or the throw sentinel).
+    pub str_call: JitCallMethodHelper,
     /// A generator `next` call's lean form, tried first at a site that last
     /// made one (`jit_helper_gen_call(ctx, regs, n_regs, op, cache,
     /// call_site)`: `0` with the result stored, the throw sentinel with a
@@ -4118,6 +4122,16 @@ pub(crate) fn str_compare_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_STRCMP").is_none_or(|v| v != "0"))
+}
+
+/// Whether a `String.prototype` method call on a plain string calls its
+/// built-in directly when the site proves it (`jit_helper_str_call`)
+/// rather than through the general call (`KATAAN_JIT_STRCALL=0` turns it
+/// off; read once per process).
+pub(crate) fn str_call_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_STRCALL").is_none_or(|v| v != "0"))
 }
 
 pub type JitBinHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
@@ -12584,6 +12598,66 @@ impl JitFunction {
                         numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
                         a.store_rax(disp(dst));
                         a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
+                    // `s.slice(a, b)`, `s.toUpperCase()`, …: a
+                    // `String.prototype` method on a plain string cell, the
+                    // site proving the built-in (as `charCodeAt` above),
+                    // called straight through `jit_helper_str_call`; a
+                    // decline is the general call's, nothing done.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && let Some(code) = crate::nbvm::native_call::str_call_code(key)
+                        && margs.len() <= 2
+                        && str_call_enabled()
+                        && ok(dst)
+                        && ok(recv)
+                        && margs.iter().all(|&m| ok(m))
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                        && num.result_xmm(op_idx, dst).is_none()
+                    {
+                        // (Promoted operands into the register file, which
+                        // the helper reads.)
+                        for &r in core::iter::once(&recv).chain(margs.iter()) {
+                            num.operand_xmm(&mut a, op_idx, r, false);
+                        }
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.str_special, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.p_str_proof(si.method_ptr, prove, general);
+                        walk_to_slot!(recv, general);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_str_disc);
+                        a.jne(general);
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, si.method_ptr as i64);
+                        a.movabs_argreg(5, i64::from(code));
+                        a.movabs_rax(helpers.str_call as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.je(done);
+                        throw_check!();
+                        a.jmp(general);
                         let cold = a.cold_begin();
                         a.bind(prove);
                         a.mov_rdi_r15();

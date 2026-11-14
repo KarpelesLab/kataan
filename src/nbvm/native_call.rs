@@ -835,6 +835,89 @@ pub(super) fn prove_array_pop(realm: &mut Realm, site: &mut crate::jit::MethodSi
     prove_proto_method(realm, site, start, "pop", FastOp::ArrayPop);
 }
 
+/// The `String.prototype` methods compiled code calls straight through
+/// [`str_call`] (`crate::jit`'s direct string call): each a [`run_op`]
+/// string op that runs no code (it declines whatever input could). The
+/// code of `key`, or `None`.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn str_call_code(key: &str) -> Option<u8> {
+    Some(match key {
+        "indexOf" => 1,
+        "slice" => 2,
+        "substring" => 3,
+        "startsWith" => 4,
+        "endsWith" => 5,
+        "includes" => 6,
+        "toUpperCase" => 7,
+        "toLowerCase" => 8,
+        "trim" => 9,
+        "trimStart" => 10,
+        "trimEnd" => 11,
+        "padStart" => 12,
+        "padEnd" => 13,
+        "charAt" => 14,
+        _ => return None,
+    })
+}
+
+/// The op of a [`str_call_code`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn str_call_op(code: u8) -> Option<FastOp> {
+    Some(match code {
+        1 => FastOp::StrIndexOf,
+        2 => FastOp::StrSlice,
+        3 => FastOp::StrSubstring,
+        4 => FastOp::StrStartsWith,
+        5 => FastOp::StrEndsWith,
+        6 => FastOp::StrIncludes,
+        7 => FastOp::StrCase(true),
+        8 => FastOp::StrCase(false),
+        9 => FastOp::StrTrim(true, true),
+        10 => FastOp::StrTrim(true, false),
+        11 => FastOp::StrTrim(false, true),
+        12 => FastOp::StrPad(true),
+        13 => FastOp::StrPad(false),
+        14 => FastOp::StrCharAt,
+        _ => return None,
+    })
+}
+
+/// What compiled code's direct string call relies on, for `site` (whose
+/// key has a [`str_call_code`]): as [`prove_char_code_at`], of that
+/// built-in. Whether the site's key is one.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prove_str_method(realm: &mut Realm, site: &mut crate::jit::MethodSite) -> bool {
+    let Some(want) = str_call_code(site.key()).and_then(str_call_op) else {
+        return false;
+    };
+    let start = realm.string_proto_intrinsic;
+    let key = alloc::string::String::from(site.key());
+    prove_proto_method(realm, site, start, &key, want);
+    true
+}
+
+/// A direct string call from compiled code: `recv.key(args…)` with `recv`
+/// a plain string cell whose lookup of the key the site proved finds the
+/// built-in `method` (`code`'s, [`str_call_code`]): that op's answer
+/// ([`run_op`]), or `None`, having done nothing, for the general call.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn str_call(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    recv: NanBox,
+    args: &[Reg],
+    method: u64,
+    code: u8,
+) -> Option<Result<NanBox, VmError>> {
+    let op = str_call_op(code)?;
+    let h = Handle::from_raw(recv.as_handle()?);
+    if ctx.host.is_none() || ctx.realm.multi_realm || args.len() > 2 {
+        return None;
+    }
+    run_op(ctx, funcs, op, method, recv, h, false, regs, args)
+}
+
 /// The proof of [`prove_char_code_at`] / [`prove_array_push`]: `key` is a
 /// data property of the ordinary object `start` (watched), the built-in
 /// `want`.
