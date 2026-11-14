@@ -189,6 +189,14 @@ pub struct Regex {
     /// [`program_lead_run`]): a failed attempt then rules out every start
     /// inside the same run.
     lead_run: Option<usize>,
+    /// The index in `prog` of the atom `A` when the whole program is
+    /// `A+$` (no capture group, no `m`/`u`/`v`; see [`program_tail_run`]):
+    /// a match is then the maximal run of units `A` accepts that ends the
+    /// subject, found by walking back from its end.
+    tail_run: Option<usize>,
+    /// [`tail_run`](Self::tail_run)'s atom over the Latin-1 code units, by
+    /// the matcher's own predicate; built on first use.
+    tail_latin1: core::cell::OnceCell<[u64; 4]>,
     /// The program as a straight step sequence, when it is one (see
     /// [`linear`]): the same matches as `prog`, without the recursive VM.
     linear: Option<linear::Linear>,
@@ -320,6 +328,8 @@ impl Regex {
             },
             first_unit,
             lead_run: program_lead_run(&prog, flags),
+            tail_run: program_tail_run(&prog, flags),
+            tail_latin1: core::cell::OnceCell::new(),
             linear: linear::Linear::build(&prog, flags, 2 * (group_count + 1)),
             prog,
             scalar_prog: core::cell::OnceCell::new(),
@@ -388,6 +398,7 @@ impl Regex {
     #[cfg(test)]
     pub(crate) fn without_linear(mut self) -> Self {
         self.linear = None;
+        self.tail_run = None;
         self
     }
 
@@ -664,6 +675,12 @@ impl Regex {
         if self.single_atom_scan(units, from, out) {
             return;
         }
+        // `A+$`: at most one match (the next find starts at the end, where a
+        // non-empty match cannot).
+        if let Some(span) = self.tail_run_find(units, from, self.flags) {
+            out.extend(span.map(Some));
+            return;
+        }
         let flags = self.flags;
         let Some(lin) = &self.linear else {
             let stride = self.group_count + 1;
@@ -723,6 +740,54 @@ impl Regex {
                 b
             };
         }
+    }
+
+    /// The find of an `A+$` pattern (see [`tail_run`](Self::tail_run)) from
+    /// `start` under `flags` (the ones it was compiled with but `g`/`y`,
+    /// which the caller may vary): `Some(Some(span))` for the match,
+    /// `Some(None)` for none, `None` when the pattern is no such one (or
+    /// `KATAAN_RX_TAILRUN=0`). The leftmost match begins where the run of
+    /// accepted units that ends the subject begins (or at `start`, inside
+    /// it): no earlier start can reach the end through units `A` accepts.
+    fn tail_run_find<T: Unit>(
+        &self,
+        units: &[T],
+        start: usize,
+        flags: Flags,
+    ) -> Option<Option<(usize, usize)>> {
+        let c = self.tail_run?;
+        if !tail_run_enabled() || flags.multiline || flags.unicode || flags.unicode_sets {
+            return None;
+        }
+        let atom = self.prog.get(c)?;
+        let latin1 = self.tail_latin1.get_or_init(|| {
+            let mut set = [0u64; 4];
+            for u in 0u32..256 {
+                if vm::single_consume_matches(atom, u, self.flags) {
+                    set[(u >> 6) as usize] |= 1u64 << (u & 63);
+                }
+            }
+            set
+        });
+        let accepts = |u: u16| {
+            if u < 256 {
+                latin1[usize::from(u >> 6)] & (1u64 << (u & 63)) != 0
+            } else {
+                vm::single_consume_matches(atom, u32::from(u), self.flags)
+            }
+        };
+        let len = units.len();
+        if start >= len {
+            return Some(None);
+        }
+        let mut p = len;
+        while p > start && accepts(units[p - 1].u()) {
+            p -= 1;
+        }
+        if p == len || (flags.sticky && p != start) {
+            return Some(None);
+        }
+        Some(Some((p, len)))
     }
 
     /// For a pattern that is a single one-character atom with no capture
@@ -790,6 +855,15 @@ impl Regex {
         } else {
             start
         };
+        if core::ptr::eq(prog, self.prog.as_slice())
+            && let Some(span) = self.tail_run_find(units, start, flags)
+        {
+            if let Some(span) = span {
+                out.push(Some(span));
+                return true;
+            }
+            return false;
+        }
         let anchored = self.anchored && !flags.multiline;
         let last = if flags.sticky || anchored {
             start
@@ -1192,6 +1266,57 @@ fn program_lead_run(prog: &[vm::Inst], flags: Flags) -> Option<usize> {
         return None;
     }
     Some(c)
+}
+
+/// Whether [`Regex::tail_run_find`] serves `A+$` patterns
+/// (`KATAAN_RX_TAILRUN=0` turns it off; read once per process).
+fn tail_run_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_RX_TAILRUN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// The index of the atom `A` when `prog` is exactly `A+$` — `Save(0); A;
+/// Split(body, exit); A; Jmp; Assert(End); Save(1); Match` with `A` a
+/// one-unit atom (a literal, `.` or a class) — compiled under flags without
+/// `m` (so `$` is the subject's end), `u` or `v` (so the atom consumes one
+/// code unit, by a per-unit predicate). `None` for anything else.
+fn program_tail_run(prog: &[vm::Inst], flags: Flags) -> Option<usize> {
+    use vm::{Assert, Inst};
+    if flags.multiline || flags.unicode || flags.unicode_sets {
+        return None;
+    }
+    let atom = |i: &Inst| {
+        matches!(
+            i,
+            Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. }
+        )
+    };
+    match prog {
+        [
+            Inst::Save(0),
+            a,
+            Inst::Split(3, 5) | Inst::Split(5, 3),
+            b,
+            Inst::Jmp(2),
+            Inst::Assert(Assert::End),
+            Inst::Save(1),
+            Inst::Match,
+        ] if atom(a) && atom(b) => {
+            // The two copies are one atom: the same acceptance everywhere.
+            let same = (0u32..256).all(|u| {
+                vm::single_consume_matches(a, u, flags) == vm::single_consume_matches(b, u, flags)
+            });
+            same.then_some(1)
+        }
+        _ => None,
+    }
 }
 
 fn program_first_unit(prog: &[vm::Inst]) -> Option<u16> {

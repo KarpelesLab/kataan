@@ -1257,6 +1257,12 @@ fn linear_shortcuts_agree_with_the_vm() {
         (r"[^.!?]+[.!?]", ""),
         (r"\d+$", "u"),
         (r"\w+$", "iu"),
+        (r"\d+$", ""),
+        (r"[a-z]+$", "i"),
+        (r"\s+$", ""),
+        (r".+$", ""),
+        (r"\d+?$", ""),
+        (r"[^a-c]+$", "g"),
     ] {
         let fast = re(pat, flags);
         let slow = re(pat, flags).without_linear();
