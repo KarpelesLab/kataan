@@ -47,6 +47,22 @@ await_toggle!(
     "KATAAN_AWAIT_SETTLE"
 );
 
+await_toggle!(
+    /// Whether `Promise.all` / `allSettled` subscribe to a plain promise
+    /// without a derived promise or named element functions, and their
+    /// element jobs run without the call machinery (`KATAAN_PALL_LEAN`).
+    pall_lean_on,
+    "KATAAN_PALL_LEAN"
+);
+
+await_toggle!(
+    /// Whether a promise known to own nothing and to have the default
+    /// `[[Prototype]]` (`PromiseState::tainted`) skips the side-table
+    /// lookups that would prove it (`KATAAN_AWAIT_PLAIN`).
+    await_plain_on,
+    "KATAAN_AWAIT_PLAIN"
+);
+
 /// A `PromiseCapability` record: the dependent promise plus its resolve/reject
 /// functions, as produced by `NewPromiseCapability(C)`.
 #[derive(Clone, Copy)]
@@ -1108,6 +1124,20 @@ impl Interp {
             }
             return Ok(());
         }
+        // A combinator's element function (`Promise.all` resolve element…):
+        // its body, without the call machinery.
+        if pall_lean_on()
+            && !job.finally
+            && let Some(h) = job.handler.as_handle().map(Handle::from_raw)
+            && let Some((id, state)) = self.realm.bound_native_at(h)
+            && let Some(r) = self.combinator_element(id, state, job.value)
+        {
+            return match r {
+                Ok(v) => self.job_settle(job, v, true),
+                Err(ExecError::Throw(e)) => self.job_settle(job, e, false),
+                Err(other) => Err(other),
+            };
+        }
         if job.finally
             && job
                 .handler
@@ -1384,11 +1414,50 @@ impl Interp {
         self.realm.get_element(cell, 0).as_number().unwrap_or(0.0)
     }
     fn cell_set(&mut self, cell: Handle, v: f64) {
-        self.realm.set_element(cell, 0, NanBox::number(v));
+        if pall_lean_on() {
+            self.realm.internal_array_set(cell, 0, NanBox::number(v));
+        } else {
+            self.realm.set_element(cell, 0, NanBox::number(v));
+        }
+    }
+
+    /// The call of the combinator element function `id` (bound to `state`)
+    /// with `value` while one realm exists: its body. `None` for another
+    /// function.
+    fn combinator_element(
+        &mut self,
+        id: u16,
+        state: Handle,
+        value: NanBox,
+    ) -> Option<Result<NanBox, ExecError>> {
+        if self.realm.multi_realm || !self.created_realms.is_empty() {
+            return None;
+        }
+        Some(match id {
+            N_PROMISE_ALL_ELEMENT => self.promise_all_element(state, value),
+            N_PROMISE_ALLSETTLED_FULFILL => self.promise_allsettled_element(state, value, true),
+            N_PROMISE_ALLSETTLED_REJECT => self.promise_allsettled_element(state, value, false),
+            N_PROMISE_ANY_ELEMENT => self.promise_any_element(state, value),
+            _ => return None,
+        })
     }
 
     /// Reads the shared parts of an element-state object.
     fn state_parts(&mut self, state: Handle) -> (Handle, NanBox, PromiseCapability, usize) {
+        // (Every slot from one look at the state's elements.)
+        if pall_lean_on()
+            && let Some(e) = self.realm.array_elements(state)
+            && e.len() > PCOMB_INDEX
+            && let Some(remaining) = e[PCOMB_REMAINING].as_handle().map(Handle::from_raw)
+        {
+            let cap = PromiseCapability {
+                promise: e[PCOMB_CAP],
+                resolve: e[PCOMB_RESOLVE],
+                reject: e[PCOMB_REJECT],
+            };
+            let index = e[PCOMB_INDEX].as_number().unwrap_or(0.0) as usize;
+            return (remaining, e[PCOMB_VALUES], cap, index);
+        }
         let remaining = self
             .state_slot(state, PCOMB_REMAINING)
             .as_handle()
@@ -1413,8 +1482,13 @@ impl Interp {
         if self.state_slot(state, PCOMB_CALLED).as_boolean() == Some(true) {
             return true;
         }
-        self.realm
-            .set_element(state, PCOMB_CALLED, NanBox::boolean(true));
+        if pall_lean_on() {
+            self.realm
+                .internal_array_set(state, PCOMB_CALLED, NanBox::boolean(true));
+        } else {
+            self.realm
+                .set_element(state, PCOMB_CALLED, NanBox::boolean(true));
+        }
         false
     }
 
@@ -1429,7 +1503,11 @@ impl Interp {
         }
         let (remaining, container, cap, index) = self.state_parts(state);
         if let Some(arr) = container.as_handle().map(Handle::from_raw) {
-            self.realm.set_element(arr, index, value);
+            if pall_lean_on() {
+                self.realm.internal_array_set(arr, index, value);
+            } else {
+                self.realm.set_element(arr, index, value);
+            }
         }
         let n = self.cell_get(remaining) - 1.0;
         self.cell_set(remaining, n);
@@ -1697,12 +1775,23 @@ impl Interp {
         if let Some(arr) = iterable.as_handle().map(Handle::from_raw)
             && crate::nbvm::array_iteration_is_plain(&mut self.realm, iterable)
         {
+            // (`c` and `promiseResolve` are the same for every element, and
+            // being the intrinsics depends on nothing user code can change.)
+            let intrinsic_resolve = pall_lean_on().then(|| {
+                self.is_intrinsic_promise_ctor(c)
+                    && self.is_intrinsic_promise_resolve(promise_resolve)
+            });
             let mut i = 0usize;
             while let Some(len) = self.realm.array_length(arr)
                 && i < len
             {
                 let item = self.get_index(arr, i)?;
-                self.realm.set_element(values, i, NanBox::undefined());
+                if pall_lean_on() {
+                    self.realm
+                        .internal_array_set(values, i, NanBox::undefined());
+                } else {
+                    self.realm.set_element(values, i, NanBox::undefined());
+                }
                 let cur = self.cell_get(remaining);
                 self.cell_set(remaining, cur + 1.0);
                 let step = self.perform_promise_all_element(
@@ -1714,6 +1803,7 @@ impl Interp {
                     cap,
                     i,
                     settled,
+                    intrinsic_resolve,
                 );
                 if let Err(e) = step {
                     // IteratorClose of the iterator this stood in for, past
@@ -1765,6 +1855,7 @@ impl Interp {
                 cap,
                 i,
                 settled,
+                None,
             );
             if let Err(e) = step {
                 let _ = sc.iterator_close(it);
@@ -1797,16 +1888,49 @@ impl Interp {
         cap: &PromiseCapability,
         i: usize,
         settled: bool,
+        intrinsic_resolve: Option<bool>,
     ) -> Result<(), ExecError> {
-        // (`%Promise%.resolve` of `%Promise%`: PromiseResolve itself.)
-        let next = if self.is_intrinsic_promise_ctor(c)
-            && self.is_intrinsic_promise_resolve(promise_resolve)
-        {
+        // (`%Promise%.resolve` of `%Promise%`: PromiseResolve itself. The
+        // caller may have found that out once for every element.)
+        let intrinsic = match intrinsic_resolve {
+            Some(b) => b,
+            None => {
+                self.is_intrinsic_promise_ctor(c)
+                    && self.is_intrinsic_promise_resolve(promise_resolve)
+            }
+        };
+        let next = if intrinsic {
             NanBox::handle(self.promise_resolve_checked(item)?.to_raw())
         } else {
             self.call_with_this(promise_resolve, c, &[item])?
         };
         let state = self.combinator_state(remaining, values_box, cap, NanBox::number(i as f64));
+        // `Invoke(next, "then", …)` of a plain promise whose `then` is the
+        // intrinsic and whose species is `%Promise%`: PerformPromiseThen,
+        // whose derived promise nothing can reach, so none is made (the
+        // reaction's result is the element function, whose settling is a
+        // no-op); and as the element functions reach no code but the
+        // reaction job's, they get no `length` / `name` either.
+        if let Some(h) = next
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|h| pall_lean_on() && self.has_intrinsic_then(*h))
+            .filter(|h| self.promise_species_fast(*h).is_some())
+        {
+            let (fid, rid) = if settled {
+                (N_PROMISE_ALLSETTLED_FULFILL, N_PROMISE_ALLSETTLED_REJECT)
+            } else {
+                (N_PROMISE_ALL_ELEMENT, 0)
+            };
+            let on_f = self.realm.new_bound_native(fid, state);
+            let on_r = if settled {
+                NanBox::handle(self.realm.new_bound_native(rid, state).to_raw())
+            } else {
+                cap.reject
+            };
+            self.register_await_reaction(h, NanBox::handle(on_f.to_raw()), on_r, on_f, false);
+            return Ok(());
+        }
         if settled {
             let on_f = self.make_element_fn(N_PROMISE_ALLSETTLED_FULFILL, state);
             let on_r = self.make_element_fn(N_PROMISE_ALLSETTLED_REJECT, state);

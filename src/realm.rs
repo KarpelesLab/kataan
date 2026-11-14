@@ -2191,8 +2191,11 @@ impl Realm {
     /// an array gains an auxiliary object, a sparse length, or a frozen/sealed
     /// mark.
     fn mark_array_side_state(&mut self, handle: Handle) {
-        if let Some(Cell::Array(a)) = self.heap.get_mut(handle) {
-            a.mark_side_state();
+        match self.heap.get_mut(handle) {
+            Some(Cell::Array(a)) => a.mark_side_state(),
+            // (A promise's side state: see `PromiseState::tainted`.)
+            Some(Cell::Promise(s)) => s.tainted = true,
+            _ => {}
         }
     }
 
@@ -2200,8 +2203,10 @@ impl Realm {
     /// `[[Prototype]]` was set explicitly (see [`crate::cell::ArrayElems`]):
     /// called wherever a non-object cell's prototype link is recorded.
     fn mark_array_proto_set(&mut self, handle: Handle) {
-        if let Some(Cell::Array(a)) = self.heap.get_mut(handle) {
-            a.mark_proto_set();
+        match self.heap.get_mut(handle) {
+            Some(Cell::Array(a)) => a.mark_proto_set(),
+            Some(Cell::Promise(s)) => s.tainted = true,
+            _ => {}
         }
     }
 
@@ -5186,6 +5191,7 @@ impl Realm {
             value: NanBox::undefined(),
             reactions: alloc::vec::Vec::new(),
             already_resolved: false,
+            tainted: false,
         }))
     }
 
@@ -6493,6 +6499,29 @@ impl Realm {
             }
             None => false,
         }
+    }
+
+    /// `arr[index] = value` for an array only the engine can reach (a
+    /// combinator's state, count cell or values before they are handed out):
+    /// an overwrite or an append of its dense store, with the write barrier;
+    /// any other array or index takes [`set_element`](Self::set_element).
+    pub(crate) fn internal_array_set(&mut self, handle: Handle, index: usize, value: NanBox) {
+        if let Some(a) = self
+            .heap
+            .get_mut_append(handle, |c| index.min(c.ref_len()))
+            .and_then(Cell::as_array_mut)
+            && !a.has_side_state()
+            && index <= a.len()
+        {
+            if index == a.len() {
+                a.vec_mut().push(value);
+            } else {
+                a[index] = value;
+            }
+            self.shade_stored(value);
+            return;
+        }
+        self.set_element(handle, index, value);
     }
 
     /// `arr[index] = value` into a hole of the dense store, when that `[[Set]]`

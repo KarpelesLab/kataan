@@ -73,6 +73,11 @@ pub struct PromiseState {
     /// committed — this flag records that commitment so a subsequent reject (e.g.
     /// from a `Promise` executor that throws *after* calling `resolve`) is ignored.
     pub already_resolved: bool,
+    /// The promise has (or had) an auxiliary own-property object or an
+    /// explicitly set `[[Prototype]]` (see `Realm::mark_array_side_state`):
+    /// while `false`, it owns no property and its `[[Prototype]]` is the
+    /// realm's default for promises, with no side-table lookup.
+    pub tainted: bool,
 }
 
 /// A suspended bytecode-VM activation: a sync or async generator's frame

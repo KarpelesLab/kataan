@@ -130,15 +130,7 @@ impl Realm {
         h: Handle,
         cache: &mut crate::ic::PropertyCache,
     ) -> Option<NanBox> {
-        if !matches!(self.heap.get(h), Some(Cell::Promise(_)))
-            || self.aux_props.get(&h.to_raw()).is_some()
-        {
-            return None;
-        }
-        let proto = self.promise_proto_intrinsic?;
-        if self.object_proto(h) != Some(proto) {
-            return None;
-        }
+        let proto = self.plain_promise_proto(h)?;
         self.object_get_cached(proto, "constructor", cache)
     }
 
@@ -208,16 +200,33 @@ impl Realm {
         h: Handle,
         cache: &mut crate::ic::PropertyCache,
     ) -> Option<NanBox> {
-        if !matches!(self.heap.get(h), Some(Cell::Promise(_)))
-            || self.aux_props.get(&h.to_raw()).is_some()
-        {
-            return None;
-        }
-        let proto = self.promise_proto_intrinsic?;
-        if self.object_proto(h) != Some(proto) {
-            return None;
-        }
+        let proto = self.plain_promise_proto(h)?;
         self.object_get_cached(proto, "then", cache)
+    }
+
+    /// The intrinsic `%Promise.prototype%` when `h` is a promise with no own
+    /// properties whose `[[Prototype]]` it is.
+    #[inline]
+    fn plain_promise_proto(&self, h: Handle) -> Option<Handle> {
+        let proto = self.promise_proto_intrinsic?;
+        match self.heap.get(h) {
+            // (Owning nothing, linked to the default: see
+            // `PromiseState::tainted`.)
+            Some(Cell::Promise(s))
+                if !s.tainted
+                    && self.promise_default_proto == Some(proto)
+                    && crate::nbexec::promise::await_plain_on() =>
+            {
+                Some(proto)
+            }
+            Some(Cell::Promise(_))
+                if self.aux_props.get(&h.to_raw()).is_none()
+                    && self.object_proto(h) == Some(proto) =>
+            {
+                Some(proto)
+            }
+            _ => None,
+        }
     }
 
     /// Whether `Get(h, "then")` is `undefined` without running any code,
