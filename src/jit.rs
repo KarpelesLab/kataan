@@ -55,6 +55,7 @@ mod handle;
 pub mod inline;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod instof;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod iter_reuse;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod key_probe;
@@ -3756,7 +3757,7 @@ pub struct GenericHelpers {
     /// fault pending, `1` to make the ordinary call).
     pub gen_call: JitCallMethodHelper,
     /// [`gen_call`](Self::gen_call) for a site whose iterator results never
-    /// escape (`jit_helper_gen_call_reuse`: see [`iter_noescape`]).
+    /// escape (`jit_helper_gen_call_reuse`: see `iter_reuse::plan`).
     pub gen_call_reuse: JitCallMethodHelper,
     /// A method call's callee lookup (`jit_method_info`).
     pub method_info: MethodHelper,
