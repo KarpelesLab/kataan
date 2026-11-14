@@ -98,6 +98,16 @@ pub fn cold_inl_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLDINL").is_none_or(|v| v != "0"))
 }
 
+/// Whether an inlined call's guard whose misses turned its loop's fast
+/// version off asks for a recompilation only when that could inline
+/// something more: the calls its site made since are not all to functions
+/// no recompilation could inline (`TierUp::guard_keys`). Unless
+/// `KATAAN_JIT_GUARDGAIN=0`.
+pub(super) fn guard_gain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GUARDGAIN").is_none_or(|v| v != "0"))
+}
+
 /// Whether an inlined callee's property sites carry what their caches
 /// learned into the recompilation of the body that inlined them
 /// ([`JitProto::inlined_warm`]); `KATAAN_JIT_INLWARM=0` turns it off (read
@@ -151,6 +161,9 @@ pub(super) struct TierUp {
     /// (`call_seq::CallSite::spec_misses`) is worth a recompilation, which
     /// inlines what the call site has seen since.
     pub(super) guard_calls: Vec<(usize, u16)>,
+    /// `(call cache, callee key)` of every inlined call's guard: what the
+    /// site inlines (see [`JitProto::guard_may_gain`]).
+    pub(super) guard_keys: Vec<(u16, u64)>,
     /// How many recompilations produced this body (`0`: the first compile).
     pub(super) generation: u8,
     /// `(header, region)` of the speculative loops: one whose fast version
@@ -397,6 +410,24 @@ impl TierUp {
             })
             .filter(|(_, sites)| !sites.is_empty())
             .collect();
+        let guards: Vec<(usize, u16, u64)> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| {
+                let GenericOp::InlineGuard { call, key, .. } = *op else {
+                    return None;
+                };
+                let cache = match *ops.get(call as usize)? {
+                    GenericOp::CallMethod { cache, .. }
+                    | GenericOp::CallValue { cache, .. }
+                    | GenericOp::CallWithMethod { cache, .. }
+                    | GenericOp::Construct { cache, .. } => cache,
+                    GenericOp::GetProp { call, .. } | GenericOp::SetProp { call, .. } => call,
+                    _ => return None,
+                };
+                Some((pc, cache, key))
+            })
+            .collect();
         Self {
             site_pcs,
             site_writes,
@@ -415,24 +446,8 @@ impl TierUp {
             int_demote: Vec::new(),
             elem_kinds: Vec::new(),
             leave_heads: false,
-            guard_calls: ops
-                .iter()
-                .enumerate()
-                .filter_map(|(pc, op)| {
-                    let GenericOp::InlineGuard { call, .. } = *op else {
-                        return None;
-                    };
-                    let cache = match *ops.get(call as usize)? {
-                        GenericOp::CallMethod { cache, .. }
-                        | GenericOp::CallValue { cache, .. }
-                        | GenericOp::CallWithMethod { cache, .. }
-                        | GenericOp::Construct { cache, .. } => cache,
-                        GenericOp::GetProp { call, .. } | GenericOp::SetProp { call, .. } => call,
-                        _ => return None,
-                    };
-                    Some((pc, cache))
-                })
-                .collect(),
+            guard_calls: guards.iter().map(|&(pc, cache, _)| (pc, cache)).collect(),
+            guard_keys: guards.iter().map(|&(_, cache, key)| (cache, key)).collect(),
             generation: 0,
             countdown: core::cell::Cell::new(1),
             entry_asked: core::cell::Cell::new(false),
@@ -687,6 +702,7 @@ impl JitProto {
                         #[allow(unsafe_code)]
                         let c = unsafe { &*c.get() };
                         c.spec_misses >= super::call_seq::SPEC_MISS_LIMIT
+                            && self.guard_may_gain(cache, c, inlinable)
                     })
             }) {
                 return true;
@@ -715,6 +731,36 @@ impl JitProto {
             .1
             .iter()
             .any(|&(site, write)| self.site_learned(site as usize, write))
+    }
+
+    /// Whether recompiling for the misses of call cache `cache`'s inlined
+    /// guard could inline more at it: unless every callee its call
+    /// sequence took in (`CallSite::targets`) but those it inlines is a
+    /// function no recompilation could inline (by its key, `inlinable`) —
+    /// its misses then call what a recompilation would call too. (No such
+    /// callee: the misses are no call's, as the old rule had it.)
+    fn guard_may_gain(
+        &self,
+        cache: u16,
+        c: &super::call_seq::CallSite,
+        inlinable: &dyn Fn(u64) -> bool,
+    ) -> bool {
+        if !guard_gain_enabled() {
+            return true;
+        }
+        let Some(s) = self.sites.as_ref() else {
+            return true;
+        };
+        let mut other = c
+            .targets
+            .iter()
+            .map(|t| t.key)
+            .filter(|&k| {
+                k != super::call_seq::CallSite::EMPTY
+                    && !s.tier_up.guard_keys.contains(&(cache, k))
+            })
+            .peekable();
+        other.peek().is_none() || other.any(inlinable)
     }
 
     /// Whether a property site's request (`jit::poly`) should have the
