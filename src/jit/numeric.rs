@@ -3662,7 +3662,9 @@ impl NumGen {
                 continue;
             };
             let r = &self.regions[ri];
-            if r.spec.is_none() || r.spec_int || r.int.is_some() {
+            // (A speculative region's integer version enters through the
+            // same checks, `spec_int_entry`: `KATAAN_JIT_INTMATH`.)
+            if r.spec.is_none() || (r.int.is_some() && !(r.spec_int && int_math_proof_enabled())) {
                 continue;
             }
             let Some(Op::CallMethod { recv, args, .. }) = self.bc(pc) else {
@@ -3719,13 +3721,17 @@ impl NumGen {
     /// fast version's and its entry check proves it ([`MathProof`]): its
     /// receiver and method checks are left out.
     pub(super) fn math_proved(&self, pc: usize) -> bool {
-        !self.copy && self.imode.is_none() && self.math_proofs.iter().any(|m| m.pc == pc)
+        !self.copy
+            && (self.imode.is_none() || self.spec_int_mode())
+            && self.math_proofs.iter().any(|m| m.pc == pc)
     }
 
     /// Whether the `LoadGlobal` at `pc`, emitted now in a fast version, only
     /// fed an entry-proved call that does not read it ([`MathProof::load`]).
     fn math_load_dead(&self, pc: usize) -> bool {
-        !self.copy && self.imode.is_none() && self.math_proofs.iter().any(|m| m.load == Some(pc))
+        !self.copy
+            && (self.imode.is_none() || self.spec_int_mode())
+            && self.math_proofs.iter().any(|m| m.load == Some(pc))
     }
 
     /// Region `ri`'s [`MathProof`]s, at an entry into its fast version
@@ -8579,6 +8585,15 @@ fn const_mem_enabled() -> bool {
 fn licm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LICM").is_none_or(|v| v != "0"))
+}
+
+/// Whether a speculative region with an integer version proves its
+/// `Math.f(x)` calls at its entries too ([`NumGen::plan_math_proofs`]; the
+/// integer version's entry, `spec_int_entry`, runs the same checks as the
+/// double version's): unless `KATAAN_JIT_INTMATH=0`. Read once.
+fn int_math_proof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INTMATH").is_none_or(|v| v != "0"))
 }
 
 /// Whether the invariant prefixes ([`plan_licm`]) of loops that have loops
