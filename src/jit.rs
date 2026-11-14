@@ -5572,10 +5572,11 @@ pub struct X64Assembler {
     /// [`RECV_CACHE_EMPTY`]: the generic tier's global binding cache, which
     /// a call does not empty (it is guarded by the global binding epoch).
     entry_clear: Vec<i32>,
-    /// Frame slots the frame prologue sets to a 64-bit word (through `r11`,
-    /// which no entry passes anything in): the global binding cache's
-    /// direct-read base (`global_persist::direct_enabled`).
-    entry_init: Vec<(i32, u64)>,
+    /// The global binding cache's direct reads (`global_persist::
+    /// direct_enabled`), which the frame prologue starts (through `r11`,
+    /// which no entry passes anything in).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    entry_globals: Option<global_persist::DirectEntry>,
     /// Where the most recent [`bind`](Self::bind) bound its label (no label
     /// is bound past it, as `bind` binds at the end of the code).
     last_bind: usize,
@@ -6519,11 +6520,11 @@ impl X64Assembler {
         self.entry_clear = slots;
     }
 
-    /// Sets the slots the frame prologue sets to a word (see the
-    /// `entry_init` field).
+    /// Sets the direct global reads the frame prologue starts (see the
+    /// `entry_globals` field).
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-    pub(crate) fn set_entry_init(&mut self, slots: Vec<(i32, u64)>) {
-        self.entry_init = slots;
+    fn set_entry_globals(&mut self, e: Option<global_persist::DirectEntry>) {
+        self.entry_globals = e;
     }
 
     /// Empties every receiver-cache key slot (after a `call`, in the
@@ -7704,12 +7705,18 @@ impl X64Assembler {
         self.code.push(0x53); // push rbx
         self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
         self.code.extend_from_slice(&frame.to_le_bytes());
+        self.frame_entry_clears();
+        // (Then the global binding cache's direct-read base, set where the
+        // frame's epoch slot was emptied.)
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-        for i in 0..self.entry_init.len() {
-            let (d, w) = self.entry_init[i];
-            self.g_movabs(call_seq::r::R11, w);
-            self.g_store(call_seq::r::RBP, d, call_seq::r::R11);
+        if let Some(e) = self.entry_globals {
+            self.gp_entry(e);
         }
+    }
+
+    /// The frame prologue's emptying of the receiver-cache keys and the
+    /// entry-cleared slots.
+    fn frame_entry_clears(&mut self) {
         // (The entry empties every way.)
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         if prologue_sse_clear() {
@@ -10426,11 +10433,17 @@ impl JitFunction {
         entry_clear.extend(gi_pcs.iter().filter_map(|&pc| gi_slots(pc)).map(|s| s.0));
         if gc_plan.slots > 0 {
             entry_clear.extend((0..gc_plan.slots).filter(|&k| !gdirect(k)).map(gc_slot));
-            entry_clear.push(gc_epoch);
+            // (With direct reads the prologue notes the current epoch.)
+            if !gd {
+                entry_clear.push(gc_epoch);
+            }
         }
-        if gd {
-            a.set_entry_init(alloc::vec![(gd_slot, global_persist::empty_words_addr())]);
-        }
+        a.set_entry_globals(gd.then_some(global_persist::DirectEntry {
+            base: gd_slot,
+            epoch: gc_epoch,
+            persist,
+            epoch_addr: epoch_addr as u64,
+        }));
         if has_inline {
             // (Emptied by the prologue only: `entry_clear` is also the
             // global binding cache's reset, which may run inside an inlined
@@ -17993,8 +18006,9 @@ impl JitFunction {
         } else {
             (Some(native_exact), native_exact_pinned)
         };
-        // (The handler entry's calls are not the body's.)
+        // (The handler entry's calls are not the body's, nor its frame.)
         a.set_body_globals(None);
+        a.set_entry_globals(None);
         let entries = if uses_handlers {
             // The handler entry is the Rust caller's, and behind a stub that
             // passes it the context, the call sequence's.

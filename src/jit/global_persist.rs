@@ -61,8 +61,9 @@ pub(super) fn restore_first() -> bool {
 /// first global access ([`EMPTY_WORDS`]); `KATAAN_JIT_GDIRECT=0` turns it
 /// off (read once per process).
 ///
-/// The frame word starts at [`EMPTY_WORDS`] (every entry empty, so a read
-/// takes the epoch path) and points at the array only while the array's
+/// The frame word starts at the array when the prologue finds it current,
+/// else at [`EMPTY_WORDS`] (every entry empty, so a read takes the epoch
+/// path), and points at the array only while the array's
 /// noted epoch is the frame's noted epoch and that is the current one: it
 /// is set so after the epoch check, and every `call` that finds the epoch
 /// changed (`X64Assembler::recheck_body_globals`'s stub), like a `catch`
@@ -85,6 +86,20 @@ pub(super) const DIRECT_MIN: usize = 4;
 /// known current (see [`direct_enabled`]): every one empty, laid out as the
 /// array's first [`BODY_WORDS`].
 pub(super) static EMPTY_WORDS: [u64; BODY_WORDS] = [EMPTY; BODY_WORDS];
+
+/// What a body's frame prologue needs to start its direct global reads
+/// (`X64Assembler::gp_entry`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DirectEntry {
+    /// The frame's base word.
+    pub base: i32,
+    /// The frame's noted epoch.
+    pub epoch: i32,
+    /// The body's array.
+    pub persist: u64,
+    /// The global binding epoch's address.
+    pub epoch_addr: u64,
+}
 
 /// The address of [`EMPTY_WORDS`].
 pub(super) fn empty_words_addr() -> u64 {
@@ -306,6 +321,26 @@ impl X64Assembler {
         self.g_store(r::R11, off(noted), r::RCX);
         self.bind(same);
         self.g_store(r::R11, off(word), r::RAX);
+    }
+
+    /// A body's direct global reads' start, at the end of its frame
+    /// prologue: the frame notes the current epoch (its global slots are
+    /// all empty) and points its base word at the body's array when that
+    /// array was validated under it, else at [`EMPTY_WORDS`]. Clobbers
+    /// `r11` and the flags.
+    pub(super) fn gp_entry(&mut self, e: DirectEntry) {
+        let store = self.new_label();
+        self.g_movabs(r::R11, e.epoch_addr);
+        self.g_load(r::R11, r::R11, 0);
+        self.g_store(r::RBP, e.epoch, r::R11);
+        self.g_movabs(r::R11, e.persist);
+        self.g_load(r::R11, r::R11, off(0));
+        self.g_cmp_mem(r::R11, r::RBP, e.epoch);
+        self.g_movabs(r::R11, empty_words_addr());
+        self.g_jcc(super::call_seq::cc::NE, store);
+        self.g_movabs(r::R11, e.persist);
+        self.bind(store);
+        self.g_store(r::RBP, e.base, r::R11);
     }
 
     /// Records a whole validated group: its entries (`(word, frame
