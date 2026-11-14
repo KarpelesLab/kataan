@@ -587,8 +587,17 @@ impl X64Assembler {
             self.g_cmp_mem(r::R9, r::R11, is_set);
             self.g_jcc(cc::NE, stale);
         } else {
-            // The proof first (an indexed or larger collection is served
-            // by the helper under it too).
+            // The receiver: a strong collection (anything else, the usual
+            // other receiver of such a call, is the call's at once) ...
+            self.g_load(r::RAX, rbase, recv);
+            self.p_is_handle(r::RCX, slow);
+            self.p_slot_rooted(l, r::RCX, slow);
+            self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, c.disc);
+            self.g_jcc(cc::NE, slow);
+            self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
+            self.g_jcc(cc::NE, slow);
+            // ... under the proof (an indexed or larger collection is
+            // served by the helper under it too) ...
             self.g_movabs(r::R11, site as u64);
             if let Some(cd) = callee {
                 // The method read is the built-in the proof names; else a
@@ -613,15 +622,8 @@ impl X64Assembler {
                 self.g_cmp_mem(r::R9, r::R11, method);
                 self.g_jcc(cc::NE, slow);
             }
-            // The receiver: a strong collection of the proof's kind (with
-            // the default `[[Prototype]]` unless the method was read).
-            self.g_load(r::RAX, rbase, recv);
-            self.p_is_handle(r::RCX, slow);
-            self.p_slot_rooted(l, r::RCX, slow);
-            self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, c.disc);
-            self.g_jcc(cc::NE, slow);
-            self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
-            self.g_jcc(cc::NE, slow);
+            // ... of the proof's kind (with the default `[[Prototype]]`
+            // unless the method was read).
             if callee.is_none() {
                 self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
                 self.g_jcc(cc::NE, slow);
@@ -781,14 +783,7 @@ impl X64Assembler {
         let stale = self.new_label();
         self.bind(retry);
         self.p_arena(realm_off, &l.props);
-        self.g_movabs(r::R11, site as u64);
-        self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
-        self.g_cmp_mem(r::R9, r::R11, stamp);
-        self.g_jcc(cc::NE, if prove.is_some() { stale } else { miss });
-        self.g_load(r::R9, r::R11, ptr);
-        self.g_load(r::R9, r::R9, 0);
-        self.g_cmp_mem(r::R9, r::R11, method);
-        self.g_jcc(cc::NE, miss);
+        // (The receiver first: any other kind is the usual miss.)
         let base = self.frame_base(recv);
         self.g_load(r::RAX, base, recv);
         self.p_is_handle(r::RCX, miss);
@@ -798,6 +793,14 @@ impl X64Assembler {
         self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
         self.g_jcc(cc::NE, miss);
         self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
+        self.g_jcc(cc::NE, miss);
+        self.g_movabs(r::R11, site as u64);
+        self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
+        self.g_cmp_mem(r::R9, r::R11, stamp);
+        self.g_jcc(cc::NE, if prove.is_some() { stale } else { miss });
+        self.g_load(r::R9, r::R11, ptr);
+        self.g_load(r::R9, r::R9, 0);
+        self.g_cmp_mem(r::R9, r::R11, method);
         self.g_jcc(cc::NE, miss);
         self.g_mem(false, &[0x0f, 0xb6], r::R9, r::RCX, c.is_set);
         self.g_cmp_mem(r::R9, r::R11, is_set);

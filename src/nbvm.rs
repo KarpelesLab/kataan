@@ -8712,8 +8712,9 @@ pub(crate) extern "C" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u
 
 /// Generic-JIT slow path for a relational `Op::Compare` (`op` 0 `<`, 1 `>`,
 /// 2 `<=`, 3 `>=`) of two strings, as the interpreter's arm decides it
-/// first ([`string_compare`]): the boolean's bits, or the hole's when that
-/// declines (the caller then runs the interpreter's op). Runs no code,
+/// first (two BigInts by `Realm::bigint_binary_try`, two strings by
+/// [`string_compare`]): the boolean's bits, or the hole's when those
+/// decline (the caller then runs the interpreter's op). Runs no code,
 /// never throws.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) extern "C" fn jit_helper_str_compare(
@@ -8728,14 +8729,23 @@ pub(crate) extern "C" fn jit_helper_str_compare(
     let Ok(op) = u8::try_from(op) else {
         return NanBox::hole().to_bits();
     };
-    string_compare(
-        &mut ctx.realm,
-        NanBox::from_bits(a),
-        NanBox::from_bits(b),
-        op,
-    )
-    .map_or(NanBox::hole(), NanBox::boolean)
-    .to_bits()
+    let (a, b) = (NanBox::from_bits(a), NanBox::from_bits(b));
+    if let Some(v) = string_compare(&mut ctx.realm, a, b, op) {
+        return NanBox::boolean(v).to_bits();
+    }
+    // Two BigInts: the interpreter arm's answer on the borrowed values,
+    // which cannot throw (else nothing was done).
+    let bop = match op {
+        0 => crate::ast::BinaryOp::Lt,
+        1 => crate::ast::BinaryOp::Gt,
+        2 => crate::ast::BinaryOp::LtEq,
+        3 => crate::ast::BinaryOp::GtEq,
+        _ => return NanBox::hole().to_bits(),
+    };
+    ctx.realm
+        .bigint_binary_try(bop, a, b)
+        .unwrap_or(NanBox::hole())
+        .to_bits()
 }
 
 /// Generic-JIT slow path for strict equality `===` (`Op::StrictEq`): runs the shared
