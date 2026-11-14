@@ -55,6 +55,8 @@ mod global_mirror;
 mod global_obj;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use global_mirror::plan_body as plan_global_mirrors;
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+mod await_fast;
 mod gen_fast;
 mod iter_fast;
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
@@ -3551,8 +3553,48 @@ fn next_batch_resume(
 }
 
 /// One resumption of the hosted async frame parked in its frame cell
-/// `controller` ([`resume_vm_async`]'s), in the context `ctx`.
+/// `controller` ([`resume_vm_async`]'s), in the context `ctx`: a hot one
+/// fulfilled runs in place (`await_fast`, `KATAAN_AWAIT_LEAN`).
 fn resume_async_frame(
+    ctx: &mut Ctx,
+    table: &FnTable,
+    controller: NanBox,
+    state: Option<Handle>,
+    fulfilled: bool,
+    v: NanBox,
+) -> Result<(), VmError> {
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    if fulfilled
+        && let Some(fh) = state
+        && crate::nbexec::promise::await_lean_on()
+        && let await_fast::Lean::Done(r) = await_fast::lean_resume(ctx, table, controller, fh, v)
+    {
+        return if r.is_ok() && !ctx.microtasks.is_empty() {
+            Err(VmError::Unsupported)
+        } else {
+            r
+        };
+    }
+    resume_async_general(ctx, table, controller, state, fulfilled, v)
+}
+
+/// [`resume_async_frame`]'s fulfilled resumption of the frame cell `fh` by
+/// the general path (`await_fast`'s, for a frame it continued in place and
+/// then declined).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn resume_parked(
+    ctx: &mut Ctx,
+    table: &FnTable,
+    controller: NanBox,
+    fh: Handle,
+    v: NanBox,
+) -> Result<(), VmError> {
+    resume_async_general(ctx, table, controller, Some(fh), true, v)
+}
+
+/// [`resume_async_frame`] by the general path: the register file and handler
+/// stack moved out of the cell for the run, and back in at the next `await`.
+fn resume_async_general(
     ctx: &mut Ctx,
     table: &FnTable,
     controller: NanBox,
@@ -3573,6 +3615,11 @@ fn resume_async_frame(
             ),
             None => return Err(VmError::NotAnObject),
         };
+        // (A register file kept at its compiled body's size by the lean
+        // resumption: the registers past the function's own are dead here.)
+        if let Some(proto) = table.get(id) {
+            regs.truncate(proto.n_regs);
+        }
         let inject = if fulfilled {
             if let Some(slot) = regs.get_mut(dst as usize) {
                 *slot = v;
@@ -3596,6 +3643,10 @@ fn resume_async_frame(
             _ => Vec::new(),
         };
         let (mut pc, mut handlers, mut inject) = (pc, handlers, inject);
+        // A settled value to continue with by the lean resumption, the frame
+        // parked in its cell for it (see below).
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        let mut handoff = None;
         let r = loop {
             #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
             let (mut hot, mut resumes) = (false, 0);
@@ -3643,6 +3694,22 @@ fn resume_async_frame(
                     dst: d,
                 }) => match await_settled_now(ctx, table, value) {
                     Some(w) => {
+                        // Once the body runs hot in place, the frame goes to
+                        // the lean resumption, parked as at a suspension.
+                        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+                        if crate::nbexec::promise::await_lean_on()
+                            && await_fast::lean_ready(proto, regs.len())
+                        {
+                            if let Some(f) = ctx.realm.vm_frame_mut(fh) {
+                                f.regs = core::mem::take(&mut regs);
+                                f.handlers = hs;
+                                f.pc = at as u32;
+                                f.dst = d;
+                            }
+                            ctx.realm.vm_frame_stored(fh);
+                            handoff = Some(w);
+                            break Ok(FrameExit::Return(None));
+                        }
                         if let Some(slot) = regs.get_mut(d as usize) {
                             *slot = w;
                         }
@@ -3664,6 +3731,11 @@ fn resume_async_frame(
         if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
             t.ic = ic;
             t.ic_body = body;
+        }
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if let Some(w) = handoff {
+            ctx.frame_shadow.truncate(mark);
+            return resume_async_frame(ctx, table, controller, Some(fh), true, w);
         }
         let r = drive_async(ctx, table, id, Some(fh), p, regs, r);
         ctx.frame_shadow.truncate(mark);

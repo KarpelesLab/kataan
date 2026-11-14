@@ -25,6 +25,13 @@ await_toggle!(
     "KATAAN_AWAIT_DIRECT"
 );
 
+await_toggle!(
+    /// Whether a hot async function resumed with a fulfilled value runs in
+    /// place on its frame cell's registers (`KATAAN_AWAIT_LEAN`).
+    await_lean_on,
+    "KATAAN_AWAIT_LEAN"
+);
+
 /// A `PromiseCapability` record: the dependent promise plus its resolve/reject
 /// functions, as produced by `NewPromiseCapability(C)`.
 #[derive(Clone, Copy)]
