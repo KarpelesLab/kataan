@@ -17,14 +17,14 @@ use puremp::Int;
 /// one limb, bitwise ops of non-negatives; `KATAAN_BIGINT_FAST=0` turns them
 /// off, read once per process).
 #[cfg(feature = "std")]
-fn fast_enabled() -> bool {
+pub(crate) fn fast_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_BIGINT_FAST").is_none_or(|v| v != "0"))
 }
 
 #[cfg(not(feature = "std"))]
-fn fast_enabled() -> bool {
+pub(crate) fn fast_enabled() -> bool {
     true
 }
 

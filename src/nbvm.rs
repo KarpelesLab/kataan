@@ -2147,15 +2147,30 @@ fn host_binary(
     b: NanBox,
     regs: Option<&[NanBox]>,
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() || !(host_operand(&ctx.realm, a) || host_operand(&ctx.realm, b)) {
+    if ctx.host.is_none() {
         return None;
     }
     // Two BigInt primitives under an operator that cannot throw: the host's
-    // answer, computed on the borrowed values.
-    let both_big = match ctx.realm.bigint_binary_try(op, a, b) {
-        Ok(v) => return Some(Ok(v)),
-        Err(both_big) => both_big,
-    };
+    // answer, computed on the borrowed values. (Two BigInts are host
+    // operands, so trying them first changes nothing but the order of the
+    // checks; `KATAAN_BIGINT_FAST=0` keeps the old order.)
+    let early = crate::bignum::fast_enabled() && a.as_handle().is_some() && b.as_handle().is_some();
+    let mut both_big = false;
+    if early {
+        match ctx.realm.bigint_binary_try(op, a, b) {
+            Ok(v) => return Some(Ok(v)),
+            Err(big) => both_big = big,
+        }
+    }
+    if !both_big && !(host_operand(&ctx.realm, a) || host_operand(&ctx.realm, b)) {
+        return None;
+    }
+    if !early {
+        both_big = match ctx.realm.bigint_binary_try(op, a, b) {
+            Ok(v) => return Some(Ok(v)),
+            Err(both_big) => both_big,
+        };
+    }
     // From a VM frame's operation (`regs`, its register file): the frame
     // lends its registers, so the coercions the host runs may collect (see
     // `crate::realm::host_roots`). Two BigInts run no user code: no link,
