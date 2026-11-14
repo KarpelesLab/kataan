@@ -621,6 +621,39 @@ impl Rope {
         Self::with_known_utf16(node, bytes.len())
     }
 
+    /// The ASCII `bytes` upper- (`upper`) or lower-cased, as a flat rope
+    /// with its UTF-16 length (the byte length) recorded: written straight
+    /// into an inline node when short.
+    #[must_use]
+    pub fn from_ascii_mapped(bytes: &[u8], upper: bool) -> Self {
+        debug_assert!(bytes.is_ascii());
+        let map = |b: u8| {
+            if upper {
+                b.to_ascii_uppercase()
+            } else {
+                b.to_ascii_lowercase()
+            }
+        };
+        if let Some(r) = Self::small_with(bytes.len(), |out| {
+            for (o, &b) in out.iter_mut().zip(bytes) {
+                *o = map(b);
+            }
+        }) {
+            if let Node::Small { u16, .. } = &*r.0 {
+                u16.set(bytes.len() as u8);
+            }
+            return r;
+        }
+        let out: Vec<u8> = bytes.iter().map(|&b| map(b)).collect();
+        Self::with_known_utf16(
+            Node::Leaf(
+                out.into_boxed_slice(),
+                core::cell::Cell::new(U16_LEN_UNKNOWN),
+            ),
+            bytes.len(),
+        )
+    }
+
     /// A flat `node` with its UTF-16 length memo set to `units`.
     #[inline]
     fn with_known_utf16(node: Node, units: usize) -> Self {

@@ -15599,6 +15599,37 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(call_helper);
+                    // `m.set` / `s.add` / … read before the call's
+                    // arguments, on a default collection: the built-in the
+                    // site's collection proof names (`coll`).
+                    if coll::write_enabled()
+                        && matches!(
+                            bytecode.get(op_idx),
+                            Some(
+                                crate::nbvm::Op::GetProp { key, .. }
+                                    | crate::nbvm::Op::GetMethod { key, .. }
+                            ) if matches!(key.as_str(), "get" | "set" | "has" | "add" | "delete")
+                        )
+                        && num.result_xmm(op_idx, dst).is_none()
+                    {
+                        let miss = a.new_label();
+                        let retry = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, miss);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, miss);
+                        a.coll_method_read(
+                            &layout,
+                            cl.realm,
+                            s.method_ptr,
+                            (disp(obj), disp(dst)),
+                            (retry, miss, done),
+                            (!num.in_spec(op_idx)).then_some(helpers.str_proof as usize as u64),
+                        );
+                        a.bind(miss);
+                    }
                     // (In a speculative loop's fast version, which makes
                     // no call, the slow path leaves for the plain copy.)
                     if let Some(b) = num.spec_bail(&mut a, op_idx) {

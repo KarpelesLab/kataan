@@ -756,6 +756,74 @@ impl X64Assembler {
         self.jmp(fill);
     }
 
+    /// The read of a `Map.prototype` / `Set.prototype` method (`m.set`
+    /// before its arguments, `Op::GetMethod`) on a strong collection of the
+    /// proof's kind with the default `[[Prototype]]`: under the site's
+    /// proof (see the module docs: the collection owns no property, and its
+    /// prototype's slot holds the built-in), the method is that built-in,
+    /// stored to the register at frame displacement `dst`, on to `done`.
+    /// A stale proof is made again (`prove`, the fill helper, then
+    /// `retry`) while the site may still try; anything else to `miss`,
+    /// nothing done. With no `prove` (a fast version, which makes no call),
+    /// a stale proof is a miss too. Clobbers `rax`, `rcx`, `rdx`, `r9`–`r11`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn coll_method_read(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        site: *const MethodSite,
+        (recv, dst): (i32, i32),
+        (retry, miss, done): (Label, Label, Label),
+        prove: Option<u64>,
+    ) {
+        let c = coll_layout();
+        let [stamp, ptr, method, is_set, tries] = MethodSite::coll_offsets();
+        let stale = self.new_label();
+        self.bind(retry);
+        self.p_arena(realm_off, &l.props);
+        self.g_movabs(r::R11, site as u64);
+        self.g_load_abs(r::R9, crate::object::proto_epoch_addr() as u64);
+        self.g_cmp_mem(r::R9, r::R11, stamp);
+        self.g_jcc(cc::NE, if prove.is_some() { stale } else { miss });
+        self.g_load(r::R9, r::R11, ptr);
+        self.g_load(r::R9, r::R9, 0);
+        self.g_cmp_mem(r::R9, r::R11, method);
+        self.g_jcc(cc::NE, miss);
+        let base = self.frame_base(recv);
+        self.g_load(r::RAX, base, recv);
+        self.p_is_handle(r::RCX, miss);
+        self.p_slot_rooted(l, r::RCX, miss);
+        self.g_cmp_byte_imm(r::RCX, l.off_cell_tag, c.disc);
+        self.g_jcc(cc::NE, miss);
+        self.g_cmp_byte_imm(r::RCX, c.is_weak, 0);
+        self.g_jcc(cc::NE, miss);
+        self.g_cmp_byte_imm(r::RCX, c.default_proto, 1);
+        self.g_jcc(cc::NE, miss);
+        self.g_mem(false, &[0x0f, 0xb6], r::R9, r::RCX, c.is_set);
+        self.g_cmp_mem(r::R9, r::R11, is_set);
+        self.g_jcc(cc::NE, if prove.is_some() { stale } else { miss });
+        self.g_load(r::RAX, r::R11, method);
+        self.store_rax(dst);
+        self.jmp(done);
+        if let Some(helper) = prove {
+            let cold = self.cold_begin();
+            self.bind(stale);
+            self.g_movabs(r::R11, site as u64);
+            self.g_mem(true, &[0x83], 7, r::R11, tries); // cmp qword [r11+tries], imm8
+            self.code.push(u8::try_from(COLL_TRIES).expect("an imm8"));
+            self.g_jcc(cc::AE, miss);
+            self.mov_rdi_r15();
+            self.load_argreg(1, recv);
+            self.g_movabs(r::RDX, site as u64);
+            self.g_movabs(r::RAX, helper);
+            self.call_rax();
+            self.g_test(r::RAX);
+            self.g_jcc(cc::NE, retry);
+            self.jmp(miss);
+            self.cold_end(cold);
+        }
+    }
+
     /// `r11` = the bits of the key at `[base + disp]`, a `-0` as `+0`.
     fn coll_key_bits(&mut self, base: u8, disp: i32) {
         self.g_load(r::R11, base, disp);

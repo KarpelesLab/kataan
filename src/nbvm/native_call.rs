@@ -835,6 +835,21 @@ pub(super) fn prove_array_pop(realm: &mut Realm, site: &mut crate::jit::MethodSi
     prove_proto_method(realm, site, start, "pop", FastOp::ArrayPop);
 }
 
+/// Whether `toUpperCase` / `toLowerCase` of an ASCII string map it in place
+/// into its new node (or answer the receiver when nothing changes)
+/// (`KATAAN_ASCII_CASE=0` turns it off; read once per process).
+fn ascii_case_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_ASCII_CASE").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// The `String.prototype` methods compiled code calls straight through
 /// [`str_call`] (`crate::jit`'s direct string call): each a [`run_op`]
 /// string op that runs no code (it declines whatever input could). The
@@ -1950,7 +1965,25 @@ fn run_op(
         }
         FastOp::StrCase(upper) => {
             let rope = str_parts(realm, h)?;
-            let out = crate::nbexec::case_map_wtf8(rope.as_leaf_bytes()?, upper);
+            let bytes = rope.as_leaf_bytes()?;
+            if ascii_case_enabled() && bytes.is_ascii() {
+                // ASCII text: mapped byte by byte, the receiver itself when
+                // no byte changes (a string is a value: which cell holds it
+                // is not observable), with its UTF-16 length known.
+                let changes = |b: &u8| {
+                    if upper {
+                        b.is_ascii_lowercase()
+                    } else {
+                        b.is_ascii_uppercase()
+                    }
+                };
+                if !bytes.iter().any(changes) {
+                    return Some(Ok(recv));
+                }
+                let out = crate::rope::Rope::from_ascii_mapped(bytes, upper);
+                return Some(Ok(NanBox::handle(realm.new_string_from_rope(out).to_raw())));
+            }
+            let out = crate::nbexec::case_map_wtf8(bytes, upper);
             NanBox::handle(realm.new_string_wtf8(out).to_raw())
         }
         FastOp::StrTrim(start, end) => {
