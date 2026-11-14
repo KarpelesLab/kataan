@@ -16213,16 +16213,20 @@ impl JitFunction {
                     // own call site (`KATAAN_JIT_GETKEY`): from the helper
                     // path below (`jit_helper_get_elem_acc`), or at
                     // `own_getter` from the inline probe of a receiver with
-                    // its own accessor of the key's name. (Not for an index
-                    // in an SSE register: the site helper re-reads the key
-                    // from the register file.)
+                    // its own accessor of the key's name. (Not for a key
+                    // known to be a Number, which neither memo knows, nor
+                    // for an index in an SSE register: the site helper
+                    // re-reads the key from the register file.)
                     let forin_key = forin_keys.get(index as usize) == Some(&true);
                     let acc_site = key_sites
                         .get(op_idx)
                         .copied()
                         .flatten()
                         .filter(|_| {
-                            bail.is_none() && !forin_key && num.result_xmm(op_idx, index).is_none()
+                            bail.is_none()
+                                && !forin_key
+                                && !num.is_number_at(op_idx, index)
+                                && num.result_xmm(op_idx, index).is_none()
                         })
                         .and_then(|k| call_sites.get(usize::from(k)).copied());
                     let own_getter = acc_site.map(|_| a.new_label());
