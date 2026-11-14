@@ -14,7 +14,7 @@
 
 use super::jit_tier::{self, GenRun};
 use super::{
-    Ctx, FnProto, FnTable, HostError, VmError, await_settled_now, drive_async, run_frame_at,
+    Ctx, FnProto, FnTable, HostError, Op, VmError, await_settled_now, drive_async, run_frame_at,
     with_host,
 };
 use crate::heap::Handle;
@@ -179,6 +179,100 @@ fn hot_body(proto: &FnProto, len: Option<usize>) -> Option<alloc::rc::Rc<crate::
     };
     t.resumes = n;
     Some(j)
+}
+
+/// The call of the hot async function `id` (`proto`, a plain one: no rest
+/// parameter, `arguments` or `new.target`, called without `new`) with
+/// `args`, `captures` and `this_val`, from `call_with_inner` (whose caller
+/// did the activation's bookkeeping): its compiled body run from its start
+/// on a window of the register stack, as a hot generator's is, without the
+/// general path's tier-up checks and interpreter caches — to its first
+/// `await` or its end, handled by `drive_async` — and its promise
+/// returned. `None`, with nothing done, for a body not compiled or not hot,
+/// or a call that may recompile it (one in `RECOMPILE_EVERY`, which the
+/// general path makes).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn call_lean(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    id: usize,
+    proto: &FnProto,
+    args: &[NanBox],
+    captures: &[NanBox],
+    this_val: NanBox,
+    new_target: Option<NanBox>,
+) -> Option<Result<NanBox, VmError>> {
+    if new_target.is_some()
+        || proto.rest_from.is_some()
+        || ctx.host.is_none()
+        || matches!(proto.ops.first(), Some(Op::MakeArguments { .. }))
+        || proto
+            .ops
+            .iter()
+            .take(2)
+            .any(|op| matches!(op, Op::LoadNewTarget { .. }))
+    {
+        return None;
+    }
+    let jit = {
+        let mut t = proto.tier.0.try_borrow_mut().ok()?;
+        let n = t.calls.saturating_add(1);
+        let j = match &t.jit {
+            Some(Some(j))
+                if j.is_generic()
+                    && jit_tier::call_is_hot(t.body.is_some())
+                    && (t.body.is_some() || n != super::TIER_UP_THRESHOLD)
+                    && !jit_tier::resume_may_recompile(n) =>
+            {
+                alloc::rc::Rc::clone(j)
+            }
+            _ => return None,
+        };
+        t.calls = n;
+        j
+    };
+    let mut regs = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
+    regs.resize(proto.n_regs, NanBox::undefined());
+    for (slot, a) in regs.iter_mut().zip(args.iter().take(proto.n_params)) {
+        *slot = *a;
+    }
+    for (i, c) in captures.iter().enumerate().take(proto.n_captures) {
+        regs[proto.n_params + i] = *c;
+    }
+    if let Some(slot) = regs.get_mut(proto.n_params + proto.n_captures) {
+        *slot = this_val;
+    }
+    // The activation's inputs, published as `call_with_inner` publishes them
+    // (its caller truncates the shadow stack).
+    if ctx.gc_enabled {
+        if ctx.call_depth == 1 {
+            ctx.top_frame_roots.clear();
+            ctx.top_frame_roots.extend_from_slice(args);
+            ctx.top_frame_roots.extend_from_slice(captures);
+            ctx.top_frame_roots.push(this_val);
+        } else {
+            ctx.frame_shadow.extend_from_slice(args);
+            ctx.frame_shadow.extend_from_slice(captures);
+            ctx.frame_shadow.push(this_val);
+        }
+    }
+    let p = super::vm_new_promise(ctx)?;
+    // (The result promise lives only in this Rust local until the body
+    // returns or parks on a controller.)
+    ctx.frame_shadow.push(p);
+    let mut handlers = alloc::vec::Vec::new();
+    let r = match jit_tier::run_generator_body(ctx, funcs, &jit, &mut regs, 0, &mut handlers) {
+        GenRun::Yield { value, pc, dst } => Ok(super::FrameExit::Yield {
+            value,
+            pc,
+            handlers,
+            dst,
+        }),
+        GenRun::Exit(r) => r,
+        // (Nothing ran: the interpreter runs it.)
+        GenRun::Refused => run_frame_at(ctx, funcs, &proto.ops, &mut regs, 0, handlers, None),
+    };
+    Some(drive_async(ctx, funcs, id, None, p, regs, r).map(|()| p))
 }
 
 /// Whether [`lean_resume`] would take the next resumption of a frame of

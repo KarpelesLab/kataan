@@ -32,6 +32,21 @@ await_toggle!(
     "KATAAN_AWAIT_LEAN"
 );
 
+await_toggle!(
+    /// Whether a call of a hot async function enters its compiled body
+    /// directly (`KATAAN_ASYNC_CALL`).
+    async_call_lean_on,
+    "KATAAN_ASYNC_CALL"
+);
+
+await_toggle!(
+    /// Whether an async function's result promise is made, and fulfilled
+    /// with a primitive while unwatched, without the host
+    /// (`KATAAN_AWAIT_SETTLE`).
+    await_settle_on,
+    "KATAAN_AWAIT_SETTLE"
+);
+
 /// A `PromiseCapability` record: the dependent promise plus its resolve/reject
 /// functions, as produced by `NewPromiseCapability(C)`.
 #[derive(Clone, Copy)]

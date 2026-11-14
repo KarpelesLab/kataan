@@ -3344,7 +3344,9 @@ fn drive_async(
             Ok(FrameExit::Return(v)) => {
                 recycle(ctx, regs);
                 let v = v.unwrap_or(NanBox::undefined());
-                with_host(ctx, |h| h.settle_promise(p, v, true));
+                if !settle_unwatched(ctx, p, v) {
+                    with_host(ctx, |h| h.settle_promise(p, v, true));
+                }
                 return Ok(());
             }
             Err(VmError::Thrown(e)) => {
@@ -3431,6 +3433,45 @@ fn drive_async(
             Err(other) => return Err(other),
         }
     }
+}
+
+/// An async function's result promise `p` resolved with `v` when no one
+/// watches it yet and `v` is a primitive that is not a string: the host's
+/// resolve function would fulfil it with `v` and queue nothing (it has no
+/// reactions), which is done here without the host (`KATAAN_AWAIT_SETTLE`).
+/// `false`, with nothing done, otherwise.
+#[inline]
+fn settle_unwatched(ctx: &mut Ctx, p: NanBox, v: NanBox) -> bool {
+    if v.as_handle().is_some() || !crate::nbexec::promise::await_settle_on() {
+        return false;
+    }
+    let Some(s) = p
+        .as_handle()
+        .and_then(|h| ctx.realm.promise_state_mut(Handle::from_raw(h)))
+    else {
+        return false;
+    };
+    if s.status != crate::cell::PromiseStatus::Pending || !s.reactions.is_empty() {
+        return false;
+    }
+    s.status = crate::cell::PromiseStatus::Fulfilled;
+    s.value = v;
+    true
+}
+
+/// A fresh promise of the intrinsic `%Promise.prototype%`, made without the
+/// host while one realm exists (as the host's `new_promise` makes it).
+#[inline]
+fn vm_new_promise(ctx: &mut Ctx) -> Option<NanBox> {
+    if !ctx.realm.multi_realm
+        && crate::nbexec::promise::await_settle_on()
+        && let Some(proto) = ctx.realm.promise_proto_intrinsic()
+    {
+        let p = ctx.realm.new_promise();
+        ctx.realm.link_promise_proto(p, proto);
+        return Some(NanBox::handle(p.to_raw()));
+    }
+    with_host(ctx, |h| h.new_promise())
 }
 
 /// Resumes the hosted async frame parked in its frame cell `controller` with
@@ -6148,6 +6189,18 @@ fn call_with_inner(
         if let Some(v) = unboxed_fast_call(proto, &args) {
             return Ok(v);
         }
+        // A hot async function: its compiled body entered directly
+        // (`KATAAN_ASYNC_CALL`).
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if proto.is_async
+            && !proto.is_generator
+            && crate::nbexec::promise::async_call_lean_on()
+            && let Some(r) = await_fast::call_lean(
+                ctx, funcs, id, proto, &args, &captures, this_val, new_target,
+            )
+        {
+            return r;
+        }
         let mut regs: Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
         regs.resize(proto.n_regs, NanBox::undefined());
         match proto.rest_from {
@@ -6324,7 +6377,7 @@ fn call_with_inner(
         // A hosted async function: its result is a host promise, and each `await`
         // parks the frame on a controller the host's reactions resume.
         if proto.is_async && !proto.is_generator && ctx.host.is_some() {
-            let p = with_host(ctx, |h| h.new_promise()).ok_or(VmError::Unsupported)?;
+            let p = vm_new_promise(ctx).ok_or(VmError::Unsupported)?;
             // The result promise lives only in this Rust local until the body
             // returns or parks on a controller: root it for the body's
             // safepoints.
