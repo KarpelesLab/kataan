@@ -477,6 +477,10 @@ impl Realm {
     /// Records what [`key_text_probe_acc`](Self::key_text_probe_acc) missed
     /// for `obj[key]` (`own_data_lookup` records an own data slot): a key on
     /// no object of the chain, or one a prototype has as an accessor.
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn key_text_note_acc(&mut self, obj: NanBox, key: NanBox) {
         if getkey_enabled() {
             let _ = self.key_text_note_chain(obj, key, true);
@@ -490,7 +494,12 @@ enum ChainNote {
     Accessor,
 }
 
-/// What [`Realm::key_text_probe_acc`] found.
+/// What [`Realm::key_text_probe_acc`] found. (The values are read by
+/// compiled code's helpers alone.)
+#[cfg_attr(
+    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 pub(crate) enum AccHit {
     /// An own data property's value.
     Value(NanBox),
