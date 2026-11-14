@@ -12759,10 +12759,12 @@ impl JitFunction {
                     }
                     // `a.pop()` on an array without side-table state, with
                     // no call (`arr_push`).
+                    // `a.shift()` likewise, on an array of at most one
+                    // element (`arr_push::X64Assembler::ap_shift`).
                     if let crate::nbvm::Op::CallMethod {
                         key, args: margs, ..
                     } = bytecode.get(op_idx)?
-                        && key == "pop"
+                        && (key == "pop" || (key == "shift" && arr_push::shift_enabled()))
                         && margs.is_empty()
                         && ok(dst)
                         && ok(recv)
@@ -12770,6 +12772,7 @@ impl JitFunction {
                         && !num.in_any_spec(op_idx)
                         && num.result_xmm(op_idx, dst).is_none()
                     {
+                        let shift = key == "shift";
                         let general = a.new_label();
                         let prove = a.new_label();
                         let cl = &helpers.call_layout;
@@ -12780,7 +12783,11 @@ impl JitFunction {
                         a.g_jcc(call_seq::cc::NE, general);
                         a.p_str_proof(si.method_ptr, prove, general);
                         walk_to_slot!(recv, general);
-                        a.ap_pop(&layout, cl.realm, general);
+                        if shift {
+                            a.ap_shift(&layout, cl.realm, general);
+                        } else {
+                            a.ap_pop(&layout, cl.realm, general);
+                        }
                         a.store_rax(disp(dst));
                         a.jmp(done);
                         let cold = a.cold_begin();

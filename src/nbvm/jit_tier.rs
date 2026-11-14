@@ -2100,6 +2100,8 @@ pub(crate) extern "C" fn jit_helper_str_proof(
         super::native_call::prove_array_push(&mut ctx.realm, site);
     } else if site.key() == "pop" {
         super::native_call::prove_array_pop(&mut ctx.realm, site);
+    } else if site.key() == "shift" {
+        super::native_call::prove_array_shift(&mut ctx.realm, site);
     } else {
         super::native_call::prove_char_code_at(&mut ctx.realm, site);
     }

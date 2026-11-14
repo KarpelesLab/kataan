@@ -23,9 +23,30 @@
 //! prototype chain would answer). A removal records no new reference, so
 //! the write barrier has nothing to do; an inline element's vacated slot
 //! is reset to `undefined` (`ArrayElems::inline`'s invariant).
+//!
+//! `shift()` (its site's proof, by `native_call::prove_array_shift`, is of
+//! `shift`): on such an array of at most one element it removes exactly
+//! what `pop()` does — `Realm::array_shift_fast`'s outcome there, a hole
+//! declined likewise. A longer array, whose shift moves elements (which an
+//! incremental marking's scan position would have to cover), is the call's.
 
 use super::call_seq::{cc, r};
 use super::{JitLayout, Label, X64Assembler};
+
+/// Whether a compiled `a.shift()` tries the inline removal before its call
+/// (`KATAAN_JIT_SHIFT=0` turns it off, read once per process).
+#[must_use]
+pub(crate) fn shift_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_SHIFT").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
 
 impl X64Assembler {
     /// For the receiver whose live heap slot is `rcx`: appends the value at
@@ -101,6 +122,20 @@ impl X64Assembler {
     /// `rax`; else to `miss` with nothing done. Clobbers `rdx`, `r8`–`r11`;
     /// preserves `rcx`.
     pub(super) fn ap_pop(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        self.ap_take(l, realm_off, miss, false);
+    }
+
+    /// For the receiver whose live heap slot is `rcx`: `a.shift()` on an
+    /// array of at most one element, where it removes exactly what `pop()`
+    /// does (as the module docs say), leaving it (or `undefined`) in `rax`;
+    /// a longer array (whose shift moves elements) to `miss` with nothing
+    /// done. Clobbers `rdx`, `r8`–`r11`; preserves `rcx`.
+    pub(super) fn ap_shift(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
+        self.ap_take(l, realm_off, miss, true);
+    }
+
+    /// [`ap_pop`](Self::ap_pop), or with `at_most_one` [`ap_shift`](Self::ap_shift).
+    fn ap_take(&mut self, l: &JitLayout, realm_off: i32, miss: Label, at_most_one: bool) {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.off_arr_side, 0);
@@ -118,6 +153,10 @@ impl X64Assembler {
         self.g_cmp_imm(r::R9, i32::from(crate::cell::ARRAY_ON_HEAP));
         self.g_jcc(cc::E, heap);
         // Inline: `r9` elements in the cell.
+        if at_most_one {
+            self.g_cmp_imm(r::R9, 1);
+            self.g_jcc(cc::A, miss);
+        }
         self.g_test(r::R9);
         self.g_jcc(cc::E, empty);
         self.raw(&[0x49, 0xff, 0xc9]); // dec r9
@@ -133,6 +172,10 @@ impl X64Assembler {
         // In the `Vec`: its length, less one.
         self.bind(heap);
         self.g_load(r::R8, r::RCX, l.off_arr_len);
+        if at_most_one {
+            self.g_cmp_imm(r::R8, 1);
+            self.g_jcc(cc::A, miss);
+        }
         self.g_test(r::R8);
         self.g_jcc(cc::E, empty);
         self.raw(&[0x49, 0xff, 0xc8]); // dec r8
