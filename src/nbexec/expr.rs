@@ -2602,50 +2602,16 @@ impl Interp {
                 // `<<`/`>>` as multiply/floor-divide by `2^n` (a negative shift
                 // count reverses direction). BigInts have no unsigned `>>>`.
                 BinaryOp::Shl | BinaryOp::Shr => {
-                    let two = crate::bignum::BigInt::from_i128(2);
-                    let count = y.to_i128().unwrap_or(0);
-                    // `>>` is `<<` by the negated count, and vice versa.
-                    let left = (op == BinaryOp::Shl) == (count >= 0);
-                    let mag = u64::try_from(count.unsigned_abs()).unwrap_or(0);
-                    // A left shift grows the result to ≈ bit_len(x) + mag bits;
-                    // reject an attacker count before building `2^mag`. (A right
-                    // shift only shrinks, so it needs no bound — but `2^mag` is
-                    // still built, so cap the exponent itself.)
-                    let projected = if left {
-                        x.bit_len().saturating_add(mag)
-                    } else {
-                        mag
-                    };
-                    if projected > self.realm.limits.max_bigint_bits {
+                    // `>>` is `<<` by the negated count, and vice versa; a right
+                    // shift by any count past the magnitude is `0` / `-1`. A left
+                    // shift that would grow past the size limit is rejected
+                    // before anything is built.
+                    let max = self.realm.limits.max_bigint_bits;
+                    let Some(r) = x.shift(op == BinaryOp::Shl, &y, max) else {
                         let m = self.new_str("Maximum BigInt size exceeded");
                         return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
-                    }
-                    if let Ok(k) = u32::try_from(mag) {
-                        // Bit shifts, not a multiply/divide by `2^k`.
-                        let r = if left {
-                            x.shl_bits(k)
-                        } else {
-                            x.shr_floor_bits(k)
-                        };
-                        return Ok(Some(val(self, r)));
-                    }
-                    let pow2 = two.pow(mag);
-                    if left {
-                        val(self, x.mul(&pow2))
-                    } else {
-                        match x.divmod(&pow2) {
-                            // Arithmetic shift floors; truncating divmod needs a
-                            // `-1` correction for a negative value with a remainder.
-                            Some((q, rem)) => {
-                                if x.is_negative() && !rem.is_zero() {
-                                    val(self, q.sub(&crate::bignum::BigInt::from_i128(1)))
-                                } else {
-                                    val(self, q)
-                                }
-                            }
-                            None => val(self, crate::bignum::BigInt::zero()),
-                        }
-                    }
+                    };
+                    val(self, r)
                 }
                 BinaryOp::Ushr => {
                     return Err(throw(self, "BigInts have no unsigned right shift"));

@@ -4111,28 +4111,9 @@ impl Realm {
             B::BitAnd => x.bitand(y),
             B::BitOr => x.bitor(y),
             B::BitXor => x.bitxor(y),
-            B::Shl | B::Shr => {
-                let count = y
-                    .to_i128()
-                    .and_then(|c| i64::try_from(c).ok())
-                    .ok_or(true)?;
-                let left = (op == B::Shl) == (count >= 0);
-                let mag = count.unsigned_abs();
-                let projected = if left {
-                    x.bit_len().saturating_add(mag)
-                } else {
-                    mag
-                };
-                if projected > self.limits.max_bigint_bits {
-                    return Err(true);
-                }
-                let k = u32::try_from(mag).map_err(|_| true)?;
-                if left {
-                    x.shl_bits(k)
-                } else {
-                    x.shr_floor_bits(k)
-                }
-            }
+            B::Shl | B::Shr => x
+                .shift(op == B::Shl, y, self.limits.max_bigint_bits)
+                .ok_or(true)?,
             B::Lt => return Ok(NanBox::boolean(x.cmp(y) == Ordering::Less)),
             B::Gt => return Ok(NanBox::boolean(x.cmp(y) == Ordering::Greater)),
             B::LtEq => return Ok(NanBox::boolean(x.cmp(y) != Ordering::Greater)),

@@ -498,6 +498,37 @@ impl BigInt {
         }
     }
 
+    /// `self << count` (`shl`) or `self >> count` (else) — BigInt's
+    /// `BigInt::leftShift` / `signedRightShift`: a negative count shifts the
+    /// other way, a right shift floors (so any count at least the magnitude's
+    /// bit length gives `0` or `-1`, however large the count), and zero
+    /// shifted is zero. `None` when the result would exceed `max_bits` bits
+    /// (a left shift of a non-zero value by a count that large).
+    #[must_use]
+    pub fn shift(&self, shl: bool, count: &Self, max_bits: u64) -> Option<Self> {
+        let left = shl != count.is_negative();
+        // The count's magnitude, `None` beyond any representable shift.
+        let mag = count
+            .to_i128()
+            .and_then(|c| u64::try_from(c.unsigned_abs()).ok());
+        if self.is_zero() {
+            return Some(Self::zero());
+        }
+        let bits = self.bit_len();
+        if !left {
+            return match mag {
+                Some(m) if m < bits => Some(self.shr_floor_bits(u32::try_from(m).ok()?)),
+                _ if self.is_negative() => Some(Self::from_i128(-1)),
+                _ => Some(Self::zero()),
+            };
+        }
+        let m = mag?;
+        if bits.saturating_add(m) > max_bits {
+            return None;
+        }
+        Some(self.shl_bits(u32::try_from(m).ok()?))
+    }
+
     /// The number of bits in the magnitude (0 for zero) — i.e.
     /// `floor(log2(|n|)) + 1`. Used to bound the projected size of a `pow`/shift
     /// result before growing it, so an attacker exponent cannot drive an OOM.
@@ -724,6 +755,39 @@ mod tests {
             };
             assert_eq!(x.shr_floor_bits(k).0, want, "{x} >> {k}");
         }
+    }
+
+    /// Shifts by any count: a right shift past the magnitude floors to `0` /
+    /// `-1` (counts beyond `i64` and `i128` included), a negative count
+    /// reverses the direction, zero stays zero, and only a left shift past
+    /// the size limit fails.
+    #[test]
+    fn shift_counts() {
+        let max = 1u64 << 20;
+        let huge = b("2").pow(200);
+        let s = |x: &str, shl: bool, c: &BigInt| {
+            BigInt::from_str_radix(x, 10)
+                .unwrap()
+                .shift(shl, c, max)
+                .map(|v| v.to_string())
+        };
+        let c = |v: i128| BigInt::from_i128(v);
+        assert_eq!(s("5", false, &c(1)).as_deref(), Some("2"));
+        assert_eq!(s("-5", false, &c(1)).as_deref(), Some("-3"));
+        assert_eq!(s("5", false, &c(10_000_000_000)).as_deref(), Some("0"));
+        assert_eq!(s("-5", false, &c(10_000_000_000)).as_deref(), Some("-1"));
+        assert_eq!(s("5", false, &huge).as_deref(), Some("0"));
+        assert_eq!(s("-5", false, &huge).as_deref(), Some("-1"));
+        assert_eq!(s("5", true, &huge.neg()).as_deref(), Some("0"));
+        assert_eq!(s("-5", true, &c(-10_000_000_000)).as_deref(), Some("-1"));
+        assert_eq!(s("0", true, &huge).as_deref(), Some("0"));
+        assert_eq!(s("5", true, &huge), None);
+        assert_eq!(s("5", true, &c(i128::from(max))), None);
+        assert_eq!(s("5", true, &c(3)).as_deref(), Some("40"));
+        assert_eq!(s("5", false, &c(-3)).as_deref(), Some("40"));
+        assert_eq!(s("-8", false, &c(3)).as_deref(), Some("-1"));
+        assert_eq!(s("-9", false, &c(3)).as_deref(), Some("-2"));
+        assert_eq!(s("-9", false, &c(4)).as_deref(), Some("-1"));
     }
 
     /// The reciprocal two-by-one division agrees with `u128` division.

@@ -1035,6 +1035,18 @@ impl Interp {
             // BigInt and OOM/abort. Cap `bits` to the same size budget as the
             // `**`/`<<` operators before building any power-of-two (MEM-6).
             let max_bigint_bits = self.realm.limits.max_bigint_bits;
+            // A value already within the width is itself, however wide the
+            // width (`BigInt.asUintN(2 ** 53 - 1, 5n)` is `5n`): a non-negative
+            // one of at most `bits` bits, or one of fewer than `bits` bits
+            // for the signed form.
+            let fits = if method == "asIntN" {
+                x.bit_len() < bits
+            } else {
+                !x.is_negative() && x.bit_len() <= bits
+            };
+            if fits {
+                return Ok(Some(NanBox::handle(self.realm.new_bigint(x).to_raw())));
+            }
             if bits > max_bigint_bits {
                 let m = self.new_str("Maximum BigInt size exceeded");
                 return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
