@@ -577,6 +577,41 @@ pub(super) fn is_native_site(cache: &PropertyCache) -> bool {
         .is_some_and(|s| !matches!(s.op, FastOp::None))
 }
 
+/// Whether function `proto`'s call op at `pc` was never seen calling a
+/// JavaScript function: neither the interpreter's cache of the site (when
+/// it has one) nor its compiled body's call site (when it has one) names a
+/// callee (`CalleeHint::None`: a built-in it served, such as `m.has(k)` or
+/// `a.push(x)`, or a call not made yet, such as a `throw new Error(...)`).
+/// Such a call pushes no activation (`crate::jit::inline` inlines a
+/// looping callee whose calls are all such). Only a guess at what later
+/// calls do: any call op inlined is compiled with its full slow path.
+/// `false` when neither knows anything (a copy of the function, whose tier
+/// state starts empty).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn no_script_callee(proto: &FnProto, pc: usize) -> bool {
+    use crate::ic::CalleeHint;
+    let mut known = false;
+    if let Ok(t) = proto.tier.0.try_borrow()
+        && let Some(c) = t.ic.get(pc)
+    {
+        if crate::jit::poly::hint_of(c) != CalleeHint::None {
+            return false;
+        }
+        known = true;
+    }
+    #[cfg(feature = "jit")]
+    if let Some(Some(j)) = proto.tier.jit()
+        && j.is_generic()
+        && let Some(h) = j.call_hints().get(pc)
+    {
+        if *h != CalleeHint::None {
+            return false;
+        }
+        known = true;
+    }
+    known
+}
+
 /// `ToIntegerOrInfinity(v)` when it runs no code: `Some(None)` for
 /// `undefined` (left to the caller, whose default differs per method),
 /// `Some(Some(n))` for a Number, `None` for anything else.

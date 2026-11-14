@@ -818,6 +818,79 @@ fn calls_only_inlined(p: &FnProto) -> bool {
     })
 }
 
+/// Whether `op` makes a call (of a value, a method, a constructor or
+/// `super`).
+fn is_call(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::CallMethod { .. }
+            | Op::CallValue { .. }
+            | Op::CallWithMethod { .. }
+            | Op::CallKey { .. }
+            | Op::Construct { .. }
+            | Op::SuperCallArgs { .. }
+            | Op::SuperCall { .. }
+    )
+}
+
+/// Whether a looping callee `p` (a callee body, maybe with calls of its
+/// own spliced in) pushes its pending activation on no iteration of its
+/// loops as its calls were seen to go: every call inside a loop (a
+/// back-edge's span) is one [`calls_only_inlined`] takes, or one never
+/// seen calling a JavaScript function (`native_call::no_script_callee`: a
+/// built-in its site serves, `m.has(k)`, `a.push(x)`, ...; or one not made
+/// yet). A call outside every loop pushes the activation at most once per
+/// call of the body, as a body without loops may (`return m.get(k)` after
+/// a lookup loop's `m.has(k)`, a `throw new Error(...)` after the loop, a
+/// heap's `h.push(x)` before its sift-up loop). The guess only decides
+/// where inlining pays: an inlined call is compiled with its full slow
+/// path either way. `KATAAN_JIT_INLLOOP=0` keeps [`calls_only_inlined`]
+/// (read once per process).
+fn loop_calls_lean(p: &FnProto) -> bool {
+    if !inl_loop_enabled() {
+        return calls_only_inlined(p);
+    }
+    let fallbacks: Vec<usize> = p
+        .ops
+        .iter()
+        .filter_map(|o| match o {
+            Op::InlineGuard { call, .. } => Some(*call),
+            _ => None,
+        })
+        .collect();
+    let spans: Vec<(usize, usize)> = p
+        .ops
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, o)| match o {
+            Op::Jump { target } if *target <= pc => Some((*target, pc)),
+            _ => None,
+        })
+        .collect();
+    p.ops.iter().enumerate().all(|(pc, o)| {
+        !is_call(o)
+            || !spans.iter().any(|&(lo, hi)| (lo..=hi).contains(&pc))
+            || super::inline_math(o).is_some()
+            || fallbacks.contains(&pc)
+            || crate::nbvm::native_call::no_script_callee(p, pc)
+    })
+}
+
+/// Whether a looping callee may make script-free calls in its loops and any
+/// call outside them ([`loop_calls_lean`]; `KATAAN_JIT_INLLOOP=0` turns it
+/// off, read once per process).
+#[cfg(feature = "std")]
+fn inl_loop_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INLLOOP").is_none_or(|v| v != "0"))
+}
+
+/// [`inl_loop_enabled`] without `std`: on.
+#[cfg(not(feature = "std"))]
+const fn inl_loop_enabled() -> bool {
+    true
+}
+
 /// Whether every `super(…)` in `p` (a callee body, maybe with calls of its
 /// own spliced in) is the fallback of one of its inlined calls' guards.
 fn super_inlined(p: &FnProto) -> bool {
@@ -1279,8 +1352,11 @@ pub fn expand<'a>(
             // nothing but through its own inlined calls' guards (an inner
             // call's activation pushes cost about what the call saved). So
             // does one that loops: its calls would push the activation on
-            // every iteration.
-            if (poly || loops(&c.proto)) && !calls_only_inlined(&c.proto) {
+            // every iteration — but for the calls outside its loops and
+            // those a built-in serves without one (`loop_calls_lean`).
+            if (poly && !calls_only_inlined(&c.proto))
+                || (loops(&c.proto) && !loop_calls_lean(&c.proto))
+            {
                 continue;
             }
             // A derived constructor only with its own `super(…)` inlined
