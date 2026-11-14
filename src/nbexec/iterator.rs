@@ -3473,6 +3473,53 @@ fn buffer_iter_step(realm: &mut Realm, h: Handle, buf: Handle) -> (NanBox, bool)
 /// bytecode VM's `IteratorStep` without the `{ value, done }` object:
 /// `Some(Some(value))`, `Some(None)` once done, or `None` when the step needs
 /// the interpreter (any other kind of iterator).
+/// [`Interp::live_typed_iter_next`]'s step of the keys or values typed-array
+/// iterator `h` over `ta`, on the realm alone (no result object): `Some(None)`
+/// once done. `None` -- leaving the step to the host -- for an entries
+/// iterator (its pair is the host's to build), a detached or out-of-bounds
+/// view (the host's TypeError), or with `KATAAN_TYPED_ITER_FAST=0`.
+fn typed_iter_step(realm: &mut Realm, h: Handle, ta: Handle) -> Option<Option<NanBox>> {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("KATAAN_TYPED_ITER_FAST").is_none_or(|v| v != "0"))
+        {
+            return None;
+        }
+    }
+    if realm.get_property(h, GEN_DONE).is_some() {
+        return Some(None);
+    }
+    let kind = realm
+        .get_property(h, GEN_KIND)
+        .and_then(|n| n.as_number())
+        .unwrap_or(0.0) as u8;
+    if kind == 2 {
+        return None;
+    }
+    let detached = realm
+        .typed_array_object(ta)
+        .is_some_and(|b| realm.get_property(b, ARRAY_BUFFER_DETACHED).is_some());
+    if detached || realm.typed_array_out_of_bounds(ta) {
+        return None;
+    }
+    let idx = realm
+        .get_property(h, GEN_IDX)
+        .and_then(|n| n.as_number())
+        .unwrap_or(0.0) as usize;
+    let len = realm.typed_len(ta).unwrap_or(0);
+    if idx >= len {
+        realm.set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
+        return Some(None);
+    }
+    realm.set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64));
+    Some(Some(if kind == 0 {
+        NanBox::number(idx as f64)
+    } else {
+        realm.typed_get(ta, idx).unwrap_or_else(NanBox::undefined)
+    }))
+}
+
 pub(crate) fn realm_builtin_iter_step(
     realm: &mut Realm,
     next: NanBox,
@@ -3502,10 +3549,14 @@ pub(crate) fn realm_builtin_iter_step(
         }
         return Some(step);
     }
-    if realm.get_property(h, GEN_TA).is_some()
-        || realm.get_property(h, GEN_ARR).is_some()
-        || realm.get_property(h, RSI_MATCHER).is_some()
+    if let Some(ta) = realm
+        .get_property(h, GEN_TA)
+        .and_then(|v| v.as_handle())
+        .map(Handle::from_raw)
     {
+        return typed_iter_step(realm, h, ta);
+    }
+    if realm.get_property(h, GEN_ARR).is_some() || realm.get_property(h, RSI_MATCHER).is_some() {
         return None;
     }
     if let Some(s) = realm.get_property(h, GEN_STR) {
