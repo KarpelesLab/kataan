@@ -1733,6 +1733,21 @@ impl Cell {
     }
 }
 
+/// Whether the sweep drops a BigInt cell's value in place (see
+/// `Trace::release_in` for [`Cell`]; `KATAAN_BIGINT_RELEASE=0` turns it
+/// off, read once per process).
+fn bigint_release_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_BIGINT_RELEASE").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// The full drop of a swept cell of one of the less common kinds — out of
 /// the sweep loop.
 #[cold]
@@ -1840,6 +1855,14 @@ impl Trace for Cell {
                     drop(elems);
                 }
                 // Elements inline (or none, or just moved out): nothing owned.
+                core::mem::forget(place.take());
+                return;
+            }
+            // A BigInt (often a small one, owning nothing): its value
+            // dropped where it lies, not the whole cell moved out of line
+            // (`KATAAN_BIGINT_RELEASE=0` takes the full drop glue).
+            Some(Cell::BigInt(b)) if bigint_release_on() => {
+                drop(core::mem::replace(b, crate::bignum::BigInt::zero()));
                 core::mem::forget(place.take());
                 return;
             }
