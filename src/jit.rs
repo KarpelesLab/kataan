@@ -6369,6 +6369,10 @@ pub struct X64Assembler {
     /// ops' code, which is no cold region but runs as rarely): its calls'
     /// after-sequences may be shared stubs too
     /// ([`post_call_outlined`](Self::post_call_outlined)).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) ool_tail: bool,
     /// The shared lookup subroutines out-of-line code calls
     /// ([`props::LookupSub`]), placed by [`finish`](Self::finish).
@@ -6438,6 +6442,10 @@ struct ColdChunk {
 /// ([`X64Assembler::dbg_mark`]; an `x-`/`o-`/`n-` one names an out-of-line
 /// section, any other a part of it) and whether a cold region holds them.
 /// Each compile reports its table to stderr as `[size]` lines.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 #[derive(Default)]
 pub(crate) struct SizeMap {
     bytes: alloc::collections::BTreeMap<
@@ -6457,6 +6465,10 @@ pub(crate) struct SizeMap {
     cut: usize,
 }
 
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 impl SizeMap {
     /// A map when `KATAAN_JIT_SIZEMAP` is set.
     pub(crate) fn new_if_on() -> Option<alloc::boxed::Box<Self>> {
@@ -7185,6 +7197,10 @@ impl X64Assembler {
     }
 
     /// [`SizeMap`]: the code from here on is op `name`'s.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn size_op(&mut self, name: &str) {
         self.size_flush();
         if let Some(m) = self.size_map.as_mut() {
