@@ -179,6 +179,18 @@ fn spec_poly_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SPECPOLY").is_none_or(|v| v != "0"))
 }
 
+/// Whether bytecode op `bc` is an array method call the generic tier may
+/// make in line (`arr_push`): `a.push(x)`, `a.pop()`, `a.shift()` — a
+/// receiver-cache site of an array way when `KATAAN_JIT_APWAY` is on (read
+/// once per process).
+pub(super) fn ap_site(bc: Option<&Op>) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_APWAY").is_none_or(|v| v != "0"))
+        && matches!(bc, Some(Op::CallMethod { key, args, .. })
+            if (key == "push" && args.len() == 1)
+                || ((key == "pop" || key == "shift") && args.is_empty()))
+}
+
 /// Whether `op` is a fill-only receiver-cache site (a strict equality's,
 /// see [`plan`]): it never compares, and fills only for a later site.
 fn fill_only_op(op: &GenericOp) -> bool {
@@ -1030,6 +1042,13 @@ pub(super) fn plan(
             }
             _ => None,
         },
+        // An inline `a.push(x)`, `a.pop()` or `a.shift()` (`arr_push`)
+        // walks its array: through an array way (`KATAAN_JIT_APWAY`), as an
+        // element op does. (Not in a speculative loop, whose fast version's
+        // push proves its receiver otherwise.)
+        GenericOp::CallMethod { recv, .. } if !in_spec(i) && ap_site(bytecode.get(i)) => {
+            Some((recv, Family::Arr))
+        }
         // A strict equality of two distinct heap values walks its first
         // operand (`X64Assembler::p_strict_eq_identity`): an ordinary
         // object fills its way there (`w !== v && w.dom`), on that path
@@ -1048,6 +1067,19 @@ pub(super) fn plan(
         _ => site_recv(op, bytecode.get(i)),
     };
     let target = branch_targets(ops, osr_entries, catch_targets);
+    // Whether op `i` lies in an innermost loop none of whose ops makes a
+    // call on its fast path (an inline array method, a math built-in or a
+    // check aside).
+    let inner_loops = innermost_loops(ops);
+    let call_free = |i: usize| {
+        inner_loops[i].is_some_and(|(h, e)| {
+            (h..=e).all(|j| {
+                !ends_knowledge(&ops[j])
+                    || usually_inline(bytecode, j)
+                    || (matches!(ops[j], GenericOp::CallMethod { .. }) && ap_site(bytecode.get(j)))
+            })
+        })
+    };
     // Value ids: registers holding the same value (by `Move`) share one.
     let mut next_id = 0u32;
     let mut ids: Vec<(u16, u32)> = Vec::new();
@@ -1228,7 +1260,13 @@ pub(super) fn plan(
                 || fam == Family::Cell
                 || poly_guard
                 || fill_only;
-            if fill_only && live.iter().any(|e| e.0 == id) {
+            // (An inline array method's way pays only when it usually
+            // holds the array: walked earlier with no call since, or kept
+            // from the last iteration of a loop that makes no call.)
+            let ap = matches!(op, GenericOp::CallMethod { .. });
+            if (fill_only && live.iter().any(|e| e.0 == id))
+                || (ap && !live.iter().any(|e| e.0 == id) && !call_free(i))
+            {
                 no_site[i] = true;
             } else if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
@@ -1563,7 +1601,18 @@ pub(super) fn plan(
         seen.len().min(cap)
     };
     let obj_ways = uses(Family::Obj, MAX_OBJ_WAYS);
-    let arr_ways = uses(Family::Arr, MAX_ARR_WAYS);
+    // (A body with inline array pushes or pops: two array ways, one for
+    // the array they work on and one for an array its loop iterates.)
+    let arr_cap = if (0..n).any(|i| {
+        matches!(ops[i], GenericOp::CallMethod { .. })
+            && ap_site(bytecode.get(i))
+            && (fill[i] || check[i])
+    }) {
+        MAX_ARR_WAYS + 1
+    } else {
+        MAX_ARR_WAYS
+    };
+    let arr_ways = uses(Family::Arr, arr_cap);
     let cell_ways = uses(Family::Cell, MAX_CELL_WAYS);
     let mut way_of: Vec<(u32, usize)> = Vec::new();
     let mut used = vec![0usize; obj_ways + arr_ways + cell_ways];

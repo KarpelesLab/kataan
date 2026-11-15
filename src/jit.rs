@@ -13847,7 +13847,12 @@ impl JitFunction {
                         if push_bail.is_some() {
                             num.push_held_checks(&mut a, op_idx, recv, general);
                         }
-                        walk_to_slot!(recv, general);
+                        // (Through its array way, `recv_cache::ap_site`.)
+                        if rc.sites[op_idx].is_some() {
+                            recv_slot!(op_idx, recv, general, recv_cache::Family::Arr);
+                        } else {
+                            walk_to_slot!(recv, general);
+                        }
                         a.ap_push(&layout, cl.realm, disp(x), general, proof.is_some());
                         // (The new length, unless nothing reads it.)
                         let dead = match push_bail {
@@ -13902,7 +13907,12 @@ impl JitFunction {
                         let cl = &helpers.call_layout;
                         let proof = ap_slot(op_idx);
                         ap_proof_begin!(proof, si.method_ptr, general, prove);
-                        walk_to_slot!(recv, general);
+                        // (Through its array way, `recv_cache::ap_site`.)
+                        if rc.sites[op_idx].is_some() {
+                            recv_slot!(op_idx, recv, general, recv_cache::Family::Arr);
+                        } else {
+                            walk_to_slot!(recv, general);
+                        }
                         if shift {
                             a.ap_shift(&layout, cl.realm, general, proof.is_some());
                         } else {
