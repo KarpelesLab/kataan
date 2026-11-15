@@ -76,6 +76,8 @@ mod recv_cache;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod sink;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod switch_tree;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod tierup;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod typed;
@@ -15928,6 +15930,27 @@ impl JitFunction {
                             a.call_rax_pure();
                             a.bind(done);
                             a.store_rax(disp(*dst));
+                            // The case pick that follows, by a compare tree
+                            // (`switch_tree`), outside promoted regions.
+                            if let Some(ch) = switch_tree::enabled()
+                                .then(|| switch_tree::pick_chain(bytecode, op_idx))
+                                .flatten()
+                                .filter(|ch| (op_idx..=ch.default).all(|j| !num.in_any_region(j)))
+                            {
+                                let jump_label = |j: usize| match bytecode.get(j) {
+                                    Some(crate::nbvm::Op::Jump { target }) => {
+                                        num.branch_label(&labels, j, *target)
+                                    }
+                                    _ => None,
+                                };
+                                let keys = ch
+                                    .picks
+                                    .iter()
+                                    .map(|&(bits, j)| jump_label(j).map(|l| (bits, l)))
+                                    .collect::<Option<Vec<_>>>()?;
+                                let miss = jump_label(ch.default)?;
+                                a.pick_tree(&keys, miss);
+                            }
                         }
                         // A template's substitution: a string as it is, a
                         // primitive's text from its own helper, not the one-op
