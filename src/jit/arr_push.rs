@@ -117,6 +117,19 @@ impl X64Assembler {
         self.bind(past);
     }
 
+    /// `cmp rax, <the hole>`: against the code's constant word (with
+    /// `KATAAN_JIT_ITERCONST`, as the array iteration steps), else through
+    /// `r11`.
+    fn ap_cmp_hole(&mut self) {
+        let hole = crate::nanbox::NanBox::hole().to_bits();
+        if super::iter_const_enabled() {
+            self.cmp_rax_const(hole);
+        } else {
+            self.g_movabs(r::R11, hole);
+            self.g_cmp(r::RAX, r::R11);
+        }
+    }
+
     /// For the receiver whose live heap slot is `rcx`: removes its last
     /// element as the module docs say, leaving it (or `undefined`) in
     /// `rax`; else to `miss` with nothing done. Clobbers `rdx`, `r8`–`r11`;
@@ -161,8 +174,7 @@ impl X64Assembler {
         self.g_jcc(cc::E, empty);
         self.raw(&[0x49, 0xff, 0xc9]); // dec r9
         self.p_load_index8(r::RAX, r::RCX, r::R9, l.off_arr_inline);
-        self.g_movabs(r::R11, crate::nanbox::NanBox::hole().to_bits());
-        self.g_cmp(r::RAX, r::R11);
+        self.ap_cmp_hole();
         self.g_jcc(cc::E, miss);
         self.p_store_index8(r::RCX, r::R9, l.off_arr_inline, r::RDX);
         // dec byte [rcx + disp32]
@@ -181,8 +193,7 @@ impl X64Assembler {
         self.raw(&[0x49, 0xff, 0xc8]); // dec r8
         self.g_load(r::R11, r::RCX, l.off_arr_ptr);
         self.p_load_index8(r::RAX, r::R11, r::R8, 0);
-        self.g_movabs(r::R11, crate::nanbox::NanBox::hole().to_bits());
-        self.g_cmp(r::RAX, r::R11);
+        self.ap_cmp_hole();
         self.g_jcc(cc::E, miss);
         self.g_store(r::RCX, l.off_arr_len, r::R8);
         self.jmp(out);

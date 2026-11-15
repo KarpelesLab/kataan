@@ -3651,14 +3651,30 @@ fn iter_shadow_enabled() -> bool {
 
 /// Whether a by-index array iteration step tests `done` and a hole against
 /// the code's constant words (`cmp rax, [rip + c]`, one instruction) rather
-/// than through a scratch register (`KATAAN_JIT_ITERCONST=0` turns it off,
-/// read once per process).
+/// than through a scratch register, as does an inline `a.pop()` its element
+/// (`KATAAN_JIT_ITERCONST=0` turns it off, read once per process).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn iter_const_enabled() -> bool {
     #[cfg(feature = "std")]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("KATAAN_JIT_ITERCONST").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether an inline `a.push(x)` whose result nothing reads (the register
+/// dead past the op, by the body's liveness) skips making the new length's
+/// Number (`KATAAN_JIT_PUSHDEAD=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn push_dead_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_PUSHDEAD").map_or(true, |v| v != "0"))
     }
     #[cfg(not(feature = "std"))]
     {
@@ -9599,6 +9615,35 @@ impl JitFunction {
         // The `g.next(v)` sites whose iterator results never escape: one
         // reused result object each (`iter_reuse`).
         let iter_noescape = iter_reuse::plan(bytecode, n_regs, &catch_targets);
+        // The `a.push(x)` sites whose result (the new length) nothing reads:
+        // every path from the op writes the register before reading it, so
+        // the inline append need not make the Number (`KATAAN_JIT_PUSHDEAD`).
+        let push_dead: Vec<bool> = {
+            let is_push = |op: &crate::nbvm::Op| {
+                matches!(op, crate::nbvm::Op::CallMethod { key, args, .. }
+                    if key == "push" && args.len() == 1)
+            };
+            if push_dead_enabled() && bytecode.iter().any(is_push) {
+                match numeric::liveness(bytecode, n_regs, &catch_targets) {
+                    Some((words, l)) => bytecode
+                        .iter()
+                        .enumerate()
+                        .map(|(pc, op)| match op {
+                            crate::nbvm::Op::CallMethod { dst, .. } if is_push(op) => {
+                                (*dst as usize) < n_regs
+                                    && pc + 1 < bytecode.len()
+                                    && l.get((pc + 1) * words + *dst as usize / 64)
+                                        .is_some_and(|w| w & (1u64 << (dst % 64)) == 0)
+                            }
+                            _ => false,
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        };
         // A compiled `for-in`'s liveness check `cur in obj` branches on its
         // result itself (`forin`): the `JumpIfFalse` right after it, which
         // nothing else reaches, is emitted as nothing.
@@ -12865,7 +12910,11 @@ impl JitFunction {
                         walk_to_slot!(recv, general);
                         a.ap_push(&layout, cl.realm, disp(x), general);
                         // (The new length, unless nothing reads it.)
-                        if push_bail.is_none() || !num.dead_after(op_idx, dst) {
+                        let dead = match push_bail {
+                            Some(_) => num.dead_after(op_idx, dst),
+                            None => push_dead.get(op_idx).copied().unwrap_or(false),
+                        };
+                        if !dead {
                             a.g_mov(call_seq::r::RAX, call_seq::r::R8);
                             a.cvtsi2sd_xmm0_rax();
                             numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
