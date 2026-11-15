@@ -6840,6 +6840,44 @@ impl NumGen {
         }
     }
 
+    /// The fused length test (`KATAAN_JIT_LENBRANCH`): for the
+    /// `JumpIfFalse { cond, target }` at `pc` right after an `ArrayLen` into
+    /// `cond` whose fast path left the length's bits in `rax` (zero exactly
+    /// when the length is falsy), emits the branch to `target` as the test
+    /// would take it from its place (leaving a region through its exit
+    /// stub) and returns the label of the op after the test, where a truthy
+    /// length goes on — or, when the test is not one this can stand in for
+    /// (a speculative or integer version, `cond` promoted, the op after it
+    /// in another region), emits nothing and returns `None`.
+    pub(super) fn len_branch(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        pc: usize,
+        (cond, target): (u16, usize),
+    ) -> Option<Label> {
+        if self.copy || self.imode.is_some() || pc == 0 || target <= pc {
+            return None;
+        }
+        let reg = self.region_at(pc);
+        if reg != self.region_at(pc - 1) || reg != self.region_at(pc + 1) {
+            return None;
+        }
+        if let Some(ri) = reg {
+            let rg = &self.regions[ri];
+            if rg.spec.is_some() || rg.int.is_some() || rg.slots.iter().any(|s| s.reg == cond) {
+                return None;
+            }
+        }
+        let next = *labels.get(pc + 1)?;
+        let saved = self.cur_pc;
+        self.cur_pc = pc;
+        a.test_rax_rax();
+        self.jcc_to(a, labels, reg, CC_E, target);
+        self.cur_pc = saved;
+        Some(next)
+    }
+
     /// Where a branch from `from` (in region `reg`) to bytecode pc `target`
     /// lands without leaving the region, or `None` if it leaves it.
     fn in_region_target(

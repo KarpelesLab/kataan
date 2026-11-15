@@ -3649,6 +3649,23 @@ fn iter_shadow_enabled() -> bool {
     }
 }
 
+/// Whether an `ArrayLen` whose result only a `JumpIfFalse` right after it
+/// tests (`while (q.length)`) branches on the length its fast path read,
+/// skipping the test's general truthiness (`KATAAN_JIT_LENBRANCH=0` turns
+/// it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn len_branch_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_LENBRANCH").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
 /// code calls for `+`, property get, and property set. Passed to
 /// [`JitProto::compile_generic`].
@@ -17244,7 +17261,29 @@ impl JitFunction {
                         a.cvtsi2sd_xmm0_rax();
                         numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
                         a.store_rax(disp(dst));
-                        a.jmp(done);
+                        // `while (q.length)`: the test right after, on the
+                        // length just read (a non-negative integer: falsy
+                        // exactly when its bits are `+0`'s, zero), straight
+                        // to either of its successors; the slow paths reach
+                        // the test as usual.
+                        let fusable = pass == numeric::PASS_MAIN
+                            && len_branch_enabled()
+                            && bail.is_none()
+                            && sched.get(si + 1) == Some(&(op_idx + 1, pass))
+                            && !not_tested.get(op_idx + 1).copied().unwrap_or(true)
+                            && !fused_test.get(op_idx + 1).copied().unwrap_or(true)
+                            && sink_x.is_none_or(|x| {
+                                !x.plan.exit_after[op_idx] && !x.plan.exit_before[op_idx + 1]
+                            });
+                        let past = match ops.get(op_idx + 1) {
+                            Some(&GenericOp::JumpIfFalse { cond, target })
+                                if fusable && cond == dst && target <= ops.len() =>
+                            {
+                                num.len_branch(&mut a, &labels, op_idx + 1, (cond, target))
+                            }
+                            _ => None,
+                        };
+                        a.jmp(past.unwrap_or(done));
                     }
                     a.bind(helper);
                     if typed {
