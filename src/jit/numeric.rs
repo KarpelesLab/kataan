@@ -1161,6 +1161,10 @@ struct Stub {
     /// the ones the stubs are emitted with): the label past the test, and
     /// the target's label when it is in the region.
     ibranch: Option<(Label, Option<Label>)>,
+    /// With `branch`: nothing reads `cond` past the test (the fused
+    /// comparison stores no result, [`Fused::store`]), so a stub that
+    /// decides the comparison itself may branch without materializing it.
+    nostore: bool,
     /// A [`StubKind::Bail`] of an integer version's op whose result was no
     /// int32: the bit of the region's overflow-bail mask it sets
     /// ([`NumGen::demote_sites`]).
@@ -4241,6 +4245,7 @@ impl NumGen {
             },
             branch: None,
             ibranch: None,
+            nostore: false,
             demote: None,
             int: self.imode.is_some(),
             copy: self.copy,
@@ -5719,6 +5724,7 @@ impl NumGen {
             kind,
             branch: None,
             ibranch: None,
+            nostore: false,
             demote: None,
             int: self.imode.is_some(),
             copy: self.copy,
@@ -6607,6 +6613,7 @@ impl NumGen {
                     if !jif_reachable && let Some(st) = self.stubs.last_mut() {
                         st.branch = Some((dst, target, f.neg));
                         st.ibranch = ibranch;
+                        st.nostore = !store;
                     }
                 }
                 if !jif_reachable {
@@ -7054,6 +7061,36 @@ impl NumGen {
         }
     }
 
+    /// For a fused comparison's stub `s` (its `branch`, `(target, neg)`)
+    /// that found the comparison's answer `yes` itself: on as the test
+    /// would go — past it for a true condition, to `target` for a false
+    /// one (a `Not` fused in, `neg`, swaps them), as the stub's own branch
+    /// after the boolean goes (see [`emit_strict_eq_stub`](Self::emit_strict_eq_stub)).
+    fn stub_answer(
+        &self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        s: &Stub,
+        (target, neg): (usize, bool),
+        yes: bool,
+    ) {
+        if yes != neg
+            && let Some(&past) = labels.get(s.pc + 2 + usize::from(neg))
+        {
+            a.jmp(past);
+            return;
+        }
+        match self.in_region_target(labels, s.region, target) {
+            Some(l) => a.jmp(l),
+            None => {
+                self.flush(a, s.region);
+                if let Some(&l) = labels.get(target) {
+                    a.jmp(l);
+                }
+            }
+        }
+    }
+
     /// The code of a [`StubKind::StrictEq`] stub `s`: the words decide,
     /// unless both are distinct heap values (Strings and BigInts compare by
     /// contents). Equal words are a non-Number's `true`, or a NaN's `false`
@@ -7087,16 +7124,28 @@ impl NumGen {
         a.g_shr_imm(r::RCX, 50);
         a.g_cmp_imm(r::RCX, HANDLE_TOP);
         a.g_jcc(cc::E, handles);
+        // A fused test whose condition nothing reads after it, in no
+        // integer version: each answer branches as the test would, with no
+        // boolean made (`KATAAN_JIT_EQDIRECT`).
+        let direct = s.nostore && s.ibranch.is_none() && !s.int && eq_direct_enabled();
         a.bind(no);
-        a.movabs_rax(self.tag_false as i64);
-        a.jmp(have);
+        if let (true, Some((_, target, neg))) = (direct, s.branch) {
+            self.stub_answer(a, labels, s, (target, neg), false);
+        } else {
+            a.movabs_rax(self.tag_false as i64);
+            a.jmp(have);
+        }
         a.bind(same);
         a.movabs_r11(QNAN as i64);
         a.and_rax_r11();
         a.cmp_rax_r11();
         a.jcc(CC_NE, no);
-        a.movabs_rax(self.tag_true as i64);
-        a.jmp(have);
+        if let (true, Some((_, target, neg))) = (direct, s.branch) {
+            self.stub_answer(a, labels, s, (target, neg), true);
+        } else {
+            a.movabs_rax(self.tag_true as i64);
+            a.jmp(have);
+        }
         a.bind(handles);
         // (An integer version's int GPRs `r8` and `r10`, which the walk
         // may clobber, kept on the stack meanwhile: no call is made.)
@@ -7586,6 +7635,14 @@ impl NumGen {
 fn bit_test_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_BITTEST").is_none_or(|v| v != "0"))
+}
+
+/// Whether a fused `===` test's slow stub that decides the comparison
+/// itself branches straight on its answer when nothing reads the boolean
+/// (`KATAAN_JIT_EQDIRECT=0` turns it off, read once per process).
+fn eq_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_EQDIRECT").is_none_or(|v| v != "0"))
 }
 
 /// A comparison's fusion into the test after it ([`NumGen::fusable`]): the
