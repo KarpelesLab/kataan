@@ -6345,6 +6345,13 @@ impl NumGen {
         ok.then_some(dst)
     }
 
+    /// Whether register `r` holds, on entry to op `pc`, the immediate (no
+    /// Number, no heap value: `undefined`, `null`, a boolean, ...) the
+    /// `LoadConst` right before set (`pc` no branch target).
+    pub(super) fn imm_const_at(&self, pc: usize, r: u16) -> bool {
+        self.const_imm_bits_at(pc, r).is_some()
+    }
+
     fn const_imm_bits_at(&self, pc: usize, r: u16) -> Option<u64> {
         if pc == 0 || self.is_target.get(pc).copied().unwrap_or(true) {
             return None;

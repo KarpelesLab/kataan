@@ -3682,6 +3682,22 @@ fn push_dead_enabled() -> bool {
     }
 }
 
+/// Whether an inline property store of an immediate the `LoadConst` right
+/// before it set (`o.flag = false`) skips the write barrier's test of the
+/// value (`KATAAN_JIT_SETIMM=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn set_imm_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_SETIMM").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether an inline `Math.imul` / `Math.clz32` skips its arguments' Number
 /// tests, which their truncation's "indefinite" check covers
 /// (`KATAAN_JIT_INTMATHTAG=0` turns it off, read once per process).
@@ -16292,7 +16308,13 @@ impl JitFunction {
                             a.jne(cached);
                         }
                         pproof_end!(proof);
-                        if !val_num {
+                        // (A value the `LoadConst` just before set to an
+                        // immediate — `undefined`, `null`, a boolean — needs
+                        // nothing from the barrier, nor, in a slot of no
+                        // Number-only record, anything else:
+                        // `KATAAN_JIT_SETIMM`.)
+                        let val_imm = !b.num && set_imm_enabled() && num.imm_const_at(op_idx, val);
+                        if !val_num && !val_imm {
                             a.load_rax(disp(val));
                             if b.num {
                                 // (The slot's record of Number-only values,
