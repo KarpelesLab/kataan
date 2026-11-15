@@ -76,6 +76,23 @@ pub(super) fn direct_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GDIRECT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a promoted loop that is no speculative one keeps its validated
+/// global binding addresses across the body's activations too, its reads
+/// and its writes that mirror nothing onto the global object
+/// (`numeric::NumGen::refresh_globals`); `KATAAN_JIT_GREGION=0` turns it off
+/// (read once per process).
+///
+/// Such a loop validated each of its global ops once per activation, on
+/// its first use (the stub of `numeric::StubKind::GlobalRef`): a small
+/// function called many times whose loop reads a few globals — each
+/// inlined callee's reads its own ops — paid a helper call per global op per
+/// call. Its entry now takes the entries another activation validated
+/// under the current epoch, and each validation records its address.
+pub(super) fn region_persist() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GREGION").is_none_or(|v| v != "0"))
+}
+
 /// The fewest persisted slots a body reads directly (see
 /// [`direct_enabled`]): with fewer, the copies saved at the first global
 /// access of each activation do not pay for the extra load of every read
@@ -280,6 +297,27 @@ impl X64Assembler {
         self.bind(miss);
     }
 
+    /// [`gp_restore`](Self::gp_restore) through `rax` alone (its epoch,
+    /// then each entry): no other register is clobbered but `r11`.
+    pub(super) fn gp_restore_rax(
+        &mut self,
+        persist: u64,
+        noted: usize,
+        entries: &[(usize, i32)],
+        hit: Label,
+    ) {
+        let miss = self.new_label();
+        self.g_movabs(r::R11, persist);
+        self.g_cmp_mem(r::RAX, r::R11, off(noted));
+        self.g_jcc(super::call_seq::cc::NE, miss);
+        for &(w, d) in entries {
+            self.g_load(r::RAX, r::R11, off(w));
+            self.g_store(r::RBP, d, r::RAX);
+        }
+        self.jmp(hit);
+        self.bind(miss);
+    }
+
     /// The global binding cache's reset when the epoch changed, with `rax`
     /// the current epoch: when the persistent group noted at word `noted`
     /// was validated under it, copies its entries (`(word, frame
@@ -324,13 +362,28 @@ impl X64Assembler {
         word: usize,
         frame_epoch: i32,
     ) {
+        self.gp_save_one_as(persist, noted, group, word, frame_epoch, -1);
+    }
+
+    /// [`gp_save_one`](Self::gp_save_one), a group's emptied words holding
+    /// `empty` (`0` for a promoted loop's, whose frame slots take `0` as
+    /// "not validated": see [`region_persist`]).
+    pub(super) fn gp_save_one_as(
+        &mut self,
+        persist: u64,
+        noted: usize,
+        group: &[usize],
+        word: usize,
+        frame_epoch: i32,
+        empty: i32,
+    ) {
         let same = self.new_label();
         self.g_load(r::RCX, r::RBP, frame_epoch);
         self.g_movabs(r::R11, persist);
         self.g_cmp_mem(r::RCX, r::R11, off(noted));
         self.g_jcc(super::call_seq::cc::E, same);
         for &w in group {
-            self.g_store_imm32(r::R11, off(w), -1);
+            self.g_store_imm32(r::R11, off(w), empty);
         }
         self.g_store(r::R11, off(noted), r::RCX);
         self.bind(same);

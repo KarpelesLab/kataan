@@ -3446,6 +3446,11 @@ impl NumGen {
         a.jcc(CC_E, keep);
         a.g_store(super::call_seq::r::RBP, noted, RAX);
         self.zero_globals(a, Some(ri));
+        if !validate && let Some((pn, entries)) = self.persisted_region_gslots(ri) {
+            // The addresses another activation validated under this very
+            // epoch (`super::global_persist::region_persist`).
+            a.gp_restore_rax(self.env.persist, pn, &entries, keep);
+        }
         if validate {
             // The addresses another activation validated under this very
             // epoch, when the region's global ops are all reads
@@ -3514,6 +3519,42 @@ impl NumGen {
             ));
         }
         Some((BODY_WORDS + ri, entries))
+    }
+
+    /// [`persisted_gslots`](Self::persisted_gslots) of a region that is no
+    /// speculative one (`super::global_persist::region_persist`), whose
+    /// writes may persist too when their code mirrors nothing onto the
+    /// global object (`super::global_persist::writes_persist`), as the
+    /// body's own cache's do.
+    fn persisted_region_gslots(&self, ri: usize) -> Option<(usize, Vec<(usize, i32)>)> {
+        use super::global_persist::{BODY_WORDS, LEN};
+        if !super::global_persist::region_persist()
+            || self.regions[ri].spec.is_some()
+            || self.env.persist == 0
+            || BODY_WORDS + self.regions.len() + self.n_gslots > LEN
+        {
+            return None;
+        }
+        let r = &self.regions[ri];
+        let mut entries = Vec::new();
+        for pc in r.head..=r.end {
+            let k = self.gslot.get(pc).copied().unwrap_or(u32::MAX);
+            if k == u32::MAX {
+                continue;
+            }
+            match self.bc(pc) {
+                Some(Op::LoadGlobal { .. }) => {}
+                Some(op @ Op::StoreGlobal { .. })
+                    if super::global_persist::writes_persist()
+                        && super::global_mirror::mirror_cell(op).is_none() => {}
+                _ => return None,
+            }
+            entries.push((
+                BODY_WORDS + self.regions.len() + k as usize,
+                self.gslot_disp(k),
+            ));
+        }
+        (!entries.is_empty()).then_some((BODY_WORDS + ri, entries))
     }
 
     /// A global op `pc` of speculative region `ri`'s fast version, its
@@ -7630,6 +7671,21 @@ impl NumGen {
                     a.call_rax();
                     if k != u32::MAX {
                         a.store_rax(self.gslot_disp(k));
+                        // Recorded for the body's later activations
+                        // (`super::global_persist::region_persist`).
+                        if let Some(ri) = s.region
+                            && let Some((pn, entries)) = self.persisted_region_gslots(ri)
+                            && let Some(&(w, _)) =
+                                entries.iter().find(|e| e.1 == self.gslot_disp(k))
+                        {
+                            let skip = a.new_label();
+                            a.test_rax_rax();
+                            a.jcc(CC_E, skip);
+                            let group: Vec<usize> = entries.iter().map(|e| e.0).collect();
+                            let noted = self.gslot_disp((self.n_gslots + ri) as u32);
+                            a.gp_save_one_as(self.env.persist, pn, &group, w, noted, 0);
+                            a.bind(skip);
+                        }
                     }
                     // A speculative region's fast version makes no call that
                     // rejoins it: the copy runs the op (the next iteration
