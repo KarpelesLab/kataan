@@ -6330,8 +6330,12 @@ fn nested_candidates<'a>(
                 return None;
             };
             let n = inline_candidate_key(funcs, fid, k)?;
+            // (Within the plain limits: only a call site of the caller's own
+            // loops takes the larger ones, `inline::limits`.)
+            let plain = crate::jit::inline::callee_ok_plain(n.proto)
+                || crate::jit::inline::construct_ok(n.proto);
             // (Not the outer caller again: its body is being compiled.)
-            ((n.key & 0xffff_ffff) as usize != caller).then_some((p, n))
+            (plain && (n.key & 0xffff_ffff) as usize != caller).then_some((p, n))
         })
         .collect()
 }

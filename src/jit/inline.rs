@@ -91,14 +91,47 @@ const MAX_SPLICED_OPS: usize = 100;
 /// The most registers of such a body.
 const MAX_SPLICED_REGS: usize = 96;
 
+/// The largest callee body inlined at a call site inside one of its
+/// caller's loops (in ops; see [`limits`]).
+const MAX_LOOP_CALLEE_OPS: usize = 64;
+/// The most callee registers inlined at such a site.
+const MAX_LOOP_CALLEE_REGS: usize = 64;
+/// The largest body inlined at such a site once it has inlined calls of its
+/// own (in ops).
+const MAX_LOOP_SPLICED_OPS: usize = 128;
+
 /// The op and register limits of an inlined body (`spliced`: one that
-/// inlined calls of its own).
-const fn limits(spliced: bool) -> (usize, usize) {
-    if spliced {
-        (MAX_SPLICED_OPS, MAX_SPLICED_REGS)
-    } else {
-        (MAX_CALLEE_OPS, MAX_CALLEE_REGS)
+/// inlined calls of its own) at a site in one of its caller's loops when
+/// `in_loop`. A loop site may take a larger body
+/// ([`MAX_LOOP_CALLEE_OPS`], [`MAX_LOOP_SPLICED_OPS`]): a call made on
+/// every iteration costs its call sequence on every iteration (a
+/// constraint solver's `c.propagate(s)` in its fixpoint loop, whose callee
+/// with its two inlined getters is just past the plain limits), while the
+/// caller's budget ([`MAX_ADDED_OPS`]) still bounds what it adds in all.
+/// `KATAAN_JIT_LOOPINL=0` keeps the plain limits everywhere.
+fn limits(spliced: bool, in_loop: bool) -> (usize, usize) {
+    match (spliced, in_loop && loop_inl_enabled()) {
+        (true, false) => (MAX_SPLICED_OPS, MAX_SPLICED_REGS),
+        (true, true) => (MAX_LOOP_SPLICED_OPS, MAX_SPLICED_REGS),
+        (false, false) => (MAX_CALLEE_OPS, MAX_CALLEE_REGS),
+        (false, true) => (MAX_LOOP_CALLEE_OPS, MAX_LOOP_CALLEE_REGS),
     }
+}
+
+/// Whether call sites in loops take the larger inlining limits and a
+/// polymorphic way may call outside its own loops ([`limits`],
+/// [`poly_calls_ok`]; `KATAAN_JIT_LOOPINL=0` turns both off, read once per
+/// process).
+#[cfg(feature = "std")]
+fn loop_inl_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LOOPINL").is_none_or(|v| v != "0"))
+}
+
+/// [`loop_inl_enabled`] without `std`: on.
+#[cfg(not(feature = "std"))]
+const fn loop_inl_enabled() -> bool {
+    true
 }
 
 /// The most inlining may add to one caller, as each way's ops and
@@ -574,14 +607,23 @@ pub struct Expanded {
 /// than by its return or a throw.
 #[must_use]
 pub fn callee_ok(proto: &FnProto) -> bool {
-    callee_ok_sized(proto, false)
+    callee_ok_sized(proto, false, true)
+}
+
+/// [`callee_ok`] within the plain limits (see `limits`): a callee of an
+/// inlined body's own call sites ([`Candidate::nested`]).
+#[must_use]
+pub fn callee_ok_plain(proto: &FnProto) -> bool {
+    callee_ok_sized(proto, false, false)
 }
 
 /// [`callee_ok`], for a callee body that inlined calls of its own when
 /// `spliced` (see [`Candidate::nested`]; the function itself was small
-/// enough, and its inlined calls may add up to [`MAX_SPLICED_OPS`]).
-fn callee_ok_sized(proto: &FnProto, spliced: bool) -> bool {
-    let (max_ops, max_regs) = limits(spliced);
+/// enough, and its inlined calls may add up to [`MAX_SPLICED_OPS`]), at a
+/// site in a loop of its caller when `in_loop` (see [`limits`]; without
+/// it, as [`callee_ok`] takes it, the loop sites' larger limits).
+fn callee_ok_sized(proto: &FnProto, spliced: bool, in_loop: bool) -> bool {
+    let (max_ops, max_regs) = limits(spliced, in_loop);
     if proto.class_ctor
         || proto.is_async
         || proto.is_generator
@@ -638,6 +680,13 @@ fn size_ok(p: &FnProto, max_ops: usize) -> bool {
     p.ops.len() <= 2 * max_ops && weight(p) <= max_ops
 }
 
+/// Whether the function `p` itself (not spliced) fits the plain callee
+/// limits, which a site outside its caller's loops keeps ([`limits`]).
+fn plain_size_ok(p: &FnProto) -> bool {
+    let (max_ops, max_regs) = limits(false, false);
+    size_ok(p, max_ops) && p.n_regs <= max_regs
+}
+
 /// Whether callee op `pc`, `Jump { target }`, is a branch the splice takes:
 /// forward (to an op or the end), or a loop's back-edge — to an earlier op
 /// no branch from outside the loop enters it past (a loop the body enters
@@ -679,7 +728,7 @@ pub fn construct_ok(proto: &FnProto) -> bool {
 
 /// [`construct_ok`] as [`callee_ok_sized`] is [`callee_ok`].
 fn construct_ok_sized(proto: &FnProto, spliced: bool) -> bool {
-    let (max_ops, max_regs) = limits(spliced);
+    let (max_ops, max_regs) = limits(spliced, false);
     if proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
@@ -816,6 +865,53 @@ fn calls_only_inlined(p: &FnProto) -> bool {
             )
             || fallbacks.contains(&pc)
     })
+}
+
+/// Whether a way of a polymorphic site may inline the callee body `p`
+/// (maybe with calls of its own spliced in): one whose every call is the
+/// fallback of its inlined calls' guards ([`calls_only_inlined`]), or, at a
+/// site in a loop of the caller (`in_loop`), one whose calls the
+/// activation pushes for at most once per call of the body as
+/// [`loop_calls_lean`] takes them and that has a way to its return making
+/// none of them ([`call_free_return`]) — a constraint's `propagate` that
+/// calls `s.set(…)` only when it narrows a domain: its call sequence costs
+/// every iteration of the caller's loop, the push only the iterations that
+/// call. (A body that calls on every path, a closure that resumes a
+/// coroutine, would push on every call: what inlining saved.)
+/// `KATAAN_JIT_LOOPINL=0`: the first kind only.
+fn poly_calls_ok(p: &FnProto, in_loop: bool) -> bool {
+    calls_only_inlined(p)
+        || (in_loop && loop_inl_enabled() && loop_calls_lean(p) && call_free_return(p))
+}
+
+/// Whether some path through the callee body `p` reaches a `return`
+/// without passing a call op other than an inline `Math` function's (an
+/// inlined call's guard hit skips its fallback call).
+fn call_free_return(p: &FnProto) -> bool {
+    let n = p.ops.len();
+    let mut seen = alloc::vec![false; n];
+    let mut work = alloc::vec![0usize];
+    while let Some(pc) = work.pop() {
+        if pc >= n || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        let op = &p.ops[pc];
+        if is_call(op) && super::inline_math(op).is_none() {
+            continue;
+        }
+        match op {
+            Op::Return { .. } => return true,
+            Op::Throw { .. } => {}
+            Op::Jump { target } => work.push(*target),
+            Op::JumpIfFalse { target, .. } => {
+                work.push(*target);
+                work.push(pc + 1);
+            }
+            _ => work.push(pc + 1),
+        }
+    }
+    false
 }
 
 /// Whether `op` makes a call (of a value, a method, a constructor or
@@ -1291,6 +1387,7 @@ pub fn expand<'a>(
     // Each site's ways that can be inlined, with their costs (see
     // `Way`), before the budget picks among them.
     let mut cands_at: Vec<(usize, Vec<Way<'a>>)> = Vec::new();
+    let depth = loop_depth(proto);
     for (pc, op) in proto.ops.iter().enumerate() {
         // (A computed-key call's callee is its read's scratch register, above
         // the caller's: its receiver and key must be the caller's.)
@@ -1342,7 +1439,14 @@ pub fn expand<'a>(
         }
         let mut ways: Vec<Way<'a>> = Vec::new();
         let poly = cands.len() > 1;
+        // (A site in a loop of the caller takes the larger limits: `limits`.)
+        let in_loop = depth[pc] > 0;
         for c in cands.into_iter().take(MAX_WAYS) {
+            // (Elsewhere, the function itself within the plain limits, as
+            // before its own calls were spliced in.)
+            if !in_loop && !plain_size_ok(c.proto) {
+                continue;
+            }
             let c = site_body(c);
             // (A tail call `untail` left: its callee would not inline.)
             if c.proto.ops.iter().any(is_tail) {
@@ -1350,11 +1454,13 @@ pub fn expand<'a>(
             }
             // A polymorphic site's way inlines only a body that calls
             // nothing but through its own inlined calls' guards (an inner
-            // call's activation pushes cost about what the call saved). So
-            // does one that loops: its calls would push the activation on
-            // every iteration — but for the calls outside its loops and
-            // those a built-in serves without one (`loop_calls_lean`).
-            if (poly && !calls_only_inlined(&c.proto))
+            // call's activation pushes cost about what the call saved) —
+            // but at a site in a loop, one may also call as a looping body
+            // may (`poly_calls_ok`). So does one that loops: its calls
+            // would push the activation on every iteration — but for the
+            // calls outside its loops and those a built-in serves without
+            // one (`loop_calls_lean`).
+            if (poly && !poly_calls_ok(&c.proto, in_loop))
                 || (loops(&c.proto) && !loop_calls_lean(&c.proto))
             {
                 continue;
@@ -1369,7 +1475,7 @@ pub fn expand<'a>(
             let ok = if construct_site(op) {
                 construct_ok_sized(&c.proto, spliced)
             } else {
-                callee_ok_sized(&c.proto, spliced)
+                callee_ok_sized(&c.proto, spliced, in_loop)
             };
             if !ok
                 || (c.key >> 32) as usize != c.proto.n_captures
@@ -1401,7 +1507,6 @@ pub fn expand<'a>(
     // The budget: sites in loops first, the most deeply nested first, then
     // in order — a site's ways in order — while what the caller adds stays
     // within [`MAX_ADDED_OPS`].
-    let depth = loop_depth(proto);
     let mut order: Vec<usize> = (0..cands_at.len()).collect();
     order.sort_by_key(|&i| (core::cmp::Reverse(depth[cands_at[i].0]), cands_at[i].0));
     let mut picked: Vec<Vec<Site<'a>>> = (0..cands_at.len()).map(|_| Vec::new()).collect();
