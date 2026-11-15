@@ -495,7 +495,15 @@ pub struct Realm {
     /// For compiled code: the shape word of `coll_iter_layout` (0 while
     /// none is learned) and its two slots, in its keys' order
     /// ([`Realm::set_coll_iter_layout`]).
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) coll_iter_shape: u64,
+    #[cfg_attr(
+        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) coll_iter_slots: [u32; 2],
     /// The hidden-state layout of a snapshot-buffer built-in iterator (see
     /// `hidden_layout`), learned likewise.
@@ -4911,7 +4919,7 @@ impl Realm {
                 };
                 let ok = matches!(status.to_bits(), ZERO | ONE);
                 match (kind, idx.as_number()) {
-                    (Some(kind), Some(i)) if ok && i >= 0.0 && i < 4_294_967_295.0 => {
+                    (Some(kind), Some(i)) if ok && (0.0..4_294_967_295.0).contains(&i) => {
                         Some((kind, i as u32 as usize, epoch.to_bits()))
                     }
                     _ => None,
