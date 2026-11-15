@@ -79,6 +79,14 @@ fn imul_direct_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IMULDIRECT").is_none_or(|v| v != "0"))
 }
 
+/// Whether the integer version's `k * x` by a constant `k` takes the
+/// constant-factor form `x * k` does (`KATAAN_JIT_IMULCOMMUTE=0` turns it
+/// off; read once).
+fn imul_commute_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IMULCOMMUTE").is_none_or(|v| v != "0"))
+}
+
 /// Whether the slow paths of the integer version's inline element accesses
 /// go out of line (`NumGen::skip_cold`; `KATAAN_JIT_SKIPCOLD=0` turns it
 /// off; read once).
@@ -2595,6 +2603,11 @@ impl NumGen {
     /// product with a negative factor (`-0`).
     fn imul(&mut self, a: &mut X64Assembler, dst: u16, x: u16, y: u16) -> Option<()> {
         let d = self.iout(dst)?;
+        // (`k * x` is `x * k`: the factors commute, `KATAAN_JIT_IMULCOMMUTE`.)
+        let (x, y) = match (self.ik(x), self.ik(y)) {
+            (Some(IK::Imm(_)), Some(IK::Gpr(_))) if imul_commute_enabled() => (y, x),
+            _ => (x, y),
+        };
         // `x * k` by a constant: `imul r32, r/m32, imm32`, and with `k > 0`
         // only an overflow can make the product no int32 (no `-0`: a zero
         // product has a zero `x`, whose sign the positive `k` keeps, and
