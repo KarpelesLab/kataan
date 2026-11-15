@@ -905,6 +905,27 @@ impl Loop<'_> {
             return Ok(());
         }
         if n <= 16 {
+            // (The host's binary insertion, `nbexec::sort_binary_insertion`:
+            // the same calls in the same order.)
+            if crate::nbexec::sort_binary_insertion() {
+                for i in 1..n {
+                    let x = v[i];
+                    if self.compare(ctx, v[i - 1], x)? <= 0.0 {
+                        continue;
+                    }
+                    let (mut lo, mut hi) = (0usize, i - 1);
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        if self.compare(ctx, v[mid], x)? > 0.0 {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                    v[lo..=i].rotate_right(1);
+                }
+                return Ok(());
+            }
             for i in 1..n {
                 let mut j = i;
                 while j > 0 && self.compare(ctx, v[j - 1], v[j])? > 0.0 {

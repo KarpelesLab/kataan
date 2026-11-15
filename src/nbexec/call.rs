@@ -3933,6 +3933,28 @@ impl Interp {
             return Ok(());
         }
         if n <= 16 {
+            if sort_binary_insertion() {
+                // Each element against the one before it, and when out of
+                // order, a binary search of the sorted prefix for the first
+                // element greater than it (after its equals: stable).
+                for i in 1..n {
+                    let x = v[i];
+                    if self.sort_compare(v[i - 1], x, cmp, has_cmp, numeric)? <= 0.0 {
+                        continue;
+                    }
+                    let (mut lo, mut hi) = (0usize, i - 1);
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        if self.sort_compare(v[mid], x, cmp, has_cmp, numeric)? > 0.0 {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                    v[lo..=i].rotate_right(1);
+                }
+                return Ok(());
+            }
             for i in 1..n {
                 let mut j = i;
                 while j > 0 {
@@ -3976,6 +3998,26 @@ impl Interp {
         }
         v.copy_from_slice(&buf[..n]);
         Ok(())
+    }
+}
+
+/// Whether a sort's short runs (at most 16 elements, `Array.prototype.sort`
+/// and `%TypedArray%.prototype.sort` with or without a comparator) insert
+/// each out-of-order element at the place a binary search of the sorted
+/// prefix finds, rather than by comparing it with each element before it in
+/// turn: about 45 comparisons for 16 elements in random order instead of 68,
+/// and still one per element of a run already in order. Both sorts (the
+/// host's and `nbvm::array_hof`'s) make the same calls in the same order.
+/// `KATAAN_SORT_BINSERT=0` turns it off (read once per process).
+pub(crate) fn sort_binary_insertion() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_SORT_BINSERT").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
     }
 }
 

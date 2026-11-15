@@ -3006,6 +3006,7 @@ mod array_sparse;
 use array_search::ArraySearch;
 mod base64;
 mod call;
+pub(crate) use call::sort_binary_insertion;
 mod convert;
 mod expr;
 mod gc;
