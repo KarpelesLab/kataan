@@ -2565,7 +2565,13 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     let method = matches!(e.callee, CalleeSrc::Method { .. });
     // The identification after a memo miss, out of line: a call of the
     // body's shared subroutine (`IdentSub`), when on.
-    let ident = (ident_sub_enabled() && !matches!(e.callee, CalleeSrc::Construct { .. }))
+    // (Not at a site of fresh closures, or one that met some: there the
+    // identification is the common path, which a call would slow.)
+    // SAFETY: the site is the compiled function's own, alive while it is
+    // compiled, and only Rust code on this thread writes it.
+    #[allow(unsafe_code)]
+    let fresh = unsafe { (*e.site).fresh || (*e.site).fresh_misses > 0 };
+    let ident = (ident_sub_enabled() && !fresh && !matches!(e.callee, CalleeSrc::Construct { .. }))
         .then(|| a.ident_sub(method, l.realm));
     // `identified`: the way is in r11 and the captures in r8 already (a memo
     // hit, or a constructor the site's `fast` cache prepared).

@@ -1310,6 +1310,10 @@ pub(super) struct NumGen {
     /// The entries at a loop nest's inner headers (on-stack replacement
     /// there), as `(label, pc)` ([`Self::entry_label`]).
     nest_entries: Vec<(Label, usize)>,
+    /// Per region: the shared copy of its slow paths' global binding
+    /// re-check ([`recheck_globals`](Self::recheck_globals)), when one was
+    /// called; placed by [`finish`](Self::finish).
+    rechk_subs: core::cell::RefCell<Vec<(usize, Label)>>,
     /// Per inner header of a speculative nest: the entry into its fast
     /// version there ([`Self::emit_inner_entries`]), which the plain copy's
     /// inner back-edge (and an on-stack replacement there) takes, as
@@ -2328,6 +2332,7 @@ impl NumGen {
             truthy_ways: Vec::new(),
             leave_exit: None,
             nest_entries: Vec::new(),
+            rechk_subs: core::cell::RefCell::new(Vec::new()),
             inner_entries: Vec::new(),
             n_view_slots,
             n_fcarry,
@@ -3423,9 +3428,30 @@ impl NumGen {
     /// Clobbers `r11` and the flags.
     fn recheck_globals(&self, a: &mut X64Assembler, reg: Option<usize>) {
         let Some(ri) = reg else { return };
+        a.dbg_mark("rechk");
         if self.region_gslots[ri].is_empty() {
             return;
         }
+        // (Out of line, a call of the region's one copy: `rechk_sub_enabled`.)
+        if rechk_sub_enabled() {
+            let mut subs = self.rechk_subs.borrow_mut();
+            let l = match subs.iter().find(|x| x.0 == ri) {
+                Some(&(_, l)) => l,
+                None => {
+                    let l = a.new_label();
+                    subs.push((ri, l));
+                    l
+                }
+            };
+            a.g_call_label(l);
+            return;
+        }
+        self.recheck_globals_inline(a, ri);
+    }
+
+    /// [`recheck_globals`](Self::recheck_globals)' code for region `ri`.
+    fn recheck_globals_inline(&self, a: &mut X64Assembler, ri: usize) {
+        let reg = Some(ri);
         if self.regions[ri].spec.is_some() {
             self.zero_globals(a, reg);
             return;
@@ -5950,6 +5976,7 @@ impl NumGen {
     /// writes back to the register file.
     fn flush(&self, a: &mut X64Assembler, reg: Option<usize>) {
         let Some(ri) = reg else { return };
+        a.dbg_mark("flush");
         if self.imode == Some(ri) {
             self.iflush(a, ri);
             return;
@@ -5971,6 +5998,7 @@ impl NumGen {
     /// file (after a call: the SSE registers are caller-saved).
     fn reload(&self, a: &mut X64Assembler, reg: Option<usize>) {
         let Some(ri) = reg else { return };
+        a.dbg_mark("reload");
         if self.imode == Some(ri) {
             self.ireload(a, ri);
             return;
@@ -7641,6 +7669,7 @@ impl NumGen {
                     refuse,
                 } => {
                     self.flush(a, s.region);
+                    a.dbg_mark("ncall");
                     // Two short Strings' comparison: inline
                     // (`super::str_cmp`), stored as the helper's answer.
                     let inline = (helper == self.env.str_compare && super::str_cmp::enabled())
@@ -7837,6 +7866,13 @@ impl NumGen {
         a.set_plain_lazy(Vec::new());
         self.imode = None;
         self.copy = false;
+        // The regions' shared global binding re-checks (each keeps every
+        // register but `r11` and the flags, as in line).
+        for (ri, l) in self.rechk_subs.take() {
+            a.bind(l);
+            self.recheck_globals_inline(a, ri);
+            a.ret();
+        }
         a.dbg_mark("n-nest");
         for (l, pc) in core::mem::take(&mut self.nest_entries) {
             a.bind(l);
@@ -7972,6 +8008,14 @@ impl NumGen {
             }
         }
     }
+}
+
+/// Whether a numeric region's slow paths share one copy per region of their
+/// global binding re-check after the call (`KATAAN_JIT_RECHKSUB=0`
+/// disables). Read once.
+fn rechk_sub_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_RECHKSUB").is_none_or(|v| v != "0"))
 }
 
 /// Whether a bitwise op whose result only a test reads branches on the
