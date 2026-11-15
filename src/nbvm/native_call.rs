@@ -891,6 +891,20 @@ pub(super) fn prove_array_pop(realm: &mut Realm, site: &mut crate::jit::MethodSi
     prove_proto_method(realm, site, start, "pop", FastOp::ArrayPop);
 }
 
+/// Whether the case mapping of a one-character ASCII string answers its
+/// interned cell (`KATAAN_UNIT_CASE=0` makes a new one).
+fn unit_case_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_UNIT_CASE").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether `toUpperCase` / `toLowerCase` of an ASCII string map it in place
 /// into its new node (or answer the receiver when nothing changes), and a
 /// `split` that finds no separator answers the receiver as its one piece
@@ -995,6 +1009,12 @@ pub(super) fn str_call(
     let h = Handle::from_raw(recv.as_handle()?);
     if ctx.host.is_none() || ctx.realm.multi_realm || args.len() > 2 {
         return None;
+    }
+    if matches!(op, FastOp::StrReplace)
+        && super::str_replace::lean_on()
+        && let Some(r) = super::str_replace::try_lean(ctx, funcs, regs, recv, h, args)
+    {
+        return Some(r);
     }
     run_op(ctx, funcs, op, method, recv, h, false, regs, args)
 }
@@ -2106,6 +2126,17 @@ fn run_op(
                 };
                 if !bytes.iter().any(changes) {
                     return Some(Ok(recv));
+                }
+                // One character (`w[0].toUpperCase()`): its interned cell.
+                if let [b] = *bytes
+                    && unit_case_enabled()
+                {
+                    let m = if upper {
+                        b.to_ascii_uppercase()
+                    } else {
+                        b.to_ascii_lowercase()
+                    };
+                    return Some(Ok(NanBox::handle(realm.unit_string(u16::from(m)).to_raw())));
                 }
                 let out = crate::rope::Rope::from_ascii_mapped(bytes, upper);
                 return Some(Ok(NanBox::handle(realm.new_string_from_rope(out).to_raw())));

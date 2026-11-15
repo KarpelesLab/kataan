@@ -9766,6 +9766,28 @@ impl crate::nbvm::VmHost for Interp {
         None
     }
 
+    fn replace_lean(
+        &mut self,
+        recv: NanBox,
+        search: NanBox,
+        replace: NanBox,
+        func: bool,
+    ) -> Option<Result<crate::nbvm::ReplaceStep, crate::nbvm::HostError>> {
+        #[cfg(feature = "regex")]
+        if self.created_realms.is_empty() {
+            let h = Handle::from_raw(search.as_handle()?);
+            if !self.regexp_pristine(h, regexp::NEED_EXEC | regexp::NEED_REPLACE) {
+                return None;
+            }
+            return self
+                .regexp_replace_pristine_as(h, recv, replace, false, func)
+                .map_err(exec_to_host)
+                .transpose();
+        }
+        let _ = (recv, search, replace, func);
+        None
+    }
+
     fn string_match(
         &mut self,
         recv: NanBox,

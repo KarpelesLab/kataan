@@ -3,7 +3,7 @@ use super::*;
 #[cfg(feature = "regex")]
 mod lean;
 #[cfg(feature = "regex")]
-pub(crate) use lean::{NEED_EXEC, NEED_MATCH, NEED_SPLIT, RegexpProtoProof};
+pub(crate) use lean::{NEED_EXEC, NEED_MATCH, NEED_REPLACE, NEED_SPLIT, RegexpProtoProof};
 
 impl Interp {
     /// Builds a match-result array from a `Captures` whose spans are **code-unit**

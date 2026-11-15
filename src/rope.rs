@@ -559,6 +559,20 @@ const U16_LEN_UNKNOWN: usize = usize::MAX;
 /// stored as one new leaf rather than a `Concat` node.
 const SMALL_JOIN: usize = 64;
 
+/// Whether a short slice copy records its UTF-16 length
+/// (`KATAAN_SLICE_UNITS=0` leaves it to be counted on first use).
+fn slice_units_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_SLICE_UNITS").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 impl Rope {
     /// An empty rope.
     #[must_use]
@@ -699,7 +713,19 @@ impl Rope {
     /// exactly the strings this exists to speed up — test262's `buildString`
     /// aborted several `RegExp/property-escapes` workers that way.
     #[must_use]
+    #[inline]
     pub fn utf16_len(&self) -> usize {
+        // A memoized length of the two commonest nodes, in the caller's line.
+        match &*self.0 {
+            Node::Small { u16, .. } if u16.get() != SMALL_U16_UNKNOWN => usize::from(u16.get()),
+            Node::Leaf(_, cell) if cell.get() != U16_LEN_UNKNOWN => cell.get(),
+            _ => self.utf16_len_slow(),
+        }
+    }
+
+    /// [`utf16_len`](Self::utf16_len) past its memoized inline answers.
+    #[inline(never)]
+    fn utf16_len_slow(&self) -> usize {
         let root_cell = match &*self.0 {
             Node::Small { len, u16, buf } => {
                 let cached = u16.get();
@@ -1592,13 +1618,22 @@ impl Rope {
         if len == bytes.len() {
             return self.clone();
         }
+        // A copy records the units it holds (known here), so its `.length`
+        // or a concatenation with it needs no count.
+        let copy = |b: &[u8]| {
+            if slice_units_on() {
+                Rope::from_bytes_units(b, units)
+            } else {
+                Rope::from_bytes(b)
+            }
+        };
         let (base, base_start) = match &*self.0 {
             Node::Slice { base, start, .. } => (base, *start),
             Node::Leaf(..) | Node::Build { .. } => (self, 0),
-            _ => return Rope::from_bytes(&bytes[b0..b1]),
+            _ => return copy(&bytes[b0..b1]),
         };
         if len < SLICE_SHARE_MIN || len.saturating_mul(SLICE_SHARE_RATIO) < base.len() {
-            return Rope::from_bytes(&bytes[b0..b1]);
+            return copy(&bytes[b0..b1]);
         }
         Rope(Rc::new(Node::Slice {
             base: base.clone(),

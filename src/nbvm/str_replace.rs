@@ -97,7 +97,69 @@ pub(super) fn try_run(
         return None;
     }
     let step = with_host(ctx, |h| h.replace_plan(recv, search, replace, all))??;
-    Some(match step {
+    Some(finish(ctx, funcs, regs, [recv, search, replace], step))
+}
+
+/// Whether a direct string call of `replace` tries [`try_lean`] first
+/// (`KATAAN_REPLACE_LEAN=0` never does).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn lean_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_REPLACE_LEAN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// `recv.replace(regs[args[0]], regs[args[1]])` at a site that proved the
+/// intrinsic `replace`, for the string cell `recv_h` (`recv`): when it is a
+/// plain string, the search value a RegExp cell and the replacement a VM
+/// function or a plain string, and the host runs the call as its one-step
+/// algorithm over a pristine RegExp ([`VmHost::replace_lean`](super::VmHost::replace_lean)),
+/// the call's result. `None`, with nothing done, otherwise ([`try_run`]
+/// then takes it from the top).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[inline]
+pub(super) fn try_lean(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    recv: NanBox,
+    recv_h: Handle,
+    args: &[Reg],
+) -> Option<Result<NanBox, VmError>> {
+    let &[a, b] = args else {
+        return None;
+    };
+    let (search, replace) = (regs[a as usize], regs[b as usize]);
+    let sh = Handle::from_raw(search.as_handle()?);
+    let rh = Handle::from_raw(replace.as_handle()?);
+    let realm = &ctx.realm;
+    if !realm.typeof_is_string(recv_h) || realm.regexp_flags(sh).is_none() {
+        return None;
+    }
+    let func = realm.is_vm_function(rh);
+    if !func && !realm.typeof_is_string(rh) {
+        return None;
+    }
+    let step = with_host(ctx, |h| h.replace_lean(recv, search, replace, func))??;
+    Some(finish(ctx, funcs, regs, [recv, search, replace], step))
+}
+
+/// The rest of a replace call whose host step is `step`: its result, or the
+/// replacer calls of a plan made here.
+fn finish(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    [recv, search, replace]: [NanBox; 3],
+    step: Result<ReplaceStep, HostError>,
+) -> Result<NanBox, VmError> {
+    match step {
         Err(e) => Err(VmError::from(e)),
         Ok(ReplaceStep::Done(v)) => Ok(v),
         Ok(ReplaceStep::Plan(plan)) => {
@@ -111,7 +173,7 @@ pub(super) fn try_run(
             ctx.frame_shadow.truncate(mark);
             r
         }
-    })
+    }
 }
 
 /// `RegExp.prototype[@@replace]` steps 14–15 over `plan` with the function

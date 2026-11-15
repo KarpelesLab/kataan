@@ -755,6 +755,11 @@ pub struct Realm {
     /// string's method lookup may not simply start at `%String.prototype%`
     /// (`plain_recv_lookup_start`). Never cleared.
     pub str_special: bool,
+    /// Some RegExp cell was given an auxiliary object, an explicit
+    /// `[[Prototype]]` or a null one, or swapped with another cell's state, so
+    /// a RegExp's plainness is not implied by its kind
+    /// (`plain_regexp_default_proto`). Never cleared.
+    pub(crate) regexp_special: bool,
     /// Recent `'k' + i` results (`Realm::add_str_int`), allocated on first
     /// use.
     pub(crate) str_int_memo: Option<alloc::boxed::Box<concat_fast::StrIntMemo>>,
@@ -1154,6 +1159,7 @@ impl Realm {
             multi_realm: false,
             coll_hint: (u64::MAX, 0, 0),
             str_special: false,
+            regexp_special: false,
             str_int_memo: None,
             vm_callee_stack: Vec::new(),
             vm_gen_running: Vec::new(),
@@ -1583,7 +1589,10 @@ impl Realm {
     /// auxiliary object: bumps the prototype epoch when a method-site cache
     /// watches the cell (see [`Self::watched_cells`]).
     #[inline]
-    fn cell_link_changed(&self, handle: Handle) {
+    fn cell_link_changed(&mut self, handle: Handle) {
+        if matches!(self.heap.get(handle), Some(Cell::RegExp { .. })) {
+            self.regexp_special = true;
+        }
         if self.watched_cells.contains_key(&handle.to_raw()) {
             crate::object::bump_proto_epoch();
         }
@@ -5482,14 +5491,22 @@ impl Realm {
     /// auxiliary property object gives it the bound-function or VM-closure
     /// marker; a non-string cell never is.
     #[must_use]
+    #[inline(always)]
     pub fn typeof_is_string(&self, handle: Handle) -> bool {
-        if !self.is_string_handle(handle) {
+        if !matches!(self.heap.get_hot(handle), Some(Cell::Str(_))) {
             return false;
         }
-        if !self.aux_props.contains_key(&handle.to_raw()) {
-            return true;
-        }
-        self.type_of_value(NanBox::handle(handle.to_raw())) == "string"
+        // (Only a string cell given an auxiliary object can carry a function
+        // marker; until one is, `str_special` stays clear.)
+        (!self.str_special && builtins_fast::str_plain_on()) || self.typeof_is_string_aux(handle)
+    }
+
+    /// [`typeof_is_string`](Self::typeof_is_string) of a string cell, once
+    /// some string cell has an auxiliary object.
+    #[inline(never)]
+    fn typeof_is_string_aux(&self, handle: Handle) -> bool {
+        !self.aux_props.contains_key(&handle.to_raw())
+            || self.type_of_value(NanBox::handle(handle.to_raw())) == "string"
     }
 
     /// The array elements at `handle`, or `None` if it is not an array.
@@ -6154,6 +6171,12 @@ impl Realm {
         // before the cell changes handles.
         self.materialize_fn_proto(a);
         self.materialize_fn_proto(b);
+        if [a, b]
+            .iter()
+            .any(|&h| matches!(self.heap.get(h), Some(Cell::RegExp { .. })))
+        {
+            self.regexp_special = true;
+        }
         self.heap.swap(a, b);
         self.cell_swaps = self.cell_swaps.wrapping_add(1);
         // A watched object may have moved: retire every validated chain.

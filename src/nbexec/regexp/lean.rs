@@ -66,6 +66,20 @@ impl Subject {
     }
 }
 
+/// Whether [`Interp::regexp_pristine`] rechecks a proven prototype in one
+/// lookup (`KATAAN_RX_PRISTINE_FAST=0` takes the stamp's own lookups).
+fn pristine_fast_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_RX_PRISTINE_FAST").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// [`Interp::regexp_pristine`]'s `need` bit for `exec`.
 pub(crate) const NEED_EXEC: u32 = 1;
 /// … for `[@@replace]`.
@@ -93,6 +107,19 @@ impl Interp {
         };
         if self.realm.plain_regexp_default_proto(h) != Some(proto) {
             return false;
+        }
+        // The proof's stamp but the key epoch, then that epoch and the
+        // methods' slots read from one lookup of the prototype.
+        if let Some(p) = &self.regexp_proto_proof
+            && pristine_fast_on()
+            && p.stamp.0 == core::ptr::from_ref::<Realm>(&self.realm) as usize
+            && p.stamp.1 == proto.to_raw()
+            && p.stamp.3 == self.realm.cell_swap_count()
+            && self
+                .realm
+                .own_data_epoch_hold(proto, p.stamp.2, &p.keys, need)
+        {
+            return true;
         }
         let Some(epoch) = self.realm.object_key_epoch(proto) else {
             return false;
@@ -426,7 +453,6 @@ impl Interp {
         replace: NanBox,
         all: bool,
     ) -> Result<Option<crate::nbvm::ReplaceStep>, ExecError> {
-        use crate::nbvm::{ReplacePlan, ReplaceStep};
         let Some(rh) = replace.as_handle().map(Handle::from_raw) else {
             return Ok(None);
         };
@@ -434,6 +460,24 @@ impl Interp {
         if !func && !(self.realm.is_string_handle(rh) && self.realm.typeof_is_string(rh)) {
             return Ok(None);
         }
+        self.regexp_replace_pristine_as(h, o, replace, all, func)
+    }
+
+    /// [`regexp_replace_pristine`](Self::regexp_replace_pristine) for a
+    /// caller that has checked the replacement: a VM function when `func`,
+    /// else a plain string.
+    pub(crate) fn regexp_replace_pristine_as(
+        &mut self,
+        h: Handle,
+        o: NanBox,
+        replace: NanBox,
+        all: bool,
+        func: bool,
+    ) -> Result<Option<crate::nbvm::ReplaceStep>, ExecError> {
+        use crate::nbvm::{ReplacePlan, ReplaceStep};
+        let Some(rh) = replace.as_handle().map(Handle::from_raw) else {
+            return Ok(None);
+        };
         let Some(re) = self.realm.regex_compiled(h) else {
             return Ok(None);
         };

@@ -1300,6 +1300,24 @@ pub trait VmHost {
     ) -> Option<Result<ReplaceStep, HostError>> {
         None
     }
+    /// [`replace_plan`](Self::replace_plan) of `recv.replace(search,
+    /// replace)` for a plain string `recv`, a RegExp cell `search` and a
+    /// replacement that is a VM function (`func`) or a plain string, when
+    /// the call is the one-step algorithm over a pristine RegExp (see
+    /// `nbexec::regexp::lean`): its step. `None`, with nothing done, for
+    /// anything else (the caller then takes the ordinary path).
+    ///
+    /// # Errors
+    /// A host fault (`RangeError` for a result past the length limit).
+    fn replace_lean(
+        &mut self,
+        _recv: NanBox,
+        _search: NanBox,
+        _replace: NanBox,
+        _func: bool,
+    ) -> Option<Result<ReplaceStep, HostError>> {
+        None
+    }
     /// `recv.match(rx)` for a string `recv` and a RegExp object `rx`, when
     /// the host can run the whole call in one step (see
     /// `Interp::regexp_pristine`). `None` when it cannot (nothing has run:
@@ -8281,6 +8299,21 @@ pub(crate) extern "C" fn jit_helper_get_elem(
     jit_get_elem_general(ctx, recv, key)
 }
 
+/// Whether compiled code's general element read answers a string's index
+/// first (`KATAAN_STR_INDEX=0` takes it after the other kinds' checks).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn str_index_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_STR_INDEX").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// [`jit_helper_get_elem`] past its memoized String-key read.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
 #[inline(never)]
@@ -8323,6 +8356,14 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
             .jit_funcs
             .expect("jit_funcs set before generic dispatch")
     };
+    // An in-range index of a string primitive (`s[i]`): `vm_get_elem_from`'s
+    // answer, whose checks before it are of other kinds of cell.
+    if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
+        && str_index_on()
+        && let Some(s) = ctx.realm.string_index_get(Handle::from_raw(h), n)
+    {
+        return NanBox::handle(s.to_raw()).to_bits();
+    }
     // An in-range element of a typed array wholly inside its buffer (what
     // `vm_get_elem` would reach after its plain-array / arguments / string
     // checks).

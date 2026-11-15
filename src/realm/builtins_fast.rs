@@ -233,8 +233,14 @@ impl Realm {
     #[must_use]
     pub(crate) fn plain_regexp_default_proto(&self, handle: Handle) -> Option<Handle> {
         let raw = handle.to_raw();
-        if !matches!(self.heap.get(handle), Some(Cell::RegExp { .. }))
-            || self.aux_props.contains_key(&raw)
+        if !matches!(self.heap.get(handle), Some(Cell::RegExp { .. })) {
+            return None;
+        }
+        // (Until some RegExp is given a side-table entry, none has one.)
+        if !self.regexp_special && rx_plain_on() {
+            return self.regexp_default_proto;
+        }
+        if self.aux_props.contains_key(&raw)
             || self.native_protos.contains_key(&raw)
             || self.has_explicit_null_proto(handle)
         {
@@ -355,6 +361,41 @@ impl Realm {
             };
             if v.is_none_or(|v| v.to_bits() != bits) {
                 return false;
+            }
+        }
+        true
+    }
+
+    /// [`own_data_all_hold`](Self::own_data_all_hold) together with the check
+    /// that the ordinary object at `handle` still has the key epoch `epoch`,
+    /// in one lookup of the cell: `false` (the caller then makes the full
+    /// check) also for a dictionary-mode slot.
+    #[inline]
+    #[must_use]
+    pub(crate) fn own_data_epoch_hold(
+        &self,
+        handle: Handle,
+        epoch: u32,
+        at: &[(u32, u64)],
+        mask: u32,
+    ) -> bool {
+        let Some(Cell::Object(o)) = self.heap.get_hot(handle) else {
+            return false;
+        };
+        if o.key_epoch() != epoch {
+            return false;
+        }
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match at.get(i) {
+                Some(&(slot, bits)) if slot != u32::MAX => {
+                    if o.slot(slot).is_none_or(|v| v.to_bits() != bits) {
+                        return false;
+                    }
+                }
+                _ => return false,
             }
         }
         true
@@ -1836,6 +1877,37 @@ pub struct MethodSiteCache {
     prim: bool,
     armed: bool,
     swaps: u32,
+}
+
+/// Whether `Realm::typeof_is_string` may answer a string cell from
+/// `Realm::str_special` alone (`KATAAN_STR_PLAIN=0` always looks the cell's
+/// auxiliary object up).
+#[inline]
+pub(crate) fn str_plain_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_STR_PLAIN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether `Realm::plain_regexp_default_proto` may answer a RegExp cell
+/// from `Realm::regexp_special` alone (`KATAAN_RX_PLAIN=0` always looks its
+/// side tables up).
+fn rx_plain_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_RX_PLAIN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// The program slot of `Realm::regexp_literal_memo`.
