@@ -487,6 +487,11 @@ pub struct Realm {
     /// The hidden-state layout of a live Set/Map iterator (see
     /// `hidden_layout`), learned from the first one the bytecode VM steps.
     pub(crate) coll_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
+    /// The bits of the last `next` method a built-in iterator step found
+    /// to be the shared built-in one (`N_GEN_ITER_NEXT`), so the next step
+    /// with that very value skips the check (a handle's bits name one live
+    /// cell: a freed one's slot is reused under another generation), or 0.
+    pub(crate) coll_iter_next: u64,
     /// The hidden-state layout of a snapshot-buffer built-in iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) buf_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
@@ -1207,6 +1212,7 @@ impl Realm {
             assign_memo: assign_fast::AssignMemo::default(),
             len_cache: None,
             coll_iter_layout: None,
+            coll_iter_next: 0,
             buf_iter_layout: None,
             str_iter_layout: None,
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -4847,6 +4853,110 @@ impl Realm {
     /// `None` once exhausted (detaching it; it then stays done whatever later
     /// mutations happen).
     pub fn collection_iter_advance(
+        &mut self,
+        state: Handle,
+        coll: Handle,
+    ) -> Option<(u8, NanBox, NanBox)> {
+        if coll_step_lean_enabled() {
+            return self
+                .collection_iter_advance_kv(state, coll)
+                .map(|(kind, k, v, _)| (kind, k, v));
+        }
+        self.collection_iter_advance_plain(state, coll)
+    }
+
+    /// [`collection_iter_advance`](Self::collection_iter_advance), with
+    /// whether the collection is a `Set` as well. The common step — the
+    /// state's numbers exactly the ones it writes (`kind` 0, 1 or 2, a
+    /// `status` of 0 or 1, the collection's own epoch: no compaction since)
+    /// — is one pass over the state and the collection, which tests those
+    /// by their bits, rewrites only the cursor, the last key and the
+    /// status, and runs the write barrier only for a heap key; any other
+    /// state takes the general step.
+    pub fn collection_iter_advance_kv(
+        &mut self,
+        state: Handle,
+        coll: Handle,
+    ) -> Option<(u8, NanBox, NanBox, bool)> {
+        // (A Number's bits are its `f64`'s.)
+        const ZERO: u64 = 0.0f64.to_bits();
+        const ONE: u64 = 1.0f64.to_bits();
+        const TWO: u64 = 2.0f64.to_bits();
+        let quick = match self.heap.get(state).and_then(Cell::as_array) {
+            Some(&[kind, idx, epoch, _, status]) => {
+                let kind = match kind.to_bits() {
+                    ZERO => Some(0u8),
+                    ONE => Some(1),
+                    TWO => Some(2),
+                    _ => None,
+                };
+                let ok = matches!(status.to_bits(), ZERO | ONE);
+                match (kind, idx.as_number()) {
+                    (Some(kind), Some(i)) if ok && i >= 0.0 && i < 4_294_967_295.0 => {
+                        Some((kind, i as u32 as usize, epoch.to_bits()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((kind, idx, epoch_bits)) = quick else {
+            let is_set = self.collection_is_set(coll).unwrap_or(false);
+            return self
+                .collection_iter_advance_plain(state, coll)
+                .map(|(kind, k, v)| (kind, k, v, is_set));
+        };
+        let (next, is_set) = match self.heap.get_mut(coll) {
+            Some(Cell::Collection {
+                epoch,
+                entries,
+                index,
+                is_set,
+                ..
+            }) if NanBox::number(f64::from(*epoch)).to_bits() == epoch_bits => {
+                // (As the general step: no live entry lies before the dead
+                // prefix's end; a scan from there extends it.)
+                let head = index.as_deref_mut().map_or(0, |m| m.head as usize);
+                let from = idx.max(head);
+                let found = entries
+                    .get(from..)
+                    .and_then(|rest| rest.iter().position(|e| !e.0.is_hole()))
+                    .map(|i| from + i);
+                if from == head
+                    && let Some(m) = index.as_deref_mut()
+                {
+                    m.head = u32::try_from(found.unwrap_or(entries.len())).unwrap_or(0);
+                }
+                (found.map(|i| (i, entries[i].0, entries[i].1)), *is_set)
+            }
+            _ => {
+                let is_set = self.collection_is_set(coll).unwrap_or(false);
+                return self
+                    .collection_iter_advance_plain(state, coll)
+                    .map(|(kind, k, v)| (kind, k, v, is_set));
+            }
+        };
+        let a = self.heap.get_mut(state)?.as_array_mut()?.as_mut_slice();
+        if a.len() < 5 {
+            return None;
+        }
+        let Some((pos, k, v)) = next else {
+            a[4] = NanBox::number(2.0);
+            self.collection_iter_detach(coll);
+            return None;
+        };
+        a[1] = NanBox::number(f64::from(u32::try_from(pos + 1).unwrap_or(u32::MAX)));
+        a[3] = k;
+        a[4] = NanBox::number(1.0);
+        if k.as_handle().is_some() {
+            self.write_barrier(state, k);
+        }
+        Some((kind, k, v, is_set))
+    }
+
+    /// [`collection_iter_advance`](Self::collection_iter_advance)'s general
+    /// form (`KATAAN_JIT_COLLSTEP=0`).
+    fn collection_iter_advance_plain(
         &mut self,
         state: Handle,
         coll: Handle,
@@ -13089,6 +13199,22 @@ fn fn_meta_watermark() -> bool {
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("KATAAN_GC_FNMETA_LOG").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether a live Set/Map iterator steps on its lean path
+/// (`Realm::collection_iter_advance_kv`, and the step's cached `next`
+/// check, `Realm::coll_iter_next`): unless `KATAAN_JIT_COLLSTEP=0`. Read
+/// once per process.
+pub(crate) fn coll_step_lean_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLSTEP").is_none_or(|v| v != "0"))
     }
     #[cfg(not(feature = "std"))]
     {

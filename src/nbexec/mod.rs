@@ -3017,7 +3017,7 @@ mod intl_aliases;
 mod intl_fmt;
 mod iter_plain;
 mod iterator;
-pub(crate) use iterator::{realm_builtin_entry_step, realm_builtin_iter_step};
+pub(crate) use iterator::{coll_iter_step_lean, realm_builtin_entry_step, realm_builtin_iter_step};
 mod dataview_fast;
 mod json;
 mod json_parse;

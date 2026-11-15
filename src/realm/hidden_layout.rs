@@ -60,6 +60,7 @@ impl<const N: usize> HiddenLayout<N> {
     /// order, when it has exactly the layout's shape and its slots may be
     /// rewritten directly (not frozen, no read-only property). `None`
     /// otherwise.
+    #[inline]
     pub(crate) fn read(&self, realm: &Realm, handle: Handle) -> Option<[NanBox; N]> {
         let Some(Cell::Object(o)) = realm.heap.get(handle) else {
             return None;

@@ -3269,6 +3269,15 @@ fn collection_iter_step(realm: &mut Realm, h: Handle, coll: Handle) -> Option<Na
 
 /// The body of [`collection_iter_step`] once the cursor `state` is found.
 fn collection_iter_yield(realm: &mut Realm, state: Handle, coll: Handle) -> Option<NanBox> {
+    if crate::realm::coll_step_lean_enabled() {
+        let (kind, k, v, is_set) = realm.collection_iter_advance_kv(state, coll)?;
+        return Some(match kind {
+            0 => k,
+            2 => NanBox::handle(realm.new_array(alloc::vec![k, v]).to_raw()),
+            _ if is_set => k,
+            _ => v,
+        });
+    }
     let (kind, k, v) = realm.collection_iter_advance(state, coll)?;
     Some(match kind {
         0 => k,                                                           // keys
@@ -3343,8 +3352,7 @@ pub(crate) fn realm_builtin_entry_step(
     next: NanBox,
     it: NanBox,
 ) -> Option<Option<(NanBox, NanBox)>> {
-    let nh = Handle::from_raw(next.as_handle()?);
-    if realm.native_at(nh) != Some(N_GEN_ITER_NEXT) {
+    if !builtin_iter_next(realm, next) {
         return None;
     }
     let h = Handle::from_raw(it.as_handle()?);
@@ -3520,14 +3528,64 @@ fn typed_iter_step(realm: &mut Realm, h: Handle, ta: Handle) -> Option<Option<Na
     }))
 }
 
+/// Whether `next` is the shared built-in iterator `next`
+/// (`N_GEN_ITER_NEXT`): the value `Realm::coll_iter_next` last confirmed,
+/// else checked (and then remembered).
+#[inline]
+pub(crate) fn builtin_iter_next(realm: &mut Realm, next: NanBox) -> bool {
+    let bits = next.to_bits();
+    if bits == realm.coll_iter_next && bits != 0 {
+        return true;
+    }
+    let Some(nh) = next.as_handle() else {
+        return false;
+    };
+    if realm.native_at(Handle::from_raw(nh)) != Some(N_GEN_ITER_NEXT) {
+        return false;
+    }
+    if crate::realm::coll_step_lean_enabled() {
+        realm.coll_iter_next = bits;
+    }
+    true
+}
+
+/// [`realm_builtin_iter_step`] for an iterator `it` whose `next` was just
+/// found to be the shared built-in one: when it is a live Set/Map iterator
+/// in the learned layout, its step (`Some(None)` once done), with no other
+/// kind tried first; `None` (nothing changed) otherwise.
+#[inline]
+pub(crate) fn coll_iter_step_lean(realm: &mut Realm, it: NanBox) -> Option<Option<NanBox>> {
+    let h = Handle::from_raw(it.as_handle()?);
+    // (The layout's read is of a `Cell::Object`: an ordinary `[[Get]]`
+    // cell, as `realm_builtin_iter_step` requires.)
+    let [coll, state] = realm.coll_iter_layout.as_ref()?.read(realm, h)?;
+    let coll = Handle::from_raw(coll.as_handle()?);
+    let Some(state) = state.as_handle().map(Handle::from_raw) else {
+        return Some(None);
+    };
+    let Some((kind, k, v, is_set)) = realm.collection_iter_advance_kv(state, coll) else {
+        return Some(None);
+    };
+    Some(Some(match kind {
+        0 => k,
+        2 => NanBox::handle(realm.new_array(alloc::vec![k, v]).to_raw()),
+        _ if is_set => k,
+        _ => v,
+    }))
+}
+
 pub(crate) fn realm_builtin_iter_step(
     realm: &mut Realm,
     next: NanBox,
     it: NanBox,
 ) -> Option<Option<NanBox>> {
-    let nh = Handle::from_raw(next.as_handle()?);
-    if realm.native_at(nh) != Some(N_GEN_ITER_NEXT) {
+    if !builtin_iter_next(realm, next) {
         return None;
+    }
+    if crate::realm::coll_step_lean_enabled()
+        && let Some(step) = coll_iter_step_lean(realm, it)
+    {
+        return Some(step);
     }
     let h = Handle::from_raw(it.as_handle()?);
     if !realm.is_ordinary_get_cell(h) {

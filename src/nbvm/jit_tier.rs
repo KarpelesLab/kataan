@@ -2250,6 +2250,22 @@ pub(crate) extern "C" fn jit_helper_iter_next(
     #[allow(unsafe_code)]
     let regs = unsafe { core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs) };
     let (dst, done, iter, next) = (*dst, *done, *iter, *next);
+    // A built-in Set/Map (or snapshot) iterator whose `next` is the one the
+    // last such step confirmed (`nbexec::builtin_iter_next`): the step that
+    // `vm_iter_step` would come to, with no generator test first.
+    let (it, nx) = (regs[iter as usize], regs[next as usize]);
+    if it.as_handle().is_some()
+        && nx.to_bits() == ctx.realm.coll_iter_next
+        && regs[done as usize].as_boolean() != Some(true)
+        && let Some(step) = crate::nbexec::coll_iter_step_lean(&mut ctx.realm, it)
+            .or_else(|| crate::nbexec::realm_builtin_iter_step(&mut ctx.realm, nx, it))
+    {
+        if step.is_none() {
+            regs[done as usize] = NanBox::boolean(true);
+        }
+        regs[dst as usize] = step.unwrap_or(NanBox::undefined());
+        return 0;
+    }
     let r = match super::gen_fast::jit_for_of_step(ctx, funcs, regs, done, iter, next) {
         Some(r) => r,
         None => super::vm_iter_step(ctx, funcs, regs, done, iter, next),
