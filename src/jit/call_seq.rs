@@ -344,6 +344,48 @@ pub struct GetMethodMemo {
     pub stamp: u64,
     /// The last own-property hit (`KATAAN_JIT_OWNMEMO`).
     pub own: OwnMemo,
+    /// The last hit for a watched receiver (`KATAAN_JIT_WATCHMEMO`).
+    pub watched: WatchedMemo,
+}
+
+/// An `Op::GetMethod`'s last hit for a receiver that is
+/// [`JIT_FLAG_WATCHED`](crate::object::JIT_FLAG_WATCHED) (a prototype, or
+/// the stand-in of a sunk object, watched once made: `jit::sink`, whose
+/// method reads all have it for their receiver): the receiver's handle
+/// bits (`0` for none), the method value's address and the prototype epoch
+/// they were recorded at. Every change to a watched object's layout — its
+/// shape, `[[Prototype]]`, accessors, representation — bumps the epoch, as
+/// does any move of a heap cell, and a handle's bits name one object for
+/// as long as it lives (its generation is in them). So while the epoch is
+/// still `stamp`, that very receiver has the layout and chain the lookup
+/// memo's hit proved, and the method's value at `value` (read there, so a
+/// data property's write is seen): no walk, layout, epoch-recorded chain
+/// or accessor check.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WatchedMemo {
+    /// The receiver's handle bits, or `0`.
+    pub recv: u64,
+    /// The value's address.
+    pub value: u64,
+    /// The prototype epoch it was recorded at.
+    pub stamp: u64,
+}
+
+/// Whether an `Op::GetMethod` on a sunk object's stand-in first tries its
+/// memo of a watched receiver (`WatchedMemo`; `KATAAN_JIT_WATCHMEMO=0`
+/// turns it off, read once per process).
+#[must_use]
+pub fn watch_memo_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_WATCHMEMO").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// An `Op::GetMethod`'s last lookup that hit an own data property of its
@@ -663,6 +705,11 @@ impl CallSite {
                 own: OwnMemo {
                     recv: 0,
                     shape: 0,
+                    value: 0,
+                    stamp: 0,
+                },
+                watched: WatchedMemo {
+                    recv: 0,
                     value: 0,
                     stamp: 0,
                 },
@@ -2074,12 +2121,17 @@ pub(crate) fn emit_get_method(
     method: *const super::props::MethodSite,
     site: *const CallSite,
     miss: Label,
-    (way, proof): (Option<super::recv_cache::GetMethodWay>, Option<(i32, i32)>),
+    (way, proof, watched): (
+        Option<super::recv_cache::GetMethodWay>,
+        Option<(i32, i32)>,
+        bool,
+    ),
 ) {
     use core::mem::offset_of;
     let jl = super::compute_jit_layout();
     let m = |f: usize| site_off(offset_of!(CallSite, getm) + f);
     let lk = |f: usize| m(offset_of!(GetMethodMemo, lookup) + f);
+    let wm = |f: usize| m(offset_of!(GetMethodMemo, watched) + f);
     let lookup = a.new_label();
     let have = a.new_label();
     // The read's proof (`super::gelim`, `(bits, value)` slots): the same
@@ -2094,6 +2146,23 @@ pub(crate) fn emit_get_method(
         a.g_load(r::RAX, RBP, value);
         a.jmp(proven);
         a.bind(full);
+    }
+    // A receiver that keeps being the same watched object (`watched`: a sunk
+    // object's method read, whose receiver is its site's stand-in): the memo
+    // of its last hit, with no walk (see `WatchedMemo`).
+    if watched {
+        let walk = a.new_label();
+        a.g_load(r::RAX, recv.0, recv.1);
+        a.g_movabs(r::R11, site as u64);
+        a.g_cmp_mem(r::RAX, r::R11, wm(offset_of!(WatchedMemo, recv)));
+        a.g_jcc(cc::NE, walk);
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, wm(offset_of!(WatchedMemo, stamp)));
+        a.g_jcc(cc::NE, walk);
+        a.g_load(r::R9, r::R11, wm(offset_of!(WatchedMemo, value)));
+        a.g_load(r::RAX, r::R9, 0);
+        a.jmp(have);
+        a.bind(walk);
     }
     // The receiver through its receiver-cache way (see `GetMethodWay`): a
     // hit takes the walked slot from it; a walk fills it.
@@ -2135,6 +2204,21 @@ pub(crate) fn emit_get_method(
     let own = own_memo_enabled();
     a.g_load(r::R9, r::R11, lk(offset_of!(LookupMemo, value)));
     a.g_load(r::RAX, r::R9, 0);
+    // (A watched receiver's hit — its slot in `rcx`, the site in `r11`, the
+    // value's address in `r9` and the value in `rax`, kept — recorded for
+    // it: `WatchedMemo`.)
+    let fill_watched = |a: &mut X64Assembler| {
+        if watched {
+            a.p_test_byte_imm(r::RCX, jl.props.off_jit_flags, super::props::FLAG_WATCHED);
+            a.g_jcc(cc::E, have);
+            a.g_store(r::R11, wm(offset_of!(WatchedMemo, value)), r::R9);
+            a.g_load(r::R9, recv.0, recv.1);
+            a.g_store(r::R11, wm(offset_of!(WatchedMemo, recv)), r::R9);
+            load_proto_epoch(a, r::R9);
+            a.g_store(r::R11, wm(offset_of!(WatchedMemo, stamp)), r::R9);
+        }
+    };
+    fill_watched(a);
     a.jmp(have);
     // (Out of line: the lookup, from the walked receiver in `rcx`, leaves
     // its entry in `r11` and `rsi` nonzero when the memo may record it.)
@@ -2157,6 +2241,7 @@ pub(crate) fn emit_get_method(
         emit_no_accessors(a, full);
         a.g_load(r::R9, r::R11, o(offset_of!(OwnMemo, value)));
         a.g_load(r::RAX, r::R9, 0);
+        fill_watched(a);
         a.jmp(have);
     }
     a.bind(full);

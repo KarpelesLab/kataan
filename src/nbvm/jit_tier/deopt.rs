@@ -360,6 +360,12 @@ fn refresh_memos(ctx: &mut Ctx, sx: &SinkExits, regs: &[NanBox], pc: usize, afte
             for key in &site.keys {
                 ctx.realm.set_property(t, key, NanBox::number(0.0));
             }
+            // (Watched, its layout now made: a method read on it takes its
+            // memo of a watched receiver, `call_seq::WatchedMemo`. Nothing
+            // changes it, but anything that did would bump the epoch.)
+            if crate::jit::watch_memo_enabled() {
+                ctx.realm.jit_watch(t);
+            }
             ctx.realm
                 .fill_lit_word(&sx.lits, sx.lit_base + k, NanBox::handle(t.to_raw()));
             memo.proto.set(f.proto);

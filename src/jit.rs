@@ -88,7 +88,7 @@ pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, FnCallMemo, HDR_CONSTRUCT,
     IdentMemo, JitStack, MethodHelper, PollLayout, SuperTwiceHelper, header_argc,
-    inline_hframe_enabled,
+    inline_hframe_enabled, watch_memo_enabled,
 };
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use deopt::DeoptInfo;
@@ -16727,6 +16727,10 @@ impl JitFunction {
                                         layout: way_shape[p.way],
                                     }),
                                 gm_slot[op_idx].map(gm_proof),
+                                // (A sunk object's method read: its receiver
+                                // is the site's stand-in, every time.)
+                                call_seq::watch_memo_enabled()
+                                    && sink_x.is_some_and(|x| x.plan.vget[op_idx]),
                             ),
                         );
                     }
