@@ -2341,7 +2341,12 @@ fn emit_call_fast(
         }
     }
     a.jmp(slow);
+    // (Past the first, the ways' paths are out of line.)
+    let mut cold = None;
     for (w, &f) in found.iter().enumerate() {
+        if w == 1 && call_cold_enabled() {
+            cold = Some(a.cold_begin());
+        }
         a.bind(f);
         a.dbg_mark("c-found");
         load_proto_epoch(a, r::R9);
@@ -2358,6 +2363,18 @@ fn emit_call_fast(
         a.g_load(r::R11, r::R11, m(w, offset_of!(CallMemo, target)));
         a.jmp(identified);
     }
+    if let Some(cold) = cold {
+        a.cold_end(cold);
+    }
+}
+
+/// Whether a method call sequence has what runs when its first way's memo
+/// does not hold — the other ways' paths, the chain-cache lookup and the
+/// memo check after it — out of line (`KATAAN_JIT_CALLCOLD=0` disables).
+/// Read once.
+fn call_cold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CALLCOLD").is_none_or(|v| v != "0"))
 }
 
 /// A body's **shared callee identification** (`KATAAN_JIT_IDENTSUB`): what a
@@ -2585,6 +2602,9 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // `identified`: the way is in r11 and the captures in r8 already (a memo
     // hit, or a constructor the site's `fast` cache prepared).
     let identified = a.new_label();
+    // (A method call's lookup past its memos' fast path is out of line:
+    // `call_cold_enabled`.)
+    let mut slow_cold = None;
     // The memo check for the callee value in `rax` (see `CallMemo`): the
     // value one of the ways' memos names, at the current prototype epoch —
     // then r11 = the way, r8 = the captures and on to `identified`; else on,
@@ -2677,6 +2697,9 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.p_walk_plain(jl, l.realm, (r::RBX, reg(recv)), lookup);
             let slow = a.new_label();
             emit_call_fast(a, e.site, scratch, slow, identified);
+            if call_cold_enabled() && !fresh {
+                slow_cold = Some(a.cold_begin());
+            }
             a.bind(slow);
             a.p_method_lookup_walked(jl, l.realm, site, lookup, None);
             a.g_mov(r::RDI, r::R11);
@@ -2893,6 +2916,11 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
                 a.cold_end(cold);
             }
         }
+    }
+    // (The method lookup's region goes on after the memo check's way-0
+    // path, which ends in a jump to `identified`.)
+    if let Some(cold) = slow_cold {
+        a.cold_end(cold);
     }
     a.bind(identified);
     // In an inlined body (`InlineCtx`): when every enclosing activation is
