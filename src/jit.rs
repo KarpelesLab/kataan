@@ -11066,7 +11066,6 @@ impl JitFunction {
         a.mov_rbx_rsi(); // pin the register file
         a.pin_enter(); // the caller's `r12`/`r13`, and the arena (clobbers `r11` only)
         a.mov_frame8_imm32(COUNTDOWN, 1); // poll at the first back-edge
-        call_seq::emit_act_ok(&mut a, &helpers.call_layout);
         // A sync generator's native resumptions (`gen_native`): per plain
         // `yield` whose resumption pc is an entry, a stub landing the sent
         // value — (stub, the function's own resumption pc, the `yield`'s
@@ -11103,6 +11102,7 @@ impl JitFunction {
         if !gen_stubs.is_empty() {
             gen_native::emit_dispatch_check(&mut a, gen_native_l);
         }
+        call_seq::emit_act_ok(&mut a, &helpers.call_layout);
         // Entry dispatch: `entry` (rdx) is 0 or a known loop header.
         for &t in osr_entries {
             if t == 0 || t >= ops.len() {

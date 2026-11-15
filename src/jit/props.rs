@@ -1643,6 +1643,15 @@ impl X64Assembler {
         self.bind(done);
     }
 
+    /// After a [`p_method_lookup`](Self::p_method_lookup) hit (`r11` the
+    /// entry that hit): to `other` unless the entry is of depth `0` (the
+    /// receiver's own property). Changes no register.
+    pub(crate) fn p_entry_depth_zero(&mut self, other: Label) {
+        let depth = i32::try_from(core::mem::offset_of!(MethodEntry, depth)).expect("offset");
+        self.p_cmp32_imm8(r::R11, depth, 0);
+        self.g_jcc(cc::NE, other);
+    }
+
     /// With a slot index (zero-extended) in `rax` and an object's heap slot in
     /// `rcx`: `dst` = the address of that property value — inline in the
     /// object for the first [`crate::object::INLINE_SLOTS`], else in its

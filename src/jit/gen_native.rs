@@ -243,10 +243,15 @@ pub(crate) fn emit_dispatch_check(a: &mut X64Assembler, native: Label) {
     a.g_jcc(0x8, native); // js
 }
 
-/// The body's native dispatch (`native`, out of line): the entry word with
+/// The body's native dispatch (`native`, out of line, before the entry's
+/// own `call_seq::emit_act_ok`): the activation may make native calls —
+/// its register file is the one its caller declared rooted, and the
+/// caller, compiled code that may itself make native calls, runs at a
+/// nonzero depth, which no native call changes — and the entry word with
 /// its top bit cleared is the resumption stub's address.
 pub(crate) fn emit_native_dispatch(a: &mut X64Assembler, native: Label) {
     a.bind(native);
+    super::call_seq::emit_act_ok_known(a);
     // btr rdx, 63; jmp rdx
     a.code
         .extend_from_slice(&[0x48, 0x0f, 0xba, 0xf2, ENTRY_BIT]);
@@ -481,9 +486,6 @@ pub(crate) fn emit_resume(a: &mut X64Assembler, l: &CallLayout, e: &ResumeEmit) 
     a.g_load(r::R9, r::R15, l.realm);
     a.g_dec_mem(r::R9, g.live_n);
     a.g_dec_mem(r::R9, l.total_depth);
-    a.g_store(r::R15, g.scratch, r::RAX);
-    a.g_store(r::R15, g.scratch + 8, r::RSI);
-    a.g_store(r::R15, g.scratch + 16, r::R8);
     let fin = a.new_label();
     // A plain `yield` (the exit sentinel, a suspension pending at a pc with
     // a resumption stub), the handler segment empty, no sweep since the
@@ -570,8 +572,12 @@ pub(crate) fn emit_resume(a: &mut X64Assembler, l: &CallLayout, e: &ResumeEmit) 
         a.cold_end(c);
     }
     // Any other end: the Rust path's (it stores the result).
+    // (`rax`, `rsi` and `r8` as the end left them.)
     let cold = a.cold_begin();
     a.bind(fin);
+    a.g_store(r::R15, g.scratch, r::RAX);
+    a.g_store(r::R15, g.scratch + 8, r::RSI);
+    a.g_store(r::R15, g.scratch + 16, r::R8);
     a.g_mov(r::RDI, r::R15);
     a.g_mov(r::RSI, r::RBX);
     a.g_movabs(r::RDX, e.n_regs as u64);

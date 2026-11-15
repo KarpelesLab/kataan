@@ -1040,6 +1040,29 @@ pub(super) fn native_finish(
     reuse: Option<&mut u64>,
 ) -> Result<NanBox, VmError> {
     use super::jit_tier::GenRun;
+    // The body returned (fell off its end or ran a `return`): the generator
+    // completes with that value — `cell_exit` + `finish`'s outcome for it,
+    // in one borrow of the cell.
+    let ret = NanBox::from_bits(raw);
+    if raw != NanBox::jit_exit_bits() && !ret.is_jit_throw_sentinel() {
+        super::jit_tier::native_close_segment(ctx, outer_base);
+        let value = if raw == NanBox::jit_falloff_bits() {
+            NanBox::undefined()
+        } else {
+            ret
+        };
+        let regs = match ctx.realm.vm_frame_mut(fh) {
+            Some(f) => {
+                f.state = S_COMPLETED;
+                core::mem::take(&mut f.regs)
+            }
+            None => return Err(VmError::NotAnObject),
+        };
+        recycle(ctx, regs);
+        return Ok(NanBox::handle(
+            ctx.realm.new_iter_result(value, true).to_raw(),
+        ));
+    }
     let (run, handlers) = super::jit_tier::native_run_outcome(ctx, raw, outer_base);
     let Some(id) = ctx.realm.vm_frame(fh).map(|f| f.func as usize) else {
         return Err(VmError::NotAnObject);

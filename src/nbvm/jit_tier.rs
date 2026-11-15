@@ -3964,6 +3964,15 @@ pub(crate) extern "C" fn jit_helper_gen_native_result(
     super::gen_fast::yield_result(ctx, NanBox::from_bits(value), slot).to_bits()
 }
 
+/// A native resumption's body's handler segment closed (its handlers
+/// dropped) and the caller's base `outer_base` restored, for an end that
+/// is not a suspension.
+pub(super) fn native_close_segment(ctx: &mut Ctx, outer_base: usize) {
+    let base = ctx.jit_rt.base;
+    ctx.jit_rt.handlers.truncate(base);
+    ctx.jit_rt.base = outer_base;
+}
+
 /// [`run_generator_body_with`]'s ending, for a native resumption's body
 /// that ran with its own handler segment from the context's current
 /// `base` (`outer_base` the caller's): what it ran to, and the handlers

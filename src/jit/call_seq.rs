@@ -282,9 +282,9 @@ pub struct CallSite {
     /// value is a new one (`ev.fn()` over events each made with its own
     /// arrow function), so no memo would name it. The sequence then
     /// identifies the callee by its function at once (`KATAAN_JIT_FRESHCALL`):
-    /// no later way's memo is compared, no method-call memo is tried, and
-    /// none is refilled. Only which checks run first changes: the
-    /// identification is the same.
+    /// past the first way's, no memo is compared (nor a method-call memo
+    /// tried). Only which checks run first changes: the identification is
+    /// the same.
     pub fresh: bool,
     /// A `g.next(v)` site's native resumption memo (`super::gen_native`).
     pub gnat: super::gen_native::GenMemo,
@@ -333,7 +333,8 @@ pub(crate) const SPEC_MISSES: i32 = core::mem::offset_of!(CallSite, spec_misses)
 /// epoch `stamp`. While the epoch is still `stamp`, a receiver with the
 /// lookup's shape and `[[Prototype]]` and no accessors has the method's
 /// value at the lookup's address, which the read then loads without the
-/// lookup.
+/// lookup. A lookup that hit an own data property of the receiver is
+/// recorded apart (`own`, see [`OwnMemo`]), tried when that misses.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GetMethodMemo {
@@ -341,6 +342,46 @@ pub struct GetMethodMemo {
     pub lookup: LookupMemo,
     /// The prototype epoch at which it was recorded.
     pub stamp: u64,
+    /// The last own-property hit (`KATAAN_JIT_OWNMEMO`).
+    pub own: OwnMemo,
+}
+
+/// An `Op::GetMethod`'s last lookup that hit an own data property of its
+/// receiver — the method of a namespace object, `Math.imul`: the receiver
+/// (its handle bits, `0` for none), its shape and the property value's
+/// address at prototype epoch `stamp`. The address is the receiver's own
+/// slot's — in its cell (which moves only with the epoch), its `extra`
+/// part's near spill or its far spill array (which only an added property,
+/// a new shape, reallocates) — so for that very receiver with that shape and
+/// no accessors, while the epoch stands, the property is still there (its
+/// `[[Prototype]]` does not matter: the own property is found first).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OwnMemo {
+    /// The receiver's handle bits, or `0`.
+    pub recv: u64,
+    /// Its shape word.
+    pub shape: u64,
+    /// The value's address.
+    pub value: u64,
+    /// The prototype epoch it was recorded at.
+    pub stamp: u64,
+}
+
+/// Whether an `Op::GetMethod`'s memo records an own data property's hit
+/// for its receiver (see [`GetMethodMemo::recv`]; `KATAAN_JIT_OWNMEMO=0`
+/// turns it off, read once per process).
+#[must_use]
+pub(crate) fn own_memo_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_OWNMEMO").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// What a method lookup that hit proved, as a memo keeps it: the site's
@@ -619,6 +660,12 @@ impl CallSite {
             getm: GetMethodMemo {
                 lookup: LookupMemo::empty(),
                 stamp: 0,
+                own: OwnMemo {
+                    recv: 0,
+                    shape: 0,
+                    value: 0,
+                    stamp: 0,
+                },
             },
             spec_misses: 0,
             entry_argc: Self::ENTRY_UNSET,
@@ -1919,6 +1966,13 @@ pub(crate) fn emit_act_ok(a: &mut X64Assembler, l: &CallLayout) {
     a.bind(bad);
 }
 
+/// [`emit_act_ok`]'s outcome for an entry known to qualify (a native
+/// generator resumption's, `super::gen_native`): the activation may make
+/// native calls.
+pub(crate) fn emit_act_ok_known(a: &mut X64Assembler) {
+    a.g_store_imm32(RBP, ACT_OK, FALLOFF_DELTA << 8);
+}
+
 /// Falling off the end of a body: `rax` = what its entry says that returns
 /// (see [`ACT_OK`]). Clobbers `r11`.
 pub(crate) fn emit_falloff_value(a: &mut X64Assembler) {
@@ -2078,6 +2132,7 @@ pub(crate) fn emit_get_method(
     a.g_cmp_mem(r::R9, r::R11, m(offset_of!(GetMethodMemo, stamp)));
     a.g_jcc(cc::NE, lookup);
     emit_no_accessors(a, lookup);
+    let own = own_memo_enabled();
     a.g_load(r::R9, r::R11, lk(offset_of!(LookupMemo, value)));
     a.g_load(r::RAX, r::R9, 0);
     a.jmp(have);
@@ -2085,15 +2140,52 @@ pub(crate) fn emit_get_method(
     // its entry in `r11` and `rsi` nonzero when the memo may record it.)
     let cold = a.cold_begin();
     a.bind(lookup);
+    let o = |f: usize| m(offset_of!(GetMethodMemo, own) + f);
+    let full = a.new_label();
+    if own {
+        // The last own-property hit's, for this very receiver.
+        a.g_movabs(r::R11, site as u64);
+        a.g_load(r::RAX, recv.0, recv.1);
+        a.g_cmp_mem(r::RAX, r::R11, o(offset_of!(OwnMemo, recv)));
+        a.g_jcc(cc::NE, full);
+        a.g_load(r::RAX, r::RCX, jl.off_shape);
+        a.g_cmp_mem(r::RAX, r::R11, o(offset_of!(OwnMemo, shape)));
+        a.g_jcc(cc::NE, full);
+        load_proto_epoch(a, r::R9);
+        a.g_cmp_mem(r::R9, r::R11, o(offset_of!(OwnMemo, stamp)));
+        a.g_jcc(cc::NE, full);
+        emit_no_accessors(a, full);
+        a.g_load(r::R9, r::R11, o(offset_of!(OwnMemo, value)));
+        a.g_load(r::RAX, r::R9, 0);
+        a.jmp(have);
+    }
+    a.bind(full);
     a.p_method_lookup_walked(jl, realm_off, method, miss, None);
+    let own_hit = a.new_label();
     a.g_test(r::RSI);
-    a.g_jcc(cc::E, have);
+    a.g_jcc(cc::E, if own { own_hit } else { have });
     a.g_mov(r::RDI, r::R11);
     a.g_movabs(r::R11, site as u64);
     emit_lookup_fill(a, r::R11, lk(0));
     load_proto_epoch(a, r::R9);
     a.g_store(r::R11, m(offset_of!(GetMethodMemo, stamp)), r::R9);
     a.jmp(have);
+    if own {
+        // An own data property's hit (the entry in `r11` of depth `0`, the
+        // value's address in `r9`, the receiver's slot in `rcx`): recorded
+        // for this receiver.
+        a.bind(own_hit);
+        a.p_entry_depth_zero(have);
+        a.g_movabs(r::RDX, site as u64);
+        a.g_store(r::RDX, o(offset_of!(OwnMemo, value)), r::R9);
+        a.g_load(r::R9, r::RCX, jl.off_shape);
+        a.g_store(r::RDX, o(offset_of!(OwnMemo, shape)), r::R9);
+        a.g_load(r::R9, recv.0, recv.1);
+        a.g_store(r::RDX, o(offset_of!(OwnMemo, recv)), r::R9);
+        load_proto_epoch(a, r::R9);
+        a.g_store(r::RDX, o(offset_of!(OwnMemo, stamp)), r::R9);
+        a.jmp(have);
+    }
     a.cold_end(cold);
     a.bind(have);
     if let Some((bits, value)) = proof {
@@ -2129,11 +2221,6 @@ fn emit_call_fast(
     a.g_load(r::RAX, r::RCX, jl.off_shape);
     a.g_load(r::RDX, r::RCX, jl.props.off_proto);
     a.g_movabs(r::R11, site as u64);
-    // (A site of fresh closures: no memo names the callee value.)
-    if fresh_call_enabled() {
-        a.g_cmp_byte_imm(r::R11, FRESH, 0);
-        a.g_jcc(cc::NE, slow);
-    }
     for (w, &f) in found.iter().enumerate() {
         let next = a.new_label();
         a.g_cmp_mem(r::RAX, r::R11, lk(w, offset_of!(LookupMemo, shape)));
@@ -2141,6 +2228,12 @@ fn emit_call_fast(
         a.g_cmp_mem(r::RDX, r::R11, lk(w, offset_of!(LookupMemo, proto)));
         a.g_jcc(cc::E, f);
         a.bind(next);
+        // (A site of fresh closures, past its first way: no memo names the
+        // callee value.)
+        if w == 0 && fresh_call_enabled() {
+            a.g_cmp_byte_imm(r::R11, FRESH, 0);
+            a.g_jcc(cc::NE, slow);
+        }
     }
     a.jmp(slow);
     for (w, &f) in found.iter().enumerate() {
@@ -2421,15 +2514,15 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     }
     a.bind(hit);
     a.g_mov(r::R8, r::RDX); // captures, for the callee's entry
-    let memoized = a.new_label();
     if memoize && fresh_call_enabled() {
-        // A site of fresh closures refills no memo; at any other, a way
-        // whose memo named another value counts as a fresh closure (see
-        // `CallSite::fresh`).
+        // (A site of fresh closures still refills its way's memo — a
+        // closure called again right away hits it — but counts no more.)
+        // At any other, a way whose memo named another value counts as a
+        // fresh closure (see `CallSite::fresh`).
         let store = a.new_label();
         a.g_movabs(r::R9, e.site as u64);
         a.g_cmp_byte_imm(r::R9, FRESH, 0);
-        a.g_jcc(cc::NE, memoized);
+        a.g_jcc(cc::NE, store);
         a.g_load(r::R9, r::R10, memo_bits(0));
         a.g_cmp_mem(r::R9, callee_base, callee_disp);
         a.g_jcc(cc::E, store);
@@ -2467,7 +2560,6 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.bind(filled);
         }
     }
-    a.bind(memoized);
     if let Some(cold) = cold {
         a.jmp(identified);
         a.cold_end(cold);
