@@ -507,6 +507,9 @@ pub struct MethodSite {
     /// The way the next new entry replaces.
     next: usize,
     fills: u32,
+    /// Whether a read's fill ever found an inherited getter
+    /// ([`saw_getter`](Self::saw_getter)).
+    saw_getter: bool,
     /// The site's add cache, when it is a property write.
     add: AddEntry,
     /// The proof of an inline `s.charCodeAt(i)`, kept beside the cache of the
@@ -670,6 +673,7 @@ impl MethodSite {
             cache,
             next: 0,
             fills: 0,
+            saw_getter: false,
             add: AddEntry::default(),
             str_proof: StrProof {
                 stamp: u64::MAX,
@@ -941,6 +945,14 @@ impl MethodSite {
         )
     }
 
+    /// Whether a property read here ever found an inherited VM-function
+    /// getter its entries could record ([`fill_get`](Self::fill_get)): a
+    /// compile that sees none leaves the getter's call to the read's
+    /// helper (`KATAAN_JIT_GETSEEN`).
+    pub(crate) fn saw_getter(&self) -> bool {
+        self.saw_getter
+    }
+
     /// The site's key.
     pub(crate) fn key(&self) -> &'static str {
         // SAFETY: `key_ptr`/`key_len` are the owning `JitProto`'s boxed key
@@ -1045,6 +1057,7 @@ impl MethodSite {
             self.count_fill(false);
             return None;
         };
+        self.saw_getter |= entry.acc != 0;
         if !self.count_fill(self.holds_layout(&entry)) {
             return None;
         }

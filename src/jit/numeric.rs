@@ -7521,6 +7521,21 @@ impl NumGen {
         let stubs = core::mem::take(&mut self.stubs);
         for s in &stubs {
             a.bind(s.entry);
+            a.dbg_mark(match s.kind {
+                StubKind::Bail { .. } => "n-bail",
+                StubKind::PostBail { .. } => "n-postbail",
+                StubKind::SpecBail { .. } => "n-specbail",
+                StubKind::StrictEq { .. } => "n-stricteq",
+                StubKind::CanonNan => "n-canon",
+                StubKind::NanCheck { .. } => "n-nancheck",
+                StubKind::DeferNan { .. } => "n-defernan",
+                StubKind::Exit { .. } => "n-exit",
+                StubKind::Helper { .. } => "n-helper",
+                StubKind::GlobalRef { .. } => "n-gref",
+                StubKind::Mirror { .. } => "n-mirror",
+                StubKind::Exec { .. } => "n-exec",
+                StubKind::Truthy { .. } => "n-truthy",
+            });
             a.set_plain_lazy(s.plain.clone());
             self.cur_pc = s.pc;
             self.copy = s.copy;
@@ -7822,6 +7837,7 @@ impl NumGen {
         a.set_plain_lazy(Vec::new());
         self.imode = None;
         self.copy = false;
+        a.dbg_mark("n-nest");
         for (l, pc) in core::mem::take(&mut self.nest_entries) {
             a.bind(l);
             let Some(ri) = self.region_at(pc) else {
@@ -7846,6 +7862,7 @@ impl NumGen {
                 a.jmp(t);
             }
         }
+        a.dbg_mark("n-inner");
         self.emit_inner_entries(a, labels);
     }
 

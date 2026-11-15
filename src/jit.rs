@@ -6183,6 +6183,8 @@ pub struct X64Assembler {
         allow(dead_code)
     )]
     pub(crate) dbg_op: Option<usize>,
+    /// The code-size attribution (`KATAAN_JIT_SIZEMAP`), when on.
+    pub(crate) size_map: Option<alloc::boxed::Box<SizeMap>>,
     /// Per-label byte offset (`usize::MAX` until [`bind`](Self::bind)).
     labels: Vec<usize>,
     /// Pending `rel32` jump fixups: `(operand offset in `code`, target label,
@@ -6363,6 +6365,11 @@ pub struct X64Assembler {
     /// [`finish`](Self::finish) after the cold chunks.
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     post_stubs: Vec<(PostCall, Label)>,
+    /// Emitting the body's out-of-line tail (its slow paths after the
+    /// ops' code, which is no cold region but runs as rarely): its calls'
+    /// after-sequences may be shared stubs too
+    /// ([`post_call_outlined`](Self::post_call_outlined)).
+    pub(crate) ool_tail: bool,
     /// The latest 10-byte `movabs rax, imm64` (`mov_imm64`): where it
     /// starts and its value ([`call_rax`](Self::call_rax)).
     last_imm_rax: Option<(usize, u64)>,
@@ -6415,6 +6422,86 @@ struct ColdChunk {
     code: Vec<u8>,
     labels: Vec<(usize, usize)>,
     fixups: Vec<Fixup>,
+}
+
+/// **Code-size attribution** (`KATAAN_JIT_SIZEMAP`, a diagnostic): the
+/// bytes a generic compile emits, before `finish_jumps` shrinks them, by the
+/// op emitting them (`pre`/`post` around the ops), the profiling marks
+/// ([`X64Assembler::dbg_mark`]; an `x-`/`o-`/`n-` one names an out-of-line
+/// section, any other a part of it) and whether a cold region holds them.
+/// Each compile reports its table to stderr as `[size]` lines.
+#[derive(Default)]
+pub(crate) struct SizeMap {
+    bytes: alloc::collections::BTreeMap<
+        (alloc::string::String, &'static str, &'static str, bool),
+        i64,
+    >,
+    counts: alloc::collections::BTreeMap<&'static str, u32>,
+    ops: alloc::collections::BTreeMap<alloc::string::String, u32>,
+    op: alloc::string::String,
+    section: &'static str,
+    part: &'static str,
+    /// The bytes emitted so far, cut cold regions included, at the last
+    /// flush; and the bytes cut so far.
+    at: usize,
+    cut: usize,
+}
+
+impl SizeMap {
+    /// A map when `KATAAN_JIT_SIZEMAP` is set.
+    pub(crate) fn new_if_on() -> Option<alloc::boxed::Box<Self>> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SIZEMAP").is_some()) {
+            return None;
+        }
+        let mut m = alloc::boxed::Box::new(Self::default());
+        m.op = "pre".into();
+        Some(m)
+    }
+
+    fn flush(&mut self, len: usize, cold: bool) {
+        let now = len + self.cut;
+        let d = now as i64 - self.at as i64;
+        self.at = now;
+        if d != 0 {
+            let k = (self.op.clone(), self.section, self.part, cold);
+            *self.bytes.entry(k).or_insert(0) += d;
+        }
+    }
+
+    fn op(&mut self, name: &str) {
+        self.op = name.into();
+        (self.section, self.part) = ("", "");
+        *self.ops.entry(self.op.clone()).or_insert(0) += 1;
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        if ["x-", "o-", "n-"].iter().any(|p| name.starts_with(p)) || name == "stub" {
+            (self.section, self.part) = (name, "");
+        } else {
+            self.part = name;
+        }
+        *self.counts.entry(name).or_insert(0) += 1;
+    }
+
+    /// The report: `[size] T <bytes>`, then `[size] B <op> <section>/<part>
+    /// <H|C> <bytes>`, `[size] N <mark> <count>`, `[size] O <op> <count>`.
+    pub(crate) fn report(&self) -> alloc::string::String {
+        use core::fmt::Write as _;
+        let mut s = alloc::string::String::new();
+        let _ = writeln!(s, "[size] T {}", self.at);
+        for ((op, sec, part, cold), b) in &self.bytes {
+            let c = if *cold { 'C' } else { 'H' };
+            let _ = writeln!(s, "[size] B {op} {sec}/{part} {c} {b}");
+        }
+        for (m, n) in &self.counts {
+            let _ = writeln!(s, "[size] N {m} {n}");
+        }
+        for (op, n) in &self.ops {
+            let _ = writeln!(s, "[size] O {op} {n}");
+        }
+        s
+    }
 }
 
 /// Where a cold region began ([`X64Assembler::cold_begin`]).
@@ -6900,6 +6987,16 @@ pub(crate) fn scan_memo_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SCANMEMO").is_none_or(|v| v != "0"))
 }
 
+/// Whether a `GetProp`'s out-of-line miss path calls an inherited getter in
+/// line only at a site that has seen one (`MethodSite::saw_getter`); at
+/// any other the getter's call is the read helper's, which needs none of
+/// the call sequence's code (unless `KATAAN_JIT_GETSEEN=0`). Read once.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn get_seen_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GETSEEN").is_none_or(|v| v != "0"))
+}
+
 /// The value a receiver-cache key slot holds when it caches nothing: the
 /// handle bits of slot index `u32::MAX`, which `Heap::alloc` never hands out,
 /// so no register ever holds them.
@@ -6912,6 +7009,15 @@ const RECV_CACHE_EMPTY: i32 = -1;
 fn prologue_sse_clear() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SSECLR").is_none_or(|v| v != "0"))
+}
+
+/// Whether the out-of-line tail of a generic body counts as cold code for
+/// [`X64Assembler::post_call_outlined`] (`KATAAN_JIT_POSTOOL=0` disables).
+/// Read once.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn post_ool_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_POSTOOL").is_none_or(|v| v != "0"))
 }
 
 /// The least number of bytes (roughly) of in-line post-call code that a
@@ -7021,11 +7127,35 @@ impl X64Assembler {
         allow(dead_code)
     )]
     pub(crate) fn dbg_mark(&mut self, name: &'static str) {
+        if self.size_map.is_some() {
+            self.size_flush();
+            if let Some(m) = self.size_map.as_mut() {
+                m.mark(name);
+            }
+        }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_OPMAP").is_some()) {
             let l = self.new_label();
             self.bind(l);
             self.dbg_marks.push((l, name, self.dbg_op));
+        }
+    }
+
+    /// [`SizeMap`]: charges the bytes emitted since its last flush (cut
+    /// cold regions included) to its current key.
+    pub(crate) fn size_flush(&mut self) {
+        let len = self.code.len();
+        let cold = self.cold_binds.is_some();
+        if let Some(m) = self.size_map.as_mut() {
+            m.flush(len, cold);
+        }
+    }
+
+    /// [`SizeMap`]: the code from here on is op `name`'s.
+    pub(crate) fn size_op(&mut self, name: &str) {
+        self.size_flush();
+        if let Some(m) = self.size_map.as_mut() {
+            m.op(name);
         }
     }
 
@@ -7422,6 +7552,7 @@ impl X64Assembler {
         allow(dead_code)
     )]
     pub(crate) fn cold_begin(&mut self) -> ColdMark {
+        self.size_flush();
         let start = self.code.len();
         let mark = ColdMark {
             start,
@@ -7461,6 +7592,10 @@ impl X64Assembler {
         allow(dead_code)
     )]
     pub(crate) fn cold_end(&mut self, mark: ColdMark) {
+        self.size_flush();
+        if let Some(m) = self.size_map.as_mut() {
+            m.cut += self.code.len() - mark.start;
+        }
         let (start, end) = (mark.start, self.code.len());
         self.last_imm_rax = None;
         let code = self.code.split_off(start);
@@ -8157,7 +8292,7 @@ impl X64Assembler {
     /// made pushed its own, so it disturbs nothing the call did not.)
     #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn post_call_outlined(&mut self, globals: bool) -> bool {
-        if self.cold_binds.is_none() {
+        if self.cold_binds.is_none() && !(self.ool_tail && post_ool_enabled()) {
             return false;
         }
         if !self.recv_survive.is_empty() {
@@ -11018,6 +11153,7 @@ impl JitFunction {
         // about a kilobyte of code per op, a `rel32` per 20 bytes of it, and
         // growing a buffer that large copies it each time.)
         a.code.reserve(ops.len() * 1024 + 4096);
+        a.size_map = SizeMap::new_if_on();
         a.fixups.reserve(ops.len() * 48 + 256);
         a.set_rbx_frame(true);
         a.call_saved_top = call_seq::headerless_enabled().then(|| -(frame as i32));
@@ -12193,6 +12329,10 @@ impl JitFunction {
                 a.bind(pre_resume.swap_remove(k).2);
             }
             a.dbg_op = Some(op_idx);
+            if a.size_map.is_some() {
+                let name = alloc::format!("{:?}", ops[op_idx]);
+                a.size_op(name.split([' ', '{', '(']).next().unwrap_or(""));
+            }
             // (A lazily pending activation's window is its body's ops in
             // the pass that emitted its guard.)
             if let Some(k) = lazy_open
@@ -19610,6 +19750,10 @@ impl JitFunction {
         a.set_recv_survive(Vec::new(), layout);
         num.set_copy(false);
         a.dbg_op = None;
+        if a.size_map.is_some() {
+            a.size_op("post");
+        }
+        a.ool_tail = true;
         // (Out of line, a call sequence runs the stub of whatever inlined
         // activation is pending first.)
         a.set_inline_ctx(None);
@@ -19877,7 +20021,15 @@ impl JitFunction {
             a.set_plain_lazy(plain_of(&plain_stubs, helper));
             a.dbg_mark("x-get");
             let slow = a.new_label();
-            let getter = a.new_label();
+            // (A site that never met an inherited getter leaves one to the
+            // helper: `get_seen_enabled`.)
+            // SAFETY: the site is the compiled function's own, alive while
+            // it is compiled, and only Rust code on this thread writes it.
+            #[allow(unsafe_code)]
+            let seen = !get_seen_enabled()
+                || method_ptr.is_null()
+                || unsafe { (*method_ptr).saw_getter() };
+            let getter = if seen { a.new_label() } else { slow };
             // A built-in function receiver's own data property
             // (`Object.prototype`): the site's memo of it.
             let chain = a.new_label();
@@ -19890,37 +20042,41 @@ impl JitFunction {
             a.store_rax(disp(dst));
             a.jmp(done);
             a.bind(chain);
+            a.dbg_mark("look");
             a.p_method_lookup(
                 &layout,
                 helpers.call_layout.realm,
                 (call_seq::r::RBX, disp(obj)),
                 method_ptr,
                 slow,
-                Some(getter),
+                seen.then_some(getter),
             );
             a.store_rax(disp(dst));
             a.jmp(done);
-            a.bind(getter);
-            a.store_rax(method_scratch);
-            call_seq::emit_call(
-                &mut a,
-                &call_seq::CallEmit {
-                    dst,
-                    callee: call_seq::CalleeSrc::Frame {
-                        scratch: method_scratch,
+            if seen {
+                a.bind(getter);
+                a.store_rax(method_scratch);
+                call_seq::emit_call(
+                    &mut a,
+                    &call_seq::CallEmit {
+                        dst,
+                        callee: call_seq::CalleeSrc::Frame {
+                            scratch: method_scratch,
+                        },
+                        this: Some(obj),
+                        args: &[],
+                        spread: None,
+                        site: call_site,
+                        layout: &helpers.call_layout,
+                        throw_exit,
+                        slow,
+                        done,
                     },
-                    this: Some(obj),
-                    args: &[],
-                    spread: None,
-                    site: call_site,
-                    layout: &helpers.call_layout,
-                    throw_exit,
-                    slow,
-                    done,
-                },
-            )?;
+                )?;
+            }
             // jit_helper_get_prop_site(ctx, obj, site, call site).
             a.bind(slow);
+            a.dbg_mark("slow");
             a.mov_rdi_r15();
             a.load_argreg(1, disp(obj));
             a.movabs_argreg(2, method_ptr as i64);
@@ -20002,6 +20158,7 @@ impl JitFunction {
         a.bind(refuse_exit);
         a.movabs_rax(NanBox::jit_throw_bits() as i64);
         a.frame_epilogue();
+        a.ool_tail = false;
         // (Out of line, called: see `call_seq::emit_inline_stub`.)
         for (stub, argv, nt, level) in core::mem::take(&mut inline_stubs) {
             a.dbg_mark("o-istub");
@@ -20099,6 +20256,10 @@ impl JitFunction {
             .any(|(e, &b)| e.is_some() && !b)
         {
             return None;
+        }
+        a.size_flush();
+        if let Some(m) = a.size_map.take() {
+            std::eprint!("{}", m.report());
         }
         let (code, at) = a.finish_reporting(&want, 2..tail - 4);
         let f = Self::from_code(&code);
