@@ -11991,7 +11991,7 @@ impl X64Assembler {
     /// `[pfx] [REX.R] 0F opc xmm(x), [rip + c]`, `c` a constant word with the
     /// value `value` (placed after the code, each once, as
     /// `handle::p_rip_const`'s).
-    fn sse_rip_const(&mut self, pfx: u8, opc: u8, x: u8, value: u64) {
+    pub(super) fn sse_rip_const(&mut self, pfx: u8, opc: u8, x: u8, value: u64) {
         let c = self.const_word(value);
         self.code.push(pfx);
         if x >= 8 {

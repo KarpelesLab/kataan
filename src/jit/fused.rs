@@ -106,6 +106,28 @@ impl X64Assembler {
     ) {
         const QNAN: u64 = 0x7ffc_0000_0000_0000;
         self.store_rax(disp[0]);
+        if step_nan_enabled() {
+            // `x ± 1` first (`KATAAN_JIT_STEPNAN`): every value but a
+            // Number reads as a NaN, which stays one — then (as for a NaN
+            // Number) the `ToNumeric` takes it from here, nothing stored.
+            self.code.extend_from_slice(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+            self.sse_rip_const(0xf2, if dec { 0x5c } else { 0x58 }, 0, 1.0f64.to_bits());
+            self.code.extend_from_slice(&[0x66, 0x0f, 0x2e, 0xc0]); // ucomisd xmm0, xmm0
+            self.jp(step_op);
+            self.store_rax(disp[1]);
+            self.code.extend_from_slice(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+            self.store_rax(disp[2]);
+            self.p_test_byte_imm(
+                r::RCX,
+                l.props.off_jit_flags,
+                super::props::FLAGS_NO_INLINE_STORE,
+            );
+            self.jne(store_op);
+            self.g_mov(r::RDX, r::RAX);
+            self.p_obj_fixed_slot_store(l, slot);
+            self.jmp(past);
+            return;
+        }
         // Not a Number: the `ToNumeric` takes it from here.
         self.g_mov(r::RDX, r::RAX);
         self.g_movabs(r::R11, QNAN);
@@ -136,4 +158,12 @@ impl X64Assembler {
         self.p_obj_fixed_slot_store(l, slot);
         self.jmp(past);
     }
+}
+
+/// Whether a fused `o.k++` adds first and sends a NaN result (a value that
+/// is no Number, or a NaN one) to the general ops, instead of testing the
+/// value's tag (`KATAAN_JIT_STEPNAN=0` turns it off, read once per process).
+fn step_nan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_STEPNAN").is_none_or(|v| v != "0"))
 }
