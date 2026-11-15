@@ -102,6 +102,27 @@ pub(super) fn relied_on(rc: &super::recv_cache::RecvPlan, pc: usize) -> bool {
         .any(|s| s.is_some_and(|p| p.known && p.pred == Some(pc)))
 }
 
+/// [`relied_on`] for every op of a body of `n` ops, in one pass over the
+/// sites (`None` under `KATAAN_JIT_SCANMEMO=0`: each op asks on its own).
+pub(super) fn relied_all(
+    rc: &super::recv_cache::RecvPlan,
+    n: usize,
+) -> Option<alloc::vec::Vec<bool>> {
+    if !super::scan_memo_enabled() {
+        return None;
+    }
+    let mut out = alloc::vec![false; n];
+    for p in rc.sites.iter().flatten() {
+        if p.known
+            && let Some(q) = p.pred
+            && let Some(x) = out.get_mut(q)
+        {
+            *x = true;
+        }
+    }
+    Some(out)
+}
+
 /// Takes every array-family site of `rc` out of the receiver cache: a way
 /// only an array fills is no help to a typed-array view (a compare, a miss,
 /// a walk to a failing family check, then the view's own walk), and no site

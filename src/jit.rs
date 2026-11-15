@@ -6890,6 +6890,16 @@ std::thread_local! {
     pub(crate) static EMIT_ATTEMPTS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
+/// Whether the generic compile answers its per-op questions about the
+/// receiver cache's sites from tables listed once (`typed::relied_all`,
+/// each way's family) rather than a scan of every site per op (unless
+/// `KATAAN_JIT_SCANMEMO=0`). Read once.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) fn scan_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SCANMEMO").is_none_or(|v| v != "0"))
+}
+
 /// The value a receiver-cache key slot holds when it caches nothing: the
 /// handle bits of slot index `u32::MAX`, which `Heap::alloc` never hands out,
 /// so no register ever holds them.
@@ -10327,7 +10337,13 @@ impl JitFunction {
                 .unwrap_or(false)
                 .then_some(rc_base - 8 * (rc_ways + 3 * w as i32 + 3))
         };
-        num.set_rc_relied((0..ops.len()).map(|pc| typed::relied_on(&rc, pc)).collect());
+        // (Asked of every op: once, `typed::relied_all`.)
+        let rc_relied_all = typed::relied_all(&rc, ops.len());
+        let relied = |pc: usize| match &rc_relied_all {
+            Some(v) => v.get(pc).copied().unwrap_or(false),
+            None => typed::relied_on(&rc, pc),
+        };
+        num.set_rc_relied((0..ops.len()).map(relied).collect());
         // A strict equality's walk of an object first operand fills its
         // way (`recv_cache::plan`'s fill-only sites).
         num.set_eq_ways(
@@ -11232,7 +11248,7 @@ impl JitFunction {
         let fi_keeps = |i: usize| {
             num.sa(i) & numeric::SA_FORIN != 0
                 || matches!(ops[i], GenericOp::GetElem { index, .. }
-                    if forin_plan.key_loop(index).is_some() && !typed::relied_on(&rc, i))
+                    if forin_plan.key_loop(index).is_some() && !relied(i))
         };
         num.set_keeps_si_di(
             (0..ops.len())
@@ -11282,7 +11298,21 @@ impl JitFunction {
                 .flatten()
                 .filter_map(|f| rc.sites.get(f.guard).copied().flatten().map(|p| p.way))
                 .collect();
+            // (Each way's family: its first site's, listed once,
+            // `KATAAN_JIT_SCANMEMO`.)
+            let mut way_family: Vec<Option<recv_cache::Family>> = Vec::new();
+            if scan_memo_enabled() {
+                for p in rc.sites.iter().flatten() {
+                    if way_family.len() <= p.way {
+                        way_family.resize(p.way + 1, None);
+                    }
+                    way_family[p.way].get_or_insert(p.family);
+                }
+            }
             let family = |w: usize| {
+                if scan_memo_enabled() {
+                    return way_family.get(w).copied().flatten();
+                }
                 rc.sites
                     .iter()
                     .flatten()
@@ -14241,7 +14271,7 @@ impl JitFunction {
                             idx = forin::Idx::File;
                         }
                         let other = bail.unwrap_or(slow);
-                        if bail.is_some() && typed::relied_on(&rc, op_idx) {
+                        if bail.is_some() && relied(op_idx) {
                             // (A later site would take the way this one
                             // fills as filled: the plain copy's.)
                             a.jmp(other);
@@ -16561,7 +16591,7 @@ impl JitFunction {
                         && rc.sites[op_idx].is_none_or(|p| !shape_ways.contains(&p.way));
                     let answer = num
                         .answer_run_proof(op_idx)
-                        .filter(|_| spec_chain && !typed::relied_on(&rc, op_idx))
+                        .filter(|_| spec_chain && !relied(op_idx))
                         .map(|ps| (ps, a.new_label()));
                     if let Some((ps, proven)) = answer {
                         a.g_load(call_seq::r::RAX, call_seq::r::RBP, ps);
@@ -17639,7 +17669,7 @@ impl JitFunction {
                             ok(l.obj)
                                 && ok(l.arr)
                                 && ok(l.index)
-                                && (bail.is_none() || !typed::relied_on(&rc, op_idx))
+                                && (bail.is_none() || !relied(op_idx))
                                 && [obj, index, l.obj, l.arr]
                                     .iter()
                                     .all(|&r| num.result_xmm(op_idx, r).is_none())
@@ -17722,7 +17752,7 @@ impl JitFunction {
                         })
                         .and_then(|k| call_sites.get(usize::from(k)).copied());
                     let own_getter = acc_site.map(|_| a.new_label());
-                    if (bail.is_none() || !typed::relied_on(&rc, op_idx))
+                    if (bail.is_none() || !relied(op_idx))
                         && !num.is_number_at(op_idx, index)
                         && num.result_xmm(op_idx, index).is_none()
                         && num.result_xmm(op_idx, obj).is_none()
@@ -17824,7 +17854,7 @@ impl JitFunction {
                     // (`recv_cache::SitePlan::known`), which only an array
                     // does: there a view leaves for the plain copy, which
                     // reads it inline.
-                    let typed = bail.is_none() || !typed::relied_on(&rc, op_idx);
+                    let typed = bail.is_none() || !relied(op_idx);
                     let not_arr = if typed { a.new_label() } else { helper };
                     // Without a receiver-cache site, one walk serves both:
                     // its cell tag picks the array path or the view's (with
@@ -18090,7 +18120,7 @@ impl JitFunction {
                     // element write (`typed::t_set`) — not at a receiver-
                     // cache site of a speculative loop's fast version (see
                     // `GetElem`).
-                    let typed = bail.is_none() || !typed::relied_on(&rc, op_idx);
+                    let typed = bail.is_none() || !relied(op_idx);
                     let not_arr = if typed { a.new_label() } else { helper };
                     // One walk for both without a receiver-cache site (see
                     // `GetElem`).
@@ -18147,7 +18177,7 @@ impl JitFunction {
                     // later site relies on the receiver-cache way the array
                     // path would fill; there a promoted value is a Number,
                     // which needs neither barrier nor representation check.)
-                    if (bail.is_none() || !typed::relied_on(&rc, op_idx))
+                    if (bail.is_none() || !relied(op_idx))
                         && !num.is_number_at(op_idx, index)
                         && index_x.is_none()
                         && (val_x.is_none() || bail.is_some())
@@ -18391,7 +18421,7 @@ impl JitFunction {
                     // A typed-array view's length (`typed::t_len`) where the
                     // array path misses (as for `GetElem`, one walk serves
                     // both without a receiver-cache site), then the helper.
-                    let typed = bail.is_none() || !typed::relied_on(&rc, op_idx);
+                    let typed = bail.is_none() || !relied(op_idx);
                     let merged = typed && rc.sites[op_idx].is_none();
                     let slow = a.new_label();
                     let walked = a.new_label();
