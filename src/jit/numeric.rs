@@ -1339,6 +1339,12 @@ pub(super) struct NumGen {
     /// region's fast version, up to its leaves) keeps `rsi` and `rdi`
     /// ([`Self::set_keeps_si_di`]).
     keeps_si_di: Vec<bool>,
+    /// Per pc: the int GPRs its code may clobber
+    /// ([`Self::set_int_clobbers`]).
+    int_clobbers: Vec<u8>,
+    /// The op being emitted saved its int GPRs only for the check of
+    /// `int32::int_keep_check` mode, which `after_generic_op` makes.
+    int_keep_check: bool,
     /// The inline `Math.f(x)` calls whose receiver and method the fast
     /// version's entry checks prove ([`Self::plan_math_proofs`]).
     math_proofs: Vec<MathProof>,
@@ -2299,6 +2305,8 @@ impl NumGen {
             int_clean_ok: false,
             rc_relied: Vec::new(),
             keeps_si_di: Vec::new(),
+            int_clobbers: Vec::new(),
+            int_keep_check: false,
             math_proofs: Vec::new(),
             plain_lazy: Vec::new(),
             icur: Vec::new(),
@@ -3312,6 +3320,22 @@ impl NumGen {
     /// Whether op `pc` keeps `rsi` and `rdi` ([`Self::set_keeps_si_di`]).
     pub(super) fn keeps_si_di(&self, pc: usize) -> bool {
         self.keeps_si_di.get(pc).copied().unwrap_or(false)
+    }
+
+    /// Per pc: the int GPRs (bits by their index in `int32::GPRS`) the
+    /// generic emitter's code for the op may clobber on a path that comes
+    /// back to the speculative region's fast version or leaves it (every
+    /// other path leaving it, where the leave reads the GPRs in place);
+    /// [`GPR_ALL`] for an op not so analysed. The integer version saves
+    /// none around an op none of whose live int GPRs is in its mask
+    /// (`int32::emit_spec_int_op`).
+    pub(super) fn set_int_clobbers(&mut self, masks: Vec<u8>) {
+        self.int_clobbers = masks;
+    }
+
+    /// Op `pc`'s mask of [`Self::set_int_clobbers`].
+    pub(super) fn int_clobbers(&self, pc: usize) -> u8 {
+        self.int_clobbers.get(pc).copied().unwrap_or(GPR_ALL)
     }
 
     /// The receiver-cache ways of the region truthiness tests (per pc).
@@ -7754,6 +7778,20 @@ fn bit_test_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_BITTEST").is_none_or(|v| v != "0"))
 }
+
+/// Whether a speculative region's integer version saves only the int GPRs
+/// an op's code may clobber (`NumGen::set_int_clobbers`) around it
+/// (`KATAAN_JIT_INTKEEP=0` turns it off, read once per process).
+pub(super) fn int_keep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INTKEEP").is_none_or(|v| v != "0"))
+}
+
+/// [`NumGen::set_int_clobbers`]'s mask of every int GPR.
+pub(super) const GPR_ALL: u8 = 0x1f;
+
+/// [`NumGen::set_int_clobbers`]'s bit of `r10` (`int32::GPRS`' last).
+pub(super) const GPR_R10: u8 = 0x10;
 
 /// Whether a Number's truncation (`to_int32`: the bitwise operators' and
 /// `~x`'s) is tested for the "indefinite" integer against the code's constant

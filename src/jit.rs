@@ -10956,6 +10956,41 @@ impl JitFunction {
                 .map(|i| (pproved[i] || fi_keeps(i)) && num.in_spec(i))
                 .collect(),
         );
+        // Per op, the int GPRs its code may clobber (`numeric::GPR_ALL`:
+        // any), for a speculative region's integer version, which saves
+        // only the live ones among them around it. A compiled-in layout's
+        // read in a fast version with the arena pinned: its inline path and
+        // its out-of-line walks and verifies use `rax`, `rcx` and `r11`
+        // only (`walk_to_slot!` with no arena to load, `family_checks!`,
+        // `p_cmp_shape`, `p_obj_fixed_slot_ex`), every miss leaves the
+        // version (`spec_bail`, which then reads the GPRs in place), and a
+        // way fill that predicts its slot (`p_fill_way`) takes `r10`. (Not
+        // in audit mode, whose walks take `r8`; nor a chase or a fused
+        // step, which are not emitted there anyway.)
+        num.set_int_clobbers(
+            (0..ops.len())
+                .map(|i| {
+                    let GenericOp::GetProp { obj, site, .. } = ops[i] else {
+                        return numeric::GPR_ALL;
+                    };
+                    let ok = numeric::int_keep_enabled()
+                        && num.in_spec(i)
+                        && a.pinned()
+                        && !handle::handle_audit()
+                        && !chase_at.get(i).copied().unwrap_or(true)
+                        && fused_step.get(i).is_some_and(Option::is_none)
+                        && sites.get(site as usize).is_some_and(|s| s.baked.is_some())
+                        && rc.sites[i].is_none_or(|p| p.family == recv_cache::Family::Obj);
+                    if !ok {
+                        return numeric::GPR_ALL;
+                    }
+                    match rc.sites[i] {
+                        Some(p) if rc_delta(p.way, obj).is_some() => numeric::GPR_R10,
+                        _ => 0,
+                    }
+                })
+                .collect(),
+        );
         // Per op, the ways a call there keeps, re-validated after it
         // (`recv_cache::survivors`); never an inlined `new`'s.
         let survive: Vec<Vec<recv_cache::SurviveWay>> = {

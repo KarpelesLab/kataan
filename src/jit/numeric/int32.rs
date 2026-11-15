@@ -87,6 +87,15 @@ fn skip_cold_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SKIPCOLD").is_none_or(|v| v != "0"))
 }
 
+/// Whether the integer version checks, after an op it saved no int GPR
+/// around (`NumGen::set_int_clobbers`), that the live ones kept their
+/// values, else `ud2` (`KATAAN_JIT_INTKEEPCHECK=1`, a debugging aid; read
+/// once).
+fn int_keep_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INTKEEPCHECK").is_some_and(|v| v == "1"))
+}
+
 /// Whether the integer version's `%` by a register tries its division-free
 /// paths first (`KATAAN_JIT_IMODFAST=0` turns them off; read once).
 fn imod_fast_enabled() -> bool {
@@ -3136,6 +3145,24 @@ impl NumGen {
     /// After the generic emitter's code for an op (any op): in a speculative
     /// region's integer version, the int registers it saved come back.
     pub(crate) fn after_generic_op(&mut self, a: &mut X64Assembler) {
+        if core::mem::take(&mut self.int_keep_check) {
+            // The int GPRs the op's code kept, still their saved values.
+            let pc = self.cur_pc;
+            let kept: Vec<(u8, usize)> = self.iplan().map_or_else(Vec::new, |p| {
+                p.slots
+                    .iter()
+                    .filter(|s| s.carried || (s.start < pc && s.end > pc))
+                    .filter_map(|s| GPRS.iter().position(|&g| g == s.gpr).map(|i| (s.gpr, i)))
+                    .collect()
+            });
+            for (g, i) in kept {
+                let ok = a.new_label();
+                a.g_cmp_mem(g, super::super::call_seq::r::RBP, self.int_save_disp(i));
+                a.jcc(CC_E, ok);
+                a.raw(&[0x0f, 0x0b]); // ud2
+                a.bind(ok);
+            }
+        }
         self.int_saved = false;
         self.int_math = None;
         // Save slots kept: those saved around this op's code, unless its
@@ -3784,6 +3811,22 @@ impl NumGen {
                         .live_int_gprs(pc)
                         .iter()
                         .all(|&(g, _)| g == RSI || g == RDI) => {}
+            // (Likewise an op whose code clobbers none of the live ones,
+            // `set_int_clobbers`; checked at run time in
+            // `KATAAN_JIT_INTKEEPCHECK` mode.)
+            GenericOp::GetProp { .. }
+                if self.in_spec(pc)
+                    && self.copy_label(pc).is_some()
+                    && self
+                        .live_int_gprs(pc)
+                        .iter()
+                        .all(|&(_, i)| self.int_clobbers(pc) & (1 << i) == 0) =>
+            {
+                if int_keep_check() {
+                    self.int_save(a, pc);
+                    self.int_keep_check = true;
+                }
+            }
             _ => {
                 self.int_save(a, pc);
                 self.int_saved = true;
