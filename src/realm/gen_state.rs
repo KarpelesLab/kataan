@@ -405,6 +405,14 @@ impl Realm {
         stored
     }
 
+    /// The shape word ([`crate::jit::shape_word`]) of the iterator-result
+    /// layout [`new_iter_result`](Self::new_iter_result) makes, once made.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn iter_result_shape_word(&self) -> Option<u64> {
+        self.iter_result_shape.as_ref().map(crate::jit::shape_word)
+    }
+
     pub fn new_iter_result(&mut self, value: NanBox, done: bool) -> Handle {
         // The usual case, the layout made: `new_object_in_shape`'s steps for
         // exactly these two slots (the second never holds a reference).

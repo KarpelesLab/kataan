@@ -343,6 +343,23 @@ pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {
     (field + ptr_off, field + len_off)
 }
 
+/// The byte offsets, within the object heap (`Heap<Cell>`), of its handle
+/// epoch ([`Heap::epoch`], a `u32`) and of its GC-verification state (an
+/// `Option<Box<_>>`: one word, null while the mode is off).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn jit_heap_epoch_poison_offsets() -> (usize, usize) {
+    use crate::cell::Cell;
+    const _: () = assert!(
+        core::mem::size_of::<Option<alloc::boxed::Box<PoisonState>>>()
+            == core::mem::size_of::<usize>()
+    );
+    (
+        core::mem::offset_of!(Heap<Cell>, epoch),
+        core::mem::offset_of!(Heap<Cell>, poison),
+    )
+}
+
 /// Where compiled code finds what [`Heap::alloc`]'s free-list path touches,
 /// as byte offsets within a `Heap<Cell>` (see [`jit_heap_alloc_offsets`]).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

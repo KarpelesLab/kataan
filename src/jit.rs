@@ -44,6 +44,8 @@ mod fused;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod gelim;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod gen_native;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod gforward;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod global_mirror;
@@ -92,6 +94,8 @@ pub use deopt::DeoptInfo;
 pub(crate) use deopt::{
     AFTER_SHIFT as DEOPT_AFTER_SHIFT, leave_of as deopt_leave_of, site_end as deopt_site_end,
 };
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub use gen_native::{GenLayout, GenMemo, GenWay};
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub use props::MethodSite;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -3519,7 +3523,8 @@ pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::Str
 }
 
 /// A generic-tier body as compiled: its code, its native-call entries'
-/// offsets, its speculative loops' `(header, region)`
+/// offsets, its native resumption stubs' (`JitProto::gen_resume`), its
+/// speculative loops' `(header, region)`
 /// (`tierup::TierUp::spec_regions`) and its integer versions' overflow
 /// bail sites (`tierup::TierUp::int_regions`).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
@@ -3527,6 +3532,7 @@ type GenericCompiled = (
     JitFunction,
     NativeEntries,
     (Vec<(usize, usize)>, Vec<numeric::DemoteRegion>),
+    Vec<u32>,
 );
 
 /// A generic body's native-call entries (`call_seq::emit_native_entry`), as
@@ -3603,6 +3609,10 @@ pub struct JitProto {
     /// see [`numeric_tier_booleans`]), which [`Self::call_guarded`] boxes as
     /// a boolean. Such a body is never a native callee of another Int body.
     returns_bool: bool,
+    /// Generic tier, a sync generator's body: by the function's own pc, the
+    /// code offset of the stub a native resumption there enters
+    /// (`gen_native`, `0` for none); empty for any other body.
+    gen_resume: Vec<u32>,
 }
 
 /// Per-site key + inline-cache storage for a generic-tier body, owned by the
@@ -4046,6 +4056,17 @@ pub struct GenericHelpers {
     /// [`gen_call`](Self::gen_call) for a site whose iterator results never
     /// escape (`jit_helper_gen_call_reuse`: see `iter_reuse::plan`).
     pub gen_call_reuse: JitCallMethodHelper,
+    /// Whether `g.next(v)` sites may resume compiled generator bodies
+    /// natively (`gen_native`; the VM's settings allow it).
+    pub gen_native: bool,
+    /// The end of a native resumption other than a plain `yield`
+    /// (`jit_helper_gen_native_finish(ctx, regs, n_regs, op, cache,
+    /// call_site)`: `0` with the result stored, or the throw sentinel).
+    pub gen_native_finish: JitCallMethodHelper,
+    /// A native resumption's iterator result for a yielded value
+    /// (`jit_helper_gen_native_result(ctx, value, call_site, reuse)`).
+    pub gen_native_result:
+        extern "C" fn(*mut core::ffi::c_void, u64, *mut core::ffi::c_void, u64) -> u64,
     /// A method call's callee lookup (`jit_method_info`).
     pub method_info: MethodHelper,
     /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
@@ -4664,6 +4685,7 @@ impl JitProto {
                 bytecode: None,
                 pc_map: None,
                 returns_bool,
+                gen_resume: Vec::new(),
             });
         }
         let ops = lower_nbvm_float(proto)?;
@@ -4679,6 +4701,7 @@ impl JitProto {
             bytecode: None,
             pc_map: None,
             returns_bool: false,
+            gen_resume: Vec::new(),
         })
     }
 
@@ -5452,7 +5475,7 @@ impl JitProto {
             &lits,
         );
         numeric::EXTRA_USES.with(|e| e.borrow_mut().clear());
-        let (func, native_entry, (spec_heads, demote_heads)) = compiled?;
+        let (func, native_entry, (spec_heads, demote_heads), gen_resume) = compiled?;
         tier_up.spec_regions = spec_heads;
         tier_up.int_regions = demote_heads;
         Some(Self {
@@ -5478,6 +5501,7 @@ impl JitProto {
             bytecode: Some(bytecode),
             pc_map,
             returns_bool: false,
+            gen_resume,
         })
     }
 
@@ -5675,6 +5699,17 @@ impl JitProto {
     #[must_use]
     pub fn is_generic(&self) -> bool {
         self.kind == JitKind::Generic
+    }
+
+    /// A generic sync generator body's native resumption stub table
+    /// (`gen_native`): its address and length (`u32` code offsets by the
+    /// function's own pc; empty for any other body).
+    #[must_use]
+    pub fn gen_resume_table(&self) -> (u64, u64) {
+        (
+            self.gen_resume.as_ptr() as u64,
+            self.gen_resume.len() as u64,
+        )
     }
 
     /// Whether this Int-tier body returns a boolean as a native `0`/`1` (see
@@ -11032,6 +11067,42 @@ impl JitFunction {
         a.pin_enter(); // the caller's `r12`/`r13`, and the arena (clobbers `r11` only)
         a.mov_frame8_imm32(COUNTDOWN, 1); // poll at the first back-edge
         call_seq::emit_act_ok(&mut a, &helpers.call_layout);
+        // A sync generator's native resumptions (`gen_native`): per plain
+        // `yield` whose resumption pc is an entry, a stub landing the sent
+        // value — (stub, the function's own resumption pc, the `yield`'s
+        // destination and mode registers, the entry).
+        let mut gen_stubs: Vec<(Label, usize, Option<(u16, u16)>, Label)> = Vec::new();
+        if helpers.gen_native && gen_native::enabled() {
+            let own_of = |i: usize| match pc_orig.get(i) {
+                Some(&o) if o != u32::MAX => Some(o as usize),
+                Some(_) => None,
+                None => Some(i),
+            };
+            for (i, op) in bytecode.iter().enumerate() {
+                let land = match op {
+                    crate::nbvm::Op::YieldResume { dst, mode, .. }
+                        if (*dst as usize) < n_regs && (*mode as usize) < n_regs =>
+                    {
+                        Some(Some((*dst, *mode)))
+                    }
+                    crate::nbvm::Op::GeneratorStart => Some(None),
+                    _ => None,
+                };
+                if let Some(land) = land
+                    && let Some(own) = own_of(i)
+                    && own_of(i + 1) == Some(own + 1)
+                    && i + 1 < ops.len()
+                    && osr_entries.contains(&(i + 1))
+                {
+                    let entry = num.entry_label(&mut a, &labels, i + 1)?;
+                    gen_stubs.push((a.new_label(), own + 1, land, entry));
+                }
+            }
+        }
+        let gen_native_l = a.new_label();
+        if !gen_stubs.is_empty() {
+            gen_native::emit_dispatch_check(&mut a, gen_native_l);
+        }
         // Entry dispatch: `entry` (rdx) is 0 or a known loop header.
         for &t in osr_entries {
             if t == 0 || t >= ops.len() {
@@ -11043,6 +11114,14 @@ impl JitFunction {
         }
         a.test_rdx_rdx();
         a.jne(refuse_exit); // an unknown entry is a caller bug: refuse, never misrun
+        if !gen_stubs.is_empty() {
+            let cold = a.cold_begin();
+            gen_native::emit_native_dispatch(&mut a, gen_native_l);
+            for &(stub, _, land, entry) in &gen_stubs {
+                gen_native::emit_land_stub(&mut a, stub, helpers.call_layout.susp, land, entry);
+            }
+            a.cold_end(cold);
+        }
         let ok = |r: u16| (r as usize) < n_regs;
         // The `Op::InitFnPrototype` ops whose closure an inline
         // `Op::MakeClosure` right before them makes (the codegen pairs them):
@@ -13120,6 +13199,30 @@ impl JitFunction {
                         a.movabs_r11(site_ptr as i64);
                         a.g_cmp_byte_imm(call_seq::r::R11, call_seq::GEN_NEXT, 0);
                         a.g_jcc(call_seq::cc::E, skip);
+                        // A compiled generator body resumed natively
+                        // (`gen_native`), else the lean helper.
+                        if helpers.gen_native && gen_native::enabled() {
+                            let lean = a.new_label();
+                            gen_native::emit_resume(
+                                &mut a,
+                                &helpers.call_layout,
+                                &gen_native::ResumeEmit {
+                                    site: site_ptr,
+                                    recv,
+                                    arg: margs.first().copied(),
+                                    dst,
+                                    reuse: iter_noescape.get(op_idx) == Some(&true),
+                                    finish: helpers.gen_native_finish as usize as u64,
+                                    result: helpers.gen_native_result as usize as u64,
+                                    n_regs,
+                                    op: op_ptr as u64,
+                                    slow: lean,
+                                    done,
+                                    throw_exit,
+                                },
+                            );
+                            a.bind(lean);
+                        }
                         a.mov_rdi_r15(); // rdi = ctx
                         a.mov_rsi_rbx(); // rsi = regs
                         a.movabs_argreg(2, n_regs as i64); // rdx = n_regs
@@ -19408,6 +19511,9 @@ impl JitFunction {
         };
         want.push(direct.unwrap_or(entries.0));
         want.push(direct_pinned.or(direct).unwrap_or(entries.0));
+        // (The resumption stubs' offsets, after the entries.)
+        let tail = want.len();
+        want.extend(gen_stubs.iter().map(|g| g.0));
         let marks: Vec<(&'static str, Option<usize>)> =
             a.dbg_marks.iter().map(|m| (m.1, m.2)).collect();
         // (The profiling labels between the entries and the exact entries
@@ -19419,7 +19525,7 @@ impl JitFunction {
         {
             return None;
         }
-        let (code, at) = a.finish_reporting(&want, 2..want.len() - 4);
+        let (code, at) = a.finish_reporting(&want, 2..tail - 4);
         let f = Self::from_code(&code);
         if let (Some(path), Some(f)) = (opmap, f.as_ref()) {
             use std::io::Write as _;
@@ -19466,7 +19572,21 @@ impl JitFunction {
             }
         }
         let spec_heads = (num.spec_heads(), num.demote_heads());
-        let n = at.len();
+        let n = tail;
+        let mut gen_tab: Vec<u32> = Vec::new();
+        for (k, g) in gen_stubs.iter().enumerate() {
+            let off = u32::try_from(at[tail + k])
+                .ok()
+                .filter(|&o| o & gen_native::START_STUB == 0)?;
+            if gen_tab.len() <= g.1 {
+                gen_tab.resize(g.1 + 1, 0);
+            }
+            gen_tab[g.1] = if g.2.is_none() {
+                off | gen_native::START_STUB
+            } else {
+                off
+            };
+        }
         let entries = NativeEntries {
             general: at[0],
             rust: at[1],
@@ -19476,7 +19596,7 @@ impl JitFunction {
             direct_pinned: direct_pinned.map(|_| at[n - 1]),
             room: native_room,
         };
-        f.map(|f| (f, entries, spec_heads))
+        f.map(|f| (f, entries, spec_heads, gen_tab))
     }
 
     /// Wraps already-emitted machine `code` into a callable region (the entry

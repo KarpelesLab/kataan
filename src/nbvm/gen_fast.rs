@@ -166,11 +166,18 @@ pub(super) fn create(
             return None;
         }
         t.calls = t.calls.saturating_add(1);
-        t.gen_plain as usize - 1
+        // (A file kept at a compiled body's size, `keep_regs`, from the
+        // start: its first resumption, natively too, need not resize it.)
+        let n = match &t.jit {
+            Some(Some(j)) if keep_regs() && j.is_generic() => j.n_regs().max(proto.n_regs),
+            _ => proto.n_regs,
+        };
+        (t.gen_plain as usize - 1, n)
     };
+    let (start, n) = start;
     let mut w: Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
     w.clear();
-    w.resize(proto.n_regs, NanBox::undefined());
+    w.resize(n, NanBox::undefined());
     for (i, &a) in args.iter().enumerate().take(proto.n_params) {
         if let (Some(slot), Some(&v)) = (w.get_mut(i), regs.get(a as usize)) {
             *slot = v;
@@ -827,31 +834,237 @@ pub(super) fn jit_next(
     let gh = Handle::from_raw(recv.as_handle()?);
     let fh = site_frame(ctx, gh, "next", 0, method)?;
     match lean_next(ctx, funcs, fh, v) {
-        Lean::Yield(value) => Some(Ok(match reuse {
-            // (A site whose results never escape: its one result object,
-            // while it lives.)
-            Some(slot) => {
-                let held = NanBox::from_bits(*slot);
-                match held.as_handle() {
-                    Some(h)
-                        if ctx
-                            .realm
-                            .reuse_iter_result(Handle::from_raw(h), value, false) =>
-                    {
-                        held
-                    }
-                    _ => {
-                        let r = NanBox::handle(ctx.realm.new_iter_result(value, false).to_raw());
-                        *slot = r.to_bits();
-                        r
-                    }
-                }
-            }
-            None => NanBox::handle(ctx.realm.new_iter_result(value, false).to_raw()),
-        })),
+        Lean::Yield(value) => Some(Ok(yield_result(ctx, value, reuse))),
         Lean::Other(r) => Some(r.map(|o| result_object(ctx, o))),
         Lean::Untaken => site_resume(ctx, funcs, regs, recv, fh, 0, v, rooted),
     }
+}
+
+/// The iterator result of a plain `yield value` at a compiled `g.next(v)`
+/// site: with `reuse` (a site whose results never escape) its one result
+/// object while it lives, else a fresh one.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[inline]
+pub(super) fn yield_result(ctx: &mut Ctx, value: NanBox, reuse: Option<&mut u64>) -> NanBox {
+    match reuse {
+        // (A site whose results never escape: its one result object,
+        // while it lives.)
+        Some(slot) => {
+            let held = NanBox::from_bits(*slot);
+            match held.as_handle() {
+                Some(h)
+                    if ctx
+                        .realm
+                        .reuse_iter_result(Handle::from_raw(h), value, false) =>
+                {
+                    held
+                }
+                _ => {
+                    let r = NanBox::handle(ctx.realm.new_iter_result(value, false).to_raw());
+                    *slot = r.to_bits();
+                    r
+                }
+            }
+        }
+        None => NanBox::handle(ctx.realm.new_iter_result(value, false).to_raw()),
+    }
+}
+
+/// Whether compiled `g.next(v)` sites resume compiled generator bodies
+/// natively (`crate::jit::gen_native`): enabled, the register files kept at
+/// the body's size ([`keep_regs`], which the native sequence relies on),
+/// the lean path on and the tier's settings allowing it.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn native_resume_on() -> bool {
+    crate::jit::gen_native::enabled()
+        && keep_regs()
+        && lean_on()
+        && reuse_frame_ptr()
+        && super::jit_tier::gen_native_allowed()
+}
+
+/// After the lean path resumed the generator `recv` at a compiled
+/// `g.next(v)` site (it suspended at a `yield` again), records in the site's
+/// memo `memo` what a native resumption of its function's generators there
+/// relies on (see `crate::jit::gen_native`), when the way serving its layout
+/// and prototype wants a refill (its proof is of an older epoch, or its
+/// countdown ran out) and all of it holds: the `[[Get]]` of `next` from its
+/// prototype proved by the site memo ([`site_frame`]'s) at the current
+/// epoch, still finding the intrinsic `method`; the frame at a resumption pc
+/// its compiled body has a stub for, its register file at the body's size,
+/// no handler on its stack. A frame that fails those is not resumed
+/// natively for the next [`RUNS`](crate::jit::gen_native::RUNS) slow
+/// resumptions of the way (it is recorded with no epoch: the sequence
+/// declines it at once, and this path counts down before it tries again).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn native_fill(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    method: u64,
+    memo: &mut crate::jit::GenMemo,
+) {
+    let Some(gh) = recv.as_handle().map(Handle::from_raw) else {
+        return;
+    };
+    let Some((proto, fh)) = ctx
+        .realm
+        .generator_proto_and_frame(gh, VM_GEN, &mut ctx.gen_ic)
+    else {
+        return;
+    };
+    let Some(shape) = ctx
+        .realm
+        .jit_object(gh)
+        .and_then(|o| o.shaped_shape())
+        .map(crate::jit::shape_word)
+    else {
+        return;
+    };
+    let epoch = crate::object::proto_epoch();
+    if memo.serving(shape, proto.to_raw(), epoch) {
+        return;
+    }
+    let Some(at) = ctx
+        .gen_site_memo
+        .entries
+        .iter()
+        .flatten()
+        .find(|e| e.proto == proto.to_raw() && e.mode == 0 && e.stamp == epoch)
+        .map(|e| (e.at.0, alloc::rc::Rc::clone(&e.at.1), e.at.2))
+    else {
+        return;
+    };
+    let Some(value) = ctx
+        .realm
+        .jit_object(Handle::from_raw(at.0))
+        .filter(|o| {
+            o.shaped_shape()
+                .is_some_and(|s| alloc::rc::Rc::ptr_eq(s, &at.1))
+        })
+        .and_then(|o| o.jit_slot_ptr(at.2))
+    else {
+        return;
+    };
+    // SAFETY: the slot of a live object, just found.
+    #[allow(unsafe_code)]
+    if unsafe { *value }.to_bits() != method {
+        return;
+    }
+    let way = match native_way(ctx, funcs, fh) {
+        // (A frame not suspended at a plain `yield` — one that completed, or
+        // whose register file is not at the body's size yet — says nothing
+        // of the next ones.)
+        Err(false) => return,
+        r => r.ok(),
+    };
+    let way = way.map(|(func, code, n_regs, tab, tab_len)| crate::jit::GenWay {
+        shape,
+        proto: proto.to_raw(),
+        stamp: epoch,
+        value: value as u64,
+        method,
+        func,
+        code,
+        n_regs,
+        tab,
+        tab_len,
+        countdown: crate::jit::gen_native::RUNS,
+    });
+    if let Some(s) = ctx.realm.iter_result_shape_word() {
+        memo.iter_shape = s;
+    }
+    memo.fill(way.unwrap_or(crate::jit::GenWay {
+        shape,
+        proto: proto.to_raw(),
+        stamp: crate::jit::GenWay::NO_STAMP,
+        countdown: crate::jit::gen_native::RUNS,
+        ..crate::jit::GenWay::EMPTY
+    }));
+}
+
+/// [`native_fill`]'s frame checks, for the frame cell `fh`: its function
+/// id, its compiled body's code address, the register-file size, and the
+/// body's resumption stub table (address and length), when the frame is
+/// suspended at a `yield` with no handler, at a pc the table has a stub
+/// for, its register file at the body's size. `Err(true)` when the frame's
+/// suspension is one the sequence declines (a handler on its stack, a pc
+/// without a stub, a body not generic), `Err(false)` for anything else.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+fn native_way(ctx: &Ctx, funcs: &[FnProto], fh: Handle) -> Result<(u64, u64, u64, u64, u64), bool> {
+    let f = ctx.realm.vm_frame(fh).ok_or(false)?;
+    let (id, pc, len) = (f.func as usize, f.pc as usize, f.regs.len());
+    if f.state != S_YIELD {
+        return Err(false);
+    }
+    if !f.handlers.is_empty() {
+        return Err(true);
+    }
+    let p = funcs.get(id).ok_or(false)?;
+    let Some(Some(j)) = p.tier.jit() else {
+        return Err(false);
+    };
+    let n = j.n_regs().max(p.n_regs);
+    let (tab, tab_len) = j.gen_resume_table();
+    if len != n {
+        return Err(false);
+    }
+    if !j.is_generic() || (pc as u64) >= tab_len {
+        return Err(true);
+    }
+    // (The stub of the pc it is suspended at, a `yield`'s: the next
+    // resumption's.)
+    // SAFETY: `tab` is the live body's table of `tab_len` entries.
+    #[allow(unsafe_code)]
+    let e = unsafe { *(tab as *const u32).add(pc) };
+    if e == 0 || e & crate::jit::gen_native::START_STUB != 0 {
+        return Err(true);
+    }
+    Ok((id as u64, j.code_ptr() as u64, n as u64, tab, tab_len))
+}
+
+/// The end of a native resumption (`crate::jit::gen_native`) that the
+/// sequence does not record itself, from the body's raw outcome `raw` with
+/// the frame cell `fh` still executing and the body's handler segment open
+/// over the caller's base `outer_base` — exactly [`lean_next`]'s ending of
+/// the same run (whose bookkeeping before it, the running list, the depth
+/// and the rooted file, the sequence has undone already): the iterator
+/// result.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn native_finish(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    fh: Handle,
+    raw: u64,
+    outer_base: usize,
+    reuse: Option<&mut u64>,
+) -> Result<NanBox, VmError> {
+    use super::jit_tier::GenRun;
+    let (run, handlers) = super::jit_tier::native_run_outcome(ctx, raw, outer_base);
+    let Some(id) = ctx.realm.vm_frame(fh).map(|f| f.func as usize) else {
+        return Err(VmError::NotAnObject);
+    };
+    let Some(proto) = funcs.get(id) else {
+        return Err(VmError::NotAnObject);
+    };
+    if let GenRun::Yield { value, pc, dst } = run {
+        if let Some(f) = ctx.realm.vm_frame_mut(fh) {
+            f.handlers = handlers;
+            f.pc = pc as u32;
+            f.dst = dst;
+            f.state = S_YIELD;
+        }
+        ctx.realm.vm_frame_stored(fh);
+        // A `yield*` step hands the inner result object through as is.
+        return Ok(
+            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
+                value
+            } else {
+                yield_result(ctx, value, reuse)
+            },
+        );
+    }
+    cell_exit(ctx, funcs, proto, fh, 0, handlers, run).map(|o| result_object(ctx, o))
 }
 
 /// [`run_in_cell`] for a register file not of the function's own size:

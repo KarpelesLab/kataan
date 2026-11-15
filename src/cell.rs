@@ -1110,6 +1110,90 @@ pub(crate) fn jit_box_layout() -> (u8, usize) {
     (disc, core::ptr::addr_of!(*v) as usize - base)
 }
 
+/// The byte layout compiled code resumes a suspended generator frame through
+/// (`crate::jit::gen_native`): the `Cell::Frame` discriminant byte, the
+/// offset of its frame box's pointer word within the `Cell`, and the frame's
+/// fields' offsets within the boxed [`VmFrame`] — its register file's buffer
+/// pointer and length words and its handler stack's length word found on a
+/// probe.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameCellLayout {
+    /// The `Cell::Frame` discriminant byte.
+    pub disc: u8,
+    /// `Cell`-relative offset of the `Box<VmFrame>` pointer word.
+    pub boxed: usize,
+    /// `VmFrame`-relative offsets of `func` (`u32`), `pc` (`u32`), `dst`
+    /// (`u16`) and `state` (`u8`).
+    pub func: usize,
+    pub pc: usize,
+    pub dst: usize,
+    pub state: usize,
+    /// `VmFrame`-relative offsets of the register file's buffer pointer and
+    /// length words.
+    pub regs_ptr: usize,
+    pub regs_len: usize,
+    /// `VmFrame`-relative offset of the handler stack's length word.
+    pub handlers_len: usize,
+}
+
+/// The [`FrameCellLayout`], probed.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+pub(crate) fn jit_frame_layout() -> FrameCellLayout {
+    use core::mem::offset_of;
+    let mut regs = Vec::with_capacity(7);
+    regs.extend_from_slice(&[NanBox::undefined(); 3]);
+    let mut handlers = Vec::with_capacity(9);
+    handlers.extend_from_slice(&[(1usize, 1u16), (2, 2)]);
+    let cell = Cell::Frame(alloc::boxed::Box::new(VmFrame {
+        func: 0,
+        pc: 0,
+        dst: 0,
+        state: 0,
+        regs,
+        handlers,
+        aux: NanBox::undefined(),
+        resume_fns: (NanBox::undefined(), NanBox::undefined()),
+        callee: NanBox::undefined(),
+    }));
+    let base = core::ptr::addr_of!(cell) as usize;
+    // SAFETY: `cell` is a live, initialized `Cell`; its tag byte (the first, see
+    // [`Cell`]) is in bounds and always a valid `u8`.
+    let disc = unsafe { *(base as *const u8) };
+    let Cell::Frame(b) = &cell else {
+        unreachable!("just built a Cell::Frame")
+    };
+    let boxed = core::ptr::addr_of!(*b) as usize - base;
+    let f: &VmFrame = b;
+    // A `Vec`'s three words, found by value on the probe (its pointer,
+    // length and capacity all differ).
+    let vec_word = |v: usize, want: usize| -> usize {
+        assert_eq!(core::mem::size_of::<Vec<NanBox>>(), 3 * 8);
+        (0..3)
+            .find(|&k| {
+                // SAFETY: a word of the live probe frame's `Vec` field.
+                unsafe { *((v + k * 8) as *const usize) == want }
+            })
+            .expect("Vec word")
+            * 8
+    };
+    let regs_at = core::ptr::addr_of!(f.regs) as usize;
+    let handlers_at = core::ptr::addr_of!(f.handlers) as usize;
+    let fbase = core::ptr::from_ref(f) as usize;
+    FrameCellLayout {
+        disc,
+        boxed,
+        func: offset_of!(VmFrame, func),
+        pc: offset_of!(VmFrame, pc),
+        dst: offset_of!(VmFrame, dst),
+        state: offset_of!(VmFrame, state),
+        regs_ptr: regs_at - fbase + vec_word(regs_at, f.regs.as_ptr() as usize),
+        regs_len: regs_at - fbase + vec_word(regs_at, f.regs.len()),
+        handlers_len: handlers_at - fbase + vec_word(handlers_at, f.handlers.len()),
+    }
+}
+
 /// The `Cell::Native` discriminant byte and the offset of its `u16` id within
 /// the `Cell` (for the generic JIT's built-in identity check).
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

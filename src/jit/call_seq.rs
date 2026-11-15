@@ -272,6 +272,47 @@ pub struct CallSite {
     /// value's bits; `0`, no handle, before one is made). Not a root: a result
     /// swept since (its handle stale) is replaced by a fresh one.
     pub iter_reuse: u64,
+    /// How many times the call sequence identified a callee by its function
+    /// (its way's key) after its way's memo had named another value of the
+    /// same way — a fresh closure of a function the site knows (see
+    /// [`CallSite::fresh`]).
+    pub fresh_misses: u64,
+    /// Whether the site's callees are mostly fresh closures
+    /// ([`CallSite::fresh_misses`] reached [`FRESH_LIMIT`]): every callee
+    /// value is a new one (`ev.fn()` over events each made with its own
+    /// arrow function), so no memo would name it. The sequence then
+    /// identifies the callee by its function at once (`KATAAN_JIT_FRESHCALL`):
+    /// no later way's memo is compared, no method-call memo is tried, and
+    /// none is refilled. Only which checks run first changes: the
+    /// identification is the same.
+    pub fresh: bool,
+    /// A `g.next(v)` site's native resumption memo (`super::gen_native`).
+    pub gnat: super::gen_native::GenMemo,
+}
+
+/// [`CallSite::fresh_misses`] at which a site turns [`CallSite::fresh`].
+pub(crate) const FRESH_LIMIT: i8 = 16;
+
+/// `CallSite`-relative offset of [`CallSite::fresh`].
+const FRESH: i32 = core::mem::offset_of!(CallSite, fresh) as i32;
+
+/// `CallSite`-relative offset of [`CallSite::fresh_misses`].
+const FRESH_MISSES: i32 = core::mem::offset_of!(CallSite, fresh_misses) as i32;
+
+/// Whether a call site whose callees are mostly fresh closures identifies
+/// them by function first ([`CallSite::fresh`]; `KATAAN_JIT_FRESHCALL=0`
+/// turns it off, read once per process).
+#[must_use]
+pub(crate) fn fresh_call_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_FRESHCALL").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// `CallSite`-relative offset of [`CallSite::coll_ctor`].
@@ -585,6 +626,9 @@ impl CallSite {
             coll_ctor: u64::MAX,
             gen_next: false,
             iter_reuse: 0,
+            fresh_misses: 0,
+            fresh: false,
+            gnat: super::gen_native::GenMemo::new(),
         }
     }
 
@@ -954,6 +998,8 @@ pub struct CallLayout {
     /// What the back-edge poll's inline do-nothing test reads (see
     /// `emit_quiet_poll`).
     pub poll: PollLayout,
+    /// What a native generator resumption reads (`super::gen_native`).
+    pub gens: super::gen_native::GenLayout,
 }
 
 /// Where a back-edge poll finds what decides that it has nothing to do (the
@@ -1910,6 +1956,12 @@ fn emit_limit_checks_deep(a: &mut X64Assembler, l: &CallLayout, extra: i32, fail
     a.g_jcc(cc::B, fail);
 }
 
+/// [`emit_limit_checks_deep`] for an activation directly above the running
+/// one.
+pub(crate) fn emit_limit_checks(a: &mut X64Assembler, l: &CallLayout, fail: Label) {
+    emit_limit_checks_deep(a, l, 0, fail);
+}
+
 /// A proper tail call's depth test (`GenericOp::CallValue::tail`): to
 /// `deep` once the realm's call depth is half its limit or more, where the
 /// call stops being an ordinary nested one. Clobbers `rax` and `r9`.
@@ -1924,7 +1976,7 @@ pub(crate) fn emit_tail_depth_check(a: &mut X64Assembler, l: &CallLayout, deep: 
 /// To `slow` unless the walked receiver (its heap slot in `rcx`) has no
 /// accessors: no `extra` part, or an empty accessor list (as the method
 /// lookup requires). Clobbers `r9`.
-fn emit_no_accessors(a: &mut X64Assembler, slow: Label) {
+pub(crate) fn emit_no_accessors(a: &mut X64Assembler, slow: Label) {
     let jl = super::compute_jit_layout();
     let no_acc = a.new_label();
     a.g_load(r::R9, r::RCX, jl.props.off_extra);
@@ -2077,6 +2129,11 @@ fn emit_call_fast(
     a.g_load(r::RAX, r::RCX, jl.off_shape);
     a.g_load(r::RDX, r::RCX, jl.props.off_proto);
     a.g_movabs(r::R11, site as u64);
+    // (A site of fresh closures: no memo names the callee value.)
+    if fresh_call_enabled() {
+        a.g_cmp_byte_imm(r::R11, FRESH, 0);
+        a.g_jcc(cc::NE, slow);
+    }
     for (w, &f) in found.iter().enumerate() {
         let next = a.new_label();
         a.g_cmp_mem(r::RAX, r::R11, lk(w, offset_of!(LookupMemo, shape)));
@@ -2162,6 +2219,11 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         a.g_mem(true, &[0x83], 7, r::R11, SITE_KEY); // cmp qword [r11], -2
         a.code.push(0xfe);
         a.g_jcc(cc::E, e.slow);
+        // (A site of fresh closures identifies the callee at once.)
+        if fresh_call_enabled() {
+            a.g_cmp_byte_imm(r::R11, FRESH, 0);
+            a.g_jcc(cc::NE, decode);
+        }
         for w in 1..CallSite::WAYS {
             let next = a.new_label();
             a.g_cmp_mem(r::RAX, r::R11, memo_bits(w));
@@ -2359,6 +2421,28 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     }
     a.bind(hit);
     a.g_mov(r::R8, r::RDX); // captures, for the callee's entry
+    let memoized = a.new_label();
+    if memoize && fresh_call_enabled() {
+        // A site of fresh closures refills no memo; at any other, a way
+        // whose memo named another value counts as a fresh closure (see
+        // `CallSite::fresh`).
+        let store = a.new_label();
+        a.g_movabs(r::R9, e.site as u64);
+        a.g_cmp_byte_imm(r::R9, FRESH, 0);
+        a.g_jcc(cc::NE, memoized);
+        a.g_load(r::R9, r::R10, memo_bits(0));
+        a.g_cmp_mem(r::R9, callee_base, callee_disp);
+        a.g_jcc(cc::E, store);
+        a.g_cmp_imm(r::R9, CallSite::EMPTY as i64 as i32);
+        a.g_jcc(cc::E, store);
+        a.g_movabs(r::R9, e.site as u64);
+        a.g_inc_mem(r::R9, FRESH_MISSES);
+        a.g_mem(true, &[0x83], 7, r::R9, FRESH_MISSES); // cmp qword [r9+misses], LIMIT
+        a.code.push(FRESH_LIMIT as u8);
+        a.g_jcc(cc::B, store);
+        a.g_store_byte_imm(r::R9, FRESH, 1);
+        a.bind(store);
+    }
     if memoize {
         // Memoize the callee in its way's memo (see `CallMemo`).
         a.g_load(r::R9, callee_base, callee_disp);
@@ -2383,6 +2467,7 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.bind(filled);
         }
     }
+    a.bind(memoized);
     if let Some(cold) = cold {
         a.jmp(identified);
         a.cold_end(cold);

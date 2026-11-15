@@ -1327,7 +1327,7 @@ impl X64Assembler {
     /// `miss`. Clobbers `rax`, `r8`. The fully checked walk, for handles
     /// from side tables the collector does not trace; a rooted handle takes
     /// [`p_slot_rooted`](Self::p_slot_rooted) (`jit::handle`).
-    fn p_slot_of(&mut self, l: &JitLayout, miss: Label) {
+    pub(crate) fn p_slot_of(&mut self, l: &JitLayout, miss: Label) {
         self.mov_r8_rax();
         self.shr_r8_imm(32); // r8w = generation
         self.p_zext_eax(); // rax = index

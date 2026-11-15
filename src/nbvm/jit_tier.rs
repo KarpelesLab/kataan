@@ -117,6 +117,11 @@ pub(super) struct TierRuntime {
     /// make native calls, as one on the register stack (see
     /// `crate::jit::call_seq::emit_act_ok`).
     pub(super) rooted_regs: usize,
+    /// What a native generator resumption's end hands
+    /// [`jit_helper_gen_native_finish`] (`crate::jit::gen_native`): the
+    /// body's raw outcome, the frame cell's handle bits and the caller's
+    /// handler segment base.
+    pub(super) gen_scratch: [u64; 3],
     /// How many compiled activations run off the register stack on a
     /// register file no Rust frame roots ([`run_compiled_at`]'s and
     /// [`run_generator_window`]'s full-stack fallback): while any does, a
@@ -201,6 +206,7 @@ impl Default for TierRuntime {
             exit_regs: 0,
             exit_jit: core::ptr::null(),
             rooted_regs: 0,
+            gen_scratch: [0; 3],
             off_stack: 0,
             resume: None,
             left: None,
@@ -3873,6 +3879,129 @@ pub(crate) extern "C" fn jit_helper_gen_call_reuse(
     gen_call(ctx_raw, regs_raw, n_regs, op_raw, cache, call_site, true)
 }
 
+/// The end of a native generator resumption (`crate::jit::gen_native`)
+/// other than a plain `yield` it records itself: the Rust path's ending
+/// (`gen_fast::native_finish`) from the body's raw outcome, with the frame
+/// cell and the caller's handler segment base the sequence left in
+/// [`TierRuntime::gen_scratch`]; `reuse` non-null for a site whose
+/// iterator results never escape. Stores the iterator result to the op's
+/// destination register and returns `0`, or the throw sentinel with the
+/// fault pending.
+///
+/// # Safety
+/// As [`jit_helper_gen_call`] (`reuse` is not dereferenced).
+pub(crate) extern "C" fn jit_helper_gen_native_finish(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    reuse: *mut core::ffi::c_void,
+    call_site: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    // SAFETY: the activation's register file, live and unaliased here.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let [raw, fh, outer_base] = ctx.jit_rt.gen_scratch;
+    // SAFETY: the op's own `CallSite` (see the function contract).
+    #[allow(unsafe_code)]
+    let slot =
+        (!reuse.is_null()).then(|| unsafe { &mut (*call_site.cast::<CallSite>()).iter_reuse });
+    let r = super::gen_fast::native_finish(
+        ctx,
+        funcs,
+        Handle::from_raw(fh),
+        raw,
+        outer_base as usize,
+        slot,
+    );
+    let Op::CallMethod { dst, .. } = op else {
+        return NanBox::jit_throw_bits();
+    };
+    match r {
+        Ok(v) => {
+            regs[*dst as usize] = v;
+            0
+        }
+        Err(e) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
+    }
+}
+
+/// A native generator resumption's iterator result for the yielded `value`
+/// (`crate::jit::gen_native`): the site's reused one when `reuse` (its
+/// results never escape) and it still serves, else a fresh one. Runs no
+/// JavaScript and never throws.
+///
+/// # Safety
+/// `ctx_raw` is the live `Ctx`; `call_site` the op's own `CallSite`.
+pub(crate) extern "C" fn jit_helper_gen_native_result(
+    ctx_raw: *mut core::ffi::c_void,
+    value: u64,
+    call_site: *mut core::ffi::c_void,
+    reuse: u64,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    // SAFETY: the op's own `CallSite` (see the function contract).
+    #[allow(unsafe_code)]
+    let slot = (reuse != 0).then(|| unsafe { &mut (*call_site.cast::<CallSite>()).iter_reuse });
+    super::gen_fast::yield_result(ctx, NanBox::from_bits(value), slot).to_bits()
+}
+
+/// [`run_generator_body_with`]'s ending, for a native resumption's body
+/// that ran with its own handler segment from the context's current
+/// `base` (`outer_base` the caller's): what it ran to, and the handlers
+/// its segment held at a suspension.
+pub(super) fn native_run_outcome(
+    ctx: &mut Ctx,
+    raw: u64,
+    outer_base: usize,
+) -> (GenRun, alloc::vec::Vec<(usize, Reg)>) {
+    let base = ctx.jit_rt.base;
+    let saved = ctx.jit_funcs;
+    let mut handlers = alloc::vec::Vec::new();
+    if raw == NanBox::jit_exit_bits() {
+        if let Some((pc, value, dst)) = ctx.jit_rt.suspended.take() {
+            if ctx.jit_rt.handlers.len() > base {
+                handlers.extend(ctx.jit_rt.handlers.drain(base..));
+            }
+            ctx.jit_rt.base = outer_base;
+            return (GenRun::Yield { value, pc, dst }, handlers);
+        }
+        return (
+            GenRun::Exit(left_at(ctx, base, outer_base, saved)),
+            handlers,
+        );
+    }
+    ctx.jit_rt.handlers.truncate(base);
+    ctx.jit_rt.base = outer_base;
+    (GenRun::Exit(finish_raw(ctx, raw)), handlers)
+}
+
+/// Whether the VM's settings let compiled `g.next(v)` sites resume compiled
+/// generator bodies natively (`crate::jit::gen_native`): a resumption that
+/// may recompile is one in [`RECOMPILE_EVERY`] (not each one, as under
+/// `KATAAN_JIT_EXIT_STRESS`), and the tier is on.
+pub(super) fn gen_native_allowed() -> bool {
+    !exit_stress() && mode() != Mode::Off
+}
+
 /// The body of [`jit_helper_gen_call`] / [`jit_helper_gen_call_reuse`].
 #[inline(always)]
 fn gen_call(
@@ -3917,7 +4046,7 @@ fn gen_call(
             // SAFETY: the op's own `CallSite` (see the function contract).
             #[allow(unsafe_code)]
             let slot = reuse.then(|| unsafe { &mut (*call_site.cast::<CallSite>()).iter_reuse });
-            super::gen_fast::jit_next(
+            let r = super::gen_fast::jit_next(
                 ctx,
                 funcs,
                 regs,
@@ -3926,7 +4055,22 @@ fn gen_call(
                 arg,
                 window_rooted(ctx),
                 slot,
-            )
+            );
+            // (A resumption through the lean path: the native one may take
+            // the next ones.)
+            if matches!(r, Some(Ok(_))) && super::gen_fast::native_resume_on() {
+                // SAFETY: the op's own `CallSite` (see the function contract).
+                #[allow(unsafe_code)]
+                let site = unsafe { &mut *call_site.cast::<CallSite>() };
+                super::gen_fast::native_fill(
+                    ctx,
+                    funcs,
+                    regs[*recv as usize],
+                    method,
+                    &mut site.gnat,
+                );
+            }
+            r
         }
         _ => None,
     };
@@ -5383,6 +5527,36 @@ pub(super) fn call_layout() -> crate::jit::CallLayout {
             + offset_of!(crate::limits::Limits, max_handler_depth)),
         handler_entry,
         poll: poll_layout(),
+        gens: gen_layout(),
+    }
+}
+
+/// [`crate::jit::GenLayout`]: where a native generator resumption finds the
+/// frame cell's fields, the running list and the heap's epoch.
+fn gen_layout() -> crate::jit::GenLayout {
+    use core::mem::offset_of;
+    let i = |v: usize| i32::try_from(v).expect("layout offset fits in i32");
+    let f = crate::cell::jit_frame_layout();
+    let (live, live_n, heap_epoch, poison) = crate::realm::Realm::jit_gen_native_offsets();
+    crate::jit::GenLayout {
+        frame_disc: f.disc,
+        frame_box: i(f.boxed),
+        f_func: i(f.func),
+        f_pc: i(f.pc),
+        f_dst: i(f.dst),
+        f_state: i(f.state),
+        f_regs_ptr: i(f.regs_ptr),
+        f_regs_len: i(f.regs_len),
+        f_handlers_len: i(f.handlers_len),
+        s_yield: super::GEN_SUSPENDED_YIELD as u8,
+        s_start: super::GEN_SUSPENDED_START as u8,
+        s_executing: super::GEN_EXECUTING as u8,
+        live: i(live),
+        live_n: i(live_n),
+        live_max: i(crate::realm::GEN_NATIVE_MAX),
+        heap_epoch: i(heap_epoch),
+        poison: i(poison),
+        scratch: i(offset_of!(Ctx<'static>, jit_rt) + offset_of!(TierRuntime, gen_scratch)),
     }
 }
 

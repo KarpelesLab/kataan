@@ -110,6 +110,10 @@ const TYPED_LEN_PROTOS_MAX: usize = 16;
 /// The longest array whose `shift()` scans its elements for a hole to skip
 /// the prototype-chain proof (`Realm::array_shift_fast`).
 const SHIFT_SCAN_MAX: usize = 16;
+
+/// How many natively resumed generators may run nested at once
+/// ([`Realm::vm_gen_native`]); a deeper resumption takes the Rust path.
+pub(crate) const GEN_NATIVE_MAX: usize = 32;
 use alloc::vec::Vec;
 
 /// Hidden `[[PromiseState]]` slot for a **Promise subclass** instance
@@ -742,6 +746,14 @@ pub struct Realm {
     /// barrier, so every collection roots their values and re-remembers the
     /// cells ([`Self::root_running_frames`]).
     pub(crate) vm_gen_running: Vec<Handle>,
+    /// The frame cells (raw handles) of the sync generators compiled code
+    /// resumed natively (`crate::jit::gen_native`), whose compiled body runs
+    /// on the register file left in its cell: [`Self::vm_gen_running`]'s
+    /// counterpart that emitted code pushes and pops (the first
+    /// [`Self::vm_gen_native_n`] entries), rooted the same way.
+    pub(crate) vm_gen_native: [u64; GEN_NATIVE_MAX],
+    /// How many entries of [`Self::vm_gen_native`] are in use.
+    pub(crate) vm_gen_native_n: u64,
     /// What host built-ins hold across a re-entry into JS, and whether a
     /// nested VM run may collect (see [`host_roots`]). Its `vals` are roots
     /// of every collection.
@@ -1122,6 +1134,8 @@ impl Realm {
             str_int_memo: None,
             vm_callee_stack: Vec::new(),
             vm_gen_running: Vec::new(),
+            vm_gen_native: [0; GEN_NATIVE_MAX],
+            vm_gen_native_n: 0,
             host_roots: host_roots::HostRoots::default(),
             vm_args_buf: Vec::new(),
             vm_callee_args: Vec::new(),
@@ -2120,6 +2134,23 @@ impl Realm {
         );
         let field = core::mem::offset_of!(Realm, owed_fn_protos);
         (field + ptr, field + len, field + cap)
+    }
+
+    /// The byte offsets, within a `Realm`, of [`Self::vm_gen_native`], its
+    /// count, the heap's handle epoch (`u32`) and its GC-verification state
+    /// word (null when off): what a natively resumed generator's emitted code
+    /// reads (`crate::jit::gen_native`).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_gen_native_offsets() -> (usize, usize, usize, usize) {
+        let heap = core::mem::offset_of!(Realm, heap);
+        let (epoch, poison) = crate::heap::jit_heap_epoch_poison_offsets();
+        (
+            core::mem::offset_of!(Realm, vm_gen_native),
+            core::mem::offset_of!(Realm, vm_gen_native_n),
+            heap + epoch,
+            heap + poison,
+        )
     }
 
     /// The byte offsets, within a `Realm`, of the object heap's slot-array
@@ -8975,7 +9006,7 @@ impl Realm {
         let pinned = self.gc_threshold_pinned;
         let major = self.next_collection_is_major();
         let mut all: Vec<Handle> = roots.to_vec();
-        if !self.vm_gen_running.is_empty() {
+        if !self.vm_gen_running.is_empty() || self.vm_gen_native_n != 0 {
             self.root_running_frames(&mut all);
         }
         if major {
@@ -9299,8 +9330,14 @@ impl Realm {
     /// young objects now.
     #[cold]
     fn root_running_frames(&mut self, out: &mut Vec<Handle>) {
-        for i in 0..self.vm_gen_running.len() {
-            let h = self.vm_gen_running[i];
+        let native = usize::try_from(self.vm_gen_native_n)
+            .unwrap_or(GEN_NATIVE_MAX)
+            .min(GEN_NATIVE_MAX);
+        for i in 0..self.vm_gen_running.len() + native {
+            let h = match i.checked_sub(self.vm_gen_running.len()) {
+                None => self.vm_gen_running[i],
+                Some(k) => Handle::from_raw(self.vm_gen_native[k]),
+            };
             out.push(h);
             if let Some(Cell::Frame(f)) = self.heap.peek_mut(h) {
                 out.extend(
