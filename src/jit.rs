@@ -3818,13 +3818,14 @@ fn coll_proof_enabled() -> bool {
 }
 
 /// Whether op `pc` lies in a loop (its innermost back-edge's range) none of
-/// whose ops is a call but an inline array method, collection method
-/// (`KATAAN_JIT_COLLPROOF`) or `Math.f`, an iteration
+/// whose ops is a call but an inline array method, with `coll` an inline
+/// collection method (for an `m.has(k)` site, `KATAAN_JIT_COLLPROOF`) or
+/// `Math.f`, an iteration
 /// step, a global access or a coercibility check, nor anything else that
 /// usually runs Rust code (only a guess of the profit: a call just empties
 /// the proof, see `ap_slot`).
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
-fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize) -> bool {
+fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize, coll: bool) -> bool {
     use crate::nbvm::Op;
     let Some((h, e)) = bytecode
         .iter()
@@ -3842,7 +3843,7 @@ fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize) -> bool {
             (key == "push" && args.len() == 1)
                 || ((key == "pop" || key == "shift") && args.is_empty())
                 || inline_math(o).is_some()
-                || (coll_proof_enabled()
+                || (coll
                     && match key.as_str() {
                         "has" | "get" | "add" | "delete" => args.len() == 1,
                         "set" => args.len() == 2,
@@ -10582,7 +10583,7 @@ impl JitFunction {
                             || ((key == "pop" || key == "shift") && args.is_empty())))
                         || (coll_proof_enabled() && key == "has" && args.len() == 1))
                     && !math_stores_key(bytecode, key.as_str())
-                    && in_call_free_loop(bytecode, pc)
+                    && in_call_free_loop(bytecode, pc, key == "has")
             })
             .collect();
         let n_ap = ap_sites.len();
