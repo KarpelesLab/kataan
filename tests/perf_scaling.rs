@@ -462,11 +462,19 @@ fn assert_scaling3(name: &str, n: usize, bounds: (f64, f64), make: impl Fn(usize
 /// compare per case: a 16 000-case switch called 16 000 times took 743 ms
 /// (node: 30 ms, with a jump table even when jitless). It now dispatches by a
 /// binary decision tree over the case values (this loop, 1 000 / 2 000 /
-/// 4 000 cases: 29 / 57 / 654 ms before, 17 / 16 / 17 ms after). Most case
-/// bodies are empty (falling through to every 50th): a body per case would
-/// give the function a register per case, and every call initializes its
-/// whole register file, which is linear in it whatever the dispatch costs.
-/// The number of calls is fixed; only the number of cases grows.
+/// 4 000 cases: 29 / 57 / 654 ms before). That tree is about five ops per
+/// case value, so from about 1 700 cases the function outgrew what the JIT
+/// compiles and ran interpreted (38 / 62 / 66 ms, 75 / 83 / 88 ms with
+/// `KATAAN_JIT=0`). A switch of 512 values or more now finds its case with
+/// one lookup op (`Op::SwitchNum`: a direct table over close integers, else a
+/// binary search) whose answer is the case the match lands on, a run of
+/// empty cases being one, then a tree over those few: 31 / 32 / 33 ms
+/// (57 / 58 / 58 ms interpreted); the sparse switch, which searches,
+/// 38 / 41 / 47 ms. Most case bodies are empty (falling through to every
+/// 50th): a body per case would give the function a register per case, and
+/// every call initializes its whole register file, which is linear in it
+/// whatever the dispatch costs. The number of calls is fixed; only the
+/// number of cases grows.
 #[test]
 fn switch_dispatch_is_not_linear_in_cases() {
     // (`label` spells case `i`'s test, `value` the value it matches.)

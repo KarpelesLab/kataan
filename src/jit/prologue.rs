@@ -79,6 +79,7 @@ fn writes(op: &Op) -> Option<Reg> {
         // tested only by the branch after it stores nothing, but nothing
         // else reads its destination then either.)
         Op::SwitchStr { dst, .. }
+        | Op::SwitchNum { dst, .. }
         | Op::StrEqConst { dst, .. }
         | Op::Relational { dst, .. }
         | Op::NewObjectLit { dst, .. }

@@ -64,7 +64,7 @@ mod jit_tier;
 #[cfg(feature = "std")]
 mod math_fast;
 pub(crate) mod native_call;
-mod num_switch;
+pub(crate) mod num_switch;
 pub mod objlit;
 mod private_ops;
 mod str_replace;
@@ -655,6 +655,19 @@ pub enum Op {
         table: Vec<(Vec<u8>, u32)>,
         /// The last few discriminants' answers (`realm::SwitchMemo`).
         memo: crate::realm::SwitchMemo,
+    },
+    /// `dst =` the pick of the entry of `table` whose key `src` strictly
+    /// equals, else `-1` (a non-Number, NaN, or no key) — a `switch` whose
+    /// case tests are all Number constants (`num_switch::lookup`). `table`
+    /// holds each distinct case value (no NaN, `-0` as `+0`), ascending,
+    /// with the case its first case's body lands on; `dense` is its direct
+    /// table when the values are close integers (`num_switch::dense_index`).
+    /// Never throws, runs no code, allocates nothing.
+    SwitchNum {
+        dst: Reg,
+        src: Reg,
+        table: alloc::boxed::Box<[(f64, u32)]>,
+        dense: alloc::boxed::Box<[u32]>,
     },
     /// `dst = src === lit` (or `!==`, `==`, `!=` by `kind`, see
     /// `STR_EQ_NEGATE` / `STR_EQ_LOOSE`): an equality against a string
@@ -11297,6 +11310,15 @@ fn run_frame_at_ic(
                     .string_switch_index_memo(regs[*src as usize], table, memo);
                 regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
             }
+            Op::SwitchNum {
+                dst,
+                src,
+                table,
+                dense,
+            } => {
+                regs[*dst as usize] =
+                    NanBox::number(num_switch::lookup(table, dense, regs[*src as usize]));
+            }
             Op::StrEqConst {
                 dst,
                 src,
@@ -15955,6 +15977,15 @@ const SWITCH_NUM_MIN: usize = 20;
 /// decision tree rather than pick by pick (compiled code compares a short
 /// list of small integers about as fast).
 const SWITCH_STR_TREE_MIN: usize = 32;
+
+/// The fewest distinct values of a Number-constant `switch` that dispatches
+/// by one lookup op (`Op::SwitchNum`) instead of a decision tree over the
+/// values. The tree costs about five ops per value, which in a long switch
+/// is most of the function and pushes it past what compiled code takes
+/// (`jit::MAX_GENERIC_OPS`); a shorter tree is plain compares and branches,
+/// which a promoted numeric loop keeps (a byte-code interpreter's 256-case
+/// switch), where the lookup op is a call.
+const SWITCH_LOOKUP_MIN: usize = 512;
 
 /// The most keys a decision tree's leaf compares one by one.
 const SWITCH_TREE_LEAF: usize = 4;
@@ -21186,10 +21217,20 @@ impl Compiler {
                         None
                     };
                     let tabled = by_table.is_some() || num_keys.is_some();
-                    if let Some(table) = by_table {
+                    // (With the lookup op, a table's picks are the cases
+                    // their bodies land on: a run of empty cases is one
+                    // pick, `num_switch::landing_cases`.)
+                    let landing = (tabled && num_switch::lookup_enabled())
+                        .then(|| num_switch::landing_cases(cases));
+                    let land = |i: u32| landing.as_ref().map_or(i, |l| l[i as usize]);
+                    if let Some(mut table) = by_table {
+                        for e in &mut table {
+                            e.1 = land(e.1);
+                        }
                         let idx = c.alloc();
                         let mut picks: Vec<u32> = table.iter().map(|(_, i)| *i).collect();
                         picks.sort_unstable();
+                        picks.dedup();
                         c.ops.push(Op::SwitchStr {
                             dst: idx,
                             src: d,
@@ -21205,6 +21246,31 @@ impl Compiler {
                             &mut case_jumps,
                             &mut misses,
                         );
+                    } else if let Some(keys) = num_keys
+                        .as_deref()
+                        .filter(|k| landing.is_some() && k.len() >= SWITCH_LOOKUP_MIN)
+                    {
+                        // One lookup (`Op::SwitchNum`) gives the case the
+                        // match lands on, then a tree over those picks: the
+                        // dispatch is a few ops whatever the number of case
+                        // values, so a long switch stays small enough for
+                        // compiled code, and costs a table read or a binary
+                        // search per run.
+                        let table: Vec<(f64, u32)> =
+                            keys.iter().map(|&(k, i)| (k, land(i))).collect();
+                        let mut picks: Vec<u32> = table.iter().map(|(_, i)| *i).collect();
+                        picks.sort_unstable();
+                        picks.dedup();
+                        let idx = c.alloc();
+                        c.ops.push(Op::SwitchNum {
+                            dst: idx,
+                            src: d,
+                            dense: num_switch::dense_index(&table),
+                            table: table.into_boxed_slice(),
+                        });
+                        let keys: Vec<(f64, u32)> =
+                            picks.iter().map(|&i| (f64::from(i), i)).collect();
+                        c.switch_dispatch(idx, &keys, 0, &mut case_jumps, &mut misses);
                     } else if let Some(keys) = num_keys {
                         // The tree's `<` must not run code or throw: an
                         // object, a BigInt or a Symbol (never equal to a

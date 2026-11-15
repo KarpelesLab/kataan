@@ -147,6 +147,7 @@ impl<'a> StoreKeys<'a> {
                     | Op::ToStr { .. }
                     | Op::ToStrLazy { .. }
                     | Op::SwitchStr { .. }
+                    | Op::SwitchNum { .. }
                     | Op::Neg { .. }
                     | Op::BitNot { .. }
                     | Op::ToKey { .. }

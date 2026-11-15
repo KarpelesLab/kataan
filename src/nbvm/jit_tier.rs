@@ -2759,6 +2759,16 @@ pub(crate) extern "C" fn jit_helper_exec_op(
             regs[*dst as usize] = NanBox::number(i.map_or(-1.0, f64::from));
             Some(Ok(()))
         }
+        Op::SwitchNum {
+            dst,
+            src,
+            table,
+            dense,
+        } => {
+            regs[*dst as usize] =
+                NanBox::number(super::num_switch::lookup(table, dense, regs[*src as usize]));
+            Some(Ok(()))
+        }
         // `${v}` / `String(v)`'s ToString of a primitive (the interpreter
         // arm's non-object cases: a string is itself, anything else its
         // digits or name, a small integer's interned); an object runs code

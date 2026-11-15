@@ -594,7 +594,9 @@ fn verify_op_with(
         }
         Op::DeleteGlobal { dst, .. } | Op::NewBox { dst } => reg(*dst),
         Op::RequireObjectCoercible { src, .. } | Op::CheckTdz { src } => reg(*src),
-        Op::SwitchStr { dst, src, .. } | Op::StrEqConst { dst, src, .. } => {
+        Op::SwitchStr { dst, src, .. }
+        | Op::SwitchNum { dst, src, .. }
+        | Op::StrEqConst { dst, src, .. } => {
             reg(*dst)?;
             reg(*src)
         }
@@ -1590,6 +1592,20 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_u32(*i, out);
             }
         }
+        Op::SwitchNum {
+            dst, src, table, ..
+        } => {
+            w_u8(197, out);
+            w_reg(*dst, out);
+            w_reg(*src, out);
+            w_u32(table.len() as u32, out);
+            for (k, i) in table {
+                let bits = k.to_bits();
+                w_u32(bits as u32, out);
+                w_u32((bits >> 32) as u32, out);
+                w_u32(*i, out);
+            }
+        }
         Op::CheckTdz { src } => {
             w_u8(83, out);
             w_reg(*src, out);
@@ -2549,6 +2565,33 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
                 src,
                 table,
                 memo: crate::realm::SwitchMemo::default(),
+            }
+        }
+        197 => {
+            let dst = r.reg()?;
+            let src = r.reg()?;
+            let n = r.u32()? as usize;
+            let mut table = Vec::with_capacity(n.min(r.remaining()));
+            for _ in 0..n {
+                let lo = u64::from(r.u32()?);
+                let hi = u64::from(r.u32()?);
+                table.push((f64::from_bits(lo | (hi << 32)), r.u32()?));
+            }
+            // The lookup binary-searches distinct, ordered, non-NaN keys
+            // (`+0` for `-0`): keep what it relies on.
+            table.retain(|(k, _)| !k.is_nan());
+            for e in &mut table {
+                if e.0 == 0.0 {
+                    e.0 = 0.0;
+                }
+            }
+            table.sort_by(|a, b| a.0.total_cmp(&b.0));
+            table.dedup_by(|b, a| a.0 == b.0);
+            Op::SwitchNum {
+                dst,
+                src,
+                dense: crate::nbvm::num_switch::dense_index(&table),
+                table: table.into_boxed_slice(),
             }
         }
         196 => Op::StrEqConst {
