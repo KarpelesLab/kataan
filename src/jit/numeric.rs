@@ -8340,6 +8340,108 @@ fn local_mentions_enabled() -> bool {
 /// `words` words. A `catch` entry's live-in is live out of every op (any op
 /// may throw to it). `None` if the table would be too large.
 pub(super) fn liveness(ops: &[Op], n_regs: usize, catches: &[usize]) -> Option<(usize, Vec<u64>)> {
+    let extra = EXTRA_USES.with(|e| e.borrow().clone());
+    LiveMemo::get(ops, n_regs, catches, &extra, || {
+        liveness_of(ops, n_regs, catches, &extra)
+    })
+}
+
+/// A memo of [`liveness`] over the body one generic compile emits
+/// (`JitFunction::compile_generic`), which asks the same question of it
+/// from several of its analyses: open ([`LiveMemo::open`]) while that
+/// compile borrows the body, so no other slice can sit at its address,
+/// and answered by the body's address and length with the same register
+/// count, catch entries and extra uses ([`EXTRA_USES`]). Unless
+/// `KATAAN_JIT_LIVEMEMO=0`.
+pub(crate) struct LiveMemo {
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+/// A [`LiveMemo`]'s answers: `(n_regs, catches, extra, answer)`.
+type LiveAnswers = Vec<(usize, Vec<usize>, Vec<Vec<u16>>, Option<(usize, Vec<u64>)>)>;
+
+std::thread_local! {
+    /// The open [`LiveMemo`]: the body's address and length, and the
+    /// answers so far.
+    static LIVE_MEMO: core::cell::RefCell<Option<(usize, usize, LiveAnswers)>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+impl LiveMemo {
+    /// Opens the memo for `body` until the result is dropped (one level:
+    /// a compile inside another's, which no compile does, opens none).
+    pub(crate) fn open(body: &[Op]) -> Option<Self> {
+        if !live_memo_enabled() {
+            return None;
+        }
+        LIVE_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.is_some() {
+                return None;
+            }
+            *m = Some((body.as_ptr() as usize, body.len(), Vec::new()));
+            Some(LiveMemo {
+                _not_send: core::marker::PhantomData,
+            })
+        })
+    }
+
+    /// `compute()`'s answer for `ops`, from the memo when it is the open
+    /// body's and this question was answered.
+    fn get(
+        ops: &[Op],
+        n_regs: usize,
+        catches: &[usize],
+        extra: &[Vec<u16>],
+        compute: impl FnOnce() -> Option<(usize, Vec<u64>)>,
+    ) -> Option<(usize, Vec<u64>)> {
+        let key = (ops.as_ptr() as usize, ops.len());
+        let hit = LIVE_MEMO.with(|m| {
+            let m = m.borrow();
+            let (p, l, answers) = m.as_ref()?;
+            if (*p, *l) != key {
+                return None;
+            }
+            answers
+                .iter()
+                .find(|a| a.0 == n_regs && a.1 == catches && a.2 == extra)
+                .map(|a| a.3.clone())
+        });
+        if let Some(h) = hit {
+            return h;
+        }
+        let r = compute();
+        LIVE_MEMO.with(|m| {
+            if let Some((p, l, answers)) = m.borrow_mut().as_mut()
+                && (*p, *l) == key
+            {
+                answers.push((n_regs, catches.to_vec(), extra.to_vec(), r.clone()));
+            }
+        });
+        r
+    }
+}
+
+impl Drop for LiveMemo {
+    fn drop(&mut self) {
+        LIVE_MEMO.with(|m| *m.borrow_mut() = None);
+    }
+}
+
+/// Whether [`LiveMemo`] memoizes (unless `KATAAN_JIT_LIVEMEMO=0`). Read
+/// once.
+fn live_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LIVEMEMO").is_none_or(|v| v != "0"))
+}
+
+/// [`liveness`] computed.
+fn liveness_of(
+    ops: &[Op],
+    n_regs: usize,
+    catches: &[usize],
+    extra: &[Vec<u16>],
+) -> Option<(usize, Vec<u64>)> {
     let n = ops.len();
     let words = n_regs.div_ceil(64);
     if n.saturating_mul(words).saturating_mul(64) > MAX_STATE * 8 {
@@ -8351,7 +8453,6 @@ pub(super) fn liveness(ops: &[Op], n_regs: usize, catches: &[usize]) -> Option<(
     let mut succ = Vec::with_capacity(2);
     let mut out = vec![0u64; words];
     let mut catch_live = vec![0u64; words];
-    let extra = EXTRA_USES.with(|e| e.borrow().clone());
     loop {
         let mut changed = false;
         catch_live.fill(0);

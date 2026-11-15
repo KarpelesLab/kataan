@@ -9523,6 +9523,9 @@ impl JitFunction {
         if ops.len() != bytecode.len() || n_regs > 0xffff {
             return None;
         }
+        // (The body's liveness is computed once per question while this
+        // compile borrows `bytecode`: `numeric::LiveMemo`.)
+        let _live_memo = numeric::LiveMemo::open(bytecode);
         // (The stores no path reads, as nothing: `dead_inits`.)
         // (Its first analysis is the body's liveness, `body_live` below.)
         let dead_owned;
