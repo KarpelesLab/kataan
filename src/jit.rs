@@ -3682,6 +3682,22 @@ fn push_dead_enabled() -> bool {
     }
 }
 
+/// Whether a `PlainPrims` guard branches for the test right after it on the
+/// answers it finds itself, and tests a register it names twice once
+/// (`KATAAN_JIT_PLAINTEST=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn plain_test_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_PLAINTEST").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether an `ArrayLen` whose result only a `JumpIfFalse` right after it
 /// tests (`while (q.length)`) branches on the length its fast path read,
 /// skipping the test's general truthiness (`KATAAN_JIT_LENBRANCH=0` turns
@@ -17895,10 +17911,51 @@ impl JitFunction {
                     let bail = num.spec_bail(&mut a, op_idx);
                     let slow = bail.unwrap_or_else(|| a.new_label());
                     let done = a.new_label();
+                    // The guard's test right after it (`KATAAN_JIT_PLAINTEST`):
+                    // the answers the code finds itself go straight to the
+                    // test's successors (`(past, target)`), the boolean
+                    // stored only if another op names its register; the
+                    // interpreter's answer reaches the test as usual.
+                    let fused: Option<(Label, Label, bool)> = (pass == numeric::PASS_MAIN
+                        && plain_test_enabled()
+                        && bail.is_none()
+                        && sched.get(si + 1) == Some(&(op_idx + 1, pass))
+                        && !num.in_any_region(op_idx)
+                        && !num.in_any_region(op_idx + 1)
+                        && !not_tested.get(op_idx + 1).copied().unwrap_or(true)
+                        && !fused_test.get(op_idx + 1).copied().unwrap_or(true)
+                        && sink_x.is_none_or(|x| {
+                            !x.plan.exit_after[op_idx] && !x.plan.exit_before[op_idx + 1]
+                        }))
+                    .then(|| match ops.get(op_idx + 1) {
+                        Some(&GenericOp::JumpIfFalse { cond, target })
+                            if cond == dst && target > op_idx + 1 && target <= ops.len() =>
+                        {
+                            let named = bytecode
+                                .iter()
+                                .enumerate()
+                                .any(|(j, o)| {
+                                    j != op_idx
+                                        && j != op_idx + 1
+                                        && crate::bytecode::op_mentions_reg(o, dst)
+                                });
+                            Some((*labels.get(op_idx + 2)?, *labels.get(target)?, named))
+                        }
+                        _ => None,
+                    })
+                    .flatten();
                     let mut heaps = Vec::new();
+                    let mut seen: Vec<u16> = Vec::new();
                     for &r in rs {
                         if num.is_number_at(op_idx, r) {
                             continue;
+                        }
+                        // (A register named twice, `f(x & -x)`: tested once.)
+                        if plain_test_enabled() {
+                            if seen.contains(&r) {
+                                continue;
+                            }
+                            seen.push(r);
                         }
                         a.load_rax(disp(r));
                         a.p_cmp_handle_floor(call_seq::r::RAX);
@@ -17910,9 +17967,11 @@ impl JitFunction {
                             heaps.push((heap, r));
                         }
                     }
-                    a.movabs_rax(tag_true as i64);
-                    a.store_rax(disp(dst));
-                    a.jmp(done);
+                    if fused.is_none_or(|f| f.2) {
+                        a.movabs_rax(tag_true as i64);
+                        a.store_rax(disp(dst));
+                    }
+                    a.jmp(fused.map_or(done, |f| f.0));
                     if bail.is_none() {
                         // A heap value that is no string cell (an object,
                         // a BigInt, a Symbol: `plain_prim` is false for
@@ -17925,9 +17984,11 @@ impl JitFunction {
                             a.p_slot_rooted(&layout, call_seq::r::RCX, slow);
                             a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_str_disc);
                             a.je(slow);
-                            a.movabs_rax(NanBox::boolean(false).to_bits() as i64);
-                            a.store_rax(disp(dst));
-                            a.jmp(done);
+                            if fused.is_none_or(|f| f.2) {
+                                a.movabs_rax(NanBox::boolean(false).to_bits() as i64);
+                                a.store_rax(disp(dst));
+                            }
+                            a.jmp(fused.map_or(done, |f| f.1));
                         }
                         a.bind(slow);
                         exec_op!(pc);
