@@ -2102,7 +2102,9 @@ pub(crate) extern "C" fn jit_helper_str_proof(
     if super::native_call::str_call_code(site.key()).is_some() {
         return u64::from(super::native_call::prove_str_method(&mut ctx.realm, site));
     }
-    if site.key() == "push" {
+    if super::array_hof::hof_for(site.key().as_bytes()).is_some() {
+        super::native_call::prove_array_hof(&mut ctx.realm, site);
+    } else if site.key() == "push" {
         super::native_call::prove_array_push(&mut ctx.realm, site);
     } else if site.key() == "pop" {
         super::native_call::prove_array_pop(&mut ctx.realm, site);
@@ -3771,6 +3773,68 @@ pub(crate) extern "C" fn jit_helper_coll_call(
             0
         }
         None => 1,
+    }
+}
+
+/// A direct array higher-order built-in call from compiled code
+/// (`crate::jit`): `Op::CallMethod` of one of `array_hof`'s built-ins
+/// (`code`: its `array_hof::hof_code`) on a plain array (an array cell
+/// without side-table state or a set `[[Prototype]]`, which owns no named
+/// property) whose site proves that method of the realm's first
+/// `%Array.prototype%` the built-in (`native_call::prove_array_hof`), the
+/// method `try_call` would find and run: `array_hof::run` called directly,
+/// its result stored to the op's `dst` and `0`; `1`, having done nothing,
+/// for the general call; the throw sentinel when it threw.
+///
+/// # Safety
+/// As [`jit_helper_coll_call`].
+pub(crate) extern "C" fn jit_helper_hof_call(
+    ctx_raw: *mut core::ffi::c_void,
+    regs_raw: *mut u64,
+    n_regs: usize,
+    op_raw: *const Op,
+    _site: *mut core::ffi::c_void,
+    code: *mut core::ffi::c_void,
+) -> u64 {
+    // SAFETY: see the function contract (as `jit_helper_exec_op`).
+    #[allow(unsafe_code)]
+    let op = unsafe { &*op_raw };
+    let Op::CallMethod {
+        dst, recv, args, ..
+    } = op
+    else {
+        return 1;
+    };
+    let Some(hof) = super::array_hof::hof_of_code(code as usize) else {
+        return 1;
+    };
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    if ctx.host.is_none() || ctx.realm.multi_realm {
+        return 1;
+    }
+    // SAFETY: the activation's register file, live and unaliased here.
+    #[allow(unsafe_code)]
+    let regs = unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+    // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+    #[allow(unsafe_code)]
+    let funcs = unsafe {
+        &*ctx
+            .jit_funcs
+            .expect("jit_funcs set before generic dispatch")
+    };
+    let argv = super::ArgBuf::from_regs(regs, args);
+    match super::array_hof::run(ctx, funcs, regs, regs[*recv as usize], hof, &argv) {
+        None => 1,
+        Some(Ok(v)) => {
+            regs[*dst as usize] = v;
+            0
+        }
+        Some(Err(e)) => {
+            ctx.jit_pending_fault = Some(e);
+            NanBox::jit_throw_bits()
+        }
     }
 }
 

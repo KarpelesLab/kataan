@@ -39,7 +39,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-mod array_hof;
+pub(crate) mod array_hof;
 
 /// Whether `ArraySpeciesCreate(O, n)` for the array `h` is the default
 /// `ArrayCreate(n)`, decided with no observable effect: `false` whenever a
@@ -8504,6 +8504,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         call_method: jit_tier::jit_helper_call_method,
         coll_call: jit_tier::jit_helper_coll_call,
         str_call: jit_tier::jit_helper_str_call,
+        hof_call: jit_tier::jit_helper_hof_call,
         concat: jit_tier::jit_helper_concat,
         gen_call: jit_tier::jit_helper_gen_call,
         gen_call_reuse: jit_tier::jit_helper_gen_call_reuse,

@@ -3765,6 +3765,42 @@ fn ap_proof_enabled() -> bool {
     }
 }
 
+/// Whether an array higher-order built-in call (`a.map(f)`, ...) on a plain
+/// array whose site proves the method the built-in calls it through its own
+/// helper, past the general call's method lookup
+/// (`jit_tier::jit_helper_hof_call`; `KATAAN_JIT_HOFDIRECT=0` turns it off,
+/// read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn hof_direct_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_HOFDIRECT").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether a fused `typeof v === 'lit'` of an ordinary object answers from
+/// its layout's brand bits in line (`"object"` unless it is
+/// `%Function.prototype%` or holds a function or `[[IsHTMLDDA]]` marker,
+/// which take the helper) instead of the helper (`KATAAN_JIT_TYPEOFOBJ=0`
+/// turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn typeof_obj_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_TYPEOFOBJ").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether an inline `m.has(k)` / `m.get(k)` in a loop that makes no call
 /// keeps a run proof of its checks in a frame slot, as an inline `a.push(x)`
 /// does (`KATAAN_JIT_COLLPROOF=0` turns it off, read once per process).
@@ -4069,6 +4105,11 @@ pub struct GenericHelpers {
     /// `String.prototype` method call on a plain string (`0` served, `1`
     /// declined, or the throw sentinel).
     pub str_call: JitCallMethodHelper,
+    /// `jit_helper_hof_call(ctx, regs, n_regs, op, _, code)`: an array
+    /// higher-order built-in called on a plain array whose site proves the
+    /// method the built-in (`0` served, `1` declined, or the throw
+    /// sentinel).
+    pub hof_call: JitCallMethodHelper,
     /// `jit_helper_concat(ctx, regs, n_regs, op, _, _)`: `Op::Concat` of
     /// parts that convert without running code (`0`, the result stored),
     /// else `1` for the interpreter's op.
@@ -13524,6 +13565,63 @@ impl JitFunction {
                         a.cold_end(cold);
                         a.bind(general);
                     }
+                    // `a.map(f)`, `a.forEach(f)`, ... on a plain array whose
+                    // site proves the method the built-in: its run straight
+                    // through `jit_helper_hof_call` (else the general call;
+                    // a stale proof is made again for the next call).
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && let Some(hof) = crate::nbvm::array_hof::hof_for(key.as_bytes())
+                        && hof_direct_enabled()
+                        && !margs.is_empty()
+                        && ok(dst)
+                        && ok(recv)
+                        && margs.iter().all(|&m| ok(m))
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                        && num.result_xmm(op_idx, dst).is_none()
+                    {
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.p_str_proof(si.method_ptr, prove, general);
+                        walk_to_slot!(recv, general);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                        a.jne(general);
+                        a.cmp_byte_at_rcx_imm(layout.off_arr_side, 0);
+                        a.jne(general);
+                        a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
+                        a.jne(general);
+                        let op_ptr: *const crate::nbvm::Op = bytecode.get(op_idx)?;
+                        a.mov_rdi_r15();
+                        a.mov_rsi_rbx();
+                        a.movabs_argreg(2, n_regs as i64);
+                        a.movabs_argreg(3, op_ptr as i64);
+                        a.movabs_argreg(4, 0);
+                        a.movabs_argreg(5, crate::nbvm::array_hof::hof_code(hof) as i64);
+                        a.movabs_rax(helpers.hof_call as usize as i64);
+                        a.call_rax();
+                        a.test_rax_rax();
+                        a.je(done);
+                        throw_check!();
+                        a.jmp(general);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
                     // `a.push(x)` in a speculative region's fast version
                     // (`numeric::spec_push_op`): the append in place below,
                     // every other path a leave for the plain copy, nothing
@@ -14423,12 +14521,51 @@ impl JitFunction {
                                     a.jne(not_fn);
                                     a.jmp(vmfn);
                                     a.bind(not_fn);
+                                    let cl = &helpers.call_layout;
+                                    // An ordinary shaped object with no
+                                    // function or `[[IsHTMLDDA]]` marker
+                                    // (`Realm::type_of_value`), and not
+                                    // `%Function.prototype%`, is an object.
+                                    if typeof_obj_enabled() {
+                                        let not_obj = a.new_label();
+                                        a.cmp_byte_at_rcx_imm(
+                                            layout.off_cell_tag,
+                                            layout.cell_object_disc,
+                                        );
+                                        a.jne(not_obj);
+                                        a.p_shaped_after_object(&layout, slow);
+                                        a.g_load(
+                                            call_seq::r::R11,
+                                            call_seq::r::RCX,
+                                            layout.off_shape,
+                                        );
+                                        let marks = [1, 2, 3].iter().fold(0u8, |m, &i| {
+                                            m | crate::shape::brand_bit(crate::shape::BRAND_KEYS[i])
+                                        });
+                                        a.p_test_byte_imm(
+                                            call_seq::r::R11,
+                                            layout.props.shape_brands,
+                                            marks,
+                                        );
+                                        a.jne(slow);
+                                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                                        a.g_cmp_mem(
+                                            call_seq::r::RAX,
+                                            call_seq::r::R9,
+                                            i32::try_from(
+                                                crate::realm::Realm::jit_function_proto_offset(),
+                                            )
+                                            .ok()?,
+                                        );
+                                        a.je(slow);
+                                        a.jmp(if t.lit == L::Object { yes } else { no });
+                                        a.bind(not_obj);
+                                    }
                                     a.cmp_byte_at_rcx_imm(
                                         layout.off_cell_tag,
                                         layout.cell_str_disc,
                                     );
                                     a.jne(slow);
-                                    let cl = &helpers.call_layout;
                                     a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
                                     a.g_cmp_byte_imm(call_seq::r::R9, cl.str_special, 0);
                                     a.g_jcc(call_seq::cc::NE, slow);

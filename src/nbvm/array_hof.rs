@@ -64,7 +64,7 @@ pub(super) fn lean_on() -> bool {
 
 /// The built-ins this module runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Hof {
+pub(crate) enum Hof {
     ForEach,
     Map,
     Filter,
@@ -79,8 +79,35 @@ pub(super) enum Hof {
     Sort,
 }
 
+/// `op`'s code for compiled code's direct call (`jit_tier::jit_helper_hof_call`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[must_use]
+pub(crate) fn hof_code(op: Hof) -> usize {
+    op as usize
+}
+
+/// The built-in of a [`hof_code`].
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn hof_of_code(code: usize) -> Option<Hof> {
+    const ALL: [Hof; 12] = [
+        Hof::ForEach,
+        Hof::Map,
+        Hof::Filter,
+        Hof::Some,
+        Hof::Every,
+        Hof::Find,
+        Hof::FindIndex,
+        Hof::FindLast,
+        Hof::FindLastIndex,
+        Hof::Reduce,
+        Hof::ReduceRight,
+        Hof::Sort,
+    ];
+    ALL.iter().copied().find(|&h| h as usize == code)
+}
+
 /// The built-in `Array.prototype` method named `name`, if it is one of these.
-pub(super) fn hof_for(name: &[u8]) -> Option<Hof> {
+pub(crate) fn hof_for(name: &[u8]) -> Option<Hof> {
     Some(match name {
         b"forEach" => Hof::ForEach,
         b"map" => Hof::Map,

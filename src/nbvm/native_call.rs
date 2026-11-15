@@ -860,6 +860,24 @@ pub(super) fn prove_dataview(
     })
 }
 
+/// What compiled code's direct call of an array higher-order built-in
+/// relies on (`jit_tier::jit_helper_hof_call`), for `site`: as
+/// [`prove_array_push`], of the built-in the site's key names.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prove_array_hof(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
+    let start = realm
+        .root_array_proto()
+        .and_then(|p| match realm.jit_object(p) {
+            Some(_) => Some(p),
+            None => realm.jit_aux_of(p),
+        });
+    let key = alloc::string::String::from(site.key());
+    match super::array_hof::hof_for(key.as_bytes()) {
+        Some(op) => prove_proto_method(realm, site, start, &key, FastOp::ArrayHof(op)),
+        None => site.set_str_proof(None),
+    }
+}
+
 /// What compiled code's inline `a.pop()` relies on, for `site`: as
 /// [`prove_array_push`], of the built-in `pop`.
 #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]

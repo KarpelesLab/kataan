@@ -1416,7 +1416,7 @@ impl X64Assembler {
     /// After the slot in `rcx` compared equal to the object cell tag: to
     /// `miss` unless its object data is shaped — no code when the object-data
     /// tag is the very byte and value just compared.
-    fn p_shaped_after_object(&mut self, l: &JitLayout, miss: Label) {
+    pub(crate) fn p_shaped_after_object(&mut self, l: &JitLayout, miss: Label) {
         if (l.off_od_tag, l.obj_shaped_disc) != (l.off_cell_tag, l.cell_object_disc) {
             self.cmp_byte_at_rcx_imm(l.off_od_tag, l.obj_shaped_disc);
             self.jne(miss);

@@ -590,6 +590,11 @@ pub struct Realm {
     /// still be overridden explicitly (`Object.setPrototypeOf(fn, p)`), recorded
     /// in [`native_protos`](Realm::native_protos).
     function_proto_intrinsic: Option<Handle>,
+    /// [`function_proto_intrinsic`](Self::function_proto_intrinsic)'s value
+    /// bits (`u64::MAX` for none), which compiled code's inline `typeof`
+    /// compares an ordinary object with (`%Function.prototype%` is the one
+    /// ordinary object without a function marker that is a function).
+    jit_function_proto: u64,
     /// The property key (`"\0sym:<id>"`) of `Symbol.hasInstance`, recorded
     /// when `%Function.prototype%[@@hasInstance]` (non-writable,
     /// non-configurable) is installed, so the VM can tell that a function
@@ -1247,6 +1252,7 @@ impl Realm {
             native_class_tags: alloc::collections::BTreeMap::new(),
             typed_array_intrinsic: None,
             function_proto_intrinsic: None,
+            jit_function_proto: u64::MAX,
             has_instance_key: None,
             vm_fn_meta: Vec::new(),
             vm_fn_meta_old: 0,
@@ -1594,6 +1600,7 @@ impl Realm {
         // A default `[[Prototype]]` changes: retire every validated chain.
         crate::object::bump_proto_epoch();
         self.function_proto_intrinsic = Some(handle);
+        self.jit_function_proto = NanBox::handle(handle.to_raw()).to_bits();
         self.jit_vmfn_plain = false;
         self.add_jit_flags(handle, crate::object::JIT_FLAG_NO_INLINE_SET);
     }
@@ -1713,6 +1720,9 @@ impl Realm {
         self.refresh_array_proto_default();
         self.promise_proto_intrinsic = s.promise_proto;
         self.function_proto_intrinsic = s.function_proto;
+        self.jit_function_proto = s
+            .function_proto
+            .map_or(u64::MAX, |h| NanBox::handle(h.to_raw()).to_bits());
         self.jit_vmfn_plain = false;
         for h in [s.array_proto, s.function_proto].into_iter().flatten() {
             self.add_jit_flags(h, crate::object::JIT_FLAG_NO_INLINE_SET);
@@ -2062,6 +2072,15 @@ impl Realm {
     #[must_use]
     pub(crate) fn jit_proto_index_dirty_offset() -> usize {
         core::mem::offset_of!(Realm, proto_index_accessor_dirty)
+    }
+
+    /// The byte offset, within a `Realm`, of `jit_function_proto` (a
+    /// `u64`: `%Function.prototype%`'s value bits), which compiled code's
+    /// inline `typeof` of an ordinary object compares with.
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[must_use]
+    pub(crate) fn jit_function_proto_offset() -> usize {
+        core::mem::offset_of!(Realm, jit_function_proto)
     }
 
     /// The byte offset, within a `Realm`, of `jit_array_proto_default` (a
