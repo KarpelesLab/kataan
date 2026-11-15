@@ -3649,6 +3649,23 @@ fn iter_shadow_enabled() -> bool {
     }
 }
 
+/// Whether a by-index array iteration step tests `done` and a hole against
+/// the code's constant words (`cmp rax, [rip + c]`, one instruction) rather
+/// than through a scratch register (`KATAAN_JIT_ITERCONST=0` turns it off,
+/// read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn iter_const_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_ITERCONST").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether an `ArrayLen` whose result only a `JumpIfFalse` right after it
 /// tests (`while (q.length)`) branches on the length its fast path read,
 /// skipping the test's general truthiness (`KATAAN_JIT_LENBRANCH=0` turns
@@ -14142,6 +14159,19 @@ impl JitFunction {
                             let (dst, done, iter, next) = (*dst, *done, *iter, *next);
                             let slow = a.new_label();
                             let fin = a.new_label();
+                            // `cmp rax, <word>`: against the code's constant
+                            // word (`KATAAN_JIT_ITERCONST`), else through `r11`.
+                            macro_rules! iter_cmp_const {
+                                ($w:expr) => {{
+                                    let w: u64 = $w;
+                                    if iter_const_enabled() {
+                                        a.cmp_rax_const(w);
+                                    } else {
+                                        a.movabs_r11(w as i64);
+                                        a.cmp_rax_r11();
+                                    }
+                                }};
+                            }
                             // A speculative loop's hoisted step
                             // (`NumGen::iter_hoisted`): its entry proved
                             // `done` not `true`, and the array is the
@@ -14203,8 +14233,7 @@ impl JitFunction {
                                 // refilled.
                                 use call_seq::r as R;
                                 a.load_rax(disp(done));
-                                a.movabs_r11(tag_true as i64);
-                                a.cmp_rax_r11();
+                                iter_cmp_const!(tag_true);
                                 a.je(slow);
                                 recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
                                 let resync = a.new_label();
@@ -14220,8 +14249,7 @@ impl JitFunction {
                                 a.jae(end);
                                 a.mov_r8_rax();
                                 a.mov_rax_at_r11_rax8();
-                                a.movabs_r11(NanBox::hole().to_bits() as i64);
-                                a.cmp_rax_r11();
+                                iter_cmp_const!(NanBox::hole().to_bits());
                                 a.je(slow);
                                 a.store_rax(disp(dst));
                                 // cursor = index + 1 (an exact Number below the
@@ -14283,8 +14311,7 @@ impl JitFunction {
                                 a.cmp_rax_r11();
                                 a.je(slow); // an iterator object: the protocol
                                 a.load_rax(disp(done));
-                                a.movabs_r11(tag_true as i64);
-                                a.cmp_rax_r11();
+                                iter_cmp_const!(tag_true);
                                 a.je(slow);
                                 recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
                                 // The cursor's truncation, as `iter_fast::step`
@@ -14299,8 +14326,7 @@ impl JitFunction {
                                 a.jae(end);
                                 a.mov_r8_rax();
                                 a.mov_rax_at_r11_rax8();
-                                a.movabs_r11(NanBox::hole().to_bits() as i64);
-                                a.cmp_rax_r11();
+                                iter_cmp_const!(NanBox::hole().to_bits());
                                 a.je(slow);
                                 a.store_rax(disp(dst));
                                 // cursor = index + 1 (an exact Number: below the
