@@ -2248,16 +2248,34 @@ impl X64Assembler {
         self.p_add_fresh_proof(l, realm_off, sites, max_slot, miss);
     }
 
+    /// [`Self::p_add_fresh_proof_with`], the realm loaded into `r8` (which
+    /// it then clobbers, as `r9` and `r11`).
+    pub(crate) fn p_add_fresh_proof(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        sites: &[*const MethodSite],
+        max_slot: u32,
+        miss: Label,
+    ) {
+        self.g_load(r::R8, r::R15, realm_off);
+        self.p_add_fresh_proof_with(l, (r::R8, r::R8, r::R9), sites, max_slot, miss);
+    }
+
     /// [`Self::p_add_fresh_prelude`]'s checks for an object whose
     /// `[[Prototype]]` (a raw handle) is in `rsi` (kept), before the object
     /// exists: what the pre-initialised allocation of an inlined `new`
     /// (`Self::p_alloc_object_preinit`) checks of the world outside it.
     /// Otherwise to `miss`, having changed nothing. Clobbers `r8`, `r9`,
     /// `r11`.
-    pub(crate) fn p_add_fresh_proof(
+    ///
+    /// (`_with`: the realm already in register `realm` (kept, unless it is
+    /// `scratch`), `scratch` and `epoch` the two other registers it
+    /// clobbers besides `r11`.)
+    pub(crate) fn p_add_fresh_proof_with(
         &mut self,
         l: &JitLayout,
-        realm_off: i32,
+        (realm, scratch, epoch): (u8, u8, u8),
         sites: &[*const MethodSite],
         max_slot: u32,
         miss: Label,
@@ -2269,9 +2287,8 @@ impl X64Assembler {
         let i = |v: usize| i32::try_from(v).expect("site offset fits in i32");
         let p = &l.props;
         // Below the dictionary threshold.
-        self.g_load(r::R8, r::R15, realm_off);
-        self.g_load(r::R8, r::R8, p.dict_threshold);
-        self.g_cmp_imm(r::R8, i32::try_from(max_slot).expect("a small slot"));
+        self.g_load(scratch, realm, p.dict_threshold);
+        self.g_cmp_imm(scratch, i32::try_from(max_slot).expect("a small slot"));
         self.g_jcc(cc::BE, miss);
         // The prototype chain: the chain's proof, else every site's entry.
         let run_off = offset_of!(MethodSite, run);
@@ -2283,9 +2300,9 @@ impl X64Assembler {
         let level0 = i(add + offset_of!(AddEntry, levels) + offset_of!(ChainLevel, handle));
         let proved = self.new_label();
         self.g_movabs(r::R11, head as u64);
-        self.p_load_proto_epoch(r::R9);
+        self.p_load_proto_epoch(epoch);
         let validate = self.new_label();
-        self.g_cmp_mem(r::R9, r::R11, proof_stamp);
+        self.g_cmp_mem(epoch, r::R11, proof_stamp);
         self.g_jcc(cc::NE, validate);
         self.g_cmp_mem(r::RSI, r::R11, proof_proto);
         self.g_jcc(cc::E, proved);
@@ -2296,13 +2313,13 @@ impl X64Assembler {
             // prototype.)
             self.p_cmp32_imm8(r::R11, depth, 0);
             self.g_jcc(cc::E, miss);
-            self.g_cmp_mem(r::R9, r::R11, stamp);
+            self.g_cmp_mem(epoch, r::R11, stamp);
             self.g_jcc(cc::NE, miss);
             self.g_cmp_mem(r::RSI, r::R11, level0);
             self.g_jcc(cc::NE, miss);
         }
         self.g_movabs(r::R11, head as u64);
-        self.g_store(r::R11, proof_stamp, r::R9);
+        self.g_store(r::R11, proof_stamp, epoch);
         self.g_store(r::R11, proof_proto, r::RSI);
         self.bind(proved);
     }
@@ -3503,7 +3520,8 @@ impl X64Assembler {
     /// code changes, is as they found it: not checked again.)
     /// Then `rax` = the object's handle bits and `rcx` its heap slot;
     /// otherwise to `miss`, having changed nothing (but the chain's proof,
-    /// a fact). Clobbers `rax`, `rcx`, `rdx`, `r8`, `r9`, `r11`.
+    /// a fact). Clobbers `rax`, `rcx`, `rdx`, `r8`, `r9`, `r11` — but keeps
+    /// `r8` under [`ctor_trim_enabled`](super::call_seq::ctor_trim_enabled).
     pub(crate) fn p_alloc_object_preinit(
         &mut self,
         l: &JitLayout,
@@ -3530,16 +3548,36 @@ impl X64Assembler {
         self.g_movabs(r::R11, first.from);
         self.g_cmp_mem(r::R11, r::R9, p.root_shape);
         self.g_jcc(cc::NE, miss);
+        // (`lean`: the realm stays in `r9` and `r8` is untouched.)
+        let lean = super::call_seq::ctor_trim_enabled();
         if !proven {
-            self.p_add_fresh_proof(l, realm_off, sites, max_slot, miss);
-        }
-        for &(b, d, number) in run {
-            if !number && b.slot < 64 && last.num_mask & (1 << b.slot) != 0 {
-                self.g_load(r::RAX, r::RBX, d);
-                self.p_field_rep_const(l, (r::RAX, r::RDX), last.to, b.slot, miss);
+            if lean {
+                self.p_add_fresh_proof_with(l, (r::R9, r::RAX, r::RDX), sites, max_slot, miss);
+            } else {
+                self.p_add_fresh_proof(l, realm_off, sites, max_slot, miss);
             }
         }
-        self.g_load(r::R9, r::R15, realm_off);
+        let checked = |&(b, _, number): &(BakedAdd, i32, bool)| {
+            !number && b.slot < 64 && last.num_mask & (1 << b.slot) != 0
+        };
+        // (Lean, two checks or more: the boxed bound in `r11` for all.)
+        let bound = lean && run.iter().filter(|x| checked(x)).count() > 1;
+        if bound {
+            self.g_movabs(r::R11, super::fieldrep::FR_BOXED_MIN);
+        }
+        for &(b, d, number) in run {
+            if checked(&(b, d, number)) {
+                self.g_load(r::RAX, r::RBX, d);
+                if bound {
+                    self.p_field_rep_const_k(l, (r::RAX, r::RDX, r::R11), last.to, b.slot, miss);
+                } else {
+                    self.p_field_rep_const(l, (r::RAX, r::RDX), last.to, b.slot, miss);
+                }
+            }
+        }
+        if !lean {
+            self.g_load(r::R9, r::R15, realm_off);
+        }
         self.p_pop_free_slot(l, miss);
         // `Cell::Object` in the run's last layout, field by field.
         self.p_store_obj_header(l, n);

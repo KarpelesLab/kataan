@@ -3374,6 +3374,23 @@ pub(crate) fn preinit_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PREINIT").is_none_or(|v| v != "0"))
 }
 
+/// Whether an inlined `new`'s guard drops the checks and reloads its
+/// allocation path repeats (`KATAAN_JIT_CTORTRIM=0`: keeps them):
+/// * a `new c(…)` (the constructor register is its own `new.target`)
+///   compares the constructor with the [`ConstructFast`] record's once —
+///   that site's record is only ever filled for a construct whose
+///   `new.target` is the constructor itself, so its two fields are equal;
+/// * the record's site address, still in `r11` from the identification,
+///   is not loaded again, nor the constructor's value for its proof;
+/// * a pre-initialised allocation keeps the realm in one register and the
+///   captures' pointer in `r8` across its checks
+///   ([`X64Assembler::p_alloc_object_preinit`]), so neither is reloaded.
+#[must_use]
+pub(crate) fn ctor_trim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CTORTRIM").is_none_or(|v| v != "0"))
+}
+
 /// Whether an inlined accessor call's guard takes the getter (or setter)
 /// its memo recorded without reading it again at the holder
 /// (`KATAAN_JIT_ACCMEMO=0`: it compares the holder's). A memo records only
@@ -4025,6 +4042,15 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     Some(())
 }
 
+/// Whether the construct guard `e` (its constructor and `new.target`
+/// registers `(ctor, nt)`) is a plain `new c(…)` whose [`ConstructFast`]
+/// record compares the constructor once (see [`ctor_trim_enabled`]): the
+/// construct op's own sequence and the interpreter's refills record it with
+/// the constructor as `new.target`, so the record's `nt` is its `ctor`.
+fn plain_new(e: &InlineEmit<'_>, (ctor, nt): (u16, u16)) -> bool {
+    ctor == nt && e.super_this.is_none() && ctor_trim_enabled()
+}
+
 /// Step 3 of [`emit_inline_guard`] for a construct (`e.new_target`, the
 /// constructor and `new.target` registers `(ctor, nt)`; the constructor's
 /// value in `rax`): the call's [`ConstructFast`] record holds — this
@@ -4044,11 +4070,14 @@ fn emit_construct_record_check(
     a.g_movabs(r::R11, e.memo as u64);
     a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ctor)));
     a.g_jcc(cc::NE, miss);
-    if nt != ctor {
-        a.g_load(r::RAX, r::RBX, i32::from(nt) * 8);
+    // (A `new c(…)`'s record has `nt == ctor`: see `ctor_trim_enabled`.)
+    if !plain_new(e, (ctor, nt)) {
+        if nt != ctor {
+            a.g_load(r::RAX, r::RBX, i32::from(nt) * 8);
+        }
+        a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, nt)));
+        a.g_jcc(cc::NE, miss);
     }
-    a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, nt)));
-    a.g_jcc(cc::NE, miss);
     load_proto_epoch(a, r::R9);
     a.g_cmp_mem(r::R9, r::R11, f(offset_of!(ConstructFast, stamp)));
     a.g_jcc(cc::NE, miss);
@@ -4278,18 +4307,26 @@ fn emit_inline_new_this(
     // `ConstructProof`, or the guard's identification by the record,
     // `emit_construct_record_check`, which left the site in `r11`. With
     // `proof`, the proof is recorded when `this` is made without a call.)
+    let trim = ctor_trim_enabled();
     let record = |a: &mut X64Assembler| {
         if let Some(p) = proof {
             a.g_load(r::R9, r::RBX, reg(ctor));
             a.g_store(RBP, p.ctor, r::R9);
-            a.g_load(r::R9, r::RBX, reg(nt));
+            if nt != ctor || !trim {
+                a.g_load(r::R9, r::RBX, reg(nt));
+            }
             a.g_store(RBP, p.nt, r::R9);
             a.g_store(RBP, p.caps, r::R8);
         }
     };
     if checked {
-        // (A derived constructor's needs nothing of the record.)
-        if !e.derived {
+        // (A derived constructor's needs nothing of the record. The
+        // identification by the record left its site in `r11`, unless a
+        // `super(…)`'s check of `this` or another way's entry came since:
+        // see `emit_inline_guard`.)
+        let site_kept =
+            trim && !proven && e.super_this.is_none() && e.poly_entry.is_none() && e.poly >> 8 <= 1;
+        if !e.derived && !site_kept {
             a.g_movabs(r::R11, e.memo as u64);
         }
         return emit_inline_new_this_made(a, e, this, (miss, pre_hit), record, proven);
@@ -4298,11 +4335,13 @@ fn emit_inline_new_this(
     a.g_load(r::RAX, r::RBX, reg(ctor));
     a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, ctor)));
     a.g_jcc(cc::NE, miss);
-    if nt != ctor {
-        a.g_load(r::RAX, r::RBX, reg(nt));
+    if !plain_new(e, (ctor, nt)) {
+        if nt != ctor {
+            a.g_load(r::RAX, r::RBX, reg(nt));
+        }
+        a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, nt)));
+        a.g_jcc(cc::NE, miss);
     }
-    a.g_cmp_mem(r::RAX, r::R11, f(offset_of!(ConstructFast, nt)));
-    a.g_jcc(cc::NE, miss);
     load_proto_epoch(a, r::R9);
     a.g_cmp_mem(r::R9, r::R11, f(offset_of!(ConstructFast, stamp)));
     a.g_jcc(cc::NE, miss);
@@ -4404,8 +4443,11 @@ fn emit_inline_new_this_made(
             a.g_store(RBP, w.cell, r::RCX);
         }
         a.g_store(r::RBX, reg(this), r::RAX);
-        a.g_movabs(r::R11, e.memo as u64);
-        a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+        // (A lean allocation kept the captures' pointer in `r8`.)
+        if !ctor_trim_enabled() {
+            a.g_movabs(r::R11, e.memo as u64);
+            a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+        }
         record(a);
         a.jmp(hit);
         a.bind(plain);
@@ -4485,7 +4527,9 @@ fn emit_inline_new_this_made(
 /// site's [`ConstructProof`] holds: no Rust code ran since a full check of
 /// this guard passed and recorded the proof, so the memo and its copies are
 /// as that check found them) nothing is checked again. Keeps `r8` (the
-/// captures' pointer, loaded from the record); `r11` ends as `e.memo`.
+/// captures' pointer, loaded from the record); `r11` ends as `e.memo`
+/// (but under [`ctor_trim_enabled`], where nothing after needs it, it may
+/// hold anything, and `r8` is the pointer it came in with).
 fn emit_sunk_this(
     a: &mut X64Assembler,
     e: &InlineEmit<'_>,
@@ -4501,6 +4545,7 @@ fn emit_sunk_this(
     let f = |o: usize| site_off(offset_of!(CallSite, fast) + o);
     let m = |o: usize| i32::try_from(o).ok();
     let have = a.new_label();
+    let trim = ctor_trim_enabled();
     a.g_movabs(r::R9, memo as u64);
     if proven {
         a.g_load(r::RAX, r::R9, m(offset_of!(SinkMemo, standin))?);
@@ -4543,6 +4588,11 @@ fn emit_sunk_this(
         a.g_store(r::R9, m(offset_of!(SinkMemo, cell))?, r::RCX);
         load_proto_epoch(a, r::RSI);
         a.g_store(r::R9, m(offset_of!(SinkMemo, cell_stamp))?, r::RSI);
+        if trim {
+            // (The walk clobbered the captures' pointer.)
+            a.g_movabs(r::R11, e.memo as u64);
+            a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+        }
         a.jmp(have);
         if let Some(c) = cold {
             a.cold_end(c);
@@ -4556,8 +4606,11 @@ fn emit_sunk_this(
         a.g_store(RBP, w.key, r::RAX);
         a.g_store(RBP, w.cell, r::RCX);
     }
-    a.g_movabs(r::R11, e.memo as u64);
-    a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+    // (Trimmed: `r8` still holds the captures' pointer it came in with.)
+    if !trim {
+        a.g_movabs(r::R11, e.memo as u64);
+        a.g_load(r::R8, r::R11, f(offset_of!(ConstructFast, caps)));
+    }
     record(a);
     Some(())
 }

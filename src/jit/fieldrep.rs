@@ -18,6 +18,11 @@ use super::call_seq::{cc, r};
 use super::{JitLayout, Label, X64Assembler};
 use alloc::vec::Vec;
 
+/// The least doubled `NanBox` bits of a boxed value (not a Number): the 13
+/// pattern bits 50..=62, shifted to the top, all set
+/// ([`X64Assembler::p_field_rep_const_k`]).
+pub(crate) const FR_BOXED_MIN: u64 = 0xfff8_0000_0000_0000;
+
 impl X64Assembler {
     /// To `number` when register `val` holds a Number (its bits are not all
     /// of the `QNAN` pattern, bits 50..=62). Clobbers `scratch`.
@@ -81,6 +86,44 @@ impl X64Assembler {
         }
         let ok = self.new_label();
         self.fr_to_if_number(val, scratch, ok);
+        self.g_movabs(
+            scratch,
+            shape.wrapping_add_signed(i64::from(l.props.shape_any)),
+        );
+        self.fr_test_byte(scratch, (slot / 8) as i32, 1 << (slot % 8));
+        self.g_jcc(cc::E, miss);
+        self.bind(ok);
+    }
+
+    /// [`Self::p_field_rep_const`] with `boxed` holding
+    /// [`FR_BOXED_MIN`] (kept): the value is a Number exactly when its
+    /// bits doubled (the sign dropped, bits 50..=62 on top) are below it —
+    /// one compare instead of the inverted shifts. Clobbers `scratch`.
+    pub(crate) fn p_field_rep_const_k(
+        &mut self,
+        l: &JitLayout,
+        (val, scratch, boxed): (u8, u8, u8),
+        shape: u64,
+        slot: u32,
+        miss: Label,
+    ) {
+        if slot >= 64 {
+            return;
+        }
+        let ok = self.new_label();
+        // lea scratch, [val + val]
+        let rex = 0x48 | (((scratch >> 3) & 1) << 2) | (((val >> 3) & 1) << 1) | ((val >> 3) & 1);
+        let modrm = 0x04 | ((scratch & 7) << 3);
+        let sib = ((val & 7) << 3) | (val & 7);
+        if val & 7 == 5 {
+            // (An `rbp`/`r13` base needs a zero displacement.)
+            self.code
+                .extend_from_slice(&[rex, 0x8d, modrm | 0x40, sib, 0]);
+        } else {
+            self.code.extend_from_slice(&[rex, 0x8d, modrm, sib]);
+        }
+        self.g_cmp(scratch, boxed);
+        self.g_jcc(cc::B, ok);
         self.g_movabs(
             scratch,
             shape.wrapping_add_signed(i64::from(l.props.shape_any)),
