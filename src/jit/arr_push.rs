@@ -53,16 +53,26 @@ impl X64Assembler {
     /// `[rbx + val_disp]` as the module docs say, leaving `r8` = the new
     /// length; else to `miss` with nothing done. Clobbers `rax`, `rdx`,
     /// `r8`–`r11`; preserves `rcx`.
-    pub(super) fn ap_push(&mut self, l: &JitLayout, realm_off: i32, val_disp: i32, miss: Label) {
+    pub(super) fn ap_push(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        val_disp: i32,
+        miss: Label,
+        proved: bool,
+    ) {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.off_arr_side, 0);
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.off_arr_proto_set, 0);
         self.jne(miss);
-        self.g_load(r::R11, r::R15, realm_off);
-        self.g_cmp_byte_imm(r::R11, l.props.proto_index_dirty, 0);
-        self.g_jcc(cc::NE, miss);
+        // (`proved`: the site's run proof covers the realm's flag.)
+        if !proved {
+            self.g_load(r::R11, r::R15, realm_off);
+            self.g_cmp_byte_imm(r::R11, l.props.proto_index_dirty, 0);
+            self.g_jcc(cc::NE, miss);
+        }
         // The write barrier: nothing to do, or an append it covers.
         let appended = self.new_label();
         let checked = self.new_label();
@@ -134,8 +144,8 @@ impl X64Assembler {
     /// element as the module docs say, leaving it (or `undefined`) in
     /// `rax`; else to `miss` with nothing done. Clobbers `rdx`, `r8`–`r11`;
     /// preserves `rcx`.
-    pub(super) fn ap_pop(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
-        self.ap_take(l, realm_off, miss, false);
+    pub(super) fn ap_pop(&mut self, l: &JitLayout, realm_off: i32, miss: Label, proved: bool) {
+        self.ap_take(l, realm_off, miss, false, proved);
     }
 
     /// For the receiver whose live heap slot is `rcx`: `a.shift()` on an
@@ -143,21 +153,31 @@ impl X64Assembler {
     /// does (as the module docs say), leaving it (or `undefined`) in `rax`;
     /// a longer array (whose shift moves elements) to `miss` with nothing
     /// done. Clobbers `rdx`, `r8`–`r11`; preserves `rcx`.
-    pub(super) fn ap_shift(&mut self, l: &JitLayout, realm_off: i32, miss: Label) {
-        self.ap_take(l, realm_off, miss, true);
+    pub(super) fn ap_shift(&mut self, l: &JitLayout, realm_off: i32, miss: Label, proved: bool) {
+        self.ap_take(l, realm_off, miss, true, proved);
     }
 
     /// [`ap_pop`](Self::ap_pop), or with `at_most_one` [`ap_shift`](Self::ap_shift).
-    fn ap_take(&mut self, l: &JitLayout, realm_off: i32, miss: Label, at_most_one: bool) {
+    fn ap_take(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        miss: Label,
+        at_most_one: bool,
+        proved: bool,
+    ) {
         self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.off_arr_side, 0);
         self.jne(miss);
         self.cmp_byte_at_rcx_imm(l.off_arr_proto_set, 0);
         self.jne(miss);
-        self.g_load(r::R11, r::R15, realm_off);
-        self.g_cmp_byte_imm(r::R11, l.props.proto_index_dirty, 0);
-        self.g_jcc(cc::NE, miss);
+        // (`proved`: the site's run proof covers the realm's flag.)
+        if !proved {
+            self.g_load(r::R11, r::R15, realm_off);
+            self.g_cmp_byte_imm(r::R11, l.props.proto_index_dirty, 0);
+            self.g_jcc(cc::NE, miss);
+        }
         let empty = self.new_label();
         let heap = self.new_label();
         let out = self.new_label();

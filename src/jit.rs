@@ -3682,6 +3682,77 @@ fn push_dead_enabled() -> bool {
     }
 }
 
+/// Whether an inline `a.push(x)` / `a.pop()` / `a.shift()` in a loop that
+/// makes no call keeps a run proof of its checks in a frame slot
+/// (`KATAAN_JIT_APPROOF=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn ap_proof_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_APPROOF").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether op `pc` lies in a loop (its innermost back-edge's range) none of
+/// whose ops is a call but an inline array method or `Math.f`, an iteration
+/// step, a global access or a coercibility check, nor anything else that
+/// usually runs Rust code (only a guess of the profit: a call just empties
+/// the proof, see `ap_slot`).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize) -> bool {
+    use crate::nbvm::Op;
+    let Some((h, e)) = bytecode
+        .iter()
+        .enumerate()
+        .filter_map(|(j, o)| match *o {
+            Op::Jump { target } if target <= pc && pc < j => Some((target, j)),
+            _ => None,
+        })
+        .min_by_key(|&(h, e)| e - h)
+    else {
+        return false;
+    };
+    bytecode[h..=e].iter().all(|o| match o {
+        Op::CallMethod { key, args, .. } => {
+            (key == "push" && args.len() == 1)
+                || ((key == "pop" || key == "shift") && args.is_empty())
+                || inline_math(o).is_some()
+        }
+        Op::GetProp { .. }
+        | Op::SetProp { .. }
+        | Op::SetPropStrict { .. }
+        | Op::GetElem { .. }
+        | Op::SetElem { .. }
+        | Op::ArrayLen { .. }
+        | Op::Move { .. }
+        | Op::LoadConst { .. }
+        | Op::Not { .. }
+        | Op::Jump { .. }
+        | Op::JumpIfFalse { .. }
+        | Op::StrictEq { .. }
+        | Op::Compare { .. }
+        | Op::Lt { .. }
+        | Op::Sub { .. }
+        | Op::Mul { .. }
+        | Op::Add { .. }
+        | Op::AddValue { .. }
+        | Op::ValueBin { .. }
+        | Op::ToNumeric { .. }
+        | Op::Step { .. }
+        | Op::IterNext { .. }
+        | Op::LoadGlobal { .. }
+        | Op::RequireObjectCoercible { .. }
+        | Op::InlineGuard { .. }
+        | Op::InlineLeave => true,
+        _ => false,
+    })
+}
+
 /// Whether a generic forward test of a value's truthiness (`if (x)`,
 /// `if (!x)`) branches on each answer it finds, with no `0`/`1` made and
 /// tested again (`KATAAN_JIT_TRUTHYBR=0` turns it off, read once per
@@ -10301,6 +10372,37 @@ impl JitFunction {
         // copies it saves are few for a body with one or two.)
         let gd = global_persist::direct_enabled() && gc_reads.len() >= global_persist::DIRECT_MIN;
         let gd_slot = km_base - 24 * n_km as i32 - 8;
+        // The inline `a.push(x)` / `a.pop()` / `a.shift()` sites' **proof**
+        // slots (`KATAAN_JIT_APPROOF`), under the global binding cache's
+        // direct-read base: per site, a key (emptied by the prologue and
+        // every call, as the receiver cache's) that holds `0` once the
+        // site's run checks passed — a hosted run of one realm whose array
+        // prototypes have no index accessor, and the method still the
+        // built-in its proof names. Only Rust code (behind a call) changes
+        // any of that but an inline store of the method's key, which the
+        // body must not have. Only for a site in a loop that makes no call
+        // on its fast paths: elsewhere a call empties the slot between runs.
+        let ap_sites: Vec<usize> = (0..ops.len())
+            .filter(|&pc| {
+                let Some(crate::nbvm::Op::CallMethod { key, args, .. }) = bytecode.get(pc) else {
+                    return false;
+                };
+                matches!(ops[pc], GenericOp::CallMethod { .. })
+                    && ap_proof_enabled()
+                    && ((key == "push" && args.len() == 1)
+                        || ((key == "pop" || key == "shift") && args.is_empty()))
+                    && !math_stores_key(bytecode, key.as_str())
+                    && in_call_free_loop(bytecode, pc)
+            })
+            .collect();
+        let n_ap = ap_sites.len();
+        let ap_base = km_base - 24 * n_km as i32 - 8 * i32::from(gd);
+        let ap_slot = |pc: usize| {
+            ap_sites
+                .iter()
+                .position(|&p| p == pc)
+                .map(|k| ap_base - 8 * k as i32 - 8)
+        };
         let gdirect = |k: usize| gd && gc_reads.contains(&k);
         let wp_disps: Vec<Vec<Option<i32>>> = wp_slot
             .iter()
@@ -10507,7 +10609,8 @@ impl JitFunction {
                 + 3 * n_cm
                 + 2 * n_gi
                 + 3 * n_km
-                + usize::from(gd)) as u32
+                + usize::from(gd)
+                + n_ap) as u32
                 * 8)
             + 15)
             & !15;
@@ -10801,6 +10904,7 @@ impl JitFunction {
                 .chain((0..n_wp).map(wp_proof))
                 .chain(cm.map(|m| m.recv))
                 .chain((0..n_km).map(|k| km_memo(k).key))
+                .chain(ap_sites.iter().filter_map(|&pc| ap_slot(pc)))
                 .collect(),
         );
         a.coll_memo = cm;
@@ -11177,6 +11281,36 @@ impl JitFunction {
                     $bail,
                 );
                 a.bind(have);
+            }};
+        }
+        // An inline `a.push(x)` / `a.pop()` / `a.shift()`'s run checks (a
+        // hosted run of one realm, the method still the built-in the site
+        // proved, else to `$general` / `$prove`), skipped while its proof
+        // slot `$proof` (`ap_slot`) says they passed since the last call;
+        // with a slot, the realm's array-prototype index flag too, and the
+        // slot set once they pass.
+        macro_rules! ap_proof_begin {
+            ($proof:expr, $method:expr, $general:expr, $prove:expr) => {{
+                let proof: Option<i32> = $proof;
+                let proven = a.new_label();
+                let cl = &helpers.call_layout;
+                if let Some(p) = proof {
+                    a.cmp_frame_imm8(p, RECV_CACHE_EMPTY as i8);
+                    a.jne(proven);
+                }
+                a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                a.g_jcc(call_seq::cc::E, $general);
+                a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                a.g_jcc(call_seq::cc::NE, $general);
+                a.p_str_proof($method, $prove, $general);
+                if let Some(p) = proof {
+                    a.g_load(call_seq::r::R11, call_seq::r::R15, cl.realm);
+                    a.g_cmp_byte_imm(call_seq::r::R11, layout.props.proto_index_dirty, 0);
+                    a.g_jcc(call_seq::cc::NE, $general);
+                    a.g_store_imm32(call_seq::r::RBP, p, 0);
+                }
+                a.bind(proven);
             }};
         }
         // `truthy_rax!`'s branch form (`KATAAN_JIT_TRUTHYBR`): to `$yes`
@@ -13163,17 +13297,13 @@ impl JitFunction {
                         let general = a.new_label();
                         let prove = a.new_label();
                         let cl = &helpers.call_layout;
-                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
-                        a.g_jcc(call_seq::cc::E, general);
-                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
-                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
-                        a.g_jcc(call_seq::cc::NE, general);
-                        a.p_str_proof(si.method_ptr, prove, general);
+                        let proof = ap_slot(op_idx);
+                        ap_proof_begin!(proof, si.method_ptr, general, prove);
                         if push_bail.is_some() {
                             num.push_held_checks(&mut a, op_idx, recv, general);
                         }
                         walk_to_slot!(recv, general);
-                        a.ap_push(&layout, cl.realm, disp(x), general);
+                        a.ap_push(&layout, cl.realm, disp(x), general, proof.is_some());
                         // (The new length, unless nothing reads it.)
                         let dead = match push_bail {
                             Some(_) => num.dead_after(op_idx, dst),
@@ -13225,17 +13355,13 @@ impl JitFunction {
                         let general = a.new_label();
                         let prove = a.new_label();
                         let cl = &helpers.call_layout;
-                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
-                        a.g_jcc(call_seq::cc::E, general);
-                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
-                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
-                        a.g_jcc(call_seq::cc::NE, general);
-                        a.p_str_proof(si.method_ptr, prove, general);
+                        let proof = ap_slot(op_idx);
+                        ap_proof_begin!(proof, si.method_ptr, general, prove);
                         walk_to_slot!(recv, general);
                         if shift {
-                            a.ap_shift(&layout, cl.realm, general);
+                            a.ap_shift(&layout, cl.realm, general, proof.is_some());
                         } else {
-                            a.ap_pop(&layout, cl.realm, general);
+                            a.ap_pop(&layout, cl.realm, general, proof.is_some());
                         }
                         a.store_rax(disp(dst));
                         a.jmp(done);
