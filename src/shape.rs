@@ -165,6 +165,9 @@ pub struct Shape {
     /// remembered together depends on how many are in use, not on where
     /// they were allocated.
     keys_hint: Cell<u16>,
+    /// See [`first`](Self::first). (An address, not a link: the ancestor is
+    /// on this layout's own parent chain.)
+    first: Cell<usize>,
 }
 
 /// The most cached children a [`Transitions`] list holds before it becomes a
@@ -359,6 +362,7 @@ impl Shape {
             any: Cell::new(0),
             for_in_hint: Cell::new(0),
             keys_hint: Cell::new(0),
+            first: Cell::new(0),
         })
     }
 
@@ -485,6 +489,40 @@ impl Shape {
         }
     }
 
+    /// The byte offset of [`first`](Self::first)'s word within a [`Shape`],
+    /// read by compiled code (`jit::poly`'s prefix way).
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn first_offset() -> usize {
+        core::mem::offset_of!(Shape, first)
+    }
+
+    /// `Rc::as_ptr` of this layout's one-key ancestor (itself, for a one-key
+    /// layout), as an address; `0` for the root (or any layout of no keys).
+    /// Every layout with that ancestor has its key in slot 0.
+    #[must_use]
+    pub fn first(&self) -> usize {
+        self.first.get()
+    }
+
+    /// The [`first`](Self::first) word of a new child of `parent`, set
+    /// (`fix_first`) once the child is in its `Rc` when it is the one-key
+    /// layout itself.
+    fn first_from(parent: &Shape) -> Cell<usize> {
+        Cell::new(if parent.len == 0 {
+            0
+        } else {
+            parent.first.get()
+        })
+    }
+
+    /// See [`first_from`](Self::first_from).
+    fn fix_first(child: Rc<Shape>) -> Rc<Shape> {
+        if child.len == 1 {
+            child.first.set(Rc::as_ptr(&child) as usize);
+        }
+        child
+    }
+
     /// The byte offset of the `parent` link (an `Option<Rc<Shape>>`, one
     /// nullable pointer word) within a [`Shape`], for compiled code's
     /// transition check.
@@ -574,7 +612,7 @@ impl Shape {
             return child;
         }
         let key: Rc<str> = Rc::from(key);
-        let child = Rc::new(Shape {
+        let child = Self::fix_first(Rc::new(Shape {
             parent: Some(Rc::clone(self)),
             key: Some(Rc::clone(&key)),
             slot: self.len,
@@ -588,7 +626,8 @@ impl Shape {
             any: Cell::new(self.any.get()),
             for_in_hint: Cell::new(0),
             keys_hint: Cell::new(0),
-        });
+            first: Self::first_from(self),
+        }));
         self.transitions.borrow_mut().insert(&key, &child);
         child
     }
@@ -603,7 +642,7 @@ impl Shape {
     pub fn builtin_fn_layout(root: &Rc<Self>) -> Rc<Shape> {
         debug_assert!(root.is_empty());
         let length = root.transition("length");
-        Rc::new(Shape {
+        Self::fix_first(Rc::new(Shape {
             parent: Some(Rc::clone(&length)),
             key: Some(Rc::from("name")),
             slot: length.len,
@@ -615,7 +654,8 @@ impl Shape {
             any: Cell::new(length.any.get()),
             for_in_hint: Cell::new(0),
             keys_hint: Cell::new(0),
-        })
+            first: Self::first_from(&length),
+        }))
     }
 
     /// Whether this is a [`builtin_fn_layout`](Self::builtin_fn_layout).
@@ -640,7 +680,7 @@ impl Shape {
         debug_assert!(parent.lookup(key).is_none());
         debug_assert!(parent.brands & IMPLIED_ATTRS_BITS == 0);
         let key: Rc<str> = Rc::from(key);
-        Rc::new(Shape {
+        Self::fix_first(Rc::new(Shape {
             parent: Some(Rc::clone(parent)),
             slot: parent.len,
             len: parent.len + 1,
@@ -652,7 +692,8 @@ impl Shape {
             any: Cell::new(parent.any.get()),
             for_in_hint: Cell::new(0),
             keys_hint: Cell::new(0),
-        })
+            first: Self::first_from(parent),
+        }))
     }
 
     /// Whether this is an [`implied_ctor_layout`](Self::implied_ctor_layout).

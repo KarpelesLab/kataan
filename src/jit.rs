@@ -4547,6 +4547,8 @@ pub struct SiteInfo {
     add: Option<props::BakedAdd>,
     /// For a polymorphic site: its further layouts, compiled in (`poly`).
     poly: poly::Ways,
+    /// For a polymorphic read site: its prefix way (`poly::Prefix`).
+    prefix: Option<poly::Prefix>,
 }
 
 /// A property site's layout compiled into its code: a receiver whose shape
@@ -5158,6 +5160,9 @@ impl JitProto {
         let mut poly_at: Vec<poly::Ways> = alloc::vec![[None; poly::MAX_WAYS]; keys.len()];
         let mut tier_poly: Vec<Vec<(alloc::rc::Rc<crate::shape::Shape>, u32)>> =
             alloc::vec![Vec::new(); keys.len()];
+        // A polymorphic read site's prefix way (its layout kept alive by
+        // `baked`).
+        let mut prefix_at: Vec<Option<poly::Prefix>> = alloc::vec![None; keys.len()];
         for (pc, op) in ops.iter().enumerate() {
             let (site, write) = match *op {
                 GenericOp::GetProp { site, .. } => (site as usize, false),
@@ -5182,6 +5187,22 @@ impl JitProto {
                 poly_at[site] = poly::ways_of(&sel);
                 baked.extend(sel.iter().map(|(s, _)| alloc::rc::Rc::clone(s)));
                 tier_poly[site] = sel;
+            }
+            if !write && let Some(first) = poly::prefix(w, key) {
+                prefix_at[site] = Some(poly::Prefix {
+                    first: alloc::rc::Rc::as_ptr(&first) as u64,
+                });
+                // (The ways it covers need no compare of their own.)
+                let covered = |s: &alloc::rc::Rc<crate::shape::Shape>, slot: u32| {
+                    slot == 0 && poly::first_of(s).is_some_and(|f| alloc::rc::Rc::ptr_eq(f, &first))
+                };
+                let rest: Vec<(alloc::rc::Rc<crate::shape::Shape>, u32)> = tier_poly[site]
+                    .iter()
+                    .filter(|(s, k)| !covered(s, *k))
+                    .cloned()
+                    .collect();
+                poly_at[site] = poly::ways_of(&rest);
+                baked.push(first);
             }
             if let Some((shape, slot)) = primary {
                 baked_at[site] = Some(Baked {
@@ -5256,6 +5277,7 @@ impl JitProto {
                 baked: None,
                 add: None,
                 poly: [None; poly::MAX_WAYS],
+                prefix: None,
             })
             .collect();
         let mut tier_up = tierup::TierUp::plan(&ops, tier_baked, tier_added);
@@ -5297,11 +5319,12 @@ impl JitProto {
         }
         let site_info: Vec<SiteInfo> = site_info
             .into_iter()
-            .zip(baked_at.into_iter().zip(add_at).zip(poly_at))
-            .map(|(si, ((b, add), poly))| SiteInfo {
+            .zip(baked_at.into_iter().zip(add_at).zip(poly_at).zip(prefix_at))
+            .map(|(si, (((b, add), poly), prefix))| SiteInfo {
                 baked: b,
                 add,
                 poly,
+                prefix,
                 ..si
             })
             .collect();
@@ -11627,6 +11650,7 @@ impl JitFunction {
             Option<Label>,
             *mut core::ffi::c_void,
             poly::Ways,
+            Option<poly::Prefix>,
         )> = Vec::new();
         // The shape compares a layout-proving way's hit skips: (entry, a
         // write's store-guard miss, layout, mismatch, resume).
@@ -16161,6 +16185,8 @@ impl JitFunction {
                     // (`None`: stored to `dst`, then `done`), for a fast
                     // version's chain-cache read (below).
                     let mut hit_back: Option<Label> = None;
+                    // (A prefix way's hit, with the value: `poly::Prefix`.)
+                    let pre_hit = a.new_label();
                     // ===== inline monomorphic property-get fast path =====
                     // A pure sequence of reads at runtime-verified offsets: walk
                     // arena → slot → cell → object → shape, compare the object's
@@ -16393,7 +16419,15 @@ impl JitFunction {
                         match num.spec_bail(&mut a, op_idx) {
                             Some(bail) => cold_bails.push((cached, bail)),
                             None => {
-                                cold_caches.push((cached, back, helper, spill, s.cache_ptr, s.poly))
+                                cold_caches.push((
+                                    cached,
+                                    back,
+                                    helper,
+                                    spill,
+                                    s.cache_ptr,
+                                    s.poly,
+                                    s.prefix,
+                                ));
                             }
                         }
                         a.bind(back);
@@ -16422,8 +16456,15 @@ impl JitFunction {
                     } else {
                         // A polymorphic site's layouts (`poly`): a hit has
                         // its slot index in `eax`, as a cache hit.
+                        // (The prefix way first: it covers most layouts.
+                        // Its hit has the value, but for a promoted result.)
                         let slot_in = a.new_label();
+                        let direct = s.prefix.filter(|_| num.result_xmm(op_idx, dst).is_none());
+                        a.p_prefix_get(&layout, direct, pre_hit, false);
                         a.p_poly_slot(&layout, &s.poly, slot_in);
+                        if direct.is_none() {
+                            a.p_prefix_get(&layout, s.prefix, slot_in, true);
+                        }
                         a.movabs_r11(s.cache_ptr as i64); // r11 = &PropertyCache
                         a.cmp_rax_at_r11(layout.cache_shape_off);
                         a.jne(helper);
@@ -16449,6 +16490,7 @@ impl JitFunction {
                     } else {
                         a.p_obj_slot_addr(&layout, call_seq::r::R11, helper);
                         a.g_load(call_seq::r::RAX, call_seq::r::R11, 0); // rax = NanBox at slot
+                        a.bind(pre_hit);
                         a.store_rax(disp(dst));
                         a.jmp(done);
                     }
@@ -19309,14 +19351,16 @@ impl JitFunction {
         // The cache paths of sites with a compiled-in layout, for a receiver
         // of another shape (in `rax`; its heap slot in `rcx`): the site's
         // cache, else the miss path. The value goes back in `rax`.
-        for (cached, back, miss, spill, cache, ways) in core::mem::take(&mut cold_caches) {
+        for (cached, back, miss, spill, cache, ways, prefix) in core::mem::take(&mut cold_caches) {
             a.dbg_mark("x-cache");
             a.bind(cached);
             // Not the layout: a way that proves it may not keep this object.
             for &w in &shape_ways {
                 a.store_empty(rc_key(w));
             }
-            // A polymorphic site's further layouts (`poly`).
+            // A polymorphic site's prefix way, and its further layouts
+            // (`poly`).
+            a.p_prefix_get(&layout, prefix, back, false);
             a.p_poly_get(&layout, &ways, back);
             a.mov_rax_at_rcx(layout.off_shape);
             a.movabs_r11(cache as i64);

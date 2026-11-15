@@ -82,6 +82,54 @@ pub(crate) struct PolyWay {
     pub num: bool,
 }
 
+/// Whether a read site whose layouts all have the key first compiles a
+/// **prefix way** (`KATAAN_JIT_PREFIXWAY=0` turns it off; read once per
+/// process): see [`prefix`].
+#[must_use]
+pub(crate) fn prefix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PREFIXWAY").is_none_or(|v| v != "0"))
+}
+
+/// A read site's prefix way: every object whose layout descends from the
+/// one-key layout `first` (`Shape::first`) has the site's key, that key, as
+/// a data property in slot 0. Layouts only ever extend their parent, so
+/// that is a fact of every such layout (the ways' fact, for the layouts no
+/// way names): an AST walker's `node.type` over one layout per kind of
+/// node, each built with the key first, in one compare.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Prefix {
+    /// `Rc::as_ptr` of the one-key layout, as `Shape::first` holds it.
+    pub first: u64,
+}
+
+/// The prefix way of a read site of key `key` from its memo `w` (see
+/// [`Prefix`]): when at least two of the layouts it held (as usable ways)
+/// have the key in slot 0 from one same one-key layout, that layout (for
+/// the caller to keep alive).
+pub(crate) fn prefix(w: &crate::ic::WarmEntry, key: &str) -> Option<Rc<Shape>> {
+    if !prefix_enabled() || key.starts_with('\0') {
+        return None;
+    }
+    let firsts: Vec<&Rc<Shape>> = core::iter::once((&w.shape, w.slot))
+        .chain(w.others.iter().map(|e| (&e.shape, e.slot)))
+        .filter(|&(s, slot)| slot == 0 && usable(s, slot, key))
+        .filter_map(|(s, _)| first_of(s))
+        .collect();
+    let a = firsts.first()?;
+    (firsts.len() >= 2 && firsts.iter().all(|b| Rc::ptr_eq(a, b)) && a.lookup(key) == Some(0))
+        .then(|| Rc::clone(a))
+}
+
+/// `shape`'s one-key ancestor (itself, for a one-key layout).
+pub(crate) fn first_of(shape: &Rc<Shape>) -> Option<&Rc<Shape>> {
+    let mut s = shape;
+    while s.len() > 1 {
+        s = s.parent()?;
+    }
+    (s.len() == 1).then_some(s)
+}
+
 /// The ways of a site: per site, up to [`MAX_WAYS`] (unused `None`).
 pub(crate) type Ways = [Option<PolyWay>; MAX_WAYS];
 
@@ -224,6 +272,44 @@ impl X64Assembler {
             self.jmp(hit);
             self.bind(next);
         }
+    }
+
+    /// A read's prefix way (see [`Prefix`]), with the receiver's live heap
+    /// slot in `rcx` (an ordinary shaped object): when the object's layout
+    /// descends from the prefix's (and is no primitive wrapper's nor
+    /// `[[IsHTMLDDA]]`'s, as no way's is), its slot 0 — loaded into `rax`,
+    /// or with `slot_only` its index into `eax` — and to `hit`; else falls
+    /// through with `rax` = the object's shape word. Clobbers `r11`.
+    pub(crate) fn p_prefix_get(
+        &mut self,
+        l: &JitLayout,
+        p: Option<Prefix>,
+        hit: Label,
+        slot_only: bool,
+    ) {
+        let Some(p) = p else {
+            return;
+        };
+        let miss = self.new_label();
+        self.g_load(r::RAX, r::RCX, l.off_shape);
+        self.p_test_byte_imm(
+            r::RAX,
+            l.props.shape_brands,
+            1 | crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
+        );
+        self.jne(miss);
+        self.g_load(r::RAX, r::RAX, l.props.shape_first);
+        self.g_movabs(r::R11, p.first);
+        self.g_cmp(r::RAX, r::R11);
+        self.jne(miss);
+        if slot_only {
+            self.g_movabs(r::RAX, 0);
+        } else {
+            self.p_obj_fixed_slot_load(l, 0);
+        }
+        self.jmp(hit);
+        self.bind(miss);
+        self.g_load(r::RAX, r::RCX, l.off_shape);
     }
 
     /// A read's ways for a site without a compiled-in layout: the first way

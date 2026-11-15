@@ -68,6 +68,9 @@ pub(crate) struct PropsLayout {
     /// Shape-word-relative offset of the shape's may-be-non-Number slot
     /// mask (`Shape::may_be_non_number`, a `u64`).
     pub shape_any: i32,
+    /// Shape-word-relative offset of the shape's one-key ancestor word
+    /// (`Shape::first`).
+    pub shape_first: i32,
     /// `Realm`-relative offset of the heap slot array's data pointer.
     pub heap_ptr: i32,
     /// `Realm`-relative offset of the heap slot array's length.
@@ -224,6 +227,11 @@ impl PropsLayout {
             shape_any: i32::try_from(
                 obj.shape_brands_off - Shape::brands_offset().cast_signed()
                     + Shape::any_offset().cast_signed(),
+            )
+            .expect("jit layout offset fits in i32"),
+            shape_first: i32::try_from(
+                obj.shape_brands_off - Shape::brands_offset().cast_signed()
+                    + Shape::first_offset().cast_signed(),
             )
             .expect("jit layout offset fits in i32"),
             heap_ptr: i(heap_ptr),
