@@ -160,10 +160,11 @@ impl X64Assembler {
     }
 }
 
-/// Whether a fused `o.k++` adds first and sends a NaN result (a value that
-/// is no Number, or a NaN one) to the general ops, instead of testing the
-/// value's tag (`KATAAN_JIT_STEPNAN=0` turns it off, read once per process).
-fn step_nan_enabled() -> bool {
+/// Whether a fused `o.k++` (and a local's `x++`, `numeric`'s `tonum_step`)
+/// adds first and sends a NaN result (a value that is no Number, or a NaN
+/// one) to the general ops, instead of testing the value's tag
+/// (`KATAAN_JIT_STEPNAN=0` turns it off, read once per process).
+pub(super) fn step_nan_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_STEPNAN").is_none_or(|v| v != "0"))
 }

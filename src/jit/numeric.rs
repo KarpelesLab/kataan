@@ -3931,9 +3931,21 @@ impl NumGen {
         };
         let (to_stub, to_back) = (a.new_label(), a.new_label());
         let done = a.new_label();
-        self.num_guard(a, reg, x, to_stub);
-        self.copy_reg(a, reg, t1, x);
-        step(self, a);
+        if super::fused::step_nan_enabled() {
+            // The step first (`KATAAN_JIT_STEPNAN`): every value but a Number
+            // reads as a NaN, which stays one — then (as for a NaN Number)
+            // the ops run as they compile, nothing stored.
+            self.load_xmm0(a, reg, x);
+            a.sse_rip_const(0xf2, if dec { 0x5c } else { 0x58 }, 0, 1.0f64.to_bits());
+            a.sse_rr(0x66, 0x2e, 0, 0); // ucomisd xmm0, xmm0
+            a.jcc(CC_P, to_stub);
+            self.copy_reg(a, reg, t1, x);
+            self.store_xmm0(a, reg, t2);
+        } else {
+            self.num_guard(a, reg, x, to_stub);
+            self.copy_reg(a, reg, t1, x);
+            step(self, a);
+        }
         a.jmp(done);
         self.stub(to_stub, to_back, reg, StubKind::Exec { pc: to_pc });
         // The `ToNumeric`'s slow path's result: the `Step` as it compiles.
