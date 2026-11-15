@@ -121,6 +121,25 @@ pub fn inl_warm_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INLWARM").is_none_or(|v| v != "0"))
 }
 
+/// How many calls from Rust code a body sees before
+/// [`JitProto::wants_recompile_on_entry`] may say yes: a recursive descent
+/// (a parser) settles its cold call sites one at a time as it reaches deeper
+/// rules, and asking at the first one recompiles the body once per rule.
+/// `KATAAN_JIT_ENTRYBATCH=0` asks at every call (read once per process).
+fn entry_batch() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if std::env::var_os("KATAAN_JIT_ENTRYBATCH").is_some_and(|v| v == "0") {
+            0
+        } else {
+            ENTRY_BATCH
+        }
+    })
+}
+
+/// See [`entry_batch`].
+const ENTRY_BATCH: u32 = 16;
+
 /// What a body's recompilation checks need, recorded at compile time.
 pub(super) struct TierUp {
     /// `(pc, site)` of every `GetProp`/`SetProp`, by pc.
@@ -198,6 +217,9 @@ pub(super) struct TierUp {
     /// Whether [`JitProto::wants_recompile_on_entry`] has said yes (it
     /// does once).
     pub(super) entry_asked: core::cell::Cell<bool>,
+    /// The calls from Rust code [`JitProto::wants_recompile_on_entry`] has
+    /// seen (`KATAAN_JIT_ENTRYBATCH`).
+    pub(super) entry_calls: core::cell::Cell<u32>,
     /// How many cold call sites had taken a callee at the native-call
     /// entry's last poll ([`JitProto::entry_poll`]).
     pub(super) entry_seen: core::cell::Cell<u32>,
@@ -451,6 +473,7 @@ impl TierUp {
             generation: 0,
             countdown: core::cell::Cell::new(1),
             entry_asked: core::cell::Cell::new(false),
+            entry_calls: core::cell::Cell::new(0),
             entry_seen: core::cell::Cell::new(0),
             entry_round: core::cell::Cell::new(0),
             not_inlinable: core::cell::Cell::new(super::call_seq::CallSite::EMPTY),
@@ -861,6 +884,11 @@ impl JitProto {
         };
         let t = &s.tier_up;
         if t.generation >= MAX_GENERATION || t.entry_cold.is_empty() || t.entry_asked.get() {
+            return false;
+        }
+        let n = t.entry_calls.get().saturating_add(1);
+        t.entry_calls.set(n);
+        if n < entry_batch() {
             return false;
         }
         // (A callee found not inlinable is remembered: this runs on every
