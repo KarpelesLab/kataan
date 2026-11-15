@@ -1932,6 +1932,7 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
 /// ordinary object compiles as the named read it is (`KATAAN_JIT_LENGTH_GET=0`:
 /// no, it keeps the array-length helper's uncached `[[Get]]`).
 #[must_use]
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) fn length_get_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LENGTH_GET").is_none_or(|v| v != "0"))
@@ -1946,6 +1947,7 @@ pub(crate) fn length_get_enabled() -> bool {
 /// two are the same `[[Get]]` (hosted: an array's, string's and typed
 /// array's `length` are what `vm_get_prop` reads too); unhosted code leaves
 /// no feedback.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 fn length_get_sites<'a>(
     proto: &crate::nbvm::FnProto,
     warm: &[Option<crate::ic::WarmEntry>],

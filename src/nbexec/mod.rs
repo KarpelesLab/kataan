@@ -11422,14 +11422,10 @@ pub(crate) fn number_to_fixed(n: f64, digits: usize) -> String {
 
 /// Whether `toFixed` takes [`number_to_fixed_exact`] when it can
 /// (`KATAAN_FIXED_EXACT=0`: never; read once per process).
+#[cfg(feature = "std")]
 fn fixed_exact_on() -> bool {
-    #[cfg(feature = "std")]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("KATAAN_FIXED_EXACT").is_none_or(|v| v != "0"))
-    }
-    #[cfg(not(feature = "std"))]
-    true
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_FIXED_EXACT").is_none_or(|v| v != "0"))
 }
 
 /// [`number_to_fixed`] by exact integer arithmetic, for the common case
@@ -11438,6 +11434,7 @@ fn fixed_exact_on() -> bool {
 /// nearest it (the larger on a tie, as `Number.prototype.toFixed` picks) is
 /// `m·10^digits` shifted by `e`, rounded half up — no float formatting.
 /// `None` otherwise.
+#[cfg(feature = "std")]
 fn number_to_fixed_exact(n: f64, digits: usize) -> Option<String> {
     let bits = n.to_bits();
     let biased = ((bits >> 52) & 0x7ff) as i32;
@@ -11492,6 +11489,7 @@ fn number_to_fixed_exact(n: f64, digits: usize) -> Option<String> {
 }
 
 /// [`number_to_fixed`] through the float formatter (every case).
+#[cfg(feature = "std")]
 fn number_to_fixed_fmt(n: f64, digits: usize) -> String {
     if !n.is_finite() {
         // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
