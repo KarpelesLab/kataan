@@ -2360,6 +2360,191 @@ fn emit_call_fast(
     }
 }
 
+/// A body's **shared callee identification** (`KATAAN_JIT_IDENTSUB`): what a
+/// call sequence runs out of line when no way's memo names the callee value
+/// ([`CallMemo`]) — decode it (`p_callee_info`), find the site's way for
+/// its function, and memoize it there — as one subroutine per body (and
+/// method-ness, realm offset and arena pinning) that each site's cold path
+/// calls, instead of ~700 bytes of it per site.
+///
+/// Entry [`decode`](Self::decode) takes the callee value in `rax`, entry
+/// [`have`](Self::have) the decoded key and captures in `rax`/`rdx` and the
+/// callee value in `r9`; both the site in `r11` (and, for a method call,
+/// the lookup's entry in `rdi` and its memo flag in `rsi`, as the in-line
+/// sequence). It returns with CF set for the slow path, else clear with
+/// `r11` the way and `r8` the captures (`identified`'s state). It keeps the
+/// site and the callee value in two stack words of its own meanwhile.
+#[derive(Clone, Copy)]
+pub(crate) struct IdentSub {
+    method: bool,
+    realm_off: i32,
+    pin: Option<super::pin::PinArena>,
+    pub(crate) decode: Label,
+    pub(crate) have: Label,
+}
+
+/// Whether call sequences share their out-of-line callee identification
+/// ([`IdentSub`]; `KATAAN_JIT_IDENTSUB=0` disables). Read once.
+fn ident_sub_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IDENTSUB").is_none_or(|v| v != "0"))
+}
+
+/// A call site's call of its [`IdentSub`] `entry` (the site in `r11`; for
+/// [`IdentSub::have`] the callee value loaded from `callee` into `r9`), then
+/// the slow path or `identified`.
+fn ident_sub_call(
+    a: &mut X64Assembler,
+    e: &CallEmit<'_>,
+    entry: Label,
+    callee: Option<(u8, i32)>,
+    identified: Label,
+) {
+    a.g_movabs(r::R11, e.site as u64);
+    if let Some((base, disp)) = callee {
+        a.g_load(r::R9, base, disp);
+    }
+    a.g_call_label(entry);
+    a.g_jcc(cc::B, e.slow);
+    a.jmp(identified);
+}
+
+impl X64Assembler {
+    /// The body's [`IdentSub`] for these parameters (made once; placed by
+    /// [`place_ident_subs`](Self::place_ident_subs)).
+    fn ident_sub(&mut self, method: bool, realm_off: i32) -> IdentSub {
+        let pin = self.pin();
+        if let Some(s) = self
+            .ident_subs
+            .iter()
+            .find(|s| s.method == method && s.realm_off == realm_off && s.pin == pin)
+        {
+            return *s;
+        }
+        let s = IdentSub {
+            method,
+            realm_off,
+            pin,
+            decode: self.new_label(),
+            have: self.new_label(),
+        };
+        self.ident_subs.push(s);
+        s
+    }
+
+    /// Places every [`IdentSub`] the body asked for (after its code, where
+    /// nothing falls through into them).
+    pub(crate) fn place_ident_subs(&mut self) {
+        use core::mem::offset_of;
+        let subs = core::mem::take(&mut self.ident_subs);
+        if subs.is_empty() {
+            return;
+        }
+        let jl = super::compute_jit_layout();
+        let memo = |w: usize| offset_of!(CallSite, memo) + w * core::mem::size_of::<CallMemo>();
+        let memo_bits = |w: usize| site_off(memo(w) + offset_of!(CallMemo, bits));
+        let memo_stamp = site_off(memo(0) + offset_of!(CallMemo, stamp));
+        let memo_target = site_off(memo(0) + offset_of!(CallMemo, target));
+        let memo_caps = site_off(memo(0) + offset_of!(CallMemo, caps));
+        let memo_lookup = site_off(memo(0) + offset_of!(CallMemo, lookup));
+        // The stack words: the callee value at `[rsp]`, the site above it.
+        const CALLEE: i32 = 0;
+        const SITE: i32 = 8;
+        let pin = self.pin();
+        for sub in subs {
+            self.set_pin(sub.pin);
+            let (body, hit, slow) = (self.new_label(), self.new_label(), self.new_label());
+            // push r11; push rax / r9
+            self.bind(sub.decode);
+            self.last_store = None;
+            self.code.extend_from_slice(&[0x41, 0x53, 0x50]);
+            self.p_callee_info(jl, sub.realm_off);
+            self.jmp(body);
+            self.bind(sub.have);
+            self.last_store = None;
+            self.code.extend_from_slice(&[0x41, 0x53, 0x41, 0x51]);
+            self.bind(body);
+            // r11 = the matching way (r10 = its memo, addressed as way 0's).
+            self.g_load(r::R11, r::RSP, SITE);
+            self.g_mem(true, &[0x83], 7, r::R11, SITE_KEY); // cmp qword [r11], -2
+            self.code.push(0xfe);
+            self.g_jcc(cc::E, slow);
+            let mut way_hits = alloc::vec::Vec::with_capacity(CallSite::WAYS);
+            for way in 0..CallSite::WAYS {
+                if way > 0 {
+                    self.g_lea(r::R11, r::R11, TARGET_BYTES);
+                }
+                self.g_cmp_mem(r::RAX, r::R11, SITE_KEY);
+                let h = self.new_label();
+                self.g_jcc(cc::E, h);
+                way_hits.push(h);
+            }
+            self.jmp(slow);
+            for (way, h) in way_hits.into_iter().enumerate() {
+                self.bind(h);
+                let w = i32::try_from(way).expect("way");
+                self.g_lea(
+                    r::R10,
+                    r::R11,
+                    memo_bits(way) - memo_bits(0) - w * TARGET_BYTES,
+                );
+                self.jmp(hit);
+            }
+            self.bind(hit);
+            self.g_mov(r::R8, r::RDX); // captures, for the callee's entry
+            if fresh_call_enabled() {
+                // (As the in-line sequence: `emit_call`.)
+                let store = self.new_label();
+                self.g_load(r::R9, r::RSP, SITE);
+                self.g_cmp_byte_imm(r::R9, FRESH, 0);
+                self.g_jcc(cc::NE, store);
+                self.g_load(r::R9, r::R10, memo_bits(0));
+                self.g_cmp_mem(r::R9, r::RSP, CALLEE);
+                self.g_jcc(cc::E, store);
+                self.g_cmp_imm(r::R9, CallSite::EMPTY as i64 as i32);
+                self.g_jcc(cc::E, store);
+                self.g_load(r::R9, r::RSP, SITE);
+                self.g_inc_mem(r::R9, FRESH_MISSES);
+                self.g_mem(true, &[0x83], 7, r::R9, FRESH_MISSES); // cmp qword [r9+misses], LIMIT
+                self.code.push(FRESH_LIMIT as u8);
+                self.g_jcc(cc::B, store);
+                self.g_store_byte_imm(r::R9, FRESH, 1);
+                self.bind(store);
+            }
+            // Memoize the callee in its way's memo (see `CallMemo`).
+            self.g_load(r::R9, r::RSP, CALLEE);
+            self.g_store(r::R10, memo_bits(0), r::R9);
+            load_proto_epoch(self, r::R9);
+            self.g_store(r::R10, memo_stamp, r::R9);
+            self.g_store(r::R10, memo_target, r::R11);
+            self.g_store(r::R10, memo_caps, r::R8);
+            if sub.method {
+                let keep = self.new_label();
+                let filled = self.new_label();
+                self.g_test(r::RSI);
+                self.g_jcc(cc::NE, keep);
+                self.g_store_imm32(
+                    r::R10,
+                    memo_lookup + site_off(offset_of!(LookupMemo, shape)),
+                    0,
+                );
+                self.jmp(filled);
+                self.bind(keep);
+                emit_lookup_fill(self, r::R10, memo_lookup);
+                self.bind(filled);
+            }
+            // lea rsp, [rsp + 16]; clc; ret
+            self.code
+                .extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x10, 0xf8, 0xc3]);
+            // The slow path: lea rsp, [rsp + 16]; stc; ret
+            self.bind(slow);
+            self.code
+                .extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x10, 0xf9, 0xc3]);
+        }
+        self.set_pin(pin);
+    }
+}
+
 /// Emits the native call sequence of one call site (see the module docs). On
 /// any guard failure it jumps to `e.slow`, having changed nothing.
 pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
@@ -2378,6 +2563,10 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
     // A method call's lookup leaves its entry in rdi, and rsi nonzero when
     // the memo may record it (see `p_method_lookup_from`).
     let method = matches!(e.callee, CalleeSrc::Method { .. });
+    // The identification after a memo miss, out of line: a call of the
+    // body's shared subroutine (`IdentSub`), when on.
+    let ident = (ident_sub_enabled() && !matches!(e.callee, CalleeSrc::Construct { .. }))
+        .then(|| a.ident_sub(method, l.realm));
     // `identified`: the way is in r11 and the captures in r8 already (a memo
     // hit, or a constructor the site's `fast` cache prepared).
     let identified = a.new_label();
@@ -2441,13 +2630,19 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
         CalleeSrc::Frame { scratch } => {
             a.g_load(r::RAX, RBP, scratch);
             let cold = memo_check(a);
-            a.p_callee_info(jl, l.realm);
+            match ident {
+                Some(sub) => ident_sub_call(a, e, sub.decode, None, identified),
+                None => a.p_callee_info(jl, l.realm),
+            }
             (RBP, scratch, Some(cold))
         }
         CalleeSrc::Reg(c) => {
             a.g_load(r::RAX, r::RBX, reg(c));
             let cold = memo_check(a);
-            a.p_callee_info(jl, l.realm);
+            match ident {
+                Some(sub) => ident_sub_call(a, e, sub.decode, None, identified),
+                None => a.p_callee_info(jl, l.realm),
+            }
             (r::RBX, reg(c), Some(cold))
         }
         CalleeSrc::Method {
@@ -2472,8 +2667,13 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.g_mov(r::RDI, r::R11);
             a.g_store(RBP, scratch, r::RAX);
             let cold = memo_check(a);
-            a.p_callee_info(jl, l.realm);
-            a.jmp(have);
+            match ident {
+                Some(sub) => ident_sub_call(a, e, sub.decode, None, identified),
+                None => {
+                    a.p_callee_info(jl, l.realm);
+                    a.jmp(have);
+                }
+            }
             a.bind(lookup);
             a.g_mov(r::RDI, r::R15);
             a.g_load(r::RSI, r::RBX, reg(recv));
@@ -2483,7 +2683,10 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             a.call_rax();
             // (No entry to memoize.)
             a.g_movabs(r::RSI, 0);
-            a.bind(have);
+            match ident {
+                Some(sub) => ident_sub_call(a, e, sub.have, Some((RBP, scratch)), identified),
+                None => a.bind(have),
+            }
             (RBP, scratch, Some(cold))
         }
         CalleeSrc::Construct {
@@ -2585,89 +2788,96 @@ pub(crate) fn emit_call(a: &mut X64Assembler, e: &CallEmit<'_>) -> Option<()> {
             (r::RBX, reg(ctor), None)
         }
     };
-    // r11 = the matching way (and, to memoize the callee in, r10 = its
-    // memo, addressed as way 0's).
-    a.g_movabs(r::R11, e.site as u64);
-    // (No way to match at a site that never took a callee, as above.)
-    a.g_mem(true, &[0x83], 7, r::R11, SITE_KEY); // cmp qword [r11], -2
-    a.code.push(0xfe);
-    a.g_jcc(cc::E, e.slow);
-    let hit = a.new_label();
-    let memoize = !matches!(e.callee, CalleeSrc::Construct { .. });
-    let mut way_hits = alloc::vec::Vec::with_capacity(CallSite::WAYS);
-    for way in 0..CallSite::WAYS {
-        if way > 0 {
-            a.g_lea(r::R11, r::R11, TARGET_BYTES);
+    // (Out of line, the shared subroutine's: `IdentSub`; its stubs above
+    // went on to `identified` or the slow path.)
+    match cold {
+        Some(cold) if ident.is_some() => a.cold_end(cold),
+        _ => {
+            // r11 = the matching way (and, to memoize the callee in, r10 = its
+            // memo, addressed as way 0's).
+            a.g_movabs(r::R11, e.site as u64);
+            // (No way to match at a site that never took a callee, as above.)
+            a.g_mem(true, &[0x83], 7, r::R11, SITE_KEY); // cmp qword [r11], -2
+            a.code.push(0xfe);
+            a.g_jcc(cc::E, e.slow);
+            let hit = a.new_label();
+            let memoize = !matches!(e.callee, CalleeSrc::Construct { .. });
+            let mut way_hits = alloc::vec::Vec::with_capacity(CallSite::WAYS);
+            for way in 0..CallSite::WAYS {
+                if way > 0 {
+                    a.g_lea(r::R11, r::R11, TARGET_BYTES);
+                }
+                a.g_cmp_mem(r::RAX, r::R11, SITE_KEY);
+                if memoize {
+                    let h = a.new_label();
+                    a.g_jcc(cc::E, h);
+                    way_hits.push(h);
+                } else {
+                    a.g_jcc(cc::E, hit);
+                }
+            }
+            a.jmp(e.slow);
+            for (way, h) in way_hits.into_iter().enumerate() {
+                a.bind(h);
+                a.g_movabs(
+                    r::R10,
+                    e.site as u64 + (memo_bits(way) - memo_bits(0)) as u64,
+                );
+                a.jmp(hit);
+            }
+            a.bind(hit);
+            a.g_mov(r::R8, r::RDX); // captures, for the callee's entry
+            if memoize && fresh_call_enabled() {
+                // (A site of fresh closures still refills its way's memo — a
+                // closure called again right away hits it — but counts no more.)
+                // At any other, a way whose memo named another value counts as a
+                // fresh closure (see `CallSite::fresh`).
+                let store = a.new_label();
+                a.g_movabs(r::R9, e.site as u64);
+                a.g_cmp_byte_imm(r::R9, FRESH, 0);
+                a.g_jcc(cc::NE, store);
+                a.g_load(r::R9, r::R10, memo_bits(0));
+                a.g_cmp_mem(r::R9, callee_base, callee_disp);
+                a.g_jcc(cc::E, store);
+                a.g_cmp_imm(r::R9, CallSite::EMPTY as i64 as i32);
+                a.g_jcc(cc::E, store);
+                a.g_movabs(r::R9, e.site as u64);
+                a.g_inc_mem(r::R9, FRESH_MISSES);
+                a.g_mem(true, &[0x83], 7, r::R9, FRESH_MISSES); // cmp qword [r9+misses], LIMIT
+                a.code.push(FRESH_LIMIT as u8);
+                a.g_jcc(cc::B, store);
+                a.g_store_byte_imm(r::R9, FRESH, 1);
+                a.bind(store);
+            }
+            if memoize {
+                // Memoize the callee in its way's memo (see `CallMemo`).
+                a.g_load(r::R9, callee_base, callee_disp);
+                a.g_store(r::R10, memo_bits(0), r::R9);
+                load_proto_epoch(a, r::R9);
+                a.g_store(r::R10, memo_stamp(0), r::R9);
+                a.g_store(r::R10, memo_target(0), r::R11);
+                a.g_store(r::R10, memo_caps(0), r::R8);
+                if method {
+                    let keep = a.new_label();
+                    let filled = a.new_label();
+                    a.g_test(r::RSI);
+                    a.g_jcc(cc::NE, keep);
+                    a.g_store_imm32(
+                        r::R10,
+                        memo_lookup(0) + site_off(offset_of!(LookupMemo, shape)),
+                        0,
+                    );
+                    a.jmp(filled);
+                    a.bind(keep);
+                    emit_lookup_fill(a, r::R10, memo_lookup(0));
+                    a.bind(filled);
+                }
+            }
+            if let Some(cold) = cold {
+                a.jmp(identified);
+                a.cold_end(cold);
+            }
         }
-        a.g_cmp_mem(r::RAX, r::R11, SITE_KEY);
-        if memoize {
-            let h = a.new_label();
-            a.g_jcc(cc::E, h);
-            way_hits.push(h);
-        } else {
-            a.g_jcc(cc::E, hit);
-        }
-    }
-    a.jmp(e.slow);
-    for (way, h) in way_hits.into_iter().enumerate() {
-        a.bind(h);
-        a.g_movabs(
-            r::R10,
-            e.site as u64 + (memo_bits(way) - memo_bits(0)) as u64,
-        );
-        a.jmp(hit);
-    }
-    a.bind(hit);
-    a.g_mov(r::R8, r::RDX); // captures, for the callee's entry
-    if memoize && fresh_call_enabled() {
-        // (A site of fresh closures still refills its way's memo — a
-        // closure called again right away hits it — but counts no more.)
-        // At any other, a way whose memo named another value counts as a
-        // fresh closure (see `CallSite::fresh`).
-        let store = a.new_label();
-        a.g_movabs(r::R9, e.site as u64);
-        a.g_cmp_byte_imm(r::R9, FRESH, 0);
-        a.g_jcc(cc::NE, store);
-        a.g_load(r::R9, r::R10, memo_bits(0));
-        a.g_cmp_mem(r::R9, callee_base, callee_disp);
-        a.g_jcc(cc::E, store);
-        a.g_cmp_imm(r::R9, CallSite::EMPTY as i64 as i32);
-        a.g_jcc(cc::E, store);
-        a.g_movabs(r::R9, e.site as u64);
-        a.g_inc_mem(r::R9, FRESH_MISSES);
-        a.g_mem(true, &[0x83], 7, r::R9, FRESH_MISSES); // cmp qword [r9+misses], LIMIT
-        a.code.push(FRESH_LIMIT as u8);
-        a.g_jcc(cc::B, store);
-        a.g_store_byte_imm(r::R9, FRESH, 1);
-        a.bind(store);
-    }
-    if memoize {
-        // Memoize the callee in its way's memo (see `CallMemo`).
-        a.g_load(r::R9, callee_base, callee_disp);
-        a.g_store(r::R10, memo_bits(0), r::R9);
-        load_proto_epoch(a, r::R9);
-        a.g_store(r::R10, memo_stamp(0), r::R9);
-        a.g_store(r::R10, memo_target(0), r::R11);
-        a.g_store(r::R10, memo_caps(0), r::R8);
-        if method {
-            let keep = a.new_label();
-            let filled = a.new_label();
-            a.g_test(r::RSI);
-            a.g_jcc(cc::NE, keep);
-            a.g_store_imm32(
-                r::R10,
-                memo_lookup(0) + site_off(offset_of!(LookupMemo, shape)),
-                0,
-            );
-            a.jmp(filled);
-            a.bind(keep);
-            emit_lookup_fill(a, r::R10, memo_lookup(0));
-            a.bind(filled);
-        }
-    }
-    if let Some(cold) = cold {
-        a.jmp(identified);
-        a.cold_end(cold);
     }
     a.bind(identified);
     // In an inlined body (`InlineCtx`): when every enclosing activation is

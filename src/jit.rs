@@ -6370,6 +6370,14 @@ pub struct X64Assembler {
     /// after-sequences may be shared stubs too
     /// ([`post_call_outlined`](Self::post_call_outlined)).
     pub(crate) ool_tail: bool,
+    /// The shared lookup subroutines out-of-line code calls
+    /// ([`props::LookupSub`]), placed by [`finish`](Self::finish).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) lookup_subs: Vec<props::LookupSub>,
+    /// The shared callee identifications call sequences call
+    /// ([`call_seq::IdentSub`]), placed by [`finish`](Self::finish).
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) ident_subs: Vec<call_seq::IdentSub>,
     /// The latest 10-byte `movabs rax, imm64` (`mov_imm64`): where it
     /// starts and its value ([`call_rax`](Self::call_rax)).
     last_imm_rax: Option<(usize, u64)>,
@@ -6441,6 +6449,8 @@ pub(crate) struct SizeMap {
     op: alloc::string::String,
     section: &'static str,
     part: &'static str,
+    /// The parts open cold regions interrupted.
+    parts: Vec<&'static str>,
     /// The bytes emitted so far, cut cold regions included, at the last
     /// flush; and the bytes cut so far.
     at: usize,
@@ -6467,6 +6477,20 @@ impl SizeMap {
             let k = (self.op.clone(), self.section, self.part, cold);
             *self.bytes.entry(k).or_insert(0) += d;
         }
+    }
+
+    /// `cold:<file>:<line>`, as a name that lives as long as the process.
+    fn intern(file: &str, line: u32) -> &'static str {
+        static NAMES: std::sync::Mutex<
+            alloc::collections::BTreeMap<(alloc::string::String, u32), &'static str>,
+        > = std::sync::Mutex::new(alloc::collections::BTreeMap::new());
+        let file = file.rsplit('/').next().unwrap_or(file);
+        let Ok(mut names) = NAMES.lock() else {
+            return "cold";
+        };
+        names.entry((file.into(), line)).or_insert_with(|| {
+            alloc::boxed::Box::leak(alloc::format!("cold:{file}:{line}").into_boxed_str())
+        })
     }
 
     fn op(&mut self, name: &str) {
@@ -7430,6 +7454,15 @@ impl X64Assembler {
         Label(self.labels.len() - 1)
     }
 
+    /// Whether a cold region ([`cold_begin`](Self::cold_begin)) is open.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn in_cold(&self) -> bool {
+        self.cold_binds.is_some()
+    }
+
     /// Whether the code emitted last is an unconditional `jmp` (the 5-byte
     /// `E9 rel32` whose fixup is the last one): nothing falls through past
     /// it.
@@ -7502,6 +7535,10 @@ impl X64Assembler {
             }
         }
         #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        self.place_lookup_subs();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+        self.place_ident_subs();
+        #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
         self.place_post_stubs();
         // The constant words (data, after the last instruction: nothing
         // falls through into them), 8-byte aligned within the code.
@@ -7551,8 +7588,12 @@ impl X64Assembler {
         not(all(target_os = "linux", target_arch = "x86_64")),
         allow(dead_code)
     )]
+    #[track_caller]
     pub(crate) fn cold_begin(&mut self) -> ColdMark {
         self.size_flush();
+        if let Some(m) = self.size_map.as_mut() {
+            m.parts.push(m.part);
+        }
         let start = self.code.len();
         let mark = ColdMark {
             start,
@@ -7568,7 +7609,13 @@ impl X64Assembler {
             self.cold_outer.push(outer);
         }
         self.cold_binds = Some(Vec::new());
-        self.dbg_mark("cold");
+        if self.size_map.is_some() {
+            // (Named by where it begins.)
+            let at = core::panic::Location::caller();
+            self.dbg_mark(SizeMap::intern(at.file(), at.line()));
+        } else {
+            self.dbg_mark("cold");
+        }
         mark
     }
 
@@ -7580,6 +7627,7 @@ impl X64Assembler {
         not(all(target_os = "linux", target_arch = "x86_64")),
         allow(dead_code)
     )]
+    #[track_caller]
     pub(crate) fn cold_begin_after(&mut self) -> ColdMark {
         let mut m = self.cold_begin();
         m.keep = true;
@@ -7595,6 +7643,7 @@ impl X64Assembler {
         self.size_flush();
         if let Some(m) = self.size_map.as_mut() {
             m.cut += self.code.len() - mark.start;
+            m.part = m.parts.pop().unwrap_or("");
         }
         let (start, end) = (mark.start, self.code.len());
         self.last_imm_rax = None;

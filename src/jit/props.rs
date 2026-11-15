@@ -602,6 +602,35 @@ struct NativeOwn {
 /// See [`NativeOwn::tries`].
 pub(crate) const DIRECT_TRIES: u32 = 64;
 
+/// A body's **shared method-lookup subroutine** (`KATAAN_JIT_LOOKUPSUB`):
+/// out-of-line code's method lookups ([`X64Assembler::p_method_lookup`],
+/// [`X64Assembler::p_accessor_lookup_walked`]) as a `call` of one copy of
+/// the lookup per body (and arena pinning, realm offset, accessor field
+/// and getter outcome) instead of ~400 bytes of it each. The entry `full`
+/// takes the receiver's value in `rsi`, the entry `walked` its walked slot
+/// in `rcx` (as the in-line walked lookup does), and both the site's
+/// entries' address in `rdi`. It returns (every register as the in-line
+/// lookup leaves it) with CF set for a miss, else ZF set for a hit (the
+/// value in `rax`) or clear for the getter (in `rax`). It touches no
+/// stack beyond its return address.
+#[derive(Clone, Copy)]
+pub(crate) struct LookupSub {
+    pin: Option<super::pin::PinArena>,
+    realm_off: i32,
+    acc_field: i32,
+    getter: bool,
+    layout: JitLayout,
+    full: Label,
+    walked: Label,
+}
+
+/// Whether out-of-line method lookups call a shared subroutine
+/// ([`LookupSub`]; `KATAAN_JIT_LOOKUPSUB=0` disables). Read once.
+fn lookup_sub_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LOOKUPSUB").is_none_or(|v| v != "0"))
+}
+
 /// See [`NativeOwn::fills`].
 const NATIVE_OWN_FILLS: u32 = 4;
 
@@ -1494,12 +1523,118 @@ impl X64Assembler {
         miss: Label,
         getter: Option<Label>,
     ) {
+        if self.lookup_sub_ok() {
+            let sub = self.lookup_sub(l, realm_off, getter.is_some(), l.props.acc_getter);
+            self.g_load(r::RSI, recv_base, recv_disp);
+            self.lookup_sub_call(sub.full, site, miss, getter);
+            return;
+        }
         self.p_arena(realm_off, &l.props);
         self.g_load(r::RAX, recv_base, recv_disp);
         self.p_handle_check(miss);
         self.p_slot_rooted(l, r::RCX, miss);
         self.p_plain_shaped(l, miss);
-        self.p_method_lookup_from(l, site, miss, getter, l.props.acc_getter);
+        self.p_method_lookup_from(l, Some(site), miss, getter, l.props.acc_getter);
+    }
+
+    /// Whether a lookup emitted here may be a call of the body's shared
+    /// lookup subroutine ([`LookupSub`]): only in out-of-line code, where
+    /// the `call`/`ret` cost less than the code it saves.
+    fn lookup_sub_ok(&self) -> bool {
+        lookup_sub_enabled() && (self.in_cold() || self.ool_tail)
+    }
+
+    /// The body's [`LookupSub`] for these parameters (made once; placed by
+    /// [`place_lookup_subs`](Self::place_lookup_subs)).
+    fn lookup_sub(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        getter: bool,
+        acc_field: i32,
+    ) -> LookupSub {
+        let pin = self.pin();
+        if let Some(s) = self.lookup_subs.iter().find(|s| {
+            s.pin == pin
+                && s.realm_off == realm_off
+                && s.getter == getter
+                && s.acc_field == acc_field
+        }) {
+            return *s;
+        }
+        let s = LookupSub {
+            pin,
+            realm_off,
+            acc_field,
+            getter,
+            layout: *l,
+            full: self.new_label(),
+            walked: self.new_label(),
+        };
+        self.lookup_subs.push(s);
+        s
+    }
+
+    /// The call of a [`LookupSub`] entry (its receiver already in `rsi`, or
+    /// its slot in `rcx`), and the branches on its outcome.
+    fn lookup_sub_call(
+        &mut self,
+        entry: Label,
+        site: *const MethodSite,
+        miss: Label,
+        getter: Option<Label>,
+    ) {
+        self.g_movabs(
+            r::RDI,
+            site as u64
+                + u64::try_from(core::mem::offset_of!(MethodSite, entries)).expect("offset"),
+        );
+        self.g_call_label(entry);
+        self.g_jcc(cc::B, miss);
+        if let Some(g) = getter {
+            self.g_jcc(cc::NE, g);
+        }
+    }
+
+    /// Places every [`LookupSub`] the body asked for (after its code, where
+    /// nothing falls through into them).
+    pub(crate) fn place_lookup_subs(&mut self) {
+        let subs = core::mem::take(&mut self.lookup_subs);
+        if subs.is_empty() {
+            return;
+        }
+        let pin = self.pin();
+        for s in subs {
+            self.set_pin(s.pin);
+            let l = &s.layout;
+            let (miss, getter, body) = (self.new_label(), self.new_label(), self.new_label());
+            // The full entry: the receiver's value in `rsi`.
+            self.bind(s.full);
+            self.last_store = None;
+            self.p_arena(s.realm_off, &l.props);
+            self.g_mov(r::RAX, r::RSI);
+            self.p_handle_check(miss);
+            self.p_slot_rooted(l, r::RCX, miss);
+            self.p_plain_shaped(l, miss);
+            self.jmp(body);
+            // The walked entry: its slot in `rcx`.
+            self.bind(s.walked);
+            self.last_store = None;
+            self.p_arena(s.realm_off, &l.props);
+            self.bind(body);
+            self.p_method_lookup_from(l, None, miss, s.getter.then_some(getter), s.acc_field);
+            // A hit: ZF set, CF clear.
+            self.code.extend_from_slice(&[0x39, 0xe4, 0xc3]); // cmp esp, esp; ret
+            if s.getter {
+                // The getter: ZF and CF clear.
+                self.bind(getter);
+                self.code.extend_from_slice(&[0x85, 0xe4, 0xc3]); // test esp, esp; ret
+            }
+            // A miss: CF set.
+            self.bind(miss);
+            self.code.extend_from_slice(&[0xf9, 0xc3]); // stc; ret
+        }
+        self.set_pin(pin);
     }
 
     /// The receiver walk of [`p_method_lookup`](Self::p_method_lookup) alone:
@@ -1548,24 +1683,30 @@ impl X64Assembler {
         getter: Option<Label>,
         setter: bool,
     ) {
-        self.p_arena(realm_off, &l.props);
         let field = if setter {
             l.props.acc_setter
         } else {
             l.props.acc_getter
         };
-        self.p_method_lookup_from(l, site, miss, getter, field);
+        if self.lookup_sub_ok() {
+            let sub = self.lookup_sub(l, realm_off, getter.is_some(), field);
+            self.lookup_sub_call(sub.walked, site, miss, getter);
+            return;
+        }
+        self.p_arena(realm_off, &l.props);
+        self.p_method_lookup_from(l, Some(site), miss, getter, field);
     }
 
     /// The rest of a method lookup, from the walked receiver's slot in `rcx`
     /// and the arena in `r10` / `rdx`. On a hit, `r11` is the entry that hit
     /// and `rsi` is nonzero exactly when the value came through the entry's
     /// recorded holder address (`MethodEntry::value`, at a prototype level:
-    /// what `call_seq::LookupMemo` can record).
+    /// what `call_seq::LookupMemo` can record). (`site`: `None` when its
+    /// entries' address is in `rdi`, a [`LookupSub`]'s.)
     fn p_method_lookup_from(
         &mut self,
         l: &JitLayout,
-        site: *const MethodSite,
+        site: Option<*const MethodSite>,
         miss: Label,
         getter: Option<Label>,
         acc_field: i32,
@@ -1586,10 +1727,13 @@ impl X64Assembler {
         self.bind(no_acc);
         // rsi = the receiver's slot, r11 = the way, edi = ways left.
         self.g_mov(r::RSI, r::RCX);
-        self.g_movabs(
-            r::R11,
-            site as u64 + u64::try_from(offset_of!(MethodSite, entries)).expect("offset"),
-        );
+        match site {
+            Some(site) => self.g_movabs(
+                r::R11,
+                site as u64 + u64::try_from(offset_of!(MethodSite, entries)).expect("offset"),
+            ),
+            None => self.g_mov(r::R11, r::RDI),
+        }
         self.g_movabs(r::RDI, METHOD_WAYS as u64);
         let way = self.new_label();
         let next = self.new_label();
