@@ -138,6 +138,28 @@ impl Types {
     }
 }
 
+/// [`join`] of `row` with `cur`, element by element, into `row`; whether
+/// anything changed. Every fact is one of [`T_BOT`] `0`, [`T_NUM`] `1`,
+/// [`T_BOOL`] `2` and [`T_ANY`] `3` (or [`I_INT`] `1` in place of
+/// `T_NUM`), whose join is their bitwise or: one pass the compiler
+/// vectorizes, with no branch per register.
+fn join_row(row: &mut [u8], cur: &[u8]) -> bool {
+    let mut grew = 0u8;
+    for (x, &c) in row.iter_mut().zip(cur) {
+        debug_assert!(*x <= T_ANY && c <= T_ANY);
+        grew |= c & !*x;
+        *x |= c;
+    }
+    grew != 0
+}
+
+/// Whether the type inference joins its states by [`join_row`]
+/// (`KATAAN_JIT_ORJOIN=0`: one register at a time). Read once.
+fn or_join_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_ORJOIN").is_none_or(|v| v != "0"))
+}
+
 fn join(a: u8, b: u8) -> u8 {
     if a == b || b == T_BOT {
         a
@@ -544,6 +566,7 @@ fn infer_with(ops: &[Op], n_regs: usize, transfer: &dyn Fn(&Op, &mut [u8])) -> T
     }
     let mut cur = vec![T_BOT; n_regs];
     let mut succ = Vec::with_capacity(2);
+    let or_join = or_join_enabled();
     while let Some(pc) = work.pop() {
         queued[pc] = false;
         cur.copy_from_slice(&st[pc * n_regs..(pc + 1) * n_regs]);
@@ -554,14 +577,19 @@ fn infer_with(ops: &[Op], n_regs: usize, transfer: &dyn Fn(&Op, &mut [u8])) -> T
                 continue;
             }
             let row = &mut st[s * n_regs..(s + 1) * n_regs];
-            let mut changed = false;
-            for (x, &c) in row.iter_mut().zip(cur.iter()) {
-                let j = join(*x, c);
-                if j != *x {
-                    *x = j;
-                    changed = true;
+            let changed = if or_join {
+                join_row(row, &cur)
+            } else {
+                let mut changed = false;
+                for (x, &c) in row.iter_mut().zip(cur.iter()) {
+                    let j = join(*x, c);
+                    if j != *x {
+                        *x = j;
+                        changed = true;
+                    }
                 }
-            }
+                changed
+            };
             if changed && !queued[s] {
                 queued[s] = true;
                 work.push(s);

@@ -5071,6 +5071,7 @@ impl JitProto {
         demote: &[(usize, u16)],
         sink: bool,
     ) -> Option<Self> {
+        EMIT_ATTEMPTS.with(|c| c.set(c.get() + 1));
         // The register `call_with_inner` puts `new.target` in, if any (a
         // native-call entry fills it from the call header; one at or below the
         // `this` slot would collide with an input, so such a body gets none).
@@ -6882,6 +6883,11 @@ fn finish_jumps(
     for o in offsets.iter_mut() {
         *o = map(*o);
     }
+}
+
+std::thread_local! {
+    /// How many generic-tier emissions ran (`KATAAN_JIT_CTIME` diagnostics).
+    pub(crate) static EMIT_ATTEMPTS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
 /// The value a receiver-cache key slot holds when it caches nothing: the

@@ -1251,25 +1251,32 @@ fn recompile(
     };
     let prev = INLINED_WARM.with(|iw| core::mem::replace(&mut *iw.borrow_mut(), inl));
     let hdr = call_hdr_pcs(funcs, &hints);
-    let new = crate::jit::typed::with_own_kinds(kinds, || {
-        crate::jit::with_entry_poll(!cold.is_empty(), || {
-            crate::jit::with_call_hdr(hdr, || {
-                crate::jit::JitProto::compile_generic_respec(
-                    proto,
-                    &super::jit_generic_helpers(),
-                    &warm,
-                    &|f| {
-                        funcs
-                            .get(f as usize)
-                            .is_some_and(|p| !(p.is_async && !p.is_generator))
-                    },
-                    &|pc, _| inline_candidate(funcs, id, &hints, pc),
-                    &old.spec_off(),
-                    &old.int_demote(),
-                )
+    let new = timed_compile(
+        proto,
+        "recompile",
+        |j: &Option<crate::jit::JitProto>| j.as_ref().map_or(0, |j| j.code_len()),
+        || {
+            crate::jit::typed::with_own_kinds(kinds, || {
+                crate::jit::with_entry_poll(!cold.is_empty(), || {
+                    crate::jit::with_call_hdr(hdr, || {
+                        crate::jit::JitProto::compile_generic_respec(
+                            proto,
+                            &super::jit_generic_helpers(),
+                            &warm,
+                            &|f| {
+                                funcs
+                                    .get(f as usize)
+                                    .is_some_and(|p| !(p.is_async && !p.is_generator))
+                            },
+                            &|pc, _| inline_candidate(funcs, id, &hints, pc),
+                            &old.spec_off(),
+                            &old.int_demote(),
+                        )
+                    })
+                })
             })
-        })
-    });
+        },
+    );
     INLINED_WARM.with(|iw| *iw.borrow_mut() = prev);
     let mut new = new?;
     new.note_cold_calls(&cold);
@@ -6453,6 +6460,55 @@ fn inline_candidate_key(
 pub(super) fn jit_log_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LOG").is_some_and(|v| v != "0"))
+}
+
+/// Whether `KATAAN_JIT_CTIME` is set: time every compilation and report it
+/// (to stderr, one line per compile with the running total). A diagnostic
+/// only: never consulted for a compile decision. Read once per process.
+pub(super) fn ctime_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CTIME").is_some_and(|v| v != "0"))
+}
+
+std::thread_local! {
+    /// [`ctime_enabled`]'s running totals: compiles and nanoseconds.
+    static CTIME: core::cell::Cell<(u64, u64)> = const { core::cell::Cell::new((0, 0)) };
+}
+
+/// Runs `f` (a compilation of function `proto`, `what` it is), reporting
+/// its wall time when [`ctime_enabled`].
+pub(super) fn timed_compile<T>(
+    proto: &FnProto,
+    what: &str,
+    size: impl Fn(&T) -> usize,
+    f: impl FnOnce() -> T,
+) -> T {
+    if !ctime_enabled() {
+        return f();
+    }
+    let t0 = std::time::Instant::now();
+    crate::jit::EMIT_ATTEMPTS.with(|c| c.set(0));
+    let r = f();
+    let tries = crate::jit::EMIT_ATTEMPTS.with(core::cell::Cell::get);
+    let ns = t0.elapsed().as_nanos() as u64;
+    let (n, tot) = CTIME.with(|c| {
+        let (n, tot) = c.get();
+        c.set((n + 1, tot + ns));
+        (n + 1, tot + ns)
+    });
+    std::eprintln!(
+        "[ctime] {what} {} ({} ops): {} us, {} bytes, {tries} emits; total {n} compiles {} us",
+        if proto.name.is_empty() {
+            "<anonymous>"
+        } else {
+            proto.name.as_str()
+        },
+        proto.ops.len(),
+        ns / 1000,
+        size(&r),
+        tot / 1000
+    );
+    r
 }
 
 /// One `KATAAN_JIT_LOG` line for function `id`.

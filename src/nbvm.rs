@@ -6756,46 +6756,53 @@ fn ensure_jit(
     // accepts nearly any body (see `jit_tier`).
     // (A generator's body is only ever resumed on the register file: the
     // generic tier's.)
-    let compiled = (!funcs[id].is_generator)
-        .then(|| crate::jit::JitProto::compile_with_registry(&funcs[id], &registry))
-        .flatten()
-        .or_else(|| {
-            let (warm, hints) = match ic {
-                Some(ic) => (
-                    ic.iter().map(PropertyCache::warm_entry).collect(),
-                    ic.iter().map(crate::jit::poly::hint_of).collect(),
-                ),
-                None => (tier_warm(&funcs[id]), tier_hints(&funcs[id])),
-            };
-            let cold = jit_tier::cold_call_pcs(&funcs[id], &hints);
-            // (The running frame's element access feedback: its caches are
-            // out of the function's tier while it runs.)
-            let kinds = ic.map(elem_kinds_of).unwrap_or_default();
-            let hdr = jit_tier::call_hdr_pcs(funcs, &hints);
-            crate::jit::typed::with_own_kinds(kinds, || {
-                crate::jit::with_entry_poll(!cold.is_empty(), || {
-                    crate::jit::with_call_hdr(hdr, || {
-                        crate::jit::JitProto::compile_generic_inlining(
-                            &funcs[id],
-                            &jit_generic_helpers(),
-                            &warm,
-                            &|f| {
-                                funcs
-                                    .get(f as usize)
-                                    .is_some_and(|p| !(p.is_async && !p.is_generator))
-                            },
-                            &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
-                        )
+    let compiled = jit_tier::timed_compile(
+        &funcs[id],
+        "compile",
+        |j: &Option<alloc::rc::Rc<crate::jit::JitProto>>| j.as_ref().map_or(0, |j| j.code_len()),
+        || {
+            (!funcs[id].is_generator)
+                .then(|| crate::jit::JitProto::compile_with_registry(&funcs[id], &registry))
+                .flatten()
+                .or_else(|| {
+                    let (warm, hints) = match ic {
+                        Some(ic) => (
+                            ic.iter().map(PropertyCache::warm_entry).collect(),
+                            ic.iter().map(crate::jit::poly::hint_of).collect(),
+                        ),
+                        None => (tier_warm(&funcs[id]), tier_hints(&funcs[id])),
+                    };
+                    let cold = jit_tier::cold_call_pcs(&funcs[id], &hints);
+                    // (The running frame's element access feedback: its caches are
+                    // out of the function's tier while it runs.)
+                    let kinds = ic.map(elem_kinds_of).unwrap_or_default();
+                    let hdr = jit_tier::call_hdr_pcs(funcs, &hints);
+                    crate::jit::typed::with_own_kinds(kinds, || {
+                        crate::jit::with_entry_poll(!cold.is_empty(), || {
+                            crate::jit::with_call_hdr(hdr, || {
+                                crate::jit::JitProto::compile_generic_inlining(
+                                    &funcs[id],
+                                    &jit_generic_helpers(),
+                                    &warm,
+                                    &|f| {
+                                        funcs
+                                            .get(f as usize)
+                                            .is_some_and(|p| !(p.is_async && !p.is_generator))
+                                    },
+                                    &|pc, _| jit_tier::inline_candidate(funcs, id, &hints, pc),
+                                )
+                            })
+                        })
+                    })
+                    .map(|mut j| {
+                        j.note_cold_calls(&cold);
+                        j.note_function(id);
+                        j
                     })
                 })
-            })
-            .map(|mut j| {
-                j.note_cold_calls(&cold);
-                j.note_function(id);
-                j
-            })
-        })
-        .map(alloc::rc::Rc::new);
+                .map(alloc::rc::Rc::new)
+        },
+    );
     if jit_tier::jit_log_enabled() {
         let what = match &compiled {
             Some(j) if j.inlined() > 0 => alloc::format!(
