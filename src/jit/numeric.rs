@@ -1097,8 +1097,9 @@ enum StubKind {
     /// the interpreter runs the op (as [`StubKind::Exec`]).
     Mirror { pc: u32, src: u16 },
     /// `ToBoolean([cond])` through the helper, then branch: falsy → bytecode
-    /// pc `target`, truthy → `resume`.
-    Truthy { cond: u16, target: usize },
+    /// pc `target`, truthy → `resume` (the other way round when `neg`: an
+    /// `if (!x)` tested on `x`, [`NumGen::not_test_any`]).
+    Truthy { cond: u16, target: usize, neg: bool },
     /// `xmm0 = canonical NaN` (no call).
     CanonNan,
     /// `xmm x` is NaN-patterned: to `slow` unless it is a Number (a NaN),
@@ -4953,6 +4954,13 @@ impl NumGen {
                 }
                 self.skip_op(pc + 1);
             }
+            // `if (!x)` in a promoted loop, `x` of any type: the test
+            // branches on `x`'s truthiness itself (`KATAAN_JIT_NOTANY`).
+            GenericOp::Not { dst, a: x } if self.not_test_any(pc, ops, reg, dst, x).is_some() => {
+                let target = self.not_test_any(pc, ops, reg, dst, x)?;
+                self.branch_on_truthy(a, labels, (pc, reg), x, target, true);
+                self.skip_op(pc + 1);
+            }
             GenericOp::JumpIfFalse { cond, target } => {
                 let back = target <= pc;
                 if back && reg.is_none() {
@@ -5622,6 +5630,34 @@ impl NumGen {
             && dst != x
             && target > pc + 1
             && (t == T_BOOL || t == T_NUM)
+            && self.mentions_at(dst, pc) == 2
+            && !self.is_target.get(pc + 1).copied().unwrap_or(true)
+            && self.region_at(pc + 1) == self.region_at(pc))
+        .then_some(target)
+    }
+
+    /// [`not_test`](Self::not_test) in a promoted loop (`reg`), `x` of any
+    /// type: the `JumpIfFalse` target of `dst = !x` when only that branch
+    /// reads `dst` (`KATAAN_JIT_NOTANY`; the generic emitter's own
+    /// `recv_cache::not_branches` does as much outside promoted loops).
+    fn not_test_any(
+        &self,
+        pc: usize,
+        ops: &[GenericOp],
+        reg: Option<usize>,
+        dst: u16,
+        x: u16,
+    ) -> Option<usize> {
+        let Some(&GenericOp::JumpIfFalse { cond, target }) = ops.get(pc + 1) else {
+            return None;
+        };
+        (reg.is_some()
+            && not_any_enabled()
+            && !self.copy
+            && self.imode.is_none()
+            && cond == dst
+            && dst != x
+            && target > pc + 1
             && self.mentions_at(dst, pc) == 2
             && !self.is_target.get(pc + 1).copied().unwrap_or(true)
             && self.region_at(pc + 1) == self.region_at(pc))
@@ -6789,6 +6825,62 @@ impl NumGen {
         cond: u16,
         target: usize,
     ) {
+        self.branch_on_truthy(a, labels, (pc, reg), cond, target, false);
+    }
+
+    /// `if ToBoolean(register cond) != neg goto target`... that is, without
+    /// `neg` [`branch_if_false`](Self::branch_if_false)'s branch on a falsy
+    /// `cond`, and with it the branch on a truthy one (an `if (!x)` tested
+    /// on `x` itself, [`not_test_any`](Self::not_test_any)).
+    fn branch_on_truthy(
+        &mut self,
+        a: &mut X64Assembler,
+        labels: &[Label],
+        (pc, reg): (usize, Option<usize>),
+        cond: u16,
+        target: usize,
+        neg: bool,
+    ) {
+        if neg {
+            // (Only an untyped `cond`: `not_test_any`'s.)
+            let num = a.new_label();
+            let stub = a.new_label();
+            let resume = a.new_label();
+            let truthy = a.new_label();
+            self.load_gpr(a, reg, RAX, cond);
+            // `undefined`, `null`, `false` / `true` (one classification).
+            a.p_imm_class(RCX);
+            a.jcc(CC_B, resume);
+            a.jcc(CC_E, truthy);
+            a.mov_rcx_rax();
+            a.movabs_r11(QNAN as i64);
+            a.and_rcx_r11();
+            a.cmp_rcx_r11();
+            a.jcc(CC_NE, num);
+            // An ordinary object or a function inline; anything else
+            // through the helper.
+            a.p_truthy_handle_any(self.env.realm, truthy);
+            a.jmp(stub);
+            a.bind(num);
+            a.movq_x_gpr(0, RAX);
+            a.sse_rr(0x66, 0x57, 1, 1); // xorpd xmm1, xmm1
+            a.sse_rr(0x66, 0x2e, 0, 1); // ucomisd xmm0, xmm1 (ZF: zero or NaN)
+            a.jcc(CC_E, resume);
+            a.bind(truthy);
+            self.jump(a, labels, reg, target);
+            a.bind(resume);
+            self.stub(
+                stub,
+                resume,
+                reg,
+                StubKind::Truthy {
+                    cond,
+                    target,
+                    neg,
+                },
+            );
+            return;
+        }
         match self.ty(pc, cond) {
             T_BOOL => {
                 self.load_gpr(a, reg, RAX, cond);
@@ -6842,7 +6934,16 @@ impl NumGen {
                 a.sse_rr(0x66, 0x2e, 0, 1); // ucomisd xmm0, xmm1
                 self.jcc_to(a, labels, reg, CC_E, target);
                 a.bind(resume);
-                self.stub(stub, resume, reg, StubKind::Truthy { cond, target });
+                self.stub(
+                    stub,
+                    resume,
+                    reg,
+                    StubKind::Truthy {
+                        cond,
+                        target,
+                        neg,
+                    },
+                );
             }
         }
     }
@@ -7469,7 +7570,7 @@ impl NumGen {
                     self.recheck_globals(a, s.region);
                     self.after_slow(a, labels, s);
                 }
-                StubKind::Truthy { cond, target } => {
+                StubKind::Truthy { cond, target, neg } => {
                     self.flush(a, s.region);
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(cond));
@@ -7479,7 +7580,8 @@ impl NumGen {
                     self.recheck_globals(a, s.region);
                     a.test_rax_rax();
                     // Truthy → resume; falsy → the target (already flushed).
-                    a.jcc(CC_NE, s.resume);
+                    // (`neg`: falsy → resume, truthy → the target.)
+                    a.jcc(if neg { CC_E } else { CC_NE }, s.resume);
                     match self.in_region_target(labels, s.region, target) {
                         Some(l) => a.jmp(l),
                         None => {
@@ -7635,6 +7737,14 @@ impl NumGen {
 fn bit_test_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_BITTEST").is_none_or(|v| v != "0"))
+}
+
+/// Whether an `if (!x)` in a promoted loop, `x` of any type, branches on
+/// `x`'s truthiness with no boolean made (`KATAAN_JIT_NOTANY=0` turns it
+/// off, read once per process).
+fn not_any_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NOTANY").is_none_or(|v| v != "0"))
 }
 
 /// Whether a fused `===` test's slow stub that decides the comparison
