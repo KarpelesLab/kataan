@@ -6486,6 +6486,7 @@ pub(super) fn timed_compile<T>(
     if !ctime_enabled() {
         return f();
     }
+    let _ = ctime_epoch();
     let t0 = std::time::Instant::now();
     crate::jit::EMIT_ATTEMPTS.with(|c| c.set(0));
     let r = f();
@@ -6497,7 +6498,7 @@ pub(super) fn timed_compile<T>(
         (n + 1, tot + ns)
     });
     std::eprintln!(
-        "[ctime] {what} {} ({} ops): {} us, {} bytes, {tries} emits; total {n} compiles {} us",
+        "[ctime] {what} {} ({} ops): {} us, {} bytes, {tries} emits; total {n} compiles {} us; at {} us",
         if proto.name.is_empty() {
             "<anonymous>"
         } else {
@@ -6506,9 +6507,16 @@ pub(super) fn timed_compile<T>(
         proto.ops.len(),
         ns / 1000,
         size(&r),
-        tot / 1000
+        tot / 1000,
+        ctime_epoch().elapsed().as_micros()
     );
     r
+}
+
+/// When [`timed_compile`] first ran (its report's time line).
+fn ctime_epoch() -> std::time::Instant {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *T0.get_or_init(std::time::Instant::now)
 }
 
 /// One `KATAAN_JIT_LOG` line for function `id`.
