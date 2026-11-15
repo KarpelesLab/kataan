@@ -6891,16 +6891,7 @@ impl NumGen {
             a.bind(truthy);
             self.jump(a, labels, reg, target);
             a.bind(resume);
-            self.stub(
-                stub,
-                resume,
-                reg,
-                StubKind::Truthy {
-                    cond,
-                    target,
-                    neg,
-                },
-            );
+            self.stub(stub, resume, reg, StubKind::Truthy { cond, target, neg });
             return;
         }
         match self.ty(pc, cond) {
@@ -6956,16 +6947,7 @@ impl NumGen {
                 a.sse_rr(0x66, 0x2e, 0, 1); // ucomisd xmm0, xmm1
                 self.jcc_to(a, labels, reg, CC_E, target);
                 a.bind(resume);
-                self.stub(
-                    stub,
-                    resume,
-                    reg,
-                    StubKind::Truthy {
-                        cond,
-                        target,
-                        neg,
-                    },
-                );
+                self.stub(stub, resume, reg, StubKind::Truthy { cond, target, neg });
             }
         }
     }

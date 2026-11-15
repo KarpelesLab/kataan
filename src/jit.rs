@@ -18359,14 +18359,11 @@ impl JitFunction {
                         Some(&GenericOp::JumpIfFalse { cond, target })
                             if cond == dst && target > op_idx + 1 && target <= ops.len() =>
                         {
-                            let named = bytecode
-                                .iter()
-                                .enumerate()
-                                .any(|(j, o)| {
-                                    j != op_idx
-                                        && j != op_idx + 1
-                                        && crate::bytecode::op_mentions_reg(o, dst)
-                                });
+                            let named = bytecode.iter().enumerate().any(|(j, o)| {
+                                j != op_idx
+                                    && j != op_idx + 1
+                                    && crate::bytecode::op_mentions_reg(o, dst)
+                            });
                             Some((*labels.get(op_idx + 2)?, *labels.get(target)?, named))
                         }
                         _ => None,
