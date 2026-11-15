@@ -3765,8 +3765,25 @@ fn ap_proof_enabled() -> bool {
     }
 }
 
+/// Whether an inline `m.has(k)` / `m.get(k)` in a loop that makes no call
+/// keeps a run proof of its checks in a frame slot, as an inline `a.push(x)`
+/// does (`KATAAN_JIT_COLLPROOF=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn coll_proof_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_COLLPROOF").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether op `pc` lies in a loop (its innermost back-edge's range) none of
-/// whose ops is a call but an inline array method or `Math.f`, an iteration
+/// whose ops is a call but an inline array method, collection method
+/// (`KATAAN_JIT_COLLPROOF`) or `Math.f`, an iteration
 /// step, a global access or a coercibility check, nor anything else that
 /// usually runs Rust code (only a guess of the profit: a call just empties
 /// the proof, see `ap_slot`).
@@ -3789,6 +3806,12 @@ fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize) -> bool {
             (key == "push" && args.len() == 1)
                 || ((key == "pop" || key == "shift") && args.is_empty())
                 || inline_math(o).is_some()
+                || (coll_proof_enabled()
+                    && match key.as_str() {
+                        "has" | "get" | "add" | "delete" => args.len() == 1,
+                        "set" => args.len() == 2,
+                        _ => false,
+                    })
         }
         Op::GetProp { .. }
         | Op::SetProp { .. }
@@ -10490,9 +10513,10 @@ impl JitFunction {
                     return false;
                 };
                 matches!(ops[pc], GenericOp::CallMethod { .. })
-                    && ap_proof_enabled()
-                    && ((key == "push" && args.len() == 1)
-                        || ((key == "pop" || key == "shift") && args.is_empty()))
+                    && ((ap_proof_enabled()
+                        && ((key == "push" && args.len() == 1)
+                            || ((key == "pop" || key == "shift") && args.is_empty())))
+                        || (coll_proof_enabled() && key == "has" && args.len() == 1))
                     && !math_stores_key(bytecode, key.as_str())
                     && in_call_free_loop(bytecode, pc)
             })
@@ -13108,11 +13132,16 @@ impl JitFunction {
                         let fill = a.new_label();
                         let retry = a.new_label();
                         let cl = &helpers.call_layout;
-                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
-                        a.g_jcc(call_seq::cc::E, slow);
-                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
-                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
-                        a.g_jcc(call_seq::cc::NE, slow);
+                        // (With a proof slot, `coll_lookup` makes these run
+                        // checks itself, skipped while the slot is set.)
+                        let proof = ap_slot(op_idx);
+                        if proof.is_none() {
+                            a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                            a.g_jcc(call_seq::cc::E, slow);
+                            a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                            a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                        }
                         a.bind(retry);
                         a.coll_lookup(
                             &layout,
@@ -13123,6 +13152,7 @@ impl JitFunction {
                             (fill, slow, done),
                             helpers.coll_lookup as usize as u64,
                             cm_plan.get(op_idx).copied().unwrap_or(0),
+                            proof.map(|p| (p, cl.hosted, cl.multi_realm)),
                         );
                         let cold = a.cold_begin();
                         a.bind(fill);
@@ -18868,6 +18898,7 @@ impl JitFunction {
                                     (fill, general, done),
                                     helpers.coll_lookup as usize as u64,
                                     cm_plan.get(op_idx).copied().unwrap_or(0),
+                                    None,
                                 );
                             }
                             let cold = a.cold_begin();

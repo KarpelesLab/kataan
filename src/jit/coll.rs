@@ -339,7 +339,15 @@ impl X64Assembler {
     /// displacement of a method already read, `Op::CallWithMethod`), that
     /// method must be the proof's built-in itself, which is then called on
     /// any strong collection of its kind: the lookup that found it is done.
-    /// Clobbers `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`.
+    /// With `proof` (a frame slot, emptied by the prologue and every call as
+    /// a receiver cache key is, and the call layout's `hosted` and
+    /// `multi_realm` offsets; no `callee`), the run checks — a hosted run of
+    /// one realm, the proof of this epoch with the built-in still in its
+    /// slot — are made here, skipped while the slot holds `0`, which they
+    /// set once they pass (only Rust code, behind a call, changes any of
+    /// that, but for an inline store of the method's key, which the body
+    /// must not have). Clobbers `rax`, `rcx`, `rdx`, `rsi`, `rdi`,
+    /// `r8`–`r11`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn coll_lookup(
         &mut self,
@@ -351,13 +359,25 @@ impl X64Assembler {
         (fill, slow, done): (Label, Label, Label),
         probe_helper: u64,
         memo_use: u8,
+        proof: Option<(i32, i32, i32)>,
     ) {
         let c = coll_layout();
         let [stamp, ptr, method, is_set, tries] = MethodSite::coll_offsets();
         let stale = self.new_label();
         let probe = self.new_label();
+        let proven = self.new_label();
         self.p_arena(realm_off, &l.props);
         self.g_movabs(r::R11, site as u64);
+        let proof = proof.filter(|_| callee.is_none());
+        if let Some((p, hosted, multi_realm)) = proof {
+            self.cmp_frame_imm8(p, super::RECV_CACHE_EMPTY as i8);
+            self.jne(proven);
+            self.g_cmp_byte_imm(r::R15, hosted, 0);
+            self.g_jcc(cc::E, slow);
+            self.g_load(r::R9, r::R15, realm_off);
+            self.g_cmp_byte_imm(r::R9, multi_realm, 0);
+            self.g_jcc(cc::NE, slow);
+        }
         if let Some(c) = callee {
             // The method read is the built-in the proof names; else a
             // proof of this epoch is the answer (another method), and a
@@ -382,7 +402,11 @@ impl X64Assembler {
             self.g_load(r::R9, r::R9, 0);
             self.g_cmp_mem(r::R9, r::R11, method);
             self.g_jcc(cc::NE, slow);
+            if let Some((p, ..)) = proof {
+                self.g_store_imm32(r::RBP, p, 0);
+            }
         }
+        self.bind(proven);
         // The memo's answer (see `CollMemo`), under a proof of `Map` kind.
         let memo = self.coll_memo;
         if let Some(m) = memo.filter(|_| memo_use & MEMO_CHECK != 0) {
