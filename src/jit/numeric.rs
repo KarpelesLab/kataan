@@ -4917,7 +4917,13 @@ impl NumGen {
                 }
                 let resume = a.new_label();
                 let stub = a.new_label();
-                if self.ty(pc, src) != T_NUM {
+                // (Untested, `KATAAN_JIT_NEGTAG`: every value but a Number
+                // reads as a NaN `f64`, which stays one negated — the op's
+                // stub then runs it, as it does a NaN Number's — and whose
+                // truncation is the "indefinite" integer `to_int32` sends
+                // to the stub.)
+                let untested = self.ty(pc, src) != T_NUM && neg_tag_enabled();
+                if self.ty(pc, src) != T_NUM && !untested {
                     self.num_guard(a, reg, src, stub);
                 }
                 if neg {
@@ -4925,7 +4931,12 @@ impl NumGen {
                     a.movabs_r11(SIGN as i64);
                     a.raw(&[0x4c, 0x31, 0xd8]); // xor rax, r11
                     a.movq_x_gpr(0, RAX);
-                    self.canon_xmm0(a, reg);
+                    if untested {
+                        a.sse_rr(0x66, 0x2e, 0, 0); // ucomisd xmm0, xmm0
+                        a.jcc(CC_P, stub);
+                    } else {
+                        self.canon_xmm0(a, reg);
+                    }
                 } else {
                     self.to_int32(a, reg, RAX, src, stub);
                     a.not_eax();
@@ -7737,6 +7748,14 @@ impl NumGen {
 fn bit_test_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_BITTEST").is_none_or(|v| v != "0"))
+}
+
+/// Whether a unary `-x` / `~x` of a value not proven a Number skips its
+/// Number test, which the NaN its bits read as covers (`KATAAN_JIT_NEGTAG=0`
+/// turns it off, read once per process).
+fn neg_tag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_NEGTAG").is_none_or(|v| v != "0"))
 }
 
 /// Whether an `if (!x)` in a promoted loop, `x` of any type, branches on

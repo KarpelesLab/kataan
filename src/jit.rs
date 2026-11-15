@@ -3682,6 +3682,22 @@ fn push_dead_enabled() -> bool {
     }
 }
 
+/// Whether an inline `Math.imul` / `Math.clz32` skips its arguments' Number
+/// tests, which their truncation's "indefinite" check covers
+/// (`KATAAN_JIT_INTMATHTAG=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn int_math_tag_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_INTMATHTAG").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether a `PlainPrims` guard branches for the test right after it on the
 /// answers it finds itself, and tests a register it names twice once
 /// (`KATAAN_JIT_PLAINTEST=0` turns it off, read once per process).
@@ -12263,8 +12279,15 @@ impl JitFunction {
                         if num.emit_int_math(&mut a, op_idx)? {
                             a.jmp(done);
                         }
+                        // (`Math.imul` / `Math.clz32` need no test: every
+                        // value but a Number reads as a NaN `f64`, whose
+                        // truncation is the "indefinite" integer their
+                        // conversion below sends to the call anyway —
+                        // `KATAAN_JIT_INTMATHTAG`.)
+                        let untested = matches!(f, MathInline::Imul | MathInline::Clz32)
+                            && int_math_tag_enabled();
                         for &m in margs.iter() {
-                            if !num.is_number_at(op_idx, m) {
+                            if !num.is_number_at(op_idx, m) && !untested {
                                 a.movabs_r11(QNAN as i64);
                                 a.load_rax(disp(m));
                                 a.and_rax_r11();
