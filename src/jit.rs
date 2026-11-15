@@ -3427,6 +3427,123 @@ fn drop_dead_stores(
     }
 }
 
+/// Whether a generic body compiles to nothing the `LoadConst`s and `Move`s
+/// whose value no path reads ([`dead_inits`]; `KATAAN_JIT_DEADINIT=0`
+/// keeps them). Read once per process.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn dead_init_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_DEADINIT").is_none_or(|v| v != "0"))
+}
+
+/// A body's backward register liveness, as `numeric::liveness` gives it:
+/// the words per pc and the live-in bitsets.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+type Liveness = (usize, Vec<u64>);
+
+/// The generic ops `ops` (lowered from `bytecode`) with a `Nop` for every
+/// `LoadConst` and `Move` lowered as the plain write it is whose
+/// destination (a register of at least `first`: below are the activation's
+/// inputs) is dead after it — every path on writes the register before it
+/// reads it, as the body's backward liveness (`numeric::liveness`, `catch`
+/// entries live out of every op, a sunk object's fields live wherever it is
+/// held) finds — or `None` when there is none (or the analysis is skipped).
+/// Also that first analysis (over `bytecode` itself), when it ran.
+/// That is mostly the `undefined` an inlined callee's `let`/`const`
+/// bindings start with, written on each call and overwritten before use.
+///
+/// Dropping them all at once is sound: on any path to a read, the last
+/// write before it is not one of them (one would have the register live
+/// after it). What else may look at a register is unaffected: an exit to
+/// the interpreter resumes at an op start, where a dead register is never
+/// read before written again; an inlined call's materialization reads only
+/// its arguments; and the collector roots any value a register holds (the
+/// stack never holds a handle to a collected object, see
+/// `prologue`'s docs), so the older value it keeps instead is harmless.
+/// The native entry's fill (`prologue::entry_fill`) sees the `Nop`s.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn dead_inits(
+    ops: &[GenericOp],
+    bytecode: &[crate::nbvm::Op],
+    n_regs: usize,
+    first: usize,
+) -> (Option<Vec<GenericOp>>, Option<Liveness>) {
+    use crate::nbvm::Op;
+    if !dead_init_enabled() || ops.len() != bytecode.len() {
+        return (None, None);
+    }
+    let candidate = |i: usize| -> Option<u16> {
+        let d = match (&ops[i], &bytecode[i]) {
+            (GenericOp::Const { dst, .. }, Op::LoadConst { dst: b, .. }) if dst == b => *dst,
+            (GenericOp::Move { dst, src }, Op::Move { dst: b, src: s })
+                if dst == b && src == s && dst != src =>
+            {
+                *dst
+            }
+            _ => return None,
+        };
+        (d as usize >= first && (d as usize) < n_regs && i + 1 < ops.len()).then_some(d)
+    };
+    if !(0..ops.len()).any(|i| candidate(i).is_some()) {
+        return (None, None);
+    }
+    let mut catches: Vec<usize> = ops
+        .iter()
+        .filter_map(|op| match *op {
+            GenericOp::PushHandler { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect();
+    catches.sort_unstable();
+    catches.dedup();
+    let Some((words, live)) = numeric::liveness(bytecode, n_regs, &catches) else {
+        return (None, None);
+    };
+    // (A register live at a `catch` entry is kept everywhere: an op that
+    // throws before it writes its destination reaches the handler with the
+    // value before it, which the analysis's kill at that op does not see.)
+    let mut at_catch = alloc::vec![0u64; words];
+    for &c in &catches {
+        for (w, x) in at_catch.iter_mut().enumerate() {
+            *x |= live.get(c * words + w).copied().unwrap_or(u64::MAX);
+        }
+    }
+    let mut out: Option<Vec<GenericOp>> = None;
+    let mut moves = Vec::new();
+    for (i, bc) in bytecode.iter().enumerate() {
+        let Some(d) = candidate(i) else { continue };
+        let Some(&after) = live.get((i + 1) * words + d as usize / 64) else {
+            continue;
+        };
+        if (after | at_catch[d as usize / 64]) & (1u64 << (d % 64)) == 0 {
+            out.get_or_insert_with(|| ops.to_vec())[i] = GenericOp::Nop;
+            if let Op::Move { src, .. } = *bc {
+                moves.push((i, src));
+            }
+        }
+    }
+    // A dropped `Move` reads its source no more: the `LoadConst` right
+    // before it of that source (a binding's `undefined`, `LoadConst t;
+    // Move x, t`) is dead too when the source is dead after the `Move` —
+    // the `LoadConst` flows only into it, its one reader.
+    let dead_after = |i: usize, r: u16| {
+        live.get((i + 1) * words + r as usize / 64)
+            .is_some_and(|&w| (w | at_catch[r as usize / 64]) & (1u64 << (r % 64)) == 0)
+    };
+    if let Some(o) = out.as_mut() {
+        for (i, src) in moves {
+            if i > 0
+                && candidate(i - 1) == Some(src)
+                && matches!(bytecode[i - 1], Op::LoadConst { .. })
+                && dead_after(i, src)
+            {
+                o[i - 1] = GenericOp::Nop;
+            }
+        }
+    }
+    (out, Some((words, live)))
+}
+
 /// Per op of a generic body: an allocation (or a binding cell's write)
 /// whose emission (`compile_generic`) has a fast path that makes no call —
 /// a free-list allocation, header and fields written inline — and whose
@@ -9398,6 +9515,18 @@ impl JitFunction {
         if ops.len() != bytecode.len() || n_regs > 0xffff {
             return None;
         }
+        // (The stores no path reads, as nothing: `dead_inits`.)
+        // (Its first analysis is the body's liveness, `body_live` below.)
+        let dead_owned;
+        let (dead, mut first_live) =
+            dead_inits(ops, bytecode, n_regs, (n_params + n_caps + 1).min(n_regs));
+        let ops: &[GenericOp] = match dead {
+            Some(v) => {
+                dead_owned = v;
+                &dead_owned
+            }
+            None => ops,
+        };
         let _ = numeric::set_leave_heads(bytecode, pc_orig);
         let add_helper = helpers.add as usize as u64;
         let get_site_helper = helpers.get_site as usize as u64;
@@ -9967,7 +10096,9 @@ impl JitFunction {
         // (`call_seq::InlineEmit::dst_dead`).
         // The body's backward register liveness (`numeric::liveness`), for
         // the dead stores below.
-        let body_live = numeric::liveness(bytecode, n_regs, &catch_targets);
+        let body_live = first_live
+            .take()
+            .or_else(|| numeric::liveness(bytecode, n_regs, &catch_targets));
         let guard_dst_dead: Vec<bool> = {
             let mut named: Vec<u32> = alloc::vec![0; n_regs];
             for op in bytecode {
