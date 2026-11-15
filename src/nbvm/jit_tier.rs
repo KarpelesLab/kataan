@@ -2987,7 +2987,13 @@ pub(super) fn call_compiled_with(
     if ctx.realm.multi_realm || ctx.call_depth == 0 {
         return None;
     }
-    let jit = direct_jit(ctx, proto, id)?;
+    // (A rest-parameter body has no native-call entry to enter: its call
+    // here binds the rest array as `call_with_inner` does.)
+    let rest = proto.rest_from;
+    let jit = match rest {
+        None => direct_jit(ctx, proto, id)?,
+        Some(fixed) => rest_direct_target(proto, fixed)?,
+    };
     // `call_with`'s recursion guard.
     if ctx.call_depth >= ctx.realm.limits.max_call_depth
         || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
@@ -3008,7 +3014,8 @@ pub(super) fn call_compiled_with(
         }
         ctx.frames_published += 1;
     }
-    if jit.native_entry().is_some()
+    if rest.is_none()
+        && jit.native_entry().is_some()
         && jit.n_regs() >= proto.n_regs
         && let Some(caps) = ctx
             .realm
@@ -3050,12 +3057,30 @@ pub(super) fn call_compiled_with(
     // The callee's register file: parameters, captures, `this` (undefined).
     let mut cregs: alloc::vec::Vec<NanBox> = ctx.realm.vm_reg_pool.pop().unwrap_or_default();
     cregs.resize(proto.n_regs, NanBox::undefined());
-    for (slot, a) in cregs.iter_mut().zip(
-        ctx.realm.vm_args_buf[args_mark..]
-            .iter()
-            .take(proto.n_params),
-    ) {
-        *slot = *a;
+    let mut rest_arr = None;
+    match rest {
+        None => {
+            for (slot, a) in cregs.iter_mut().zip(
+                ctx.realm.vm_args_buf[args_mark..]
+                    .iter()
+                    .take(proto.n_params),
+            ) {
+                *slot = *a;
+            }
+        }
+        // The fixed parameters, then the rest of the arguments as an array
+        // in register `fixed` (`call_with_inner`'s binding).
+        Some(fixed) => {
+            for (slot, a) in cregs.iter_mut().zip(args.iter().take(fixed)) {
+                *slot = *a;
+            }
+            let arr = ctx
+                .realm
+                .new_array(args.get(fixed..).unwrap_or(&[]).to_vec());
+            let arr = NanBox::handle(arr.to_raw());
+            cregs[fixed] = arr;
+            rest_arr = Some(arr);
+        }
     }
     if let Some((_, caps)) = ctx.realm.vm_function(handle) {
         for (i, c) in caps.iter().enumerate().take(proto.n_captures) {
@@ -3073,6 +3098,7 @@ pub(super) fn call_compiled_with(
             ctx.frame_shadow.extend_from_slice(caps);
         }
         ctx.frame_shadow.push(this);
+        ctx.frame_shadow.extend(rest_arr);
     }
     proto.tier.bump();
     let outcome = run_compiled_fresh(ctx, funcs, &jit, &mut cregs);
@@ -5555,6 +5581,41 @@ fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
         Some(Some(_)) => generic_twin(proto),
         _ => None,
     }
+}
+
+/// [`direct_target`] for a body with a rest parameter after `fixed` others
+/// (`KATAAN_JIT_REST_DIRECT=0`: none): [`call_compiled_with`] runs it on a
+/// fresh register file, never through a native-call entry or a compiled
+/// call sequence (so it is not cached in `TierRuntime::direct`, which arms
+/// those).
+fn rest_direct_target(proto: &FnProto, fixed: usize) -> Option<Rc<crate::jit::JitProto>> {
+    if !rest_direct_on()
+        || proto.n_params != fixed + 1
+        || proto.class_ctor
+        || proto.is_async
+        || proto.is_generator
+        || proto
+            .ops
+            .iter()
+            .take(2)
+            .any(|o| matches!(o, Op::MakeArguments { .. }))
+        || !call_is_hot(proto.tier.has_body())
+    {
+        return None;
+    }
+    match proto.tier.jit() {
+        Some(Some(j)) if j.is_generic() => Some(j),
+        Some(Some(_)) => generic_twin(proto),
+        _ => None,
+    }
+}
+
+/// Whether a compiled caller's call of a rest-parameter function enters its
+/// compiled body directly ([`rest_direct_target`]; `KATAAN_JIT_REST_DIRECT=0`
+/// turns it off, read once per process).
+fn rest_direct_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_REST_DIRECT").is_none_or(|v| v != "0"))
 }
 
 /// The generic-tier body compiled callers enter for a function whose own
