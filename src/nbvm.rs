@@ -738,6 +738,12 @@ pub enum Op {
         /// which `RegExp.prototype.source` must reproduce exactly.
         source: Vec<u8>,
         flags: String,
+        /// The literal is the first argument of the method call that is the
+        /// very next op (`s.replace(/re/g, f)`, `s.match(/re/)`), and only
+        /// that call reads `dst`: the object may be one an earlier run of
+        /// such a site left unobserved (`Realm::new_regexp_literal`).
+        /// Never serialized (a decoded op has `false`).
+        lend: bool,
     },
     /// `dst = a new empty object` (allocated in the realm's heap).
     NewObject { dst: Reg },
@@ -11699,15 +11705,21 @@ fn run_frame_at_ic(
                     .unwrap_or_default();
                 regs[*dst as usize] = NanBox::handle(ctx.realm.new_array(rest).to_raw());
             }
-            Op::NewRegExp { dst, source, flags } => {
-                regs[*dst as usize] = if let Some(h) = ctx.realm.new_regexp_literal(source, flags) {
-                    NanBox::handle(h.to_raw())
-                } else {
-                    match with_host(ctx, |h| h.new_regexp(source, flags)) {
-                        Some(v) => v,
-                        None => NanBox::handle(ctx.realm.new_regexp(source, flags).to_raw()),
-                    }
-                };
+            Op::NewRegExp {
+                dst,
+                source,
+                flags,
+                lend,
+            } => {
+                regs[*dst as usize] =
+                    if let Some(h) = ctx.realm.new_regexp_literal(source, flags, *lend) {
+                        NanBox::handle(h.to_raw())
+                    } else {
+                        match with_host(ctx, |h| h.new_regexp(source, flags)) {
+                            Some(v) => v,
+                            None => NanBox::handle(ctx.realm.new_regexp(source, flags).to_raw()),
+                        }
+                    };
             }
             Op::NewObject { dst } => {
                 let handle = ctx.realm.new_object();
@@ -15998,6 +16010,38 @@ fn num_switch_keys(cases: &[crate::ast::SwitchCase]) -> Option<Vec<(f64, u32)>> 
         tests.push((num_switch::static_number(test)?, u32::try_from(i).ok()?));
     }
     (tests.len() >= SWITCH_NUM_MIN).then(|| num_switch::switch_keys(&tests))
+}
+
+/// Whether a method call `recv.key(arguments)` makes its regular expression
+/// literal first argument with a lending [`Op::NewRegExp`]
+/// (`Compiler::call_args_lend`): `replace` or `match`, at most two
+/// arguments, no spread (`KATAAN_REGEXP_LEND=0` never does).
+fn regexp_lend_site(key: &str, arguments: &[crate::ast::Argument]) -> bool {
+    matches!(key, "replace" | "match")
+        && arguments.len() <= 2
+        && matches!(
+            arguments.first(),
+            Some(crate::ast::Argument::Item(Expr::Regex { .. }))
+        )
+        && arguments
+            .iter()
+            .all(|a| matches!(a, crate::ast::Argument::Item(_)))
+        && regexp_lend_on()
+}
+
+/// Whether regular expression literals passed straight to `replace` /
+/// `match` may reuse an object an earlier call left unobserved
+/// (`KATAAN_REGEXP_LEND=0` turns it off; read once per process).
+pub(crate) fn regexp_lend_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_REGEXP_LEND").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 fn args_may_assign(arguments: &[crate::ast::Argument]) -> bool {
@@ -23359,7 +23403,11 @@ impl Compiler {
                     if self.hosted && !self.args_pure(arguments) {
                         return self.method_call_ordered(recv, key, None, arguments, tail);
                     }
-                    let args = self.call_args(arguments)?;
+                    let args = if !tail && self.hosted && regexp_lend_site(key, arguments) {
+                        self.call_args_lend(arguments)?
+                    } else {
+                        self.call_args(arguments)?
+                    };
                     if tail {
                         self.ops.push(Op::TailMethodGuard {
                             recv,
@@ -23960,6 +24008,7 @@ impl Compiler {
                     dst,
                     source: pattern.to_vec(),
                     flags: String::from(&**flags),
+                    lend: false,
                 });
                 Ok(dst)
             }
@@ -24241,6 +24290,7 @@ impl Compiler {
                             dst,
                             source: source.into_bytes(),
                             flags,
+                            lend: false,
                         });
                         return Ok(dst);
                     }
@@ -24710,6 +24760,41 @@ impl Compiler {
             let r = self.pin_operand(r, args_may_assign(&arguments[i + 1..]));
             args.push(r);
         }
+        Ok(args)
+    }
+
+    /// [`call_args`](Self::call_args) of a call whose first argument is a
+    /// regular expression literal ([`regexp_lend_site`]): the literal's
+    /// object is made last, by the op right before the call (it runs no code
+    /// and cannot throw, so no program can tell when it was made), into a
+    /// register nothing else reads — an [`Op::NewRegExp`] that may lend an
+    /// object an earlier such call left unobserved.
+    fn call_args_lend(
+        &mut self,
+        arguments: &[crate::ast::Argument],
+    ) -> Result<Vec<Reg>, CompileError> {
+        let Some(crate::ast::Argument::Item(Expr::Regex { pattern, flags, .. })) =
+            arguments.first()
+        else {
+            return self.call_args(arguments);
+        };
+        let re = self.alloc();
+        let mut args = Vec::with_capacity(arguments.len());
+        args.push(re);
+        for (i, a) in arguments.iter().enumerate().skip(1) {
+            let crate::ast::Argument::Item(e) = a else {
+                return Err(CompileError::Unsupported("spread argument"));
+            };
+            let r = self.expr(e)?;
+            let r = self.pin_operand(r, args_may_assign(&arguments[i + 1..]));
+            args.push(r);
+        }
+        self.ops.push(Op::NewRegExp {
+            dst: re,
+            source: pattern.to_vec(),
+            flags: String::from(&**flags),
+            lend: true,
+        });
         Ok(args)
     }
 

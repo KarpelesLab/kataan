@@ -1272,7 +1272,11 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_bytes(bytes, out);
         }
-        Op::NewRegExp { dst, source, flags } => {
+        // (`lend` is a compiler hint about the op after it, never
+        // serialized: a decoded op is an ordinary literal.)
+        Op::NewRegExp {
+            dst, source, flags, ..
+        } => {
             w_u8(38, out);
             w_reg(*dst, out);
             w_bytes(source, out);
@@ -2322,6 +2326,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             dst: r.reg()?,
             source: r.byte_string()?,
             flags: r.string()?,
+            lend: false,
         },
         39 => Op::NewObject { dst: r.reg()? },
         40 => Op::SetProp {

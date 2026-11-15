@@ -86,6 +86,8 @@ use crate::rope::Rope;
 
 /// How many regex literal (source, flags) pairs `Realm::new_regexp` shares.
 const REGEXP_LITERAL_MEMOS: usize = 4;
+/// How many unobserved RegExp cells `Realm::regexp_lend_pool` keeps.
+const REGEXP_LEND_POOL: usize = 4;
 
 /// One `Realm::regexp_literal_memo` entry: a literal's source, its flags and
 /// the program they compile to once known.
@@ -559,6 +561,14 @@ pub struct Realm {
     regexp_literal_memo: [Option<RegexpLiteralMemo>; REGEXP_LITERAL_MEMOS],
     /// The entry of `regexp_literal_memo` the next new pair replaces.
     regexp_literal_next: usize,
+    /// RegExp cells a lending literal ([`new_regexp_literal`]'s `lend`) may
+    /// take instead of a new one: each made by such a literal and handed
+    /// back by the one call that read it once that call ran as the
+    /// one-step algorithm over a pristine RegExp, which exposes the object
+    /// to nothing ([`regexp_lend_return`](Realm::regexp_lend_return)), so
+    /// no program holds it. Emptied by every collection and cell swap (a
+    /// cell only the dead register of its call held may be swept).
+    regexp_lend_pool: [Option<Handle>; REGEXP_LEND_POOL],
     /// The `[[Prototype]]` of a Promise cell that carries no `native_protos`
     /// entry, as [`regexp_default_proto`](Realm::regexp_default_proto) is a
     /// RegExp's (see [`link_promise_proto`](Realm::link_promise_proto)).
@@ -1251,6 +1261,7 @@ impl Realm {
             regexp_literal_plain: false,
             regexp_literal_memo: [const { None }; REGEXP_LITERAL_MEMOS],
             regexp_literal_next: 0,
+            regexp_lend_pool: [None; REGEXP_LEND_POOL],
             promise_default_proto: None,
             coll_default: [None; 2],
             hidden_memo: [const { None }; HIDDEN_MEMOS],
@@ -3054,6 +3065,24 @@ impl Realm {
     #[must_use]
     pub fn string_rope(&self, handle: Handle) -> Option<Rope> {
         self.heap.get(handle)?.as_str().cloned()
+    }
+
+    /// The rope of the string at `handle` when it is already flat (a leaf)
+    /// and `typeof` it is `"string"` — one cell lookup; `None` otherwise
+    /// (the caller then takes the general steps: flattening, the
+    /// function-marker check).
+    #[inline]
+    pub(crate) fn flat_plain_string_rope(&self, handle: Handle) -> Option<Rope> {
+        match self.heap.get_hot(handle) {
+            Some(Cell::Str(r))
+                if r.as_leaf_bytes().is_some()
+                    && !self.str_special
+                    && builtins_fast::str_plain_on() =>
+            {
+                Some(r.clone())
+            }
+            _ => None,
+        }
     }
 
     /// The UTF-16 code-unit length of the string at `handle` — JavaScript's
@@ -5281,9 +5310,85 @@ impl Realm {
     /// `new_regexp` makes once [`regexp_literal_plain`](Realm::regexp_literal_plain)
     /// holds in a single-realm run (`KATAAN_REGEXP_LIT=0` never does). `None`
     /// otherwise.
-    pub(crate) fn new_regexp_literal(&mut self, source: &[u8], flags: &str) -> Option<Handle> {
-        (self.regexp_literal_plain && !self.multi_realm && regexp_lit_on())
-            .then(|| self.new_regexp(source, flags))
+    ///
+    /// With `lend` (the literal is the first argument of the call right
+    /// after it, which alone reads it: `nbvm::Op::NewRegExp`), a RegExp of
+    /// that source and flags in the lending pool (see
+    /// [`regexp_lend_return`](Realm::regexp_lend_return)) is taken instead,
+    /// its `lastIndex` reset: an object no program can reach is
+    /// indistinguishable from a new one.
+    pub(crate) fn new_regexp_literal(
+        &mut self,
+        source: &[u8],
+        flags: &str,
+        lend: bool,
+    ) -> Option<Handle> {
+        if !(self.regexp_literal_plain && !self.multi_realm && regexp_lit_on()) {
+            return None;
+        }
+        if lend && let Some(h) = self.regexp_lend_take(source, flags) {
+            return Some(h);
+        }
+        Some(self.new_regexp(source, flags))
+    }
+
+    /// A RegExp of `source` and `flags` from the lending pool, `lastIndex`
+    /// 0, or `None`.
+    fn regexp_lend_take(&mut self, source: &[u8], flags: &str) -> Option<Handle> {
+        let Self {
+            regexp_lend_pool,
+            heap,
+            ..
+        } = self;
+        for slot in regexp_lend_pool.iter_mut() {
+            let Some(h) = *slot else {
+                continue;
+            };
+            if let Some(Cell::RegExp {
+                source: s,
+                flags: f,
+                last_index,
+                ..
+            }) = heap.get_mut(h)
+                && **s == *source
+                && **f == *flags
+            {
+                *last_index = 0;
+                *slot = None;
+                return Some(h);
+            }
+        }
+        None
+    }
+
+    /// Hands the RegExp `re` back to the lending pool: a lending literal's
+    /// object (`nbvm::Op::NewRegExp`'s `lend`) after the one call that read
+    /// it ran as the one-step algorithm over a pristine RegExp, which hands
+    /// the object to no code and leaves it owning no property — so nothing
+    /// holds it but that call's dead argument register. (Taking it again
+    /// resets its `lastIndex`.) A full pool keeps what it has.
+    pub(crate) fn regexp_lend_return(&mut self, re: NanBox) {
+        let Some(raw) = re.as_handle() else {
+            return;
+        };
+        let h = Handle::from_raw(raw);
+        // (Not while an interleaved collection marks: a pooled cell taken
+        // again would be a reachable object its marker never saw.)
+        if !matches!(self.heap.get(h), Some(Cell::RegExp { .. }))
+            || self.incremental.is_some()
+            || self.aux_props.contains_key(&raw)
+            || self.regexp_lend_pool.contains(&Some(h))
+        {
+            return;
+        }
+        if let Some(slot) = self.regexp_lend_pool.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(h);
+        }
+    }
+
+    /// Empties the lending pool (before a collection or a cell swap).
+    fn regexp_lend_clear(&mut self) {
+        self.regexp_lend_pool = [None; REGEXP_LEND_POOL];
     }
 
     /// Records that the host linked a regex literal to `proto` (see
@@ -6179,6 +6284,7 @@ impl Realm {
         }
         self.heap.swap(a, b);
         self.cell_swaps = self.cell_swaps.wrapping_add(1);
+        self.regexp_lend_clear();
         // A watched object may have moved: retire every validated chain.
         crate::object::bump_proto_epoch();
         let (ka, kb) = (a.to_raw(), b.to_raw());
@@ -9544,6 +9650,7 @@ impl Realm {
         extern_expand: &mut dyn FnMut(&dyn gc::LiveSet, &mut Vec<Handle>),
         extern_prune: &mut dyn FnMut(&dyn gc::LiveSet),
     ) -> Stats {
+        self.regexp_lend_clear();
         let Self {
             heap,
             aux_props,
@@ -9636,6 +9743,7 @@ impl Realm {
         extern_expand: &mut dyn FnMut(&dyn gc::LiveSet, &mut Vec<Handle>),
         extern_prune: &mut dyn FnMut(&dyn gc::LiveSet),
     ) -> Stats {
+        self.regexp_lend_clear();
         let Self {
             heap,
             aux_props,
@@ -9817,6 +9925,7 @@ impl Realm {
     /// the slot table), and rewrites every reference — including the caller's
     /// `roots`, updated in place — to the new locations. Returns the statistics.
     pub fn compact(&mut self, roots: &mut [Handle]) -> Stats {
+        self.regexp_lend_clear();
         let n = roots.len();
         // Handles move: retire every validated chain (and the watched cell
         // set, keyed by handle; a cache re-watches on its next fill).
@@ -10012,6 +10121,7 @@ impl Realm {
     /// step-based [`IncrementalMarker`](gc::IncrementalMarker) is what lets the
     /// pause be bounded / interleaved with execution.
     pub fn collect_incremental(&mut self, roots: &[Handle], step_budget: usize) -> Stats {
+        self.regexp_lend_clear();
         let before = self.heap.len();
         let mut marker = gc::IncrementalMarker::new(roots);
         while !marker.step(&self.heap, step_budget.max(1)) {}
@@ -10029,6 +10139,7 @@ impl Realm {
     /// [`incremental_step`](Realm::incremental_step) and
     /// [`incremental_finish`](Realm::incremental_finish).
     pub fn incremental_start(&mut self, roots: &[Handle]) {
+        self.regexp_lend_clear();
         self.incremental = Some(gc::IncrementalMarker::new(roots));
         self.jit_marking = true;
     }

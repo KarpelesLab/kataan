@@ -632,6 +632,12 @@ fn int_arg(v: NanBox) -> Option<Option<f64>> {
 
 /// A string receiver, flattened, as its rope (one leaf).
 fn str_parts(realm: &mut Realm, h: Handle) -> Option<crate::rope::Rope> {
+    // A flat plain string (the common case): its rope, in one lookup.
+    if str_parts_lean_on()
+        && let Some(rope) = realm.flat_plain_string_rope(h)
+    {
+        return Some(rope);
+    }
     // A string cell with a function marker is a function, not a string.
     if !realm.typeof_is_string(h) {
         return None;
@@ -640,6 +646,21 @@ fn str_parts(realm: &mut Realm, h: Handle) -> Option<crate::rope::Rope> {
     let rope = realm.string_rope(h)?;
     rope.as_leaf_bytes()?;
     Some(rope)
+}
+
+/// Whether [`str_parts`] serves a flat plain string in one cell lookup
+/// (`KATAAN_STR_PARTS_LEAN=0` takes the general steps; read once per
+/// process).
+fn str_parts_lean_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_STR_PARTS_LEAN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// A string argument, flattened (`ToString` is then the identity).
@@ -1005,7 +1026,8 @@ pub(super) fn str_call(
     method: u64,
     code: u8,
 ) -> Option<Result<NanBox, VmError>> {
-    let op = str_call_op(code)?;
+    let lent = code & STR_CALL_LENT != 0;
+    let op = str_call_op(code & !STR_CALL_LENT)?;
     let h = Handle::from_raw(recv.as_handle()?);
     if ctx.host.is_none() || ctx.realm.multi_realm || args.len() > 2 {
         return None;
@@ -1014,10 +1036,45 @@ pub(super) fn str_call(
         && super::str_replace::lean_on()
         && let Some(r) = super::str_replace::try_lean(ctx, funcs, regs, recv, h, args)
     {
+        // The one-step algorithm ran: a lending literal's object reached
+        // no code (see `STR_CALL_LENT`).
+        if lent && r.is_ok() {
+            ctx.realm.regexp_lend_return(regs[args[0] as usize]);
+        }
         return Some(r);
+    }
+    // `s.match(/re/)` of a lending literal: the one-step match first (as
+    // `run_op`'s), so its object goes back to the pool when it ran.
+    if lent
+        && matches!(op, FastOp::StrMatch)
+        && let [a] = *args
+        && ctx.realm.is_string_handle(h)
+        && ctx.realm.typeof_is_string(h)
+    {
+        let rx = regs[a as usize];
+        if rx
+            .as_handle()
+            .is_some_and(|r| ctx.realm.regexp_flags(Handle::from_raw(r)).is_some())
+            && let Some(Some(r)) = with_host(ctx, |host| host.string_match(recv, rx))
+        {
+            if r.is_ok() {
+                ctx.realm.regexp_lend_return(rx);
+            }
+            return Some(r.map_err(VmError::from));
+        }
     }
     run_op(ctx, funcs, op, method, recv, h, false, regs, args)
 }
+
+/// The flag of a [`str_call`] code for a call whose first argument the op
+/// right before it made with a lending regular expression literal
+/// (`Op::NewRegExp`'s `lend`) and which nothing else enters (compiled code
+/// proves that): once the call ran as the one-step algorithm over a
+/// pristine RegExp — which hands the object to no code and gives it no
+/// property — nothing can reach it, and it goes back to the realm's lending
+/// pool (`Realm::regexp_lend_return`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) const STR_CALL_LENT: u8 = 0x80;
 
 /// What compiled code's inline `a.shift()` relies on, for `site`: as
 /// [`prove_array_push`], of the built-in `shift`.
@@ -2218,6 +2275,13 @@ fn run_op(
             let bytes = rope.as_leaf_bytes()?;
             let n = sep_b.len();
             let lean = ascii_case_enabled();
+            // A one-byte separator the text does not hold: the receiver as
+            // the one piece, found by one scan (no piece list).
+            if lean && n == 1 && str_parts_lean_on() && !bytes.contains(&sep_b[0]) {
+                return Some(Ok(NanBox::handle(
+                    realm.new_array(alloc::vec![recv]).to_raw(),
+                )));
+            }
             let mut parts = if lean {
                 alloc::vec::Vec::with_capacity(4)
             } else {

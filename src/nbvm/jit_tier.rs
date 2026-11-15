@@ -2186,8 +2186,13 @@ pub(crate) extern "C" fn jit_helper_new_array(
             (*dst, alloc::vec![NanBox::undefined(); *len])
         }
         // A regular expression literal's new object: the interpreter arm.
-        Op::NewRegExp { dst, source, flags } => {
-            if let Some(h) = cx.realm.new_regexp_literal(source, flags) {
+        Op::NewRegExp {
+            dst,
+            source,
+            flags,
+            lend,
+        } => {
+            if let Some(h) = cx.realm.new_regexp_literal(source, flags, *lend) {
                 file[*dst as usize] = NanBox::handle(h.to_raw());
                 return 0;
             }
@@ -2444,6 +2449,15 @@ pub(crate) extern "C" fn jit_helper_typeof_test(
 fn direct_define_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_DIRECT_DEFINE").is_none_or(|v| v != "0"))
+}
+
+/// Whether compiled code's `Op::CallValue` slow path answers a conversion
+/// built-in's call of plain primitives (`String(s)`, `Number(x)`, …) before
+/// any call machinery (`KATAAN_JIT_CONV_CALL=0` turns it off, read once per
+/// process).
+fn conv_call_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONV_CALL").is_none_or(|v| v != "0"))
 }
 
 pub(crate) extern "C" fn jit_helper_exec_op(
@@ -4481,6 +4495,34 @@ pub(crate) extern "C" fn jit_helper_call_value(
         // SAFETY: the activation's register file, live and unaliased here.
         #[allow(unsafe_code)]
         let callee_val = unsafe { *regs_raw.add(*callee as usize) };
+        // `String(x)`, `Number(x)`, `parseInt(s)`, … of plain primitives:
+        // the conversion built-in's answer straight away — exactly what the
+        // one-op interpreter's arm below ends in for a native callee (it
+        // first tries a compiled or VM closure, which a native is not), with
+        // no call machinery around it.
+        if args.len() <= 2
+            && ctx.host.is_some()
+            && conv_call_on()
+            && let Some(h) = NanBox::from_bits(callee_val).as_handle()
+            && ctx.realm.native_at(Handle::from_raw(h)).is_some()
+        {
+            // SAFETY: as `jit_helper_exec_op`'s register file.
+            #[allow(unsafe_code)]
+            let regs =
+                unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
+            let mut argv = [NanBox::undefined(); 2];
+            for (slot, r) in argv.iter_mut().zip(args) {
+                *slot = regs[*r as usize];
+            }
+            if let Some(v) = super::native_call::try_call_value(
+                &mut ctx.realm,
+                NanBox::from_bits(callee_val),
+                &argv[..args.len()],
+            ) {
+                regs[*dst as usize] = v;
+                return 0;
+            }
+        }
         // SAFETY: the site's own cache (see the function contract).
         #[allow(unsafe_code)]
         let site = unsafe { &mut *site.cast::<CallSite>() };

@@ -10236,6 +10236,35 @@ impl JitFunction {
                 })
                 .collect()
         };
+        // The `s.replace(/re/, …)` / `s.match(/re/)` calls whose first
+        // argument the op right before them made with a lending literal
+        // (`Op::NewRegExp`'s `lend`) and which nothing else enters: their
+        // direct string call hands the object back to the realm's lending
+        // pool once the one-step algorithm ran (`native_call::str_call`).
+        let regexp_lent: Vec<bool> = {
+            let bt = recv_cache::branch_targets(ops, osr_entries, &catch_targets);
+            (0..ops.len())
+                .map(|i| {
+                    i > 0
+                        && !bt[i]
+                        && !num.in_region(i)
+                        && !num.in_region(i - 1)
+                        && match (bytecode.get(i - 1), bytecode.get(i)) {
+                            (
+                                Some(crate::nbvm::Op::NewRegExp {
+                                    dst, lend: true, ..
+                                }),
+                                Some(crate::nbvm::Op::CallMethod { key, args, .. }),
+                            ) => {
+                                matches!(key.as_str(), "replace" | "match")
+                                    && args.first() == Some(dst)
+                                    && !args[1..].contains(dst)
+                            }
+                            _ => false,
+                        }
+                })
+                .collect()
+        };
         let fused_test: Vec<bool> = fused_test
             .iter()
             .zip(&forin_fuse)
@@ -13685,7 +13714,13 @@ impl JitFunction {
                         a.movabs_argreg(2, n_regs as i64);
                         a.movabs_argreg(3, op_ptr as i64);
                         a.movabs_argreg(4, si.method_ptr as i64);
-                        a.movabs_argreg(5, i64::from(code));
+                        // (The lending flag: see `regexp_lent`.)
+                        let lent = if regexp_lent.get(op_idx) == Some(&true) {
+                            crate::nbvm::native_call::STR_CALL_LENT
+                        } else {
+                            0
+                        };
+                        a.movabs_argreg(5, i64::from(code | lent));
                         a.movabs_rax(helpers.str_call as usize as i64);
                         a.call_rax();
                         a.test_rax_rax();
