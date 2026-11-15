@@ -14612,6 +14612,30 @@ impl JitFunction {
                                     }
                                 }};
                             }
+                            // `r8` = the step's index + 1 (`rax` the index,
+                            // kept), before the element's load: one `lea`
+                            // (`KATAAN_JIT_ITERCONST`) rather than a copy now
+                            // and an increment after; then `xmm0` = it as
+                            // a Number.
+                            macro_rules! iter_next_index {
+                                () => {{
+                                    if iter_const_enabled() {
+                                        a.raw(&[0x4c, 0x8d, 0x40, 0x01]); // lea r8, [rax + 1]
+                                    } else {
+                                        a.mov_r8_rax();
+                                    }
+                                }};
+                            }
+                            macro_rules! iter_cursor_xmm0 {
+                                () => {{
+                                    if iter_const_enabled() {
+                                        a.raw(&[0x0f, 0x57, 0xc0]); // xorps xmm0, xmm0
+                                        a.raw(&[0xf2, 0x49, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0, r8
+                                    } else {
+                                        numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                    }
+                                }};
+                            }
                             // A speculative loop's hoisted step
                             // (`NumGen::iter_hoisted`): its entry proved
                             // `done` not `true`, and the array is the
@@ -14637,12 +14661,12 @@ impl JitFunction {
                                 a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, s.len);
                                 a.jae(end);
                                 a.g_load(call_seq::r::R11, call_seq::r::RBP, s.base);
-                                a.mov_r8_rax();
+                                iter_next_index!();
                                 a.mov_rax_at_r11_rax8();
                                 a.cmp_rax_const(NanBox::hole().to_bits());
                                 a.je(slow);
                                 a.store_rax(disp(dst));
-                                numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                iter_cursor_xmm0!();
                                 if let Some(c) = cur {
                                     a.g_store(call_seq::r::RBP, c, call_seq::r::R8);
                                 }
@@ -14687,7 +14711,7 @@ impl JitFunction {
                                 a.cmp_rax_r8();
                                 let end = a.new_label();
                                 a.jae(end);
-                                a.mov_r8_rax();
+                                iter_next_index!();
                                 a.mov_rax_at_r11_rax8();
                                 iter_cmp_const!(NanBox::hole().to_bits());
                                 a.je(slow);
@@ -14695,7 +14719,7 @@ impl JitFunction {
                                 // cursor = index + 1 (an exact Number below the
                                 // array's length), in the register and the
                                 // shadow.
-                                numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                iter_cursor_xmm0!();
                                 a.g_store(R::RBP, sh_int, R::R8);
                                 a.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
                                 a.store_rax(disp(iter));
@@ -14764,14 +14788,14 @@ impl JitFunction {
                                 a.cmp_rax_r8();
                                 let end = a.new_label();
                                 a.jae(end);
-                                a.mov_r8_rax();
+                                iter_next_index!();
                                 a.mov_rax_at_r11_rax8();
                                 iter_cmp_const!(NanBox::hole().to_bits());
                                 a.je(slow);
                                 a.store_rax(disp(dst));
                                 // cursor = index + 1 (an exact Number: below the
                                 // array's length).
-                                numeric::NumGen::inc_r8_to_xmm0(&mut a);
+                                iter_cursor_xmm0!();
                                 a.movsd_mem_xmm0(disp(iter));
                                 // Straight into the loop body when the `!done`
                                 // test after the step is known to pass.
