@@ -7654,8 +7654,13 @@ fn vm_get_prop(
         // An Array's `length` is an own data property (never an accessor, and
         // not configurable, so it cannot be redefined as one) whose value is
         // the realm's array length: what the host's `[[Get]]` reads too.
+        // (Likewise a string's: an own, non-configurable property nothing can
+        // intercept — a `.length` site compiled as a named read sees these.)
         if key == "length"
-            && let Some(n) = ctx.realm.plain_array_length(h)
+            && let Some(n) = ctx
+                .realm
+                .plain_array_length(h)
+                .or_else(|| ctx.realm.string_utf16_len(h))
         {
             return Ok(NanBox::number(n as f64));
         }
@@ -8446,7 +8451,7 @@ pub(crate) extern "C" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv:
     {
         ctx.realm.jit_typed_len_refresh();
     }
-    match vm_array_len(ctx, funcs, NanBox::from_bits(recv)) {
+    match vm_array_len(ctx, funcs, NanBox::from_bits(recv), None) {
         Ok(v) => v.to_bits(),
         Err(e) => {
             ctx.jit_pending_fault = Some(e);
@@ -11545,7 +11550,8 @@ fn run_frame_at_ic(
                 // Shared with the generic-JIT helper via `vm_array_len` (`.length`
                 // on an array / string / VM function, or an explicit `length` data
                 // property), so the two tiers can never diverge.
-                match vm_array_len(ctx, funcs, regs[*arr as usize]) {
+                let recv = regs[*arr as usize];
+                match vm_array_len(ctx, funcs, recv, Some(site_cache!(site))) {
                     Ok(v) => regs[*dst as usize] = v,
                     Err(e) => handle_throw!(e),
                 }
@@ -13053,7 +13059,17 @@ fn vm_set_elem(
 /// parameter count (from its proto), an array's length or a string's UTF-16
 /// code-unit count, else an explicit `length` data property (e.g. a regex match
 /// result). `Err(NotAnObject)` when `recv` is not a heap object.
-fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox, VmError> {
+///
+/// `site` is the interpreter's own cache for the op (`None` from compiled
+/// code): an ordinary object's `length` read through it leaves the site the
+/// memo (and getter feedback) a named read's would, which the machine-code
+/// tier compiles such a site from (as a named read, `jit::length_get`).
+fn vm_array_len(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    recv: NanBox,
+    site: Option<&mut PropertyCache>,
+) -> Result<NanBox, VmError> {
     // An unchanged `arguments` object's own `length`.
     if let Some(h) = recv.as_handle()
         && let Some(v) = ctx.realm.arguments_own_get(Handle::from_raw(h), None)
@@ -13112,6 +13128,9 @@ fn vm_array_len(ctx: &mut Ctx, funcs: &[FnProto], recv: NanBox) -> Result<NanBox
                 &mut PropertyCache::default(),
                 None,
             );
+        }
+        if let Some(cache) = site {
+            return vm_get_prop(ctx, funcs, recv, "length", cache, None);
         }
         let mut cache = ctx.realm.len_cache.take().unwrap_or_default();
         let r = vm_get_prop(ctx, funcs, recv, "length", &mut cache, None);

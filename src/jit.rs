@@ -1928,6 +1928,59 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
     Some(out)
 }
 
+/// Whether a `.length` read (`Op::ArrayLen`) whose interpreted runs saw an
+/// ordinary object compiles as the named read it is (`KATAAN_JIT_LENGTH_GET=0`:
+/// no, it keeps the array-length helper's uncached `[[Get]]`).
+#[must_use]
+pub(crate) fn length_get_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LENGTH_GET").is_none_or(|v| v != "0"))
+}
+
+/// `proto` with each `.length` read whose site saw an ordinary object while
+/// interpreted as an `Op::GetProp` of `"length"`, so it compiles with a named
+/// read's inline cache, accessor memo and getter inlining: a site whose
+/// interpreter cache holds an own-slot memo (`warm`) or a getter to inline
+/// (`pick`) — only an ordinary object's `length`, read through the site,
+/// leaves either. `None` when there is no such site. Over any receiver the
+/// two are the same `[[Get]]` (hosted: an array's, string's and typed
+/// array's `length` are what `vm_get_prop` reads too); unhosted code leaves
+/// no feedback.
+fn length_get_sites<'a>(
+    proto: &crate::nbvm::FnProto,
+    warm: &[Option<crate::ic::WarmEntry>],
+    pick: &dyn Fn(usize, &crate::nbvm::Op) -> Vec<inline::Candidate<'a>>,
+) -> Option<crate::nbvm::FnProto> {
+    use crate::nbvm::Op;
+    if !length_get_enabled() {
+        return None;
+    }
+    let sites: Vec<usize> = proto
+        .ops
+        .iter()
+        .enumerate()
+        .filter(|&(pc, op)| {
+            matches!(op, Op::ArrayLen { .. })
+                && (warm.get(pc).is_some_and(Option::is_some) || !pick(pc, op).is_empty())
+        })
+        .map(|(pc, _)| pc)
+        .collect();
+    if sites.is_empty() {
+        return None;
+    }
+    let mut p = proto.clone();
+    for pc in sites {
+        if let Op::ArrayLen { dst, arr } = p.ops[pc] {
+            p.ops[pc] = Op::GetProp {
+                dst,
+                obj: arr,
+                key: alloc::string::String::from("length"),
+            };
+        }
+    }
+    Some(p)
+}
+
 /// A single op in the **generic (NanBox) tier** IR. Unlike the Int/Float tiers
 /// (which unbox to machine `i64`/`f64` at the boundary and deopt on any
 /// non-numeric argument), the generic tier operates directly on `NanBox` words
@@ -4817,6 +4870,17 @@ impl JitProto {
         let resume_pcs = generator_resume_pcs(proto);
         // Deoptimization exits (`deopt`): never in a body that suspends.
         let can_deopt = !proto.is_async && !proto.is_generator && deopt::stress();
+        // (The function itself, by its address, before any rewrite below.)
+        let orig = proto;
+        let own_proto: *const crate::nbvm::FnProto = orig;
+        let as_named_len;
+        let proto = match length_get_sites(proto, warm, pick) {
+            Some(p) => {
+                as_named_len = p;
+                &as_named_len
+            }
+            None => proto,
+        };
         let expanded = inline::expand(proto, warm, pick);
         let spliced;
         // The inlined derived class constructors' keys (`InlineEmit::derived`).
@@ -4835,10 +4899,9 @@ impl JitProto {
         // The function itself (the hints are noted by its address), and its
         // element access sites' feedback with the inlined callees', by the
         // body's pc (`typed::activate_site_kinds`).
-        let own_proto: *const crate::nbvm::FnProto = proto;
         let own_kinds = typed::merge_kinds(
             typed::offered_own_kinds().unwrap_or_default(),
-            &crate::nbvm::tier_elem_kinds(proto),
+            &crate::nbvm::tier_elem_kinds(orig),
         );
         let mut site_kinds = own_kinds.clone();
         if let Some(e) = expanded.as_ref() {
