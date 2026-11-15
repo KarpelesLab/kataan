@@ -1209,6 +1209,10 @@ pub(super) struct NumGen {
     /// Per pc: a branch target or entry point (so the op's label can be reached
     /// other than by falling through from the previous op).
     is_target: Vec<bool>,
+    /// The body's backward liveness, when given ([`NumGen::set_live`]): the
+    /// words per pc, the live-in bitsets and the registers live at a
+    /// `catch` entry (all `None` until then).
+    live: Option<(usize, Vec<u64>, Vec<u64>)>,
     /// Per register: how many ops name it.
     mentions: Vec<u32>,
     /// Per region: per register no value of which flows into or out of the
@@ -2264,6 +2268,7 @@ impl NumGen {
             regions,
             region_of,
             is_target,
+            live: None,
             mentions,
             stubs: Vec::new(),
             lazy: Vec::new(),
@@ -5617,15 +5622,49 @@ impl NumGen {
         self.fusable(pc, ops, dst).filter(|f| !f.store && !f.neg)
     }
 
+    /// Gives the generator the body's backward liveness (`live`, over the
+    /// bytecode it compiles, with `catches` its `catch` entries), for
+    /// [`fusable`](Self::fusable)'s test of a boolean dead past its test
+    /// (`KATAAN_JIT_FUSEDEAD=0`: not given).
+    pub(super) fn set_live(&mut self, live: Option<&(usize, Vec<u64>)>, catches: &[usize]) {
+        let Some((words, l)) = live.filter(|_| fuse_dead_enabled()) else {
+            return;
+        };
+        let mut at_catch = vec![0u64; *words];
+        for &c in catches {
+            for (w, x) in at_catch.iter_mut().enumerate() {
+                *x |= l.get(c * words + w).copied().unwrap_or(u64::MAX);
+            }
+        }
+        self.live = Some((*words, l.clone(), at_catch));
+    }
+
+    /// Whether register `r` is dead on entry to op `pc` by the body's
+    /// liveness ([`NumGen::set_live`]) and at every `catch` entry; `false`
+    /// when unknown.
+    fn dead_at(&self, pc: usize, r: u16) -> bool {
+        let Some((words, live, at_catch)) = &self.live else {
+            return false;
+        };
+        let (w, bit) = (r as usize / 64, 1u64 << (r % 64));
+        (r as usize) < self.env.n_regs
+            && at_catch.get(w).is_some_and(|x| x & bit == 0)
+            && live.get(pc * words + w).is_some_and(|x| x & bit == 0)
+    }
+
     /// [`fusable`](Self::fusable)'s test of the ops themselves. Through a
     /// `Not`, only when neither boolean is read by anything else (both dead
     /// past the test) and nothing branches to the `Not` or the test.
+    /// (The test's boolean needs no store when nothing else names it, or —
+    /// with the body's liveness, [`NumGen::set_live`] — when it is dead on
+    /// both of the test's ways: every path on writes it before any read.)
     fn fuse_shape(&self, pc: usize, ops: &[GenericOp], dst: u16) -> Option<Fused> {
         let m = |r: u16| self.mentions_at(r, pc);
         let tgt = |q: usize| self.is_target.get(q).copied().unwrap_or(true);
         match ops.get(pc + 1) {
             Some(&GenericOp::JumpIfFalse { cond, target }) if cond == dst && target > pc + 1 => {
-                let store = m(dst) > 2 || tgt(pc + 1);
+                let dead = || self.dead_at(pc + 2, dst) && self.dead_at(target, dst);
+                let store = (m(dst) > 2 && !dead()) || tgt(pc + 1);
                 // Fusing skips op `pc + 1`'s own code on the fast path, so that op
                 // must belong to the same region as `pc`.
                 (self.region_at(pc + 1) == self.region_at(pc)).then_some(Fused {
@@ -8132,6 +8171,14 @@ fn region_mentions(
             out
         })
         .collect()
+}
+
+/// Whether a compare's fused test drops the store of a boolean dead on both
+/// of its ways by the body's liveness ([`NumGen::set_live`];
+/// `KATAAN_JIT_FUSEDEAD=0`: only of one nothing else names). Read once.
+fn fuse_dead_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FUSEDEAD").is_none_or(|v| v != "0"))
 }
 
 /// Whether "named by these ops alone" counts a register's mentions in its

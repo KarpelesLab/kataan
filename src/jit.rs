@@ -9772,6 +9772,12 @@ impl JitFunction {
             &catch_targets,
         );
         num.set_frame_base(method_scratch);
+        // The body's backward liveness (`body_live` below), once, for the
+        // generator's fused tests too (`numeric::NumGen::set_live`).
+        if first_live.is_none() {
+            first_live = numeric::liveness(bytecode, n_regs, &catch_targets);
+        }
+        num.set_live(first_live.as_ref(), &catch_targets);
         // Countdown slot + argument buffer + method scratch + the numeric slots,
         // rounded to keep `rsp` 16-byte aligned (after `push rbp; push r15; push
         // rbx`, rsp ≡ 0 mod 16).
