@@ -43,6 +43,25 @@ use crate::nanbox::NanBox;
 use crate::nbexec::{N_ARRAY_PROTO_FN, N_BASE_ARRAY, N_TYPED_ARRAY_SPECIES};
 use alloc::vec::Vec;
 
+/// Whether the lean loop is on (`KATAAN_JIT_HOFLEAN=0` turns it off; read
+/// once per process): a caller whose register window is on the register
+/// stack (a GC root already) is not published again, a present dense
+/// element is read once (no absent-run probe first), and a compiled
+/// callback keeps a few captures in place (`jit_tier::CompiledCallback`).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn lean_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_HOFLEAN").is_none_or(|v| v != "0"))
+}
+
+/// See the JIT build's.
+#[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+#[inline]
+pub(super) fn lean_on() -> bool {
+    false
+}
+
 /// The built-ins this module runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Hof {
@@ -259,9 +278,16 @@ pub(super) fn run(
         return None;
     }
     let this_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
-    // Publish the caller's registers and everything the loop holds.
+    // Publish the caller's registers (unless they are a GC root already)
+    // and everything the loop holds.
     let mark = ctx.frame_shadow.len();
-    ctx.frame_shadow.extend_from_slice(regs);
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    let rooted = lean_on() && super::jit_tier::on_register_stack(ctx, regs);
+    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    let rooted = false;
+    if !rooted {
+        ctx.frame_shadow.extend_from_slice(regs);
+    }
     ctx.frame_shadow.extend_from_slice(&[recv, cb, this_arg]);
     let slot = ctx.frame_shadow.len();
     ctx.frame_shadow.push(NanBox::undefined());
@@ -533,6 +559,7 @@ impl Loop<'_> {
             Hof::Find | Hof::FindIndex | Hof::FindLast | Hof::FindLastIndex
         );
         let backwards = matches!(op, Hof::FindLast | Hof::FindLastIndex);
+        let lean = lean_on();
         let mut n = 0;
         while n < len {
             // A callee on an unboxed tier runs as many elements as it can
@@ -550,7 +577,16 @@ impl Loop<'_> {
                 }
             }
             let k = if backwards { len - 1 - n } else { n };
-            if probe {
+            // (Lean: a present dense slot, read once, starts no absent run.)
+            let present = if lean {
+                ctx.realm
+                    .array_elements(self.h)
+                    .and_then(|e| e.get(k).copied())
+                    .filter(|v| !v.is_hole())
+            } else {
+                None
+            };
+            if probe && present.is_none() {
                 let run = self.absent_run(ctx, k, len - n, backwards);
                 if run > 0 {
                     if op == Hof::Map {
@@ -562,7 +598,11 @@ impl Loop<'_> {
                 }
             }
             n += 1;
-            let v = match self.element(ctx, k, probe)? {
+            let got = match present {
+                Some(v) => Some(v),
+                None => self.element(ctx, k, probe)?,
+            };
+            let v = match got {
                 Some(v) => v,
                 None if probe => {
                     if op == Hof::Map {

@@ -3335,7 +3335,13 @@ pub(super) struct CompiledCallback {
     callee: NanBox,
     id: usize,
     jit: Rc<crate::jit::JitProto>,
-    captures: alloc::vec::Vec<NanBox>,
+    /// The closure's captures: in `caps_inline` (their count `n_caps`) when
+    /// they fit and the lean loop is on (`super::array_hof::lean_on`), else
+    /// in `caps_heap`. (Copies: a closure's inline captures move with its
+    /// heap slot.)
+    caps_inline: [NanBox; crate::cell::CAPTURES_INLINE_CAP],
+    caps_heap: alloc::vec::Vec<NanBox>,
+    n_caps: usize,
     n_params: usize,
     /// The window size, when the native-call entry may be used.
     native_regs: Option<usize>,
@@ -3358,7 +3364,15 @@ impl CompiledCallback {
         if caps.len() < proto.n_captures {
             return None;
         }
-        let captures = caps.iter().copied().take(proto.n_captures).collect();
+        let caps = &caps[..proto.n_captures];
+        let mut caps_inline = [NanBox::undefined(); crate::cell::CAPTURES_INLINE_CAP];
+        let caps_heap = if caps.len() <= caps_inline.len() && super::array_hof::lean_on() {
+            caps_inline[..caps.len()].copy_from_slice(caps);
+            alloc::vec::Vec::new()
+        } else {
+            caps.to_vec()
+        };
+        let n_caps = caps.len();
         // What `fill_call_site` requires of a native-call target.
         let native_regs =
             (jit.native_entry().is_some() && jit.n_regs() >= proto.n_regs).then_some(jit.n_regs());
@@ -3366,11 +3380,23 @@ impl CompiledCallback {
             callee,
             id,
             jit,
-            captures,
+            caps_inline,
+            caps_heap,
+            n_caps,
             n_params: proto.n_params,
             native_regs,
             regs: alloc::vec::Vec::new(),
         })
+    }
+
+    /// The closure's captures (see [`Self::caps_inline`]).
+    #[inline]
+    fn captures(&self) -> &[NanBox] {
+        if self.caps_heap.is_empty() {
+            &self.caps_inline[..self.n_caps]
+        } else {
+            &self.caps_heap
+        }
     }
 
     /// `Call(callee, this, args)` from a caller that published its own frame
@@ -3410,7 +3436,7 @@ impl CompiledCallback {
         this: NanBox,
         args: &[NanBox],
     ) -> Option<Result<NanBox, VmError>> {
-        // SAFETY: `self.captures` holds the closure's `n_captures` captured
+        // SAFETY: `self.captures()` holds the closure's `n_captures` captured
         // values (kept alive by the closure, which the caller roots).
         #[allow(unsafe_code)]
         unsafe {
@@ -3420,7 +3446,7 @@ impl CompiledCallback {
                 &self.jit,
                 n_regs,
                 self.callee,
-                self.captures.as_ptr().cast::<u64>(),
+                self.captures().as_ptr().cast::<u64>(),
                 this,
                 args,
             )
@@ -3451,24 +3477,25 @@ impl CompiledCallback {
         ctx.realm.vm_args_buf.extend_from_slice(args);
         // The register file: parameters (missing ones `undefined`), captures,
         // `this`, the rest `undefined`.
-        let regs = &mut self.regs;
+        let mut regs = core::mem::take(&mut self.regs);
         regs.clear();
         regs.resize(proto.n_regs, NanBox::undefined());
         let n = self.n_params.min(args.len()).min(regs.len());
         regs[..n].copy_from_slice(&args[..n]);
-        for (slot, c) in regs.iter_mut().skip(self.n_params).zip(&self.captures) {
+        for (slot, c) in regs.iter_mut().skip(self.n_params).zip(self.captures()) {
             *slot = *c;
         }
-        if let Some(slot) = regs.get_mut(self.n_params + self.captures.len()) {
+        if let Some(slot) = regs.get_mut(self.n_params + self.n_caps) {
             *slot = this;
         }
         if ctx.gc_enabled {
             ctx.frame_shadow.extend_from_slice(args);
-            ctx.frame_shadow.extend_from_slice(&self.captures);
+            ctx.frame_shadow.extend_from_slice(self.captures());
             ctx.frame_shadow.push(this);
         }
         proto.tier.bump();
-        let outcome = run_compiled_fresh(ctx, funcs, &self.jit, regs);
+        let outcome = run_compiled_fresh(ctx, funcs, &self.jit, &mut regs);
+        self.regs = regs;
         ctx.realm.vm_callee_stack.truncate(callee_mark);
         ctx.realm.sync_callee_mark();
         ctx.realm.vm_callee_args.truncate(callee_mark);
