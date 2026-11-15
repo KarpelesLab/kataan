@@ -3682,6 +3682,22 @@ fn push_dead_enabled() -> bool {
     }
 }
 
+/// Whether a property read's data-property hit also does the same read on
+/// the same receiver right after it, which it then skips
+/// (`KATAAN_JIT_GETCSE=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn get_cse_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_GETCSE").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether an inline property store of an immediate the `LoadConst` right
 /// before it set (`o.flag = false`) skips the write barrier's test of the
 /// value (`KATAAN_JIT_SETIMM=0` turns it off, read once per process).
@@ -9617,6 +9633,9 @@ impl JitFunction {
         // names (nothing enters the body there): where that test is emitted
         // as nothing, no code reads it, so it is not stored
         // (`call_seq::InlineEmit::dst_dead`).
+        // The body's backward register liveness (`numeric::liveness`), for
+        // the dead stores below.
+        let body_live = numeric::liveness(bytecode, n_regs, &catch_targets);
         let guard_dst_dead: Vec<bool> = {
             let mut named: Vec<u32> = alloc::vec![0; n_regs];
             for op in bytecode {
@@ -9633,8 +9652,7 @@ impl JitFunction {
             }
             // (Or not live after that test: every path on writes it before
             // reading it.)
-            let live = numeric::liveness(bytecode, n_regs, &catch_targets);
-            let live_in = |pc: usize, r: u16| match &live {
+            let live_in = |pc: usize, r: u16| match &body_live {
                 Some((words, l)) => {
                     pc >= bytecode.len()
                         || (r as usize) >= n_regs
@@ -9672,7 +9690,7 @@ impl JitFunction {
                     if key == "push" && args.len() == 1)
             };
             if push_dead_enabled() && bytecode.iter().any(is_push) {
-                match numeric::liveness(bytecode, n_regs, &catch_targets) {
+                match &body_live {
                     Some((words, l)) => bytecode
                         .iter()
                         .enumerate()
@@ -11246,6 +11264,50 @@ impl JitFunction {
         // (After the copy's labels: `NumGen::roc_folded` needs them.)
         num.plan_math_proofs(&provable);
         let sched = num.schedule(ops.len());
+        // Per `GetProp`: the destination of the same read on the same
+        // receiver right after it, which its data-property hits do too
+        // (`KATAAN_JIT_GETCSE`; outside promoted loops, the reads plain).
+        let get_cse_plan: Vec<Option<u16>> = (0..ops.len())
+            .map(|i| {
+                let (
+                    GenericOp::GetProp { dst, obj, .. },
+                    Some(&GenericOp::GetProp {
+                        dst: d2, obj: o2, ..
+                    }),
+                ) = (ops[i], ops.get(i + 1))
+                else {
+                    return None;
+                };
+                let same_key = matches!(
+                    (bytecode.get(i), bytecode.get(i + 1)),
+                    (
+                        Some(crate::nbvm::Op::GetProp { key: k1, .. }),
+                        Some(crate::nbvm::Op::GetProp { key: k2, .. }),
+                    ) if k1 == k2
+                );
+                (get_cse_enabled()
+                    && same_key
+                    && obj == o2
+                    && dst != obj
+                    && (d2 as usize) < n_regs
+                    && !num.in_any_region(i)
+                    && !num.in_any_region(i + 1)
+                    && !not_tested.get(i + 1).copied().unwrap_or(true)
+                    && !fused_test.get(i + 1).copied().unwrap_or(true)
+                    && fused_step.get(i).is_some_and(Option::is_none)
+                    && fused_step.get(i + 1).is_some_and(Option::is_none)
+                    && sink_x.is_none_or(|x| !x.plan.exit_after[i] && !x.plan.exit_before[i + 1]))
+                .then_some(d2)
+            })
+            .collect();
+        let get_cse = |op_idx: usize, si: usize, pass: u8, dst: u16, obj: u16| {
+            let d2 = get_cse_plan.get(op_idx).copied().flatten()?;
+            (pass == numeric::PASS_MAIN
+                && dst != obj
+                && sched.get(si + 1) == Some(&(op_idx + 1, pass)))
+            .then(|| Some((d2, *labels.get(op_idx + 2)?)))
+            .flatten()
+        };
         // The lazily pending activations whose bodies are being emitted,
         // outermost first: `(its guard, its leave, the pass)`.
         let mut lazy_open: Vec<(usize, usize, u8)> = Vec::new();
@@ -15752,7 +15814,20 @@ impl JitFunction {
                             ool_past = Some(past);
                         } else {
                             a.store_rax(disp(dst));
-                            a.jmp(done);
+                            // `this.dom & (this.dom - 1)`: the same read
+                            // right after this one, on the same receiver
+                            // (`KATAAN_JIT_GETCSE`). Every path to `back`
+                            // read a data property's slot, which nothing can
+                            // change before that read: it is this value
+                            // too, and that op is skipped. Its other paths
+                            // run it as ever.
+                            match get_cse(op_idx, si, pass, dst, obj) {
+                                Some((d2, past)) => {
+                                    a.store_rax(disp(d2));
+                                    a.jmp(past);
+                                }
+                                None => a.jmp(done),
+                            }
                         }
                     } else {
                         // A polymorphic site's layouts (`poly`): a hit has
