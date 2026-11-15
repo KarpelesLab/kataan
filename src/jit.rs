@@ -3682,6 +3682,23 @@ fn push_dead_enabled() -> bool {
     }
 }
 
+/// Whether a generic forward test of a value's truthiness (`if (x)`,
+/// `if (!x)`) branches on each answer it finds, with no `0`/`1` made and
+/// tested again (`KATAAN_JIT_TRUTHYBR=0` turns it off, read once per
+/// process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn truthy_br_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_TRUTHYBR").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether a property read's data-property hit also does the same read on
 /// the same receiver right after it, which it then skips
 /// (`KATAAN_JIT_GETCSE=0` turns it off, read once per process).
@@ -8260,6 +8277,60 @@ impl X64Assembler {
         self.bind(have);
     }
 
+    /// [`emit_truthy_or`](Self::emit_truthy_or) for a branch on the answer:
+    /// to `yes` when the value at `disp` is truthy, to `no` when it is falsy,
+    /// with no `0`/`1` made (`KATAAN_JIT_TRUTHYBR`). With `slow`, a value
+    /// the inline cases do not decide goes there instead of the helper.
+    #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_truthy_branch(
+        &mut self,
+        disp: i32,
+        truthy_helper: u64,
+        qnan: u64,
+        realm_off: i32,
+        slow: Option<Label>,
+        (yes, no): (Label, Label),
+    ) {
+        let numl = self.new_label();
+        let heap = self.new_label();
+        let helper = self.new_label();
+        self.load_rax(disp);
+        self.p_cmp_handle_floor(call_seq::r::RAX);
+        self.g_jcc(call_seq::cc::AE, heap);
+        // `undefined`, `null`, `false` / `true` (one classification).
+        self.p_imm_class(call_seq::r::RCX);
+        self.g_jcc(call_seq::cc::B, no);
+        self.je(yes);
+        self.movabs_r11(qnan as i64);
+        self.mov_rcx_rax();
+        self.and_rcx_r11();
+        self.cmp_rcx_r11();
+        self.jne(numl); // a number → numeric truthiness
+        self.jmp(helper);
+        self.bind(heap);
+        self.p_truthy_handle(realm_off, yes, helper);
+        self.bind(helper);
+        if let Some(slow) = slow {
+            self.jmp(slow);
+        }
+        // jit_helper_truthy(ctx, v) → 0/1 (runs ToBoolean; never throws).
+        self.mov_rdi_r15();
+        self.load_argreg(1, disp);
+        self.movabs_rax(truthy_helper as i64);
+        self.call_rax();
+        self.test_rax_rax();
+        self.jne(yes);
+        self.jmp(no);
+        // A Number: truthy iff ordered and != 0 (NaN and ±0 set ZF).
+        self.bind(numl);
+        self.movsd_xmm0_mem(disp);
+        self.zero_xmm1();
+        self.ucomisd_xmm0_xmm1();
+        self.je(no);
+        self.jmp(yes);
+    }
+
     // --- inline monomorphic property-GET fast path (generic tier, Pass 6).
     // These read the object heap at runtime-verified offsets (see
     // `compute_jit_layout`): a slot pointer is built in `rcx`, the arena base in
@@ -11106,6 +11177,79 @@ impl JitFunction {
                     $bail,
                 );
                 a.bind(have);
+            }};
+        }
+        // `truthy_rax!`'s branch form (`KATAAN_JIT_TRUTHYBR`): to `$yes`
+        // for a truthy register `$r` at op `$at`, to `$no` for a falsy one,
+        // with no `0`/`1` made (`X64Assembler::emit_truthy_branch`).
+        macro_rules! truthy_branch {
+            ($at:expr, $r:expr, $yes:expr, $no:expr) => {{
+                let _: Label = $yes;
+                let _: Label = $no;
+                let general = a.new_label();
+                if let Some(p) = rc.sites[$at] {
+                    if p.family != recv_cache::Family::Obj {
+                        return None;
+                    }
+                    let walk = a.new_label();
+                    let proven = a.new_label();
+                    let yes = a.new_label();
+                    // (A hit, or a fill, on a way of a brand-free layout
+                    // proves the object truthy.)
+                    let plain = way_plain[p.way];
+                    if p.check {
+                        a.load_rax(disp($r));
+                        a.g_cmp_mem(call_seq::r::RAX, call_seq::r::RBP, rc_key(p.way));
+                        a.jne(walk);
+                        if plain {
+                            a.jmp($yes);
+                        } else {
+                            a.g_load(call_seq::r::RCX, call_seq::r::RBP, rc_cell(p.way));
+                            a.jmp(proven);
+                        }
+                    }
+                    a.bind(walk);
+                    walk_to_slot!($r, general);
+                    family_checks!(recv_cache::Family::Obj, general);
+                    // (`rax`: the receiver's bits, from the walk.)
+                    let skip_fill = a.new_label();
+                    if p.fill {
+                        if let Some(shape) = way_shape[p.way] {
+                            a.p_cmp_shape(
+                                call_seq::r::RCX,
+                                layout.off_shape,
+                                shape,
+                                call_seq::r::RDX,
+                            );
+                            a.jne(skip_fill);
+                        }
+                        a.p_fill_way(rc_key(p.way), rc_cell(p.way), rc_delta(p.way, $r));
+                        if plain {
+                            // (Straight to the branch's target, if any.)
+                            a.jmp($yes);
+                        }
+                    }
+                    a.bind(skip_fill);
+                    a.bind(proven);
+                    a.g_load(call_seq::r::R11, call_seq::r::RCX, layout.off_shape);
+                    a.p_test_byte_imm(
+                        call_seq::r::R11,
+                        layout.props.shape_brands,
+                        crate::shape::brand_bit(crate::shape::BRAND_KEYS[1]),
+                    );
+                    a.jne(general);
+                    a.bind(yes);
+                    a.jmp($yes);
+                }
+                a.bind(general);
+                a.emit_truthy_branch(
+                    disp($r),
+                    truthy_helper,
+                    QNAN,
+                    helpers.call_layout.realm,
+                    None,
+                    ($yes, $no),
+                );
             }};
         }
         // An exact integer index in `reg` → `rax`, else `$miss` (the
@@ -17752,12 +17896,18 @@ impl JitFunction {
                     // (An object its way proves truthy: `!x` is false, stored
                     // out of line on the way to the branch.)
                     let yes = if nb.dead { to } else { a.new_label() };
-                    truthy_rax!(op_idx, ra, None, Some(yes));
                     not_fused[op_idx] = true;
-                    if nb.dead {
+                    if nb.dead && truthy_br_enabled() {
+                        // `x` truthy: `!x` false → the branch; else on.
+                        let on = a.new_label();
+                        truthy_branch!(op_idx, ra, to, on);
+                        a.bind(on);
+                    } else if nb.dead {
+                        truthy_rax!(op_idx, ra, None, Some(yes));
                         a.test_rax_rax();
                         a.jne(to); // `x` truthy: `!x` false → branch
                     } else {
+                        truthy_rax!(op_idx, ra, None, Some(yes));
                         a.xor_rax_imm(1);
                         a.movabs_r11(tag_false as i64);
                         a.add_rax_r11();
@@ -17826,14 +17976,18 @@ impl JitFunction {
                     }
                     let to = num.branch_label(&labels, op_idx, target)?;
                     let stay = a.new_label();
-                    truthy_rax!(op_idx, cond, None, Some(stay));
-                    a.test_rax_rax();
-                    if target <= op_idx {
-                        a.jne(stay);
-                        backedge!(target);
-                        a.jmp(to);
+                    if target > op_idx && truthy_br_enabled() {
+                        truthy_branch!(op_idx, cond, stay, to);
                     } else {
-                        a.je(to); // falsy (truthy == 0) → branch
+                        truthy_rax!(op_idx, cond, None, Some(stay));
+                        a.test_rax_rax();
+                        if target <= op_idx {
+                            a.jne(stay);
+                            backedge!(target);
+                            a.jmp(to);
+                        } else {
+                            a.je(to); // falsy (truthy == 0) → branch
+                        }
                     }
                     a.bind(stay);
                 }
