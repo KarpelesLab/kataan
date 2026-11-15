@@ -278,7 +278,7 @@ pub struct CallSite {
     /// [`CallSite::fresh`]).
     pub fresh_misses: u64,
     /// Whether the site's callees are mostly fresh closures
-    /// ([`CallSite::fresh_misses`] reached [`FRESH_LIMIT`]): every callee
+    /// ([`CallSite::fresh_misses`] reached its limit, 16): every callee
     /// value is a new one (`ev.fn()` over events each made with its own
     /// arrow function), so no memo would name it. The sequence then
     /// identifies the callee by its function at once (`KATAAN_JIT_FRESHCALL`):

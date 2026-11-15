@@ -287,6 +287,12 @@ pub(crate) fn emit_land_stub(
     a.jmp(entry);
 }
 
+/// A sync generator body's resumption stub as the body's emission plans it:
+/// its label, the function's own resumption pc, the `yield`'s destination
+/// and mode registers (`None` at the generator's start) and the entry it
+/// continues at.
+pub(crate) type ResumeStub = (Label, usize, Option<(u16, u16)>, Label);
+
 /// What [`emit_resume`] needs of its site.
 pub(crate) struct ResumeEmit {
     /// The op's call site.

@@ -11070,7 +11070,7 @@ impl JitFunction {
         // `yield` whose resumption pc is an entry, a stub landing the sent
         // value — (stub, the function's own resumption pc, the `yield`'s
         // destination and mode registers, the entry).
-        let mut gen_stubs: Vec<(Label, usize, Option<(u16, u16)>, Label)> = Vec::new();
+        let mut gen_stubs: Vec<gen_native::ResumeStub> = Vec::new();
         if helpers.gen_native && gen_native::enabled() {
             let own_of = |i: usize| match pc_orig.get(i) {
                 Some(&o) if o != u32::MAX => Some(o as usize),
