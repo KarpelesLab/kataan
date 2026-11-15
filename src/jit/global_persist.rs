@@ -107,7 +107,7 @@ pub(super) fn empty_words_addr() -> u64 {
 }
 
 /// The array's length (`u64` words).
-pub(super) const LEN: usize = 64;
+pub(super) const LEN: usize = 72;
 
 /// An empty entry, and the "no epoch" mark (the global binding epoch never
 /// reaches it): `RECV_CACHE_EMPTY` sign-extended.
@@ -115,7 +115,21 @@ pub(super) const EMPTY: u64 = u64::MAX;
 
 /// The words of the body's own global binding cache (`compile_generic`): its
 /// epoch, then one per slot.
-pub(super) const BODY_WORDS: usize = 1 + 8;
+pub(super) const BODY_WORDS: usize = 1 + 16;
+
+/// How many of the body's global binding cache slots persist: all of
+/// [`BODY_WORDS`]' (a body with inlined callees reads many globals, each of
+/// which past the persisted ones is validated again by every activation
+/// that reads it); `KATAAN_JIT_GWIDE=0` persists only the first 8, as
+/// before (read once per process).
+pub(super) fn body_slots() -> usize {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GWIDE").is_none_or(|v| v != "0")) {
+        BODY_WORDS - 1
+    } else {
+        8
+    }
+}
 
 /// The counters past the cache, each starting at zero: per region (the
 /// first [`COUNTERS`] of a body), how often a speculative region's integer

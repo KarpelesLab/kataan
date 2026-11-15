@@ -9615,7 +9615,7 @@ impl JitFunction {
         // (So do a write's whose code mirrors nothing onto the global
         // object, `global_persist::writes_persist`: its validated address,
         // like a read's, stays right while the epoch is current.)
-        let gc_reads: Vec<usize> = (0..gc_plan.slots.min(global_persist::BODY_WORDS - 1))
+        let gc_reads: Vec<usize> = (0..gc_plan.slots.min(global_persist::body_slots()))
             .filter(|&k| {
                 let mut sites = (0..ops.len()).filter(|&pc| gc_plan.site.get(pc) == Some(&Some(k)));
                 sites.all(|pc| match bytecode.get(pc) {
