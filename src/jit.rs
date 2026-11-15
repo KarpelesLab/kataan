@@ -10317,6 +10317,20 @@ impl JitFunction {
                 .then_some(rc_base - 8 * (rc_ways + 3 * w as i32 + 3))
         };
         num.set_rc_relied((0..ops.len()).map(|pc| typed::relied_on(&rc, pc)).collect());
+        // A strict equality's walk of an object first operand fills its
+        // way (`recv_cache::plan`'s fill-only sites).
+        num.set_eq_ways(
+            (0..ops.len())
+                .map(|pc| match (&ops[pc], rc.sites[pc]) {
+                    (GenericOp::StrictEq { .. }, Some(p))
+                        if p.family == recv_cache::Family::Obj && p.fill =>
+                    {
+                        Some((rc_key(p.way), rc_cell(p.way), way_shape[p.way]))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
         // A promoted loop's truthiness tests on objects go through their
         // ways (`numeric::TruthyWay`).
         num.set_truthy_ways(
@@ -10612,11 +10626,12 @@ impl JitFunction {
             .iter()
             .enumerate()
             .map(|(i, o)| match *o {
-                GenericOp::GetMethod { call, .. }
+                GenericOp::GetMethod { call, obj, .. }
                     if looped(i)
                         && call_sites.get(call as usize).is_some_and(|p| !p.is_null())
                         && matches!(bytecode.get(i), Some(crate::nbvm::Op::GetProp { key, .. })
-                            if !store_keys.may_store(key)) =>
+                            if !store_keys.may_store(key))
+                        && !gelim::varies_per_iteration(bytecode, i, obj) =>
                 {
                     n_gm += 1;
                     Some(n_gm - 1)
@@ -18636,11 +18651,17 @@ impl JitFunction {
                     // Not two Numbers: decided inline unless both operands are
                     // heap values (strings and BigInts compare by contents) or
                     // neither is (two immediates, a Number and an immediate).
+                    // (A receiver-cache site, `recv_cache::plan`: an object
+                    // first operand fills its way.)
+                    let way = rc.sites[op_idx]
+                        .filter(|p| p.family == recv_cache::Family::Obj && p.fill)
+                        .map(|p| (rc_key(p.way), rc_cell(p.way), way_shape[p.way]));
                     a.p_strict_eq_identity(
                         helpers.call_layout.realm,
                         (disp(ra), disp(rb), disp(dst)),
                         (tag_true, tag_false),
                         done,
+                        way,
                     );
                     // `jit_helper_strict_eq` never throws → no sentinel check.
                     a.mov_rdi_r15();

@@ -1061,6 +1061,10 @@ pub(super) struct TruthyWay {
     pub(super) plain: bool,
 }
 
+/// A strict equality's receiver-cache way: its `(key, cell)` frame slots and
+/// the layout its fills prove, if any ([`NumGen::set_eq_ways`]).
+pub(super) type EqWay = (i32, i32, Option<u64>);
+
 /// Out-of-line slow paths, emitted after the body ([`NumGen::finish`]).
 enum StubKind {
     /// `rax = helper(ctx, [a], [b], extra?)`, sentinel-checked when `throws`,
@@ -1089,6 +1093,8 @@ enum StubKind {
         b: u16,
         dst: u16,
         bail: Option<u32>,
+        /// The way an object `a` fills (`NumGen::set_eq_ways`).
+        way: Option<EqWay>,
     },
     /// The `StoreGlobal` at `pc` stored the heap handle in register `src`
     /// into its binding; its global-object mirror store (which needs the
@@ -1339,6 +1345,10 @@ pub(super) struct NumGen {
     /// Per pc: a later site of the iteration takes the receiver-cache way
     /// this op fills as filled (`typed::relied_on`).
     rc_relied: Vec<bool>,
+    /// Per pc, a strict equality's receiver-cache way (`(key, cell,
+    /// layout)` frame slots) its walk of an object first operand fills
+    /// ([`Self::set_eq_ways`]).
+    eq_ways: Vec<Option<EqWay>>,
     /// Per pc: a property op whose code (its every path in a speculative
     /// region's fast version, up to its leaves) keeps `rsi` and `rdi`
     /// ([`Self::set_keeps_si_di`]).
@@ -2309,6 +2319,7 @@ impl NumGen {
             int_clean: (0, 0),
             int_clean_ok: false,
             rc_relied: Vec::new(),
+            eq_ways: Vec::new(),
             keeps_si_di: Vec::new(),
             int_clobbers: Vec::new(),
             int_keep_check: false,
@@ -3309,6 +3320,12 @@ impl NumGen {
     /// Which ops' receiver-cache ways later sites rely on (per pc).
     pub(super) fn set_rc_relied(&mut self, relied: Vec<bool>) {
         self.rc_relied = relied;
+    }
+
+    /// Per pc, the receiver-cache way a strict equality's walk of an
+    /// object first operand fills (`recv_cache::plan`'s fill-only sites).
+    pub(super) fn set_eq_ways(&mut self, ways: Vec<Option<EqWay>>) {
+        self.eq_ways = ways;
     }
 
     /// Which property ops' code keeps `rsi` and `rdi` on every path of a
@@ -4753,6 +4770,7 @@ impl NumGen {
                     b: y,
                     dst,
                     bail: None,
+                    way: self.eq_ways.get(pc).copied().flatten(),
                 };
                 let fused = self.fusable(pc, ops, dst);
                 // Against a constant: the bits alone (in a general-purpose
@@ -5793,12 +5811,15 @@ impl NumGen {
         let kind = match kind {
             // (`===` decides most pairs inline, the int GPRs kept: only
             // the helper's pairs bail, `emit_strict_eq_stub`.)
-            StubKind::StrictEq { a, b, dst, .. } if self.imode.is_some() => StubKind::StrictEq {
-                a,
-                b,
-                dst,
-                bail: Some(self.cur_pc as u32),
-            },
+            StubKind::StrictEq { a, b, dst, way, .. } if self.imode.is_some() => {
+                StubKind::StrictEq {
+                    a,
+                    b,
+                    dst,
+                    bail: Some(self.cur_pc as u32),
+                    way,
+                }
+            }
             StubKind::Helper { .. }
             | StubKind::Exec { .. }
             | StubKind::Mirror { .. }
@@ -5811,7 +5832,7 @@ impl NumGen {
                 }
             }
             // `===` decides most pairs with no call: only the rest leave.
-            StubKind::StrictEq { a, b, dst, .. }
+            StubKind::StrictEq { a, b, dst, way, .. }
                 if region.is_some_and(|ri| self.regions[ri].spec.is_some()) =>
             {
                 StubKind::StrictEq {
@@ -5819,6 +5840,7 @@ impl NumGen {
                     b,
                     dst,
                     bail: Some(self.bail_pc(self.cur_pc) as u32),
+                    way,
                 }
             }
             // In a speculative region every slow path that would run Rust
@@ -7285,7 +7307,7 @@ impl NumGen {
         labels: &[Label],
         s: &Stub,
         (x, y, dst): (u16, u16, u16),
-        bail: Option<u32>,
+        (bail, way): (Option<u32>, Option<EqWay>),
     ) {
         use super::call_seq::{cc, r};
         const HANDLE_TOP: i32 = 0x3fff;
@@ -7337,6 +7359,25 @@ impl NumGen {
         };
         a.p_arena(self.env.realm, &self.env.heap.props);
         self.load_gpr(a, s.region, r::RAX, x);
+        if let Some((key, cell, layout)) = way {
+            // An ordinary object first operand (of the way's layout, if it
+            // proves one) fills its receiver-cache way on the way to `no`,
+            // as a full walk proved it (`recv_cache::plan`). The walk keeps
+            // `rax`.
+            let l = super::compute_jit_layout();
+            let other = a.new_label();
+            a.p_slot_rooted(l, r::RCX, slow_w);
+            a.p_object_not_exotic(l, other);
+            if let Some(shape) = layout {
+                a.p_cmp_shape(r::RCX, l.off_shape, shape, r::R11);
+                a.g_jcc(cc::NE, no_w);
+            }
+            a.g_store(r::RBP, key, r::RAX);
+            a.g_store(r::RBP, cell, r::RCX);
+            a.jmp(no_w);
+            a.bind(other);
+            self.load_gpr(a, s.region, r::RAX, x);
+        }
         a.p_identity_compared(no_w, slow_w);
         self.load_gpr(a, s.region, r::RAX, y);
         a.p_identity_compared(no_w, slow_w);
@@ -7448,7 +7489,8 @@ impl NumGen {
                     b: y,
                     dst,
                     bail,
-                } => self.emit_strict_eq_stub(a, labels, s, (x, y, dst), bail),
+                    way,
+                } => self.emit_strict_eq_stub(a, labels, s, (x, y, dst), (bail, way)),
                 StubKind::CanonNan => {
                     a.movabs_rax(self.canonical_nan as i64);
                     a.movq_x_gpr(0, RAX);

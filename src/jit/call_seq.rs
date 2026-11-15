@@ -1369,6 +1369,10 @@ impl X64Assembler {
     /// array (`p_identity_compared`) are unequal too (the realm at
     /// `[r15 + realm_off]`). Falls through, with nothing stored, for two
     /// distinct heap values neither of which is one: the helper's case.
+    /// With `way` (`super::recv_cache`'s `(key, cell, layout)` frame slots),
+    /// a first operand found an ordinary shaped object without the
+    /// host-exotic flag (of the way's layout, if it proves one) fills the
+    /// way on the way to `unequal`, as a full walk proved it.
     /// Clobbers `rax`, `rcx`, `rdx`, `rsi`, `r8`-`r11`.
     pub(crate) fn p_strict_eq_identity(
         &mut self,
@@ -1376,6 +1380,7 @@ impl X64Assembler {
         (a, b, dst): (i32, i32, i32),
         (t, f): (u64, u64),
         done: Label,
+        way: Option<(i32, i32, Option<u64>)>,
     ) {
         // A heap handle's top 14 bits are all set (sign + the QNAN pattern),
         // so those of two words' AND are exactly when both are handles.
@@ -1408,6 +1413,21 @@ impl X64Assembler {
         let l = super::compute_jit_layout();
         self.p_arena(realm_off, &l.props);
         self.load_rax(a);
+        if let Some((key, cell, layout)) = way {
+            // (The walk keeps `rax`, the handle; its slot into `rcx`.)
+            let other = self.new_label();
+            self.p_slot_rooted(l, r::RCX, helper);
+            self.p_object_not_exotic(l, other);
+            if let Some(s) = layout {
+                self.p_cmp_shape(r::RCX, l.off_shape, s, r::R11);
+                self.g_jcc(cc::NE, unequal);
+            }
+            self.g_store(RBP, key, r::RAX);
+            self.g_store(RBP, cell, r::RCX);
+            self.jmp(unequal);
+            self.bind(other);
+            self.load_rax(a);
+        }
         self.p_identity_compared(unequal, helper);
         self.load_rax(b);
         self.p_identity_compared(unequal, helper);

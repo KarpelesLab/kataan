@@ -159,6 +159,22 @@ impl<'a> StoreKeys<'a> {
                     | Op::GlobalExists { .. }
                     | Op::InstanceOf { .. }
                     | Op::HasProp { .. } => {}
+                    // Ops the generic tier only ever runs through the
+                    // interpreter's helper (no inline path of any tier's
+                    // emitter): whatever they store, they store behind
+                    // that call, which empties every proof.
+                    Op::IterClose { .. }
+                    | Op::IterRest { .. }
+                    | Op::IterNextEntry { .. }
+                    | Op::DefineMethod { .. }
+                    | Op::DefineData { .. }
+                    | Op::ArrayExtend { .. }
+                    | Op::ObjectSpread { .. }
+                    | Op::ObjectRestDyn { .. }
+                    | Op::LoadFunc { .. }
+                    | Op::InitFnPrototype { .. }
+                    | Op::MakeClass { .. }
+                        if helper_ops_enabled() => {}
                     _ => s.any = true,
                 },
             }
@@ -177,6 +193,84 @@ impl<'a> StoreKeys<'a> {
             || self.keys.contains(&key)
             || (self.numeric && numeric_like(key))
     }
+}
+
+/// Whether the method read at `pc` (receiver register `recv`) most likely
+/// sees another receiver on each iteration of its innermost loop, so a
+/// method read proof there (keyed by the receiver's bits) would only cost
+/// its compare and its fill: the receiver is made in the loop by a call,
+/// an element or iteration read, or read from a global or captured binding
+/// the loop writes (`v = v.add(d)`), maybe through copies. A guess only
+/// (`KATAAN_JIT_GMSTABLE=0`: never): the proof checks the bits anyway.
+pub(super) fn varies_per_iteration(bytecode: &[Op], pc: usize, recv: u16) -> bool {
+    if !gm_stable_enabled() {
+        return false;
+    }
+    // The innermost loop around `pc`: the nearest back-edge over it.
+    let Some((head, end)) = bytecode
+        .iter()
+        .enumerate()
+        .filter_map(|(j, o)| match *o {
+            Op::Jump { target } if target <= pc && pc < j => Some((target, j)),
+            _ => None,
+        })
+        .min_by_key(|&(h, j)| j - h)
+    else {
+        return false;
+    };
+    let body = &bytecode[head..=end];
+    let (mut defs, mut uses) = (Vec::new(), Vec::new());
+    let mut r = recv;
+    let mut at = pc;
+    for _ in 0..8 {
+        // The nearest op before `at` in the loop that writes `r`.
+        let Some(d) = (head..at).rev().find(|&j| {
+            super::numeric::def_use(&bytecode[j], &mut defs, &mut uses);
+            defs.contains(&r)
+        }) else {
+            return false;
+        };
+        match &bytecode[d] {
+            Op::Move { src, .. } => {
+                r = *src;
+                at = d;
+            }
+            Op::CallMethod { .. }
+            | Op::CallWithMethod { .. }
+            | Op::CallValue { .. }
+            | Op::Construct { .. }
+            | Op::IterNext { .. }
+            | Op::GetKey { .. }
+            | Op::GetElem { .. } => return true,
+            Op::LoadGlobal { name, .. } => {
+                return body.iter().any(|o| {
+                    matches!(o, Op::StoreGlobal { name: n, .. } | Op::InitGlobal { name: n, .. }
+                        if n == name)
+                });
+            }
+            Op::CellGet { cell, .. } => {
+                return body
+                    .iter()
+                    .any(|o| matches!(o, Op::CellSet { cell: c, .. } if c == cell));
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn gm_stable_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GMSTABLE").is_none_or(|v| v != "0"))
+}
+
+/// Whether [`StoreKeys`] takes the ops the generic tier only runs through
+/// the interpreter's helper (an iterator's close, a rest element, a method
+/// or data definition, an array spread) as storing no key in line
+/// (`KATAAN_JIT_HELPERKEYS=0`: as storing any; read once per process).
+fn helper_ops_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_HELPERKEYS").is_none_or(|v| v != "0"))
 }
 
 /// Whether `KATAAN_JIT_NUMKEYS=0` turns the numeric-key refinement of

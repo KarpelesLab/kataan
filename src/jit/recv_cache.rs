@@ -171,6 +171,27 @@ pub(super) fn stepped_regs(bytecode: &[Op]) -> Vec<bool> {
     out
 }
 
+/// Whether a speculative loop's polymorphic method guard is a receiver-cache
+/// site ([`plan`]'s `spec_poly_guard`; `KATAAN_JIT_SPECPOLY=0` turns it
+/// off, read once per process).
+fn spec_poly_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SPECPOLY").is_none_or(|v| v != "0"))
+}
+
+/// Whether `op` is a fill-only receiver-cache site (a strict equality's,
+/// see [`plan`]): it never compares, and fills only for a later site.
+fn fill_only_op(op: &GenericOp) -> bool {
+    matches!(op, GenericOp::StrictEq { .. })
+}
+
+/// Whether a strict equality's walk of its first operand fills a way
+/// ([`plan`]; `KATAAN_JIT_EQFILL=0` turns it off, read once per process).
+pub(super) fn strict_eq_fill_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_EQFILL").is_none_or(|v| v != "0"))
+}
+
 /// The most global binding addresses a body caches (each costs a frame slot
 /// and a store in the prologue).
 const MAX_GLOBAL_SLOTS: usize = 32;
@@ -880,13 +901,16 @@ pub(super) fn shape_ways(
         // A truthiness test fills such a way only with an object of the
         // way's layout (`compile_generic`'s `truthy_rax!`), and so does an
         // inlined call's guard on its method's receiver
-        // (`call_seq::emit_inline_guard`): they prove none.
+        // (`call_seq::emit_inline_guard`): they prove none. Nor does a
+        // strict equality's walk of its first operand
+        // (`X64Assembler::p_strict_eq_identity`), which fills only so.
         if matches!(
             op,
             GenericOp::Not { .. }
                 | GenericOp::JumpIfFalse { .. }
                 | GenericOp::InlineGuard { .. }
                 | GenericOp::GetMethod { .. }
+                | GenericOp::StrictEq { .. }
         ) {
             continue;
         }
@@ -949,6 +973,23 @@ pub(super) fn plan(
                     || (matches!(ops.get(*call as usize), Some(GenericOp::Interp { .. }))
                         && is_super_call(bytecode, *call as usize)))
     };
+    // A speculative loop's guard of a polymorphic method site's first way
+    // (`KATAAN_JIT_SPECPOLY`): its walk of the receiver fills a way for
+    // the inlined body's reads of `this` (`for (const s of shapes)
+    // s.intersect(ray)`, whose way's body reads `this.center`). Its
+    // receiver changes every iteration, so it has no method proof
+    // (`MethodProof` is for monomorphic guards) to lose by having a way.
+    // A fill there is never certain — a miss goes on into the later ways
+    // with the way filled or not — so the guard is no later site's
+    // certain predecessor (`known`), and no earlier site's certainty is
+    // taken away by it: it only ever puts its receiver in the way.
+    let spec_poly_guard = |op: &GenericOp, i: usize| {
+        matches!(*op, GenericOp::InlineGuard { poly, .. }
+            if poly != 0 && poly & 0xff == 0)
+            && in_spec(i)
+            && !cold_new(i)
+            && spec_poly_enabled()
+    };
     // An op's receiver (a truthiness test's only where the generic
     // emitter makes it, `truthy_site`).
     let site_recv = |op: &GenericOp, i: usize| match *op {
@@ -989,6 +1030,21 @@ pub(super) fn plan(
             }
             _ => None,
         },
+        // A strict equality of two distinct heap values walks its first
+        // operand (`X64Assembler::p_strict_eq_identity`): an ordinary
+        // object fills its way there (`w !== v && w.dom`), on that path
+        // only — a fill, never a certain one, and never a compare.
+        GenericOp::StrictEq { a, .. } if strict_eq_fill_enabled() => Some((a, Family::Obj)),
+        // In a speculative loop, a polymorphic method site's first way
+        // (`spec_poly_guard`): a site that may fill, never a certain one.
+        GenericOp::InlineGuard { call, .. } if spec_poly_guard(op, i) => {
+            match ops.get(call as usize)? {
+                GenericOp::CallMethod { recv: r, .. }
+                | GenericOp::GetProp { obj: r, .. }
+                | GenericOp::SetProp { obj: r, .. } => Some((*r, Family::Obj)),
+                _ => None,
+            }
+        }
         _ => site_recv(op, bytecode.get(i)),
     };
     let target = branch_targets(ops, osr_entries, catch_targets);
@@ -1002,6 +1058,9 @@ pub(super) fn plan(
     let mut fill = vec![false; n];
     let mut check = vec![false; n];
     let mut site_id = vec![0u32; n];
+    // Fill-only sites (a strict equality's) on a value some site walked
+    // already: no site.
+    let mut no_site = vec![false; n];
     // The registers holding a value made since the last join by an op that
     // usually makes a different one each time it runs (`fresh_def`), not yet
     // walked: a promoted loop's first site on one walks it at once rather
@@ -1160,18 +1219,30 @@ pub(super) fn plan(
             // (Nor is an inlined `new`'s guard, see `cold_new`, nor a
             // captured binding's site: its walk fills the way only for a
             // binding cell, not for a captured parameter's array.)
+            let poly_guard = spec_poly_guard(op, i);
+            // (A strict equality only ever fills, and only a value nothing
+            // walked yet: one already in a way it leaves alone.)
+            let fill_only = fill_only_op(op);
             let truthy = matches!(op, GenericOp::Not { .. } | GenericOp::JumpIfFalse { .. })
                 || (in_spec(i) && cold_new(i))
-                || fam == Family::Cell;
-            if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
+                || fam == Family::Cell
+                || poly_guard
+                || fill_only;
+            if fill_only && live.iter().any(|e| e.0 == id) {
+                no_site[i] = true;
+            } else if let Some(e) = live.iter_mut().find(|e| e.0 == id) {
                 fill[e.1] = true;
                 check[i] = true;
                 if e.2 && !truthy && in_spec(i) && in_spec(e.1) && !guessed.contains(&(id / 3)) {
                     pred[i] = Some(e.1);
                 }
                 // (Every site fills its way: from here on, it holds the
-                // value on every path.)
-                *e = (id, i, !truthy);
+                // value on every path. A speculative polymorphic guard
+                // leaves an earlier walk the last: it only ever puts the
+                // same value in the way, or nothing.)
+                if !poly_guard {
+                    *e = (id, i, !truthy);
+                }
             } else {
                 live.push((id, i, !truthy));
                 fresh_first[i] = fresh.contains(&r);
@@ -1428,7 +1499,9 @@ pub(super) fn plan(
     // element or property read, a call's result), which is usually another
     // object than last time: it walks the value at once (and fills the way).
     for i in 0..n {
-        if in_region(i) && site_recv(&ops[i], i).is_some() {
+        // (A strict equality fills only for a later site on its value,
+        // found above: else its way would cost a key to empty per call.)
+        if in_region(i) && site_recv(&ops[i], i).is_some() && !fill_only_op(&ops[i]) {
             fill[i] = true;
             check[i] = !fresh_first[i];
         }
@@ -1449,9 +1522,20 @@ pub(super) fn plan(
         }
     }
     for i in 0..n {
-        if in_loop[i] && !in_region(i) && !fresh_first[i] && site_recv(&ops[i], i).is_some() {
+        if in_loop[i]
+            && !in_region(i)
+            && !fresh_first[i]
+            && site_recv(&ops[i], i).is_some()
+            && !fill_only_op(&ops[i])
+        {
             fill[i] = true;
             check[i] = true;
+        }
+    }
+    for i in 0..n {
+        if no_site[i] {
+            fill[i] = false;
+            check[i] = false;
         }
     }
     // Loop-carried receivers share a way (see `carried_aliases`).
