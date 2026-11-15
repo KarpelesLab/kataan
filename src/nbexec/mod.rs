@@ -11412,6 +11412,87 @@ impl Interp {
 /// validated to `0..=100`.
 #[cfg(feature = "std")]
 pub(crate) fn number_to_fixed(n: f64, digits: usize) -> String {
+    if fixed_exact_on()
+        && let Some(s) = number_to_fixed_exact(n, digits)
+    {
+        return s;
+    }
+    number_to_fixed_fmt(n, digits)
+}
+
+/// Whether `toFixed` takes [`number_to_fixed_exact`] when it can
+/// (`KATAAN_FIXED_EXACT=0`: never; read once per process).
+fn fixed_exact_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_FIXED_EXACT").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
+/// [`number_to_fixed`] by exact integer arithmetic, for the common case
+/// (a finite `n` below `1e21`, at most 20 digits, `n·10^digits` within 128
+/// bits): `n` is `m·2^e` exactly, so the `k` whose `k / 10^digits` is
+/// nearest it (the larger on a tie, as `Number.prototype.toFixed` picks) is
+/// `m·10^digits` shifted by `e`, rounded half up — no float formatting.
+/// `None` otherwise.
+fn number_to_fixed_exact(n: f64, digits: usize) -> Option<String> {
+    let bits = n.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    if biased == 0x7ff || digits > 20 || !(n > -1e21 && n < 1e21) {
+        return None;
+    }
+    let frac = u128::from(bits & ((1u64 << 52) - 1));
+    // `|n| = m · 2^e` (a subnormal has no implicit bit and the least exponent).
+    let (m, e) = if biased == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u128 << 52), biased - 1075)
+    };
+    let scaled = m.checked_mul(10u128.pow(digits as u32))?;
+    let k = if e >= 0 {
+        scaled.checked_mul(1u128.checked_shl(e as u32)?)?
+    } else if e <= -128 {
+        // (`scaled` is below 2^127, so under half of 2^-e: rounds to 0.)
+        0
+    } else {
+        let s = (-e) as u32;
+        let q = scaled >> s;
+        let rem = scaled & ((1u128 << s) - 1);
+        q + u128::from(rem >= 1u128 << (s - 1))
+    };
+    // The digits of `k`, at least `digits + 1` of them, with the point
+    // before the last `digits`.
+    let mut buf = [0u8; 48];
+    let mut i = buf.len();
+    let mut v = k;
+    let mut written = 0;
+    while v > 0 || written <= digits {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        written += 1;
+    }
+    let int_len = written - digits;
+    let mut out = String::with_capacity(written + 2);
+    // (The sign from `n < 0`, so `-0` has none and a tiny negative that
+    // rounds to zero keeps it.)
+    if n < 0.0 {
+        out.push('-');
+    }
+    let ds = &buf[i..];
+    out.push_str(core::str::from_utf8(&ds[..int_len]).ok()?);
+    if digits > 0 {
+        out.push('.');
+        out.push_str(core::str::from_utf8(&ds[int_len..]).ok()?);
+    }
+    Some(out)
+}
+
+/// [`number_to_fixed`] through the float formatter (every case).
+fn number_to_fixed_fmt(n: f64, digits: usize) -> String {
     if !n.is_finite() {
         // `Infinity`/`-Infinity`/`NaN` use the spec ToString.
         crate::realm::js_number_string(n)

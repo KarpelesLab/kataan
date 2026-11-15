@@ -3390,6 +3390,65 @@ fn coercion_string_number_join_freeze_tofixed() {
     assert_eq!(run("(123.456).toFixed(2)"), "123.46");
 }
 
+/// The exact-integer `toFixed` agrees with the formatter's on every value it
+/// answers: exact halves, near-halves, subnormals, signed zeros, tiny
+/// negatives, large magnitudes and pseudo-random doubles at 0..=20 digits.
+#[test]
+fn to_fixed_exact_matches_formatter() {
+    let mut vals: Vec<f64> = alloc::vec![
+        0.0,
+        -0.0,
+        0.5,
+        1.5,
+        2.5,
+        -2.5,
+        0.125,
+        1.005,
+        2.355,
+        123.456,
+        -123.456,
+        1e-7,
+        -1e-7,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        5e-324,
+        -5e-324,
+        9_007_199_254_740_991.0,
+        9_007_199_254_740_993.0,
+        1e20,
+        -1e20,
+        999_999_999_999_999_900_000.0,
+        0.1,
+        0.2,
+        0.3,
+        1.45,
+        8.345,
+        -8.345,
+    ];
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..20_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        // A spread of magnitudes: random bits, and decimals with few digits.
+        vals.push(f64::from_bits(x));
+        vals.push((x % 10_000_000) as f64 / [1.0, 10.0, 100.0, 1000.0, 8.0][(x % 5) as usize]);
+        vals.push(-((x % 99_999) as f64) / 64.0);
+    }
+    // (The common cases are the exact path's.)
+    assert_eq!(number_to_fixed_exact(123.456, 2).as_deref(), Some("123.46"));
+    assert_eq!(number_to_fixed_exact(-0.0, 2).as_deref(), Some("0.00"));
+    assert_eq!(number_to_fixed_exact(-5e-324, 0).as_deref(), Some("-0"));
+    assert_eq!(number_to_fixed_exact(2.5, 0).as_deref(), Some("3"));
+    for &v in &vals {
+        for d in 0..=20 {
+            if let Some(fast) = number_to_fixed_exact(v, d) {
+                assert_eq!(fast, number_to_fixed_fmt(v, d), "({v:e}).toFixed({d})");
+            }
+        }
+    }
+}
+
 #[test]
 fn math_abs_round_and_create_descriptors() {
     // Math.round rounds half toward +Infinity (not away from zero).

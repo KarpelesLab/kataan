@@ -13063,7 +13063,7 @@ fn vm_set_elem(
 /// `site` is the interpreter's own cache for the op (`None` from compiled
 /// code): an ordinary object's `length` read through it leaves the site the
 /// memo (and getter feedback) a named read's would, which the machine-code
-/// tier compiles such a site from (as a named read, `jit::length_get`).
+/// tier compiles such a site from (as a named read, `jit::length_get_sites`).
 fn vm_array_len(
     ctx: &mut Ctx,
     funcs: &[FnProto],
