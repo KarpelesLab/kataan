@@ -2390,6 +2390,15 @@ fn ident_sub_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IDENTSUB").is_none_or(|v| v != "0"))
 }
 
+/// Whether an inlined method call's guard has its lookup and callee
+/// identification (what runs when none of its fast path's memos holds) out
+/// of line, so its fast path runs straight on into the inlined body
+/// (`KATAAN_JIT_GUARDCOLD=0` disables). Read once.
+fn guard_cold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GUARDCOLD").is_none_or(|v| v != "0"))
+}
+
 /// A call site's call of its [`IdentSub`] `entry` (the site in `r11`; for
 /// [`IdentSub::have`] the callee value loaded from `callee` into `r9`), then
 /// the slow path or `identified`.
@@ -3986,6 +3995,9 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         a.bind(checked);
     }
     // 2. The callee value, into the `callee` slot (and rax).
+    // (A method guard's lookup and identification, past its fast path's
+    // memos, are out of line: `guard_cold_enabled`.)
+    let mut slow_cold = None;
     match e.callee {
         CalleeSrc::Reg(c) => a.g_load(r::RAX, r::RBX, reg(c)),
         // A later way's: the value the first way's guard found.
@@ -4052,6 +4064,9 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
                 .filter(|_| chain_first)
                 .map(|o| (o, lookup_miss));
             emit_guard_fast(a, e, (way, ways.max(1)), (slow, other), identified, miss)?;
+            if guard_cold_enabled() {
+                slow_cold = Some(a.cold_begin());
+            }
             a.bind(slow);
             a.dbg_mark("g-lookup");
             a.p_accessor_lookup_walked(jl, l.realm, site, lookup_miss, getter, e.setter);
@@ -4139,6 +4154,10 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
         if looked_up {
             emit_guard_fill(a, e, way);
         }
+    }
+    if let Some(cold) = slow_cold {
+        a.jmp(identified);
+        a.cold_end(cold);
     }
     a.bind(identified);
     // (Where the first way's guard brings a callee its memos identified as
