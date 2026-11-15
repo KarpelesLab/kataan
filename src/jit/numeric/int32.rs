@@ -292,6 +292,9 @@ pub(super) fn plan(
     // version has): see `NumGen::emit_spec_int_op`.
     let (spec, cold) = (spec.is_some(), spec.unwrap_or(&[]));
     let arm_of = |pc: usize| cold.iter().find(|&&(_, f, e)| (f..e).contains(&pc));
+    // The registers each op of the region names, listed once
+    // ([`RegsAt`]).
+    let regs_at = RegsAt::new(bytecode, head, end);
     // There, a temporary's int intervals are its **live ranges** in the
     // fast versions: the runs of pcs where it is live or mentioned, or a
     // branch carries its value across (so a value only flows within one
@@ -309,15 +312,13 @@ pub(super) fn plan(
                 continue;
             }
             // (One mentioned only in fallback arms is no int register.)
-            if (head..=end)
-                .all(|pc| arm_of(pc).is_some() || !super::op_regs(&bytecode[pc]).contains(&r))
-            {
+            if (head..=end).all(|pc| arm_of(pc).is_some() || !regs_at.names(pc, r)) {
                 continue;
             }
             let n = end - head + 1;
             let mut occ = alloc::vec![false; n];
             for pc in head..=end {
-                if !super::op_regs(&bytecode[pc]).contains(&r) {
+                if !regs_at.names(pc, r) {
                     if arm_of(pc).is_none() && live(pc, r) {
                         occ[pc - head] = true;
                     }
@@ -850,7 +851,7 @@ pub(super) fn plan(
         let spec_slots = if spec || !loops.is_empty() {
             let in_arm = |pc: usize| arm_of(pc).is_some();
             let need = |x: &(u16, usize, usize, u32, bool)| needs(&x);
-            match spec_alloc(bytecode, (head, end), info, &need, &carried, &in_arm, loops).and_then(
+            match spec_alloc(&regs_at, (head, end), info, &need, &carried, &in_arm, loops).and_then(
                 |v| {
                     // (A promoted global lives in a GPR, `PGlobal`.)
                     let homeless: Vec<u16> =
@@ -1280,9 +1281,51 @@ fn saves_gprs(op: &Op) -> bool {
 /// the whole interval (the frame slots survive the generic emitter's code
 /// and its calls, so they need no save). `Err`: the registers no slot was
 /// left for either.
+/// The registers each op of a region names (`super::op_regs`), listed
+/// once for the region rather than at every question about one register
+/// (`KATAAN_JIT_REGSMEMO=0`: asked of the op each time).
+pub(super) struct RegsAt<'a> {
+    bytecode: &'a [Op],
+    head: usize,
+    /// Per pc from `head`: its op's registers (empty when not memoized).
+    regs: Vec<Vec<u16>>,
+}
+
+impl<'a> RegsAt<'a> {
+    pub(super) fn new(bytecode: &'a [Op], head: usize, end: usize) -> Self {
+        let regs = if regs_memo_enabled() {
+            bytecode
+                .get(head..=end)
+                .map_or_else(Vec::new, |b| b.iter().map(super::op_regs).collect())
+        } else {
+            Vec::new()
+        };
+        RegsAt {
+            bytecode,
+            head,
+            regs,
+        }
+    }
+
+    /// Whether op `pc` names register `r`.
+    pub(super) fn names(&self, pc: usize, r: u16) -> bool {
+        match pc.checked_sub(self.head).and_then(|i| self.regs.get(i)) {
+            Some(v) => v.contains(&r),
+            None => super::op_regs(&self.bytecode[pc]).contains(&r),
+        }
+    }
+}
+
+/// Whether [`RegsAt`] lists a region's registers once (unless
+/// `KATAAN_JIT_REGSMEMO=0`). Read once.
+fn regs_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_REGSMEMO").is_none_or(|v| v != "0"))
+}
+
 #[allow(clippy::type_complexity)]
 fn spec_alloc(
-    bytecode: &[Op],
+    regs_at: &RegsAt<'_>,
     (head, end): (usize, usize),
     info: &[(u16, usize, usize, u32, bool)],
     needs: &dyn Fn(&(u16, usize, usize, u32, bool)) -> bool,
@@ -1290,13 +1333,14 @@ fn spec_alloc(
     in_arm: &dyn Fn(usize) -> bool,
     loops: &[(usize, usize)],
 ) -> Result<(Vec<ISlot>, usize), Vec<u16>> {
+    let bytecode = regs_at.bytecode;
     // (register, start, end, carried, dirty, weight)
     let mut ivs: Vec<(u16, usize, usize, bool, bool, u64)> = Vec::new();
     for x in info.iter().filter(|x| needs(x)) {
         let c = carried(x.0);
         let (s, e) = if c { (head, end) } else { (x.1, x.2) };
         let w: u64 = (s..=e)
-            .filter(|&pc| !in_arm(pc) && super::op_regs(&bytecode[pc]).contains(&x.0))
+            .filter(|&pc| !in_arm(pc) && regs_at.names(pc, x.0))
             .map(|pc| {
                 let d = loops.iter().filter(|&&(h, le)| h <= pc && pc <= le).count();
                 8u64.pow(d.min(5) as u32)
@@ -1304,7 +1348,7 @@ fn spec_alloc(
             .sum();
         // (A register no op names is a promoted global's pseudo-register
         // (a numeric nest's, `PGlobal`), which must have a GPR: first.)
-        let named = (head..=end).any(|pc| super::op_regs(&bytecode[pc]).contains(&x.0));
+        let named = (head..=end).any(|pc| regs_at.names(pc, x.0));
         let w = if named { w } else { u64::MAX >> 16 };
         ivs.push((x.0, s, e, c, x.4, w));
     }
