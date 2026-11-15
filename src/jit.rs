@@ -12350,8 +12350,12 @@ impl JitFunction {
                                 }
                             }
                             a.cvttsd2si_rax_xmm0();
-                            a.movabs_r11(i64::MIN);
-                            a.cmp_rax_r11();
+                            if matches!(f, MathInline::Clz32) && numeric::int_const_enabled() {
+                                a.cmp_rax_const(i64::MIN as u64);
+                            } else {
+                                a.movabs_r11(i64::MIN);
+                                a.cmp_rax_r11();
+                            }
                             a.je(general);
                             if let MathInline::Imul = f {
                                 a.raw(&[0x48, 0x89, 0xc1]); // mov rcx, rax

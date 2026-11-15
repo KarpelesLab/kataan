@@ -5991,8 +5991,12 @@ impl NumGen {
             }
         };
         a.cvttsd2si_gpr_x(gpr, x);
-        a.movabs_r11(INDEFINITE as i64);
-        a.cmp_gpr_r11(gpr);
+        if int_const_enabled() {
+            a.cmp_gpr_const(gpr, INDEFINITE);
+        } else {
+            a.movabs_r11(INDEFINITE as i64);
+            a.cmp_gpr_r11(gpr);
+        }
         a.jcc(CC_E, stub);
     }
 
@@ -7748,6 +7752,15 @@ impl NumGen {
 fn bit_test_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_BITTEST").is_none_or(|v| v != "0"))
+}
+
+/// Whether a Number's truncation (`to_int32`: the bitwise operators' and
+/// `~x`'s) is tested for the "indefinite" integer against the code's constant
+/// word, one instruction (`KATAAN_JIT_INTCONST=0` turns it off, read once per
+/// process).
+pub(super) fn int_const_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INTCONST").is_none_or(|v| v != "0"))
 }
 
 /// Whether a unary `-x` / `~x` of a value not proven a Number skips its
@@ -11974,6 +11987,15 @@ impl X64Assembler {
     pub(super) fn cmp_rax_const(&mut self, value: u64) {
         let c = self.const_word(value);
         self.code.extend_from_slice(&[0x48, 0x3b, 0x05]);
+        self.emit_rel32(c);
+    }
+
+    /// `cmp gpr, [rip + c]`, `c` the constant word `value` (as
+    /// [`cmp_rax_const`](Self::cmp_rax_const), any general-purpose register).
+    pub(super) fn cmp_gpr_const(&mut self, gpr: u8, value: u64) {
+        let c = self.const_word(value);
+        self.code
+            .extend_from_slice(&[0x48 | ((gpr >> 3) & 1) << 2, 0x3b, ((gpr & 7) << 3) | 5]);
         self.emit_rel32(c);
     }
 
