@@ -5367,6 +5367,10 @@ impl Realm {
     /// the object to no code and leaves it owning no property — so nothing
     /// holds it but that call's dead argument register. (Taking it again
     /// resets its `lastIndex`.) A full pool keeps what it has.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
     pub(crate) fn regexp_lend_return(&mut self, re: NanBox) {
         let Some(raw) = re.as_handle() else {
             return;

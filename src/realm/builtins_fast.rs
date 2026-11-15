@@ -1879,6 +1879,21 @@ pub struct MethodSiteCache {
     swaps: u32,
 }
 
+/// Whether a short concatenation whose pieces' UTF-16 lengths were not all
+/// known records its own when it is all ASCII (`KATAAN_CONCAT_ASCII_LEN=0`
+/// leaves it to be counted on first use; read once per process).
+fn concat_ascii_len_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_CONCAT_ASCII_LEN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether `Realm::typeof_is_string` may answer a string cell from
 /// `Realm::str_special` alone (`KATAAN_STR_PLAIN=0` always looks the cell's
 /// auxiliary object up).
@@ -2315,8 +2330,14 @@ impl Realm {
             }
             Some((n, units))
         };
+        // (A result whose pieces' lengths were not all known is still known
+        // when it is all ASCII — one scan of a short text, so its `.length`
+        // and indexed reads need none later.)
         let make = |bytes: &[u8], units: Option<usize>| match units {
             Some(u) => Rope::from_bytes_units(bytes, u),
+            None if concat_ascii_len_on() && bytes.is_ascii() => {
+                Rope::from_bytes_units(bytes, bytes.len())
+            }
             None => Rope::from_bytes(bytes),
         };
         // (Past the bound: room for a Number written as a whole buffer, and
