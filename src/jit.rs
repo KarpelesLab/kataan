@@ -76,6 +76,8 @@ mod recv_cache;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod sink;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+mod str_cmp;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod switch_tree;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod tierup;
@@ -18623,6 +18625,22 @@ impl JitFunction {
                     a.jmp(done);
                     a.bind(slow);
                     if str_compare_enabled() {
+                        // Two short strings: compared inline
+                        // (`str_cmp`).
+                        if str_cmp::enabled() {
+                            let miss = a.new_label();
+                            a.p_small_str_cmp(
+                                compute_jit_layout(),
+                                (helpers.call_layout.realm, helpers.call_layout.str_special),
+                                (disp(ra), disp(rb)),
+                                op,
+                                tag_false,
+                                miss,
+                            );
+                            a.store_rax(disp(dst));
+                            a.jmp(done);
+                            a.bind(miss);
+                        }
                         // Two strings: `jit_helper_str_compare` (runs no
                         // code); anything it declines, the interpreter's op.
                         let declined = a.new_label();

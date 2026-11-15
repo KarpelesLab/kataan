@@ -7557,6 +7557,24 @@ impl NumGen {
                     refuse,
                 } => {
                     self.flush(a, s.region);
+                    // Two short Strings' comparison: inline
+                    // (`super::str_cmp`), stored as the helper's answer.
+                    let inline = (helper == self.env.str_compare && super::str_cmp::enabled())
+                        .then(|| a.new_label());
+                    if let (Some(served), Some(op)) = (inline, extra) {
+                        let miss = a.new_label();
+                        a.p_small_str_cmp(
+                            &self.env.heap,
+                            (self.env.realm, self.env.layout.str_special),
+                            (disp(x), disp(y)),
+                            op as u8,
+                            self.tag_false,
+                            miss,
+                        );
+                        a.store_rax(disp(dst));
+                        a.jmp(served);
+                        a.bind(miss);
+                    }
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(x));
                     a.load_argreg(2, disp(y));
@@ -7594,6 +7612,9 @@ impl NumGen {
                         a.bind(joined);
                     } else {
                         a.store_rax(disp(dst));
+                    }
+                    if let Some(l) = inline {
+                        a.bind(l);
                     }
                     self.reload(a, s.region);
                     self.recheck_globals(a, s.region);
