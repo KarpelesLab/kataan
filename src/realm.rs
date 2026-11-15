@@ -492,6 +492,11 @@ pub struct Realm {
     /// with that very value skips the check (a handle's bits name one live
     /// cell: a freed one's slot is reused under another generation), or 0.
     pub(crate) coll_iter_next: u64,
+    /// For compiled code: the shape word of `coll_iter_layout` (0 while
+    /// none is learned) and its two slots, in its keys' order
+    /// ([`Realm::set_coll_iter_layout`]).
+    pub(crate) coll_iter_shape: u64,
+    pub(crate) coll_iter_slots: [u32; 2],
     /// The hidden-state layout of a snapshot-buffer built-in iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) buf_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
@@ -1213,6 +1218,8 @@ impl Realm {
             len_cache: None,
             coll_iter_layout: None,
             coll_iter_next: 0,
+            coll_iter_shape: 0,
+            coll_iter_slots: [0; 2],
             buf_iter_layout: None,
             str_iter_layout: None,
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
@@ -4386,33 +4393,34 @@ impl Realm {
     /// [`collection_find_ro`](Self::collection_find_ro) of a collection
     /// with a hash index (`map`, over `entries`) for a String or Number
     /// `key`, its cell read once for both the hash and the compares: the
-    /// position found (if any) and the key's hash. `None` for any other
-    /// key (the general path's).
+    /// position found (if any), the key's hash and, on a miss, the index
+    /// slot an insert of it takes (`CollIndex::find_free`). `None` for any
+    /// other key (the general path's).
     #[inline]
     pub(super) fn coll_probe_lean(
         &self,
         map: &coll_index::CollIndex,
         entries: &[(NanBox, NanBox)],
         key: NanBox,
-    ) -> Option<(Option<usize>, u64)> {
+    ) -> Option<(Option<usize>, u64, usize)> {
         let bits = key.to_bits();
         if let Some(n) = key.as_number() {
             let hash = coll_num_hash(n);
-            let pos = map.find(hash, |i| {
+            let (pos, free) = map.find_free(hash, |i| {
                 entries.get(i).is_some_and(|(k, _)| {
                     k.to_bits() == bits
                         || k.as_number()
                             .is_some_and(|m| m == n || (m.is_nan() && n.is_nan()))
                 })
             });
-            return Some((pos, hash));
+            return Some((pos, hash, free));
         }
         let Some(Cell::Str(r)) = self.heap.get_hot(Handle::from_raw(key.as_handle()?)) else {
             return None;
         };
         let hash = coll_str_hash(r);
         // (A String equals only a String; a tombstone's hole is no handle.)
-        let pos = map.find(hash, |i| {
+        let (pos, free) = map.find_free(hash, |i| {
             entries.get(i).is_some_and(|(k, _)| {
                 k.to_bits() == bits
                     || k.as_handle().is_some_and(|h| {
@@ -4421,7 +4429,7 @@ impl Realm {
                     })
             })
         });
-        Some((pos, hash))
+        Some((pos, hash, free))
     }
 
     /// The index of the entry whose key is `SameValueZero`-equal to `key`, using
@@ -4845,6 +4853,17 @@ impl Realm {
             NanBox::undefined(),
             NanBox::number(0.0),
         ])
+    }
+
+    /// Records the learned layout of a live Set/Map iterator
+    /// (`coll_iter_layout`), and its shape word and slots for compiled code.
+    pub(crate) fn set_coll_iter_layout(&mut self, l: Option<hidden_layout::HiddenLayout<2>>) {
+        #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+        if let Some(l) = &l {
+            self.coll_iter_shape = crate::jit::shape_word(l.shape());
+            self.coll_iter_slots = l.slots();
+        }
+        self.coll_iter_layout = l;
     }
 
     /// One step of the live iterator whose state (see

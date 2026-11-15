@@ -14959,6 +14959,26 @@ impl JitFunction {
                                 match num.spec_bail(&mut a, op_idx) {
                                     Some(bail) => a.jmp(bail),
                                     None => {
+                                        // A live Map/Set iterator's step,
+                                        // inline (`coll::p_coll_iter_step`).
+                                        if coll::coll_iter_enabled() && a.pinned() {
+                                            let helper = a.new_label();
+                                            let body =
+                                                num.iter_step_body(&labels, op_idx).unwrap_or(fin);
+                                            a.p_coll_iter_step(
+                                                &layout,
+                                                helpers.call_layout.realm,
+                                                coll::IterRegs {
+                                                    dst: disp(dst),
+                                                    done: disp(done),
+                                                    iter: disp(iter),
+                                                    next: disp(next),
+                                                },
+                                                helper,
+                                                body,
+                                            );
+                                            a.bind(helper);
+                                        }
                                         let op_ptr: *const crate::nbvm::Op =
                                             bytecode.get(pc as usize)?;
                                         a.mov_rdi_r15();
@@ -15023,6 +15043,26 @@ impl JitFunction {
                                 match num.spec_bail(&mut a, op_idx) {
                                     Some(bail) => a.jmp(bail),
                                     None => {
+                                        // A live Map/Set iterator's step,
+                                        // inline (`coll::p_coll_iter_step`).
+                                        if coll::coll_iter_enabled() && a.pinned() {
+                                            let helper = a.new_label();
+                                            let body =
+                                                num.iter_step_body(&labels, op_idx).unwrap_or(fin);
+                                            a.p_coll_iter_step(
+                                                &layout,
+                                                helpers.call_layout.realm,
+                                                coll::IterRegs {
+                                                    dst: disp(dst),
+                                                    done: disp(done),
+                                                    iter: disp(iter),
+                                                    next: disp(next),
+                                                },
+                                                helper,
+                                                body,
+                                            );
+                                            a.bind(helper);
+                                        }
                                         let op_ptr: *const crate::nbvm::Op =
                                             bytecode.get(pc as usize)?;
                                         a.mov_rdi_r15();

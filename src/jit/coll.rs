@@ -209,6 +209,10 @@ pub(crate) struct CollLayout {
     entries_cap: i32,
     live: i32,
     index: i32,
+    /// The compaction epoch (`u32`).
+    epoch: i32,
+    /// `CollIndex::head` (`u32`), from the index's box.
+    index_head: i32,
     entry_size: i32,
     entry_key: i32,
     entry_val: i32,
@@ -243,6 +247,8 @@ pub(crate) fn coll_layout() -> &'static CollLayout {
             entries_cap: at(c.entries_cap_off),
             live: at(c.live_off),
             index: at(c.index_off),
+            epoch: at(c.epoch_off),
+            index_head: i(core::mem::offset_of!(crate::realm::CollIndex, head)),
             entry_size: i(c.entry_size),
             entry_key: i(c.entry_key_off),
             entry_val: i(c.entry_val_off),
@@ -1157,5 +1163,226 @@ impl X64Assembler {
     fn g_dec(&mut self, reg: u8) {
         self.code.push(0x48 | ((reg >> 3) & 1));
         self.code.extend_from_slice(&[0xff, 0xc8 | (reg & 7)]);
+    }
+}
+
+/// The frame displacements of an `Op::IterNext`'s registers, for
+/// [`X64Assembler::p_coll_iter_step`].
+#[derive(Clone, Copy)]
+pub(crate) struct IterRegs {
+    pub(crate) dst: i32,
+    pub(crate) done: i32,
+    pub(crate) iter: i32,
+    pub(crate) next: i32,
+}
+
+/// Whether a compiled `for-of` step over a live Map/Set keys/values
+/// iterator runs inline (`X64Assembler::p_coll_iter_step`;
+/// `KATAAN_JIT_COLLITER=0` turns it off, read once per process).
+pub(crate) fn coll_iter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLITER").is_none_or(|v| v != "0"))
+}
+
+impl X64Assembler {
+    /// One step of a `for-of` over a live Map/Set `keys` / `values`
+    /// iterator, inline: what `Realm::collection_iter_advance_kv` does on
+    /// its common path, for an iterator `nbexec::coll_iter_step_lean`
+    /// would take — `next` the built-in one the last such step confirmed
+    /// (`Realm::coll_iter_next`), `done` not `true`, the iterator an
+    /// ordinary shaped object of the learned layout
+    /// (`Realm::coll_iter_shape` / `coll_iter_slots`, neither frozen nor
+    /// with a read-only property, both slots inline), its state an array
+    /// of five elements whose `kind` is 0 or 1, whose `status` is 0 or 1
+    /// and whose epoch is its collection's (no compaction since), and a
+    /// live entry at or past the cursor (and the index's dead prefix).
+    /// Then the step's value (the key, or for a Map's `values` the value)
+    /// goes to `dst`, the cursor past the entry, the last key to the
+    /// entry's key (when the write barrier has nothing to do for it,
+    /// `p_barrier_check`) and the status to 1, extending the index's dead
+    /// prefix as the Rust step does; and on to `body`. Anything else
+    /// (another iterator, the end, an entries iterator, a renumbered
+    /// cursor, a barrier with work) goes to `miss` with nothing done but
+    /// `dst` written and the dead prefix extended (which the step there
+    /// computes alike). Needs the arena pinned. Clobbers `rax`, `rcx`,
+    /// `rdx`, `r8`–`r11`, `xmm0`.
+    pub(crate) fn p_coll_iter_step(
+        &mut self,
+        l: &super::JitLayout,
+        realm_off: i32,
+        f: IterRegs,
+        miss: Label,
+        body: Label,
+    ) {
+        use crate::realm::Realm;
+        use core::mem::offset_of;
+        debug_assert!(self.pinned());
+        let cl = *coll_layout();
+        let o = |v: usize| i32::try_from(v).expect("realm offset fits in i32");
+        let next_off = o(offset_of!(Realm, coll_iter_next));
+        let shape_off = o(offset_of!(Realm, coll_iter_shape));
+        let slots_off = o(offset_of!(Realm, coll_iter_slots));
+        const ONE: u64 = 1.0f64.to_bits();
+        let hole = crate::nanbox::NanBox::hole().to_bits();
+        // `done` not `true`.
+        self.g_load(r::RAX, r::RBX, f.done);
+        self.cmp_gpr_const(r::RAX, TRUE_BITS);
+        self.je(miss);
+        // `next` the confirmed built-in (a handle: never 0).
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_load(r::RDX, r::RBX, f.next);
+        self.g_test(r::RDX);
+        self.je(miss);
+        self.g_cmp_mem(r::RDX, r::R11, next_off);
+        self.jne(miss);
+        // The iterator: an ordinary shaped object of the layout's shape.
+        self.g_load(r::RAX, r::RBX, f.iter);
+        self.p_is_handle(r::RCX, miss);
+        self.p_slot_rooted(l, r::RCX, miss);
+        self.p_object_not_exotic(l, miss);
+        self.p_test_byte_imm(
+            r::RCX,
+            l.props.off_jit_flags,
+            crate::object::JIT_FLAG_READONLY | crate::object::OBJ_FLAG_FROZEN,
+        );
+        self.jne(miss);
+        self.g_load(r::RDX, r::R11, shape_off);
+        self.g_test(r::RDX);
+        self.je(miss);
+        self.g_cmp_mem(r::RDX, r::RCX, l.off_shape);
+        self.jne(miss);
+        // r10 = its collection, rax = its state (inline slots only).
+        self.g_mem(false, &[0x8b], r::RAX, r::R11, slots_off); // mov eax, [r11 + slots]
+        self.p_obj_slot_load_inline(l, miss, miss);
+        self.g_mov(r::R10, r::RAX);
+        self.g_load(r::R11, r::R15, realm_off);
+        self.g_mem(false, &[0x8b], r::RAX, r::R11, slots_off + 4); // mov eax, [r11 + slots + 4]
+        self.p_obj_slot_load_inline(l, miss, miss);
+        // The state: an array of five elements (rcx its slot, r11 them).
+        self.p_is_handle(r::RCX, miss);
+        self.p_slot_rooted(l, r::RCX, miss);
+        self.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_array_disc);
+        self.jne(miss);
+        self.p_arr_len_ptr(l);
+        self.g_cmp_imm(r::R8, 5);
+        self.jne(miss);
+        // kind 0 or 1, status 0 or 1 (their bits).
+        let kind_ok = self.new_label();
+        self.g_load(r::RDX, r::R11, 0);
+        self.g_test(r::RDX);
+        self.je(kind_ok);
+        self.cmp_gpr_const(r::RDX, ONE);
+        self.jne(miss);
+        self.bind(kind_ok);
+        let status_ok = self.new_label();
+        self.g_load(r::RDX, r::R11, 32);
+        self.g_test(r::RDX);
+        self.je(status_ok);
+        self.cmp_gpr_const(r::RDX, ONE);
+        self.jne(miss);
+        self.bind(status_ok);
+        // r10 = the cursor (an integer below 2^32: else the Rust step's);
+        // rax = the collection's bits.
+        self.g_mov(r::RAX, r::R10);
+        self.raw(&[0xf2, 0x41, 0x0f, 0x10, 0x43, 0x08]); // movsd xmm0, [r11 + 8]
+        self.raw(&[0xf2, 0x4c, 0x0f, 0x2c, 0xd0]); // cvttsd2si r10, xmm0
+        self.g_mov(r::RDX, r::R10);
+        self.g_shr_imm(r::RDX, 32);
+        self.jne(miss);
+        // rdx = the state's epoch bits.
+        self.g_load(r::RDX, r::R11, 16);
+        // The collection (r9 its slot), of the state's epoch.
+        self.p_is_handle(r::RCX, miss);
+        self.p_slot_rooted(l, r::R9, miss);
+        self.g_cmp_byte_imm(r::R9, l.off_cell_tag, cl.disc);
+        self.jne(miss);
+        self.g_mem(false, &[0x8b], r::RAX, r::R9, cl.epoch); // mov eax, [r9 + epoch]
+        self.raw(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0, rax
+        self.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+        self.g_cmp(r::RAX, r::RDX);
+        self.jne(miss);
+        // xmm0 = the step's mode: 0 to yield the key (keys, or a Set),
+        // else the value; read while r11 is the state.
+        let mode_set = self.new_label();
+        self.g_load(r::RAX, r::R11, 0);
+        self.g_cmp_byte_imm(r::R9, cl.is_set, 0);
+        self.je(mode_set);
+        self.raw(&[0x31, 0xc0]); // xor eax, eax
+        self.bind(mode_set);
+        self.raw(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+        // from = max(cursor, index head); rdx = the index's box when the
+        // head is to be extended to the entry found (cursor <= head).
+        let no_index = self.new_label();
+        let past_head = self.new_label();
+        let from_set = self.new_label();
+        self.g_load(r::RDX, r::R9, cl.index);
+        self.raw(&[0x45, 0x31, 0xc0]); // xor r8d, r8d
+        self.g_test(r::RDX);
+        self.je(no_index);
+        self.g_mem(false, &[0x8b], r::R8, r::RDX, cl.index_head); // mov r8d, [rdx + head]
+        self.bind(no_index);
+        self.g_cmp(r::R10, r::R8);
+        self.g_jcc(cc::A, past_head);
+        self.g_mov(r::R10, r::R8);
+        self.jmp(from_set);
+        self.bind(past_head);
+        self.raw(&[0x31, 0xd2]); // xor edx, edx
+        self.bind(from_set);
+        // The scan: r11 = &entries[from], r8 = the entry count; the end
+        // is the Rust step's.
+        self.g_load(r::R8, r::R9, cl.entries_len);
+        self.g_mov(r::R11, r::R10);
+        debug_assert_eq!(cl.entry_size, 16);
+        self.raw(&[0x49, 0xc1, 0xe3, 0x04]); // shl r11, 4
+        self.g_add_mem(r::R11, r::R9, cl.entries_ptr);
+        let scan = self.new_label();
+        let found = self.new_label();
+        self.bind(scan);
+        self.g_cmp(r::R10, r::R8);
+        self.g_jcc(cc::AE, miss);
+        self.g_load(r::RAX, r::R11, cl.entry_key);
+        self.cmp_gpr_const(r::RAX, hole);
+        self.jne(found);
+        self.raw(&[0x49, 0xff, 0xc2]); // inc r10
+        self.raw(&[0x49, 0x83, 0xc3, 0x10]); // add r11, 16
+        self.jmp(scan);
+        self.bind(found);
+        // The dead prefix extended to the entry (r10 its position).
+        let head_kept = self.new_label();
+        self.g_test(r::RDX);
+        self.je(head_kept);
+        self.g_mem(false, &[0x89], r::R10, r::RDX, cl.index_head); // mov [rdx + head], r10d
+        self.bind(head_kept);
+        // dst = the key (rax) or the entry's value.
+        let key_mode = self.new_label();
+        let have = self.new_label();
+        self.raw(&[0x66, 0x49, 0x0f, 0x7e, 0xc0]); // movq r8, xmm0
+        self.g_test(r::R8);
+        self.je(key_mode);
+        self.g_load(r::R8, r::R11, cl.entry_val);
+        self.jmp(have);
+        self.bind(key_mode);
+        self.g_mov(r::R8, r::RAX);
+        self.bind(have);
+        self.g_store(r::RBX, f.dst, r::R8);
+        // xmm0 = the cursor past the entry.
+        self.raw(&[0x4d, 0x8d, 0x42, 0x01]); // lea r8, [r10 + 1]
+        self.raw(&[0xf2, 0x49, 0x0f, 0x2a, 0xc0]); // cvtsi2sd xmm0, r8
+        // The last key's store into the state (rcx): nothing for the
+        // barrier to do, else the Rust step.
+        let pop_miss = self.new_label();
+        self.raw(&[0x50]); // push rax
+        self.p_barrier_check(l, realm_off, pop_miss);
+        self.raw(&[0x58]); // pop rax
+        self.p_arr_len_ptr(l);
+        self.raw(&[0xf2, 0x41, 0x0f, 0x11, 0x43, 0x08]); // movsd [r11 + 8], xmm0
+        self.g_store(r::R11, 24, r::RAX);
+        self.g_movabs(r::R8, ONE);
+        self.g_store(r::R11, 32, r::R8);
+        self.jmp(body);
+        self.bind(pop_miss);
+        self.raw(&[0x58]); // pop rax
+        self.jmp(miss);
     }
 }

@@ -126,6 +126,65 @@ impl CollIndex {
         }
     }
 
+    /// [`find`](Self::find), and on a miss where [`insert`](Self::insert)
+    /// would then place an entry hashing to `hash` were the table not to
+    /// grow first: the first removed or empty slot of the probe sequence
+    /// (`usize::MAX` for an empty table). For
+    /// [`insert_at`](Self::insert_at), with nothing changed in between.
+    #[inline]
+    pub fn find_free(
+        &self,
+        hash: u64,
+        mut is_key: impl FnMut(usize) -> bool,
+    ) -> (Option<usize>, usize) {
+        if self.slots.is_empty() {
+            return (None, usize::MAX);
+        }
+        let h = fold(hash);
+        let mask = self.slots.len() - 1;
+        let mut i = home(h, mask);
+        let mut free = usize::MAX;
+        loop {
+            let s = self.slots[i];
+            if s == 0 {
+                return (None, if free == usize::MAX { i } else { free });
+            }
+            if s == GONE {
+                if free == usize::MAX {
+                    free = i;
+                }
+            } else if (s >> 32) as u32 == h {
+                let pos = (s as u32 - 1) as usize;
+                if is_key(pos) {
+                    return (Some(pos), usize::MAX);
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// [`insert`](Self::insert), into slot `free` as [`find_free`]
+    /// (Self::find_free) found it when the table need not grow (the slot
+    /// `insert` would take); otherwise `insert` itself.
+    #[inline]
+    pub fn insert_at(&mut self, free: usize, hash: u64, pos: usize) {
+        if free >= self.slots.len() || (self.used + self.gone + 1) * 2 > self.slots.len() {
+            self.insert(hash, pos);
+            return;
+        }
+        let h = fold(hash);
+        match self.slots[free] {
+            0 => {}
+            GONE => self.gone -= 1,
+            _ => {
+                self.insert(hash, pos);
+                return;
+            }
+        }
+        self.slots[free] = (u64::from(h) << 32) | (pos as u64 + 1);
+        self.used += 1;
+    }
+
     /// Records that the entry at `pos` (not yet indexed) has key hash `hash`.
     pub fn insert(&mut self, hash: u64, pos: usize) {
         if (self.used + self.gone + 1) * 2 > self.slots.len() {

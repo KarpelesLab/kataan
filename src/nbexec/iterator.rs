@@ -3374,7 +3374,7 @@ pub(crate) fn realm_builtin_entry_step(
                 .get_property(h, GEN_CSTATE)
                 .unwrap_or(NanBox::undefined());
             if realm.coll_iter_layout.is_none() {
-                realm.coll_iter_layout = HiddenLayout::learn(realm, h, COLL_ITER_KEYS, &[]);
+                realm.set_coll_iter_layout(HiddenLayout::learn(realm, h, COLL_ITER_KEYS, &[]));
             }
             (coll, state)
         }
@@ -3603,7 +3603,7 @@ pub(crate) fn realm_builtin_iter_step(
     {
         let step = collection_iter_step(realm, h, coll);
         if realm.coll_iter_layout.is_none() {
-            realm.coll_iter_layout = HiddenLayout::learn(realm, h, COLL_ITER_KEYS, &[]);
+            realm.set_coll_iter_layout(HiddenLayout::learn(realm, h, COLL_ITER_KEYS, &[]));
         }
         return Some(step);
     }

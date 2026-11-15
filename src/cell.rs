@@ -1352,6 +1352,8 @@ pub(crate) struct CollCellLayout {
     pub live_off: usize,
     /// The `index` word (`Option<Box<_>>`: zero for `None`).
     pub index_off: usize,
+    /// The compaction `epoch` (a `u32`).
+    pub epoch_off: usize,
     /// One entry's size, and its key's and value's offsets in it.
     pub entry_size: usize,
     pub entry_key_off: usize,
@@ -1389,6 +1391,7 @@ pub(crate) fn jit_coll_layout() -> CollCellLayout {
         entries,
         live,
         index,
+        epoch,
         ..
     } = &cell
     else {
@@ -1442,6 +1445,10 @@ pub(crate) fn jit_coll_layout() -> CollCellLayout {
         entries_cap_off: off(vec_base) + 8 * cap_word,
         live_off: off(core::ptr::addr_of!(*live) as usize),
         index_off: off(index_at),
+        epoch_off: {
+            assert_eq!(core::mem::size_of_val(epoch), 4);
+            off(core::ptr::addr_of!(*epoch) as usize)
+        },
         entry_size: core::mem::size_of::<(NanBox, NanBox)>(),
         entry_key_off: core::ptr::addr_of!(e0.0) as usize - ebase,
         entry_val_off: core::ptr::addr_of!(e0.1) as usize - ebase,

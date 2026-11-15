@@ -27,6 +27,20 @@ pub(crate) fn lean_enabled() -> bool {
     true
 }
 
+/// Whether an insert after the lean probe takes the index slot the probe
+/// found (`CollIndex::insert_at`) instead of probing again
+/// (`KATAAN_JIT_COLLINSERT=0` turns it off; read once per process).
+fn lean_insert_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLINSERT").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
 /// A `Map.prototype` / `Set.prototype` method served by [`Realm::coll_fast`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CollOp {
@@ -123,9 +137,15 @@ impl Realm {
                             && hinted.is_none()
                             && !matches!(op, CollOp::MapDelete | CollOp::SetDelete) =>
                     {
-                        self.coll_probe_lean(map, entries, a).map(|(pos, hash)| {
-                            (pos, hash, pos.and_then(|i| entries.get(i)).map(|e| e.1))
-                        })
+                        self.coll_probe_lean(map, entries, a)
+                            .map(|(pos, hash, free)| {
+                                (
+                                    pos,
+                                    hash,
+                                    pos.and_then(|i| entries.get(i)).map(|e| e.1),
+                                    free,
+                                )
+                            })
                     }
                     _ => None,
                 };
@@ -145,7 +165,7 @@ impl Realm {
             }
             return Some(NanBox::handle(h.to_raw()));
         }
-        if let Some((pos, hash, found)) = probed {
+        if let Some((pos, hash, found, free)) = probed {
             let hint = |i: usize| u32::try_from(i).ok().map(|i| (h.to_raw(), a.to_bits(), i));
             match op {
                 CollOp::MapGet | CollOp::MapHas | CollOp::SetHas => {
@@ -193,7 +213,11 @@ impl Realm {
                     let i = entries.len();
                     entries.push((key, value));
                     *live += 1;
-                    map.insert(hash, i);
+                    if lean_insert_enabled() {
+                        map.insert_at(free, hash, i);
+                    } else {
+                        map.insert(hash, i);
+                    }
                     self.shade_stored(key);
                     self.shade_stored(value);
                     if let Some(t) = hint(i) {
