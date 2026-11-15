@@ -135,6 +135,115 @@ pub(crate) struct Linear {
     /// (`(None, B)`) or with `A B*` (`(Some(A), B)`), outside `u` mode: the
     /// run skip of [`Linear::find_on`].
     skip_run: Option<(Option<usize>, usize)>,
+    /// The one branch as a choice-free sequence, when no quantifier of it
+    /// can ever give back what it took (see [`det_steps`]): each attempt is
+    /// then one pass, with no choice stack.
+    det: Option<Vec<Det>>,
+}
+
+/// A step of a choice-free sequence ([`Linear::det`]).
+#[derive(Clone, Copy)]
+enum Det {
+    /// Record the position in capture slot `n`.
+    Save(usize),
+    /// One exact code unit.
+    Unit(u16),
+    /// Between `min` and `max` units of a set (`usize::MAX`: unbounded),
+    /// as many as there are.
+    Run { set: usize, min: usize, max: usize },
+}
+
+/// The steps of `steps` (one branch, outside `u` mode) as a choice-free
+/// sequence, when its every greedy quantifier is followed by text no unit
+/// of its set can begin: a unit it gave back would then have to start what
+/// follows, which no such unit can, so backing off never finds a match that
+/// taking every unit missed (and when what follows can match empty, taking
+/// every unit never fails). `None` for a branch with an assertion, a lazy
+/// quantifier, or a quantifier whose set may meet what follows it.
+fn det_steps(steps: &[Step], sets: &[Set], prog: &[Inst], flags: Flags) -> Option<Vec<Det>> {
+    if flags.unicode || !det_enabled() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(steps.len());
+    for st in steps {
+        out.push(match *st {
+            Step::Save(n) => Det::Save(n),
+            Step::Unit(u) => Det::Unit(u),
+            Step::One(k) => Det::Run {
+                set: k,
+                min: 1,
+                max: 1,
+            },
+            Step::Rep {
+                set,
+                max,
+                greedy: true,
+                ..
+            } => Det::Run {
+                set,
+                min: 0,
+                max: max.unwrap_or(usize::MAX),
+            },
+            Step::Match => break,
+            _ => return None,
+        });
+    }
+    if !matches!(steps.last(), Some(Step::Match)) {
+        return None;
+    }
+    // Every step that makes a choice (a run of variable length) against
+    // the units that can begin what follows it: those of each step up to
+    // and including the first that must consume.
+    for (i, d) in out.iter().enumerate() {
+        let Det::Run { set, min, max } = *d else {
+            continue;
+        };
+        if min == max {
+            continue;
+        }
+        let mine = &sets[set];
+        for next in &out[i + 1..] {
+            match *next {
+                Det::Save(_) => {}
+                Det::Unit(u) => {
+                    if mine.has(u32::from(u), prog, flags) {
+                        return None;
+                    }
+                    break;
+                }
+                Det::Run { set: k, min: m, .. } => {
+                    let other = &sets[k];
+                    if mine
+                        .latin1
+                        .iter()
+                        .zip(&other.latin1)
+                        .any(|(a, b)| a & b != 0)
+                        || (!matches!(mine.high, High::None) && !matches!(other.high, High::None))
+                    {
+                        return None;
+                    }
+                    if m > 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Whether [`det_steps`] may stand in for the backtracking attempt
+/// (`KATAAN_RX_DET=0` never does).
+fn det_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_RX_DET").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
 }
 
 /// The unit every match begins with.
@@ -453,7 +562,12 @@ impl Linear {
                 .collect(),
             _ => Vec::new(),
         };
+        let det = match branches.as_slice() {
+            [only] => det_steps(only, &sets, prog, flags),
+            _ => None,
+        };
         Some(Linear {
+            det,
             branches,
             sets,
             reps,
@@ -673,6 +787,71 @@ impl Linear {
         if a.is_none() { r + 1 } else { r.max(s + 1) }
     }
 
+    /// One attempt of the choice-free sequence `det` ([`Linear::det`]) at
+    /// `start`, outside `u` mode: [`run_on`](Self::run_on)'s outcome, each
+    /// run taking every unit it can.
+    #[inline]
+    fn det_run<T: Unit>(
+        &self,
+        ctx: &Run<'_, T>,
+        det: &[Det],
+        start: usize,
+        saves: &mut [usize],
+    ) -> Outcome {
+        let (units, prog, flags) = (ctx.units, ctx.prog, ctx.flags);
+        for s in saves.iter_mut() {
+            *s = usize::MAX;
+        }
+        let len = units.len();
+        let mut p = start;
+        let mut work: u64 = 0;
+        let mut ok = true;
+        for d in det {
+            match *d {
+                Det::Save(n) => saves[n] = p,
+                Det::Unit(u) => {
+                    if p < len && units[p].u() == u {
+                        p += 1;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                Det::Run { set, min, max } => {
+                    let set = &self.sets[set];
+                    let lo = p;
+                    let limit = if max == usize::MAX {
+                        len
+                    } else {
+                        len.min(p.saturating_add(max))
+                    };
+                    while p < limit && set.has(u32::from(units[p].u()), prog, flags) {
+                        p += 1;
+                    }
+                    work += (p - lo) as u64;
+                    if p - lo < min {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if ok {
+            if work > 0 {
+                ctx.steps_used
+                    .set(ctx.steps_used.get().saturating_add(work));
+            }
+            return Outcome::Match;
+        }
+        let n = ctx.steps_used.get().saturating_add(work + 1);
+        ctx.steps_used.set(n);
+        if n > ctx.budget {
+            Outcome::Abort
+        } else {
+            Outcome::NoMatch
+        }
+    }
+
     /// One attempt of `steps` at `start`.
     fn run_on<const U: bool, T: Unit>(
         &self,
@@ -682,6 +861,9 @@ impl Linear {
         saves: &mut [usize],
         stack: &mut [Choice],
     ) -> Outcome {
+        if !U && let Some(det) = &self.det {
+            return self.det_run(ctx, det, start, saves);
+        }
         let (units, prog, flags) = (ctx.units, ctx.prog, ctx.flags);
         for s in saves.iter_mut() {
             *s = usize::MAX;
