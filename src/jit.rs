@@ -7035,6 +7035,15 @@ fn prologue_sse_clear() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SSECLR").is_none_or(|v| v != "0"))
 }
 
+/// Whether a generic body's global binding cache resets (each read site's
+/// out-of-line path when the binding epoch moved) call one shared copy of
+/// the reset (`KATAAN_JIT_EPOCHSUB=0` disables). Read once.
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn epoch_sub_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_EPOCHSUB").is_none_or(|v| v != "0"))
+}
+
 /// Whether the out-of-line tail of a generic body counts as cold code for
 /// [`X64Assembler::post_call_outlined`] (`KATAAN_JIT_POSTOOL=0` disables).
 /// Read once.
@@ -19835,6 +19844,12 @@ impl JitFunction {
         } else {
             gc_reads.iter().map(|&k| (1 + k, gc_slot(k))).collect()
         };
+        // (Shared by every site, `epoch_sub_enabled`: the plain reset, and
+        // the whole reset with the persisted entries' restore, each a
+        // subroutine; the latter returns ZF set when the restore hit.)
+        let epoch_sub = epoch_sub_enabled() && cold_epochs.len() > 1;
+        let (reset_plain, reset_full) = (a.new_label(), a.new_label());
+        let (mut plain_used, mut full_used) = (false, false);
         for (pre, fetch, recheck, direct) in core::mem::take(&mut cold_epochs) {
             a.dbg_mark("o-epoch");
             a.bind(pre);
@@ -19844,8 +19859,13 @@ impl JitFunction {
             if direct {
                 let same = a.new_label();
                 a.je(same);
-                a.clear_entry_slots();
-                a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
+                if epoch_sub {
+                    a.g_call_label(reset_plain);
+                    plain_used = true;
+                } else {
+                    a.clear_entry_slots();
+                    a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
+                }
                 a.bind(same);
                 // The array current, and not yet the base: the base, and
                 // look again. (Already the base: the entry is empty.)
@@ -19859,6 +19879,15 @@ impl JitFunction {
                 continue;
             }
             a.je(fetch);
+            if epoch_sub {
+                a.g_call_label(reset_full);
+                full_used = true;
+                if !gc_persisted.is_empty() {
+                    a.je(recheck);
+                }
+                a.jmp(fetch);
+                continue;
+            }
             if !gc_persisted.is_empty() && global_persist::restore_first() {
                 // The persistent entries first: on a hit only the other
                 // slots need emptying.
@@ -19870,6 +19899,32 @@ impl JitFunction {
                 a.gp_restore(persist, 0, &gc_persisted, recheck);
             }
             a.jmp(fetch);
+        }
+        if plain_used {
+            // Every entry-cleared slot emptied, the epoch (`rax`) noted.
+            a.bind(reset_plain);
+            a.clear_entry_slots();
+            a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
+            a.ret();
+        }
+        if full_used {
+            // As each site did in line, but returning: ZF set when the
+            // persisted entries were restored (the site rechecks), clear
+            // when the slots were only emptied (it fetches). (A `ret`
+            // keeps the flags; `rsp` is never zero.)
+            let hit = a.new_label();
+            a.bind(reset_full);
+            if !gc_persisted.is_empty() && global_persist::restore_first() {
+                a.gp_restore_first(persist, 0, &gc_persisted, gc_epoch, hit);
+            }
+            a.clear_entry_slots();
+            a.g_store(call_seq::r::RBP, gc_epoch, call_seq::r::RAX);
+            if !gc_persisted.is_empty() && !global_persist::restore_first() {
+                a.gp_restore(persist, 0, &gc_persisted, hit);
+            }
+            a.code.extend_from_slice(&[0x85, 0xe4, 0xc3]); // test esp, esp; ret
+            a.bind(hit);
+            a.code.extend_from_slice(&[0x39, 0xe4, 0xc3]); // cmp esp, esp; ret
         }
         for (entry, back, pc) in core::mem::take(&mut cold_mirrors) {
             let op_ptr: *const crate::nbvm::Op = bytecode.get(pc)?;
