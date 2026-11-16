@@ -8369,6 +8369,13 @@ impl X64Assembler {
         if self.cold_binds.is_none() && !(self.ool_tail && post_ool_enabled()) {
             return false;
         }
+        // (The out-of-line tail's slow paths may run every iteration of a
+        // loop: there only a long sequence is worth the stub's call.)
+        let min = if self.cold_binds.is_none() {
+            2 * POST_CALL_MIN
+        } else {
+            POST_CALL_MIN
+        };
         if !self.recv_survive.is_empty() {
             // Ways the call keeps are re-validated in line after the stub
             // empties the others.
@@ -8378,7 +8385,7 @@ impl X64Assembler {
                 .copied()
                 .filter(|&k| !self.recv_survive.iter().any(|w| w.key == k))
                 .collect();
-            if keys.len() * 10 < POST_CALL_MIN {
+            if keys.len() * 10 < min {
                 return false;
             }
             let stub = self.post_stub(PostCall {
@@ -8407,7 +8414,7 @@ impl X64Assembler {
             + pin.map_or(0, |_| 23)
             + seen.map_or(0, |_| 7)
             + g.map_or(0, |_| 31);
-        if est < POST_CALL_MIN {
+        if est < min {
             return false;
         }
         let stub = self.post_stub(PostCall {
@@ -19846,7 +19853,11 @@ impl JitFunction {
         // The numeric emitter's out-of-line slow paths (after a `ret`, so no op
         // falls through into them).
         a.dbg_mark("o-num");
+        // (Not the numeric stubs: a slow path a loop takes every iteration
+        // is often one of theirs.)
+        a.ool_tail = false;
         num.finish(&mut a, &labels, throw_exit);
+        a.ool_tail = true;
         // The global binding cache's resets: the epoch changed since the
         // slots were validated, so empty them all, note the current epoch
         // (in `rax`) and refill this one.
@@ -19863,10 +19874,16 @@ impl JitFunction {
         // (Shared by every site, `epoch_sub_enabled`: the plain reset, and
         // the whole reset with the persisted entries' restore, each a
         // subroutine; the latter returns ZF set when the restore hit.)
-        let epoch_sub = epoch_sub_enabled() && cold_epochs.len() > 1;
+        // (The first site's stays in line: in a short body called often it
+        // is the one each activation's first global read resets through,
+        // which a call would slow.)
+        let epoch_sub = epoch_sub_enabled() && cold_epochs.len() > 2;
         let (reset_plain, reset_full) = (a.new_label(), a.new_label());
         let (mut plain_used, mut full_used) = (false, false);
-        for (pre, fetch, recheck, direct) in core::mem::take(&mut cold_epochs) {
+        for (i, (pre, fetch, recheck, direct)) in
+            core::mem::take(&mut cold_epochs).into_iter().enumerate()
+        {
+            let epoch_sub = epoch_sub && i > 0;
             a.dbg_mark("o-epoch");
             a.bind(pre);
             a.g_movabs(call_seq::r::R11, epoch_addr as u64);
