@@ -3995,9 +3995,21 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
     });
     if !e.after_hit {
         let checked = a.new_label();
-        a.g_load(r::RAX, RBP, e.slots.ok);
-        a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
-        a.g_jcc(cc::NE, checked);
+        // (The checks out of line, when on: few guards make them, see
+        // `lim_cold_enabled`.)
+        let cold = if lim_cold(a) {
+            let check = a.new_label();
+            cmp_empty(a, e.slots.ok);
+            a.g_jcc(cc::E, check);
+            let cold = a.cold_begin_after();
+            a.bind(check);
+            Some(cold)
+        } else {
+            a.g_load(r::RAX, RBP, e.slots.ok);
+            a.g_cmp_imm(r::RAX, super::RECV_CACHE_EMPTY);
+            a.g_jcc(cc::NE, checked);
+            None
+        };
         let method = matches!(e.callee, CalleeSrc::Method { .. } | CalleeSrc::Frame { .. });
         if method {
             a.g_cmp_byte_imm(r::R15, l.hosted, 0);
@@ -4020,6 +4032,10 @@ pub(crate) fn emit_inline_guard(a: &mut X64Assembler, e: &InlineEmit<'_>) -> Opt
             a.g_jcc(cc::E, checked);
         }
         a.g_store_imm32(RBP, e.slots.ok, 0);
+        if let Some(cold) = cold {
+            a.jmp(checked);
+            a.cold_end(cold);
+        }
         a.bind(checked);
     }
     // 2. The callee value, into the `callee` slot (and rax).
@@ -4961,6 +4977,9 @@ pub(crate) fn emit_inline_stub(
 /// returns. Preserves `rax`.
 pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &InlineSlots) {
     a.dbg_mark("leave");
+    if leave_cold(a) {
+        return emit_inline_leave_cold(a, l, s);
+    }
     let materialized = a.new_label();
     let done = a.new_label();
     if let Some(save) = s.save {
@@ -5013,6 +5032,108 @@ pub(crate) fn emit_inline_leave(a: &mut X64Assembler, l: &CallLayout, s: &Inline
     a.bind(done);
 }
 
+/// Whether an inlined activation's end has what its common case skips — a
+/// materialized activation's pop, a pending one's drop — out of line, so
+/// that case runs straight through with no taken branch
+/// (`KATAAN_JIT_LEAVECOLD=0` disables). Read once.
+fn leave_cold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LEAVECOLD").is_none_or(|v| v != "0"))
+}
+
+/// [`leave_cold_enabled`], for an end emitted in the main stream (not in a
+/// cold region or the out-of-line tail, which stay as they were).
+fn leave_cold(a: &X64Assembler) -> bool {
+    leave_cold_enabled() && a.cold_binds.is_none() && !a.ool_tail
+}
+
+/// Whether an inlined call's guard has its limit checks — made only by the
+/// first guard to run since a call (or the prologue), a few in a hundred —
+/// out of line, so a guard that finds them made runs straight on
+/// (`KATAAN_JIT_LIMCOLD=0` disables). Read once.
+fn lim_cold_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LIMCOLD").is_none_or(|v| v != "0"))
+}
+
+/// [`lim_cold_enabled`], for a guard emitted in the main stream.
+fn lim_cold(a: &X64Assembler) -> bool {
+    lim_cold_enabled() && a.cold_binds.is_none() && !a.ool_tail
+}
+
+/// `cmp qword [rbp + d], RECV_CACHE_EMPTY`.
+fn cmp_empty(a: &mut X64Assembler, d: i32) {
+    a.g_mem(true, &[0x83], 7, RBP, d);
+    a.code.push(0xff);
+}
+
+/// A materialized inlined activation's pop ([`emit_inline_leave`]): its
+/// header (at `s.hdr`) off the stack, one activation fewer, `hdr` emptied.
+/// Clobbers `rcx`, `rdx`, `r9`, `r10`.
+fn emit_leave_pop(a: &mut X64Assembler, l: &CallLayout, s: &InlineSlots) {
+    a.g_load(r::RCX, RBP, s.hdr);
+    a.g_load(r::R10, r::R15, l.stack);
+    a.g_store(r::R10, STACK_TOP, r::RCX);
+    a.g_load(r::RDX, r::RCX, 0);
+    a.g_store(r::R10, STACK_FRAMES, r::RDX);
+    a.g_load(r::R9, r::R15, l.realm);
+    a.g_dec_mem(r::R9, l.total_depth);
+    a.g_store_imm32(RBP, s.hdr, super::RECV_CACHE_EMPTY);
+}
+
+/// `rcx` (what an inner level's `save` held: an outer activation's stub,
+/// or `0`) as `pend` takes it back: `0` becomes `RECV_CACHE_EMPTY`, with no
+/// branch. Clobbers `rdx`.
+fn save_to_pend(a: &mut X64Assembler) {
+    a.raw(&[0x48, 0x83, 0xf9, 0x01]); // cmp rcx, 1 (CF: rcx == 0)
+    a.raw(&[0x48, 0x19, 0xd2]); // sbb rdx, rdx
+    a.raw(&[0x48, 0x09, 0xd1]); // or rcx, rdx
+}
+
+/// [`emit_inline_leave`] with what its common case — an activation neither
+/// pending nor materialized (a lazily pending one's guard left `pend`
+/// alone), or an inner level's pending one — skips out of line
+/// ([`leave_cold_enabled`]): the same states, the same work.
+fn emit_inline_leave_cold(a: &mut X64Assembler, l: &CallLayout, s: &InlineSlots) {
+    let done = a.new_label();
+    let popped = a.new_label();
+    if let Some(save) = s.save {
+        // An inner level's: none active (only at the throw exit), pending
+        // (`pend` back to what it held), or materialized (popped).
+        let fin = a.new_label();
+        a.g_load(r::RCX, RBP, save);
+        a.g_cmp_imm(r::RCX, super::RECV_CACHE_EMPTY);
+        a.g_jcc(cc::E, done);
+        cmp_empty(a, s.hdr);
+        a.g_jcc(cc::NE, popped);
+        save_to_pend(a);
+        a.g_store(RBP, s.pend, r::RCX);
+        a.bind(fin);
+        a.g_store_imm32(RBP, save, super::RECV_CACHE_EMPTY);
+        let cold = a.cold_begin_after();
+        a.bind(popped);
+        emit_leave_pop(a, l, s);
+        a.jmp(fin);
+        a.cold_end(cold);
+        a.bind(done);
+        return;
+    }
+    let pending = a.new_label();
+    cmp_empty(a, s.pend);
+    a.g_jcc(cc::NE, pending);
+    cmp_empty(a, s.hdr);
+    a.g_jcc(cc::NE, popped);
+    let cold = a.cold_begin_after();
+    a.bind(pending);
+    a.g_store_imm32(RBP, s.pend, super::RECV_CACHE_EMPTY);
+    a.jmp(done);
+    a.bind(popped);
+    emit_leave_pop(a, l, s);
+    a.jmp(done);
+    a.cold_end(cold);
+    a.bind(done);
+}
+
 /// [`emit_inline_leave`] for a plainly lazy activation ([`PlainLazy`]) whose
 /// window no call sequence left pending across its call: the marker is
 /// empty here (every `call` that set it ran the stub, which empties it),
@@ -5025,6 +5146,21 @@ pub(crate) fn emit_inline_leave_plain(a: &mut X64Assembler, l: &CallLayout, s: &
     let done = a.new_label();
     a.g_mem(true, &[0x83], 7, RBP, s.hdr); // cmp qword [rbp+hdr], -1
     a.code.push(0xff);
+    if leave_cold(a) {
+        // (The pop out of line: the activation is rarely materialized.)
+        let popped = a.new_label();
+        a.g_jcc(cc::NE, popped);
+        let cold = a.cold_begin_after();
+        a.bind(popped);
+        emit_leave_pop(a, l, s);
+        if let Some(save) = s.save {
+            a.g_store_imm32(RBP, save, super::RECV_CACHE_EMPTY);
+        }
+        a.jmp(done);
+        a.cold_end(cold);
+        a.bind(done);
+        return;
+    }
     a.g_jcc(cc::E, done);
     a.g_load(r::RCX, RBP, s.hdr);
     a.g_load(r::R10, r::R15, l.stack);
