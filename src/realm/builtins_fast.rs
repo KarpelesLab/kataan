@@ -1879,6 +1879,25 @@ pub struct MethodSiteCache {
     swaps: u32,
 }
 
+/// The longest string literal (in bytes) [`Realm::new_literal_string`] keys
+/// by its text rather than by its address.
+const LIT_INTERN_MAX: usize = 64;
+
+/// Whether short string literals of the same text share one cell across
+/// functions ([`Realm::new_literal_string`]; `KATAAN_LITINTERN=0` keys every
+/// literal by its address, read once per process).
+fn lit_intern_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_LITINTERN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether a short concatenation whose pieces' UTF-16 lengths were not all
 /// known records its own when it is all ASCII (`KATAAN_CONCAT_ASCII_LEN=0`
 /// leaves it to be counted on first use; read once per process).
@@ -2097,7 +2116,9 @@ impl Realm {
     /// The string value of an evaluation of a string literal whose text is `s`
     /// (borrowed from the bytecode). Strings are immutable values compared by
     /// contents, so every evaluation of one literal may share one cell: a small
-    /// direct-mapped memo keyed by the text's address hands it back. A hit is
+    /// direct-mapped memo keyed by the text's address — or, for a short one,
+    /// by the text itself, so literals of the same text anywhere share it —
+    /// hands it back. A hit is
     /// re-checked against the text itself (a reused address — freed bytecode —
     /// can never return another string) and the cell against the memo's rope
     /// (an `Rc` the memo keeps alive, so its address cannot be reused either).
@@ -2126,7 +2147,18 @@ impl Realm {
             }
             _ => {}
         }
-        let key = s.as_ptr() as usize;
+        // (A short literal is keyed by its text: every literal of the same
+        // text, in any function, shares the one cell — a `Map` keyed by
+        // `'arrive'` then finds a key read from another function's literal
+        // by its first, identity compare. A long one by its address, which
+        // spares hashing it.)
+        let key = if b.len() <= LIT_INTERN_MAX && lit_intern_on() {
+            b.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &c| {
+                (h ^ u64::from(c)).wrapping_mul(0x0000_0100_0000_01b3)
+            }) as usize
+        } else {
+            s.as_ptr() as usize
+        };
         let slot = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56;
         let slot = slot as usize % SLOTS;
         if self.literal_ropes.is_empty() {
