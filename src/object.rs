@@ -84,8 +84,28 @@ pub(crate) struct DictData {
 
 /// A dictionary key, shared by its map entry and its `order` entry (and by
 /// a copy of the dictionary: `{ ...big }` clones the map without copying a
-/// single key). `Arc` rather than `Rc` only so the empty statics are `Sync`.
-type DictKey = alloc::sync::Arc<str>;
+/// single key). An `Rc`, not an `Arc`: copying a large dictionary and
+/// sweeping one bump and drop two counts per key, and an atomic count made
+/// each a locked instruction that also held the walk's cache misses back
+/// from overlapping (the empty statics below, which hold no key, are made
+/// `Sync` by [`EmptyStatic`]).
+type DictKey = alloc::rc::Rc<str>;
+
+/// One of the empty, immutable statics an object without an `extra` part
+/// or a dictionary reads ([`EMPTY_EXTRA`], [`EMPTY_DICT`]), shareable
+/// although its type holds [`DictKey`]s (which are not `Sync`).
+struct EmptyStatic<T>(T);
+
+// SAFETY: only `EmptyStatic<ObjectExtra>` and `EmptyStatic<DictData>` exist,
+// each holding values with no element at all — empty `Vec`s and maps, `None`
+// options — and no interior mutability (both types were `Sync` while their
+// keys were `Arc`s). A shared reference to one can only read that nothing
+// is there; no `Rc` exists in it whose count another thread could touch.
+#[allow(unsafe_code)]
+unsafe impl Sync for EmptyStatic<ObjectExtra> {}
+// SAFETY: as above.
+#[allow(unsafe_code)]
+unsafe impl Sync for EmptyStatic<DictData> {}
 
 /// How many property values an object stores inline, in its own cell, before
 /// spilling to a separate allocation. Most objects are small (a point, a
@@ -772,7 +792,7 @@ impl ObjectExtra {
 }
 
 /// The all-empty [`ObjectExtra`] that reads see when an object has none.
-static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
+static EMPTY_EXTRA: EmptyStatic<ObjectExtra> = EmptyStatic(ObjectExtra {
     spill: Spill::EMPTY,
     dict: None,
     readonly: Vec::new(),
@@ -784,7 +804,7 @@ static EMPTY_EXTRA: ObjectExtra = ObjectExtra {
     key_order: None,
     acc_at: [0; ACC_AT_MAX],
     index: None,
-};
+});
 
 impl Default for ObjectExtra {
     fn default() -> Self {
@@ -805,10 +825,10 @@ impl Default for ObjectExtra {
 }
 
 /// An empty dictionary, for reads of a dictionary-mode object's map.
-static EMPTY_DICT: DictData = DictData {
+static EMPTY_DICT: EmptyStatic<DictData> = EmptyStatic(DictData {
     order: Vec::new(),
     map: BTreeMap::new(),
-};
+});
 
 /// [`Object::release`] of an object with an `extra` part or holding its
 /// shape's last reference — off the sweep's common path.
@@ -1298,7 +1318,7 @@ impl Object {
     /// The dictionary (dictionary mode; else an empty one).
     #[inline]
     fn dict(&self) -> &DictData {
-        self.ex().dict.as_deref().unwrap_or(&EMPTY_DICT)
+        self.ex().dict.as_deref().unwrap_or(&EMPTY_DICT.0)
     }
 
     /// The dictionary, mutably (dictionary mode only).
@@ -1425,7 +1445,7 @@ impl Object {
 
     /// The out-of-line part, or the shared empty one.
     fn ex(&self) -> &ObjectExtra {
-        self.extra.as_deref().unwrap_or(&EMPTY_EXTRA)
+        self.extra.as_deref().unwrap_or(&EMPTY_EXTRA.0)
     }
 
     /// The out-of-line part, allocated on first use.
