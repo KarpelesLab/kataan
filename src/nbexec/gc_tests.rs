@@ -611,3 +611,32 @@ fn a_builtin_draining_a_generator_keeps_what_it_holds_across_a_collection() {
         "reg:>a0,>a1,>a2:2:6:x,y"
     );
 }
+
+#[test]
+fn old_containers_storing_numbers_then_young_objects_keep_them() {
+    // Old Maps, Sets and arrays first only count into numbers (the precise
+    // barrier records nothing for them), then take young objects — as a
+    // replaced value, an appended entry, a pushed or written element, or a
+    // value stored while a live iterator walks the map — that only they
+    // reference across the collections that follow.
+    assert_eq!(
+        run(&format!(
+            "var m = new Map(); var s = new Set(); var a = [];
+             for (var i = 0; i < 100; i++) {{ m.set('k' + i, i); s.add(i); a.push(i); }}
+             {CHURN}
+             for (var r = 0; r < 3; r++) {{
+               for (var i = 0; i < 100; i++) {{ m.set('k' + i, m.get('k' + i) + 1); a[i] = a[i] + 1; }}
+               m.set('k7', {{ v: 'replaced' + r }});
+               m.set('new' + r, {{ v: 'appended' + r }});
+               s.add({{ v: 'added' + r }});
+               a.push({{ v: 'pushed' + r }});
+               a[3] = {{ v: 'written' + r }};
+               for (var e of m) {{ if (e[0] === 'k9') m.set('k9', {{ v: 'iter' + r }}); }}
+               {CHURN}
+             }}
+             var n = 0; s.forEach(function (x) {{ if (typeof x === 'object') n++; }});
+             [m.get('k7').v, m.get('new2').v, m.get('k9').v, n, a[a.length - 1].v, a[3].v, m.get('k50')].join()"
+        )),
+        "replaced2,appended2,iter2,3,pushed2,written2,53"
+    );
+}

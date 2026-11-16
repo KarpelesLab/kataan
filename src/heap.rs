@@ -1013,6 +1013,24 @@ impl<T> Heap<T> {
         Some(value)
     }
 
+    /// [`get_mut`](Heap::get_mut) **without** the borrow's write barrier: for
+    /// a store whose caller applies the precise one itself — it passes
+    /// every reference it stores into the object to
+    /// [`record_edge`](Heap::record_edge) (`Realm::write_barrier`), and
+    /// changes nothing else that could reference a young object. An old
+    /// container whose stores keep it pointing at old objects (or at
+    /// numbers) then stays out of the remembered set, and the next minor
+    /// collection does not rescan all of it.
+    #[inline]
+    pub fn get_mut_precise(&mut self, handle: Handle) -> Option<&mut T> {
+        if self.poison.is_some() {
+            self.note_poison_use(handle);
+        }
+        self.slots
+            .get_mut(handle.index as usize)?
+            .get_mut(handle.generation)
+    }
+
     /// [`get_mut`](Heap::get_mut) for a borrow that changes the object's
     /// references only from a position on — appends (a push onto an array, a
     /// new collection entry) and stores past it: `from(value)` is that

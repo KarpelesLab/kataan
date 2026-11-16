@@ -156,7 +156,7 @@ impl Realm {
         if let Some(i) = hinted {
             // `set` replaces the hinted entry's value, `add` changes nothing.
             if op == CollOp::MapSet {
-                if let Some(Cell::Collection { entries, .. }) = self.heap.get_mut(h)
+                if let Some(Cell::Collection { entries, .. }) = self.get_mut_for_store(h)
                     && let Some(e) = entries.get_mut(i)
                 {
                     e.1 = b;
@@ -189,7 +189,8 @@ impl Realm {
                     let value = if op == CollOp::SetAdd { key } else { b };
                     if let Some(i) = pos {
                         if op == CollOp::MapSet {
-                            if let Some(Cell::Collection { entries, .. }) = self.heap.get_mut(h)
+                            if let Some(Cell::Collection { entries, .. }) =
+                                self.get_mut_for_store(h)
                                 && let Some(e) = entries.get_mut(i)
                             {
                                 e.1 = value;
@@ -206,7 +207,7 @@ impl Realm {
                         live,
                         index: Some(map),
                         ..
-                    }) = self.heap.get_mut_append(h, Cell::ref_len)
+                    }) = self.get_mut_appending(h, key, value)
                     else {
                         return Some(NanBox::handle(h.to_raw()));
                     };

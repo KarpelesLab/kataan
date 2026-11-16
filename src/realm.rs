@@ -4739,7 +4739,7 @@ impl Realm {
             if is_set {
                 return true;
             }
-            let Some(Cell::Collection { entries, .. }) = self.heap.get_mut(handle) else {
+            let Some(Cell::Collection { entries, .. }) = self.get_mut_for_store(handle) else {
                 return false;
             };
             entries[i].1 = value;
@@ -4747,13 +4747,14 @@ impl Realm {
             return true;
         }
         // A new entry, appended: the write barrier's tail form (so a minor
-        // collection rescans only the entries added since the last one).
+        // collection rescans only the entries added since the last one) —
+        // or none at all for an entry referencing no young object.
         let Some(Cell::Collection {
             entries,
             live,
             index,
             ..
-        }) = self.heap.get_mut_append(handle, Cell::ref_len)
+        }) = self.get_mut_appending(handle, key, value)
         else {
             return false;
         };
@@ -4821,10 +4822,11 @@ impl Realm {
             live,
             index,
             ..
-        }) = self.heap.get_mut(handle)
+        }) = self.get_mut_for_store(handle)
         else {
             return false;
         };
+        // (No reference is stored: the precise barrier has nothing to do.)
         // A tombstone in place: no renumbering, so live iterators' cursors and
         // the hash index stay valid (the index just drops this one position).
         entries[i] = (NanBox::hole(), NanBox::hole());
@@ -4893,7 +4895,9 @@ impl Realm {
     /// Attaches a live iterator to the collection at `handle`; returns the
     /// collection's current epoch (the iterator's cursor is in its numbering).
     pub fn collection_iter_attach(&mut self, handle: Handle) -> u32 {
-        match self.heap.get_mut(handle) {
+        // (A count changes, no reference: the precise barrier has nothing
+        // to record.)
+        match self.get_mut_for_store(handle) {
             Some(Cell::Collection { iters, epoch, .. }) => {
                 *iters += 1;
                 *epoch
@@ -5064,7 +5068,8 @@ impl Realm {
         // Entries are deleted in place (tombstones), so the cursor only needs
         // rebasing after a compaction renumbered them: with none since it was
         // saved (the common case), the next live entry is read in one look.
-        let (next, now) = match self.heap.get_mut(coll) {
+        // (Only the dead-prefix mark changes: no reference is stored.)
+        let (next, now) = match self.get_mut_for_store(coll) {
             Some(Cell::Collection {
                 epoch: e,
                 entries,
@@ -5091,7 +5096,8 @@ impl Realm {
                 (self.collection_next_live(coll, idx), now)
             }
         };
-        let a = self.heap.get_mut(state)?.as_array_mut()?;
+        // (`k`, the one reference stored, takes the precise barrier below.)
+        let a = self.get_mut_for_store(state)?.as_array_mut()?;
         let Some((pos, k, v)) = next else {
             a[4] = NanBox::number(2.0);
             self.collection_iter_detach(coll);
@@ -5107,7 +5113,7 @@ impl Realm {
 
     /// Detaches an exhausted live iterator (see [`Realm::collection_iter_attach`]).
     pub fn collection_iter_detach(&mut self, handle: Handle) {
-        if let Some(Cell::Collection { iters, .. }) = self.heap.get_mut(handle) {
+        if let Some(Cell::Collection { iters, .. }) = self.get_mut_for_store(handle) {
             *iters = iters.saturating_sub(1);
         }
     }
@@ -6810,9 +6816,9 @@ impl Realm {
             return true;
         }
         // Nothing below `index` changes: the write barrier's tail form.
+        let max_len = self.limits.max_array_len;
         match self
-            .heap
-            .get_mut_append(handle, |c| index.min(c.ref_len()))
+            .get_mut_storing_from(handle, value, |c| index.min(c.ref_len()))
             .and_then(Cell::as_array_mut)
         {
             Some(a) => {
@@ -6830,7 +6836,7 @@ impl Realm {
                     let Some(new_len) = index.checked_add(1) else {
                         return false;
                     };
-                    if new_len > self.limits.max_array_len {
+                    if new_len > max_len {
                         return false;
                     }
                     // The skipped slots between the old end and `index` become real
@@ -6858,8 +6864,7 @@ impl Realm {
     /// any other array or index takes [`set_element`](Self::set_element).
     pub(crate) fn internal_array_set(&mut self, handle: Handle, index: usize, value: NanBox) {
         if let Some(a) = self
-            .heap
-            .get_mut_append(handle, |c| index.min(c.ref_len()))
+            .get_mut_storing_from(handle, value, |c| index.min(c.ref_len()))
             .and_then(Cell::as_array_mut)
             && !a.has_side_state()
             && index <= a.len()
@@ -6897,8 +6902,7 @@ impl Realm {
         }
         // Nothing below `index` changes: the write barrier's tail form.
         let Some(a) = self
-            .heap
-            .get_mut_append(handle, |c| index.min(c.ref_len()))
+            .get_mut_storing_from(handle, value, |c| index.min(c.ref_len()))
             .and_then(Cell::as_array_mut)
         else {
             return false;
@@ -6963,10 +6967,9 @@ impl Realm {
             return None;
         }
         let max = self.limits.max_array_len;
-        // (Only appends: the write barrier's tail form.)
+        // (Only appends: the write barrier's tail form, if any.)
         let a = self
-            .heap
-            .get_mut_append(handle, Cell::ref_len)
+            .get_mut_storing_from(handle, value, Cell::ref_len)
             .and_then(Cell::as_array_mut)?;
         // C1: refuse to grow past the configured cap rather than risk an unbounded
         // allocation (a single push only adds one element, but an array already at
@@ -8974,6 +8977,67 @@ impl Realm {
         self.incremental.is_some()
             || !bulk_barrier_skip_on()
             || self.heap.age(container).is_none_or(|a| a >= gc::OLD_AGE)
+    }
+
+    /// Borrows `h` mutably for a store whose every stored value the caller
+    /// then passes to [`write_barrier`](Self::write_barrier) (and that
+    /// changes no other reference the cell holds): the precise barrier
+    /// alone, so an old container whose stores reference no young object —
+    /// a `Map` counting into numbers, say — stays out of the remembered set
+    /// rather than being rescanned whole by every minor collection
+    /// (`KATAAN_GC_PRECISE=0` takes the borrow's barrier too).
+    #[inline]
+    pub(crate) fn get_mut_for_store(&mut self, h: Handle) -> Option<&mut Cell> {
+        if precise_barrier_on() {
+            self.heap.get_mut_precise(h)
+        } else {
+            self.heap.get_mut(h)
+        }
+    }
+
+    /// Whether `value` is a reference to a young object.
+    #[inline]
+    pub(crate) fn is_young_value(&self, value: NanBox) -> bool {
+        value
+            .as_handle()
+            .is_some_and(|raw| self.heap.is_young(Handle::from_raw(raw)))
+    }
+
+    /// Borrows the array or collection `h` mutably to append an element or
+    /// entry referencing `a` and `b` (and to change nothing else that could
+    /// reference a young object): [`Heap::get_mut_append`]'s tail form of
+    /// the barrier, or — when neither `a` nor `b` is a young object — no
+    /// barrier at all, as [`get_mut_for_store`](Self::get_mut_for_store)
+    /// (`KATAAN_GC_PRECISE=0` always takes the tail form).
+    #[inline]
+    pub(crate) fn get_mut_appending(
+        &mut self,
+        h: Handle,
+        a: NanBox,
+        b: NanBox,
+    ) -> Option<&mut Cell> {
+        if precise_barrier_on() && !self.is_young_value(a) && !self.is_young_value(b) {
+            self.heap.get_mut_precise(h)
+        } else {
+            self.heap.get_mut_append(h, Cell::ref_len)
+        }
+    }
+
+    /// [`get_mut_appending`](Self::get_mut_appending) for a store of
+    /// `value` that changes the array's references only from position
+    /// `from(cell)` on (an overwrite of one element, an append).
+    #[inline]
+    pub(crate) fn get_mut_storing_from(
+        &mut self,
+        h: Handle,
+        value: NanBox,
+        from: impl FnOnce(&Cell) -> usize,
+    ) -> Option<&mut Cell> {
+        if precise_barrier_on() && !self.is_young_value(value) {
+            self.heap.get_mut_precise(h)
+        } else {
+            self.heap.get_mut_append(h, from)
+        }
     }
 
     fn write_barrier(&mut self, container: Handle, value: NanBox) {
@@ -11023,6 +11087,21 @@ fn regexp_lit_on() -> bool {
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("KATAAN_REGEXP_LIT").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether [`Realm::get_mut_for_store`] leaves out the borrow's barrier
+/// (`KATAAN_GC_PRECISE=0` keeps it; read once per process).
+#[inline]
+fn precise_barrier_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_GC_PRECISE").is_none_or(|v| v != "0"))
     }
     #[cfg(not(feature = "std"))]
     {
