@@ -311,6 +311,13 @@ fn resume_state_at(
     {
         return r;
     }
+    if mode == 0
+        && state == S_YIELD
+        && ctx.gen_site_memo.pending.is_none()
+        && let Some(r) = delegate_chain(ctx, funcs, fh, v)
+    {
+        return r;
+    }
     let proto = funcs.get(id);
     // Suspended inside a `yield*` (the delegation step) or at a capturing
     // `YieldResume`: every resumption kind lands in registers.
@@ -1431,6 +1438,126 @@ pub(super) struct SiteMemo {
     next: usize,
     /// The entry the last lookup found (tried first).
     last: usize,
+    /// [`delegate_chain`]'s hand-over to a `yield*` step it resumes: the
+    /// inner generator (its bits) whose `next` call that step would make,
+    /// and what the call returned (`PEND_*`; the value is the sent one).
+    pending: Option<(u64, u8)>,
+}
+
+/// [`SiteMemo::pending`]'s outcomes: the inner generator completed, an
+/// inner `yield*` handed a result object through, or it threw.
+const PEND_DONE: u8 = 1;
+const PEND_DELEGATED: u8 = 2;
+const PEND_THROW: u8 = 3;
+
+/// The levels [`delegate_chain`] walks down at once (a deeper chain resumes
+/// its innermost level the same way, recursively).
+const CHAIN_MAX: usize = 32;
+
+/// Whether `next(v)` on a generator suspended in a `yield*` over another VM
+/// generator resumes the innermost one directly (`KATAAN_GEN_CHAIN`,
+/// default on).
+fn chain_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_GEN_CHAIN").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
+/// The inner generator's frame cell of the generator whose frame cell is
+/// `fh`, when that generator is suspended in a `yield*` step whose inner
+/// iterator is a VM generator with the intrinsic `next` (which the step
+/// would resume directly, see [`delegate_next`]), and the inner generator's
+/// bits.
+fn chain_link(ctx: &mut Ctx, funcs: &[FnProto], fh: Handle) -> Option<(Handle, u64)> {
+    let f = ctx.realm.vm_frame(fh)?;
+    if f.state != S_YIELD {
+        return None;
+    }
+    let Some(Op::YieldDelegate { iter, next, .. }) =
+        funcs.get(f.func as usize)?.ops.get(f.pc as usize)
+    else {
+        return None;
+    };
+    let (it, nx) = (*f.regs.get(*iter as usize)?, *f.regs.get(*next as usize)?);
+    if ctx.realm.native_at(Handle::from_raw(nx.as_handle()?)) != Some(crate::nbexec::N_GEN_NEXT) {
+        return None;
+    }
+    let inner = direct_target(ctx, funcs, it)?;
+    Some((inner, it.to_bits()))
+}
+
+/// `next(v)` of the generator whose frame cell is `fh`, suspended in a
+/// `yield*` step over a VM generator: the step's resumption of the inner
+/// generator, made directly on the innermost generator of the chain of such
+/// steps (ECMA-262 14.4.14) instead of through every level's step.
+///
+/// Every level's step is a call of the intrinsic `next` with `v` (a direct
+/// resume, [`delegate_next`]); what it returns decides that level: a fresh
+/// not-done result object of a plain `yield` (whose `done` read runs no
+/// code) is yielded as is, the level staying suspended at its step — so the
+/// innermost `yield`'s value passes up unchanged, as the result object would
+/// have, and the levels stay suspended without running. Any other outcome (a
+/// completion, a result object an inner `yield*` handed through, a throw)
+/// resumes that level at its step, which takes it as its inner call's
+/// outcome ([`SiteMemo::pending`]) — its done value, its own `done` read, its
+/// handlers. While the innermost level runs, the levels above it are
+/// executing (a resumption of one throws, as it would).
+///
+/// `None` (nothing done) when the first level's step is not over such a
+/// generator.
+fn delegate_chain(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    fh: Handle,
+    v: NanBox,
+) -> Option<Result<GenOut, VmError>> {
+    if !chain_on() || crate::stack::exhausted() {
+        return None;
+    }
+    let mut chain = [(Handle::from_raw(0), 0u64); CHAIN_MAX];
+    let mut n = 0;
+    let mut cur = fh;
+    while n < CHAIN_MAX {
+        let Some((inner, bits)) = chain_link(ctx, funcs, cur) else {
+            break;
+        };
+        chain[n] = (cur, bits);
+        n += 1;
+        cur = inner;
+    }
+    if n == 0 {
+        return None;
+    }
+    for &(h, _) in &chain[..n] {
+        if let Some(f) = ctx.realm.vm_frame_mut(h) {
+            f.state = S_EXECUTING;
+        }
+    }
+    let mut out = resume_state(ctx, funcs, cur, 0, v);
+    for &(h, bits) in chain[..n].iter().rev() {
+        if let Some(f) = ctx.realm.vm_frame_mut(h) {
+            f.state = S_YIELD;
+        }
+        let (kind, x) = match out {
+            Ok(GenOut::Yield(_)) => continue,
+            Ok(GenOut::Done(x)) => (PEND_DONE, x),
+            Ok(GenOut::Delegated(r)) => (PEND_DELEGATED, r),
+            Err(VmError::Thrown(e)) => (PEND_THROW, e),
+            Err(e) => {
+                complete(ctx, h);
+                out = Err(e);
+                continue;
+            }
+        };
+        ctx.gen_site_memo.pending = Some((bits, kind));
+        out = resume_state(ctx, funcs, h, 0, x);
+        ctx.gen_site_memo.pending = None;
+    }
+    Some(out)
 }
 
 struct SiteEntry {
@@ -1658,6 +1785,17 @@ pub(super) fn delegate_next(
 ) -> Option<Result<GenOut, VmError>> {
     if ctx.realm.native_at(Handle::from_raw(next.as_handle()?)) != Some(crate::nbexec::N_GEN_NEXT) {
         return None;
+    }
+    // (A step `delegate_chain` resumed: the inner call's outcome is known.)
+    if let Some((bits, kind)) = ctx.gen_site_memo.pending
+        && bits == g.to_bits()
+    {
+        ctx.gen_site_memo.pending = None;
+        return Some(match kind {
+            PEND_DONE => Ok(GenOut::Done(v)),
+            PEND_DELEGATED => Ok(GenOut::Delegated(v)),
+            _ => Err(VmError::Thrown(v)),
+        });
     }
     let sh = direct_target(ctx, funcs, g)?;
     Some(nested(ctx, regs, g, v, |ctx| {
