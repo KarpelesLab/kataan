@@ -36,6 +36,9 @@ pub(crate) struct DvAccess {
     pub signed: bool,
     /// `Float32` / `Float64`.
     pub float: bool,
+    /// `BigInt64` / `BigUint64` (only from [`dv_access_any`]: compiled
+    /// code's inline accessor serves Number types only).
+    pub big: bool,
 }
 
 /// The accessor named `name` (`getInt8` … `setFloat64`), or `None` for any
@@ -62,6 +65,29 @@ pub(crate) fn dv_access_for(name: &[u8]) -> Option<DvAccess> {
         size,
         signed,
         float,
+        big: false,
+    })
+}
+
+/// [`dv_access_for`], and also the BigInt accessors (`getBigInt64` …
+/// `setBigUint64`), for [`dataview_fast`] itself.
+pub(crate) fn dv_access_any(name: &[u8]) -> Option<DvAccess> {
+    if let Some(acc) = dv_access_for(name) {
+        return Some(acc);
+    }
+    let (set, signed) = match name {
+        b"getBigInt64" => (false, true),
+        b"getBigUint64" => (false, false),
+        b"setBigInt64" => (true, true),
+        b"setBigUint64" => (true, false),
+        _ => return None,
+    };
+    Some(DvAccess {
+        set,
+        size: 8,
+        signed,
+        float: false,
+        big: true,
     })
 }
 
@@ -148,7 +174,18 @@ pub(crate) fn dataview_fast(
     if !(0.0..9_007_199_254_740_992.0).contains(&off) || (off as u64) as f64 != off {
         return None;
     }
-    let (value, le) = if acc.set {
+    // A BigInt set's value is a BigInt (`ToBigInt` the identity): its
+    // two's-complement low 64 bits are what `ToBigInt64` / `ToBigUint64`
+    // keep, the same bits either way.
+    let big_bits = if acc.big && acc.set {
+        let b = realm.bigint_ref(as_handle(Some(rest[0]))?)?;
+        Some(b.low_u64())
+    } else {
+        None
+    };
+    let (value, le) = if acc.set && acc.big {
+        (Some(0.0), realm.truthy(rest[1]))
+    } else if acc.set {
         (Some(rest[0].as_number()?), realm.truthy(rest[1]))
     } else {
         (None, realm.truthy(rest[0]))
@@ -180,7 +217,9 @@ pub(crate) fn dataview_fast(
         return None;
     }
     if let Some(v) = value {
-        let bits: u64 = if acc.float {
+        let bits: u64 = if let Some(b) = big_bits {
+            b
+        } else if acc.float {
             if size == 4 {
                 u64::from((v as f32).to_bits())
             } else {
@@ -209,6 +248,15 @@ pub(crate) fn dataview_fast(
     for (i, &b) in src.iter().enumerate() {
         let shift = if le { i } else { size - 1 - i };
         bits |= u64::from(b) << (8 * shift);
+    }
+    if acc.big {
+        let v = if acc.signed {
+            i128::from(bits as i64)
+        } else {
+            i128::from(bits)
+        };
+        let b = crate::bignum::BigInt::from_i128(v);
+        return Some(NanBox::handle(realm.new_bigint(b).to_raw()));
     }
     let n = if acc.float {
         if size == 4 {

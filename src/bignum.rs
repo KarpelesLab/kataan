@@ -328,6 +328,63 @@ impl BigInt {
         Some((self.small()?, other.small()?))
     }
 
+    /// The low 64 bits of the two's-complement value (as
+    /// [`to_u64_wrapping`](Self::to_u64_wrapping), from the lowest limb
+    /// alone: `-m mod 2^64` is `-(m mod 2^64) mod 2^64`).
+    #[must_use]
+    #[inline]
+    pub fn low_u64(&self) -> u64 {
+        let low = self.0.least_significant_limb();
+        if self.0.is_negative() {
+            low.wrapping_neg()
+        } else {
+            low
+        }
+    }
+
+    /// `BigInt.asUintN(bits, self)` (`signed`: `asIntN`), or `None` when that
+    /// needs a modulus wider than `max_bits` (the caller's `RangeError`).
+    /// The value itself when it already lies in the range.
+    #[must_use]
+    pub fn as_n_bits(&self, bits: u64, signed: bool, max_bits: u64) -> Option<Self> {
+        let fits = if signed {
+            self.bit_len() < bits
+        } else {
+            !self.is_negative() && self.bit_len() <= bits
+        };
+        if fits {
+            return Some(self.clone());
+        }
+        if bits > max_bits {
+            return None;
+        }
+        if bits == 0 {
+            return Some(Self::zero());
+        }
+        // Up to 127 bits of a value that fits an `i128`: its two's
+        // complement masked, then (signed, top bit set) sign-extended, which
+        // is the residue minus `2^bits`.
+        if bits < 128
+            && let Some(v) = self.small()
+        {
+            let mask = (1u128 << bits) - 1;
+            let u = (v as u128) & mask;
+            let r = if signed && (u >> (bits - 1)) & 1 == 1 {
+                (u | !mask) as i128
+            } else {
+                u as i128
+            };
+            return Some(Self::from_i128(r));
+        }
+        // The non-negative residue modulo `2^bits`, less `2^bits` when the
+        // signed form's top bit is set.
+        let u = self.0.mod_2k(bits);
+        if signed && u.bit(bits - 1) {
+            return Some(Self(u.sub(&Int::from(1i32).mul_2k(bits))));
+        }
+        Some(Self(u))
+    }
+
     /// Returns `self + other`.
     #[must_use]
     pub fn add(&self, other: &Self) -> Self {

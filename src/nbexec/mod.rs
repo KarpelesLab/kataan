@@ -2449,7 +2449,7 @@ fn is_native_constructor(id: u16) -> bool {
 /// Bound native: the `revoke` function from `Proxy.revocable` (carries the proxy).
 const N_PROXY_REVOKE: u16 = 122;
 const N_SYMBOL: u16 = 38;
-const N_BIGINT: u16 = 39;
+pub(crate) const N_BIGINT: u16 = 39;
 const N_PROXY: u16 = 106;
 pub(crate) const N_PARSE_FLOAT: u16 = 31;
 pub(crate) const N_IS_NAN: u16 = 32;
@@ -3041,7 +3041,7 @@ mod json_parse;
 mod method_dispatch;
 #[cfg(all(feature = "jit", jit_native))]
 pub(crate) use dataview_fast::dv_view_facts;
-pub(crate) use dataview_fast::{DvAccess, dataview_fast, dv_access_for};
+pub(crate) use dataview_fast::{DvAccess, dataview_fast, dv_access_any, dv_access_for};
 #[cfg(all(feature = "module", feature = "std"))]
 pub mod module;
 mod native_dispatch;

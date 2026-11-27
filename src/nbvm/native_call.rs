@@ -100,6 +100,9 @@ enum FastOp {
     TypedArr(crate::realm::typed_methods::TaMethod),
     /// `Date.UTC` (served for Number arguments).
     DateUtc,
+    /// `BigInt.asUintN` / (`true`) `BigInt.asIntN`, served for an integral
+    /// Number width (`ToIndex` the identity) and a BigInt value.
+    BigIntAsN(bool),
     /// `Object.fromEntries` over a plain array of plain `[key, value]`
     /// arrays (`obj_from_entries_fast`).
     ObjFromEntries,
@@ -430,6 +433,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
             Some(b"isNaN") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::NaN),
             Some(b"resolve") if ctor == Some(crate::nbexec::N_PROMISE) => FastOp::PromiseResolve,
             Some(b"UTC") if ctor == Some(crate::nbexec::N_DATE) => FastOp::DateUtc,
+            Some(b"asUintN") if ctor == Some(crate::nbexec::N_BIGINT) => FastOp::BigIntAsN(false),
+            Some(b"asIntN") if ctor == Some(crate::nbexec::N_BIGINT) => FastOp::BigIntAsN(true),
             _ => FastOp::HostDirect,
         };
     }
@@ -438,7 +443,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
     };
     match (id, name) {
         (N_DATA_VIEW_PROTO_FN, n) => {
-            crate::nbexec::dv_access_for(n).map_or(FastOp::HostDirect, FastOp::DataView)
+            crate::nbexec::dv_access_any(n).map_or(FastOp::HostDirect, FastOp::DataView)
         }
         (N_ARRAY_PROTO_FN, b"push") => FastOp::ArrayPush,
         (N_ARRAY_PROTO_FN, b"pop") => FastOp::ArrayPop,
@@ -2019,6 +2024,18 @@ fn run_op(
             }
             NanBox::number(crate::realm::date_fields::date_utc(&nums[..n]))
         }
+        FastOp::BigIntAsN(signed) => {
+            let bits = arg(0).as_number()?;
+            if !(0.0..9_007_199_254_740_992.0).contains(&bits) || (bits as u64) as f64 != bits {
+                return None;
+            }
+            let x = arg(1);
+            let max = realm.limits.max_bigint_bits;
+            let r = realm
+                .bigint_ref(Handle::from_raw(x.as_handle()?))?
+                .as_n_bits(bits as u64, signed, max)?;
+            NanBox::handle(realm.new_bigint(r).to_raw())
+        }
         FastOp::DateSet(set) => {
             // Number arguments (ToNumber the identity; an absent primary one
             // is `undefined`'s NaN), the date value read before them.
@@ -3072,7 +3089,7 @@ fn plain_primitive(realm: &Realm, v: NanBox) -> bool {
 /// the caller takes the host's general path. A multi-realm run is left alone.
 pub(super) fn try_call_value(realm: &mut Realm, f: NanBox, args: &[NanBox]) -> Option<NanBox> {
     use crate::nbexec::{
-        N_BOOLEAN, N_IS_FINITE, N_IS_NAN, N_NUMBER, N_PARSE_FLOAT, N_PARSE_INT, N_STRING,
+        N_BIGINT, N_BOOLEAN, N_IS_FINITE, N_IS_NAN, N_NUMBER, N_PARSE_FLOAT, N_PARSE_INT, N_STRING,
     };
     let id = realm.native_at(Handle::from_raw(f.as_handle()?))?;
     if realm.multi_realm {
@@ -3090,6 +3107,31 @@ pub(super) fn try_call_value(realm: &mut Realm, f: NanBox, args: &[NanBox]) -> O
                 // A number shares its rope (or a digit's interned cell).
                 NanBox::handle(realm.new_primitive_string(a0).to_raw())
             }
+        }
+        // `BigInt(v)` of a BigInt is `v`; of a Boolean, `0n` / `1n`; of an
+        // integral Number (NumberToBigInt) its exact value — below `2^127`
+        // in magnitude here; anything else (a RangeError, a string's parse,
+        // an object's conversion) is the host's.
+        N_BIGINT
+            if a0
+                .as_handle()
+                .is_some_and(|h| realm.is_bigint(Handle::from_raw(h))) =>
+        {
+            a0
+        }
+        N_BIGINT if matches!(a0.unpack(), Unpacked::Bool(_) | Unpacked::Number(_)) => {
+            let v = match a0.unpack() {
+                Unpacked::Bool(b) => i128::from(b),
+                // (A NaN or an infinity fails the bound; the cast back is
+                // exact just when `n` is an integer.)
+                Unpacked::Number(n) if n.abs() < 1.7e38 && (n as i128) as f64 == n => n as i128,
+                _ => return None,
+            };
+            NanBox::handle(
+                realm
+                    .new_bigint(crate::bignum::BigInt::from_i128(v))
+                    .to_raw(),
+            )
         }
         N_NUMBER if args.is_empty() => NanBox::number(0.0),
         N_NUMBER if plain_primitive(realm, a0) => NanBox::number(realm.to_number(a0)),
