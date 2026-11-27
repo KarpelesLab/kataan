@@ -597,6 +597,10 @@ pub struct Interp {
     /// `RegExp.prototype[@@replace]` / `[@@match]` / `[@@split]` lookup memos
     /// (see `regexp_symbol_method`), and those keys' storage strings.
     regexp_symbol_lookup: [crate::realm::builtins_fast::MethodSiteCache; 3],
+    /// `%String.prototype%[@@iterator]`'s lookup memo (`find_iterator_fn_recv`
+    /// for a string) and `@@iterator`'s storage key in a realm.
+    str_iter_site: crate::realm::builtins_fast::MethodSiteCache,
+    iter_symbol_key: Option<(usize, alloc::rc::Rc<str>)>,
     regexp_symbol_keys: [Option<(usize, alloc::rc::Rc<str>)>; 5],
     /// The layout of a RegExp match array's `index`/`input`/`groups`.
     #[cfg(feature = "regex")]
@@ -3115,6 +3119,8 @@ impl Interp {
             #[cfg(feature = "regex")]
             regexp_split_memo: None,
             regexp_symbol_lookup: Default::default(),
+            str_iter_site: Default::default(),
+            iter_symbol_key: None,
             regexp_symbol_keys: [None, None, None, None, None],
             #[cfg(feature = "regex")]
             match_array_shape: Default::default(),

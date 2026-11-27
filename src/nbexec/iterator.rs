@@ -2881,6 +2881,27 @@ impl Interp {
         h: crate::heap::Handle,
         receiver: NanBox,
     ) -> Result<Option<NanBox>, ExecError> {
+        // A string primitive: `%String.prototype%`'s chain, through a
+        // validated lookup memo (a data property found there is what the
+        // ordinary [[Get]] finds; anything else takes it below).
+        if receiver.as_handle() == Some(h.to_raw())
+            && !self.realm.multi_realm
+            && self.realm.is_string_handle(h)
+            && self.realm.typeof_is_string(h)
+            && let Some(start) = self.realm.string_proto_intrinsic
+        {
+            let key = self.iterator_symbol_key();
+            let cache = &mut self.str_iter_site;
+            let hit = match self.realm.method_site_get_prim(start, &key, cache) {
+                Some(v) => Some(v),
+                None => self.realm.method_site_fill_prim(start, &key, cache),
+            };
+            if let Some(v) = hit {
+                return Ok(
+                    (!matches!(v.unpack(), Unpacked::Undefined | Unpacked::Null)).then_some(v),
+                );
+            }
+        }
         let iter_sym = self.well_known_symbol("iterator");
         let iter_key = self.member_key(iter_sym);
         // Both walk the prototype chain (and fire inherited accessors), so an
@@ -2896,6 +2917,20 @@ impl Interp {
             return Ok(Some(fn_val));
         }
         Ok(None)
+    }
+
+    /// The storage key of `@@iterator` in this realm, memoized.
+    pub(crate) fn iterator_symbol_key(&mut self) -> alloc::rc::Rc<str> {
+        let rp = core::ptr::from_ref::<Realm>(&self.realm) as usize;
+        match &self.iter_symbol_key {
+            Some((p, k)) if *p == rp => alloc::rc::Rc::clone(k),
+            _ => {
+                let sym = self.well_known_symbol("iterator");
+                let k: alloc::rc::Rc<str> = self.member_key(sym).into();
+                self.iter_symbol_key = Some((rp, alloc::rc::Rc::clone(&k)));
+                k
+            }
+        }
     }
 
     /// The keys iterated by `for-in`: object property names or array indices,
