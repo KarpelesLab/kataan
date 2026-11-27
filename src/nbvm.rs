@@ -11956,11 +11956,27 @@ fn run_frame_at_ic(
                 // `call_closure`'s host call, lending this frame's registers:
                 // a built-in called here may let what it re-enters collect
                 // (`crate::realm::host_roots`).
-                let r = match native_call::try_call_value(&mut ctx.realm, f, &argv) {
-                    Some(v) => Ok(v),
-                    None => with_host_regs(ctx, regs, |h| h.call(f, NanBox::undefined(), &argv))
-                        .unwrap_or(Err(HostError::Fault))
-                        .map_err(VmError::from),
+                let r = if let Some((t, bthis, all)) =
+                    bound_vm_target(&mut ctx.realm, funcs, f, &argv)
+                {
+                    // A bound VM function: its target's call, this frame
+                    // published as for a VM callee.
+                    let pub_mark = ctx.frame_shadow.len();
+                    ctx.frame_shadow.extend_from_slice(regs);
+                    ctx.frames_published += 1;
+                    let r = call_closure(ctx, funcs, t, &all, bthis);
+                    ctx.frames_published -= 1;
+                    ctx.frame_shadow.truncate(pub_mark);
+                    r
+                } else {
+                    match native_call::try_call_value(&mut ctx.realm, f, &argv) {
+                        Some(v) => Ok(v),
+                        None => {
+                            with_host_regs(ctx, regs, |h| h.call(f, NanBox::undefined(), &argv))
+                                .unwrap_or(Err(HostError::Fault))
+                                .map_err(VmError::from)
+                        }
+                    }
                 };
                 match r {
                     Ok(ret) => regs[*dst as usize] = ret,
@@ -13478,6 +13494,67 @@ impl core::ops::Deref for ArgBuf {
     }
 }
 
+/// `Call(F, thisArgument, args)` of a bound function exotic object `F`
+/// (10.4.1.1) whose `[[BoundTargetFunction]]` is a VM function that is not a
+/// class constructor: that target, `F`'s `[[BoundThis]]`, and
+/// `[[BoundArguments]]` followed by `args` — the call the host's `[[Call]]`
+/// of `F` makes. `None` for anything else.
+fn bound_vm_target(
+    realm: &mut Realm,
+    funcs: &[FnProto],
+    f: NanBox,
+    args: &[NanBox],
+) -> Option<(NanBox, NanBox, ArgBuf)> {
+    use crate::nbexec::{BOUND_ARGS, BOUND_TARGET, BOUND_THIS};
+    let h = Handle::from_raw(f.as_handle()?);
+    if realm.multi_realm {
+        return None;
+    }
+    // By slot in the learned layout, else by name (learning the layout).
+    let [target, bthis, bargs] = match realm
+        .bound_fn_layout
+        .as_ref()
+        .and_then(|l| l.peek(realm, h))
+    {
+        Some(s) => s,
+        None => {
+            if !realm.is_plain_object(h) {
+                return None;
+            }
+            let target = realm.get_property(h, BOUND_TARGET)?;
+            let s = [
+                target,
+                realm
+                    .get_property(h, BOUND_THIS)
+                    .unwrap_or(NanBox::undefined()),
+                realm
+                    .get_property(h, BOUND_ARGS)
+                    .unwrap_or(NanBox::undefined()),
+            ];
+            if realm.bound_fn_layout.is_none() {
+                realm.bound_fn_layout = crate::realm::hidden_layout::HiddenLayout::learn(
+                    realm,
+                    h,
+                    [BOUND_TARGET, BOUND_THIS, BOUND_ARGS],
+                    &[],
+                );
+            }
+            s
+        }
+    };
+    let (id, _) = realm.vm_function(Handle::from_raw(target.as_handle()?))?;
+    if funcs.get(id as usize).is_none_or(|p| p.class_ctor) {
+        return None;
+    }
+    let bound = bargs
+        .as_handle()
+        .and_then(|a| realm.array_elements(Handle::from_raw(a)))
+        .unwrap_or(&[]);
+    let mut all = ArgBuf::from_slice(bound);
+    all.extend_from_slice(args);
+    Some((target, bthis, all))
+}
+
 fn call_closure(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -13492,6 +13569,10 @@ fn call_closure(
             .as_handle()
             .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h)))
     {
+        // A bound VM function: its target, called here.
+        if let Some((target, bthis, all)) = bound_vm_target(&mut ctx.realm, funcs, closure, args) {
+            return call_closure(ctx, funcs, target, &all, bthis);
+        }
         // `String(n)`, `Number(s)`, `parseInt(s)`, … over primitives.
         if let Some(v) = native_call::try_call_value(&mut ctx.realm, closure, args) {
             return Ok(v);

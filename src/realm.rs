@@ -508,6 +508,9 @@ pub struct Realm {
     /// The hidden-state layout of a live Array Iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) arr_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
+    /// The hidden-state layout of a bound function (`[[BoundTargetFunction]]`,
+    /// `[[BoundThis]]`, `[[BoundArguments]]`), learned likewise.
+    pub(crate) bound_fn_layout: Option<hidden_layout::HiddenLayout<3>>,
     /// Shared prototype-chain lookup memos (see
     /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
     chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
@@ -1267,6 +1270,7 @@ impl Realm {
             buf_iter_layout: None,
             str_iter_layout: None,
             arr_iter_layout: None,
+            bound_fn_layout: None,
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,

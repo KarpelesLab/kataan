@@ -2598,6 +2598,33 @@ pub(crate) fn jit_helper_exec_op(
                     ctx.frame_shadow.truncate(pub_mark);
                     Some(r.map(|v| regs[*dst as usize] = v))
                 }
+                // A bound VM function: its target's call, as the arm above
+                // makes a VM closure's.
+                None if let Some((t, bthis, all)) = ctx
+                    .host
+                    .is_some()
+                    .then(|| {
+                        let argv = super::ArgBuf::from_regs(regs, args);
+                        super::bound_vm_target(&mut ctx.realm, funcs, callee, &argv)
+                    })
+                    .flatten()
+                    && let Some((id, caps)) = t.as_handle().and_then(|h| {
+                        ctx.realm
+                            .vm_function(Handle::from_raw(h))
+                            .map(|(f, c)| (f as usize, super::ArgBuf::from_slice(c)))
+                    }) =>
+                {
+                    ctx.pending_callee = Some(t);
+                    let pub_mark = ctx.frame_shadow.len();
+                    if !on_register_stack(ctx, regs) {
+                        ctx.frame_shadow.extend_from_slice(regs);
+                    }
+                    ctx.frames_published += 1;
+                    let r = super::call_with(ctx, funcs, id, &all, &caps, bthis);
+                    ctx.frames_published -= 1;
+                    ctx.frame_shadow.truncate(pub_mark);
+                    Some(r.map(|v| regs[*dst as usize] = v))
+                }
                 // `String(n)`, `parseInt(s)`, …: `call_closure`'s own first step.
                 None if ctx.host.is_some() => {
                     let argv = super::ArgBuf::from_regs(regs, args);

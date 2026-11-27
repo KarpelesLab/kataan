@@ -90,6 +90,25 @@ impl<const N: usize> HiddenLayout<N> {
         Some(out)
     }
 
+    /// The values of the layout's keys on the object at `handle` when it has
+    /// exactly the layout's shape — for reading only (unlike
+    /// [`read`](Self::read), a frozen object or a read-only property does not
+    /// matter). `None` otherwise.
+    #[inline]
+    pub(crate) fn peek(&self, realm: &Realm, handle: Handle) -> Option<[NanBox; N]> {
+        let Some(Cell::Object(o)) = realm.heap.get(handle) else {
+            return None;
+        };
+        if !o.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, &self.shape)) {
+            return None;
+        }
+        let mut out = [NanBox::undefined(); N];
+        for (v, &slot) in out.iter_mut().zip(&self.slots) {
+            *v = o.slot(slot)?;
+        }
+        Some(out)
+    }
+
     /// Writes `value` to the layout's key `i` on the object at `handle` — what
     /// [`Realm::set_hidden_property`] does for that existing key. Only for an
     /// object [`read`](Self::read) just accepted, with nothing in between that

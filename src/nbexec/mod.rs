@@ -2678,9 +2678,9 @@ const TYPED_ARRAY_PROTO_BRAND: &str = "\u{0}taproto";
 /// `flags` → `""`, and each flag getter → `undefined` — rather than throwing the
 /// non-RegExp `TypeError`.
 const REGEXP_PROTO_BRAND: &str = "\u{0}reproto";
-const BOUND_TARGET: &str = "\u{0}bnd_t";
-const BOUND_THIS: &str = "\u{0}bnd_this";
-const BOUND_ARGS: &str = "\u{0}bnd_args";
+pub(crate) const BOUND_TARGET: &str = "\u{0}bnd_t";
+pub(crate) const BOUND_THIS: &str = "\u{0}bnd_this";
+pub(crate) const BOUND_ARGS: &str = "\u{0}bnd_args";
 /// Marks a function built by the dynamic `Function`/`GeneratorFunction`/… constructor.
 /// Such a function's `.caller`/`.arguments` keep the conservative poisoned-accessor
 /// throw (the engine cannot yet distinguish a dynamically-built *generator* from an
