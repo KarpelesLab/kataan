@@ -2501,7 +2501,7 @@ const ERROR_DATA: &str = "\u{0}errordata";
 // read live from `self.realm.limits`, so an embedder can tune them per realm.
 pub(crate) const SYMBOL_NO_DESC: &str = "\u{0}nodesc";
 /// Hidden key holding a `WeakRef`'s target (returned by `deref`).
-const WEAKREF_TARGET: &str = "\u{0}wrtarget";
+pub(crate) const WEAKREF_TARGET: &str = "\u{0}wrtarget";
 /// Hidden marker tagging a `FinalizationRegistry` instance.
 const FINREG_TAG: &str = "\u{0}finreg";
 const GEN_BUF: &str = "\u{0}gbuf";
@@ -2810,11 +2810,11 @@ pub(crate) const N_MAP_PROTO_FN: u16 = 254;
 
 /// A first-class `WeakMap.prototype.<method>`: the receiver must be a WeakMap
 /// (`[[WeakMapData]]`), else a `TypeError`.
-const N_WEAKMAP_PROTO_FN: u16 = 255;
+pub(crate) const N_WEAKMAP_PROTO_FN: u16 = 255;
 
 /// A first-class `WeakSet.prototype.<method>`: the receiver must be a WeakSet
 /// (`[[WeakSetData]]`), else a `TypeError`.
-const N_WEAKSET_PROTO_FN: u16 = 256;
+pub(crate) const N_WEAKSET_PROTO_FN: u16 = 256;
 
 // --- ES2025 explicit resource management + ShadowRealm (see `resource.rs`) ---
 /// The `DisposableStack` constructor.
@@ -2945,7 +2945,7 @@ const N_ERROR_IS_ERROR: u16 = 660;
 const N_MATH_SUM_PRECISE: u16 = 661;
 /// `WeakRef.prototype.deref()` — brand-checks `this` (a `[[WeakRefTarget]]`
 /// slot) and returns the held target (never collected here). `.length` is 0.
-const N_WEAKREF_DEREF: u16 = 662;
+pub(crate) const N_WEAKREF_DEREF: u16 = 662;
 /// `FinalizationRegistry.prototype.register(target, heldValue [, token])` —
 /// brand-checks `this` (a `[[Cells]]` slot), validates CanBeHeldWeakly(target)
 /// and `target !== heldValue`, appends a cell, returns undefined. `.length` 2.

@@ -107,6 +107,20 @@ impl Realm {
         a: NanBox,
         b: NanBox,
     ) -> Option<NanBox> {
+        self.coll_fast_of(h, op, a, b, false)
+    }
+
+    /// [`coll_fast`](Self::coll_fast) on a strong (`weak` false) or weak
+    /// collection.
+    #[inline(always)]
+    fn coll_fast_of(
+        &mut self,
+        h: Handle,
+        op: CollOp,
+        a: NanBox,
+        b: NanBox,
+        weak: bool,
+    ) -> Option<NanBox> {
         let lean = lean_enabled();
         // One read of the cell: its kind, and for a collection with a hash
         // index a lookup or update by the lean probe (`coll_probe_lean`):
@@ -114,11 +128,11 @@ impl Realm {
         let (indexed, hinted, probed) = match self.heap.get_hot(h)? {
             Cell::Collection {
                 is_set,
-                is_weak: false,
+                is_weak,
                 index,
                 entries,
                 ..
-            } if *is_set == op.on_set() => {
+            } if *is_set == op.on_set() && *is_weak == weak => {
                 // The entry the last lookup found, when it is this
                 // collection's entry for this key (see `Realm::coll_hint`).
                 let hinted = (lean
@@ -267,5 +281,32 @@ impl Realm {
             },
             _ => NanBox::boolean(pos.is_some()),
         })
+    }
+
+    /// `op` on the receiver `h` when it is a weak collection of the method's
+    /// kind (a `WeakMap` for a `Map` operation, a `WeakSet` for a `Set`
+    /// one): exactly what the host's `WeakMap.prototype` / `WeakSet.prototype`
+    /// method does once its brand check passed, which is the strong
+    /// collections' (a weak collection keeps its entries as a strong one
+    /// does; the collector clears dead keys), so [`coll_fast`](Self::coll_fast)'s
+    /// lean form. The caller has checked that
+    /// an added key can be held weakly; a lookup or delete of any other key
+    /// finds nothing, as the host's. `None`, having done nothing, for a
+    /// receiver of another kind (the general path's `TypeError`).
+    pub(crate) fn weak_coll_fast(
+        &mut self,
+        h: Handle,
+        op: CollOp,
+        a: NanBox,
+        b: NanBox,
+    ) -> Option<NanBox> {
+        self.coll_fast_of(h, op, a, b, true)
+    }
+
+    /// `WeakRef.prototype.deref()` on `h`: its target when `h` is a WeakRef
+    /// (the host's `[[WeakRefTarget]]` slot); `None` otherwise (the general
+    /// path's `TypeError`).
+    pub(crate) fn weak_ref_target(&self, h: Handle) -> Option<NanBox> {
+        self.get_property(h, crate::nbexec::WEAKREF_TARGET)
     }
 }

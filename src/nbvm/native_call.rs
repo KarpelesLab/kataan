@@ -45,6 +45,7 @@ use crate::nbexec::{
     N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_GET_OWN_NAMES,
     N_OBJECT_GET_PROTO, N_OBJECT_HAS_OWN, N_OBJECT_KEYS, N_OBJECT_VALUES, N_REFLECT_GET_PROTO,
     N_REFLECT_HAS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
+    N_WEAKMAP_PROTO_FN, N_WEAKREF_DEREF, N_WEAKSET_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -88,6 +89,12 @@ enum FastOp {
     MapDelete,
     /// `Set.prototype.delete`.
     SetDelete,
+    /// A `WeakMap.prototype` / `WeakSet.prototype` method (`get`, `set`,
+    /// `has`, `delete` / `add`, `has`, `delete`), named by the `Map`/`Set`
+    /// operation it shares ([`Realm::weak_coll_fast`]).
+    WeakColl(CollOp),
+    /// `WeakRef.prototype.deref`.
+    WeakRefDeref,
     /// `Object.prototype.hasOwnProperty`.
     ObjHasOwn,
     /// `RegExp.prototype.test` / `exec`: the resolved function called through
@@ -376,6 +383,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_OBJECT_CREATE) => return FastOp::ObjCreate,
         Some(N_OBJECT_ASSIGN) => return FastOp::ObjAssign,
         Some(N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
+        Some(N_WEAKREF_DEREF) => return FastOp::WeakRefDeref,
         Some(N_GEN_NEXT) => return FastOp::GenResume(0),
         Some(N_GEN_THROW) => return FastOp::GenResume(1),
         Some(N_GEN_RETURN) => return FastOp::GenResume(2),
@@ -433,6 +441,13 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_SET_PROTO_FN, b"has") => FastOp::SetHas,
         (N_MAP_PROTO_FN, b"delete") => FastOp::MapDelete,
         (N_SET_PROTO_FN, b"delete") => FastOp::SetDelete,
+        (N_WEAKMAP_PROTO_FN, b"get") => FastOp::WeakColl(CollOp::MapGet),
+        (N_WEAKMAP_PROTO_FN, b"set") => FastOp::WeakColl(CollOp::MapSet),
+        (N_WEAKMAP_PROTO_FN, b"has") => FastOp::WeakColl(CollOp::MapHas),
+        (N_WEAKMAP_PROTO_FN, b"delete") => FastOp::WeakColl(CollOp::MapDelete),
+        (N_WEAKSET_PROTO_FN, b"add") => FastOp::WeakColl(CollOp::SetAdd),
+        (N_WEAKSET_PROTO_FN, b"has") => FastOp::WeakColl(CollOp::SetHas),
+        (N_WEAKSET_PROTO_FN, b"delete") => FastOp::WeakColl(CollOp::SetDelete),
         (N_REGEXP_PROTO_FN, b"test" | b"exec") => FastOp::RegExpCall,
         (N_STRING_PROTO_FN, b"slice") => FastOp::StrSlice,
         (N_STRING_PROTO_FN, b"substring") => FastOp::StrSubstring,
@@ -1915,6 +1930,16 @@ fn run_op(
             // receiver of another kind, or a weak one, is a miss).
             realm.coll_fast(h, op.coll_op()?, arg(0), arg(1))?
         }
+        FastOp::WeakColl(op) => {
+            // A key that cannot be held weakly is the general path's (its
+            // `TypeError` for an add, a symbol's registry check).
+            let a = arg(0);
+            if matches!(op, CollOp::MapSet | CollOp::SetAdd) && !super::is_object_value(realm, a) {
+                return None;
+            }
+            realm.weak_coll_fast(h, op, a, arg(1))?
+        }
+        FastOp::WeakRefDeref => realm.weak_ref_target(h)?,
         FastOp::ObjHasOwn => NanBox::boolean(obj_has_own_fast(realm, h, arg(0))?),
         FastOp::StrSlice | FastOp::StrSubstring | FastOp::StrSubstr => {
             // A `Concat` is sliced by walking its tree when that is cheap (see
