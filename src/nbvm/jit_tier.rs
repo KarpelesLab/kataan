@@ -5054,15 +5054,18 @@ pub(crate) extern "C" fn jit_helper_construct(
         let ctor_val = regs[*ctor as usize];
         // `new Map()` / `new Set()` of the default constructors (the
         // interpreter arm's step for a built-in constructor).
+        // And `new Array()` / `new Array(x)` of the intrinsic `Array`.
         if args.len() <= 1 {
             let argv = super::ArgBuf::from_regs(regs, args);
-            if let Some(v) = ctx.realm.new_default_collection(ctor_val, &argv) {
+            if let Some(v) = ctx
+                .realm
+                .new_default_collection(ctor_val, &argv)
+                .or_else(|| ctx.realm.new_default_array(ctor_val, &argv))
+            {
                 regs[*dst as usize] = v;
-                // (With no arguments, the compiled sequence's lean form
-                // takes this constructor next time: `jit_helper_new_coll`.)
-                if args.is_empty() {
-                    site.coll_ctor = ctor_val.to_bits();
-                }
+                // (The compiled sequence's lean form takes this constructor
+                // next time: `jit_helper_new_coll`.)
+                site.coll_ctor = ctor_val.to_bits();
                 return 0;
             }
         }
@@ -5071,21 +5074,31 @@ pub(crate) extern "C" fn jit_helper_construct(
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
 }
 
-/// `new C()` with no arguments in compiled code, `C` (`ctor`) the value the
-/// site last saw be a default collection constructor
-/// (`crate::jit::CallSite::coll_ctor`): the new empty `Map` / `Set`, as
-/// [`jit_helper_construct`]'s first step makes it, or `0` (nothing done)
-/// when `ctor` is no longer such a constructor (the call sequence then
+/// `new C()` / `new C(x)` (`argc` 0 or 1, `x` in `arg0`) in compiled code,
+/// `C` (`ctor`) the value the site last saw be a default collection
+/// constructor or the intrinsic `Array` (`crate::jit::CallSite::coll_ctor`):
+/// the new `Map` / `Set` / array, as [`jit_helper_construct`]'s first step
+/// makes it, or `0` (nothing done) when `ctor` is no longer such a
+/// constructor or the arguments need the interpreter (the call sequence then
 /// runs). An allocation only: no call, no throw.
 ///
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with.
-pub(crate) extern "C" fn jit_helper_new_coll(ctx: *mut core::ffi::c_void, ctor: u64) -> u64 {
+pub(crate) extern "C" fn jit_helper_new_coll(
+    ctx: *mut core::ffi::c_void,
+    ctor: u64,
+    argc: u64,
+    arg0: u64,
+) -> u64 {
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    let buf = [NanBox::from_bits(arg0)];
+    let args = &buf[..usize::from(argc != 0)];
+    let ctor = NanBox::from_bits(ctor);
     ctx.realm
-        .new_default_collection(NanBox::from_bits(ctor), &[])
+        .new_default_collection(ctor, args)
+        .or_else(|| ctx.realm.new_default_array(ctor, args))
         .map_or(0, NanBox::to_bits)
 }
 

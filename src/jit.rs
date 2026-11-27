@@ -4280,10 +4280,11 @@ pub struct GenericHelpers {
     pub call_this: JitCallKeyHelper,
     /// A `new`'s callee check and object creation (`jit_construct_info`).
     pub construct_info: ConstructHelper,
-    /// `new Map()` / `new Set()` of a default collection constructor
-    /// (`jit_helper_new_coll(ctx, ctor)`): the new collection's bits, or `0`
-    /// (nothing done) for any other constructor. Never throws.
-    pub new_coll: JitTruthyHelper,
+    /// `new Map()` / `new Set()` of a default collection constructor, or
+    /// `new Array()` / `new Array(x)` of the intrinsic one
+    /// (`jit_helper_new_coll(ctx, ctor, argc, arg0)`): the new object's bits,
+    /// or `0` (nothing done) for any other constructor. Never throws.
+    pub new_coll: JitBinHelper,
     /// A `new`'s result when the body returned a heap value
     /// (`jit_construct_result`).
     pub construct_result: ConstructResultHelper,
@@ -19366,7 +19367,7 @@ impl JitFunction {
                     // `new Map()` / `new Set()` (the site's last constructor a
                     // default collection one): the lean helper, before the
                     // call sequence (`CallSite::coll_ctor`).
-                    let coll = (args.is_empty() && call_seq::new_coll_enabled()).then(|| {
+                    let coll = (args.len() <= 1 && call_seq::new_coll_enabled()).then(|| {
                         let coll = a.new_label();
                         let normal = a.new_label();
                         a.load_rax(disp(ctor));
@@ -19417,6 +19418,11 @@ impl JitFunction {
                         a.bind(coll);
                         a.mov_rdi_r15();
                         a.g_mov(call_seq::r::RSI, call_seq::r::RAX);
+                        a.movabs_argreg(2, args.len() as i64);
+                        match args.first() {
+                            Some(&r) => a.load_argreg(3, disp(r)),
+                            None => a.movabs_argreg(3, 0),
+                        }
                         a.movabs_rax(new_coll_helper as i64);
                         a.call_rax();
                         a.test_rax_rax();

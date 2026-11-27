@@ -1479,6 +1479,44 @@ impl Realm {
         Some(NanBox::handle(h.to_raw()))
     }
 
+    /// `new Array()` / `new Array(x)` of the (single) realm's intrinsic
+    /// `Array` constructor, with `new.target` the constructor itself: the new
+    /// array as the interpreter's construct makes it (a number `x` is the
+    /// length, the indices holes; anything else the one element), or `None`
+    /// when the interpreter must run it (another constructor, more than one
+    /// argument, a `$262.createRealm` program, or an invalid length, whose
+    /// `RangeError` the interpreter throws). Allocation only: no call, no
+    /// throw. `GetPrototypeFromConstructor(Array, %Array.prototype%)` reads
+    /// `Array.prototype`, which is non-writable and non-configurable, so the
+    /// fresh array's default prototype is always the right one.
+    pub fn new_default_array(&mut self, ctor: NanBox, args: &[NanBox]) -> Option<NanBox> {
+        if self.multi_realm || args.len() > 1 {
+            return None;
+        }
+        let c = Handle::from_raw(ctor.as_handle()?);
+        if self.native_at(c) != Some(crate::nbexec::N_BASE_ARRAY) {
+            return None;
+        }
+        let h = match args.first().and_then(|a| a.as_number()) {
+            Some(n) => {
+                if n < 0.0 || n > f64::from(u32::MAX) || n != f64::from(n as u32) {
+                    return None;
+                }
+                let len = n as usize;
+                if len <= crate::cell::ARRAY_INLINE_CAP {
+                    let holes = [NanBox::hole(); crate::cell::ARRAY_INLINE_CAP];
+                    self.new_array_from_slice(&holes[..len])
+                } else {
+                    let h = self.new_array(Vec::new());
+                    self.set_array_length(h, len);
+                    h
+                }
+            }
+            None => self.new_array_from_slice(args),
+        };
+        Some(NanBox::handle(h.to_raw()))
+    }
+
     /// Records an explicit `[[Prototype]]` for a callable cell (native / bound
     /// native) that has no inline object part. Read back by
     /// [`object_proto`](Realm::object_proto) so `Object.getPrototypeOf` resolves
