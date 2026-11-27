@@ -222,6 +222,17 @@ pub(crate) fn time_clip(t: f64) -> f64 {
 }
 
 impl super::Realm {
+    /// Whether the cell at `h` is an ordinary object or a Date owning no
+    /// property (the receivers `nbvm::to_prim` converts), on one read of it.
+    #[inline]
+    pub(crate) fn to_prim_receiver(&self, h: crate::heap::Handle) -> bool {
+        match self.heap.get(h) {
+            Some(crate::cell::Cell::Object(_)) => true,
+            Some(crate::cell::Cell::Date(_)) => !self.has_aux_object(h),
+            _ => false,
+        }
+    }
+
     /// `new Date(…)` of the (single) realm's intrinsic `Date`, with
     /// `new.target` the constructor itself, when no argument conversion can
     /// run code: one Number (its TimeClip) or one Date (its time value), or

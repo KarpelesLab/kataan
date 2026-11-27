@@ -2252,6 +2252,21 @@ fn host_binary(
     Some(r.unwrap_or(Err(HostError::Fault)).map_err(VmError::from))
 }
 
+/// [`host_binary`]'s first step on its own: two BigInt primitives under an
+/// operator that cannot throw, answered on the borrowed values (no code runs).
+/// `None` otherwise (nothing done).
+#[inline]
+fn bigint_early(ctx: &mut Ctx, op: crate::ast::BinaryOp, a: NanBox, b: NanBox) -> Option<NanBox> {
+    if ctx.host.is_none()
+        || !crate::bignum::fast_enabled()
+        || a.as_handle().is_none()
+        || b.as_handle().is_none()
+    {
+        return None;
+    }
+    ctx.realm.bigint_binary_try(op, a, b).ok()
+}
+
 /// [`host_binary`] for a unary operator.
 fn host_unary(
     ctx: &mut Ctx,
@@ -7341,6 +7356,9 @@ fn vm_add(
     if (a.is_number() || prim_str(a)) && (b.is_number() || prim_str(b)) {
         return vm_add_prims(ctx, a, b);
     }
+    if let Some(v) = bigint_early(ctx, crate::ast::BinaryOp::Add, a, b) {
+        return Ok(v);
+    }
     if let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Default, regs) {
         let (x, y) = r?;
         return vm_add(ctx, funcs, x, y, regs);
@@ -7479,6 +7497,9 @@ fn vm_arith(
         GA_DIV => crate::ast::BinaryOp::Div,
         _ => crate::ast::BinaryOp::Mod,
     };
+    if let Some(v) = bigint_early(ctx, bop, a, b) {
+        return Ok(v);
+    }
     if let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Number, regs) {
         let (x, y) = r?;
         return vm_arith(ctx, funcs, x, y, op, regs);
@@ -7518,6 +7539,9 @@ fn vm_lt(
     }
     if let Some(lt) = string_lt(&mut ctx.realm, a, b) {
         return Ok(NanBox::boolean(lt));
+    }
+    if let Some(v) = bigint_early(ctx, crate::ast::BinaryOp::Lt, a, b) {
+        return Ok(v);
     }
     if let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Number, regs) {
         let (x, y) = r?;
@@ -7692,6 +7716,9 @@ fn vm_value_bin(
             VB_LOOSE_EQ => B::EqEq,
             _ => B::NotEq,
         };
+        if let Some(v) = bigint_early(ctx, bop, a, b) {
+            return Ok(v);
+        }
         if !matches!(op, VB_LOOSE_EQ | VB_LOOSE_NEQ)
             && let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Number, regs)
         {

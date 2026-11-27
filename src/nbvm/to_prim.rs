@@ -56,14 +56,15 @@ fn enabled() -> bool {
 /// (not host-exotic), or a Date owning no property (whose `[[Get]]` starts
 /// at its `[[Prototype]]`), in a hosted single-realm run.
 fn candidate(ctx: &Ctx, v: NanBox) -> bool {
-    ctx.host.is_some()
-        && !ctx.realm.multi_realm
-        && v.as_handle().is_some_and(|h| {
-            let h = Handle::from_raw(h);
-            !ctx.realm.is_host_exotic(h)
-                && (ctx.realm.is_object_cell(h)
-                    || (ctx.realm.date_at(h).is_some() && !ctx.realm.has_aux_object(h)))
-        })
+    // (One read of the cell decides the common case, a primitive's or a
+    // BigInt's `false`.)
+    v.as_handle().is_some_and(|h| {
+        let h = Handle::from_raw(h);
+        ctx.realm.to_prim_receiver(h)
+            && ctx.host.is_some()
+            && !ctx.realm.multi_realm
+            && !ctx.realm.is_host_exotic(h)
+    })
 }
 
 /// [`plain_get`] on a [`candidate`] receiver `o`.
