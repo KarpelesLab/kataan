@@ -1955,7 +1955,7 @@ const DATE_PROTO_METHODS: &[&str] = &[
 /// `[[TypedArrayName]]` internal slot first (throwing a `TypeError` otherwise),
 /// and never applies the plain-`Array` result conversion — so e.g.
 /// `Int8Array.prototype.map.call(ta, fn)` returns a same-kind typed array.
-const N_TYPED_ARRAY_PROTO_FN: u16 = 246;
+pub(crate) const N_TYPED_ARRAY_PROTO_FN: u16 = 246;
 /// A first-class `RegExp.prototype.<method>` (`exec`/`test`/`compile`/`toString`
 /// and the `@@match`/`@@matchAll`/`@@replace`/`@@search`/`@@split` symbol
 /// methods). A bound native carrying the method name; calling it brand-validates

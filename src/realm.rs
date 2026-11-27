@@ -64,6 +64,7 @@ mod spread_fast;
 mod str_key_fast;
 mod str_switch;
 mod typed_fast;
+pub(crate) mod typed_methods;
 pub use coll_index::CollIndex;
 #[cfg(all(feature = "jit", jit_native))]
 pub(crate) use coll_index::jit_counts_layout as jit_coll_index_counts;

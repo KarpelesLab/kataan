@@ -95,6 +95,11 @@ enum FastOp {
     WeakColl(CollOp),
     /// `WeakRef.prototype.deref`.
     WeakRefDeref,
+    /// A `%TypedArray%.prototype` method with a lean form
+    /// (`Realm::ta_method`).
+    TypedArr(crate::realm::typed_methods::TaMethod),
+    /// `Date.UTC` (served for Number arguments).
+    DateUtc,
     /// A `Date.prototype` getter.
     DateGet(crate::realm::date_fields::DateGet),
     /// A `Date.prototype` component setter (served for Number arguments).
@@ -420,6 +425,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
             Some(b"isFinite") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::Finite),
             Some(b"isNaN") if ctor == Some(N_NUMBER) => FastOp::NumPred(NumPred::NaN),
             Some(b"resolve") if ctor == Some(crate::nbexec::N_PROMISE) => FastOp::PromiseResolve,
+            Some(b"UTC") if ctor == Some(crate::nbexec::N_DATE) => FastOp::DateUtc,
             _ => FastOp::HostDirect,
         };
     }
@@ -452,6 +458,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
             }
             _ => FastOp::HostDirect,
         },
+        (crate::nbexec::N_TYPED_ARRAY_PROTO_FN, n) => crate::realm::typed_methods::TaMethod::of(n)
+            .map_or(FastOp::HostDirect, FastOp::TypedArr),
         (N_WEAKMAP_PROTO_FN, b"get") => FastOp::WeakColl(CollOp::MapGet),
         (N_WEAKMAP_PROTO_FN, b"set") => FastOp::WeakColl(CollOp::MapSet),
         (N_WEAKMAP_PROTO_FN, b"has") => FastOp::WeakColl(CollOp::MapHas),
@@ -1952,6 +1960,20 @@ fn run_op(
         }
         FastOp::WeakRefDeref => realm.weak_ref_target(h)?,
         FastOp::DateGet(g) => NanBox::number(g.get(realm.date_at(h)?)),
+        FastOp::TypedArr(m) => {
+            let n = args.len().min(3);
+            let argv = [arg(0), arg(1), arg(2)];
+            realm.ta_method(h, m, &argv[..n])?
+        }
+        FastOp::DateUtc => {
+            // Number arguments (ToNumber the identity), the seven read.
+            let mut nums = [0.0; 7];
+            let n = args.len().min(7);
+            for (i, slot) in nums.iter_mut().enumerate().take(n) {
+                *slot = arg(i).as_number()?;
+            }
+            NanBox::number(crate::realm::date_fields::date_utc(&nums[..n]))
+        }
         FastOp::DateSet(set) => {
             // Number arguments (ToNumber the identity; an absent primary one
             // is `undefined`'s NaN), the date value read before them.

@@ -190,6 +190,27 @@ impl DateSet {
     }
 }
 
+/// `Date.UTC(…)` (§21.4.3.4) of its arguments after ToNumber (at most the
+/// seven read): `NaN` without a year or with a non-finite component.
+pub(crate) fn date_utc(nums: &[f64]) -> f64 {
+    let getn = |i: usize, dflt: f64| nums.get(i).copied().unwrap_or(dflt);
+    let c = [
+        getn(0, f64::NAN),
+        getn(1, 0.0),
+        getn(2, 1.0),
+        getn(3, 0.0),
+        getn(4, 0.0),
+        getn(5, 0.0),
+        getn(6, 0.0),
+    ];
+    if c.iter().any(|v| !v.is_finite()) {
+        return f64::NAN;
+    }
+    // MakeDate(MakeDay(y, m, d), MakeTime(h, min, s, milli)) in IEEE-754
+    // `f64` (the two-digit-year mapping is folded into the helper).
+    crate::nbexec::make_date_ms(c[0], c[1], c[2], c[3], c[4], c[5], c[6])
+}
+
 /// TimeClip (§21.4.1.31).
 pub(crate) fn time_clip(t: f64) -> f64 {
     if !t.is_finite() || !(-8.64e15..=8.64e15).contains(&t) {

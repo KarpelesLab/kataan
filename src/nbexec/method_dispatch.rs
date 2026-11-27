@@ -1117,24 +1117,9 @@ impl Interp {
                 let v = self.coerce_to_number(*a)?;
                 nums.push(self.realm.to_number(v));
             }
-            let getn = |i: usize, dflt: f64| nums.get(i).copied().unwrap_or(dflt);
-            let year_n = getn(0, f64::NAN);
-            let month = getn(1, 0.0);
-            let day = getn(2, 1.0);
-            let hours = getn(3, 0.0);
-            let mins = getn(4, 0.0);
-            let secs = getn(5, 0.0);
-            let millis = getn(6, 0.0);
-            if [year_n, month, day, hours, mins, secs, millis]
-                .iter()
-                .any(|v| v.is_nan() || !v.is_finite())
-            {
-                return Ok(Some(NanBox::number(f64::NAN)));
-            }
-            // MakeDate(MakeDay(y, m, d), MakeTime(h, min, s, milli)) in IEEE-754
-            // `f64` (the two-digit-year mapping is folded into the helper).
-            let ms = crate::nbexec::make_date_ms(year_n, month, day, hours, mins, secs, millis);
-            return Ok(Some(NanBox::number(ms)));
+            return Ok(Some(NanBox::number(crate::realm::date_fields::date_utc(
+                &nums,
+            ))));
         }
         // --- `Proxy.revocable(target, handler)` → `{ proxy, revoke }` ---
         if self.realm.native_at(handle) == Some(N_PROXY) && method == "revocable" {

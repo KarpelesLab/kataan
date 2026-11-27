@@ -25,7 +25,7 @@ use crate::nbexec::decode_typed_element;
 
 /// The element kinds these helpers write (all but Float16 = 11 and the BigInt
 /// kinds 9 / 10).
-const fn fast_kind(kind: u8) -> bool {
+pub(super) const fn fast_kind(kind: u8) -> bool {
     kind <= 8
 }
 

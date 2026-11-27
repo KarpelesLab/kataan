@@ -874,6 +874,7 @@ impl Realm {
             | Cell::RegExp { .. }
             | Cell::Collection { .. }
             | Cell::Date(_)
+            | Cell::TypedArray { .. }
             | Cell::Native(_)
             | Cell::BoundNative { .. }
             | Cell::VmFunction { .. } => {
