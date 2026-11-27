@@ -2536,6 +2536,28 @@ impl Object {
         }
     }
 
+    /// `CreateDataProperty(key, value)` (or the value-only
+    /// `[[DefineOwnProperty]]` of OrdinarySetWithOwnDescriptor, which agrees
+    /// with it here) when it is a plain store on an object no host hook
+    /// watches: `key` is absent from an extensible object, or an existing
+    /// writable, enumerable, configurable data property. `false`, having
+    /// changed nothing, for anything else (the caller takes the full define).
+    pub fn create_data_plain(&mut self, key: &str, value: NanBox, dict_threshold: usize) -> bool {
+        if self.flags & (JIT_FLAG_EXOTIC | JIT_FLAG_NO_INLINE_SET | JIT_FLAG_GLOBAL) != 0
+            || self.is_prim_wrapper()
+            || !self.is_plain_data_slot_or_absent(key)
+        {
+            return false;
+        }
+        if self.write_existing(key, value) {
+            return true;
+        }
+        self.maybe_convert_to_dict(key, dict_threshold);
+        self.add_new(key, value);
+        self.track_key(key);
+        true
+    }
+
     /// Overwrites own data property `key` with `value` if it exists; `false`
     /// (nothing written) if it does not.
     fn write_existing(&mut self, key: &str, value: NanBox) -> bool {

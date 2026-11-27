@@ -3047,6 +3047,7 @@ pub mod module;
 mod native_dispatch;
 mod object;
 pub(crate) mod promise;
+mod proxy_fast;
 mod regexp;
 mod resource;
 pub(crate) mod str_rope;

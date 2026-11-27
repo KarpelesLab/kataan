@@ -4257,6 +4257,33 @@ impl Realm {
         self.heap.get(handle)?.as_proxy()
     }
 
+    /// Whether `GetMethod(handler, name)` is certainly `undefined` without
+    /// running code: an ordinary handler chain with no accessor and no
+    /// non-nullish data property `name`. `false` means "unknown" (the caller
+    /// takes the full lookup).
+    pub fn proxy_trap_absent_quiet(&self, handler: Handle, name: &str) -> bool {
+        let mut cur = Some(handler);
+        for _ in 0..256 {
+            let Some(c) = cur else {
+                return true;
+            };
+            let Some(Cell::Object(obj)) = self.heap.get(c) else {
+                return false;
+            };
+            if obj.jit_flags() & crate::object::JIT_FLAG_EXOTIC != 0 || obj.is_prim_wrapper() {
+                return false;
+            }
+            if obj.accessor(name).is_some() {
+                return false;
+            }
+            if let Some(v) = obj.get(name) {
+                return v.is_undefined() || v.is_null();
+            }
+            cur = obj.proto();
+        }
+        false
+    }
+
     /// Whether the proxy at `handle` has been revoked.
     #[must_use]
     pub fn proxy_revoked(&self, handle: Handle) -> bool {
@@ -8870,6 +8897,22 @@ impl Realm {
             return true;
         }
         false
+    }
+
+    /// `CreateDataProperty(handle, key, value)` when it is a plain add or
+    /// overwrite on an ordinary object cell (see [`Object::create_data_plain`]).
+    /// `false`, having changed nothing, for anything else; the caller then
+    /// takes `[[DefineOwnProperty]]`.
+    pub fn create_data_property_plain(&mut self, handle: Handle, key: &str, value: NanBox) -> bool {
+        let dict_threshold = self.limits.object_dictionary_threshold;
+        let Some(obj) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) else {
+            return false;
+        };
+        if !obj.create_data_plain(key, value, dict_threshold) {
+            return false;
+        }
+        self.write_barrier(handle, value);
+        true
     }
 
     /// `CreateDataProperty(handle, key, value)` when `handle` is an ordinary

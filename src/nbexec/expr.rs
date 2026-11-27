@@ -907,6 +907,9 @@ impl Interp {
             // Receiver via `[[DefineOwnProperty]]` — for a proxy Receiver this runs
             // its `getOwnPropertyDescriptor` + `defineProperty` traps.
             if self.realm.proxy_at(recv_h).is_some() {
+                if let Some(ok) = self.proxy_receiver_define_quiet(recv_h, key, value) {
+                    return Ok(ok);
+                }
                 let existing = self.descriptor_of(recv_h, key)?;
                 let desc = self.realm.new_object();
                 self.realm.set_property(desc, "value", value);
