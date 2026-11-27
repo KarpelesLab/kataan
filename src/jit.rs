@@ -25,6 +25,13 @@
 //! of a page or more on Windows, whose thread stacks commit lazily behind a
 //! single guard page.
 //!
+//! **AArch64** (`jit_a64`: Linux, and macOS on Apple Silicon) is a second
+//! backend, brought up tier by tier: `a64` (the encoder, whose module docs
+//! give the porting strategy), `a64_numeric` (the Int/Float tiers) and
+//! `exec_a64` (W^X memory and instruction-cache maintenance; on macOS through
+//! `libSystem`, which has no stable system-call ABI). `jit_native` is either
+//! backend.
+//!
 //! `unsafe` is used — and *only* used — for the three irreducibly-unsafe steps a
 //! JIT requires: the raw syscalls, writing/executing mapped memory, and the
 //! transmute of a code pointer to a function pointer. Each carries a safety
@@ -33,6 +40,11 @@
 
 use alloc::vec::Vec;
 
+/// The AArch64 encoder (the second backend; see its module docs) and the
+/// numeric tiers' AArch64 lowerings. Pure byte emission, built on every host
+/// (its encodings are checked on any host); only aarch64 runs the code.
+mod a64;
+mod a64_numeric;
 #[cfg(all(feature = "alloc", jit_x64))]
 mod arr_push;
 #[cfg(all(feature = "alloc", jit_x64))]
@@ -47,6 +59,9 @@ mod dataview;
 mod deopt;
 #[cfg(all(feature = "alloc", jit_x64))]
 pub(crate) mod direct_call;
+/// W^X executable memory on AArch64 (Linux, macOS).
+#[cfg(jit_a64)]
+mod exec_a64;
 #[cfg(all(feature = "alloc", jit_x64))]
 mod fieldrep;
 #[cfg(all(feature = "alloc", jit_x64))]
@@ -75,6 +90,8 @@ mod iter_reuse;
 mod key_probe;
 #[cfg(all(feature = "alloc", jit_x64))]
 mod key_reuse;
+#[cfg(test)]
+mod numeric_diff_tests;
 #[cfg(all(feature = "alloc", jit_x64))]
 pub(crate) mod legacy_hl;
 #[cfg(all(feature = "alloc", jit_x64))]
@@ -1773,9 +1790,11 @@ fn nanbox_f64(v: crate::nanbox::NanBox) -> Option<f64> {
 fn has_sse41() -> bool {
     std::is_x86_feature_detected!("sse4.1")
 }
+/// Elsewhere: AArch64 always has the rounding instructions (`frintm`,
+/// `frintp`, `frintz`) the Float tier's floor/ceil/trunc need.
 #[cfg(all(feature = "alloc", not(target_arch = "x86_64")))]
 fn has_sse41() -> bool {
-    false
+    cfg!(target_arch = "aarch64")
 }
 
 /// straight-line). Returns `None` otherwise, with the same def-use safety check.
@@ -9059,13 +9078,13 @@ impl X64Assembler {
 /// Whether the JIT can emit and run native code on this target.
 #[must_use]
 pub const fn available() -> bool {
-    cfg!(jit_x64)
+    cfg!(jit_native)
 }
 
 /// A compiled native function over `i64` arguments, owning the executable
 /// memory it lives in. `f1`/`f2` call into the mapped code.
 pub struct JitFunction {
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     buf: exec::ExecBuffer,
 }
 
@@ -9074,6 +9093,9 @@ impl JitFunction {
     /// argument). Returns `None` when the JIT is unavailable on this target.
     #[must_use]
     pub fn compile_arith(ops: &[ArithOp]) -> Option<Self> {
+        if cfg!(target_arch = "aarch64") {
+            return Self::from_code(&a64_numeric::arith(ops)?);
+        }
         let mut a = X64Assembler::new();
         a.mov_rax_rdi();
         for op in ops {
@@ -9096,6 +9118,9 @@ impl JitFunction {
     /// Compiles a native binary op `fn(i64, i64) -> i64` (`a <op> b`).
     #[must_use]
     pub fn compile_binary(op: BinOp) -> Option<Self> {
+        if cfg!(target_arch = "aarch64") {
+            return Self::from_code(&a64_numeric::binary(op)?);
+        }
         let mut a = X64Assembler::new();
         a.mov_rax_rdi();
         match op {
@@ -9125,6 +9150,9 @@ impl JitFunction {
     /// ```
     #[must_use]
     pub fn compile_sum_1_to_n() -> Option<Self> {
+        if cfg!(target_arch = "aarch64") {
+            return Self::from_code(&a64_numeric::sum_1_to_n()?);
+        }
         let mut a = X64Assembler::new();
         let loop_top = a.new_label();
         let done = a.new_label();
@@ -9167,6 +9195,9 @@ impl JitFunction {
         if depth != 1 {
             return None;
         }
+        if cfg!(target_arch = "aarch64") {
+            return Self::from_code(&a64_numeric::stack(ops)?);
+        }
         let mut a = X64Assembler::new();
         for op in ops {
             match *op {
@@ -9201,6 +9232,9 @@ impl JitFunction {
     /// arg index out of range, or no `Ret`).
     #[must_use]
     pub fn compile_reg(n_regs: usize, n_args: usize, ops: &[RegOp]) -> Option<Self> {
+        if cfg!(target_arch = "aarch64") {
+            return Self::from_code(&a64_numeric::reg(n_regs, n_args, ops)?);
+        }
         if n_regs > 64 || n_args > 6 {
             return None;
         }
@@ -9461,6 +9495,9 @@ impl JitFunction {
     /// registers, `>4` args, or a malformed program (bad index / no `Ret`).
     #[must_use]
     pub fn compile_float(n_regs: usize, n_args: usize, ops: &[FloatOp]) -> Option<Self> {
+        if cfg!(target_arch = "aarch64") {
+            return Self::from_code(&a64_numeric::float(n_regs, n_args, ops)?);
+        }
         if n_regs > 64 || n_args > 4 {
             return None;
         }
@@ -9542,9 +9579,12 @@ impl JitFunction {
                     if !ok(dst) || !ok(ra) {
                         return None;
                     }
-                    // -x == 0.0 - x (NaN/∞ propagate correctly).
-                    a.zero_xmm0();
-                    a.fbin_xmm0_mem(FBinOp::Sub, disp(ra));
+                    // -x: the sign bit flipped (`0.0 - x` would make
+                    // -(+0) = +0).
+                    a.movsd_xmm0_mem(disp(ra));
+                    a.movabs_rax(i64::MIN);
+                    a.cvt_rax_bits_to_xmm1();
+                    a.code.extend_from_slice(&[0x66, 0x0f, 0x57, 0xc1]); // xorpd xmm0, xmm1
                     a.movsd_mem_xmm0(disp(dst));
                 }
                 FloatOp::Sqrt { dst, a: ra } => {
@@ -20634,6 +20674,17 @@ impl JitFunction {
         f.map(|f| (f, entries, spec_heads, gen_tab))
     }
 
+    /// Tests' hand-assembled x86-64 code: mapped executable on an x86-64
+    /// host, `None` on any other (where it would not run).
+    #[cfg(test)]
+    pub(crate) fn from_x64_code(code: &[u8]) -> Option<Self> {
+        if cfg!(target_arch = "x86_64") {
+            Self::from_code(code)
+        } else {
+            None
+        }
+    }
+
     /// Wraps already-emitted machine `code` into a callable region (the entry
     /// point for hand-assembled functions, e.g. one that calls another).
     #[must_use]
@@ -20662,11 +20713,11 @@ impl JitFunction {
     /// native code emits a `call` to (intra-JIT calls). `0` if unavailable.
     #[must_use]
     pub fn code_ptr(&self) -> usize {
-        #[cfg(jit_x64)]
+        #[cfg(jit_native)]
         {
             self.buf.ptr() as usize
         }
-        #[cfg(not(jit_x64))]
+        #[cfg(not(jit_native))]
         {
             0
         }
@@ -20687,7 +20738,7 @@ impl JitFunction {
     #[must_use]
     #[inline]
     pub fn call_f64x4(&self, a: [f64; 4]) -> f64 {
-        #[cfg(jit_x64)]
+        #[cfg(jit_native)]
         {
             // SAFETY: the compiled code follows the System V ABI for
             // `extern "sysv64" fn(f64 x4) -> f64` (args in xmm0..xmm3, result in xmm0);
@@ -20697,7 +20748,7 @@ impl JitFunction {
                 unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a[0], a[1], a[2], a[3])
         }
-        #[cfg(not(jit_x64))]
+        #[cfg(not(jit_native))]
         {
             let _ = a;
             unreachable!("JitFunction cannot be constructed on this target")
@@ -20721,7 +20772,7 @@ impl JitFunction {
     #[must_use]
     #[inline]
     pub fn call_int6(&self, a: [i64; 6]) -> i64 {
-        #[cfg(jit_x64)]
+        #[cfg(jit_native)]
         {
             // SAFETY: the compiled code follows the System V ABI for
             // `extern "sysv64" fn(i64 x6) -> i64`; reading fewer than 6 args is sound
@@ -20731,7 +20782,7 @@ impl JitFunction {
                 unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a[0], a[1], a[2], a[3], a[4], a[5])
         }
-        #[cfg(not(jit_x64))]
+        #[cfg(not(jit_native))]
         {
             let _ = a;
             unreachable!("JitFunction cannot be constructed on this target")
@@ -20741,7 +20792,7 @@ impl JitFunction {
     /// Calls the compiled function with one argument.
     #[must_use]
     pub fn call1(&self, a: i64) -> i64 {
-        #[cfg(jit_x64)]
+        #[cfg(jit_native)]
         {
             // SAFETY: `buf` holds verified, self-emitted machine code following the
             // System V ABI for `extern "sysv64" fn(i64) -> i64`; the memory is mapped
@@ -20750,7 +20801,7 @@ impl JitFunction {
             let f: extern "sysv64" fn(i64) -> i64 = unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a)
         }
-        #[cfg(not(jit_x64))]
+        #[cfg(not(jit_native))]
         {
             let _ = a;
             unreachable!("JitFunction cannot be constructed on this target")
@@ -20760,7 +20811,7 @@ impl JitFunction {
     /// Calls the compiled function with two arguments.
     #[must_use]
     pub fn call2(&self, a: i64, b: i64) -> i64 {
-        #[cfg(jit_x64)]
+        #[cfg(jit_native)]
         {
             // SAFETY: as `call1`, for `extern "sysv64" fn(i64, i64) -> i64`.
             #[allow(unsafe_code)]
@@ -20768,7 +20819,7 @@ impl JitFunction {
                 unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a, b)
         }
-        #[cfg(not(jit_x64))]
+        #[cfg(not(jit_native))]
         {
             let _ = (a, b);
             unreachable!("JitFunction cannot be constructed on this target")
@@ -20778,22 +20829,22 @@ impl JitFunction {
     /// The machine code's length in bytes.
     #[must_use]
     pub fn code_len(&self) -> usize {
-        #[cfg(jit_x64)]
+        #[cfg(jit_native)]
         {
             self.buf.code_len()
         }
-        #[cfg(not(jit_x64))]
+        #[cfg(not(jit_native))]
         {
             0
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     fn from_code(code: &[u8]) -> Option<Self> {
         exec::ExecBuffer::new(code).map(|buf| Self { buf })
     }
 
-    #[cfg(not(jit_x64))]
+    #[cfg(not(jit_native))]
     fn from_code(_code: &[u8]) -> Option<Self> {
         None
     }
@@ -20812,6 +20863,9 @@ pub enum BinOp {
 
 #[cfg(all(feature = "alloc", jit_x64))]
 mod numeric;
+
+#[cfg(jit_a64)]
+use exec_a64 as exec;
 
 #[cfg(jit_x64)]
 mod exec {
@@ -21778,7 +21832,7 @@ mod tests {
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn allocated_program_runs_natively() {
         let ops = [
@@ -21842,7 +21896,7 @@ mod tests {
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn bit32_matches_js_toint32_semantics() {
         // f(a,b) = a & b, with JS ToInt32 truncation.
@@ -21873,7 +21927,7 @@ mod tests {
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn mod_compiles_and_deopts_on_zero() {
         let ops = [
@@ -21898,7 +21952,7 @@ mod tests {
         assert_eq!(f.call_args(&[5, 0]), i64::MAX, "% 0 must deopt");
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn shift32_matches_js_semantics() {
         let run = |op: ShiftOp, a: i64, b: i64| -> i64 {
@@ -21929,7 +21983,7 @@ mod tests {
         assert_eq!(run(ShiftOp::Shr, -8, 1), 0x7FFF_FFFC);
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn eqz_compiles_and_runs() {
         // f(x) = !(x < 5)  ≡  (x < 5) then Eqz → (x >= 5).
@@ -22145,7 +22199,7 @@ mod tests {
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn optimized_program_runs_natively() {
         let ops = [
@@ -22302,7 +22356,7 @@ mod tests {
         a.add_rsp_imm8(8);
         a.add_rax_imm(1);
         a.ret();
-        let af = JitFunction::from_machine_code(&a.finish()).expect("compile A");
+        let af = JitFunction::from_x64_code(&a.finish()).expect("compile A");
 
         // A(x) = 2*x + 1, computed by A natively calling B natively.
         for x in [0i64, 1, 5, -3, 1000] {
@@ -22312,7 +22366,7 @@ mod tests {
         assert_eq!(b.call1(21), 42);
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn float_sqrt_and_abs_native() {
         // f(x) = sqrt(|x|).
@@ -22342,10 +22396,10 @@ mod tests {
         assert!(g.call_args_f64(&[-1.0]).is_nan(), "sqrt(-1) is NaN");
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn float_floor_ceil_native() {
-        if !std::is_x86_feature_detected!("sse4.1") {
+        if !has_sse41() {
             return; // roundsd unavailable; the lowering bails and this is moot
         }
         let floor = [
@@ -22405,7 +22459,7 @@ mod tests {
         a.round_half_xmm0();
         a.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
         a.ret();
-        let f = JitFunction::from_code(&a.finish()).expect("jit available");
+        let f = JitFunction::from_x64_code(&a.finish()).expect("jit available");
         let spec = |x: f64| -> f64 {
             if !x.is_finite() || x == 0.0 {
                 return x;
@@ -22454,7 +22508,7 @@ mod tests {
         assert!(nan.is_nan());
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn float_min_max_js_semantics() {
         let max = [
@@ -22516,7 +22570,7 @@ mod tests {
         );
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn float_eq_is_nan_aware() {
         // f(a,b) = (a === b) ? 1.0 : 0.0.
@@ -22541,7 +22595,7 @@ mod tests {
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn float_eqz_handles_zero_and_nan() {
         // f(x) = !x  (1.0 for falsy x: ±0.0 or NaN; else 0.0).
@@ -22558,7 +22612,7 @@ mod tests {
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn float_neg_compiles_and_runs() {
         // f(x) = -x + 1.5  (negation on the float path).
@@ -22709,7 +22763,7 @@ mod tests {
             // The forward `je` spans `6 * f` bytes: short up to 127.
             let short = 6 * f <= 127;
             assert_eq!(code[6] == 0x74, short, "f = {f}");
-            if let Some(func) = JitFunction::from_code(&code) {
+            if let Some(func) = JitFunction::from_x64_code(&code) {
                 assert_eq!(func.call1(0), 0, "f = {f}");
                 assert_eq!(func.call1(5), 35, "f = {f}");
             }
@@ -22754,7 +22808,7 @@ mod tests {
             if pin {
                 assert_eq!(code[at[0]], 0xeb);
             }
-            if let Some(func) = JitFunction::from_code(&code) {
+            if let Some(func) = JitFunction::from_x64_code(&code) {
                 assert_eq!(func.call1(0), 110, "pin = {pin}");
                 assert_eq!(func.call1(1), 100, "pin = {pin}");
             }

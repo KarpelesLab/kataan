@@ -300,7 +300,7 @@ mod tests {
         a.bind(no);
         a.code.extend_from_slice(&[0x31, 0xc0]); // xor eax, eax
         a.ret();
-        let Some(f) = super::super::JitFunction::from_code(&a.finish()) else {
+        let Some(f) = super::super::JitFunction::from_x64_code(&a.finish()) else {
             return;
         };
         let call = |bits: u64| f.call_args(&[bits.cast_signed()]) != 0;
