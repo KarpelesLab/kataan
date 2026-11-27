@@ -123,8 +123,11 @@ pub(crate) const MEMO_FILL: u8 = 2;
 /// it compile to an inline lookup) uses the lookup memo: a `get` checks it
 /// when an earlier `has` or `get` site takes its key from the same
 /// register, which then fills it (`if (m.has(k)) return m.get(k)`;
-/// `m.get(k) … m.get(k)`). Only a guess of where it pays (the memo is
-/// checked at run time). Empty when no site uses it.
+/// `m.get(k) … m.get(k)`); so does an `m.set(k, v)` site (should it
+/// compile to an inline update, [`X64Assembler::coll_update`]), whose
+/// update of an entry the memo holds needs no lookup of its own
+/// (`m.set(k, (m.get(k) || 0) + 1)`). Only a guess of where it pays (the
+/// memo is checked at run time). Empty when no site uses it.
 pub(crate) fn memo_plan(ops: &[crate::nbvm::Op]) -> alloc::vec::Vec<u8> {
     use crate::nbvm::Op;
     let site = |op: &Op| match op {
@@ -135,10 +138,19 @@ pub(crate) fn memo_plan(ops: &[crate::nbvm::Op]) -> alloc::vec::Vec<u8> {
         }
         _ => None,
     };
+    // A `set(k, v)` site checks the memo as a `get` does.
+    let checker = |op: &Op| match op {
+        Op::CallMethod { key, args, .. } | Op::CallWithMethod { key, args, .. }
+            if args.len() == 2 && key == "set" =>
+        {
+            Some(args[0])
+        }
+        _ => site(op).and_then(|(get, k)| get.then_some(k)),
+    };
     let mut plan = alloc::vec![0u8; ops.len()];
     let mut any = false;
     for (g, op) in ops.iter().enumerate() {
-        let Some((true, k)) = site(op) else { continue };
+        let Some(k) = checker(op) else { continue };
         for (h, earlier) in ops[..g].iter().enumerate() {
             if site(earlier).is_some_and(|(_, k2)| k2 == k) {
                 plan[h] |= MEMO_FILL;
@@ -584,6 +596,10 @@ impl X64Assembler {
     /// writes): the result stored to the register at frame displacement
     /// `dst` and on to `done`; to `fill` when the site's proof is stale and
     /// may be made again, to `slow` for anything else, with nothing done.
+    /// A `set` whose `memo_use` has [`MEMO_CHECK`] first looks for the
+    /// receiver and key in the lookup memo ([`CollMemo`]): an entry found
+    /// there by a lookup since (whatever the collection's size) is updated
+    /// in place under the site's own proof, with no scan, probe or helper.
     /// Clobbers `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn coll_update(
@@ -595,10 +611,38 @@ impl X64Assembler {
         (callee, recv, key, val, dst): (Option<i32>, i32, i32, i32, i32),
         (fill, slow, done): (Label, Label, Label),
         probe_helper: Option<u64>,
+        memo_use: u8,
     ) {
         let c = coll_layout();
         let [stamp, ptr, method, is_set, tries] = MethodSite::coll_offsets();
         let stale = self.new_label();
+        let found = self.new_label();
+        // The memo's entry for this receiver and key, read before the memo
+        // is emptied below: `rsi` = its address (`0`: none, or no entry
+        // has the key), kept through the proof (nothing there writes
+        // `rsi`). Only the helper's form (an indexed collection's update
+        // is the one worth saving) of a `Map` `set`.
+        let memo_hit = self
+            .coll_memo
+            .filter(|_| memo_use & MEMO_CHECK != 0 && w == CollWrite::MapSet)
+            .filter(|_| probe_helper.is_some());
+        if let Some(m) = memo_hit {
+            let none = self.new_label();
+            let read = self.new_label();
+            let base = self.frame_base(recv);
+            self.g_load(r::R9, base, recv);
+            self.g_cmp_mem(r::R9, r::RBP, m.recv);
+            self.g_jcc(cc::NE, none);
+            let base = self.frame_base(key);
+            self.g_load(r::R9, base, key);
+            self.g_cmp_mem(r::R9, r::RBP, m.key);
+            self.g_jcc(cc::NE, none);
+            self.g_load(r::RSI, r::RBP, m.entry);
+            self.jmp(read);
+            self.bind(none);
+            self.g_movabs(r::RSI, 0);
+            self.bind(read);
+        }
         // An indexed or larger collection, or a key compared out of line:
         // the helper's update (`jit_helper_coll_write`), which runs no
         // code, when there is one; else the call's.
@@ -697,6 +741,12 @@ impl X64Assembler {
             // (A method read is the other kind's built-in only on a
             // receiver of the wrong kind: the call's `TypeError`.)
             self.g_jcc(cc::NE, if callee.is_some() { slow } else { stale });
+            if memo_hit.is_some() {
+                // The entry the memo holds (the receiver is the one the
+                // memo's lookup found it in, of `Map` kind as the proof's).
+                self.g_test(r::RSI);
+                self.g_jcc(cc::NE, found);
+            }
             self.g_mem(true, &[0x83], 7, r::RCX, c.index); // cmp qword [rcx+index], imm8
             self.code.push(0);
             self.g_jcc(cc::NE, probe);
@@ -711,7 +761,6 @@ impl X64Assembler {
         // r11 = the key's bits (`-0` as `+0`).
         let kbase = self.frame_base(key);
         self.coll_key_bits(kbase, key);
-        let found = self.new_label();
         let absent = self.new_label();
         self.coll_scan(l, (found, absent, probe));
         self.bind(absent);

@@ -13716,6 +13716,7 @@ impl JitFunction {
                             (None, disp(recv), disp(k), disp(v), disp(dst)),
                             (fill, slow, done),
                             coll::write_enabled().then_some(helpers.coll_write as usize as u64),
+                            cm_plan.get(op_idx).copied().unwrap_or(0),
                         );
                         let cold = a.cold_begin();
                         a.bind(fill);
@@ -19567,6 +19568,7 @@ impl JitFunction {
                                     (Some(disp(callee)), disp(recv), disp(k), disp(v), disp(dst)),
                                     (fill, general, done),
                                     Some(helpers.coll_write as usize as u64),
+                                    cm_plan.get(op_idx).copied().unwrap_or(0),
                                 );
                             } else {
                                 a.coll_lookup(
