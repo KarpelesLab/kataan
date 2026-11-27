@@ -7324,8 +7324,9 @@ pub(crate) fn jit_helper_set_prop_site(
             .chain
             .as_ref()
             .is_some_and(|c| c.accessor);
-        if accessor {
-            note_inlined_accessor(ctx, site, site_setter(ctx, h, site));
+        if accessor && !site.inlined_keys().is_empty() {
+            let setter = site_setter(ctx, h, site);
+            note_inlined_accessor(ctx, site, setter);
         }
         if accessor
             && let Some(setter) = site.fill_set(&mut ctx.realm, h)

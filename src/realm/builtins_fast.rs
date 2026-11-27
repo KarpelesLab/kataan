@@ -1913,6 +1913,35 @@ impl Realm {
         None
     }
 
+    /// [`watch_get_chain`](Self::watch_get_chain) for a key whose first
+    /// holder from `start` is an accessor: every link up to that holder
+    /// watched, and `true`, when the walk meets only such links (at most
+    /// eight deep) and ends at an own accessor of `key`. While the
+    /// prototype epoch then stands, the `[[Get]]` / `[[Set]]` of `key` from
+    /// `start` finds the same accessor pair (a change to any link's keys,
+    /// its accessors or its `[[Prototype]]` moves the epoch). `false`
+    /// (some links perhaps watched) for anything else.
+    pub(crate) fn watch_accessor_chain(&mut self, start: Handle, key: &str) -> bool {
+        let mut cur = Some(start);
+        for _ in 0..8 {
+            let Some(h) = cur else {
+                return false;
+            };
+            let Some((aux, _, next)) = self.key_link(h) else {
+                return false;
+            };
+            self.watch_link(h.to_raw(), aux);
+            if self.accessor(h, key).is_some() {
+                return true;
+            }
+            if self.has_own(h, key) {
+                return false;
+            }
+            cur = next;
+        }
+        false
+    }
+
     /// The current value at a [`StampedSlot`], while its holder still has the
     /// recorded shape.
     pub(crate) fn stamped_slot(&self, at: &StampedSlot) -> Option<NanBox> {
