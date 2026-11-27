@@ -3304,6 +3304,14 @@ pub(super) fn call_compiled_with(
     if let Some(slot) = cregs.get_mut(proto.n_params + proto.n_captures) {
         *slot = this;
     }
+    // The `arguments` object (`Op::MakeArguments`), as `call_with_inner`
+    // makes it.
+    let made = entry_arguments(ctx, proto, callee_val, args);
+    if let Some((dst, v)) = made
+        && let Some(slot) = cregs.get_mut(dst)
+    {
+        *slot = v;
+    }
     if ctx.gc_enabled {
         let n = ctx.realm.vm_args_buf.len();
         ctx.frame_shadow
@@ -3313,6 +3321,7 @@ pub(super) fn call_compiled_with(
         }
         ctx.frame_shadow.push(this);
         ctx.frame_shadow.extend(rest_arr);
+        ctx.frame_shadow.extend(made.map(|m| m.1));
     }
     proto.tier.bump();
     let outcome = run_compiled_fresh(ctx, funcs, &jit, &mut cregs);
@@ -3333,6 +3342,27 @@ pub(super) fn call_compiled_with(
         Ok(_) => Err(VmError::Unsupported),
         Err(e) => Err(e),
     })
+}
+
+/// The `arguments` object a body whose first op is `Op::MakeArguments`
+/// starts with, as `call_with_inner` makes it on entry — over every argument
+/// passed (`args`), with the callee value `callee` — and the register it goes
+/// in; `None` for any other body.
+fn entry_arguments(
+    ctx: &mut Ctx,
+    proto: &FnProto,
+    callee: NanBox,
+    args: &[NanBox],
+) -> Option<(usize, NanBox)> {
+    let Some(Op::MakeArguments { dst, mapped }) = proto.ops.first() else {
+        return None;
+    };
+    let v = match ctx.realm.new_arguments_object(args, callee, *mapped) {
+        Some(h) => NanBox::handle(h.to_raw()),
+        None => super::with_host(ctx, |h| h.make_arguments(args, callee, *mapped))
+            .unwrap_or(NanBox::undefined()),
+    };
+    Some((*dst as usize, v))
 }
 
 /// `Call(callee, this, args)` of a VM closure from a host built-in (a
@@ -3756,10 +3786,30 @@ impl CompiledCallback {
         if let Some(slot) = regs.get_mut(self.n_params + self.n_caps) {
             *slot = this;
         }
+        // What `call_with_inner` binds on entry beyond those: a rest
+        // parameter's array, the `arguments` object.
+        let rest = proto.rest_from.map(|fixed| {
+            let arr = ctx
+                .realm
+                .new_array(args.get(fixed..).unwrap_or(&[]).to_vec());
+            let arr = NanBox::handle(arr.to_raw());
+            if let Some(slot) = regs.get_mut(fixed) {
+                *slot = arr;
+            }
+            arr
+        });
+        let made = entry_arguments(ctx, proto, self.callee, args);
+        if let Some((dst, v)) = made
+            && let Some(slot) = regs.get_mut(dst)
+        {
+            *slot = v;
+        }
         if ctx.gc_enabled {
             ctx.frame_shadow.extend_from_slice(args);
             ctx.frame_shadow.extend_from_slice(self.captures());
             ctx.frame_shadow.push(this);
+            ctx.frame_shadow.extend(rest);
+            ctx.frame_shadow.extend(made.map(|m| m.1));
         }
         proto.tier.bump();
         let outcome = run_compiled_fresh(ctx, funcs, &self.jit, &mut regs);
@@ -5549,11 +5599,6 @@ fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     if proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
-        || proto
-            .ops
-            .iter()
-            .take(2)
-            .any(|o| matches!(o, Op::MakeArguments { .. }))
         || !call_is_hot(proto.tier.has_body())
     {
         return None;
@@ -5862,6 +5907,41 @@ fn fill_construct_fast(
             crate::jit::CallSite::EMPTY
         },
     };
+}
+
+jit_extern! {
+/// The `arguments` object a native-call entry makes for its body
+/// (`crate::jit::call_seq::MadeArgs`), as `call_with_inner` makes it on
+/// entry: over every argument passed (`argc` of them at `argv`), with the
+/// callee the native-call header just below them names (a mapped object's
+/// `callee`). Never runs user code, never collects.
+///
+/// # Safety
+/// `ctx` the live `Ctx`; `argv` the arguments of a complete native-call
+/// header (`FRAME_HEADER` words below it).
+pub(crate) fn jit_helper_make_arguments(
+    ctx: *mut core::ffi::c_void,
+    argc: u64,
+    argv: *const u64,
+    mapped: u64,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let (ctx, args, callee) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            core::slice::from_raw_parts(argv.cast::<NanBox>(), argc as usize),
+            NanBox::from_bits(*argv.sub(crate::jit::FRAME_HEADER - 1)),
+        )
+    };
+    let mapped = mapped != 0;
+    match ctx.realm.new_arguments_object(args, callee, mapped) {
+        Some(h) => NanBox::handle(h.to_raw()).to_bits(),
+        None => super::with_host(ctx, |h| h.make_arguments(args, callee, mapped))
+            .unwrap_or(NanBox::undefined())
+            .to_bits(),
+    }
+}
 }
 
 jit_extern! {
@@ -6256,17 +6336,14 @@ pub(super) fn callee_view(
 /// or `arguments` one) that is hot and already compiled to the generic tier —
 /// its compiled body, if so.
 fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
+    // (`new.target` is fine: the callee's register starts `undefined`, a
+    // call's `new.target`. So is an `arguments` object: a native-call entry
+    // makes it from its header, `crate::jit::call_seq::MadeArgs`, and
+    // `call_compiled_with`'s framed call as `call_with_inner` does.)
     if proto.class_ctor
         || proto.is_async
         || proto.is_generator
         || proto.rest_from.is_some()
-        // (`new.target` is fine: the callee's register starts `undefined`,
-        // a call's `new.target`.)
-        || proto
-            .ops
-            .iter()
-            .take(2)
-            .any(|o| matches!(o, Op::MakeArguments { .. }))
         || !call_is_hot(proto.tier.has_body())
     {
         return None;

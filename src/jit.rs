@@ -4322,6 +4322,9 @@ pub struct GenericHelpers {
     /// A `new` served by its site's inline constructor cache: its `this`
     /// (`jit_construct_alloc`).
     pub construct_alloc: ConstructAllocHelper,
+    /// A native-call entry's `arguments` object (`call_seq::MadeArgs`,
+    /// `jit_helper_make_arguments(ctx, argc, argv, mapped)`).
+    pub make_arguments: jit_abi!(fn(*mut core::ffi::c_void, u64, *const u64, u64) -> u64),
     /// `super(…)`'s "already bound" `ReferenceError` (`jit_super_twice`).
     pub super_twice: SuperTwiceHelper,
     /// `Op::SuperCallArgs`'s slow path (`jit_helper_super_call(ctx, regs,
@@ -12376,8 +12379,20 @@ impl JitFunction {
         // direct`): not for a body whose activation needs its header. (A
         // sloppy ordinary body's is handed out only while no code can read
         // the legacy `f.caller` / `f.arguments`: `JitProto::call_target`.)
+        // A body making an `arguments` object: its entry makes it from the
+        // header's arguments and callee (`call_seq::MadeArgs`), so it has no
+        // headerless entry either.
+        let made_args = match bytecode.first() {
+            Some(crate::nbvm::Op::MakeArguments { dst, mapped }) => Some(call_seq::MadeArgs {
+                dst: usize::from(*dst),
+                mapped: *mapped,
+                helper: helpers.make_arguments as usize as u64,
+            }),
+            _ => None,
+        };
         let native_direct =
-            (call_seq::headerless_enabled() && new_target.is_none()).then(|| a.new_label());
+            (call_seq::headerless_enabled() && new_target.is_none() && made_args.is_none())
+                .then(|| a.new_label());
         let native_direct_pinned = native_direct.and_then(|_| a.pinned().then(|| a.new_label()));
         let native_room = if has_inline && !has_handlers {
             inl_slots.levels() * (call_seq::FRAME_HEADER + inl_slots.max_argc) * 8
@@ -12414,6 +12429,7 @@ impl JitFunction {
                 },
                 &helpers.call_layout,
             )),
+            made_args,
         )?;
         // A speculative region's plain copy is emitted right after it
         // (`numeric::NumGen::schedule`).
