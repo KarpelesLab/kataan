@@ -2181,6 +2181,22 @@ fn host_get(
     r.unwrap_or(Err(HostError::Fault)).map_err(VmError::from)
 }
 
+/// `recv.[[Get]](key)` for an iterator result's `done` / `value`: answered
+/// by the ordinary chain walk when it finds a data property or nothing over
+/// ordinary objects only (no code can run), else [`host_get_str`].
+fn get_str_plain(ctx: &mut Ctx, recv: NanBox, key: &str) -> Result<NanBox, VmError> {
+    if let Some(h) = recv.as_handle().map(Handle::from_raw)
+        && ctx.realm.is_object_cell(h)
+    {
+        match ctx.realm.ordinary_chain_get(h, key).map(|(hit, _)| hit) {
+            Some(crate::realm::ChainHit::Data(v)) => return Ok(v),
+            Some(crate::realm::ChainHit::Absent) => return Ok(NanBox::undefined()),
+            _ => {}
+        }
+    }
+    host_get_str(ctx, recv, key, None)
+}
+
 /// [`host_get`] for a static string key.
 fn host_get_str(
     ctx: &mut Ctx,
@@ -3408,7 +3424,7 @@ fn yield_delegate_op(
     let (it, nx) = (regs[iter as usize], regs[next as usize]);
     let m = regs[mode as usize].as_number().unwrap_or(0.0) as u8;
     let v = regs[dst as usize];
-    match yield_delegate_step(ctx, funcs, it, nx, m, v)? {
+    match yield_delegate_step(ctx, funcs, regs, it, nx, m, v)? {
         DelegateStep::Yield(res) => Ok(Some(res)),
         DelegateStep::Done(value) => {
             regs[dst as usize] = value;
@@ -3438,11 +3454,31 @@ enum DelegateStep {
 fn yield_delegate_step(
     ctx: &mut Ctx,
     funcs: &[FnProto],
+    regs: &[NanBox],
     iter: NanBox,
     next: NanBox,
     mode: u8,
     v: NanBox,
 ) -> Result<DelegateStep, VmError> {
+    // `next` the intrinsic over a VM generator: its resume, without the
+    // host's call. A `yield` hands back a fresh result object (as the call
+    // would have made it, `done` false: yielded as is); a completion is done
+    // with its value (the call's fresh `{value, done: true}`, whose reads
+    // run no code); an inner `yield*`'s result object is read as any is.
+    if mode == 0
+        && let Some(out) = gen_fast::delegate_next(ctx, funcs, regs, iter, next, v)
+    {
+        match out? {
+            gen_fast::GenOut::Yield(x) => {
+                return Ok(DelegateStep::Yield(gen_fast::result_object(
+                    ctx,
+                    gen_fast::GenOut::Yield(x),
+                )));
+            }
+            gen_fast::GenOut::Done(x) => return Ok(DelegateStep::Done(x)),
+            gen_fast::GenOut::Delegated(r) => return yield_delegate_result(ctx, r, mode),
+        }
+    }
     let res = match mode {
         0 => call_closure(ctx, funcs, next, &[v], iter)?,
         1 => {
@@ -3477,15 +3513,20 @@ fn yield_delegate_step(
             call_closure(ctx, funcs, m, &[v], iter)?
         }
     };
+    yield_delegate_result(ctx, res, mode)
+}
+
+/// The rest of a [`yield_delegate_step`] once the inner method returned `res`.
+fn yield_delegate_result(ctx: &mut Ctx, res: NanBox, mode: u8) -> Result<DelegateStep, VmError> {
     if !is_object_value(&ctx.realm, res) {
         let e = vm_error(ctx, "TypeError", "Iterator result is not an object");
         return Err(VmError::Thrown(e));
     }
-    let done = host_get_str(ctx, res, "done", None)?;
+    let done = get_str_plain(ctx, res, "done")?;
     if !ctx.realm.truthy(done) {
         return Ok(DelegateStep::Yield(res));
     }
-    let value = host_get_str(ctx, res, "value", None)?;
+    let value = get_str_plain(ctx, res, "value")?;
     Ok(if mode == 2 {
         DelegateStep::Return(value)
     } else {

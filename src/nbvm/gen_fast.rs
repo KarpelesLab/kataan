@@ -22,8 +22,7 @@
 
 use super::{
     Ctx, FnProto, FrameExit, GEN_COMPLETED, GEN_EXECUTING, GEN_SUSPENDED_START,
-    GEN_SUSPENDED_YIELD, Op, STACK_EXHAUSTED, VM_GEN, VmError, host_get_str, run_frame_at_ic,
-    vm_error,
+    GEN_SUSPENDED_YIELD, Op, STACK_EXHAUSTED, VM_GEN, VmError, run_frame_at_ic, vm_error,
 };
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
@@ -1243,11 +1242,11 @@ fn for_of_outcome(
         GenOut::Yield(v) => Ok(Some(v)),
         GenOut::Done(_) => Ok(None),
         GenOut::Delegated(r) => (|| {
-            let d = host_get_str(ctx, r, "done", None)?;
+            let d = super::get_str_plain(ctx, r, "done")?;
             if ctx.realm.truthy(d) {
                 return Ok(None);
             }
-            host_get_str(ctx, r, "value", None).map(Some)
+            super::get_str_plain(ctx, r, "value").map(Some)
         })(),
     };
     regs[done as usize] = NanBox::boolean(!matches!(step, Ok(Some(_))));
@@ -1637,6 +1636,29 @@ pub(super) fn call(
     )
 }
 
+/// A `yield*` step's `next(v)` on the inner iterator `g` whose captured
+/// `next` method is `next`: when that is the intrinsic
+/// `%GeneratorPrototype%.next` and `g` a VM generator it may resume, the
+/// resume's outcome (a `yield`'s value, a completion, or a result object an
+/// inner `yield*` handed through) — what calling `next` would return, before
+/// its result object is made. `None` (nothing done) for the general call.
+pub(super) fn delegate_next(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    g: NanBox,
+    next: NanBox,
+    v: NanBox,
+) -> Option<Result<GenOut, VmError>> {
+    if ctx.realm.native_at(Handle::from_raw(next.as_handle()?)) != Some(crate::nbexec::N_GEN_NEXT) {
+        return None;
+    }
+    let sh = direct_target(ctx, funcs, g)?;
+    Some(nested(ctx, regs, g, v, |ctx| {
+        resume_state(ctx, funcs, sh, 0, v)
+    }))
+}
+
 /// A `for-of` step over the generator `it` whose `next` is the intrinsic
 /// `%GeneratorPrototype%.next`: the yielded value (`Some`), or `None` once
 /// done; `None` from the outer `Option` (nothing done) to take the general
@@ -1658,11 +1680,11 @@ pub(super) fn for_of_step(
         GenOut::Yield(v) => Ok(Some(v)),
         GenOut::Done(_) => Ok(None),
         GenOut::Delegated(r) => (|| {
-            let done = host_get_str(ctx, r, "done", None)?;
+            let done = super::get_str_plain(ctx, r, "done")?;
             if ctx.realm.truthy(done) {
                 return Ok(None);
             }
-            host_get_str(ctx, r, "value", None).map(Some)
+            super::get_str_plain(ctx, r, "value").map(Some)
         })(),
     })
 }
