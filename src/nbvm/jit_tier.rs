@@ -3110,15 +3110,25 @@ pub(crate) fn jit_helper_exec_op(
         }
         Op::IterOpen { iter, next, src } => {
             let v = regs[*src as usize];
-            super::gen_fast::open(ctx, funcs, v)
+            let fast = super::gen_fast::open(ctx, funcs, v)
                 .or_else(|| super::iter_fast::open_self_iterator(&ctx.realm, v))
                 .map(|n| (v, n))
-                .or_else(|| super::iter_fast::open_collection(&mut ctx.realm, v))
-                .map(|(i, n)| {
-                    regs[*iter as usize] = i;
-                    regs[*next as usize] = n;
-                    Ok(())
+                .or_else(|| super::iter_fast::open_collection(&mut ctx.realm, v));
+            if let Some((i, n)) = fast {
+                regs[*iter as usize] = i;
+                regs[*next as usize] = n;
+                Some(Ok(()))
+            } else {
+                // A user `[Symbol.iterator]()` (the compiled window is rooted).
+                let lent = super::jit_lent(ctx);
+                super::iter_fast::open_vm_call(ctx, funcs, lent, v).map(|r| {
+                    r.and_then(|it| {
+                        regs[*iter as usize] = it;
+                        super::iter_fast::open_vm_next(ctx, funcs, it)
+                    })
+                    .map(|n| regs[*next as usize] = n)
                 })
+            }
         }
         Op::IterNext {
             dst,

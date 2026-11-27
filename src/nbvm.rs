@@ -10385,6 +10385,16 @@ fn run_frame_at_ic(
                     regs[*next as usize] = n;
                     continue;
                 }
+                if let Some(r) = iter_fast::open_vm_call(ctx, funcs, Some(regs), v) {
+                    match r.and_then(|it| {
+                        regs[*iter as usize] = it;
+                        iter_fast::open_vm_next(ctx, funcs, it)
+                    }) {
+                        Ok(n) => regs[*next as usize] = n,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 match with_host(ctx, |h| h.get_iterator(v)) {
                     Some(Ok((i, n))) => {
                         regs[*iter as usize] = i;

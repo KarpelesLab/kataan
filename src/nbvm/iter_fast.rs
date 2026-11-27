@@ -255,6 +255,58 @@ pub(super) fn open_self_iterator(realm: &Realm, v: NanBox) -> Option<NanBox> {
     )
 }
 
+/// The first half of `GetIterator(v)` (ECMA-262 7.4.2, sync) for an
+/// ordinary object whose `@@iterator`, along a chain of ordinary data
+/// properties, is a VM function (a user-written `[Symbol.iterator]()`,
+/// often a generator method): the method called on `v` in the VM and its
+/// result checked to be an object — the iterator, which the caller roots in
+/// its register before [`open_vm_next`] reads its `next`. `regs` is the
+/// calling frame's register file, published for the call as
+/// `call_closure_pub` does. `None` (nothing run) for anything else, which
+/// the host's `GetIterator` then runs.
+pub(super) fn open_vm_call(
+    ctx: &mut Ctx,
+    funcs: &[super::FnProto],
+    regs: Option<&[NanBox]>,
+    v: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    let h = Handle::from_raw(v.as_handle()?);
+    if !ctx.realm.is_plain_object(h) {
+        return None;
+    }
+    let key = ctx.realm.vm_array_iter().iter_key.as_deref()?;
+    let f = super::array_hof::chain_data(&ctx.realm, h, key).ok()??;
+    ctx.realm.vm_function(Handle::from_raw(f.as_handle()?))?;
+    let it = match super::call_closure_pub(ctx, funcs, regs, f, &[], v) {
+        Ok(it) => it,
+        Err(e) => return Some(Err(e)),
+    };
+    if !super::is_object_value(&ctx.realm, it) {
+        let e = super::vm_error(
+            ctx,
+            "TypeError",
+            "Result of the Symbol.iterator method is not an object",
+        );
+        return Some(Err(VmError::Thrown(e)));
+    }
+    Some(Ok(it))
+}
+
+/// The second half of [`open_vm_call`]'s `GetIterator`: `Get(it, "next")`
+/// of the iterator `it` it returned — a VM generator's straight from its
+/// memoized prototype chain (`gen_fast::open`), anything else through
+/// `[[Get]]`.
+pub(super) fn open_vm_next(
+    ctx: &mut Ctx,
+    funcs: &[super::FnProto],
+    it: NanBox,
+) -> Result<NanBox, VmError> {
+    if let Some(n) = super::gen_fast::open(ctx, funcs, it) {
+        return Ok(n);
+    }
+    super::get_str_plain(ctx, it, "next")
+}
+
 /// `GetIterator(v)` of a Map or Set whose `@@iterator` is, along a chain of
 /// ordinary data properties, the intrinsic `entries` (a Map's) / `values`
 /// (a Set's) of its kind: the live iterator that method makes
