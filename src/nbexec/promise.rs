@@ -1970,6 +1970,39 @@ impl Interp {
         cap: &PromiseCapability,
     ) -> Result<NanBox, ExecError> {
         let promise_resolve = self.combinator_resolve_fn(c)?;
+        // A plain array iterated by the built-in iterator: its steps by index
+        // (the iterator object is made only to close it), as `all` takes it.
+        if pall_lean_on()
+            && let Some(arr) = iterable.as_handle().map(Handle::from_raw)
+            && crate::nbvm::array_iteration_is_plain(&mut self.realm, iterable)
+        {
+            let intrinsic = self.is_intrinsic_promise_ctor(c)
+                && self.is_intrinsic_promise_resolve(promise_resolve);
+            let mut i = 0usize;
+            while let Some(len) = self.realm.array_length(arr)
+                && i < len
+            {
+                let item = self.get_index(arr, i)?;
+                let step = if intrinsic {
+                    self.perform_promise_race_element_lean(item, cap)
+                } else {
+                    self.perform_promise_race_element(c, promise_resolve, item, cap)
+                };
+                if let Err(e) = step {
+                    // IteratorClose of the iterator this stood in for, past
+                    // the element just taken.
+                    let it = self.make_live_array_iterator(arr, 1);
+                    if let Some(ih) = it.as_handle().map(Handle::from_raw) {
+                        self.realm
+                            .set_hidden_property(ih, GEN_IDX, NanBox::number((i + 1) as f64));
+                        let _ = self.iterator_close(ih);
+                    }
+                    return Err(e);
+                }
+                i += 1;
+            }
+            return Ok(cap.promise);
+        }
         // Lazy iteration + IteratorClose on an abrupt `promiseResolve`/`then`.
         let it = self.get_iter_object(iterable)?;
         let next_m = self.read_member(it, "next")?;
@@ -2006,6 +2039,37 @@ impl Interp {
         let next = self.call_with_this(promise_resolve, c, &[item])?;
         self.invoke_then(next, cap.resolve, cap.reject)?;
         Ok(())
+    }
+
+    /// [`perform_promise_race_element`](Self::perform_promise_race_element)
+    /// with `C` = `%Promise%` and `promiseResolve` its intrinsic
+    /// `Promise.resolve` (PromiseResolve itself). `Invoke(next, "then", …)` of
+    /// a plain promise whose `then` is the intrinsic and whose species is
+    /// `%Promise%` is PerformPromiseThen, whose derived promise nothing can
+    /// reach (the capability's resolving functions never throw), so none is
+    /// made: the reaction's result is a sink that is not a promise (the
+    /// resolve function itself), whose settling is a no-op.
+    fn perform_promise_race_element_lean(
+        &mut self,
+        item: NanBox,
+        cap: &PromiseCapability,
+    ) -> Result<(), ExecError> {
+        let next = NanBox::handle(self.promise_resolve_checked(item)?.to_raw());
+        if let Some(h) = next
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|h| self.has_intrinsic_then(*h))
+            .filter(|h| self.promise_species_fast(*h).is_some())
+            && let Some(sink) = cap
+                .resolve
+                .as_handle()
+                .map(Handle::from_raw)
+                .filter(|s| !self.realm.is_promise(*s))
+        {
+            self.register_await_reaction(h, cap.resolve, cap.reject, sink, false);
+            return Ok(());
+        }
+        self.invoke_then(next, cap.resolve, cap.reject)
     }
 
     /// `Promise.any(iterable)` (this = `C`).
