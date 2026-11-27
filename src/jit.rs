@@ -4747,6 +4747,14 @@ pub(crate) fn concat_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONCAT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a private field read (`Op::PrivateGet`) runs inline through its
+/// site's memo (`KATAAN_JIT_PRIVGET=0` turns it off, read once per process).
+fn private_inline_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PRIVGET").is_none_or(|v| v != "0"))
+}
+
 /// Whether an array destructuring's unpack (`Op::ArrayUnpack`) runs inline
 /// over a plain array (`KATAAN_JIT_UNPACK=0` turns it off, read once per
 /// process).
@@ -16278,6 +16286,54 @@ impl JitFunction {
                             a.store_rax(disp(*flag));
                             a.jmp(fused.unwrap_or(fin));
                             a.cold_end(cold);
+                        }
+                        // `o.#x` read again as the site's memo last served
+                        // it (`realm::JitPrivWay`): the same private name
+                        // (its handle under the same heap epoch) on an
+                        // ordinary shaped object of the recorded layout,
+                        // whose recorded slot it reads. Anything else is the
+                        // interpreter's op (which refills the memo).
+                        crate::nbvm::Op::PrivateGet {
+                            dst,
+                            obj,
+                            key,
+                            cache,
+                        } if private_inline_enabled() && ok(*dst) && ok(*obj) && ok(*key) => {
+                            use crate::realm::JitPrivWay as W;
+                            use call_seq::r as R;
+                            use core::mem::offset_of;
+                            let w = core::ptr::from_ref(cache.jit_way()) as u64;
+                            let off = |o: usize| i32::try_from(o).ok();
+                            let (slow, done) = (a.new_label(), a.new_label());
+                            let (got, spill) = (a.new_label(), a.new_label());
+                            a.load_rax(disp(*key));
+                            a.g_movabs(R::R11, w);
+                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, key_bits))?);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            a.g_load(R::R9, R::R15, helpers.call_layout.realm);
+                            a.p_load32(
+                                R::RAX,
+                                R::R9,
+                                off(crate::realm::Realm::jit_heap_epoch_offset())?,
+                            );
+                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, epoch))?);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            walk_to_slot!(*obj, slow);
+                            family_checks!(recv_cache::Family::Obj, slow);
+                            a.g_movabs(R::R11, w);
+                            a.mov_rax_at_rcx(layout.off_shape);
+                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, shape))?);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            a.g_load(R::RAX, R::R11, off(offset_of!(W, slot))?);
+                            a.p_obj_slot_load_inline(&layout, slow, spill);
+                            a.bind(got);
+                            a.store_rax(disp(*dst));
+                            a.jmp(done);
+                            a.bind(spill);
+                            a.p_obj_slot_load_spill(&layout, got);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(done);
                         }
                         // An array destructuring's values at once
                         // (`Op::ArrayUnpack`) with no rest element, over a

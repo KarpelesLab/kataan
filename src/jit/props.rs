@@ -1273,7 +1273,7 @@ fn watch_levels(realm: &mut crate::realm::Realm, levels: &[ChainLevel]) {
 
 impl X64Assembler {
     /// `mov r32, [base+disp32]` (zero-extending; `base` neither `rsp` nor `r12`).
-    fn p_load32(&mut self, dst: u8, base: u8, disp: i32) {
+    pub(crate) fn p_load32(&mut self, dst: u8, base: u8, disp: i32) {
         self.p_rm32(0x8b, dst, base, disp);
     }
 

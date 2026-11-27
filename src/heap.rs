@@ -310,6 +310,14 @@ fn vacant_tag_byte<T>(slot: Slot<T>) -> u8 {
 /// calling [`Heap::slots_raw`]. The field offset is `offset_of!`; the `Vec`'s
 /// word order (unspecified) is probed on a live `Vec<Slot<Cell>>` whose
 /// length, capacity and pointer all differ. `(ptr_off, len_off)`.
+/// The offset of the heap's handle epoch (`Heap::epoch`, a `u32`) in a
+/// `Heap<Cell>`, for compiled code that checks a memo of handles.
+#[cfg(all(feature = "jit", jit_native))]
+#[must_use]
+pub(crate) const fn jit_heap_epoch_offset() -> usize {
+    core::mem::offset_of!(Heap<crate::cell::Cell>, epoch)
+}
+
 #[cfg(all(feature = "jit", jit_native))]
 #[must_use]
 pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {

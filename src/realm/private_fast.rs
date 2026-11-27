@@ -33,7 +33,32 @@ const PRIV_ACCESSOR: u8 = b'a';
 /// One private-element site's memo (see the module docs). Empty when cold,
 /// and when copied (a fresh copy of the bytecode starts cold).
 #[derive(Default)]
-pub struct PrivCache(core::cell::Cell<Option<Box<PrivEntry>>>);
+pub struct PrivCache(core::cell::Cell<Option<Box<PrivEntry>>>, JitPrivWay);
+
+/// A private-element site's read memo for compiled code (`jit::private`):
+/// the last field or method read it served — the private name's handle
+/// bits and the heap epoch they were taken under (while it is unchanged the
+/// handle still names that string), the layout and the slot. Compiled code
+/// reads it in place (the site's op lives in bytecode its code owns), so
+/// its fields are at fixed offsets; `shape` is the layout's `Rc` word as an
+/// object's shape field holds it (`None` is zero, which no object's is),
+/// keeping that layout alive while the memo names it.
+#[derive(Default)]
+#[repr(C)]
+pub struct JitPrivWay {
+    pub(crate) key_bits: core::cell::Cell<u64>,
+    pub(crate) epoch: core::cell::Cell<u64>,
+    pub(crate) slot: core::cell::Cell<u64>,
+    pub(crate) shape: core::cell::Cell<Option<Rc<Shape>>>,
+}
+
+impl PrivCache {
+    /// The site's memo for compiled code.
+    #[must_use]
+    pub fn jit_way(&self) -> &JitPrivWay {
+        &self.1
+    }
+}
 
 struct PrivEntry {
     /// The layouts seen with the key's slot in each, most recently filled
@@ -44,6 +69,12 @@ struct PrivEntry {
     /// Where the next layout goes (round robin).
     next: u8,
     key: Box<[u8]>,
+    /// The key's string handle bits as last seen naming `key`, and the heap
+    /// epoch then (`Heap::epoch`: while it is unchanged the handle still
+    /// names that string), so a run with the same name skips reading and
+    /// comparing its text.
+    key_bits: u64,
+    key_epoch: u32,
 }
 
 /// How many layouts a [`PrivCache`] keeps.
@@ -66,17 +97,18 @@ impl Realm {
     /// object `o`, through `cache`; `None` when `o` is anything else, or its
     /// layout lacks the key. `kinds` lists the element kinds served.
     fn private_slot(&self, o: NanBox, k: NanBox, cache: &PrivCache, kinds: &[u8]) -> Option<u32> {
-        let key = self.string_leaf_bytes(Handle::from_raw(k.as_handle()?))?;
-        if !key.last().is_some_and(|b| kinds.contains(b)) {
-            return None;
-        }
         let Some(Cell::Object(obj)) = self.heap.get(Handle::from_raw(o.as_handle()?)) else {
             return None;
         };
         let shape = obj.shaped_shape()?;
         let mut memo = cache.0.take();
+        // The same name as last time (its handle, under the same epoch):
+        // the recorded key, without reading the string.
+        let epoch = self.heap.epoch();
         if let Some(e) = &memo
-            && *e.key == *key
+            && e.key_bits == k.to_bits()
+            && e.key_epoch == epoch
+            && e.key.last().is_some_and(|b| kinds.contains(b))
             && let Some(slot) = e
                 .ways
                 .iter()
@@ -87,7 +119,31 @@ impl Realm {
             cache.0.set(memo);
             return Some(slot);
         }
-        let slot = shape.lookup(core::str::from_utf8(key).ok()?);
+        let Some(key) = k
+            .as_handle()
+            .and_then(|h| self.string_leaf_bytes(Handle::from_raw(h)))
+            .filter(|key| key.last().is_some_and(|b| kinds.contains(b)))
+        else {
+            cache.0.set(memo);
+            return None;
+        };
+        if let Some(e) = &mut memo
+            && *e.key == *key
+        {
+            e.key_bits = k.to_bits();
+            e.key_epoch = epoch;
+            if let Some(slot) = e
+                .ways
+                .iter()
+                .flatten()
+                .find(|(s, _)| Rc::ptr_eq(s, shape))
+                .map(|(_, slot)| *slot)
+            {
+                cache.0.set(memo);
+                return Some(slot);
+            }
+        }
+        let slot = core::str::from_utf8(key).ok().and_then(|t| shape.lookup(t));
         if let Some(slot) = slot {
             match &mut memo {
                 Some(e) if *e.key == *key => {
@@ -102,6 +158,8 @@ impl Realm {
                         ways,
                         next: 1,
                         key: key.into(),
+                        key_bits: k.to_bits(),
+                        key_epoch: epoch,
                     }));
                 }
             }
@@ -118,7 +176,17 @@ impl Realm {
         let Some(Cell::Object(obj)) = self.heap.get(Handle::from_raw(o.as_handle()?)) else {
             return None;
         };
-        obj.slot(slot)
+        let v = obj.slot(slot)?;
+        // The read compiled code may repeat (`JitPrivWay`).
+        if let Some(shape) = obj.shaped_shape() {
+            let w = &cache.1;
+            w.key_bits.set(k.to_bits());
+            w.epoch.set(u64::from(self.heap.epoch()));
+            w.slot.set(u64::from(slot));
+            let same = w.shape.take().filter(|s| Rc::ptr_eq(s, shape));
+            w.shape.set(Some(same.unwrap_or_else(|| Rc::clone(shape))));
+        }
+        Some(v)
     }
 
     /// `o.#k = v` for a private field `k` found through `cache` (see the

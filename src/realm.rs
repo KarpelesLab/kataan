@@ -49,7 +49,7 @@ mod lit_cells;
 pub(crate) use key_memo::{KeyMemoLayout, jit_key_memo_layout};
 pub use lit_cells::LitCells;
 mod private_fast;
-pub use private_fast::PrivCache;
+pub use private_fast::{JitPrivWay, PrivCache};
 mod field_cache;
 pub use field_cache::FieldCache;
 pub(crate) mod hidden_layout;
@@ -2334,6 +2334,12 @@ impl Realm {
             heap + epoch,
             heap + poison,
         )
+    }
+
+    /// `Realm`-relative offset of the heap's handle epoch (a `u32`).
+    #[cfg(all(feature = "jit", jit_native))]
+    pub(crate) const fn jit_heap_epoch_offset() -> usize {
+        core::mem::offset_of!(Realm, heap) + crate::heap::jit_heap_epoch_offset()
     }
 
     /// The byte offsets, within a `Realm`, of the object heap's slot-array
