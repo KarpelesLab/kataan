@@ -2755,12 +2755,14 @@ pub(crate) fn jit_helper_exec_op(
             key,
             src,
             attrs,
+            cache,
         } => Some(super::vm_define_data(
             ctx,
             regs[*obj as usize],
             regs[*key as usize],
             regs[*src as usize],
             *attrs,
+            cache,
         )),
         // `this.#x`, `this.#x = v`, `#x in o`, a private field's add: exactly
         // their interpreter arm.

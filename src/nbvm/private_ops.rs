@@ -75,13 +75,35 @@ pub(super) fn exec(
                 }
             }
         }
-        Op::PrivateDefine { obj, key, src } => {
+        Op::PrivateDefine {
+            obj,
+            key,
+            src,
+            cache,
+        } => {
             let (o, k, v) = (
                 regs[*obj as usize],
                 regs[*key as usize],
                 regs[*src as usize],
             );
+            // A private field's add the general path made last time (the same
+            // name on the same incoming layout of a plain, extensible object,
+            // so the name is absent: no second-initialization error).
+            if ctx.realm.field_cached_add(o, k, v, cache, true) {
+                return Ok(());
+            }
+            let before = ctx.realm.field_layout(o);
             private_define(ctx, o, k, &[("", v)])?;
+            if let Some(kh) = k.as_handle()
+                && let Some(text) = ctx
+                    .realm
+                    .string_leaf_bytes(Handle::from_raw(kh))
+                    .filter(|b| b.last() == Some(&b'f'))
+                    .and_then(|b| core::str::from_utf8(b).ok())
+                    .map(alloc::string::String::from)
+            {
+                ctx.realm.field_arm(o, before, &text, cache);
+            }
         }
         _ => {}
     }

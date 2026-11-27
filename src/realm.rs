@@ -49,6 +49,8 @@ pub(crate) use key_memo::{KeyMemoLayout, jit_key_memo_layout};
 pub use lit_cells::LitCells;
 mod private_fast;
 pub use private_fast::PrivCache;
+mod field_cache;
+pub use field_cache::FieldCache;
 pub(crate) mod hidden_layout;
 mod inst_memo;
 pub(crate) mod json_fast;

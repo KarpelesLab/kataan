@@ -285,6 +285,8 @@ pub enum Op {
         key: Reg,
         src: Reg,
         attrs: u8,
+        /// The site's transition memo (`crate::realm::FieldCache`).
+        cache: crate::realm::FieldCache,
     },
     /// An object literal's `key: src` with a static key:
     /// `CreateDataPropertyOrThrow(obj, key, src)` on the literal's own fresh
@@ -374,7 +376,14 @@ pub enum Op {
     },
     /// Adds private field/method `#k` = `src` to `obj` (a `TypeError` if
     /// already present).
-    PrivateDefine { obj: Reg, key: Reg, src: Reg },
+    PrivateDefine {
+        obj: Reg,
+        key: Reg,
+        src: Reg,
+        /// The site's transition memo (`crate::realm::FieldCache`), for a
+        /// private field's add.
+        cache: crate::realm::FieldCache,
+    },
     /// Adds private accessor `#k` (`getter`/`setter` may be `undefined`).
     PrivateDefineAccessor {
         obj: Reg,
@@ -2428,7 +2437,13 @@ fn vm_define_data(
     k: NanBox,
     v: NanBox,
     attrs: u8,
+    cache: &crate::realm::FieldCache,
 ) -> Result<(), VmError> {
+    // The site's memo: the add the general path below made last time (the
+    // same key on the same incoming layout of a plain, extensible object).
+    if attrs == 7 && ctx.realm.field_cached_add(o, k, v, cache, false) {
+        return Ok(());
+    }
     if attrs == 7
         && let Some(h) = o.as_handle().map(Handle::from_raw)
         && let Some(kh) = k.as_handle().map(Handle::from_raw)
@@ -2443,6 +2458,7 @@ fn vm_define_data(
         && !ctx.host.as_deref().is_some_and(|x| x.is_global_object(o))
     {
         let key = private_ops::KeyText::of(&ctx.realm, k);
+        let before = ctx.realm.field_layout(o);
         if key.as_str() != "__proto__"
             && ctx.realm.init_data_property_cached(
                 h,
@@ -2451,6 +2467,7 @@ fn vm_define_data(
                 &mut PropertyCache::default(),
             )
         {
+            ctx.realm.field_arm(o, before, key.as_str(), cache);
             return Ok(());
         }
     }
@@ -10830,13 +10847,14 @@ fn run_frame_at_ic(
                 key,
                 src,
                 attrs,
+                cache,
             } => {
                 let (o, k, v) = (
                     regs[*obj as usize],
                     regs[*key as usize],
                     regs[*src as usize],
                 );
-                if let Err(e) = vm_define_data(ctx, o, k, v, *attrs) {
+                if let Err(e) = vm_define_data(ctx, o, k, v, *attrs, cache) {
                     handle_throw!(e);
                 }
             }
@@ -19370,6 +19388,7 @@ impl Compiler {
                         obj: this,
                         key,
                         src: v,
+                        cache: Default::default(),
                     });
                     continue;
                 }
@@ -19380,6 +19399,7 @@ impl Compiler {
                         obj: this,
                         key,
                         src,
+                        cache: Default::default(),
                     });
                     continue;
                 }
@@ -19422,6 +19442,7 @@ impl Compiler {
                         key,
                         src: v,
                         attrs: 7,
+                        cache: Default::default(),
                     }
                 });
                 continue;
@@ -19437,6 +19458,7 @@ impl Compiler {
                 key,
                 src: v,
                 attrs: 7,
+                cache: Default::default(),
             });
         }
         Ok(())
@@ -26411,6 +26433,7 @@ impl Compiler {
                             key: nk,
                             src: nv,
                             attrs: 4,
+                            cache: Default::default(),
                         });
                         let cell =
                             alloc::format!("\0pm{}{}", if m.is_static { "s" } else { "i" }, fname);
@@ -26548,7 +26571,12 @@ impl Compiler {
                     FieldKey::PrivateMethod(n, c) => {
                         let key = self.read_hidden(n)?;
                         let src = self.read_hidden(c)?;
-                        self.ops.push(Op::PrivateDefine { obj: f, key, src });
+                        self.ops.push(Op::PrivateDefine {
+                            obj: f,
+                            key,
+                            src,
+                            cache: Default::default(),
+                        });
                     }
                     FieldKey::PrivateAccessor(n, g, st) => {
                         let key = self.read_hidden(n)?;
@@ -26691,6 +26719,7 @@ impl Compiler {
                         key,
                         src: v,
                         attrs: 7,
+                        cache: Default::default(),
                     }),
                     Static::PrivateField(n, _) => {
                         if named {
@@ -26711,6 +26740,7 @@ impl Compiler {
                             obj: f,
                             key,
                             src: v,
+                            cache: Default::default(),
                         });
                     }
                     Static::Block(_) => {}
@@ -26823,6 +26853,7 @@ impl Compiler {
                                 key: k,
                                 src: v,
                                 attrs: 7,
+                                cache: Default::default(),
                             });
                         }
                     }

@@ -3037,6 +3037,49 @@ impl Object {
         true
     }
 
+    /// A class field's add through its site's transition memo
+    /// (`crate::realm::FieldCache`): when the object is an ordinary
+    /// extensible one no host hook watches (not frozen, sealed or
+    /// non-extensible; not exotic, a global object or a tracked built-in
+    /// prototype), shaped below the dictionary threshold, with no
+    /// insertion-order log, its layout `to`'s parent, and — for a public key —
+    /// `key` carries no accessor or attribute mark, the add is `to` plus the
+    /// value in the new slot (and for a `private` key, the key's
+    /// non-enumerable mark, as `Realm::set_hidden_property` makes it), exactly
+    /// as the general path's `set` makes it. `false`, having changed nothing,
+    /// otherwise.
+    pub(crate) fn field_add_by_transition(
+        &mut self,
+        to: &Rc<crate::shape::Shape>,
+        key: &str,
+        value: NanBox,
+        dict_threshold: usize,
+        private: bool,
+    ) -> bool {
+        const DECLINE: u8 = OBJ_FLAG_FROZEN
+            | OBJ_FLAG_SEALED
+            | OBJ_FLAG_NON_EXTENSIBLE
+            | JIT_FLAG_EXOTIC
+            | JIT_FLAG_NO_INLINE_SET
+            | JIT_FLAG_GLOBAL;
+        if self.flags & DECLINE != 0
+            || self.is_dict()
+            || (self.shape.len() as usize) >= dict_threshold.min(MAX_SHAPED_LEN)
+            || !to.parent().is_some_and(|p| Rc::ptr_eq(p, &self.shape))
+            || self.extra.as_deref().is_some_and(|x| x.key_order.is_some())
+            || (!private && !self.is_plain_data_slot_or_absent(key))
+        {
+            return false;
+        }
+        self.shape = Rc::clone(to);
+        self.slot_push(value);
+        self.bump_key_epoch();
+        if private {
+            self.set_hidden(key);
+        }
+        true
+    }
+
     /// Whether `key` is an own property (data slot or accessor).
     #[must_use]
     pub fn has_own_key(&self, key: &str) -> bool {

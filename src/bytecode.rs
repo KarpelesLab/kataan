@@ -817,7 +817,7 @@ fn verify_op_with(
             reg(*obj)?;
             reg(*key)
         }
-        Op::PrivateSet { obj, key, src, .. } | Op::PrivateDefine { obj, key, src } => {
+        Op::PrivateSet { obj, key, src, .. } | Op::PrivateDefine { obj, key, src, .. } => {
             reg(*obj)?;
             reg(*key)?;
             reg(*src)
@@ -1672,6 +1672,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             key,
             src,
             attrs,
+            ..
         } => {
             w_u8(92, out);
             w_reg(*obj, out);
@@ -1959,7 +1960,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
                 w_reg(*r, out);
             }
         }
-        Op::PrivateDefine { obj, key, src } => {
+        Op::PrivateDefine { obj, key, src, .. } => {
             w_u8(102, out);
             for r in [obj, key, src] {
                 w_reg(*r, out);
@@ -2644,6 +2645,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             key: r.reg()?,
             src: r.reg()?,
             attrs: r.u8()?,
+            cache: crate::realm::FieldCache::default(),
         },
         93 => Op::SuperCall {
             dst: r.reg()?,
@@ -2851,6 +2853,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             obj: r.reg()?,
             key: r.reg()?,
             src: r.reg()?,
+            cache: crate::realm::FieldCache::default(),
         },
         103 => Op::PrivateDefineAccessor {
             obj: r.reg()?,
