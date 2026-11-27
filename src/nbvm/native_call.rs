@@ -621,11 +621,21 @@ fn fill(realm: &mut Realm, site: &mut NativeSite, h: Handle, prim: bool, key: &s
 /// index side table, no inherited index accessor, and its length the dense
 /// length.
 fn dense_elements(realm: &Realm, h: Handle) -> Option<&[NanBox]> {
+    let e = dense_storage(realm, h)?;
+    if e.iter().any(|v| v.is_hole()) {
+        return None;
+    }
+    Some(e)
+}
+
+/// [`dense_elements`] without its scan for holes: the caller checks the
+/// part it reads (a `slice` reads only its range, so scanning a long array
+/// whole for each short slice would make a loop of slices quadratic).
+fn dense_storage(realm: &Realm, h: Handle) -> Option<&[NanBox]> {
     let e = realm.array_elements(h)?;
     if realm.array_has_index_overrides(h)
         || realm.proto_index_accessor_dirty()
         || realm.array_length(h) != Some(e.len())
-        || e.iter().any(|v| v.is_hole())
     {
         return None;
     }
@@ -2611,11 +2621,15 @@ fn run_op(
             if !super::array_hof::default_species_armed(realm, h) {
                 return None;
             }
-            let elems = dense_elements(realm, h)?;
+            let elems = dense_storage(realm, h)?;
             let len = elems.len();
             let a = rel_index(arg(0), len, 0)?;
             let b = rel_index(arg(1), len, len)?;
-            let part = elems.get(a..b.max(a)).unwrap_or(&[]).to_vec();
+            let part = elems.get(a..b.max(a)).unwrap_or(&[]);
+            if part.iter().any(|v| v.is_hole()) {
+                return None;
+            }
+            let part = part.to_vec();
             NanBox::handle(realm.new_array(part).to_raw())
         }
         FastOp::ArrConcat => {
