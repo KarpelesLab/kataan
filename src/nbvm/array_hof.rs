@@ -458,7 +458,7 @@ fn direct_steps(
 /// (`element_general`) — and the callback called on it; the first truthy
 /// result decides. (`kValue` is the callee's argument, so a value a getter
 /// produced stays rooted across the call it is returned after.)
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_native))]
 #[allow(clippy::too_many_arguments)]
 fn direct_find(
     ctx: &mut Ctx,
@@ -506,7 +506,7 @@ fn direct_find(
 /// `HasProperty` + `Get` a present dense slot or the host's. The
 /// accumulator stays rooted on the frame shadow (the slot pushed here)
 /// while the host may run code between calls.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_native))]
 #[allow(clippy::too_many_arguments)]
 fn direct_reduce(
     ctx: &mut Ctx,

@@ -48,9 +48,9 @@ pub(super) fn for_each(
     // Publish the caller's registers (unless they are a GC root already)
     // and what the walk holds.
     let mark = ctx.frame_shadow.len();
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_native))]
     let rooted = super::array_hof::lean_on() && super::jit_tier::on_register_stack(ctx, regs);
-    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(all(feature = "jit", jit_native)))]
     let rooted = false;
     if !rooted {
         ctx.frame_shadow.extend_from_slice(regs);
