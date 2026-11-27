@@ -93,6 +93,15 @@ pub(crate) struct Helpers {
     pub arith: u64,
     /// `jit_helper_value_bin(ctx, a, b, VB_*) -> value | throw`.
     pub value_bin: u64,
+    /// `jit_helper_call_value(ctx, regs, n_regs, op, site, _) -> 0 | throw`:
+    /// a `CallValue`'s slow path, which also points the site at the callee.
+    pub call_value: u64,
+    /// `jit_helper_construct(ctx, regs, n_regs, op, site, _) -> 0 | throw`.
+    pub construct: u64,
+    /// `jit_construct_info(ctx, ctor, new_target, out, site) -> CalleeInfo`.
+    pub construct_info: u64,
+    /// `jit_helper_construct_result(ctx, result, this) -> value | throw`.
+    pub construct_result: u64,
 }
 
 /// The heap layout the inline property read walks (every offset from the
@@ -147,6 +156,24 @@ pub(crate) struct Layout {
     pub marking: i32,
     pub off_slot_age: i32,
     pub off_slot_dirty: i32,
+    /// The native call sequence's: `ctx`-relative the `*mut JitStack` and
+    /// `call_depth`; `Realm`-relative `vm_total_depth`, the call depth
+    /// limit, `multi_realm` and the header's realm mark word (`vm_mark`).
+    pub stack: i32,
+    pub call_depth: i32,
+    pub total_depth: i32,
+    pub max_depth: i32,
+    pub multi_realm: i32,
+    pub vm_mark: i32,
+    /// A `Cell::VmFunction`'s tag, `func: u32`, and its captures: inline
+    /// count byte (`ARRAY_ON_HEAP`: in the `Vec`), first inline capture,
+    /// and the `Vec`'s data pointer and length.
+    pub vmfn_disc: u8,
+    pub off_vmfn_func: i32,
+    pub off_vmfn_caps_inline_len: i32,
+    pub off_vmfn_caps_inline: i32,
+    pub off_vmfn_caps_ptr: i32,
+    pub off_vmfn_caps_len: i32,
 }
 
 /// The per-site state a body's code points into: one `PropertyCache` per
@@ -165,6 +192,9 @@ pub(crate) struct Sites {
         core::cell::UnsafeCell<super::MethodSite>,
         core::cell::UnsafeCell<super::CallSite>,
     )>,
+    /// Per `CallValue`: its call site (the callees the native call
+    /// sequence enters, which its slow path fills).
+    pub calls: Vec<core::cell::UnsafeCell<super::CallSite>>,
 }
 
 impl Sites {
@@ -187,8 +217,19 @@ impl Sites {
                 _ => None,
             })
             .collect();
+        let calls = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::CallValue { .. } | Op::CallWithMethod { .. } | Op::Construct { .. }
+                )
+            })
+            .map(|_| core::cell::UnsafeCell::new(super::CallSite::new()))
+            .collect();
         Self {
             caches,
+            calls,
             globals: (0..g)
                 .map(|_| core::cell::UnsafeCell::new([0; 2]))
                 .collect(),
@@ -471,6 +512,7 @@ pub(crate) fn compile(
     let mut next_cache = 0usize;
     let mut next_global = 0usize;
     let mut next_method = 0usize;
+    let mut next_call = 0usize;
     let hole_bits = NanBox::hole().to_bits();
     // `x14` = the arena slot of the heap handle in `x9`, else to `miss`.
     // Clobbers `x10..x13`, `x15`.
@@ -814,7 +856,60 @@ pub(crate) fn compile(
                 a.b_cond(Cond::Eq, thrown);
                 a.bind(done);
             }
-            Op::CallMethod { .. } | Op::CallWithMethod { .. } => {
+            Op::CallValue {
+                dst,
+                callee,
+                ref args,
+                ..
+            } => {
+                let site = sites.calls.get(next_call)?.get() as u64;
+                next_call += 1;
+                // (`jit_helper_call_value(.., op, site, _)`.)
+                emit_call_value(
+                    &mut a,
+                    l,
+                    (op, n_regs),
+                    (dst, callee, None, args),
+                    (site, h.call_value, site),
+                    thrown,
+                )?;
+            }
+            Op::CallWithMethod {
+                dst,
+                callee,
+                recv,
+                ref args,
+                ..
+            } => {
+                // (`jit_helper_call_with_method(.., op, cache, site)`.)
+                let site = sites.calls.get(next_call)?.get() as u64;
+                next_call += 1;
+                emit_call_value(
+                    &mut a,
+                    l,
+                    (op, n_regs),
+                    (dst, callee, Some(recv), args),
+                    (site, h.call_with_method, cache),
+                    thrown,
+                )?;
+            }
+            Op::Construct {
+                dst,
+                ctor,
+                ref args,
+            } => {
+                let site = sites.calls.get(next_call)?.get() as u64;
+                next_call += 1;
+                emit_construct(
+                    &mut a,
+                    l,
+                    (op, n_regs),
+                    (dst, ctor, args),
+                    (site, h),
+                    thrown,
+                )?;
+            }
+            Op::CallMethod { .. } => {
                 a.mov(0, CTX);
                 a.mov(1, REGS);
                 a.mov_imm(2, n_regs as u64);
@@ -1313,6 +1408,315 @@ pub(crate) fn compile(
     Some((a.finish()?, native_at))
 }
 
+/// The ways of a call site the native call sequence tries (of
+/// `CallSite::WAYS`).
+const CALL_WAYS: usize = 4;
+
+/// `CallValue` (`dst = callee(args…)`, `this` undefined) as a **native call
+/// sequence**, as the x86-64 tier makes it: the callee identified inline
+/// (a VM closure: function id and capture count, the key `CallTarget`s
+/// are filled under, and its captures); one of the site's first ways
+/// holding that key gives the callee's native-call entry and window size;
+/// then, with the depth limits not reached, a single realm, the native
+/// stack above `JitStack::sp_limit`, this activation's window on the
+/// register stack and room there, the call lays out a native-call header
+/// (the previous header, the callee, the realm's mark word, the count,
+/// `undefined`) and the arguments at the stack's top, as
+/// `jit_tier::enter_native` does, counts the call depth, and enters the
+/// callee, which builds its window above them. Anything else — and the
+/// first call, which fills the way — is `jit_helper_call_value`, the
+/// interpreter's call.
+fn emit_call_value(
+    a: &mut A64Assembler,
+    l: &Layout,
+    (op, n_regs): (&Op, usize),
+    (dst, callee, this, args): (u16, u16, Option<u16>, &[u16]),
+    (site, slow_helper, slow_arg4): (u64, u64, u64),
+    thrown: Label,
+) -> Option<()> {
+    emit_native_call(
+        a,
+        l,
+        (op, n_regs),
+        (dst, callee, this, args),
+        (site, slow_helper, slow_arg4),
+        thrown,
+        None,
+    )
+}
+
+/// `new C(args…)` (`Construct`) as a native call sequence: the x86-64
+/// tier's leaf `jit_construct_info` checks the constructor against the site
+/// and makes the `this` `[[Construct]]` starts with (only a plain one is
+/// taken here: a derived constructor's unbound `this`, or a constructor
+/// whose body is another function's, a forwarding default constructor's,
+/// is the slow path); the header then marks a construct and carries
+/// `new.target` (the constructor); a returned heap value goes through
+/// `jit_helper_construct_result` (an object is the result, else `this`).
+/// The slow path is `jit_helper_construct`, which fills the site.
+fn emit_construct(
+    a: &mut A64Assembler,
+    l: &Layout,
+    (op, n_regs): (&Op, usize),
+    (dst, ctor, args): (u16, u16, &[u16]),
+    (site, h): (u64, &Helpers),
+    thrown: Label,
+) -> Option<()> {
+    emit_native_call(
+        a,
+        l,
+        (op, n_regs),
+        (dst, ctor, None, args),
+        (site, h.construct, site),
+        thrown,
+        Some((h.construct_info, h.construct_result)),
+    )
+}
+
+/// The native call sequence of [`emit_call_value`] and [`emit_construct`]
+/// (`construct`: the latter's `(construct_info, construct_result)`).
+#[allow(clippy::too_many_arguments)]
+fn emit_native_call(
+    a: &mut A64Assembler,
+    l: &Layout,
+    (op, n_regs): (&Op, usize),
+    (dst, callee, this, args): (u16, u16, Option<u16>, &[u16]),
+    (site, slow_helper, slow_arg4): (u64, u64, u64),
+    thrown: Label,
+    construct: Option<(u64, u64)>,
+) -> Option<()> {
+    use super::call_seq::{CallSite, CallTarget, FRAME_HEADER, STACK_BASE, STACK_FRAMES};
+    use super::call_seq::{STACK_LIMIT, STACK_SP_LIMIT, STACK_TOP};
+    let off = |v: usize| i64::try_from(v).ok();
+    let t0 = off(core::mem::offset_of!(CallSite, targets))?;
+    let tsz = off(core::mem::size_of::<CallTarget>())?;
+    let t_key = off(core::mem::offset_of!(CallTarget, key))?;
+    let t_code = off(core::mem::offset_of!(CallTarget, code))?;
+    let t_frame = off(core::mem::offset_of!(CallTarget, frame_bytes))?;
+    let argc = args.len() as i64;
+    let hdr_bytes = 8 * (FRAME_HEADER as i64 + argc);
+    let slow = a.new_label();
+    let done = a.new_label();
+    let hit = a.new_label();
+    let have_caps = a.new_label();
+    let caps_heap = a.new_label();
+    // A construct's `this` slot on the native stack (`[sp]`), released on
+    // every way out; `x8` = the key `jit_construct_info` reported.
+    let slow_free = a.new_label();
+    let slow_at = if construct.is_some() { slow_free } else { slow };
+    if let Some((info, _)) = construct {
+        a.sub_imm(SP, SP, 16);
+        a.mov(0, CTX);
+        a.ldr(1, REGS, slot(callee));
+        a.mov(2, 1);
+        a.mov_sp(3, SP);
+        a.mov_imm(4, site);
+        a.call_abs(info);
+        a.mov_imm(9, u64::MAX);
+        a.cmp(0, 9);
+        a.b_cond(Cond::Eq, slow_free);
+        a.mov(8, 0);
+        // (A plain `this`: a heap object, not a derived constructor's
+        // unbound sentinel.)
+        a.ldr(9, SP, 0);
+        a.mov_imm(10, NanBox::handle(0).to_bits());
+        a.cmp(9, 10);
+        a.b_cond(Cond::Lo, slow_free);
+    }
+    let slow = slow_at;
+    // The callee: a VM closure's key (x10) and captures (x12).
+    a.ldr(9, REGS, slot(callee));
+    a.mov_imm(10, NanBox::handle(0).to_bits());
+    a.cmp(9, 10);
+    a.b_cond(Cond::Lo, slow);
+    a.ldr(11, CTX, i64::from(l.realm));
+    a.ldr(12, 11, i64::from(l.heap_ptr));
+    a.ldr(13, 11, i64::from(l.heap_len));
+    a.mov_w(14, 9);
+    a.cmp(14, 13);
+    a.b_cond(Cond::Hs, slow);
+    a.mov_imm(15, l.stride as u64);
+    a.mul(14, 14, 15);
+    a.add(14, 14, 12);
+    a.ldrb(10, 14, i64::from(l.off_cell_tag));
+    a.cmp_imm(10, i64::from(l.vmfn_disc));
+    a.b_cond(Cond::Ne, slow);
+    a.ldrb(11, 14, i64::from(l.off_vmfn_caps_inline_len));
+    a.cmp_imm(11, i64::from(crate::cell::ARRAY_ON_HEAP));
+    a.b_cond(Cond::Eq, caps_heap);
+    a.add_imm(12, 14, i64::from(l.off_vmfn_caps_inline));
+    a.b(have_caps);
+    a.bind(caps_heap);
+    a.ldr(12, 14, i64::from(l.off_vmfn_caps_ptr));
+    a.ldr(11, 14, i64::from(l.off_vmfn_caps_len));
+    a.bind(have_caps);
+    a.ldr_w(10, 14, i64::from(l.off_vmfn_func));
+    a.add_shifted(10, 10, 11, Shift::Lsl, 32);
+    if construct.is_some() {
+        // (The constructor runs its own body: not a forwarding one's.)
+        a.cmp(10, 8);
+        a.b_cond(Cond::Ne, slow);
+    }
+    // A way of the site holding it: x15 = the entry, x16 = the window size.
+    a.mov_imm(13, site);
+    for w in 0..CALL_WAYS as i64 {
+        let next = a.new_label();
+        a.ldr(15, 13, t0 + w * tsz + t_key);
+        a.cmp(15, 10);
+        a.b_cond(Cond::Ne, next);
+        a.ldr(15, 13, t0 + w * tsz + t_code);
+        a.ldr(16, 13, t0 + w * tsz + t_frame);
+        a.b(hit);
+        a.bind(next);
+    }
+    a.b(slow);
+    a.bind(hit);
+    // The depth limits (`call_with`'s recursion guard), one realm, a nested
+    // call (`ctx.call_depth != 0`, as `call_compiled_with` requires).
+    a.ldr(11, CTX, i64::from(l.realm));
+    a.ldr(0, CTX, i64::from(l.call_depth));
+    a.cbz(0, slow);
+    a.ldr(1, 11, i64::from(l.max_depth));
+    a.cmp(0, 1);
+    a.b_cond(Cond::Hs, slow);
+    a.ldr(2, 11, i64::from(l.total_depth));
+    a.cmp(2, 1);
+    a.b_cond(Cond::Hs, slow);
+    a.ldrb(3, 11, i64::from(l.multi_realm));
+    a.cbnz(3, slow);
+    // The native stack, and this window on the register stack.
+    a.ldr(4, CTX, i64::from(l.stack));
+    a.ldr(5, 4, i64::from(STACK_SP_LIMIT));
+    a.mov_sp(6, SP);
+    a.cmp(6, 5);
+    a.b_cond(Cond::Lo, slow);
+    a.ldr(5, 4, i64::from(STACK_BASE));
+    a.cmp(REGS, 5);
+    a.b_cond(Cond::Lo, slow);
+    a.ldr(6, 4, i64::from(STACK_TOP)); // x6 = the header
+    a.cmp(REGS, 6);
+    a.b_cond(Cond::Hs, slow);
+    // Room: header, arguments and the callee's window under the limit.
+    a.ldr(5, 4, i64::from(STACK_LIMIT));
+    a.add_imm(7, 6, hdr_bytes);
+    a.add(7, 7, 16); // x7 = one past the callee's window
+    a.cmp(7, 5);
+    a.b_cond(Cond::Hi, slow);
+    // The header and the arguments.
+    a.ldr(5, 4, i64::from(STACK_FRAMES));
+    a.str(5, 6, 0);
+    a.str(9, 6, 8);
+    a.ldr(5, 11, i64::from(l.vm_mark));
+    a.str(5, 6, 16);
+    let count = if construct.is_some() {
+        argc as u64 | super::call_seq::HDR_CONSTRUCT
+    } else {
+        argc as u64
+    };
+    a.mov_imm(5, count);
+    a.str(5, 6, 24);
+    if construct.is_some() {
+        a.str(9, 6, 32); // `new.target`: the constructor
+    } else {
+        a.mov_imm(5, NanBox::undefined().to_bits());
+        a.str(5, 6, 32);
+    }
+    for (i, &r) in args.iter().enumerate() {
+        a.ldr(5, REGS, slot(r));
+        a.str(5, 6, 8 * (FRAME_HEADER as i64 + i as i64));
+    }
+    a.str(6, 4, i64::from(STACK_FRAMES));
+    a.str(7, 4, i64::from(STACK_TOP));
+    // The call depth (x0, x2: the depths read above).
+    a.add_imm(0, 0, 1);
+    a.str(0, CTX, i64::from(l.call_depth));
+    a.add_imm(2, 2, 1);
+    a.str(2, 11, i64::from(l.total_depth));
+    // Enter: (ctx, window, argc, argv, caps, this), the header kept on the
+    // native stack across the call.
+    a.push(6);
+    a.mov(0, CTX);
+    a.add_imm(1, 6, hdr_bytes);
+    a.mov_imm(2, argc as u64);
+    a.add_imm(3, 6, 8 * FRAME_HEADER as i64);
+    a.mov(4, 12);
+    match this {
+        Some(r) => a.ldr(5, REGS, slot(r)),
+        None if construct.is_some() => a.ldr(5, SP, 16),
+        None => a.mov_imm(5, NanBox::undefined().to_bits()),
+    }
+    a.blr(15);
+    // Back: the header and window released, the depth restored.
+    a.pop(6);
+    a.ldr(4, CTX, i64::from(l.stack));
+    a.str(6, 4, i64::from(STACK_TOP));
+    a.ldr(5, 6, 0);
+    a.str(5, 4, i64::from(STACK_FRAMES));
+    a.ldr(5, CTX, i64::from(l.call_depth));
+    a.sub_imm(5, 5, 1);
+    a.str(5, CTX, i64::from(l.call_depth));
+    a.ldr(11, CTX, i64::from(l.realm));
+    a.ldr(5, 11, i64::from(l.total_depth));
+    a.sub_imm(5, 5, 1);
+    a.str(5, 11, i64::from(l.total_depth));
+    // The outcome: a value, the fall-off's `undefined`, or a throw.
+    if let Some((_, result)) = construct {
+        // `this` unless the body returned an object (a heap value: the
+        // helper decides); the slot released first.
+        let use_this = a.new_label();
+        let have = a.new_label();
+        a.ldr(1, SP, 0);
+        a.add_imm(SP, SP, 16);
+        a.mov_imm(9, NanBox::jit_throw_bits());
+        a.cmp(0, 9);
+        a.b_cond(Cond::Eq, thrown);
+        a.mov_imm(9, NanBox::handle(0).to_bits());
+        a.cmp(0, 9);
+        a.b_cond(Cond::Lo, use_this); // (also the fall-off sentinel)
+        a.mov(2, 1);
+        a.mov(1, 0);
+        a.mov(0, CTX);
+        a.call_abs(result);
+        a.mov_imm(9, NanBox::jit_throw_bits());
+        a.cmp(0, 9);
+        a.b_cond(Cond::Eq, thrown);
+        a.b(have);
+        a.bind(use_this);
+        a.mov(0, 1);
+        a.bind(have);
+        a.str(0, REGS, slot(dst));
+        a.b(done);
+        a.bind(slow_free);
+        a.add_imm(SP, SP, 16);
+    } else {
+        let value = a.new_label();
+        a.mov_imm(9, NanBox::jit_falloff_bits());
+        a.cmp(0, 9);
+        a.b_cond(Cond::Ne, value);
+        a.mov_imm(0, NanBox::undefined().to_bits());
+        a.bind(value);
+        a.mov_imm(9, NanBox::jit_throw_bits());
+        a.cmp(0, 9);
+        a.b_cond(Cond::Eq, thrown);
+        a.str(0, REGS, slot(dst));
+        a.b(done);
+    }
+    // The interpreter's call, which also fills the site.
+    if construct.is_none() {
+        a.bind(slow);
+    }
+    a.mov(0, CTX);
+    a.mov(1, REGS);
+    a.mov_imm(2, n_regs as u64);
+    a.mov_imm(3, core::ptr::from_ref(op) as u64);
+    a.mov_imm(4, slow_arg4);
+    a.mov_imm(5, site);
+    a.call_abs(slow_helper);
+    a.cbnz(0, thrown);
+    a.bind(done);
+    Some(())
+}
+
 /// Whether the baseline generic tier runs on this target: aarch64, unless
 /// `KATAAN_JIT_A64GEN=0` turns it (and with it the aarch64 JIT: see
 /// `jit::backend_enabled`) off (read once per process; always on in the
@@ -1357,6 +1761,10 @@ impl super::JitProto {
             set_strict: helpers.set_strict as usize as u64,
             init_prop: helpers.init_prop as usize as u64,
             call_method: helpers.call_method as usize as u64,
+            call_value: helpers.call_value as usize as u64,
+            construct: helpers.construct as usize as u64,
+            construct_info: helpers.construct_info as usize as u64,
+            construct_result: helpers.construct_result as usize as u64,
             global_ref: helpers.global_ref as usize as u64,
             get_elem: helpers.get_elem as usize as u64,
             set_elem: helpers.set_elem as usize as u64,
@@ -1402,6 +1810,18 @@ impl super::JitProto {
             marking: jl.props.marking,
             off_slot_age: jl.props.off_slot_age,
             off_slot_dirty: jl.props.off_slot_dirty,
+            stack: helpers.call_layout.stack,
+            call_depth: helpers.call_layout.call_depth,
+            total_depth: helpers.call_layout.total_depth,
+            max_depth: helpers.call_layout.max_depth,
+            multi_realm: helpers.call_layout.multi_realm,
+            vm_mark: helpers.call_layout.callee_len,
+            vmfn_disc: jl.props.vmfn_disc,
+            off_vmfn_func: jl.props.off_vmfn_func,
+            off_vmfn_caps_inline_len: jl.props.off_vmfn_caps_inline_len,
+            off_vmfn_caps_inline: jl.props.off_vmfn_caps_inline,
+            off_vmfn_caps_ptr: jl.props.off_vmfn_caps_ptr,
+            off_vmfn_caps_len: jl.props.off_vmfn_caps_len,
         };
         let sites = alloc::boxed::Box::new(Sites::for_ops(&bytecode));
         // A native-call entry (what `jit_tier::call_compiled_with` enters a
@@ -1483,6 +1903,10 @@ mod tests {
         set_strict: 0xa000,
         init_prop: 0xb000,
         call_method: 0xc000,
+        call_value: 0x1_7000,
+        construct: 0x1_8000,
+        construct_info: 0x1_9000,
+        construct_result: 0x1_a000,
         global_ref: 0xd000,
         get_elem: 0xe000,
         set_elem: 0xf000,
@@ -1527,6 +1951,18 @@ mod tests {
         marking: 32,
         off_slot_age: 60,
         off_slot_dirty: 61,
+        stack: 40,
+        call_depth: 48,
+        total_depth: 56,
+        max_depth: 64,
+        multi_realm: 72,
+        vm_mark: 80,
+        vmfn_disc: 5,
+        off_vmfn_func: 8,
+        off_vmfn_caps_inline_len: 12,
+        off_vmfn_caps_inline: 16,
+        off_vmfn_caps_ptr: 40,
+        off_vmfn_caps_len: 48,
     };
 
     #[test]
