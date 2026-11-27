@@ -142,6 +142,8 @@ enum FastOp {
     FnCall,
     /// `Function.prototype.apply` on a VM function.
     FnApply,
+    /// `Function.prototype.bind` of a VM function (`fn_bind`).
+    FnBind,
     /// An `Array.prototype` higher-order built-in (`map`, `forEach`, `sort`,
     /// …), whose loop runs in the VM (`array_hof`).
     ArrayHof(super::array_hof::Hof),
@@ -529,6 +531,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         // `Function.prototype`'s methods share the Array methods' dispatch id.
         (N_ARRAY_PROTO_FN, b"call") => FastOp::FnCall,
         (N_ARRAY_PROTO_FN, b"apply") => FastOp::FnApply,
+        (N_ARRAY_PROTO_FN, b"bind") => FastOp::FnBind,
         (N_ARRAY_PROTO_FN, n) => {
             super::array_hof::hof_for(n).map_or(FastOp::HostDirect, FastOp::ArrayHof)
         }
@@ -1740,6 +1743,7 @@ fn run_op(
                 | FastOp::HostDirect
                 | FastOp::FnCall
                 | FastOp::FnApply
+                | FastOp::FnBind
                 | FastOp::ObjStaticHasOwn
                 | FastOp::NumToFixed
                 | FastOp::NumToString
@@ -2233,6 +2237,11 @@ fn run_op(
             Some(a) => NanBox::boolean(realm.is_array(a) && !realm.is_vm_function(a)),
             None => NanBox::boolean(false),
         },
+        FastOp::FnBind => {
+            let bound: alloc::vec::Vec<NanBox> =
+                args.iter().skip(1).map(|r| regs[*r as usize]).collect();
+            fn_bind(realm, h, arg(0), bound)?
+        }
         FastOp::FnCall | FastOp::FnApply => {
             // (Another callable — a built-in — is called through the host
             // below, with the same `this` and arguments.)
@@ -3257,4 +3266,56 @@ pub(super) fn direct_run(realm: &mut Realm, kind: u8, a0: NanBox, a1: NanBox) ->
         }
         _ => None,
     }
+}
+
+/// `Function.prototype.bind` of the VM function `t` with `this` and the
+/// leading arguments `bound` (BoundFunctionCreate, then the `length` and
+/// `name` steps), built in the realm as the host's `make_bound_function`
+/// builds it — the same hidden slots and properties, in the same order —
+/// when every read it makes is a plain data read that runs no code: a
+/// single-realm run, an ordinary (non-proxy) target whose own `length` and
+/// `name` are data properties held in its object. `None`, having made
+/// nothing, for anything else (the host's `bind` then runs).
+fn fn_bind(
+    realm: &mut Realm,
+    t: Handle,
+    this: NanBox,
+    bound: alloc::vec::Vec<NanBox>,
+) -> Option<NanBox> {
+    use crate::nbexec::{BOUND_ARGS, BOUND_TARGET, BOUND_THIS};
+    if realm.multi_realm || !realm.is_vm_function(t) || realm.proxy_at(t).is_some() {
+        return None;
+    }
+    // `HasOwnProperty(Target, "length")` and `Get(Target, "length")`, and
+    // `Get(Target, "name")`: own data properties only.
+    let own_data = |realm: &Realm, key: &str| {
+        (realm.has_own(t, key) && realm.accessor(t, key).is_none())
+            .then(|| realm.get_property(t, key))
+            .flatten()
+    };
+    let len = own_data(realm, "length")?;
+    let name = own_data(realm, "name")?;
+    let l = match len.as_number() {
+        Some(n) if !n.is_nan() => (crate::common::FloatExt::trunc(n) - bound.len() as f64).max(0.0),
+        _ => 0.0,
+    };
+    let prefix = NanBox::handle(realm.new_string("bound ").to_raw());
+    let bound_name = match name.as_handle().map(Handle::from_raw) {
+        Some(nh) if realm.typeof_is_string(nh) => realm.add_checked(prefix, name)?,
+        _ => prefix,
+    };
+    let proto = realm.object_proto(t);
+    let obj = realm.new_object();
+    realm.set_object_proto(obj, proto);
+    realm.set_hidden_property(obj, BOUND_TARGET, NanBox::handle(t.to_raw()));
+    realm.set_hidden_property(obj, BOUND_THIS, this);
+    let arr = realm.new_array(bound);
+    realm.set_hidden_property(obj, BOUND_ARGS, NanBox::handle(arr.to_raw()));
+    realm.set_property(obj, "length", NanBox::number(l));
+    realm.mark_hidden(obj, "length");
+    realm.set_readonly_property(obj, "length");
+    realm.set_property(obj, "name", bound_name);
+    realm.mark_hidden(obj, "name");
+    realm.set_readonly_property(obj, "name");
+    Some(NanBox::handle(obj.to_raw()))
 }
