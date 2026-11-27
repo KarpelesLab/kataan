@@ -305,7 +305,7 @@ pub(super) fn run(
         return None;
     }
     let this_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     if let Some(r) = run_direct(ctx, funcs, regs, recv, h, len, op, cb, this_arg) {
         return Some(r);
     }
@@ -345,7 +345,7 @@ pub(super) fn run(
 /// a callback whose compiled body is entered through its native-call entry
 /// (`jit_tier::DirectCallee`), the steps [`Loop::iterate`] takes with none of
 /// its per-call setup. `None`, having done nothing, for anything else.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[allow(clippy::too_many_arguments)]
 fn run_direct(
     ctx: &mut Ctx,
@@ -394,7 +394,7 @@ fn run_direct(
 
 /// [`run_direct`]'s steps `0..len`: the built-in's result for `some` /
 /// `every` / `forEach` (`map` / `filter` leave theirs on the frame shadow).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[allow(clippy::too_many_arguments)]
 fn direct_steps(
     ctx: &mut Ctx,

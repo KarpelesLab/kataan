@@ -161,12 +161,7 @@ pub(super) fn try_lean(
 /// global or sticky RegExp's `lastIndex` is left 0, the legacy match record
 /// as it was — and returns the subject. `None`, having done nothing,
 /// otherwise.
-#[cfg(all(
-    feature = "jit",
-    feature = "regex",
-    target_os = "linux",
-    target_arch = "x86_64"
-))]
+#[cfg(all(feature = "jit", feature = "regex", jit_x64))]
 #[inline]
 pub(super) fn try_never(
     ctx: &mut Ctx,
@@ -198,12 +193,7 @@ pub(super) fn try_never(
 
 /// The host's `NEED_EXEC | NEED_REPLACE` (`nbexec::regexp::lean`): the
 /// methods a replace reads.
-#[cfg(all(
-    feature = "jit",
-    feature = "regex",
-    target_os = "linux",
-    target_arch = "x86_64"
-))]
+#[cfg(all(feature = "jit", feature = "regex", jit_x64))]
 const NEED_EXEC_REPLACE: u32 = 1 | 2;
 
 /// The rest of a replace call whose host step is `step`: its result, or the

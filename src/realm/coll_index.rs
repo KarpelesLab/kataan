@@ -88,7 +88,7 @@ pub(crate) fn jit_slots_layout() -> Option<(usize, usize)> {
 /// The byte offsets, from an index, of its `used` and `gone` counts (both
 /// `usize`), which compiled code's inline insert (`crate::jit::coll`) reads
 /// for [`CollIndex::insert_at`]'s growth test and bumps as it does.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[must_use]
 pub(crate) fn jit_counts_layout() -> (usize, usize) {
     (

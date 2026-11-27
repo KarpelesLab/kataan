@@ -75,9 +75,9 @@ mod iter_reuse;
 mod key_probe;
 #[cfg(all(feature = "alloc", jit_x64))]
 mod key_reuse;
-#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "alloc", jit_x64))]
 pub(crate) mod legacy_hl;
-#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "alloc", jit_x64))]
 mod pin;
 #[cfg(all(feature = "alloc", jit_x64))]
 pub(crate) mod poly;
@@ -3866,7 +3866,7 @@ fn iter_const_enabled() -> bool {
 /// Whether a compiled `a.push(x, y, …)` (several values, or one read
 /// after the method) appends in place (`arr_push::X64Assembler::ap_push_n`;
 /// `KATAAN_JIT_PUSHN=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "alloc", jit_x64))]
 fn push_n_enabled() -> bool {
     #[cfg(feature = "std")]
     {

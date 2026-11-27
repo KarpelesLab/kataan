@@ -9444,7 +9444,7 @@ fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>, Vec<u
     // built at run time reaches here without having turned it on before:
     // see `crate::legacy_reach`.)
     crate::legacy_reach::note();
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     if let Some(v) = jit_tier::callee_view(ctx) {
         return v;
     }

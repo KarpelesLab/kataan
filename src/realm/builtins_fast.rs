@@ -409,10 +409,7 @@ impl Realm {
     /// the proved methods of `need` (the host's `NEED_*` bits) under the
     /// proved key epoch and cell-swap count, in a single-realm run. `false`
     /// (ask the host) otherwise.
-    #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(jit_x64), allow(dead_code))]
     #[inline]
     pub(crate) fn regexp_pristine_mirrored(&self, handle: Handle, need: u32) -> bool {
         let Some((proto, epoch, keys, swaps)) = &self.regexp_proof_mirror else {
@@ -430,10 +427,7 @@ impl Realm {
     /// and holding no named group: then whether the RegExp is global or
     /// sticky. `None` when that is not known.
     #[cfg(feature = "regex")]
-    #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(jit_x64), allow(dead_code))]
     #[inline]
     pub(crate) fn regexp_ascii_never(&self, handle: Handle, subject: Handle) -> Option<bool> {
         let Some(Cell::RegExp { compiled, .. }) = self.heap.get(handle) else {
