@@ -965,7 +965,10 @@ impl Realm {
     /// continues, as [`method_lookup_start`](Self::method_lookup_start)
     /// answers for it. `None` for anything else.
     ///
-    /// Likewise the realm's first `%Array.prototype%` for an array that never
+    /// Likewise `%RegExp.prototype%` for a RegExp with no auxiliary object
+    /// and its default `[[Prototype]]` (`plain_regexp_default_proto`), which
+    /// owns no named property but `lastIndex`, and the realm's first
+    /// `%Array.prototype%` for an array that never
     /// had side-table state nor a `[[Prototype]]` set: it owns no named
     /// property, so its lookup continues there (`method_lookup_start`'s
     /// answer for it too).
@@ -979,6 +982,9 @@ impl Realm {
                 self.string_proto_intrinsic?
             }
             Cell::Array(a) if !a.has_side_state() && !a.has_proto_set() => self.root_array_proto?,
+            // A RegExp with no auxiliary object and its default prototype
+            // owns only `lastIndex` (a key `cacheable_key` turns away).
+            Cell::RegExp { .. } => self.plain_regexp_default_proto(h)?,
             _ => return None,
         };
         (!self.is_host_exotic(h)).then_some(start)
