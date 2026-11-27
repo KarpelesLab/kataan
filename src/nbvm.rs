@@ -3525,6 +3525,7 @@ fn yield_delegate_op(
     if regs[iter as usize].is_number() {
         iter_fast::materialize(ctx, regs, iter)?;
     }
+    gen_fast::take_fresh_yield(ctx);
     let (it, nx) = (regs[iter as usize], regs[next as usize]);
     let m = regs[mode as usize].as_number().unwrap_or(0.0) as u8;
     let v = regs[dst as usize];
@@ -3574,10 +3575,7 @@ fn yield_delegate_step(
     {
         match out? {
             gen_fast::GenOut::Yield(x) => {
-                return Ok(DelegateStep::Yield(gen_fast::result_object(
-                    ctx,
-                    gen_fast::GenOut::Yield(x),
-                )));
+                return Ok(DelegateStep::Yield(gen_fast::delegate_yield_value(ctx, x)));
             }
             gen_fast::GenOut::Done(x) => return Ok(DelegateStep::Done(x)),
             gen_fast::GenOut::Delegated(r) => return yield_delegate_result(ctx, r, mode),

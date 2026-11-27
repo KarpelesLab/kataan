@@ -446,11 +446,7 @@ fn finish(
             }
             ctx.realm.vm_frame_stored(fh);
             // A `yield*` step hands the inner result object through as is.
-            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
-                Ok(GenOut::Delegated(value))
-            } else {
-                Ok(GenOut::Yield(value))
-            }
+            Ok(suspended_out(ctx, proto, pc, value))
         }
         Ok(FrameExit::Return(ret)) => {
             complete(ctx, fh);
@@ -466,6 +462,24 @@ fn finish(
             recycle(ctx, regs);
             Err(err)
         }
+    }
+}
+
+/// What a generator suspended at `pc` with `value` hands its resumer: a
+/// plain `yield`'s value, or a `yield*` step's — the inner result object,
+/// handed through as is, unless the step passed the value of an inner VM
+/// generator's plain `yield` up unwrapped ([`SiteMemo::fresh`]): the fresh
+/// `{ value, done: false }` that `next` call stood for, whose `done` read
+/// ran no code, is made (if at all) by whoever finally needs it.
+#[inline]
+fn suspended_out(ctx: &mut Ctx, proto: &FnProto, pc: usize, value: NanBox) -> GenOut {
+    if !matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
+        return GenOut::Yield(value);
+    }
+    if ctx.gen_site_memo.fresh.take() == Some(value.to_bits()) {
+        GenOut::Yield(value)
+    } else {
+        GenOut::Delegated(value)
     }
 }
 
@@ -619,13 +633,7 @@ fn run_in_cell(
         }
         ctx.realm.vm_frame_stored(fh);
         // A `yield*` step hands the inner result object through as is.
-        return Ok(
-            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
-                GenOut::Delegated(value)
-            } else {
-                GenOut::Yield(value)
-            },
-        );
+        return Ok(suspended_out(ctx, proto, pc, value));
     }
     cell_exit(ctx, funcs, proto, fh, pc, handlers, run)
 }
@@ -809,10 +817,9 @@ fn lean_next(ctx: &mut Ctx, funcs: &[FnProto], fh: Handle, v: NanBox) -> Lean {
         }
         ctx.realm.vm_frame_stored(fh);
         // A `yield*` step hands the inner result object through as is.
-        return if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
-            Lean::Other(Ok(GenOut::Delegated(value)))
-        } else {
-            Lean::Yield(value)
+        return match suspended_out(ctx, proto, pc, value) {
+            GenOut::Yield(value) => Lean::Yield(value),
+            out => Lean::Other(Ok(out)),
         };
     }
     Lean::Other(cell_exit(ctx, funcs, proto, fh, pc, handlers, run))
@@ -1085,13 +1092,10 @@ pub(super) fn native_finish(
         }
         ctx.realm.vm_frame_stored(fh);
         // A `yield*` step hands the inner result object through as is.
-        return Ok(
-            if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
-                value
-            } else {
-                yield_result(ctx, value, reuse)
-            },
-        );
+        return Ok(match suspended_out(ctx, proto, pc, value) {
+            GenOut::Delegated(r) => r,
+            _ => yield_result(ctx, value, reuse),
+        });
     }
     cell_exit(ctx, funcs, proto, fh, 0, handlers, run).map(|o| result_object(ctx, o))
 }
@@ -1145,13 +1149,7 @@ fn run_on_window(
                 f.state = S_YIELD;
             }
             ctx.realm.vm_frame_stored(fh);
-            return Ok(
-                if matches!(proto.ops.get(pc), Some(Op::YieldDelegate { .. })) {
-                    GenOut::Delegated(value)
-                } else {
-                    GenOut::Yield(value)
-                },
-            );
+            return Ok(suspended_out(ctx, proto, pc, value));
         }
         GenRun::Exit(r) => r,
         GenRun::Refused => run_frame_at_ic(
@@ -1442,6 +1440,42 @@ pub(super) struct SiteMemo {
     /// inner generator (its bits) whose `next` call that step would make,
     /// and what the call returned (`PEND_*`; the value is the sent one).
     pending: Option<(u64, u8)>,
+    /// Set by a `yield*` step about to suspend with the unwrapped value (its
+    /// bits) of an inner VM generator's plain `yield` (see
+    /// [`take_fresh_yield`]); taken by the suspension's [`suspended_out`].
+    fresh: Option<u64>,
+}
+
+/// A `yield*` step's suspension value for the inner VM generator's plain
+/// `yield value`: `value` itself, marked fresh for [`suspended_out`] (which
+/// the suspension reaches next, nothing running in between), when the
+/// unwrapped form is on (`KATAAN_GEN_FRESH`, default on); else the result
+/// object the inner `next` call would have made.
+pub(super) fn delegate_yield_value(ctx: &mut Ctx, value: NanBox) -> NanBox {
+    if fresh_on() {
+        ctx.gen_site_memo.fresh = Some(value.to_bits());
+        value
+    } else {
+        result_object(ctx, GenOut::Yield(value))
+    }
+}
+
+/// Clears a stale [`SiteMemo::fresh`] mark (a `yield*` step starting).
+#[inline]
+pub(super) fn take_fresh_yield(ctx: &mut Ctx) {
+    ctx.gen_site_memo.fresh = None;
+}
+
+/// Whether a `yield*` step passes an inner VM generator's yielded value up
+/// unwrapped (`KATAAN_GEN_FRESH`, default on).
+fn fresh_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_GEN_FRESH").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
 }
 
 /// [`SiteMemo::pending`]'s outcomes: the inner generator completed, an
