@@ -9024,6 +9024,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
         coll_write: jit_tier::jit_helper_coll_write,
         direct_fill: jit_tier::jit_helper_direct_fill,
         direct_call: jit_tier::jit_helper_direct_call,
+        unpack_rest: jit_tier::jit_helper_unpack_rest,
         direct_has_own: jit_tier::jit_helper_direct_has_own,
         to_str: jit_tier::jit_helper_to_str,
         switch_str: jit_tier::jit_helper_switch_str,

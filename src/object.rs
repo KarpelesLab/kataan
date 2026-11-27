@@ -172,6 +172,13 @@ impl PlainCopy {
         }
     }
 
+    /// A shaped copy of the layout `shape` with `values` in its slots (the
+    /// caller's to make consistent: one value per key of `shape`).
+    #[must_use]
+    pub(crate) fn shaped(shape: Rc<Shape>, values: Vec<NanBox>) -> Self {
+        Self(PlainRepr::Shaped(shape, values))
+    }
+
     /// The layout of a shaped copy (`None` for a dictionary).
     #[must_use]
     pub(crate) fn shape(&self) -> Option<&Rc<Shape>> {

@@ -7386,6 +7386,59 @@ fn note_inlined_accessor(ctx: &mut Ctx, site: &mut crate::jit::MethodSite, f: Op
     }
 }
 
+/// Whether the array-iteration open memo published to compiled code
+/// (`realm::builtins_fast::ArrayIterJit`, see `iter_fast::publish_open`)
+/// holds now, as compiled code's own test makes it
+/// (`X64Assembler::p_array_iter_open`): its stamp is the prototype epoch
+/// and both watched slots still hold the intrinsics it recorded. Then an
+/// array with no side-table state whose prototype is the first
+/// `%Array.prototype%` iterates the built-in way.
+pub(super) fn array_iter_open_holds(realm: &crate::realm::Realm) -> bool {
+    let j = &realm.array_iter_jit;
+    if j.stamp != crate::object::proto_epoch() || j.iter_ptr == 0 || j.next_ptr == 0 {
+        return false;
+    }
+    // SAFETY: while the stamp is the current prototype epoch the two slot
+    // pointers address live slots of the watched holders (a change to
+    // either's layout, or a move of its slots, moves the epoch); compiled
+    // code reads them the same way.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::ptr::read(j.iter_ptr as *const u64) == j.iter_fn
+            && core::ptr::read(j.next_ptr as *const u64) == j.next_fn
+    }
+}
+
+jit_extern! {
+/// An inline array destructuring's rest element (`Op::ArrayUnpack` in
+/// compiled code, `crate::jit::GenericHelpers::unpack_rest`), the array
+/// `src` found plain by the inline checks (a plain array of at least `n`
+/// elements whose iteration is the built-in one): a fresh array of its
+/// elements from `n` on, as `dstr_fast::unpack` makes it; `0`, having made
+/// nothing, when one of those is a hole (whose read the protocol must do)
+/// or the array is no longer plain.
+///
+/// # Safety
+/// `ctx` the live `Ctx`.
+pub(crate) fn jit_helper_unpack_rest(ctx_raw: *mut core::ffi::c_void, src: u64, n: u64, _: u64) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+    let Some(h) = NanBox::from_bits(src).as_handle().map(Handle::from_raw) else {
+        return 0;
+    };
+    let Some((_, elems)) = ctx.realm.plain_root_array_elems(h) else {
+        return 0;
+    };
+    let tail = elems.get(n as usize..).unwrap_or(&[]);
+    if tail.iter().any(|e| e.is_hole()) {
+        return 0;
+    }
+    let tail = super::ArgBuf::from_slice(tail);
+    NanBox::handle(ctx.realm.new_array_from_slice(&tail).to_raw()).to_bits()
+}
+}
+
 jit_extern! {
 /// `Op::GetProp`'s slow path in compiled code (`crate::jit::JitGetSiteHelper`):
 /// the interpreter's read ([`jit_helper_get_prop`](super::jit_helper_get_prop)),

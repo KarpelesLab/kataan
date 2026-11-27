@@ -4442,6 +4442,11 @@ pub struct GenericHelpers {
     /// `jit_helper_direct_call(ctx, kind, a0, a1) -> bits | throw sentinel`:
     /// a direct built-in call's narrow entry (`direct_call`).
     pub direct_call: JitBinHelper,
+    /// `jit_helper_unpack_rest(ctx, array, n, _) -> bits | 0`: an inline
+    /// array destructuring's rest element (`Op::ArrayUnpack`), a fresh
+    /// array of the plain array's elements from `n` on, or `0` (nothing
+    /// made) when one of them is a hole.
+    pub unpack_rest: JitBinHelper,
     /// `jit_helper_direct_has_own(ctx, o, k, site) -> bits | throw
     /// sentinel`: a direct `Object.hasOwn(o, k)` that also notes its answer
     /// in the method site (`direct_call`).
@@ -16470,17 +16475,26 @@ impl JitFunction {
                         // and `true` inline. Anything else is the
                         // interpreter's op (which also takes the rest of
                         // the cases, and publishes the memo this reads).
+                        // With a rest element (outside promoted loops,
+                        // whose registers a helper call would not keep), the
+                        // same, then the rest made by a narrow helper
+                        // (`jit_helper_unpack_rest`) from the elements past
+                        // the pattern's: no close to check (the rest drains
+                        // the iterator), and a hole among them declines.
                         crate::nbvm::Op::ArrayUnpack {
                             ok: flag,
                             src,
                             dsts,
-                            rest: None,
+                            rest,
                         } if unpack_inline_enabled()
                             && ok(*flag)
                             && ok(*src)
-                            && !dsts.is_empty()
+                            && (!dsts.is_empty() || rest.is_some())
                             && dsts.len() <= 16
-                            && dsts.iter().all(|&r| ok(r)) =>
+                            && dsts.iter().all(|&r| ok(r))
+                            && rest.is_none_or(|r| {
+                                ok(r) && !num.in_any_region(op_idx) && !num.in_any_spec(op_idx)
+                            }) =>
                         {
                             use call_seq::r as R;
                             let slow = a.new_label();
@@ -16488,20 +16502,22 @@ impl JitFunction {
                             a.p_array_iter_open(helpers.call_layout.realm, slow);
                             // (`r9` is still the realm.) Nothing to close:
                             // the memo `iter_fast::close_is_noop` arms.
-                            a.g_load_abs(R::RAX, crate::object::proto_epoch_addr() as u64);
-                            a.g_cmp_mem(
-                                R::RAX,
-                                R::R9,
-                                i32::try_from(
-                                    core::mem::offset_of!(crate::realm::Realm, array_iter_memo)
-                                        + core::mem::offset_of!(
-                                            crate::realm::builtins_fast::ArrayIterMemo,
-                                            close_stamp
-                                        ),
-                                )
-                                .ok()?,
-                            );
-                            a.g_jcc(call_seq::cc::NE, slow);
+                            if rest.is_none() {
+                                a.g_load_abs(R::RAX, crate::object::proto_epoch_addr() as u64);
+                                a.g_cmp_mem(
+                                    R::RAX,
+                                    R::R9,
+                                    i32::try_from(
+                                        core::mem::offset_of!(crate::realm::Realm, array_iter_memo)
+                                            + core::mem::offset_of!(
+                                                crate::realm::builtins_fast::ArrayIterMemo,
+                                                close_stamp
+                                            ),
+                                    )
+                                    .ok()?,
+                                );
+                                a.g_jcc(call_seq::cc::NE, slow);
+                            }
                             walk_to_slot!(*src, slow);
                             family_checks!(recv_cache::Family::Arr, slow);
                             a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
@@ -16518,6 +16534,18 @@ impl JitFunction {
                             for (i, &d) in dsts.iter().enumerate() {
                                 a.g_load(R::RAX, R::R11, 8 * i as i32);
                                 a.g_store(R::RBX, disp(d), R::RAX);
+                            }
+                            if let Some(r) = *rest {
+                                // jit_helper_unpack_rest(ctx, src, n, _).
+                                a.mov_rdi_r15();
+                                a.load_argreg(1, disp(*src));
+                                a.movabs_argreg(2, i64::try_from(dsts.len()).ok()?);
+                                a.movabs_argreg(3, 0);
+                                a.movabs_rax(helpers.unpack_rest as usize as i64);
+                                a.call_rax();
+                                a.g_test(R::RAX);
+                                a.g_jcc(call_seq::cc::E, slow);
+                                a.store_rax(disp(r));
                             }
                             a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
                             a.store_rax(disp(*flag));

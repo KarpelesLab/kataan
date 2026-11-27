@@ -49,6 +49,20 @@ pub(crate) struct MergePlan {
 /// How many merge plans a realm remembers (a power of two).
 const MERGE_PLANS: usize = 16;
 
+/// A remembered object rest of a shaped source (see
+/// [`Realm::rest_planned`]): the source layout (held, so its address is not
+/// reused), the excluded keys, the layout of the copy (the source's minus
+/// those keys) and the source slots it keeps, in order.
+pub(crate) struct RestPlan {
+    source: Rc<Shape>,
+    excluded: alloc::boxed::Box<[String]>,
+    result: Rc<Shape>,
+    keep: Rc<[u32]>,
+}
+
+/// How many rest plans a realm remembers (a power of two).
+const REST_PLANS: usize = 8;
+
 impl Realm {
     /// `CopyDataProperties(target, src, excluded)` when it is a wholesale
     /// copy (see the module docs): `target` an empty ordinary object (an
@@ -71,11 +85,20 @@ impl Realm {
         if excluded.is_empty() && self.merge_shaped_planned(target, src) {
             return true;
         }
-        let Some(Cell::Object(s)) = self.heap.get(src) else {
-            return false;
-        };
-        let Some(copy) = s.plain_copy(excluded) else {
-            return false;
+        let copy = match self.rest_planned(src, excluded) {
+            Some(c) => c,
+            None => {
+                let Some(Cell::Object(s)) = self.heap.get(src) else {
+                    return false;
+                };
+                let Some(copy) = s.plain_copy(excluded) else {
+                    return false;
+                };
+                if !excluded.is_empty() {
+                    self.rest_plan_record(src, excluded, &copy);
+                }
+                copy
+            }
         };
         if self.is_host_exotic(target) {
             return false;
@@ -111,6 +134,75 @@ impl Realm {
                     && self.merge_plain_into(target, copy).is_ok()
             }
         }
+    }
+
+    /// `Object::plain_copy(excluded)` of the shaped object `src` (an object
+    /// rest's) by a remembered [`RestPlan`] for its layout and those keys:
+    /// the copy's layout and the kept slots' values, without walking the
+    /// keys or building the layout again. `None` when no plan matches (or
+    /// `src` is not a plain shaped object), for the caller's own copy.
+    fn rest_planned(&self, src: Handle, excluded: &[String]) -> Option<crate::object::PlainCopy> {
+        if excluded.is_empty() || self.rest_plans.is_empty() {
+            return None;
+        }
+        let Some(Cell::Object(s)) = self.heap.get(src) else {
+            return None;
+        };
+        let shape = s.plain_shaped_shape()?;
+        let p = self.rest_plans.get(rest_way(shape, excluded))?.as_ref()?;
+        if !Rc::ptr_eq(&p.source, shape) || *p.excluded != *excluded {
+            return None;
+        }
+        let values = p
+            .keep
+            .iter()
+            .map(|&i| s.slot(i))
+            .collect::<Option<Vec<_>>>()?;
+        Some(crate::object::PlainCopy::shaped(
+            Rc::clone(&p.result),
+            values,
+        ))
+    }
+
+    /// Remembers the rest `copy` of the shaped object `src` without the keys
+    /// `excluded` as a [`RestPlan`] (when both are shaped and the copy is the
+    /// source's layout minus those keys, as `Object::plain_copy` makes it).
+    fn rest_plan_record(
+        &mut self,
+        src: Handle,
+        excluded: &[String],
+        copy: &crate::object::PlainCopy,
+    ) {
+        let Some(result) = copy.shape() else {
+            return;
+        };
+        let Some(Cell::Object(s)) = self.heap.get(src) else {
+            return;
+        };
+        let Some(shape) = s.plain_shaped_shape() else {
+            return;
+        };
+        let keep: Vec<u32> = shape
+            .keys()
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| !excluded.iter().any(|e| e == *k))
+            .map(|(i, _)| i as u32)
+            .collect();
+        if keep.len() != copy.len() {
+            return;
+        }
+        let way = rest_way(shape, excluded);
+        let plan = RestPlan {
+            source: Rc::clone(shape),
+            excluded: excluded.into(),
+            result: Rc::clone(result),
+            keep: keep.into(),
+        };
+        if self.rest_plans.is_empty() {
+            self.rest_plans.resize_with(REST_PLANS, || None);
+        }
+        self.rest_plans[way] = Some(plan);
     }
 
     /// [`Object::merge_plain`](crate::object::Object::merge_plain) of the
@@ -284,4 +376,10 @@ impl Realm {
         }
         Some(out)
     }
+}
+
+/// A rest plan's way in the realm's table: by the source layout's address
+/// and the first excluded key's length.
+fn rest_way(shape: &Rc<Shape>, excluded: &[String]) -> usize {
+    ((Rc::as_ptr(shape) as usize >> 4) ^ excluded.first().map_or(0, String::len)) & (REST_PLANS - 1)
 }

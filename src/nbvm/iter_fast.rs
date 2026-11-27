@@ -423,8 +423,32 @@ fn can_open_array(realm: &mut Realm, v: NanBox) -> bool {
 #[inline]
 pub(super) fn plain_spread_elems(realm: &Realm, v: NanBox) -> Option<&[NanBox]> {
     let (p, elems) = realm.plain_root_array_elems(Handle::from_raw(v.as_handle()?))?;
+    // (The memo as published to compiled code, for the first
+    // `%Array.prototype%` that `plain_root_array_elems` found: two compares
+    // through its slot pointers, as compiled code makes them.)
+    #[cfg(all(feature = "jit", feature = "alloc", jit_native))]
+    if super::jit_tier::array_iter_open_holds(realm) {
+        return (!elems.iter().any(|e| e.is_hole())).then_some(elems);
+    }
     let (ok, _, _) = open_memo_hit(realm, p)?;
     (ok && !elems.iter().any(|e| e.is_hole())).then_some(elems)
+}
+
+/// Whether [`can_open`]'s memo, current, is the one published to compiled
+/// code ([`publish_open`]): a caller that finds a plain array through
+/// [`plain_spread_elems`] then need not ask [`can_open`] to publish it.
+/// Without the JIT there is nothing to publish.
+pub(super) fn open_published(realm: &Realm) -> bool {
+    #[cfg(all(feature = "jit", feature = "alloc", jit_native))]
+    {
+        let s = realm.array_iter_memo.open_stamp;
+        realm.array_iter_jit.stamp == s && s == crate::object::proto_epoch()
+    }
+    #[cfg(not(all(feature = "jit", feature = "alloc", jit_native)))]
+    {
+        let _ = realm;
+        true
+    }
 }
 
 /// Whether `Get(iterator, "next")` on a fresh built-in `%ArrayIterator%`

@@ -29,18 +29,24 @@ pub(super) fn unpack(
 ) -> bool {
     let v = regs[src as usize];
     let n = dsts.len();
-    // (`can_open` also publishes its memo to compiled code, whose inline
-    // form of this op reads it.)
-    if !iter_fast::can_open(&mut ctx.realm, v) {
+    // (A close of an unfinished iteration must find nothing to call:
+    // asked first, so the values are read in one pass below.)
+    if rest.is_none() && !iter_fast::close_is_noop(&mut ctx.realm) {
+        // (Only a pattern no longer than the array leaves it unfinished.)
+        match iter_fast::plain_spread_elems(&ctx.realm, v) {
+            Some(e) if e.len() < n => {}
+            _ => return false,
+        }
+    }
+    // The common case, a warm memo already published to compiled code (whose
+    // inline form of this op reads it), in one lookup; else `can_open`
+    // (which also publishes it) first.
+    if !(iter_fast::open_published(&ctx.realm)
+        && iter_fast::plain_spread_elems(&ctx.realm, v).is_some())
+        && !iter_fast::can_open(&mut ctx.realm, v)
+    {
         return false;
     }
-    let Some(len) = iter_fast::plain_spread_elems(&ctx.realm, v).map(<[NanBox]>::len) else {
-        return false;
-    };
-    if rest.is_none() && len >= n && !iter_fast::close_is_noop(&mut ctx.realm) {
-        return false;
-    }
-    // (Found plain just now: the memo it read is current.)
     let Some(elems) = iter_fast::plain_spread_elems(&ctx.realm, v) else {
         return false;
     };
@@ -48,8 +54,8 @@ pub(super) fn unpack(
         regs[*d as usize] = elems.get(i).copied().unwrap_or(NanBox::undefined());
     }
     if let Some(r) = rest {
-        let tail = elems.get(n..).unwrap_or(&[]).to_vec();
-        let h = ctx.realm.new_array_from_iter(tail.into_iter());
+        let tail = super::ArgBuf::from_slice(elems.get(n..).unwrap_or(&[]));
+        let h = ctx.realm.new_array_from_slice(&tail);
         regs[r as usize] = NanBox::handle(h.to_raw());
     }
     true

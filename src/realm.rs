@@ -488,6 +488,9 @@ pub struct Realm {
     /// Remembered shaped-into-shaped merges (`{ k: v, ...src }`), by the
     /// target's and the source's layouts (see `spread_fast::MergePlan`).
     merge_plans: alloc::vec::Vec<Option<spread_fast::MergePlan>>,
+    /// Remembered object rests (`{ a, b, ...rest } = src`), by the source's
+    /// layout and the excluded keys (see `spread_fast::RestPlan`).
+    rest_plans: alloc::vec::Vec<Option<spread_fast::RestPlan>>,
     /// `Object.assign`'s plain-copy proofs, kept from one call to the next
     /// (see `assign_fast`), for the host's built-in and the VM's fast call
     /// alike.
@@ -1302,6 +1305,7 @@ impl Realm {
             key_strings_next: 0,
             dict_key_strings: alloc::vec::Vec::new(),
             merge_plans: alloc::vec::Vec::new(),
+            rest_plans: alloc::vec::Vec::new(),
             assign_memo: assign_fast::AssignMemo::default(),
             len_cache: None,
             coll_iter_layout: None,
