@@ -213,6 +213,10 @@ pub struct Interp {
     /// tag, so `Object.getPrototypeOf(arr.values())` is a real
     /// `%ArrayIteratorPrototype%` (reflection tests).
     builtin_iter_protos: alloc::collections::BTreeMap<&'static str, Handle>,
+    /// The comparison settings of the collator `localeCompare` makes from no
+    /// locales and no options (`default_locale_compare`), once made.
+    #[cfg(feature = "intl")]
+    default_collator: Option<alloc::rc::Rc<intl_fmt::CollatorParams>>,
     /// Intrinsic `Temporal.<Type>.prototype` handles, indexed by `TemporalKind`.
     temporal_protos: Vec<Option<Handle>>,
     /// Whether `new.target` is lexically in scope at the current execution point —
@@ -3110,6 +3114,8 @@ impl Interp {
             script_eval_globals: false,
             annexb_block_fns: Vec::new(),
             builtin_iter_protos: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "intl")]
+            default_collator: None,
             temporal_protos: Vec::new(),
             new_target_in_scope: false,
             super_call_in_scope: false,

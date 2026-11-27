@@ -298,6 +298,43 @@ fn is_digit_of_numbering_system(nu: &str, c: char) -> bool {
     }
 }
 
+/// A collator's comparison settings, from its resolved slots
+/// (`Interp::collator_params`).
+#[cfg(feature = "intl")]
+pub(crate) struct CollatorParams {
+    strength: intl::unicode::collate::Strength,
+    case_level: bool,
+    numeric: bool,
+    upper_first: bool,
+    alternate: intl::unicode::collate::AlternateHandling,
+    /// The resolved locale's CLDR tailoring, when it serves these settings.
+    tailoring: Option<alloc::rc::Rc<intl::unicode::collate::Tailoring>>,
+}
+
+#[cfg(feature = "intl")]
+impl CollatorParams {
+    /// The ordering of `a` and `b` (see `Interp::collator_ordering`).
+    fn compare(&self, a: &str, b: &str) -> core::cmp::Ordering {
+        use intl::unicode::collate::Collator;
+        let (swapped_a, swapped_b);
+        let (a, b) = if self.upper_first {
+            swapped_a = swap_letter_case(a);
+            swapped_b = swap_letter_case(b);
+            (swapped_a.as_str(), swapped_b.as_str())
+        } else {
+            (a, b)
+        };
+        if let Some(t) = &self.tailoring {
+            return t.compare(a, b);
+        }
+        Collator::new(self.alternate)
+            .with_strength(self.strength)
+            .with_case_level(self.case_level)
+            .with_numeric(self.numeric)
+            .compare(a, b)
+    }
+}
+
 /// The CLDR collation tailoring for a resolved locale tag, memoized.
 ///
 /// Building one parses the locale's CLDR rule, which is far too expensive to
@@ -5845,7 +5882,35 @@ impl Interp {
         a: &str,
         b: &str,
     ) -> core::cmp::Ordering {
-        use intl::unicode::collate::{AlternateHandling, Collator, Strength};
+        self.collator_params(ch).compare(a, b)
+    }
+
+    /// `String.prototype.localeCompare(that)` with `locales` and `options`
+    /// both `undefined`: the ordering of a collator made from no locales and
+    /// no options, whose resolved slots (read once from such a collator, made
+    /// the same way, and kept) do not change during a run — building one
+    /// per call, a dozen hidden properties, cost more than the comparison.
+    #[cfg(feature = "intl")]
+    pub(crate) fn default_locale_compare(
+        &mut self,
+        a: &str,
+        b: &str,
+    ) -> Result<core::cmp::Ordering, ExecError> {
+        if self.default_collator.is_none() {
+            let u = NanBox::undefined();
+            let c = self.make_collator(&[u, u])?;
+            let ch = c.as_handle().map(Handle::from_raw);
+            self.default_collator = Some(alloc::rc::Rc::new(self.collator_params(ch)));
+        }
+        let params = self.default_collator.clone().expect("made above");
+        Ok(params.compare(a, b))
+    }
+
+    /// The comparison settings of a collator's resolved slots (see
+    /// [`Self::collator_ordering`]).
+    #[cfg(feature = "intl")]
+    fn collator_params(&mut self, ch: Option<Handle>) -> CollatorParams {
+        use intl::unicode::collate::{AlternateHandling, Strength};
         // `sensitivity` selects the comparison strength. "case" is the odd one: it
         // ignores accents but *not* case, which is not a strength level at all —
         // it is primary strength with the UCA case level switched on. Folding it
@@ -5877,14 +5942,6 @@ impl Interp {
             .and_then(|h| self.realm.get_property(h, islot!("caseFirst")))
             .map(|v| self.realm.to_display_string(v))
             .is_some_and(|cf| cf == "upper");
-        let (swapped_a, swapped_b);
-        let (a, b) = if upper_first {
-            swapped_a = swap_letter_case(a);
-            swapped_b = swap_letter_case(b);
-            (swapped_a.as_str(), swapped_b.as_str())
-        } else {
-            (a, b)
-        };
         let alternate = if matches!(
             ch.and_then(|h| self.realm.get_property(h, islot!("ignorePunctuation")))
                 .map(|v| v.unpack()),
@@ -5913,33 +5970,35 @@ impl Interp {
         // `new Intl.Collator("de-u-co-phonebk", {usage: "search"})`). German's
         // search rule folds `ä` with `ae`, so `["AE", "Ä"]` sorts as-is there
         // where plain `de` (root order) puts the single letter `Ä` first.
-        if strength == Strength::Tertiary
+        let tailoring = if strength == Strength::Tertiary
             && !case_level
             && !numeric
             && alternate == AlternateHandling::NonIgnorable
             && let Some(locale) = ch
                 .and_then(|h| self.realm.get_property(h, "\u{0}locale"))
                 .map(|v| self.realm.to_display_string(v))
-            && let Some(tailoring) = {
-                let search = ch
-                    .and_then(|h| self.realm.get_property(h, islot!("usage")))
-                    .map(|v| self.realm.to_display_string(v))
-                    .is_some_and(|u| u == "search");
-                if search {
-                    let base = strip_unicode_extension(&locale);
-                    locale_tailoring(&alloc::format!("{base}-u-co-search"))
-                } else {
-                    locale_tailoring(&locale)
-                }
-            }
         {
-            return tailoring.compare(a, b);
+            let search = ch
+                .and_then(|h| self.realm.get_property(h, islot!("usage")))
+                .map(|v| self.realm.to_display_string(v))
+                .is_some_and(|u| u == "search");
+            if search {
+                let base = strip_unicode_extension(&locale);
+                locale_tailoring(&alloc::format!("{base}-u-co-search"))
+            } else {
+                locale_tailoring(&locale)
+            }
+        } else {
+            None
+        };
+        CollatorParams {
+            strength,
+            case_level,
+            numeric,
+            upper_first,
+            alternate,
+            tailoring,
         }
-        Collator::new(alternate)
-            .with_strength(strength)
-            .with_case_level(case_level)
-            .with_numeric(numeric)
-            .compare(a, b)
     }
 
     /// Builds an `Intl.ListFormat` instance (`InitializeListFormat`): canonicalizes

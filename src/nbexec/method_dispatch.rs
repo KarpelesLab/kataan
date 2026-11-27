@@ -2971,7 +2971,9 @@ impl Interp {
                     // numeric / ignorePunctuation, and the default lowercase-first
                     // ordering) rather than raw code-point comparison.
                     #[cfg(feature = "intl")]
-                    let ord = {
+                    let ord = if arg(1).is_undefined() && arg(2).is_undefined() {
+                        self.default_locale_compare(&s, &other)?
+                    } else {
                         let collator = self.make_collator(&[arg(1), arg(2)])?;
                         let ch = collator.as_handle().map(Handle::from_raw);
                         self.collator_ordering(ch, &s, &other)
