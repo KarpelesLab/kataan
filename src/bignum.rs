@@ -305,9 +305,37 @@ impl BigInt {
         u64::try_from(&self.0.mod_2k(64)).unwrap_or(0)
     }
 
+    /// The value as an `i128` when its magnitude has at most two limbs and
+    /// is below `2^127` (so the conversion is exact), from the limbs alone;
+    /// `None` for anything larger or when the fast paths are off.
+    #[inline]
+    fn small(&self) -> Option<i128> {
+        if !fast_enabled() {
+            return None;
+        }
+        let m = match *self.0.limbs() {
+            [] => return Some(0),
+            [lo] => i128::from(lo),
+            [lo, hi] if hi >> 63 == 0 => (i128::from(hi) << 64) | i128::from(lo),
+            _ => return None,
+        };
+        Some(if self.0.is_negative() { -m } else { m })
+    }
+
+    /// Both operands as [`small`](Self::small) values.
+    #[inline]
+    fn small2(&self, other: &Self) -> Option<(i128, i128)> {
+        Some((self.small()?, other.small()?))
+    }
+
     /// Returns `self + other`.
     #[must_use]
     pub fn add(&self, other: &Self) -> Self {
+        if let Some((a, b)) = self.small2(other)
+            && let Some(v) = a.checked_add(b)
+        {
+            return Self::from_i128(v);
+        }
         Self(self.0.add(&other.0))
     }
 
@@ -320,12 +348,22 @@ impl BigInt {
     /// Returns `self - other`.
     #[must_use]
     pub fn sub(&self, other: &Self) -> Self {
+        if let Some((a, b)) = self.small2(other)
+            && let Some(v) = a.checked_sub(b)
+        {
+            return Self::from_i128(v);
+        }
         Self(self.0.sub(&other.0))
     }
 
     /// Returns `self * other`.
     #[must_use]
     pub fn mul(&self, other: &Self) -> Self {
+        if let Some((a, b)) = self.small2(other)
+            && let Some(v) = a.checked_mul(b)
+        {
+            return Self::from_i128(v);
+        }
         let (a, b) = (self.0.limbs(), other.0.limbs());
         if fast_enabled() && a.len() >= 2 && b.len() >= 2 && a.len() + b.len() <= SMALL_LIMBS * 2 {
             let neg = self.0.is_negative() != other.0.is_negative();
@@ -338,6 +376,13 @@ impl BigInt {
     /// the remainder takes the dividend's sign. Returns `None` on divide-by-zero.
     #[must_use]
     pub fn divmod(&self, other: &Self) -> Option<(Self, Self)> {
+        if let Some((a, b)) = self.small2(other) {
+            // Rust's `/` and `%` truncate toward zero, the remainder taking
+            // the dividend's sign, as BigInt's do; `checked_*` refuses a zero
+            // divisor (and `i128::MIN / -1`, unreachable: |a| < 2^127).
+            let (q, r) = (a.checked_div(b)?, a.checked_rem(b)?);
+            return Some((Self::from_i128(q), Self::from_i128(r)));
+        }
         if let Some((q, r)) = self.small_div(other, true) {
             let qneg = self.0.is_negative() != other.0.is_negative();
             return Some((
@@ -366,11 +411,24 @@ impl BigInt {
     #[must_use]
     pub fn rem(&self, other: &Self) -> Option<Self> {
         if fast_enabled()
-            && let [d] = other.0.limbs()
+            && let [d] = *other.0.limbs()
         {
-            // A zero remainder is the (unsigned) zero.
-            let r = Int::from_u64(rem_1(self.0.limbs(), *d));
+            // A one-limb divisor: the machine's remainder of a dividend of
+            // up to two limbs, else a pass over its limbs. (A zero
+            // remainder is the unsigned zero.)
+            let r = match *self.0.limbs() {
+                [] => 0,
+                [x] => x % d,
+                [lo, hi] => ((u128::from(hi) << 64 | u128::from(lo)) % u128::from(d)) as u64,
+                ref a => rem_1(a, d),
+            };
+            let r = Int::from_u64(r);
             return Some(Self(if self.0.is_negative() { r.neg() } else { r }));
+        }
+        if let Some((a, b)) = self.small2(other) {
+            // Truncated, the remainder taking the dividend's sign, as
+            // Rust's `%`; `None` for a zero divisor.
+            return Some(Self::from_i128(a.checked_rem(b)?));
         }
         if let Some((_, r)) = self.small_div(other, false) {
             return Some(Self(Int::from_limb_vec(sign_of(self.0.is_negative()), r)));
@@ -381,6 +439,10 @@ impl BigInt {
     /// Bitwise AND (two's-complement).
     #[must_use]
     pub fn bitand(&self, other: &Self) -> Self {
+        // Two's complement over `i128` is the infinite one's restriction.
+        if let Some((a, b)) = self.small2(other) {
+            return Self::from_i128(a & b);
+        }
         if fast_enabled() {
             let (a, b) = (&self.0, &other.0);
             match (a.is_negative(), b.is_negative()) {
@@ -412,6 +474,10 @@ impl BigInt {
     /// Bitwise OR (two's-complement).
     #[must_use]
     pub fn bitor(&self, other: &Self) -> Self {
+        // Two's complement over `i128` is the infinite one's restriction.
+        if let Some((a, b)) = self.small2(other) {
+            return Self::from_i128(a | b);
+        }
         if let Some(v) = self.nonneg_limbwise(other, |x, y| x | y) {
             return v;
         }
@@ -421,6 +487,10 @@ impl BigInt {
     /// Bitwise XOR (two's-complement).
     #[must_use]
     pub fn bitxor(&self, other: &Self) -> Self {
+        // Two's complement over `i128` is the infinite one's restriction.
+        if let Some((a, b)) = self.small2(other) {
+            return Self::from_i128(a ^ b);
+        }
         if let Some(v) = self.nonneg_limbwise(other, |x, y| x ^ y) {
             return v;
         }
@@ -600,6 +670,9 @@ impl BigInt {
 impl Ord for BigInt {
     /// Signed comparison.
     fn cmp(&self, other: &Self) -> Ordering {
+        if let Some((a, b)) = self.small2(other) {
+            return a.cmp(&b);
+        }
         self.0.cmp(&other.0)
     }
 }
