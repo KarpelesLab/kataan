@@ -426,7 +426,6 @@ impl Realm {
     /// with the host's `exec` bit): the receiver owns no `exec`, so the
     /// [[Get]] finds the proved `%RegExp.prototype%`'s data property, the
     /// intrinsic recorded in the proof. `None` (look it up) otherwise.
-    #[cfg_attr(not(jit_native), allow(dead_code))]
     #[inline]
     pub(crate) fn regexp_pristine_exec(&self, handle: Handle) -> Option<NanBox> {
         let (_, _, keys, _) = self.regexp_proof_mirror.as_ref()?;

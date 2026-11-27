@@ -2652,10 +2652,11 @@ fn vm_set_prop_mode(
     // object not frozen) and writes it; a canonical index is the cell's slot.
     if key == "lastIndex"
         && let Some(h) = recv.as_handle().map(Handle::from_raw)
-        && ctx.realm.regexp_flags(h).is_some()
         && let Some(n) = canonical_last_index(value)
-        && !ctx.realm.regex_aux_last_index_defined(h)
-        && !ctx.realm.is_frozen(h)
+        && (ctx.realm.regexp_lean_last_index(h)
+            || (ctx.realm.regexp_flags(h).is_some()
+                && !ctx.realm.regex_aux_last_index_defined(h)
+                && !ctx.realm.is_frozen(h)))
     {
         ctx.realm.set_regex_last_index(h, n);
         return Ok(());
@@ -8040,12 +8041,24 @@ fn vm_get_prop(
         // RegExpAlloc, non-configurable): without a descriptor of its own in
         // the auxiliary object, its value is the cell's slot.
         if key == "lastIndex"
-            && ctx.realm.regexp_flags(h).is_some()
-            && !ctx.realm.regex_aux_last_index_defined(h)
+            && (ctx.realm.regexp_lean_last_index(h)
+                || (ctx.realm.regexp_flags(h).is_some()
+                    && !ctx.realm.regex_aux_last_index_defined(h)))
         {
             return Ok(NanBox::number(ctx.realm.regex_last_index(h) as f64));
         }
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
+            return Ok(v);
+        }
+        // An Array's named own data property lives in its auxiliary object
+        // (a match result's `index`/`input`/`groups`); an index or `length`
+        // is the element store's.
+        if !key
+            .as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_digit() || *c == b'-')
+            && let Some(v) = ctx.realm.array_named_cached_get(h, key, cache)
+        {
             return Ok(v);
         }
         // A built-in function's own data property (`Object.prototype`).

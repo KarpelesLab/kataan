@@ -7096,6 +7096,17 @@ pub(crate) fn jit_helper_set_prop_site(
     // (interior-mutable, touched only by this helper while it runs).
     #[allow(unsafe_code)]
     let (ctx, site) = unsafe { (&mut *(ctx_raw as *mut Ctx), &mut *site) };
+    // `re.lastIndex = n` (a canonical index) of a RegExp with no auxiliary
+    // object: the slot store `vm_set_prop_mode` makes, with nothing for the
+    // site to learn.
+    if let Some(h) = NanBox::from_bits(obj).as_handle().map(Handle::from_raw)
+        && let Some(n) = super::canonical_last_index(NanBox::from_bits(val))
+        && site.key() == "lastIndex"
+        && ctx.realm.regexp_lean_last_index(h)
+    {
+        ctx.realm.set_regex_last_index(h, n);
+        return NanBox::undefined().to_bits();
+    }
     if site.try_add(&mut ctx.realm, obj, NanBox::from_bits(val)) {
         return NanBox::undefined().to_bits();
     }
@@ -7158,6 +7169,18 @@ pub(crate) fn jit_helper_get_prop_site(
     #[allow(unsafe_code)]
     let site = unsafe { &mut *site };
     let key = site.key();
+    // `re.lastIndex` of a RegExp with no auxiliary object: its slot, with
+    // nothing for the site to learn (`Realm::regexp_lean_last_index`).
+    if key == "lastIndex"
+        && let Some(h) = NanBox::from_bits(obj).as_handle().map(Handle::from_raw)
+    {
+        // SAFETY: as `jit_helper_get_prop`; this borrow ends here.
+        #[allow(unsafe_code)]
+        let realm = unsafe { &(*(ctx_raw as *const Ctx)).realm };
+        if realm.regexp_lean_last_index(h) {
+            return NanBox::number(realm.regex_last_index(h) as f64).to_bits();
+        }
+    }
     let r = super::jit_helper_get_prop(ctx_raw, obj, key.as_ptr(), key.len(), site.cache);
     if r != NanBox::jit_throw_bits()
         && let Some(h) = NanBox::from_bits(obj).as_handle().map(Handle::from_raw)

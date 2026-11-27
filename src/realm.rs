@@ -5775,8 +5775,44 @@ impl Realm {
     /// the aux slot and to honor a user-installed `writable: false`.
     #[must_use]
     pub fn regex_aux_last_index_defined(&self, handle: Handle) -> bool {
+        if !self.aux_props.contains_key(&handle.to_raw()) {
+            return false;
+        }
         self.aux_obj(handle)
             .is_some_and(|o| o.contains("lastIndex") || o.accessor("lastIndex").is_some())
+    }
+
+    /// Whether the cell at `handle` is a RegExp with no auxiliary object:
+    /// then its `lastIndex` is the own writable data property RegExpAlloc
+    /// made, held in the cell's slot, and the RegExp is extensible and not
+    /// frozen (a descriptor of its own, a non-extensible or frozen mark all
+    /// live in that object). Reading `lastIndex` is the slot; writing a
+    /// canonical index is storing it.
+    #[must_use]
+    #[inline]
+    pub fn regexp_lean_last_index(&self, handle: Handle) -> bool {
+        matches!(self.heap.get(handle), Some(Cell::RegExp { .. }))
+            && !self.aux_props.contains_key(&handle.to_raw())
+    }
+
+    /// The named own data property `key` (not an index, not `length`) of
+    /// the Array at `handle`, read from its auxiliary object through `cache`
+    /// (a match result's `index` / `input` / `groups`): `None` when the cell
+    /// is no Array, has no auxiliary object, or that object has no such data
+    /// slot (an accessor, an absent key).
+    #[must_use]
+    #[inline]
+    pub fn array_named_cached_get(
+        &self,
+        handle: Handle,
+        key: &str,
+        cache: &mut crate::ic::PropertyCache,
+    ) -> Option<NanBox> {
+        if !matches!(self.heap.get(handle), Some(Cell::Array(_))) {
+            return None;
+        }
+        let aux = *self.aux_props.get(&handle.to_raw())?;
+        self.heap.get(aux)?.as_object()?.cached_get(key, cache)
     }
 
     /// The `(source, flags)` of the `RegExp` at `handle` (owned), if it is one.

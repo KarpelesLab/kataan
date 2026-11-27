@@ -890,6 +890,32 @@ pub(super) fn try_call(
         let (op, method) = (site.op, site.method);
         return run_op(ctx, funcs, op, method, recv, r, false, regs, args);
     }
+    // `re.exec(s)` where the site called `RegExp.prototype.exec` before and
+    // the RegExp is pristine by the realm's mirror of the host's protocol
+    // proof (no own property, the proved `%RegExp.prototype%` still holding
+    // that intrinsic `exec`): the same method, with no chain walk.
+    if key == "exec"
+        && let Some(site) = cache.native.as_deref()
+        && matches!(site.op, FastOp::RegExpCall)
+        && let Some(r) = recv.as_handle().map(Handle::from_raw)
+        && ctx
+            .realm
+            .regexp_pristine_exec(r)
+            .is_some_and(|m| m.to_bits() == site.method)
+    {
+        let method = site.method;
+        return run_op(
+            ctx,
+            funcs,
+            FastOp::RegExpCall,
+            method,
+            recv,
+            r,
+            false,
+            regs,
+            args,
+        );
+    }
     if cache
         .native
         .as_deref()
