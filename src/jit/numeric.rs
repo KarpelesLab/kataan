@@ -7505,11 +7505,27 @@ impl NumGen {
             return;
         }
         self.flush(a, s.region);
+        // Two Strings held in their rope nodes: compared inline
+        // (`str_cmp::p_small_str_eq`), else the helper.
+        let have_rax = a.new_label();
+        if super::str_cmp::enabled() {
+            let call = a.new_label();
+            a.p_small_str_eq(
+                super::compute_jit_layout(),
+                self.env.realm,
+                (disp(x), disp(y)),
+                self.tag_false,
+                call,
+            );
+            a.jmp(have_rax);
+            a.bind(call);
+        }
         a.mov_rdi_r15();
         a.load_argreg(1, disp(x));
         a.load_argreg(2, disp(y));
         a.movabs_rax(self.env.strict_eq as i64);
         a.call_rax();
+        a.bind(have_rax);
         a.store_rax(disp(dst));
         self.reload(a, s.region);
         self.recheck_globals(a, s.region);

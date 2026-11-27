@@ -118,4 +118,59 @@ impl X64Assembler {
         self.g_movabs(r::R11, f);
         self.g_add(r::RAX, r::R11);
     }
+
+    /// `a === b` of the frame slots `a` and `b` when both hold Strings held
+    /// in their rope nodes (`Node::Small`), as `Realm::strict_equals`
+    /// compares them (`Rope::same_bytes`): `rax` = the boolean's bits (`f`
+    /// false's, true's being `f + 1`), falling through; else to `miss` with
+    /// nothing stored. A node's bytes past its text's length are zero, so
+    /// the first four words differ exactly when the texts' first 32 bytes
+    /// do; with all four equal, the lengths decide when both texts fit in
+    /// them. Clobbers `rax`, `rcx`, `rdx`, `rsi`, `r8`–`r11` (what a helper
+    /// call may).
+    pub(crate) fn p_small_str_eq(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        (a, b): (i32, i32),
+        f: u64,
+        miss: Label,
+    ) {
+        let rl = l.rope;
+        let w = |k: i32| rl.small_buf + 8 * k;
+        self.p_arena(realm_off, &l.props);
+        // r8 / r11 = the operands' rope nodes, each a String's held in it.
+        for (slot, node) in [(a, r::R8), (b, r::R11)] {
+            self.load_rax(slot);
+            self.p_cmp_handle_floor(r::RAX);
+            self.g_jcc(cc::B, miss);
+            self.p_slot_rooted(l, r::R9, miss);
+            self.g_cmp_byte_imm(r::R9, l.off_cell_tag, l.cell_str_disc);
+            self.g_jcc(cc::NE, miss);
+            self.g_load(node, r::R9, l.off_str_rope);
+            self.g_cmp_byte_imm(node, rl.tag, rl.small_tag);
+            self.g_jcc(cc::NE, miss);
+        }
+        let result = self.new_label();
+        let differ = self.new_label();
+        for k in 0..4 {
+            self.g_load(r::RAX, r::R8, w(k));
+            self.g_cmp_mem(r::RAX, r::R11, w(k));
+            self.g_jcc(cc::NE, differ);
+        }
+        // movzx eax, byte [r8 + len]; movzx ecx, byte [r11 + len]
+        self.g_mem(false, &[0x0f, 0xb6], r::RAX, r::R8, rl.small_len);
+        self.g_mem(false, &[0x0f, 0xb6], r::RCX, r::R11, rl.small_len);
+        self.code.extend_from_slice(&[0x83, 0xf8, 0x20]); // cmp eax, 32
+        self.g_jcc(cc::A, miss);
+        self.code.extend_from_slice(&[0x39, 0xc8]); // cmp eax, ecx
+        self.code.extend_from_slice(&[0x0f, 0x94, 0xc0]); // sete al
+        self.jmp(result);
+        self.bind(differ);
+        self.code.extend_from_slice(&[0x31, 0xc0]); // xor eax, eax
+        self.bind(result);
+        self.code.extend_from_slice(&[0x0f, 0xb6, 0xc0]); // movzx eax, al
+        self.g_movabs(r::R11, f);
+        self.g_add(r::RAX, r::R11);
+    }
 }

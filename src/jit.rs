@@ -18951,6 +18951,21 @@ impl JitFunction {
                         done,
                         way,
                     );
+                    // Two Strings held in their rope nodes: compared inline
+                    // (`str_cmp::p_small_str_eq`), else the helper.
+                    if str_cmp::enabled() {
+                        let helper = a.new_label();
+                        a.p_small_str_eq(
+                            &layout,
+                            helpers.call_layout.realm,
+                            (disp(ra), disp(rb)),
+                            tag_false,
+                            helper,
+                        );
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        a.bind(helper);
+                    }
                     // `jit_helper_strict_eq` never throws → no sentinel check.
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(ra));
