@@ -2787,7 +2787,12 @@ impl Interp {
                 }
             }
             let r = self.new_regexp_instance(&pat, &flags);
-            if let Some(proto) = proto {
+            // (A fresh instance already has the default `[[Prototype]]`:
+            // an explicit link to that same object would change nothing
+            // but mark the cell as having one.)
+            if let Some(proto) = proto
+                && self.realm.object_proto(r) != Some(proto)
+            {
                 self.realm.set_native_proto(r, proto);
             }
             return Ok(NanBox::handle(r.to_raw()));

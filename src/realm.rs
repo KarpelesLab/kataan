@@ -517,6 +517,9 @@ pub struct Realm {
     /// The hidden-state layout of a lazy String Iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) str_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
+    /// The hidden-state layout of a live RegExp String Iterator (matcher,
+    /// subject, flag bits; not done), learned likewise.
+    pub(crate) rsi_layout: Option<hidden_layout::HiddenLayout<3>>,
     /// The hidden-state layout of a live Array Iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) arr_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
@@ -1296,6 +1299,7 @@ impl Realm {
             coll_iter_slots: [0; 2],
             buf_iter_layout: None,
             str_iter_layout: None,
+            rsi_layout: None,
             arr_iter_layout: None,
             bound_fn_layout: None,
             iter_helper_fn_layout: None,

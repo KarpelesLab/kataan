@@ -1521,14 +1521,50 @@ impl Interp {
             .realm
             .get_property(h, RSI_STR)
             .unwrap_or(NanBox::undefined());
-        let bits = self
+        let flags_v = self
             .realm
             .get_property(h, RSI_FLAGS)
-            .and_then(|n| n.as_number())
-            .unwrap_or(0.0) as u32;
+            .unwrap_or(NanBox::undefined());
+        if self.realm.rsi_layout.is_none() {
+            self.realm.rsi_layout = crate::realm::hidden_layout::HiddenLayout::learn(
+                &self.realm,
+                h,
+                [RSI_MATCHER, RSI_STR, RSI_FLAGS],
+                &[GEN_DONE, GEN_COLL, GEN_TA, GEN_ARR, GEN_STR, GEN_BUF],
+            );
+        }
+        self.regexp_string_iter_step(h, matcher_v, str_v, flags_v)
+    }
+
+    /// [`regexp_string_iter_next`](Self::regexp_string_iter_next) of a not
+    /// yet done iterator `h` once its state is read: the matcher, the
+    /// subject and the flag bits.
+    pub(crate) fn regexp_string_iter_step(
+        &mut self,
+        h: Handle,
+        matcher_v: NanBox,
+        str_v: NanBox,
+        flags_v: NanBox,
+    ) -> Result<NanBox, ExecError> {
+        let bits = flags_v.as_number().unwrap_or(0.0) as u32;
         let global = bits & 1 != 0;
         let unicode = bits & 2 != 0;
-        let result = self.regexp_exec(matcher_v, str_v)?;
+        // `RegExpExec(matcher, S)`: over a pristine matcher (its `exec` the
+        // intrinsic, read without running code) `RegExpBuiltinExec` itself.
+        #[cfg(feature = "regex")]
+        let lean = match matcher_v.as_handle().map(Handle::from_raw) {
+            Some(mh) if self.regexp_pristine(mh, NEED_EXEC) => {
+                self.regexp_exec_lean(mh, str_v, true)
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "regex"))]
+        let lean = None;
+        let lean_hit = lean.is_some();
+        let result = match lean {
+            Some(v) => v,
+            None => self.regexp_exec(matcher_v, str_v)?,
+        };
         if matches!(result.unpack(), Unpacked::Null) {
             self.realm
                 .set_hidden_property(h, GEN_DONE, NanBox::boolean(true));
@@ -1542,11 +1578,26 @@ impl Interp {
         // Global: `matchStr = ToString(Get(match, "0"))`; on an empty match,
         // bump the matcher's `lastIndex` so iteration terminates.
         if let Some(rh) = result.as_handle().map(Handle::from_raw) {
-            let match0 = self.get_own_fast(rh, "0")?;
-            let m_str = self.coerce_to_string(match0)?;
-            if m_str.is_empty()
-                && let Some(matcher) = matcher_v.as_handle().map(Handle::from_raw)
-            {
+            // (A built-in match array's element 0 is its own data property,
+            // a string: read in place.)
+            let known = if lean_hit {
+                self.realm
+                    .array_elements(rh)
+                    .and_then(|e| e.first().copied())
+                    .and_then(|v| v.as_handle())
+                    .and_then(|s| self.realm.string_utf16_len(Handle::from_raw(s)))
+                    .map(|n| n == 0)
+            } else {
+                None
+            };
+            let empty = match known {
+                Some(e) => e,
+                None => {
+                    let match0 = self.get_own_fast(rh, "0")?;
+                    self.coerce_to_string(match0)?.is_empty()
+                }
+            };
+            if empty && let Some(matcher) = matcher_v.as_handle().map(Handle::from_raw) {
                 let cli_v = self.read_member(matcher, "lastIndex")?;
                 let cli = self.coerce_to_integer_or_infinity(cli_v)?.max(0.0) as usize;
                 // This runs inside the iterator's `next`, once per step, so the

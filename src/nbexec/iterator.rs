@@ -322,6 +322,16 @@ impl Interp {
         let Some(h) = this.as_handle().map(Handle::from_raw) else {
             return Err(self.type_error("Generator.prototype.next called on non-object"));
         };
+        // A live RegExp String Iterator in the learned layout: its state by
+        // slot, no other kind tried first.
+        if let Some([m, s, f]) = self
+            .realm
+            .rsi_layout
+            .as_ref()
+            .and_then(|l| l.peek(&self.realm, h))
+        {
+            return self.regexp_string_iter_step(h, m, s, f);
+        }
         // A **live** Set/Map iterator (has `GEN_COLL`) re-reads the collection.
         if let Some(coll) = self
             .realm
@@ -3663,6 +3673,14 @@ pub(crate) fn realm_builtin_iter_step(
     }
     let h = Handle::from_raw(it.as_handle()?);
     if !realm.is_ordinary_get_cell(h) {
+        return None;
+    }
+    // A RegExp String Iterator's step runs RegExpExec, the interpreter's.
+    if realm
+        .rsi_layout
+        .as_ref()
+        .is_some_and(|l| l.peek(realm, h).is_some())
+    {
         return None;
     }
     // A built-in iterator in a learned layout: its state by slot.
