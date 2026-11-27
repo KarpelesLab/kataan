@@ -88,6 +88,36 @@ const SLOT_RETURN: usize = 2;
 /// properties whose prototype is the memo's needs only the two found values
 /// re-read.
 pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
+    can_open_array(realm, v)
+}
+
+/// `GetIterator(v)` of an iterator object whose `@@iterator` is
+/// `%IteratorPrototype%[@@iterator]` (which returns `this`), found along a
+/// chain of ordinary data properties: the iterator is `v` itself, and the
+/// returned value is `Get(v, "next")` (also a data-property read). `None`
+/// for anything whose lookups could run code or be exotic (an accessor, a
+/// proxy), or another `@@iterator`: the host's `GetIterator` then runs.
+pub(super) fn open_self_iterator(realm: &Realm, v: NanBox) -> Option<NanBox> {
+    let h = Handle::from_raw(v.as_handle()?);
+    if !realm.is_plain_object(h) {
+        return None;
+    }
+    let key = realm.vm_array_iter().iter_key.as_deref()?;
+    let f = super::array_hof::chain_data(realm, h, key).ok()??;
+    if realm.native_at(Handle::from_raw(f.as_handle()?))
+        != Some(crate::nbexec::N_ITERATOR_PROTO_SELF)
+    {
+        return None;
+    }
+    Some(
+        super::array_hof::chain_data(realm, h, "next")
+            .ok()?
+            .unwrap_or(NanBox::undefined()),
+    )
+}
+
+/// [`can_open`]'s body.
+fn can_open_array(realm: &mut Realm, v: NanBox) -> bool {
     let Some(h) = v.as_handle().map(Handle::from_raw) else {
         return false;
     };

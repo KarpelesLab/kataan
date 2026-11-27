@@ -3295,6 +3295,58 @@ const COLL_ITER_KEYS: [&str; 2] = [GEN_COLL, GEN_CSTATE];
 /// in [`Realm::buf_iter_layout`] slot order.
 const BUF_ITER_KEYS: [&str; 3] = [GEN_BUF, GEN_IDX, GEN_RET];
 
+/// The hidden keys of a live Array Iterator (`make_live_array_iterator`), in
+/// [`Realm::arr_iter_layout`] slot order.
+const ARR_ITER_KEYS: [&str; 3] = [GEN_ARR, GEN_KIND, GEN_IDX];
+
+/// A live Array Iterator's step over the real array `arr` (`kind` 0 keys,
+/// 1 values, 2 entries) at cursor `idx`, as `live_array_iter_step` takes it
+/// when the element read is an own data slot: `Some(Some(value))`, or
+/// `Some(None)` at the end (`idx` reached the live length). `None` (nothing
+/// done) when the step is the host's: an array-like, or an element whose
+/// `Get` is not the slot (a hole, an index with attributes or an accessor).
+fn array_iter_value(
+    realm: &mut Realm,
+    arr: Handle,
+    kind: u8,
+    idx: usize,
+) -> Option<Option<NanBox>> {
+    let len = realm.array_length(arr)?;
+    if idx >= len {
+        return Some(None);
+    }
+    let elem = |realm: &Realm| {
+        if realm.array_has_index_side_table(arr) {
+            return None;
+        }
+        realm
+            .array_elements(arr)
+            .and_then(|a| a.get(idx).copied())
+            .filter(|v| !v.is_hole())
+    };
+    Some(Some(match kind {
+        0 => NanBox::number(idx as f64),
+        2 => {
+            let e = elem(realm)?;
+            NanBox::handle(
+                realm
+                    .new_array(alloc::vec![NanBox::number(idx as f64), e])
+                    .to_raw(),
+            )
+        }
+        _ => elem(realm)?,
+    }))
+}
+
+/// [`array_iter_value`]'s step applied to the iterator `h`: the cursor
+/// advanced, or the iterator marked done.
+fn array_iter_apply(realm: &mut Realm, h: Handle, step: Option<NanBox>, idx: usize) {
+    match step {
+        Some(_) => realm.set_hidden_property(h, GEN_IDX, NanBox::number((idx + 1) as f64)),
+        None => realm.set_hidden_property(h, GEN_DONE, NanBox::boolean(true)),
+    };
+}
+
 /// `realm_builtin_iter_step` for an iterator `h` with one of the realm's
 /// learned layouts (`hidden_layout`): a live Set/Map iterator, or a
 /// snapshot-buffer iterator (whose layout also proves that none of the keys
@@ -3317,6 +3369,23 @@ fn builtin_iter_step_by_slot(realm: &mut Realm, h: Handle) -> Option<Option<NanB
             Some(v)
         });
         realm.str_iter_layout = Some(layout);
+        if r.is_some() {
+            return r;
+        }
+    }
+    if let Some(layout) = realm.arr_iter_layout.take() {
+        let r = layout.read(realm, h).and_then(|[arr, kind, idx]| {
+            let arr = Handle::from_raw(arr.as_handle()?);
+            let kind = kind.as_number().unwrap_or(0.0) as u8;
+            let idx = idx.as_number().unwrap_or(0.0) as usize;
+            let step = array_iter_value(realm, arr, kind, idx)?;
+            match step {
+                Some(_) => layout.write(realm, h, 2, NanBox::number((idx + 1) as f64)),
+                None => array_iter_apply(realm, h, None, idx),
+            }
+            Some(step)
+        });
+        realm.arr_iter_layout = Some(layout);
         if r.is_some() {
             return r;
         }
@@ -3614,7 +3683,34 @@ pub(crate) fn realm_builtin_iter_step(
     {
         return typed_iter_step(realm, h, ta);
     }
-    if realm.get_property(h, GEN_ARR).is_some() || realm.get_property(h, RSI_MATCHER).is_some() {
+    if let Some(arr) = realm.get_property(h, GEN_ARR) {
+        // A live Array Iterator (as `live_array_iter_step`), when its step
+        // reads nothing but the array's own slots.
+        if realm.get_property(h, GEN_DONE).is_some() {
+            return Some(None);
+        }
+        let arr = Handle::from_raw(arr.as_handle()?);
+        let kind = realm
+            .get_property(h, GEN_KIND)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as u8;
+        let idx = realm
+            .get_property(h, GEN_IDX)
+            .and_then(|n| n.as_number())
+            .unwrap_or(0.0) as usize;
+        let step = array_iter_value(realm, arr, kind, idx)?;
+        array_iter_apply(realm, h, step, idx);
+        if step.is_some() && realm.arr_iter_layout.is_none() {
+            realm.arr_iter_layout = HiddenLayout::learn(
+                realm,
+                h,
+                ARR_ITER_KEYS,
+                &[GEN_COLL, GEN_TA, GEN_DONE, RSI_MATCHER, GEN_STR, GEN_BUF],
+            );
+        }
+        return Some(step);
+    }
+    if realm.get_property(h, RSI_MATCHER).is_some() {
         return None;
     }
     if let Some(s) = realm.get_property(h, GEN_STR) {

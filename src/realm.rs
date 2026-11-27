@@ -505,6 +505,9 @@ pub struct Realm {
     /// The hidden-state layout of a lazy String Iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) str_iter_layout: Option<hidden_layout::HiddenLayout<2>>,
+    /// The hidden-state layout of a live Array Iterator (see
+    /// `hidden_layout`), learned likewise.
+    pub(crate) arr_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
     /// Shared prototype-chain lookup memos (see
     /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
     chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
@@ -1259,6 +1262,7 @@ impl Realm {
             coll_iter_slots: [0; 2],
             buf_iter_layout: None,
             str_iter_layout: None,
+            arr_iter_layout: None,
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,
@@ -7020,6 +7024,19 @@ impl Realm {
         a.as_mut_slice()[start..end].fill(value);
         self.shade_stored(value);
         true
+    }
+
+    /// A live Array Iterator over the array `arr` (`kind` 0 keys, 1 values,
+    /// 2 entries), as the host's `make_live_array_iterator` makes it, once
+    /// the host has made `%ArrayIteratorPrototype%` (`None` before).
+    pub(crate) fn new_live_array_iterator(&mut self, arr: Handle, kind: u8) -> Option<Handle> {
+        let proto = self.vm_array_iter.iter_proto?;
+        let obj = self.new_object();
+        self.set_object_proto(obj, Some(proto));
+        self.set_hidden_property(obj, "\u{0}garr", NanBox::handle(arr.to_raw()));
+        self.set_hidden_property(obj, "\u{0}gkind", NanBox::number(f64::from(kind)));
+        self.set_hidden_property(obj, "\u{0}gidx", NanBox::number(0.0));
+        Some(obj)
     }
 
     /// `O.reverse()` of the array at `handle` when each `[[Get]]` / `[[Set]]`

@@ -143,6 +143,9 @@ enum FastOp {
     ArrFill,
     /// `Array.prototype.at`.
     ArrAt,
+    /// `Array.prototype.keys` / `values` / `entries` (the iterator's kind:
+    /// 0 keys, 1 values, 2 entries).
+    ArrIter(u8),
     /// `Array.prototype.lastIndexOf`.
     ArrLastIndexOf,
     /// `Array.prototype.reverse`.
@@ -439,6 +442,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"concat") => FastOp::ArrConcat,
         (N_ARRAY_PROTO_FN, b"fill") => FastOp::ArrFill,
         (N_ARRAY_PROTO_FN, b"at") => FastOp::ArrAt,
+        (N_ARRAY_PROTO_FN, b"keys") => FastOp::ArrIter(0),
+        (N_ARRAY_PROTO_FN, b"values") => FastOp::ArrIter(1),
+        (N_ARRAY_PROTO_FN, b"entries") => FastOp::ArrIter(2),
         (N_ARRAY_PROTO_FN, b"lastIndexOf") => FastOp::ArrLastIndexOf,
         (N_ARRAY_PROTO_FN, b"reverse") => FastOp::ArrReverse,
         (N_STRING_PROTO_FN, b"at") => FastOp::StrAt,
@@ -2278,6 +2284,14 @@ fn run_op(
                 return None;
             }
             recv
+        }
+        FastOp::ArrIter(kind) => {
+            // `CreateArrayIterator(O, kind)` of a real array: the host's live
+            // iterator, made here once `%ArrayIteratorPrototype%` exists.
+            if !realm.is_plain_array_cell(h) {
+                return None;
+            }
+            NanBox::handle(realm.new_live_array_iterator(h, kind)?.to_raw())
         }
         FastOp::ArrAt => {
             // `k` outside `0..len` is `undefined` with no `Get`; inside, a
