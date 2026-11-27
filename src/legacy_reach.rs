@@ -77,7 +77,7 @@ pub fn reachable() -> bool {
 pub fn note() {
     #[cfg(feature = "std")]
     if !REACHABLE.with(|r| r.replace(true)) {
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         crate::jit::legacy_hl::invalidate();
     }
 }

@@ -568,7 +568,7 @@ pub struct Realm {
     /// proved there, and the cell-swap count. Lets the VM recheck the proof
     /// without crossing to the host
     /// ([`regexp_pristine_mirrored`](Realm::regexp_pristine_mirrored)).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) regexp_proof_mirror: Option<RegexpProofMirror>,
     /// The `[[Prototype]]` of a Promise cell that carries no `native_protos`
     /// entry, as [`regexp_default_proto`](Realm::regexp_default_proto) is a
@@ -2803,7 +2803,7 @@ impl Realm {
     /// flat all-ASCII string's in-range integer index whose one-unit string
     /// is already interned (`interned_unit_string`). Reads the heap only;
     /// `None` leaves the read to the general path, which answers the same.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     #[inline]
     pub(crate) fn string_index_interned(&self, handle: Handle, n: f64) -> Option<Handle> {
         let rope = self.heap.get(handle)?.as_str()?;

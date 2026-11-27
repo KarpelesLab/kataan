@@ -3886,7 +3886,7 @@ fn iter_const_enabled() -> bool {
 /// Whether a compiled `a.push(x, y, …)` (several values, or one read
 /// after the method) appends in place (`arr_push::X64Assembler::ap_push_n`;
 /// `KATAAN_JIT_PUSHN=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn push_n_enabled() -> bool {
     #[cfg(feature = "std")]
     {
