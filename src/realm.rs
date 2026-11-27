@@ -2762,6 +2762,34 @@ impl Realm {
         Some(self.unit_string(unit))
     }
 
+    /// [`string_index_get`](Self::string_index_get) when it needs no work: a
+    /// flat all-ASCII string's in-range integer index whose one-unit string
+    /// is already interned (`interned_unit_string`). Reads the heap only;
+    /// `None` leaves the read to the general path, which answers the same.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    #[inline]
+    pub(crate) fn string_index_interned(&self, handle: Handle, n: f64) -> Option<Handle> {
+        let rope = self.heap.get(handle)?.as_str()?;
+        let bytes = rope.as_leaf_bytes()?;
+        if !(n >= 0.0 && n < bytes.len() as f64) {
+            return None;
+        }
+        let i = n as usize;
+        if i as f64 != n {
+            return None;
+        }
+        let b = bytes[i];
+        // (A byte index is the unit index only when every byte before it is
+        // ASCII: the whole string's test, memoized.)
+        if b >= 0x80 || !rope.is_ascii() {
+            return None;
+        }
+        self.interned_unit_string(u16::from(b))
+    }
+
     /// [`string_unit_at`](Self::string_unit_at) for in-order access: a non-ASCII
     /// flat string resumes from the last read's position (see `unit_cursor`),
     /// and a `Concat` rope is flattened in place first.

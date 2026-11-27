@@ -97,6 +97,8 @@ enum FastOp {
     StrSlice,
     /// `String.prototype.substring`.
     StrSubstring,
+    /// `String.prototype.substr` (Annex B.2.2.1).
+    StrSubstr,
     /// `String.prototype.startsWith`.
     StrStartsWith,
     /// `String.prototype.endsWith`.
@@ -394,6 +396,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_REGEXP_PROTO_FN, b"test" | b"exec") => FastOp::RegExpCall,
         (N_STRING_PROTO_FN, b"slice") => FastOp::StrSlice,
         (N_STRING_PROTO_FN, b"substring") => FastOp::StrSubstring,
+        (N_STRING_PROTO_FN, b"substr") => FastOp::StrSubstr,
         (N_STRING_PROTO_FN, b"startsWith") => FastOp::StrStartsWith,
         (N_STRING_PROTO_FN, b"endsWith") => FastOp::StrEndsWith,
         (N_STRING_PROTO_FN, b"includes") => FastOp::StrIncludes,
@@ -967,6 +970,7 @@ pub(crate) fn str_call_code(key: &str) -> Option<u8> {
         "replace" => 16,
         "match" => 17,
         "replaceAll" => 18,
+        "substr" => 19,
         _ => return None,
     })
 }
@@ -993,6 +997,7 @@ fn str_call_op(code: u8) -> Option<FastOp> {
         16 => FastOp::StrReplace,
         17 => FastOp::StrMatch,
         18 => FastOp::StrReplaceAll,
+        19 => FastOp::StrSubstr,
         _ => return None,
     })
 }
@@ -1802,7 +1807,7 @@ fn run_op(
             realm.coll_fast(h, op.coll_op()?, arg(0), arg(1))?
         }
         FastOp::ObjHasOwn => NanBox::boolean(obj_has_own_fast(realm, h, arg(0))?),
-        FastOp::StrSlice | FastOp::StrSubstring => {
+        FastOp::StrSlice | FastOp::StrSubstring | FastOp::StrSubstr => {
             // A `Concat` is sliced by walking its tree when that is cheap (see
             // `Rope::slice_units_tree`), and flattened only otherwise.
             let unflat = realm
@@ -1817,7 +1822,18 @@ fn run_op(
             let units = rope.utf16_len();
             let start = int_arg(arg(0))?.unwrap_or(0.0);
             let end = int_arg(arg(1))?;
-            let (a, b) = if matches!(op, FastOp::StrSlice) {
+            let (a, b) = if matches!(op, FastOp::StrSubstr) {
+                // B.2.2.1 steps 4-11: a negative start counts from the end,
+                // the length (all of it when `undefined`) is clamped to
+                // `0..=size`, the end to `size`.
+                let a = if start < 0.0 {
+                    (units as f64 + start).max(0.0) as usize
+                } else {
+                    (start as usize).min(units)
+                };
+                let len = end.map_or(units, |n| (n.max(0.0) as usize).min(units));
+                (a, a.saturating_add(len).min(units))
+            } else if matches!(op, FastOp::StrSlice) {
                 let idx = |n: f64| -> usize {
                     if n < 0.0 {
                         (units as f64 + n).max(0.0) as usize

@@ -8296,6 +8296,16 @@ pub(crate) extern "C" fn jit_helper_get_elem(
         // SAFETY: as below; this borrow ends before it runs.
         #[allow(unsafe_code)]
         let c = unsafe { &*(ctx as *const Ctx) };
+        // `s[i]` of a flat all-ASCII string primitive: the interned one-unit
+        // string (what `jit_get_elem_general`'s string index answers, after
+        // the probes below, which a Number key never hits).
+        if let (Some(n), Some(h)) = (
+            NanBox::from_bits(key).as_number(),
+            NanBox::from_bits(recv).as_handle(),
+        ) && let Some(s) = c.realm.string_index_interned(Handle::from_raw(h), n)
+        {
+            return NanBox::handle(s.to_raw()).to_bits();
+        }
         // A String key whose slot in the receiver's layout is memoized (what
         // `vm_get_elem` reads through `own_data_by_string`), decided in this
         // small frame.
