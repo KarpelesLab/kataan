@@ -5321,6 +5321,9 @@ fn user_has_instance(
     x: NanBox,
     y: NanBox,
 ) -> Option<Result<bool, VmError>> {
+    // (Only on behalf of a VM frame whose registers are rooted or lent: a
+    // Rust caller holding values of its own leaves it to the host.)
+    regs?;
     ctx.host.as_ref()?;
     let m = ctx
         .realm

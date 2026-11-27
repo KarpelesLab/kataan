@@ -24,6 +24,11 @@
 //!
 //! The values the operation holds across the trap call (target, handler,
 //! key, receiver) are listed in the host root set for the call's duration.
+//! Only an operation on behalf of a VM frame is taken (`regs` is `Some`: the
+//! frame's registers lent, or a compiled caller's window, rooted already): a
+//! Rust caller passing `None` may hold values of its own across the call,
+//! which a collection inside the trap would not see, so that is the host's
+//! (whose trap calls collect only inside an audited segment).
 
 use super::{Ctx, FnProto, VmError, with_host};
 use crate::heap::Handle;
@@ -235,7 +240,7 @@ pub(super) fn get(
     ks: &str,
     kv: Option<NanBox>,
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() || ctx.realm.multi_realm || !key_ok(ks) || !enabled() {
+    if regs.is_none() || ctx.host.is_none() || ctx.realm.multi_realm || !key_ok(ks) || !enabled() {
         return None;
     }
     let mut obj = Handle::from_raw(recv.as_handle()?);
@@ -296,7 +301,7 @@ pub(super) fn set(
     value: NanBox,
     strict: bool,
 ) -> Option<Result<(), VmError>> {
-    if ctx.host.is_none() || ctx.realm.multi_realm || !key_ok(ks) || !enabled() {
+    if regs.is_none() || ctx.host.is_none() || ctx.realm.multi_realm || !key_ok(ks) || !enabled() {
         return None;
     }
     let recv_h = Handle::from_raw(recv.as_handle()?);
@@ -371,7 +376,7 @@ pub(super) fn has(
     obj: NanBox,
     key: NanBox,
 ) -> Option<Result<bool, VmError>> {
-    if ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
+    if regs.is_none() || ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
         return None;
     }
     let mut cur = Handle::from_raw(obj.as_handle()?);
@@ -421,7 +426,7 @@ pub(super) fn delete(
     key: NanBox,
     strict: bool,
 ) -> Option<Result<bool, VmError>> {
-    if ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
+    if regs.is_none() || ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
         return None;
     }
     let h = Handle::from_raw(obj.as_handle()?);
@@ -474,7 +479,7 @@ pub(super) fn apply(
     this: NanBox,
     args: &[NanBox],
 ) -> Option<Result<NanBox, VmError>> {
-    if ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
+    if regs.is_none() || ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
         return None;
     }
     let h = Handle::from_raw(f.as_handle()?);
