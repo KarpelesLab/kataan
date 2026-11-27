@@ -713,8 +713,8 @@ impl Interp {
     /// `RegExpBuiltinExec(h, o)` in one step for a RegExp `h` whose
     /// `lastIndex` is its own plain slot and a string `o`: with `array`, the
     /// result array (or null); without, whether there was a match (`test`,
-    /// whose array nobody sees). `None`, with nothing done, when the array
-    /// would need `indices` (the `d` flag), or `o` is not a string.
+    /// whose array nobody sees; under the `d` flag the array carries its
+    /// `indices`). `None`, with nothing done, when `o` is not a string.
     ///
     /// Every step is the algorithm's: `lastIndex` read from the slot and
     /// used only when global or sticky, a start past the end failing, a
@@ -734,9 +734,6 @@ impl Interp {
             .realm
             .regexp_flags(h)
             .map(|f| (f.contains('g'), f.contains('y'), f.contains('d')))?;
-        if array && indices {
-            return None;
-        }
         let re = self.realm.regex_compiled(h)?;
         let stateful = global || sticky;
         let start = if stateful {
@@ -781,12 +778,52 @@ impl Interp {
                 }
                 _ => self.lean_match_parts(sub.units(), &spans, &re),
             };
-            let obj = self.realm.new_array_with_named(
-                elems,
-                &["index", "input", "groups"],
-                &[NanBox::number(index as f64), o, groups],
-                &mut self.match_array_shape,
-            );
+            let obj = if indices {
+                // `MakeMatchIndicesIndexPairArray`: per group its
+                // `[start, end]` (or undefined), the named groups' pairs as
+                // `indices.groups`; then the result's `indices`.
+                let pairs: Vec<NanBox> = spans
+                    .iter()
+                    .map(|g| match *g {
+                        Some((a, b)) => NanBox::handle(
+                            self.realm
+                                .new_array(alloc::vec![
+                                    NanBox::number(a as f64),
+                                    NanBox::number(b as f64)
+                                ])
+                                .to_raw(),
+                        ),
+                        None => NanBox::undefined(),
+                    })
+                    .collect();
+                let idx_groups = self.realm.named_groups_object(&re, &pairs, |i| {
+                    spans.get(i).is_some_and(Option::is_some)
+                });
+                let ind = self.realm.new_array_with_named(
+                    pairs,
+                    &["groups"],
+                    &[idx_groups],
+                    &mut self.indices_array_shape,
+                );
+                self.realm.new_array_with_named(
+                    elems,
+                    &["index", "input", "groups", "indices"],
+                    &[
+                        NanBox::number(index as f64),
+                        o,
+                        groups,
+                        NanBox::handle(ind.to_raw()),
+                    ],
+                    &mut self.match_array_shape_d,
+                )
+            } else {
+                self.realm.new_array_with_named(
+                    elems,
+                    &["index", "input", "groups"],
+                    &[NanBox::number(index as f64), o, groups],
+                    &mut self.match_array_shape,
+                )
+            };
             NanBox::handle(obj.to_raw())
         } else {
             NanBox::boolean(true)
