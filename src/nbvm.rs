@@ -5302,6 +5302,29 @@ fn instance_of_fast(realm: &mut Realm, x: NanBox, y: NanBox) -> Option<bool> {
     None
 }
 
+/// `InstanceofOperator(x, y)` (ECMA-262 13.10.2) when `y` is a VM function
+/// whose `@@hasInstance` lookup runs no code and finds a VM function other
+/// than a class constructor (`Realm::user_has_instance`): `ToBoolean` of its
+/// call with `y` as `this`. `None` for anything else (the default
+/// `[[HasInstance]]` included), having done nothing.
+fn user_has_instance(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: Option<&[NanBox]>,
+    x: NanBox,
+    y: NanBox,
+) -> Option<Result<bool, VmError>> {
+    ctx.host.as_ref()?;
+    let m = ctx
+        .realm
+        .user_has_instance(Handle::from_raw(y.as_handle()?))?;
+    let (id, _) = ctx.realm.vm_function(Handle::from_raw(m.as_handle()?))?;
+    if funcs.get(id as usize).is_none_or(|p| p.class_ctor) {
+        return None;
+    }
+    Some(call_closure_compiled(ctx, funcs, regs, m, &[x], y).map(|v| ctx.realm.truthy(v)))
+}
+
 /// Whether `v` is an Object (not a primitive — note strings are heap handles
 /// too).
 fn is_object_value(realm: &Realm, v: NanBox) -> bool {
@@ -11586,6 +11609,15 @@ fn run_frame_at_ic(
                     ctx.realm.has_property_by_string_noting(x, y)
                 } {
                     regs[*dst as usize] = NanBox::boolean(r);
+                    continue;
+                }
+                // `x instanceof F` with F's own (or inherited) `@@hasInstance`
+                // a VM function: called here.
+                if *instanceof && let Some(r) = user_has_instance(ctx, funcs, Some(&*regs), x, y) {
+                    match r {
+                        Ok(b) => regs[*dst as usize] = NanBox::boolean(b),
+                        Err(e) => handle_throw!(e),
+                    }
                     continue;
                 }
                 // `key in proxy`: its `has` trap (or the forward) in the VM.

@@ -2894,10 +2894,15 @@ pub(crate) fn jit_helper_exec_op(
             a,
             b,
         } => {
-            super::instance_of_fast(&mut ctx.realm, regs[*a as usize], regs[*b as usize]).map(|r| {
+            let (x, y) = (regs[*a as usize], regs[*b as usize]);
+            if let Some(r) = super::instance_of_fast(&mut ctx.realm, x, y) {
                 regs[*dst as usize] = NanBox::boolean(r);
-                Ok(())
-            })
+                Some(Ok(()))
+            } else {
+                let lent = super::jit_lent(ctx);
+                super::user_has_instance(ctx, funcs, lent, x, y)
+                    .map(|r| r.map(|b| regs[*dst as usize] = NanBox::boolean(b)))
+            }
         }
         // `key in obj` over an ordinary chain (the interpreter arm's first
         // step, also a `for-in`'s per-key liveness check).

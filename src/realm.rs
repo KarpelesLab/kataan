@@ -1957,6 +1957,38 @@ impl Realm {
         )
     }
 
+    /// `GetMethod(f, @@hasInstance)` on the VM function `f` when the lookup
+    /// runs no code and finds a data property: `f`'s own (in its auxiliary
+    /// object), else one of the ordinary chain from its `[[Prototype]]`.
+    /// `None` for an accessor, an exotic object on the chain, a miss, or a
+    /// multi-realm run.
+    #[must_use]
+    pub(crate) fn user_has_instance(&self, f: Handle) -> Option<NanBox> {
+        let k = self.has_instance_key.as_deref()?;
+        if self.multi_realm || !self.is_vm_function(f) {
+            return None;
+        }
+        // A VM function's Symbol-keyed own property lives in its auxiliary
+        // object (the synthesized ones are `name`/`length`/`prototype`).
+        if let Some(o) = self
+            .aux_props
+            .get(&f.to_raw())
+            .and_then(|aux| self.heap.get(*aux))
+            .and_then(Cell::as_object)
+        {
+            if o.accessor(k).is_some() {
+                return None;
+            }
+            if let Some(v) = o.get(k) {
+                return Some(v);
+            }
+        }
+        match self.ordinary_chain_get(self.object_proto(f)?, k)?.0 {
+            ChainHit::Data(v) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Whether `GetMethod(f, @@hasInstance)` on the VM function (or built-in) `f` is
     /// `%Function.prototype%[@@hasInstance]`: `f` owns no such property and
     /// its `[[Prototype]]` is `%Function.prototype%`, whose own one is
