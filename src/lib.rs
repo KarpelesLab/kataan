@@ -175,8 +175,8 @@ pub mod nbvm;
 pub mod flatbc;
 
 /// The baseline machine-code JIT (Phase G): an x86-64 assembler + W^X executable
-/// memory that lowers an arithmetic IR to native code. Real on x86-64 Linux
-/// and Windows (the `jit_x64` cfg); a no-op fallback elsewhere.
+/// memory that lowers an arithmetic IR to native code. Real on x86-64 Linux,
+/// Windows and macOS (the `jit_x64` cfg); a no-op fallback elsewhere.
 #[cfg(feature = "jit")]
 #[doc(hidden)]
 pub mod jit;

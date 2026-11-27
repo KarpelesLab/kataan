@@ -3,8 +3,8 @@
 //! condition instead of repeating its parts.
 //!
 //! - `jit_x64`: the x86-64 machine-code JIT (`src/jit.rs`, `src/jit/`, and
-//!   the VM's JIT tier) can run on this target: x86-64 on Linux or Windows
-//!   (the emitted code uses the System V calling convention on all of
+//!   the VM's JIT tier) can run on this target: x86-64 on Linux, Windows or
+//!   macOS (the emitted code uses the System V calling convention on all of
 //!   them, see `src/jit.rs`).
 //!
 //! Every use still adds its own feature condition (`feature = "jit"` or
@@ -14,7 +14,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(jit_x64)");
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if arch == "x86_64" && matches!(os.as_str(), "linux" | "windows") {
+    if arch == "x86_64" && matches!(os.as_str(), "linux" | "windows" | "macos") {
         println!("cargo::rustc-cfg=jit_x64");
     }
     println!("cargo::rerun-if-changed=build.rs");

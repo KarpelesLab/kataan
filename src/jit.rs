@@ -8,12 +8,12 @@
 //! **No foreign code.** Executable memory needs the OS, but we never link a C
 //! library of our own. On Linux the `mmap`/`mprotect`/`munmap` calls are
 //! issued directly through the x86-64 `syscall` instruction via
-//! `core::arch::asm!` — pure Rust over the kernel ABI. Windows has no stable
-//! syscall ABI, so there the page calls go through the OS's own system
-//! interface (`kernel32`'s `VirtualAlloc`/`VirtualProtect`/`VirtualFree`),
-//! which `std` links on that target anyway (see `exec::os`). The whole thing
-//! is gated to the `jit_x64` cfg (x86-64 Linux and Windows; set by
-//! `build.rs`); on every other
+//! `core::arch::asm!` — pure Rust over the kernel ABI. Windows and macOS have
+//! no stable syscall ABI, so there the page calls go through the OS's own
+//! system interface (`kernel32`'s `VirtualAlloc`/`VirtualProtect`/`VirtualFree`,
+//! `libSystem`'s `mmap`/`mprotect`/`munmap`), which `std` links on those
+//! targets anyway (see `exec::os`). The whole thing is gated to the `jit_x64`
+//! cfg (x86-64 Linux, Windows and macOS; set by `build.rs`); on every other
 //! target `available()` is `false` and compilation returns `None`, so callers
 //! transparently fall back to the interpreter.
 //!
@@ -20824,6 +20824,11 @@ mod exec {
     //!   pages there — Windows has no stable syscall ABI. `kernel32` is the
     //!   OS's own interface, which `std` already links on every Windows
     //!   target, so this adds no library and no foreign code to the build.
+    //! - macOS: `mmap`/`mprotect`/`munmap` from `libSystem`, Darwin's only
+    //!   supported system interface (raw syscalls are not a stable ABI
+    //!   there), likewise already linked by `std`. Plain W^X anonymous
+    //!   pages suffice on x86-64 (`MAP_JIT` is an arm64/hardened-runtime
+    //!   requirement).
 
     #[cfg(target_os = "linux")]
     mod os {
@@ -20911,6 +20916,55 @@ mod exec {
             #[allow(unsafe_code)]
             unsafe {
                 syscall6(SYS_MUNMAP, base as usize, len, 0, 0, 0, 0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod os {
+        /// `PROT_READ | PROT_WRITE`
+        const PROT_RW: i32 = 0x1 | 0x2;
+        /// `PROT_READ | PROT_EXEC`
+        const PROT_RX: i32 = 0x1 | 0x4;
+        /// `MAP_PRIVATE | MAP_ANON` (Darwin's values)
+        const MAP_PRIVATE_ANON: i32 = 0x0002 | 0x1000;
+        /// `MAP_FAILED`
+        const MAP_FAILED: usize = usize::MAX;
+
+        // Darwin's system interface is `libSystem` (it has no stable syscall
+        // ABI); `std` already links it, so these declarations add no library.
+        #[allow(unsafe_code)]
+        unsafe extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+            -> *mut u8;
+            fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+
+        /// Maps `len` (a page multiple) fresh read-write bytes.
+        pub(super) fn map_rw(len: usize) -> Option<*mut u8> {
+            // SAFETY: a standard anonymous private mapping at an address of
+            // the OS's choosing; returns `MAP_FAILED` on failure.
+            #[allow(unsafe_code)]
+            let p = unsafe { mmap(core::ptr::null_mut(), len, PROT_RW, MAP_PRIVATE_ANON, -1, 0) };
+            (p as usize != MAP_FAILED && !p.is_null()).then_some(p)
+        }
+
+        /// Flips the mapping `base..base+len` from [`map_rw`] to read+execute.
+        pub(super) fn protect_rx(base: *mut u8, len: usize) -> bool {
+            // SAFETY: `base`/`len` describe a mapping the caller owns.
+            #[allow(unsafe_code)]
+            unsafe {
+                mprotect(base, len, PROT_RX) == 0
+            }
+        }
+
+        /// Unmaps the mapping `base..base+len` from [`map_rw`].
+        pub(super) fn unmap(base: *mut u8, len: usize) {
+            // SAFETY: unmapping exactly a region the caller owns.
+            #[allow(unsafe_code)]
+            unsafe {
+                munmap(base, len);
             }
         }
     }
