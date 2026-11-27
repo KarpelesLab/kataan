@@ -16335,6 +16335,58 @@ impl JitFunction {
                             exec_op!(pc);
                             a.bind(done);
                         }
+                        // `o.#x = v` as the site's memo last served it (as
+                        // for the read above): the store, when the write
+                        // barrier has nothing to do and the slot's record
+                        // of Number-only values holds (`fieldrep`); a
+                        // private element is no property, so no flag of the
+                        // object matters. Anything else is the
+                        // interpreter's op.
+                        crate::nbvm::Op::PrivateSet {
+                            obj,
+                            key,
+                            src,
+                            cache,
+                        } if private_inline_enabled() && ok(*obj) && ok(*key) && ok(*src) => {
+                            use crate::realm::JitPrivWay as W;
+                            use call_seq::r as R;
+                            use core::mem::offset_of;
+                            let w = core::ptr::from_ref(cache.jit_way()) as u64;
+                            let off = |o: usize| i32::try_from(o).ok();
+                            let (slow, done) = (a.new_label(), a.new_label());
+                            a.load_rax(disp(*key));
+                            a.g_movabs(R::R11, w);
+                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, key_bits))?);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            a.g_load(R::R9, R::R15, helpers.call_layout.realm);
+                            a.p_load32(
+                                R::RAX,
+                                R::R9,
+                                off(crate::realm::Realm::jit_heap_epoch_offset())?,
+                            );
+                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, epoch))?);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            walk_to_slot!(*obj, slow);
+                            family_checks!(recv_cache::Family::Obj, slow);
+                            a.g_movabs(R::R11, w);
+                            a.mov_rax_at_rcx(layout.off_shape);
+                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, shape))?);
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            a.load_rax(disp(*src));
+                            a.p_barrier_check(&layout, helpers.call_layout.realm, slow);
+                            a.g_movabs(R::R11, w);
+                            a.g_load(R::RAX, R::R11, off(offset_of!(W, slot))?);
+                            a.g_load(R::R8, R::RBX, disp(*src));
+                            a.g_load(R::R9, R::R11, off(offset_of!(W, shape))?);
+                            a.p_field_rep_dyn(&layout, (R::R8, R::R9, R::RAX, R::R10), slow);
+                            a.p_obj_slot_addr(&layout, R::R11, slow);
+                            a.load_rdx(disp(*src));
+                            a.g_store(R::R11, 0, R::RDX);
+                            a.jmp(done);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(done);
+                        }
                         // An array destructuring's values at once
                         // (`Op::ArrayUnpack`) with no rest element, over a
                         // plain array as an inline open finds it (above)

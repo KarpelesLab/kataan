@@ -58,6 +58,18 @@ impl PrivCache {
     pub fn jit_way(&self) -> &JitPrivWay {
         &self.1
     }
+
+    /// Records in [`jit_way`](Self::jit_way) an access the site served:
+    /// name `k` (its handle under heap epoch `epoch`) in layout `shape` at
+    /// `slot`.
+    fn note_jit(&self, k: NanBox, epoch: u32, shape: &Rc<Shape>, slot: u32) {
+        let w = &self.1;
+        w.key_bits.set(k.to_bits());
+        w.epoch.set(u64::from(epoch));
+        w.slot.set(u64::from(slot));
+        let same = w.shape.take().filter(|s| Rc::ptr_eq(s, shape));
+        w.shape.set(Some(same.unwrap_or_else(|| Rc::clone(shape))));
+    }
 }
 
 struct PrivEntry {
@@ -179,12 +191,7 @@ impl Realm {
         let v = obj.slot(slot)?;
         // The read compiled code may repeat (`JitPrivWay`).
         if let Some(shape) = obj.shaped_shape() {
-            let w = &cache.1;
-            w.key_bits.set(k.to_bits());
-            w.epoch.set(u64::from(self.heap.epoch()));
-            w.slot.set(u64::from(slot));
-            let same = w.shape.take().filter(|s| Rc::ptr_eq(s, shape));
-            w.shape.set(Some(same.unwrap_or_else(|| Rc::clone(shape))));
+            cache.note_jit(k, self.heap.epoch(), shape, slot);
         }
         Some(v)
     }
@@ -206,11 +213,16 @@ impl Realm {
             return false;
         };
         let h = Handle::from_raw(raw);
+        let epoch = self.heap.epoch();
         let Some(Cell::Object(obj)) = self.heap.get_mut(h) else {
             return false;
         };
         if !obj.set_slot(slot, v) {
             return false;
+        }
+        // The write compiled code may repeat (`JitPrivWay`).
+        if let Some(shape) = obj.shaped_shape() {
+            cache.note_jit(k, epoch, shape, slot);
         }
         self.write_barrier(h, v);
         true
