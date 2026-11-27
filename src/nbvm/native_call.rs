@@ -2029,7 +2029,9 @@ fn run_op(
                 *c = arg(i).as_number()?;
             }
             let nms = set.apply(ms, &comps[..take]);
-            realm.set_date_ms(h, nms);
+            if set.writes_on_nan_date() || !ms.is_nan() {
+                realm.set_date_ms(h, nms);
+            }
             NanBox::number(nms)
         }
         FastOp::ObjHasOwn => NanBox::boolean(obj_has_own_fast(realm, h, arg(0))?),

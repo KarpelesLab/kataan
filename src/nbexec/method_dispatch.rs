@@ -1981,7 +1981,12 @@ impl Interp {
                         comps.push(self.realm.to_number(num));
                     }
                     let nms = set.apply(ms, &comps);
-                    self.realm.set_date_ms(handle, nms);
+                    // "If t is NaN, return NaN" (every setter but setFullYear,
+                    // which takes NaN as +0): the date is not written, so a
+                    // value an argument's valueOf stored there stays.
+                    if set.writes_on_nan_date() || !ms.is_nan() {
+                        self.realm.set_date_ms(handle, nms);
+                    }
                     NanBox::number(nms)
                 }
                 _ => return Ok(None),

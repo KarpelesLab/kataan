@@ -110,6 +110,13 @@ impl DateSet {
     /// setter with the (already ToNumber'd) components `comps`: `NaN` for an
     /// invalid result (and for an invalid date, except under `setFullYear`,
     /// which takes its time as +0).
+    /// Whether the setter stores its result when the date value is NaN:
+    /// only `setFullYear` / `setUTCFullYear` (which take NaN as +0); the
+    /// others "return NaN" without touching the date.
+    pub(crate) fn writes_on_nan_date(self) -> bool {
+        self == Self::FullYear
+    }
+
     pub(crate) fn apply(self, ms: f64, comps: &[f64]) -> f64 {
         let is_full_year = self == Self::FullYear;
         let date_is_nan = !ms.is_finite();
