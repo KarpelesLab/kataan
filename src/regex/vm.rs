@@ -368,12 +368,15 @@ pub(crate) struct Guards {
     idx: Vec<[u32; 2]>,
     /// The Latin-1 code units with which a guarded branch can go on.
     sets: Vec<[u64; 4]>,
+    /// Per instruction: for a `Split`, [`simple_loop`]'s answer.
+    simple: Vec<Option<(usize, usize, bool)>>,
 }
 
 impl Guards {
     const NONE: u32 = u32::MAX;
 
-    /// The guards of `prog` under `flags`, `None` when no `Split` has one.
+    /// The guards of `prog` under `flags` (and each `Split`'s
+    /// [`simple_loop`] answer), `None` when it has no `Split`.
     ///
     /// A target of a `Split` is guarded when every path from it, through
     /// zero-width instructions only (jumps, splits, capture saves and
@@ -404,12 +407,15 @@ impl Guards {
         let mut sets: Vec<[u64; 4]> = Vec::new();
         let mut seen = alloc::vec![false; prog.len()];
         let mut stack = Vec::new();
+        let mut simple = alloc::vec![None; prog.len()];
         let mut any = false;
         for pc in 0..prog.len() {
             let Inst::Split(a, b) = prog[pc] else {
                 continue;
             };
-            if simple_loop(prog, pc).is_some() {
+            any = true;
+            simple[pc] = simple_loop(prog, pc);
+            if simple[pc].is_some() {
                 continue;
             }
             for (k, target) in [a, b].into_iter().enumerate() {
@@ -463,11 +469,10 @@ impl Guards {
                 if ok && set.iter().any(|w| *w != u64::MAX) {
                     idx[pc][k] = sets.len() as u32;
                     sets.push(set);
-                    any = true;
                 }
             }
         }
-        any.then_some(Guards { idx, sets })
+        any.then_some(Guards { idx, sets, simple })
     }
 
     /// Whether the guarded target `k` (0 or 1) of the `Split` at `pc` may
@@ -695,7 +700,11 @@ fn backtrack(
                     // through it, instead of one choice point per repetition. A
                     // single-consume body always advances, so it can never be
                     // zero-width — no loop-stack bookkeeping is needed here.
-                    if let Some((consume_pc, cont_pc, greedy)) = simple_loop(ctx.prog, pc) {
+                    let simple = match ctx.guards {
+                        Some(g) => g.simple[pc],
+                        None => simple_loop(ctx.prog, pc),
+                    };
+                    if let Some((consume_pc, cont_pc, greedy)) = simple {
                         if greedy && !unicode {
                             // Outside `u` mode every consume is exactly one code
                             // unit, so the candidate positions are the contiguous
