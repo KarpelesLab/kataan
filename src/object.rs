@@ -3233,21 +3233,39 @@ impl Object {
         if let Some(x) = self.extra.as_deref_mut() {
             x.order_remove(key);
         }
-        if self.is_dict() {
-            let d = self.dict_mut();
-            let Some(s) = d.map.remove(key) else {
-                return had_accessor;
-            };
-            d.order[s.pos] = None;
-            self.compact_order();
-            true
-        } else {
+        if !self.is_dict() {
             if !self.shape.contains(key) {
                 return had_accessor;
             }
-            self.rebuild_without(root, key);
-            true
+            // The last property added: the layout without it is the parent
+            // (when the chain grows from `root`, as the rebuild's would).
+            if self.shape.last_key() == Some(key)
+                && let Some(parent) = self.shape.parent().cloned()
+                && Rc::ptr_eq(&chain_root(&parent), &root)
+            {
+                let n = parent.len();
+                let values: Vec<NanBox> = (0..n).map(|i| self.slot_at(i)).collect();
+                self.shape = parent;
+                self.set_slots(values);
+                self.tidy_extra();
+                return true;
+            }
+            // Any other key of a larger object: a dictionary from now on (an
+            // object deleted from is usually a map, which every further delete
+            // would otherwise rebuild a layout for, property by property).
+            if self.shape.len() < DELETE_DICT_MIN || !self.is_extensible() || self.is_frozen() {
+                self.rebuild_without(root, key);
+                return true;
+            }
+            self.convert_to_dict();
         }
+        let d = self.dict_mut();
+        let Some(s) = d.map.remove(key) else {
+            return had_accessor;
+        };
+        d.order[s.pos] = None;
+        self.compact_order();
+        true
     }
 
     /// Rewrites every outgoing handle through `forward` — the mutating mirror of
@@ -3570,6 +3588,20 @@ pub(crate) fn jit_object_layout() -> ObjectLayout {
         acc_name_len_off,
         shape_brands_off,
     }
+}
+
+/// The fewest own properties a shaped object deleted from (other than its
+/// last-added key) has for the delete to turn it into a dictionary rather
+/// than rebuild its layout ([`Object::delete`]).
+const DELETE_DICT_MIN: u32 = 8;
+
+/// The root of the layout chain `s` grows from.
+fn chain_root(s: &Rc<Shape>) -> Rc<Shape> {
+    let mut cur = Rc::clone(s);
+    while let Some(p) = cur.parent().cloned() {
+        cur = p;
+    }
+    cur
 }
 
 #[cfg(test)]
