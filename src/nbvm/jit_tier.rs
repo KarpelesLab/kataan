@@ -43,9 +43,7 @@ fn mode() -> Mode {
     static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("KATAAN_JIT").as_deref() {
         Ok("0" | "off") => Mode::Off,
-        // The AArch64 port is opt-in while its generic tier is a baseline
-        // (`KATAAN_JIT_A64GEN`): without it the tier stays off there, so
-        // no call pays for compile attempts that would mostly be refused.
+        // (`KATAAN_JIT_A64GEN=0` on AArch64: see `jit::backend_enabled`.)
         _ if !crate::jit::backend_enabled() => Mode::Off,
         Ok("eager") => Mode::Eager,
         _ => Mode::Normal,
@@ -2639,6 +2637,58 @@ pub(crate) fn jit_helper_exec_op(
                 }
                 None => None,
             }
+        }
+        // `new C(…)` of a VM function: the interpreter arm's construct,
+        // without a one-op frame around it (anything else takes the frame).
+        Op::Construct { dst, ctor, args }
+            if regs[*ctor as usize]
+                .as_handle()
+                .is_some_and(|h| ctx.realm.is_vm_function(Handle::from_raw(h))) =>
+        {
+            let c = regs[*ctor as usize];
+            let argv = super::ArgBuf::from_regs(regs, args);
+            let pub_mark = ctx.frame_shadow.len();
+            if !on_register_stack(ctx, regs) {
+                ctx.frame_shadow.extend_from_slice(regs);
+            }
+            ctx.frames_published += 1;
+            let r = super::vm_construct(ctx, funcs, c, &argv, c);
+            ctx.frames_published -= 1;
+            ctx.frame_shadow.truncate(pub_mark);
+            Some(r.map(|v| regs[*dst as usize] = v))
+        }
+        // `o[k](…)`: the interpreter arm's element read and call, a compiled
+        // callee entered directly, without a one-op frame around it.
+        Op::CallKey {
+            dst,
+            recv,
+            key,
+            args,
+        } => {
+            let recv_val = regs[*recv as usize];
+            let argv = super::ArgBuf::from_regs(regs, args);
+            Some(
+                match super::vm_get_elem(ctx, funcs, recv_val, regs[*key as usize], Some(regs)) {
+                    Err(e) => Err(e),
+                    Ok(method) => {
+                        match call_compiled_with(ctx, funcs, Some(regs), method, recv_val, &argv) {
+                            Some(r) => r,
+                            None => {
+                                let pub_mark = ctx.frame_shadow.len();
+                                if !on_register_stack(ctx, regs) {
+                                    ctx.frame_shadow.extend_from_slice(regs);
+                                }
+                                ctx.frames_published += 1;
+                                let r = super::call_closure(ctx, funcs, method, &argv, recv_val);
+                                ctx.frames_published -= 1;
+                                ctx.frame_shadow.truncate(pub_mark);
+                                r
+                            }
+                        }
+                    }
+                }
+                .map(|v| regs[*dst as usize] = v),
+            )
         }
         // `f(...xs)` over a plain array (its interpreter arm), entering a
         // compiled callee directly; when the spread is not plain, `ok` says

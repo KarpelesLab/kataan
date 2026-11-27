@@ -28,9 +28,12 @@
 //! polls, handlers and suspensions as the x86-64 body, with branches,
 //! moves, constants and the Number fast paths of arithmetic and compares
 //! inline, and every other op handed to the interpreter on the shared
-//! register file (`jit_helper_exec_op`). Its ops gain inline fast paths one
-//! at a time (property access through the inline caches next), and it is
-//! opt-in (`KATAAN_JIT_A64GEN=1`) until those make it pay.
+//! register file (`jit_helper_exec_op`). Its hot ops have inline fast paths
+//! (property reads through the inline caches, globals, dense array reads,
+//! `.length`, captured variables, unary/bitwise/`%` on Numbers) and the
+//! rest go to the x86-64 tier's own runtime helpers; calls between compiled
+//! bodies enter through a native-call entry. It is on by default
+//! (`KATAAN_JIT_A64GEN=0` turns the aarch64 JIT off).
 //!
 //! # Encoding notes
 //!

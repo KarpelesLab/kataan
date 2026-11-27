@@ -5,12 +5,20 @@
 //! function's bytecode.
 //!
 //! What it lowers natively: constants and moves, the branches (with the
-//! back-edge poll on every backward one), `return`, and the Number fast
-//! paths of `+ - * /`, `<` and the relational compares and `===` (both
-//! operands Numbers: the FP instruction, its NaN made the canonical one).
-//! Every other op — and every slow path — is the interpreter's own,
-//! run on the same register file by `jit_helper_exec_op`, so the body has
-//! the interpreter's semantics by construction. `try` regions keep their
+//! back-edge poll on every backward one), `return`, the Number fast paths of
+//! `+ - * /`, `%`, the comparisons, `===`, `!`, unary `-`, `++`/`--` and the
+//! bitwise operators and shifts (the NaN results made the canonical NaN);
+//! and inline over the heap layout the shared probe (`compute_jit_layout`)
+//! describes: a property read's monomorphic hit through its site's inline
+//! cache, a global binding through a cached address checked against the
+//! global binding epoch, a plain array's present element and `.length`, a
+//! captured variable's box. Their misses, property writes and method calls
+//! call the x86-64 tier's runtime helpers (each site with its own caches,
+//! [`Sites`]); every other op is the interpreter's own, run on the same
+//! register file by `jit_helper_exec_op`. So the body has the interpreter's
+//! semantics by construction. A body that no `try` region, suspension or
+//! early `new.target` keeps from it has a native-call entry, which
+//! `jit_tier::call_compiled_with` enters a compiled callee through. `try` regions keep their
 //! handlers on the activation's handler stack in the context (as the x86-64
 //! body does): a throw anywhere asks `jit_helper_unwind` for the catch pc
 //! and continues there. Ops whose meaning is tied
@@ -23,7 +31,7 @@
 //!
 //! Registers: `x19` = `ctx`, `x20` = the register file, `x21` = the poll
 //! countdown, `x22` = the NanBox `QNAN` mask (all callee-saved, so they
-//! survive the helpers); `x9..x12`, `d0`/`d1` are scratch. The native frame
+//! survive the helpers); `x9..x15`, `d0..d2` are scratch. The native frame
 //! holds no values (everything lives in the register file the collector
 //! roots), so a collection in any helper is safe at any point.
 
@@ -32,7 +40,7 @@
 #![cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 
 use super::Label;
-use super::a64::{A64Assembler, Cond, FP, LR, SP};
+use super::a64::{A64Assembler, Cond, FP, LR, SP, Shift};
 use crate::nanbox::NanBox;
 use crate::nbvm::Op;
 use alloc::vec::Vec;
@@ -55,7 +63,152 @@ pub(crate) struct Helpers {
     pub unwind: u64,
     /// `jit_helper_suspend(ctx, regs, n_regs, op, pc) -> 0 | throw | exit`.
     pub suspend: u64,
+    /// `jit_helper_get_prop(ctx, obj, key, key_len, cache) -> value | throw`.
+    pub get: u64,
+    /// `jit_helper_set_prop(ctx, obj, key, key_len, cache, value)` (sloppy).
+    pub set: u64,
+    /// [`set`](Self::set) for strict code.
+    pub set_strict: u64,
+    /// `jit_helper_init_prop`: a literal's property definition (as `set`).
+    pub init_prop: u64,
+    /// `jit_helper_call_method(ctx, regs, n_regs, op, cache, null) -> 0 | throw`.
+    pub call_method: u64,
+    /// `jit_helper_global_ref(ctx, op) -> binding address | 0`.
+    pub global_ref: u64,
+    /// `jit_helper_get_elem(ctx, recv, key) -> value | throw`.
+    pub get_elem: u64,
+    /// `jit_helper_set_elem(ctx, recv, key, value, strict) -> _ | throw`.
+    pub set_elem: u64,
+    /// `jit_helper_array_len(ctx, recv) -> value | throw`.
+    pub array_len: u64,
+    /// `jit_helper_get_method_site(ctx, obj, site, call) -> value | throw`.
+    pub get_method_site: u64,
+    /// `jit_helper_call_with_method(ctx, regs, n_regs, op, cache, null)`.
+    pub call_with_method: u64,
+    /// `jit_helper_strict_eq(ctx, a, b) -> boolean` (never throws).
+    pub strict_eq: u64,
+    /// `jit_helper_add(ctx, a, b) -> value | throw` (`+`).
+    pub add: u64,
+    /// `jit_helper_arith(ctx, a, b, GA_*) -> value | throw` (`- * / %`).
+    pub arith: u64,
+    /// `jit_helper_value_bin(ctx, a, b, VB_*) -> value | throw`.
+    pub value_bin: u64,
 }
+
+/// The heap layout the inline property read walks (every offset from the
+/// shared probe, `compute_jit_layout`; never written by hand).
+#[derive(Clone, Copy)]
+pub(crate) struct Layout {
+    /// `Ctx`-relative offset of the `Box<Realm>` pointer.
+    pub realm: i32,
+    /// `Realm`-relative offsets of the heap arena's slot pointer and length.
+    pub heap_ptr: i32,
+    pub heap_len: i32,
+    /// The arena's slot stride.
+    pub stride: i32,
+    /// Slot-relative offsets and tags (see `JitLayout`).
+    pub off_cell_tag: i32,
+    pub cell_object_disc: u8,
+    pub off_od_tag: i32,
+    pub obj_shaped_disc: u8,
+    pub off_jit_flags: i32,
+    pub off_shape: i32,
+    pub off_slots_len: i32,
+    pub off_inline: i32,
+    pub off_extra: i32,
+    /// `ObjectExtra`-relative offsets of the near spill and the far spill's
+    /// data pointer.
+    pub extra_near: i32,
+    pub extra_far_ptr: i32,
+    /// `PropertyCache`-relative offsets of the cached shape and slot.
+    pub cache_shape_off: i32,
+    pub cache_slot_off: i32,
+    /// A `Cell::Array`'s tag, side-state flag byte, inline element count
+    /// byte (`ARRAY_ON_HEAP`: the `Vec` holds them), first inline element,
+    /// and its `Vec`'s data pointer and length.
+    pub cell_array_disc: u8,
+    pub off_arr_side: i32,
+    pub off_arr_inline_len: i32,
+    pub off_arr_inline: i32,
+    pub off_arr_ptr: i32,
+    pub off_arr_len: i32,
+    /// A `Cell::Box`'s tag and value.
+    pub box_disc: u8,
+    pub off_box_val: i32,
+    /// The global binding epoch's address (`env`).
+    pub global_epoch: u64,
+}
+
+/// The per-site state a body's code points into: one `PropertyCache` per
+/// property op ([`cache_sites`]), owned by the `JitProto` alongside the
+/// code (the vector is never resized, so the addresses stay put).
+#[derive(Default)]
+pub(crate) struct Sites {
+    pub caches: Vec<core::cell::UnsafeCell<crate::ic::PropertyCache>>,
+    /// One `[epoch, binding address]` pair per global binding op: the
+    /// address `jit_helper_global_ref` gave, good while the global binding
+    /// epoch is the one noted.
+    pub globals: Vec<core::cell::UnsafeCell<[u64; 2]>>,
+    /// Per `GetMethod`: its method site (over its `caches` entry) and the
+    /// call site its getter fills.
+    pub methods: Vec<(
+        core::cell::UnsafeCell<super::MethodSite>,
+        core::cell::UnsafeCell<super::CallSite>,
+    )>,
+}
+
+impl Sites {
+    /// One fresh cache per property op and global op of `ops`.
+    pub(crate) fn for_ops(ops: &[Op]) -> Self {
+        let n = ops.iter().filter(|op| cache_op(op)).count();
+        let g = ops.iter().filter(|op| global_op(op)).count();
+        let caches: Vec<core::cell::UnsafeCell<crate::ic::PropertyCache>> =
+            (0..n).map(|_| core::cell::UnsafeCell::default()).collect();
+        // (The caches are in place for good: the method sites point at them.)
+        let methods = ops
+            .iter()
+            .filter(|op| cache_op(op))
+            .zip(caches.iter())
+            .filter_map(|(op, c)| match op {
+                Op::GetMethod { key, .. } => Some((
+                    core::cell::UnsafeCell::new(super::MethodSite::new(key, c.get().cast())),
+                    core::cell::UnsafeCell::new(super::CallSite::new()),
+                )),
+                _ => None,
+            })
+            .collect();
+        Self {
+            caches,
+            globals: (0..g)
+                .map(|_| core::cell::UnsafeCell::new([0; 2]))
+                .collect(),
+            methods,
+        }
+    }
+}
+
+/// Whether `op` reads or writes a global binding through a [`Sites`] pair.
+fn global_op(op: &Op) -> bool {
+    matches!(op, Op::LoadGlobal { .. } | Op::StoreGlobal { .. })
+}
+
+/// Whether `op` gets an inline cache of its own ([`Sites`]).
+fn cache_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::GetProp { .. }
+            | Op::GetMethod { .. }
+            | Op::SetProp { .. }
+            | Op::SetPropStrict { .. }
+            | Op::InitProp { .. }
+            | Op::CallMethod { .. }
+            | Op::CallWithMethod { .. }
+    )
+}
+
+/// `crate::object::INLINE_SLOTS`, and where the far spill begins.
+const INLINE: i64 = crate::object::INLINE_SLOTS as i64;
+const FAR_FROM: i64 = (crate::object::INLINE_SLOTS + crate::object::SPILL_NEAR) as i64;
 
 /// `ctx`.
 const CTX: u8 = 19;
@@ -174,13 +327,32 @@ fn slot(r: u16) -> i64 {
 /// frame ABI. `entries` are its entry pcs besides 0 ([`osr_entries`] and
 /// [`resume_pcs`]). `None` when an operand does not encode.
 #[must_use]
+/// The register-window layout a body's native-call entry builds (see
+/// [`compile`]): its parameter and capture counts, and the register it
+/// reads `new.target` into, if any.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeShape {
+    pub n_params: usize,
+    pub n_caps: usize,
+    pub new_target: Option<usize>,
+}
+
+/// With `native`, the code also gets a **native-call entry** (its offset
+/// is returned): `extern "C" fn(ctx, window, argc, argv, caps, this) -> u64`,
+/// which `jit_tier::enter_native` calls on a window it reserved on the
+/// register stack below the call's header and arguments. It lays the window
+/// out as `call_with_inner` does — arguments `0..n_params` (missing ones
+/// `undefined`), captures after them, `this` after those, `new.target`
+/// (the header word just below `argv`) in its register, every other
+/// register `undefined` — and runs the body from pc 0.
 pub(crate) fn compile(
     ops: &[Op],
     n_regs: usize,
     (is_async, is_generator): (bool, bool),
     entries: &[usize],
-    h: &Helpers,
-) -> Option<Vec<u8>> {
+    (h, l, sites): (&Helpers, &Layout, &Sites),
+    native: Option<NativeShape>,
+) -> Option<(Vec<u8>, Option<usize>)> {
     if n_regs > 0xffff || !eligible(ops, is_async, is_generator) {
         return None;
     }
@@ -207,14 +379,17 @@ pub(crate) fn compile(
     };
 
     // Prologue: the frame record and the four callee-saved registers.
-    a.stp_pre(FP, LR, SP, -48);
-    a.mov_sp(FP, SP);
-    a.stp(CTX, REGS, SP, 16);
-    a.stp(COUNT, QNAN_R, SP, 32);
-    a.mov(CTX, 0);
-    a.mov(REGS, 1);
-    a.mov_imm(COUNT, 1); // poll at the first back-edge
-    a.mov_imm(QNAN_R, QNAN);
+    let prologue = |a: &mut A64Assembler| {
+        a.stp_pre(FP, LR, SP, -48);
+        a.mov_sp(FP, SP);
+        a.stp(CTX, REGS, SP, 16);
+        a.stp(COUNT, QNAN_R, SP, 32);
+        a.mov(CTX, 0);
+        a.mov(REGS, 1);
+        a.mov_imm(COUNT, 1); // poll at the first back-edge
+        a.mov_imm(QNAN_R, QNAN);
+    };
+    prologue(&mut a);
     // Entry dispatch: pc 0 or a loop header; anything else is refused with
     // the throw sentinel, the register file untouched.
     a.cbz(2, labels[0]);
@@ -282,8 +457,59 @@ pub(crate) fn compile(
         a.fmov_from_x(1, 10);
     };
 
+    // Each property op's cache, in op order (`Sites::for_ops`).
+    let mut next_cache = 0usize;
+    let mut next_global = 0usize;
+    let mut next_method = 0usize;
+    let hole_bits = NanBox::hole().to_bits();
+    // `x14` = the arena slot of the heap handle in `x9`, else to `miss`.
+    // Clobbers `x10..x13`, `x15`.
+    let walk = |a: &mut A64Assembler, miss: Label| {
+        a.mov_imm(10, NanBox::handle(0).to_bits());
+        a.cmp(9, 10);
+        a.b_cond(Cond::Lo, miss);
+        a.ldr(11, CTX, i64::from(l.realm));
+        a.ldr(12, 11, i64::from(l.heap_ptr));
+        a.ldr(13, 11, i64::from(l.heap_len));
+        a.mov_w(14, 9);
+        a.cmp(14, 13);
+        a.b_cond(Cond::Hs, miss);
+        a.mov_imm(15, l.stride as u64);
+        a.mul(14, 14, 15);
+        a.add(14, 14, 12);
+    };
+    // `x12` = the element count and `x13` = the first element's address of
+    // the plain array whose slot is `x14`, else (not an array, or one with
+    // side state) to `miss`. Clobbers `x10`.
+    let array = |a: &mut A64Assembler, miss: Label| {
+        let on_heap = a.new_label();
+        let have = a.new_label();
+        a.ldrb(10, 14, i64::from(l.off_cell_tag));
+        a.cmp_imm(10, i64::from(l.cell_array_disc));
+        a.b_cond(Cond::Ne, miss);
+        a.ldrb(10, 14, i64::from(l.off_arr_side));
+        a.cbnz(10, miss);
+        a.ldrb(12, 14, i64::from(l.off_arr_inline_len));
+        a.cmp_imm(12, i64::from(crate::cell::ARRAY_ON_HEAP));
+        a.b_cond(Cond::Eq, on_heap);
+        a.add_imm(13, 14, i64::from(l.off_arr_inline));
+        a.b(have);
+        a.bind(on_heap);
+        a.ldr(12, 14, i64::from(l.off_arr_len));
+        a.ldr(13, 14, i64::from(l.off_arr_ptr));
+        a.bind(have);
+    };
     for (pc, op) in ops.iter().enumerate() {
         a.bind(labels[pc]);
+        let cache = if cache_op(op) {
+            next_cache += 1;
+            sites.caches.get(next_cache - 1)?.get() as u64
+        } else if global_op(op) {
+            next_global += 1;
+            sites.globals.get(next_global - 1)?.get() as u64
+        } else {
+            0
+        };
         match *op {
             Op::LoadConst { dst, value } => {
                 a.mov_imm(9, value.to_bits());
@@ -379,7 +605,26 @@ pub(crate) fn compile(
                 a.str(9, REGS, slot(dst));
                 a.b(done);
                 a.bind(slow);
-                exec_op(&mut a, pc);
+                // Not two Numbers: the interpreter's operation, by its helper.
+                a.mov(0, CTX);
+                a.mov(1, 9);
+                a.mov(2, 10);
+                match op {
+                    Op::Sub { .. } | Op::Mul { .. } | Op::Div { .. } => {
+                        let ga = match op {
+                            Op::Sub { .. } => crate::nbvm::GA_SUB,
+                            Op::Mul { .. } => crate::nbvm::GA_MUL,
+                            _ => crate::nbvm::GA_DIV,
+                        };
+                        a.mov_imm(3, u64::from(ga));
+                        a.call_abs(h.arith);
+                    }
+                    _ => a.call_abs(h.add),
+                }
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+                a.str(0, REGS, slot(dst));
                 a.bind(done);
             }
             Op::Lt { dst, a: ra, b: rb }
@@ -413,6 +658,478 @@ pub(crate) fn compile(
                 a.str(9, REGS, slot(dst));
                 a.b(done);
                 a.bind(slow);
+                if matches!(op, Op::StrictEq { .. }) {
+                    // (Not both Numbers: the helper, which never throws.)
+                    a.mov(0, CTX);
+                    a.mov(1, 9);
+                    a.mov(2, 10);
+                    a.call_abs(h.strict_eq);
+                    a.str(0, REGS, slot(dst));
+                } else {
+                    exec_op(&mut a, pc);
+                }
+                a.bind(done);
+            }
+            Op::GetProp { dst, obj, ref key } | Op::GetMethod { dst, obj, ref key } => {
+                // The monomorphic hit inline: an ordinary shaped object whose
+                // shape is the cache's, its cached slot loaded. Anything else
+                // is the helper, which also arms the cache.
+                let miss = a.new_label();
+                let done = a.new_label();
+                let spill = a.new_label();
+                let far = a.new_label();
+                let got = a.new_label();
+                a.ldr(9, REGS, slot(obj));
+                // A heap handle: its arena slot (`x14`).
+                walk(&mut a, miss);
+                // An ordinary, shaped, not host-exotic object.
+                a.ldrb(10, 14, i64::from(l.off_cell_tag));
+                a.cmp_imm(10, i64::from(l.cell_object_disc));
+                a.b_cond(Cond::Ne, miss);
+                if (l.off_od_tag, l.obj_shaped_disc) != (l.off_cell_tag, l.cell_object_disc) {
+                    a.ldrb(10, 14, i64::from(l.off_od_tag));
+                    a.cmp_imm(10, i64::from(l.obj_shaped_disc));
+                    a.b_cond(Cond::Ne, miss);
+                }
+                a.ldrb(10, 14, i64::from(l.off_jit_flags));
+                a.tbnz(
+                    10,
+                    crate::object::JIT_FLAG_EXOTIC.trailing_zeros() as u8,
+                    miss,
+                );
+                // Its shape is the cache's: the cached slot.
+                a.ldr(10, 14, i64::from(l.off_shape));
+                a.mov_imm(11, cache);
+                a.ldr(12, 11, i64::from(l.cache_shape_off));
+                a.cmp(10, 12);
+                a.b_cond(Cond::Ne, miss);
+                a.ldr_w(12, 11, i64::from(l.cache_slot_off));
+                a.ldrh(13, 14, i64::from(l.off_slots_len));
+                a.cmp(12, 13);
+                a.b_cond(Cond::Hs, miss);
+                a.cmp_imm(12, INLINE);
+                a.b_cond(Cond::Hs, spill);
+                a.add_shifted(15, 14, 12, Shift::Lsl, 3);
+                a.ldr(0, 15, i64::from(l.off_inline));
+                a.b(got);
+                a.bind(spill);
+                a.ldr(15, 14, i64::from(l.off_extra));
+                a.cmp_imm(12, FAR_FROM);
+                a.b_cond(Cond::Hs, far);
+                a.add_shifted(15, 15, 12, Shift::Lsl, 3);
+                a.ldr(0, 15, i64::from(l.extra_near) - 8 * INLINE);
+                a.b(got);
+                a.bind(far);
+                a.ldr(15, 15, i64::from(l.extra_far_ptr));
+                a.add_shifted(15, 15, 12, Shift::Lsl, 3);
+                a.ldr(0, 15, -8 * FAR_FROM);
+                a.b(got);
+                a.bind(miss);
+                a.mov(0, CTX);
+                a.mov(1, 9);
+                if matches!(op, Op::GetMethod { .. }) {
+                    // (A method read first asks the site's built-in memo.)
+                    let (m, c) = sites.methods.get(next_method)?;
+                    next_method += 1;
+                    a.mov_imm(2, m.get() as u64);
+                    a.mov_imm(3, c.get() as u64);
+                    a.call_abs(h.get_method_site);
+                } else {
+                    a.mov_imm(2, key.as_ptr() as u64);
+                    a.mov_imm(3, key.len() as u64);
+                    a.mov_imm(4, cache);
+                    a.call_abs(h.get);
+                }
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+                a.bind(got);
+                a.str(0, REGS, slot(dst));
+                a.bind(done);
+            }
+            Op::SetProp { obj, ref key, src }
+            | Op::SetPropStrict { obj, ref key, src }
+            | Op::InitProp { obj, ref key, src } => {
+                let helper = match op {
+                    Op::SetProp { .. } => h.set,
+                    Op::SetPropStrict { .. } => h.set_strict,
+                    _ => h.init_prop,
+                };
+                a.mov(0, CTX);
+                a.ldr(1, REGS, slot(obj));
+                a.mov_imm(2, key.as_ptr() as u64);
+                a.mov_imm(3, key.len() as u64);
+                a.mov_imm(4, cache);
+                a.ldr(5, REGS, slot(src));
+                a.call_abs(helper);
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+            }
+            Op::CallMethod { .. } | Op::CallWithMethod { .. } => {
+                a.mov(0, CTX);
+                a.mov(1, REGS);
+                a.mov_imm(2, n_regs as u64);
+                a.mov_imm(3, core::ptr::from_ref(op) as u64);
+                a.mov_imm(4, cache);
+                a.mov_imm(5, 0);
+                let helper = if matches!(op, Op::CallMethod { .. }) {
+                    h.call_method
+                } else {
+                    h.call_with_method
+                };
+                a.call_abs(helper);
+                a.cbnz(0, thrown);
+            }
+            Op::CheckTdz { src } => {
+                // Nothing unless the binding is still uninitialized (then the
+                // interpreter's op throws).
+                let fine = a.new_label();
+                a.ldr(9, REGS, slot(src));
+                a.mov_imm(10, NanBox::tdz().to_bits());
+                a.cmp(9, 10);
+                a.b_cond(Cond::Ne, fine);
+                exec_op(&mut a, pc);
+                a.bind(fine);
+            }
+            Op::RequireObjectCoercible { src, .. } => {
+                // Nothing unless the value reads as `undefined` or `null`
+                // (`QNAN | 1, 2, 5, 6, 7`: not `false`/`true`, `| 3, 4`).
+                let fine = a.new_label();
+                a.ldr(9, REGS, slot(src));
+                a.mov_imm(10, QNAN);
+                a.sub(10, 9, 10);
+                a.cmp_imm(10, 7);
+                a.b_cond(Cond::Hi, fine);
+                a.cmp_imm(10, 3);
+                a.b_cond(Cond::Eq, fine);
+                a.cmp_imm(10, 4);
+                a.b_cond(Cond::Eq, fine);
+                exec_op(&mut a, pc);
+                a.bind(fine);
+            }
+            Op::LoadGlobal { dst, .. } | Op::StoreGlobal { src: dst, .. } => {
+                // Through the site's `[epoch, address]` pair while the global
+                // binding epoch is the noted one; else a fresh address from
+                // the helper, else the interpreter's op.
+                let fetch = a.new_label();
+                let hit = a.new_label();
+                let slow = a.new_label();
+                let done = a.new_label();
+                a.mov_imm(11, cache);
+                a.ldr(12, 11, 0);
+                a.ldr(13, 11, 8);
+                a.mov_imm(10, l.global_epoch);
+                a.ldr(10, 10, 0);
+                a.cmp(10, 12);
+                a.b_cond(Cond::Ne, fetch);
+                a.cbz(13, fetch);
+                a.bind(hit);
+                if matches!(op, Op::LoadGlobal { .. }) {
+                    a.ldr(9, 13, 0);
+                    a.str(9, REGS, slot(dst));
+                } else {
+                    a.ldr(9, REGS, slot(dst));
+                    a.str(9, 13, 0);
+                }
+                a.b(done);
+                a.bind(fetch);
+                a.mov(0, CTX);
+                a.mov_imm(1, core::ptr::from_ref(op) as u64);
+                a.call_abs(h.global_ref);
+                a.cbz(0, slow);
+                a.mov(13, 0);
+                a.mov_imm(10, l.global_epoch);
+                a.ldr(10, 10, 0);
+                a.mov_imm(11, cache);
+                a.str(10, 11, 0);
+                a.str(13, 11, 8);
+                a.b(hit);
+                a.bind(slow);
+                exec_op(&mut a, pc);
+                a.bind(done);
+            }
+            Op::GetKey { dst, obj, key } => {
+                // A plain array's present element at an integer index inline;
+                // anything else is the helper.
+                let miss = a.new_label();
+                let done = a.new_label();
+                a.ldr(9, REGS, slot(obj));
+                walk(&mut a, miss);
+                array(&mut a, miss);
+                a.ldr(10, REGS, slot(key));
+                a.and(11, 10, QNAN_R);
+                a.cmp(11, QNAN_R);
+                a.b_cond(Cond::Eq, miss);
+                a.fmov_from_x(0, 10);
+                a.fcvtzs(11, 0);
+                a.scvtf(1, 11);
+                a.fcmp(0, 1);
+                a.b_cond(Cond::Ne, miss);
+                a.cmp(11, 12);
+                a.b_cond(Cond::Hs, miss); // (also a negative index)
+                a.ldr_idx(0, 13, 11);
+                a.mov_imm(10, hole_bits);
+                a.cmp(0, 10);
+                a.b_cond(Cond::Eq, miss);
+                a.str(0, REGS, slot(dst));
+                a.b(done);
+                a.bind(miss);
+                a.mov(0, CTX);
+                a.ldr(1, REGS, slot(obj));
+                a.ldr(2, REGS, slot(key));
+                a.call_abs(h.get_elem);
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+                a.str(0, REGS, slot(dst));
+                a.bind(done);
+            }
+            Op::SetKey { obj, key, src } | Op::SetKeyStrict { obj, key, src } => {
+                a.mov(0, CTX);
+                a.ldr(1, REGS, slot(obj));
+                a.ldr(2, REGS, slot(key));
+                a.ldr(3, REGS, slot(src));
+                a.mov_imm(4, u64::from(matches!(op, Op::SetKeyStrict { .. })));
+                a.call_abs(h.set_elem);
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+            }
+            Op::ArrayLen { dst, arr } => {
+                let miss = a.new_label();
+                let done = a.new_label();
+                a.ldr(9, REGS, slot(arr));
+                walk(&mut a, miss);
+                array(&mut a, miss);
+                a.scvtf(0, 12);
+                a.str_d(0, REGS, slot(dst));
+                a.b(done);
+                a.bind(miss);
+                a.mov(0, CTX);
+                a.ldr(1, REGS, slot(arr));
+                a.call_abs(h.array_len);
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+                a.str(0, REGS, slot(dst));
+                a.bind(done);
+            }
+            Op::Not { dst, a: src } => {
+                // `!b` of a boolean inline, else ToBoolean by the helper.
+                let to_true = a.new_label();
+                let to_false = a.new_label();
+                let store = a.new_label();
+                a.ldr(1, REGS, slot(src));
+                a.mov_imm(9, false_bits);
+                a.cmp(1, 9);
+                a.b_cond(Cond::Eq, to_true);
+                a.mov_imm(10, true_bits);
+                a.cmp(1, 10);
+                a.b_cond(Cond::Eq, to_false);
+                a.mov(0, CTX);
+                a.call_abs(h.truthy);
+                a.cbz(0, to_true);
+                a.bind(to_false);
+                a.mov_imm(9, false_bits);
+                a.b(store);
+                a.bind(to_true);
+                a.mov_imm(9, true_bits);
+                a.bind(store);
+                a.str(9, REGS, slot(dst));
+            }
+            Op::Neg { dst, a: src } | Op::Step { dst, src, .. } | Op::ToNumeric { dst, src } => {
+                let slow = a.new_label();
+                let done = a.new_label();
+                a.ldr(9, REGS, slot(src));
+                a.and(11, 9, QNAN_R);
+                a.cmp(11, QNAN_R);
+                a.b_cond(Cond::Eq, slow);
+                match *op {
+                    Op::Neg { .. } | Op::Step { .. } => {
+                        a.fmov_from_x(0, 9);
+                        match *op {
+                            Op::Neg { .. } => a.fneg(0, 0),
+                            Op::Step { dec, .. } => {
+                                a.mov_imm(10, 1.0f64.to_bits());
+                                a.fmov_from_x(1, 10);
+                                if dec {
+                                    a.fsub(0, 0, 1);
+                                } else {
+                                    a.fadd(0, 0, 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                        let nan = a.new_label();
+                        a.fcmp(0, 0);
+                        a.b_cond(Cond::Vs, nan);
+                        a.str_d(0, REGS, slot(dst));
+                        a.b(done);
+                        a.bind(nan);
+                        a.mov_imm(9, CANONICAL_NAN);
+                        a.str(9, REGS, slot(dst));
+                    }
+                    _ => a.str(9, REGS, slot(dst)),
+                }
+                a.b(done);
+                a.bind(slow);
+                exec_op(&mut a, pc);
+                a.bind(done);
+            }
+            Op::ValueBin {
+                dst,
+                op: vb @ 1..=6,
+                a: ra,
+                b: rb,
+            } => {
+                // Two integral Numbers: the 32-bit operation on their ToInt32
+                // (exact below 2^63, where an integral double's low 32 bits
+                // are its ToInt32).
+                let slow = a.new_label();
+                let done = a.new_label();
+                a.ldr(9, REGS, slot(ra));
+                a.ldr(10, REGS, slot(rb));
+                both_numbers(&mut a, slow);
+                a.fcvtzs(11, 0);
+                a.scvtf(2, 11);
+                a.fcmp(0, 2);
+                a.b_cond(Cond::Ne, slow);
+                // (Within ±2^53: `fcvtzs` saturates, and a saturated
+                // result can convert back equal, as 2^63 does.)
+                a.mov_imm(15, 1 << 53);
+                a.add(14, 11, 15);
+                a.mov_imm(15, 1 << 54);
+                a.cmp(14, 15);
+                a.b_cond(Cond::Hi, slow);
+                a.fcvtzs(12, 1);
+                a.scvtf(2, 12);
+                a.fcmp(1, 2);
+                a.b_cond(Cond::Ne, slow);
+                // (Within ±2^53: `fcvtzs` saturates, and a saturated
+                // result can convert back equal, as 2^63 does.)
+                a.mov_imm(15, 1 << 53);
+                a.add(14, 12, 15);
+                a.mov_imm(15, 1 << 54);
+                a.cmp(14, 15);
+                a.b_cond(Cond::Hi, slow);
+                match vb {
+                    1 => a.and_w(11, 11, 12),
+                    2 => a.orr_w(11, 11, 12),
+                    3 => a.eor_w(11, 11, 12),
+                    4 => a.lsl_w(11, 11, 12),
+                    5 => a.asr_w(11, 11, 12),
+                    _ => a.lsr_w(11, 11, 12),
+                }
+                if vb != 6 {
+                    a.sxtw(11, 11);
+                }
+                a.scvtf(0, 11);
+                a.str_d(0, REGS, slot(dst));
+                a.b(done);
+                a.bind(slow);
+                a.mov(0, CTX);
+                a.mov(1, 9);
+                a.mov(2, 10);
+                a.mov_imm(3, u64::from(vb));
+                a.call_abs(h.value_bin);
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+                a.str(0, REGS, slot(dst));
+                a.bind(done);
+            }
+            Op::Mod { dst, a: ra, b: rb } => {
+                // Integral `a >= 0`, `b > 0` below 2^53: the integer
+                // remainder (exact, and never `-0`); else the interpreter.
+                let slow = a.new_label();
+                let done = a.new_label();
+                a.ldr(9, REGS, slot(ra));
+                a.ldr(10, REGS, slot(rb));
+                both_numbers(&mut a, slow);
+                a.fcvtzs(11, 0);
+                a.scvtf(2, 11);
+                a.fcmp(0, 2);
+                a.b_cond(Cond::Ne, slow);
+                // (Within ±2^53: `fcvtzs` saturates, and a saturated
+                // result can convert back equal, as 2^63 does.)
+                a.mov_imm(15, 1 << 53);
+                a.add(14, 11, 15);
+                a.mov_imm(15, 1 << 54);
+                a.cmp(14, 15);
+                a.b_cond(Cond::Hi, slow);
+                a.fcvtzs(12, 1);
+                a.scvtf(2, 12);
+                a.fcmp(1, 2);
+                a.b_cond(Cond::Ne, slow);
+                // (Within ±2^53: `fcvtzs` saturates, and a saturated
+                // result can convert back equal, as 2^63 does.)
+                a.mov_imm(15, 1 << 53);
+                a.add(14, 12, 15);
+                a.mov_imm(15, 1 << 54);
+                a.cmp(14, 15);
+                a.b_cond(Cond::Hi, slow);
+                a.tbnz(11, 63, slow);
+                a.cmp_imm(12, 0);
+                a.b_cond(Cond::Le, slow);
+                // (A -0 dividend converts to 0 but its result is -0.)
+                a.tbnz(9, 63, slow);
+                a.sdiv(13, 11, 12);
+                a.msub(11, 13, 12, 11);
+                a.scvtf(0, 11);
+                a.str_d(0, REGS, slot(dst));
+                a.b(done);
+                a.bind(slow);
+                a.mov(0, CTX);
+                a.mov(1, 9);
+                a.mov(2, 10);
+                a.mov_imm(3, u64::from(crate::nbvm::GA_MOD));
+                a.call_abs(h.arith);
+                a.mov_imm(9, throw_bits);
+                a.cmp(0, 9);
+                a.b_cond(Cond::Eq, thrown);
+                a.str(0, REGS, slot(dst));
+                a.bind(done);
+            }
+            Op::CellGet { dst, cell } => {
+                // A `Cell::Box`'s value, or a one-element array cell's present
+                // element, inline; anything else is the interpreter's op.
+                let miss = a.new_label();
+                let done = a.new_label();
+                let not_box = a.new_label();
+                let got = a.new_label();
+                a.ldr(9, REGS, slot(cell));
+                walk(&mut a, miss);
+                a.ldrb(10, 14, i64::from(l.off_cell_tag));
+                a.cmp_imm(10, i64::from(l.box_disc));
+                a.b_cond(Cond::Ne, not_box);
+                a.ldr(0, 14, i64::from(l.off_box_val));
+                a.b(got);
+                a.bind(not_box);
+                array(&mut a, miss);
+                a.cbz(12, miss);
+                a.ldr(0, 13, 0);
+                a.mov_imm(10, hole_bits);
+                a.cmp(0, 10);
+                a.b_cond(Cond::Eq, miss);
+                a.bind(got);
+                a.str(0, REGS, slot(dst));
+                a.b(done);
+                a.bind(miss);
+                exec_op(&mut a, pc);
+                a.bind(done);
+            }
+            Op::BindThis { this } => {
+                // An ordinary object is its own `this`: nothing to do. Anything
+                // else is the interpreter's op.
+                let slow = a.new_label();
+                let done = a.new_label();
+                a.ldr(9, REGS, slot(this));
+                walk(&mut a, slow);
+                a.ldrb(10, 14, i64::from(l.off_cell_tag));
+                a.cmp_imm(10, i64::from(l.cell_object_disc));
+                a.b_cond(Cond::Eq, done);
+                a.bind(slow);
                 exec_op(&mut a, pc);
                 a.bind(done);
             }
@@ -443,20 +1160,59 @@ pub(crate) fn compile(
     a.ldp(CTX, REGS, SP, 16);
     a.ldp_post(FP, LR, SP, 48);
     a.ret();
-    a.finish()
+    // The native-call entry (see the function docs): x2 = argc, x3 = argv,
+    // x4 = the captures, x5 = `this`.
+    let native_at = native.map(|ns| {
+        let at = a.pos();
+        prologue(&mut a);
+        let undef = NanBox::undefined().to_bits();
+        a.mov_imm(9, undef);
+        for i in 0..ns.n_params.min(n_regs) {
+            let missing = a.new_label();
+            let next = a.new_label();
+            a.cmp_imm(2, i as i64);
+            a.b_cond(Cond::Ls, missing);
+            a.ldr(10, 3, 8 * i as i64);
+            a.str(10, REGS, 8 * i as i64);
+            a.b(next);
+            a.bind(missing);
+            a.str(9, REGS, 8 * i as i64);
+            a.bind(next);
+        }
+        for j in 0..ns.n_caps {
+            let r = ns.n_params + j;
+            if r < n_regs {
+                a.ldr(10, 4, 8 * j as i64);
+                a.str(10, REGS, 8 * r as i64);
+            }
+        }
+        let this_at = ns.n_params + ns.n_caps;
+        if this_at < n_regs {
+            a.str(5, REGS, 8 * this_at as i64);
+        }
+        for r in (this_at + 1)..n_regs {
+            a.str(9, REGS, 8 * r as i64);
+        }
+        if let Some(nt) = ns.new_target.filter(|&nt| nt < n_regs) {
+            a.ldr(10, 3, -8);
+            a.str(10, REGS, 8 * nt as i64);
+        }
+        a.b(labels[0]);
+        at
+    });
+    Some((a.finish()?, native_at))
 }
 
-/// Whether the baseline generic tier runs on this target: aarch64, opted in
-/// with `KATAAN_JIT_A64GEN=1` (read once per process; always on in the
-/// crate's own tests, so the whole suite exercises it there). Off by
-/// default while it hands most ops to the interpreter one at a time, which
-/// can cost more than interpreting them.
+/// Whether the baseline generic tier runs on this target: aarch64, unless
+/// `KATAAN_JIT_A64GEN=0` turns it (and with it the aarch64 JIT: see
+/// `jit::backend_enabled`) off (read once per process; always on in the
+/// crate's own tests).
 #[must_use]
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(target_arch = "aarch64")
         && (cfg!(test)
-            || *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_A64GEN").is_some_and(|v| v != "0")))
+            || *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_A64GEN").is_none_or(|v| v != "0")))
 }
 
 #[cfg(all(feature = "alloc", jit_native))]
@@ -486,14 +1242,96 @@ impl super::JitProto {
             pop_handler: helpers.pop_handler as usize as u64,
             unwind: helpers.unwind as usize as u64,
             suspend: helpers.suspend as usize as u64,
+            get: helpers.get as usize as u64,
+            set: helpers.set as usize as u64,
+            set_strict: helpers.set_strict as usize as u64,
+            init_prop: helpers.init_prop as usize as u64,
+            call_method: helpers.call_method as usize as u64,
+            global_ref: helpers.global_ref as usize as u64,
+            get_elem: helpers.get_elem as usize as u64,
+            set_elem: helpers.set_elem as usize as u64,
+            array_len: helpers.array_len as usize as u64,
+            get_method_site: helpers.get_method_site as usize as u64,
+            call_with_method: helpers.call_with_method as usize as u64,
+            strict_eq: helpers.strict_eq as usize as u64,
+            add: helpers.add as usize as u64,
+            arith: helpers.arith as usize as u64,
+            value_bin: helpers.value_bin as usize as u64,
         };
-        let code = compile(&bytecode, proto.n_regs, kind, &entries, &h)?;
+        let jl = super::compute_jit_layout();
+        let (heap_ptr, heap_len) = (jl.props.heap_ptr, jl.props.heap_len);
+        let l = Layout {
+            realm: helpers.call_layout.realm,
+            heap_ptr,
+            heap_len,
+            stride: jl.slot_stride,
+            off_cell_tag: jl.off_cell_tag,
+            cell_object_disc: jl.cell_object_disc,
+            off_od_tag: jl.off_od_tag,
+            obj_shaped_disc: jl.obj_shaped_disc,
+            off_jit_flags: jl.props.off_jit_flags,
+            off_shape: jl.off_shape,
+            off_slots_len: jl.off_slots_len,
+            off_inline: jl.off_inline,
+            off_extra: jl.props.off_extra,
+            extra_near: jl.extra_near,
+            extra_far_ptr: jl.extra_far_ptr,
+            cache_shape_off: jl.cache_shape_off,
+            cache_slot_off: jl.cache_slot_off,
+            cell_array_disc: jl.cell_array_disc,
+            off_arr_side: jl.off_arr_side,
+            off_arr_inline_len: jl.off_arr_inline_len,
+            off_arr_inline: jl.off_arr_inline,
+            off_arr_ptr: jl.off_arr_ptr,
+            off_arr_len: jl.off_arr_len,
+            box_disc: jl.props.box_disc,
+            off_box_val: jl.props.off_box_val,
+            global_epoch: crate::env::global_binding_epoch_addr() as u64,
+        };
+        let sites = alloc::boxed::Box::new(Sites::for_ops(&bytecode));
+        // A native-call entry (what `jit_tier::call_compiled_with` enters a
+        // compiled callee through) for a body a call can enter that way:
+        // not a generator or async function, no `try` regions (whose handler
+        // stack segment the entry would have to open), and a `new.target`
+        // register, if any, past the inputs (as the x86-64 tier's rule).
+        let new_target = proto.ops.iter().take(2).find_map(|o| match o {
+            Op::LoadNewTarget { dst } => Some(*dst as usize),
+            _ => None,
+        });
+        let native = (!proto.is_async
+            && !proto.is_generator
+            && !bytecode.iter().any(|o| matches!(o, Op::PushHandler { .. }))
+            && new_target.is_none_or(|nt| nt > proto.n_params + proto.n_captures))
+        .then_some(NativeShape {
+            n_params: proto.n_params,
+            n_caps: proto.n_captures,
+            new_target,
+        });
+        let (code, native_at) = compile(
+            &bytecode,
+            proto.n_regs,
+            kind,
+            &entries,
+            (&h, &l, &sites),
+            native,
+        )?;
         let func = super::JitFunction::from_code(&code)?;
         Some(Self {
             func,
             n_params: proto.n_params,
             kind: super::JitKind::Generic,
-            native_entry: None,
+            native_entry: native_at.map(|at| super::NativeEntries {
+                // (Only Rust enters an aarch64 body natively: no compiled
+                // call sequence here takes the other entries.)
+                general: at,
+                rust: at,
+                exact: at,
+                exact_pinned: None,
+                direct: None,
+                direct_pinned: None,
+                room: 0,
+                legacy: proto.legacy,
+            }),
             n_regs: proto.n_regs,
             osr_entries: entries,
             bytecode: Some(bytecode),
@@ -501,6 +1339,7 @@ impl super::JitProto {
             pc_map: None,
             returns_bool: false,
             gen_resume: Vec::new(),
+            a64: Some(sites),
         })
     }
 }
@@ -524,6 +1363,50 @@ mod tests {
         pop_handler: 0x5000,
         unwind: 0x6000,
         suspend: 0x7000,
+        get: 0x8000,
+        set: 0x9000,
+        set_strict: 0xa000,
+        init_prop: 0xb000,
+        call_method: 0xc000,
+        global_ref: 0xd000,
+        get_elem: 0xe000,
+        set_elem: 0xf000,
+        array_len: 0x1_0000,
+        get_method_site: 0x1_1000,
+        call_with_method: 0x1_2000,
+        strict_eq: 0x1_3000,
+        add: 0x1_4000,
+        arith: 0x1_5000,
+        value_bin: 0x1_6000,
+    };
+
+    const L: Layout = Layout {
+        realm: 8,
+        heap_ptr: 16,
+        heap_len: 24,
+        stride: 72,
+        off_cell_tag: 0,
+        cell_object_disc: 0,
+        off_od_tag: 0,
+        obj_shaped_disc: 0,
+        off_jit_flags: 1,
+        off_shape: 8,
+        off_slots_len: 16,
+        off_inline: 24,
+        off_extra: 56,
+        extra_near: 0,
+        extra_far_ptr: 64,
+        cache_shape_off: 0,
+        cache_slot_off: 8,
+        cell_array_disc: 3,
+        off_arr_side: 2,
+        off_arr_inline_len: 3,
+        off_arr_inline: 8,
+        off_arr_ptr: 40,
+        off_arr_len: 48,
+        box_disc: 4,
+        off_box_val: 8,
+        global_epoch: 0x2_0000,
     };
 
     #[test]
@@ -538,7 +1421,20 @@ mod tests {
         for p in &funcs {
             if eligible(&p.ops, p.is_async, p.is_generator) {
                 let entries = osr_entries(&p.ops);
-                let code = compile(&p.ops, p.n_regs, (false, false), &entries, &H);
+                let sites = Sites::for_ops(&p.ops);
+                let native = Some(NativeShape {
+                    n_params: p.n_params,
+                    n_caps: p.n_captures,
+                    new_target: None,
+                });
+                let code = compile(
+                    &p.ops,
+                    p.n_regs,
+                    (false, false),
+                    &entries,
+                    (&H, &L, &sites),
+                    native,
+                );
                 assert!(code.is_some(), "{} encodes", p.name);
                 compiled += 1;
             }

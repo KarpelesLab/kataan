@@ -44,6 +44,7 @@ use alloc::vec::Vec;
 /// numeric tiers' AArch64 lowerings. Pure byte emission, built on every host
 /// (its encodings are checked on any host); only aarch64 runs the code.
 mod a64;
+#[cfg(jit_native)]
 mod a64_generic;
 mod a64_numeric;
 #[cfg(all(feature = "alloc", jit_native))]
@@ -3782,6 +3783,10 @@ pub struct JitProto {
     /// code offset of the stub a native resumption there enters
     /// (`gen_native`, `0` for none); empty for any other body.
     gen_resume: Vec<u32>,
+    /// The AArch64 baseline generic body's per-site caches (`a64_generic`),
+    /// which its code points into.
+    #[allow(dead_code)]
+    a64: Option<alloc::boxed::Box<a64_generic::Sites>>,
 }
 
 /// Per-site key + inline-cache storage for a generic-tier body, owned by the
@@ -4941,6 +4946,7 @@ impl JitProto {
                 pc_map: None,
                 returns_bool,
                 gen_resume: Vec::new(),
+                a64: None,
             });
         }
         let ops = lower_nbvm_float(proto)?;
@@ -4957,6 +4963,7 @@ impl JitProto {
             pc_map: None,
             returns_bool: false,
             gen_resume: Vec::new(),
+            a64: None,
         })
     }
 
@@ -5793,6 +5800,7 @@ impl JitProto {
             pc_map,
             returns_bool: false,
             gen_resume,
+            a64: None,
         })
     }
 
@@ -9235,8 +9243,9 @@ impl X64Assembler {
 }
 
 /// Whether this target's backend is switched on: always on x86-64; on
-/// AArch64 only when its baseline generic tier is (`KATAAN_JIT_A64GEN=1`,
-/// or the crate's own tests), the port being opt-in until that tier pays.
+/// AArch64 unless `KATAAN_JIT_A64GEN=0` turns its generic tier off (then
+/// the whole tier is off there: the Int/Float tiers alone seldom apply, and
+/// every call would pay for compile attempts they refuse).
 #[cfg(jit_native)]
 #[must_use]
 pub(crate) fn backend_enabled() -> bool {
