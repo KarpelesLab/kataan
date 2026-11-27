@@ -113,6 +113,17 @@ pub(crate) fn write_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLWRITE").is_none_or(|v| v != "0"))
 }
 
+/// Whether an inline `Map` `set` / `Set` `add` on an indexed collection
+/// probes its index in line and, for a key it lacks, appends the entry and
+/// indexes it there ([`X64Assembler::coll_update`]) rather than through
+/// `jit_helper_coll_write` (`KATAAN_JIT_COLLINS=0` turns it off; read once
+/// per process).
+fn insert_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_COLLINS").is_none_or(|v| v != "0"))
+}
+
 /// A lookup site's use of the memo ([`memo_plan`]): it answers from the
 /// memo first.
 pub(crate) const MEMO_CHECK: u8 = 1;
@@ -626,6 +637,13 @@ impl X64Assembler {
             .coll_memo
             .filter(|_| memo_use & MEMO_CHECK != 0 && w == CollWrite::MapSet)
             .filter(|_| probe_helper.is_some());
+        // An indexed collection's `set` / `add` probed in line
+        // (`coll_hash_probe`, which needs the arena pinned) when the helper's
+        // form is emitted: the slot layout of its index, and the label.
+        let hashed_slots = crate::realm::jit_coll_index_layout()
+            .filter(|_| self.pinned() && hash_enabled() && insert_enabled())
+            .filter(|_| probe_helper.is_some() && w != CollWrite::Delete);
+        let hashed = hashed_slots.map(|_| self.new_label());
         if let Some(m) = memo_hit {
             let none = self.new_label();
             let read = self.new_label();
@@ -749,7 +767,7 @@ impl X64Assembler {
             }
             self.g_mem(true, &[0x83], 7, r::RCX, c.index); // cmp qword [rcx+index], imm8
             self.code.push(0);
-            self.g_jcc(cc::NE, probe);
+            self.g_jcc(cc::NE, hashed.unwrap_or(probe));
             self.g_load(r::RDI, r::RCX, c.entries_len);
             self.g_cmp_imm(
                 r::RDI,
@@ -836,6 +854,16 @@ impl X64Assembler {
         self.g_load(r::RAX, rbase, recv);
         self.store_rax(dst);
         self.jmp(done);
+        if let (Some(hashed), Some(slots)) = (hashed, hashed_slots) {
+            self.coll_insert_indexed(
+                l,
+                realm_off,
+                w,
+                (recv, key, val, dst),
+                slots,
+                (hashed, found, probe, done),
+            );
+        }
         if let Some(helper) = probe_helper {
             // The helper's update (`jit_helper_coll_write`: the value, the
             // key for an `add`, a hole for a `delete`), which runs no code;
@@ -869,6 +897,103 @@ impl X64Assembler {
         self.code.push(u8::try_from(COLL_TRIES).expect("an imm8"));
         self.g_jcc(cc::AE, slow);
         self.jmp(fill);
+    }
+
+    /// [`coll_update`](Self::coll_update)'s `set` / `add` of an indexed
+    /// collection (from `hashed`, with `rcx` its heap slot, the receiver and
+    /// the method proved): the key looked up in line (`coll_hash_probe`; a
+    /// key found goes to `found`, with `rsi` its entry, as from the scan),
+    /// and a key it lacks appended and indexed as `Realm::coll_fast` would
+    /// do it: the entry (`-0` as `+0`, a `Set`'s value its key) pushed in
+    /// the entries' spare capacity, one live entry more, and the packed slot
+    /// (`hash32 << 32 | position + 1`) stored at the empty slot the probe
+    /// ended on, one used slot more, when the index need not grow first
+    /// (`CollIndex::insert_at`'s test). Either only when the write barrier
+    /// has nothing to do for the key or the value (checked before the
+    /// probe). The result is the receiver. Anything
+    /// else to `probe` (the helper's update), with nothing done. Placed out
+    /// of line.
+    #[allow(clippy::too_many_arguments)]
+    fn coll_insert_indexed(
+        &mut self,
+        l: &JitLayout,
+        realm_off: i32,
+        w: CollWrite,
+        (recv, key, val, dst): (i32, i32, i32, i32),
+        (slots_ptr, slots_len): (usize, usize),
+        (hashed, found, probe, done): (Label, Label, Label, Label),
+    ) {
+        let c = coll_layout();
+        let (used, gone) = crate::realm::jit_coll_index_counts();
+        let off = |v: usize| i32::try_from(v).expect("small");
+        let (sp, sl, used, gone) = (off(slots_ptr), off(slots_len), off(used), off(gone));
+        debug_assert_eq!(c.entry_size, 16);
+        let absent = self.new_label();
+        let cold = self.cold_begin();
+        self.bind(hashed);
+        let kbase = self.frame_base(key);
+        let vbase = self.frame_base(val);
+        let rbase = self.frame_base(recv);
+        // Nothing for the barrier, first (`rcx` the container; the arena is
+        // pinned, so nothing else is clobbered): an update or append the
+        // barrier has work for is the helper's at once, with no probe here
+        // first (an old collection given young keys, the usual case of a
+        // String-keyed one).
+        if w == CollWrite::MapSet {
+            self.g_load(r::RAX, vbase, val);
+            self.p_barrier_check(l, realm_off, probe);
+        }
+        self.g_load(r::RAX, kbase, key);
+        self.p_barrier_check(l, realm_off, probe);
+        self.coll_key_bits(kbase, key);
+        self.coll_hash_probe(l, (sp, sl), (found, absent, probe));
+        // rdi = the collection's slot, r8 = its index, r10 = the key's 32
+        // hash bits, rdx = the empty slot the probe ended on.
+        self.bind(absent);
+        // (used + gone + 1) * 2 <= the slot count: no growth.
+        self.g_load(r::RAX, r::R8, used);
+        self.g_add_mem(r::RAX, r::R8, gone);
+        self.g_lea(r::RAX, r::RAX, 1);
+        self.g_add(r::RAX, r::RAX);
+        self.g_cmp_mem(r::RAX, r::R8, sl);
+        self.g_jcc(cc::A, probe);
+        // Spare capacity, and a position that packs in 32 bits.
+        self.g_load(r::R9, r::RDI, c.entries_len);
+        self.g_cmp_mem(r::R9, r::RDI, c.entries_cap);
+        self.g_jcc(cc::AE, probe);
+        self.g_cmp_imm(r::R9, 0x7fff_0000);
+        self.g_jcc(cc::AE, probe);
+        // (The barrier checks above still hold: no Rust code ran since.)
+        self.g_mov(r::RCX, r::RDI);
+        // The entry, at `entries[len]`.
+        self.coll_key_bits(kbase, key);
+        self.g_load(r::R9, r::RCX, c.entries_len);
+        self.g_mov(r::RAX, r::R9);
+        self.raw(&[0x48, 0xc1, 0xe0, 0x04]); // shl rax, 4
+        self.g_add_mem(r::RAX, r::RCX, c.entries_ptr);
+        self.g_store(r::RAX, c.entry_key, r::R11);
+        if w == CollWrite::MapSet {
+            self.g_load(r::RSI, vbase, val);
+            self.g_store(r::RAX, c.entry_val, r::RSI);
+        } else {
+            self.g_store(r::RAX, c.entry_val, r::R11);
+        }
+        // The slot: hash32 << 32 | (position + 1).
+        self.g_lea(r::RSI, r::R9, 1);
+        self.g_mov(r::RAX, r::R10);
+        self.raw(&[0x48, 0xc1, 0xe0, 0x20]); // shl rax, 32
+        self.raw(&[0x48, 0x09, 0xf0]); // or rax, rsi
+        self.g_load(r::RSI, r::R8, sp);
+        self.raw(&[0x48, 0x89, 0x04, 0xd6]); // mov [rsi + rdx*8], rax
+        self.g_inc_mem(r::R8, used);
+        self.raw(&[0x49, 0xff, 0xc1]); // inc r9
+        self.g_store(r::RCX, c.entries_len, r::R9);
+        self.raw(&[0xff, 0x81]); // inc dword [rcx + disp32]
+        self.raw(&c.live.to_le_bytes());
+        self.g_load(r::RAX, rbase, recv);
+        self.store_rax(dst);
+        self.jmp(done);
+        self.cold_end(cold);
     }
 
     /// The read of a `Map.prototype` / `Set.prototype` method (`m.set`
