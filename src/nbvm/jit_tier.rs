@@ -2917,8 +2917,10 @@ pub(crate) fn jit_helper_exec_op(
             let v = regs[*src as usize];
             super::gen_fast::open(ctx, funcs, v)
                 .or_else(|| super::iter_fast::open_self_iterator(&ctx.realm, v))
-                .map(|n| {
-                    regs[*iter as usize] = v;
+                .map(|n| (v, n))
+                .or_else(|| super::iter_fast::open_collection(&mut ctx.realm, v))
+                .map(|(i, n)| {
+                    regs[*iter as usize] = i;
                     regs[*next as usize] = n;
                     Ok(())
                 })

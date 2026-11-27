@@ -1087,6 +1087,10 @@ pub struct VmArrayIterIntrinsics {
     /// was absent along that `%Array.prototype%`'s chain, every link of
     /// which is watched (so any change to their keys moves the epoch).
     pub concat_spread_absent: Option<(u64, u64)>,
+    /// `%SetIteratorPrototype%` and `%MapIteratorPrototype%`, once created.
+    pub set_iter_proto: Option<Handle>,
+    /// See [`Self::set_iter_proto`].
+    pub map_iter_proto: Option<Handle>,
 }
 
 /// A snapshot of a realm's intrinsic prototype pointers (the realm-wide
@@ -7024,6 +7028,31 @@ impl Realm {
         a.as_mut_slice()[start..end].fill(value);
         self.shade_stored(value);
         true
+    }
+
+    /// A live Map/Set Iterator over the (non-weak) collection `coll` (`kind`
+    /// 0 keys, 1 values, 2 entries), as the host's
+    /// `make_live_collection_iterator` makes it, once the host has made the
+    /// kind's iterator prototype (`None` before, and for any other cell).
+    pub(crate) fn new_live_collection_iterator(
+        &mut self,
+        coll: Handle,
+        kind: u8,
+    ) -> Option<Handle> {
+        if self.collection_is_weak(coll) {
+            return None;
+        }
+        let proto = if self.collection_is_set(coll)? {
+            self.vm_array_iter.set_iter_proto?
+        } else {
+            self.vm_array_iter.map_iter_proto?
+        };
+        let obj = self.new_object();
+        self.set_object_proto(obj, Some(proto));
+        self.set_hidden_property(obj, "\u{0}gcoll", NanBox::handle(coll.to_raw()));
+        let state = self.collection_iter_state(coll, kind);
+        self.set_hidden_property(obj, "\u{0}gcstate", NanBox::handle(state.to_raw()));
+        Some(obj)
     }
 
     /// A live Array Iterator over the array `arr` (`kind` 0 keys, 1 values,

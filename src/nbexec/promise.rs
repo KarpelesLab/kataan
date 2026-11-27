@@ -327,6 +327,13 @@ impl Interp {
             ai.iter_proto = Some(proto);
             ai.next_fn = Some(next);
         }
+        // And for the VM's Map/Set iterator creation (`native_call`).
+        if tag == "Set Iterator" {
+            self.realm.vm_array_iter_mut().set_iter_proto = Some(proto);
+        }
+        if tag == "Map Iterator" {
+            self.realm.vm_array_iter_mut().map_iter_proto = Some(proto);
+        }
         proto
     }
 

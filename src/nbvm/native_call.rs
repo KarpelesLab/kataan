@@ -146,6 +146,9 @@ enum FastOp {
     /// `Array.prototype.keys` / `values` / `entries` (the iterator's kind:
     /// 0 keys, 1 values, 2 entries).
     ArrIter(u8),
+    /// `Map.prototype` / `Set.prototype` (whether a Set's) `keys` / `values`
+    /// / `entries` (the iterator's kind, as for [`FastOp::ArrIter`]).
+    CollIter(bool, u8),
     /// `Array.prototype.lastIndexOf`.
     ArrLastIndexOf,
     /// `Array.prototype.reverse`.
@@ -442,6 +445,12 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"concat") => FastOp::ArrConcat,
         (N_ARRAY_PROTO_FN, b"fill") => FastOp::ArrFill,
         (N_ARRAY_PROTO_FN, b"at") => FastOp::ArrAt,
+        (N_MAP_PROTO_FN, b"keys") => FastOp::CollIter(false, 0),
+        (N_MAP_PROTO_FN, b"values") => FastOp::CollIter(false, 1),
+        (N_MAP_PROTO_FN, b"entries") => FastOp::CollIter(false, 2),
+        (N_SET_PROTO_FN, b"keys") => FastOp::CollIter(true, 0),
+        (N_SET_PROTO_FN, b"values") => FastOp::CollIter(true, 1),
+        (N_SET_PROTO_FN, b"entries") => FastOp::CollIter(true, 2),
         (N_ARRAY_PROTO_FN, b"keys") => FastOp::ArrIter(0),
         (N_ARRAY_PROTO_FN, b"values") => FastOp::ArrIter(1),
         (N_ARRAY_PROTO_FN, b"entries") => FastOp::ArrIter(2),
@@ -2284,6 +2293,14 @@ fn run_op(
                 return None;
             }
             recv
+        }
+        FastOp::CollIter(set, kind) => {
+            // `CreateMapIterator` / `CreateSetIterator` of a collection of the
+            // method's own kind (anything else is the host's TypeError).
+            if realm.collection_is_set(h) != Some(set) {
+                return None;
+            }
+            NanBox::handle(realm.new_live_collection_iterator(h, kind)?.to_raw())
         }
         FastOp::ArrIter(kind) => {
             // `CreateArrayIterator(O, kind)` of a real array: the host's live

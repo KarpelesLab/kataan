@@ -116,6 +116,45 @@ pub(super) fn open_self_iterator(realm: &Realm, v: NanBox) -> Option<NanBox> {
     )
 }
 
+/// `GetIterator(v)` of a Map or Set whose `@@iterator` is, along a chain of
+/// ordinary data properties, the intrinsic `entries` (a Map's) / `values`
+/// (a Set's) of its kind: the live iterator that method makes
+/// (`Realm::new_live_collection_iterator`) and its `next` (a data-property
+/// read). `None` (nothing made) for anything else, which the host's
+/// `GetIterator` then runs.
+pub(super) fn open_collection(realm: &mut Realm, v: NanBox) -> Option<(NanBox, NanBox)> {
+    let h = Handle::from_raw(v.as_handle()?);
+    let set = realm.collection_is_set(h)?;
+    if realm.collection_is_weak(h) {
+        return None;
+    }
+    let key = realm.vm_array_iter().iter_key.as_deref()?;
+    // A collection's own properties (in its auxiliary object) are not an
+    // ordinary object's: none of that key, then the walk from its prototype.
+    if realm.is_host_exotic(h)
+        || realm.accessor(h, key).is_some()
+        || realm.get_property(h, key).is_some()
+    {
+        return None;
+    }
+    let f = super::array_hof::chain_data(realm, realm.object_proto(h)?, key).ok()??;
+    let (id, name) = realm.bound_native_at(Handle::from_raw(f.as_handle()?))?;
+    let want: &[u8] = if set { b"values" } else { b"entries" };
+    let want_id = if set {
+        crate::nbexec::N_SET_PROTO_FN
+    } else {
+        crate::nbexec::N_MAP_PROTO_FN
+    };
+    if id != want_id || realm.string_leaf_bytes(name) != Some(want) {
+        return None;
+    }
+    let it = realm.new_live_collection_iterator(h, if set { 1 } else { 2 })?;
+    let next = super::array_hof::chain_data(realm, it, "next")
+        .ok()?
+        .unwrap_or(NanBox::undefined());
+    Some((NanBox::handle(it.to_raw()), next))
+}
+
 /// [`can_open`]'s body.
 fn can_open_array(realm: &mut Realm, v: NanBox) -> bool {
     let Some(h) = v.as_handle().map(Handle::from_raw) else {

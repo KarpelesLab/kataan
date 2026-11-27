@@ -10007,6 +10007,11 @@ fn run_frame_at_ic(
                     regs[*next as usize] = n;
                     continue;
                 }
+                if let Some((i, n)) = iter_fast::open_collection(&mut ctx.realm, v) {
+                    regs[*iter as usize] = i;
+                    regs[*next as usize] = n;
+                    continue;
+                }
                 match with_host(ctx, |h| h.get_iterator(v)) {
                     Some(Ok((i, n))) => {
                         regs[*iter as usize] = i;
