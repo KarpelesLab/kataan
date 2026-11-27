@@ -30,6 +30,7 @@ pub(crate) mod builtins_fast;
 pub(crate) mod coll_fast;
 mod coll_index;
 mod concat_fast;
+pub(crate) mod date_fields;
 mod fn_chain;
 mod forin_cache;
 pub use fn_chain::FnChain;

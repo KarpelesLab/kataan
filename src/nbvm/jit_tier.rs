@@ -5215,6 +5215,14 @@ pub(crate) fn jit_helper_construct(
                 return 0;
             }
         }
+        // `new Date(…)` of the intrinsic `Date` over Numbers.
+        {
+            let argv = super::ArgBuf::from_regs(regs, args);
+            if let Some(v) = ctx.realm.new_default_date(ctor_val, &argv) {
+                regs[*dst as usize] = v;
+                return 0;
+            }
+        }
         fill_construct_site(ctx, ctor_val, site);
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)

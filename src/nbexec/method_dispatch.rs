@@ -1803,20 +1803,23 @@ impl Interp {
         }
         // --- Date instance methods ---
         if let Some(ms) = self.realm.date_at(handle).filter(|_| !force_array_like) {
+            let resolved = core::mem::take(&mut self.date_method_resolved);
             // A user-overridden prototype method wins over the built-in dispatch
             // (e.g. `Date.prototype.toString = Object.prototype.toString`). If the
             // method resolves on the proto chain to anything other than a first-class
             // `Date.prototype` native, call that instead.
-            if let Some(m) = self.realm.object_proto(handle).and_then(|p| {
-                let mut cur = Some(p);
-                while let Some(c) = cur {
-                    if self.realm.has_own(c, method) {
-                        return self.realm.get_property(c, method);
+            if !resolved
+                && let Some(m) = self.realm.object_proto(handle).and_then(|p| {
+                    let mut cur = Some(p);
+                    while let Some(c) = cur {
+                        if self.realm.has_own(c, method) {
+                            return self.realm.get_property(c, method);
+                        }
+                        cur = self.realm.object_proto(c);
                     }
-                    cur = self.realm.object_proto(c);
-                }
-                None
-            }) && let Some(mh) = m.as_handle().map(Handle::from_raw)
+                    None
+                })
+                && let Some(mh) = m.as_handle().map(Handle::from_raw)
                 && self.realm.bound_native_at(mh).map(|(id, _)| id) != Some(N_DATE_PROTO_FN)
                 && self.realm.native_at(mh) != Some(N_DATE_TO_JSON)
                 && self.realm.native_at(mh) != Some(N_DATE_TO_PRIMITIVE)
@@ -1842,57 +1845,16 @@ impl Interp {
                 }
                 return Ok(Some(NanBox::handle(ih.to_raw())));
             }
-            // An invalid (NaN) date: every numeric getter is `NaN` (the field
-            // decomposition below would otherwise read garbage from `0`).
-            if !ms.is_finite()
-                && matches!(
-                    method,
-                    "getTime"
-                        | "valueOf"
-                        | "getFullYear"
-                        | "getUTCFullYear"
-                        | "getMonth"
-                        | "getUTCMonth"
-                        | "getDate"
-                        | "getUTCDate"
-                        | "getDay"
-                        | "getUTCDay"
-                        | "getHours"
-                        | "getUTCHours"
-                        | "getMinutes"
-                        | "getUTCMinutes"
-                        | "getSeconds"
-                        | "getUTCSeconds"
-                        | "getMilliseconds"
-                        | "getUTCMilliseconds"
-                        | "getTimezoneOffset"
-                        | "getYear"
-                )
-            {
-                return Ok(Some(NanBox::number(f64::NAN)));
+            // A numeric getter (`NaN` for an invalid date), shared with the
+            // call sites' lean form.
+            if let Some(g) = crate::realm::date_fields::DateGet::of(method) {
+                return Ok(Some(NanBox::number(g.get(ms))));
             }
             let t = ms as i64;
             let day = t.div_euclid(86_400_000);
             let tod = t.rem_euclid(86_400_000);
             let (y, mo, d) = crate::realm::civil_from_days(day);
             return Ok(Some(match method {
-                // The engine models all dates in UTC, so `getUTC*` aliases `get*`.
-                "getTime" | "valueOf" => NanBox::number(ms),
-                "getFullYear" | "getUTCFullYear" => NanBox::number(y as f64),
-                // Annex B.2.4.1 `getYear`: `YearFromTime(LocalTime(t)) - 1900`
-                // (the engine is UTC, so `LocalTime(t) == t`).
-                "getYear" => NanBox::number((y - 1900) as f64),
-                "getMonth" | "getUTCMonth" => NanBox::number((mo - 1) as f64), // 0-based
-                "getDate" | "getUTCDate" => NanBox::number(d as f64),
-                "getDay" | "getUTCDay" => {
-                    NanBox::number((day.rem_euclid(7) + 4).rem_euclid(7) as f64)
-                }
-                "getHours" | "getUTCHours" => NanBox::number((tod / 3_600_000) as f64),
-                "getMinutes" | "getUTCMinutes" => NanBox::number((tod / 60_000 % 60) as f64),
-                "getSeconds" | "getUTCSeconds" => NanBox::number((tod / 1000 % 60) as f64),
-                "getMilliseconds" | "getUTCMilliseconds" => NanBox::number((tod % 1000) as f64),
-                // The engine models all dates in UTC, so the local offset is 0.
-                "getTimezoneOffset" => NanBox::number(0.0),
                 // `toISOString` throws on an invalid date; `toJSON` returns null.
                 "toISOString" => {
                     if !ms.is_finite() {
@@ -2019,114 +1981,21 @@ impl Interp {
                 "setFullYear" | "setUTCFullYear" | "setMonth" | "setUTCMonth" | "setDate"
                 | "setUTCDate" | "setHours" | "setUTCHours" | "setMinutes" | "setUTCMinutes"
                 | "setSeconds" | "setUTCSeconds" | "setMilliseconds" | "setUTCMilliseconds" => {
-                    // The number of components this setter consumes, in order.
-                    let max_components = match method {
-                        "setHours" | "setUTCHours" => 4,
-                        "setFullYear" | "setUTCFullYear" | "setMinutes" | "setUTCMinutes" => 3,
-                        "setMonth" | "setUTCMonth" | "setSeconds" | "setUTCSeconds" => 2,
-                        _ => 1, // setDate / setMilliseconds
+                    let Some(set) = crate::realm::date_fields::DateSet::of(method) else {
+                        return Ok(None);
                     };
-                    // `setFullYear` works on an invalid date (treating the time as
-                    // +0); the others propagate NaN. The date value is read *before*
-                    // coercing the arguments.
-                    let is_full_year = matches!(method, "setFullYear" | "setUTCFullYear");
-                    let date_is_nan = !ms.is_finite();
                     // The primary component is always ToNumber'd (an absent argument
                     // is `undefined` → NaN); the trailing optional components only
                     // when actually supplied. Coercion is in order, exactly once
                     // each, even when the date is NaN (a later abrupt completion
-                    // still throws). `setHours()` with no args therefore yields NaN.
-                    let take = max_components.min(args.len().max(1));
+                    // still throws), and after the date value was read (`ms`).
+                    let take = set.max_components().min(args.len().max(1));
                     let mut comps = Vec::with_capacity(take);
                     for i in 0..take {
                         let num = self.coerce_to_number(arg(i))?;
                         comps.push(self.realm.to_number(num));
                     }
-                    if date_is_nan && !is_full_year {
-                        // Invalid date stays invalid; arguments were still coerced.
-                        return Ok(Some(NanBox::number(f64::NAN)));
-                    }
-                    // Decompose the (possibly zeroed, for setFullYear) current time.
-                    let (mut yy, mut mo0, mut dd) = (y, (mo as i64) - 1, d as i64);
-                    let mut hh = tod / 3_600_000;
-                    let mut mi = tod / 60_000 % 60;
-                    let mut ss = tod / 1000 % 60;
-                    let mut mss = tod % 1000;
-                    if is_full_year && date_is_nan {
-                        // Time treated as +0: all components reset to their epoch value.
-                        yy = 1970;
-                        mo0 = 0;
-                        dd = 1;
-                        hh = 0;
-                        mi = 0;
-                        ss = 0;
-                        mss = 0;
-                    }
-                    // Any NaN component makes the whole result NaN (TimeClip).
-                    let mut any_nan = false;
-                    // `limit` bounds each component so the `i64` combination below
-                    // cannot silently wrap. A finite-but-astronomical argument
-                    // (`setUTCFullYear(Number.MAX_VALUE, …)`) otherwise saturates on
-                    // `as i64` and yields a bogus finite timestamp; every limit here
-                    // is far outside the representable range (|t| ≤ 8.64e15 ms), so
-                    // exceeding one is exactly the spec's MakeDay/TimeClip NaN.
-                    let mut comp = |slot: &mut i64, idx: usize, limit: f64| {
-                        if let Some(&v) = comps.get(idx) {
-                            if v.is_nan() || !v.is_finite() || v > limit || v < -limit {
-                                any_nan = true;
-                            }
-                            *slot = v as i64;
-                        }
-                    };
-                    const YEAR_MAX: f64 = 1.0e7;
-                    const MONTH_MAX: f64 = 1.0e8;
-                    const DATE_MAX: f64 = 1.0e10;
-                    const HOUR_MAX: f64 = 1.0e11;
-                    const MIN_MAX: f64 = 1.0e13;
-                    const SEC_MAX: f64 = 1.0e14;
-                    const MS_MAX: f64 = 1.0e17;
-                    match method {
-                        "setFullYear" | "setUTCFullYear" => {
-                            comp(&mut yy, 0, YEAR_MAX);
-                            comp(&mut mo0, 1, MONTH_MAX);
-                            comp(&mut dd, 2, DATE_MAX);
-                        }
-                        "setMonth" | "setUTCMonth" => {
-                            comp(&mut mo0, 0, MONTH_MAX);
-                            comp(&mut dd, 1, DATE_MAX);
-                        }
-                        "setDate" | "setUTCDate" => comp(&mut dd, 0, DATE_MAX),
-                        "setHours" | "setUTCHours" => {
-                            comp(&mut hh, 0, HOUR_MAX);
-                            comp(&mut mi, 1, MIN_MAX);
-                            comp(&mut ss, 2, SEC_MAX);
-                            comp(&mut mss, 3, MS_MAX);
-                        }
-                        "setMinutes" | "setUTCMinutes" => {
-                            comp(&mut mi, 0, MIN_MAX);
-                            comp(&mut ss, 1, SEC_MAX);
-                            comp(&mut mss, 2, MS_MAX);
-                        }
-                        "setSeconds" | "setUTCSeconds" => {
-                            comp(&mut ss, 0, SEC_MAX);
-                            comp(&mut mss, 1, MS_MAX);
-                        }
-                        _ => comp(&mut mss, 0, MS_MAX), // setMilliseconds
-                    }
-                    if any_nan {
-                        self.realm.set_date_ms(handle, f64::NAN);
-                        return Ok(Some(NanBox::number(f64::NAN)));
-                    }
-                    // Normalize a possibly out-of-range month into the year, then
-                    // measure the day as an offset from the 1st (so out-of-range
-                    // day/hour/… values roll over via plain integer arithmetic).
-                    let yy2 = yy + mo0.div_euclid(12);
-                    let mo1 = (mo0.rem_euclid(12) + 1) as u32;
-                    let base_days = crate::realm::days_from_civil(yy2, mo1, 1) + (dd - 1);
-                    let nms = time_clip(
-                        (base_days * 86_400_000 + hh * 3_600_000 + mi * 60_000 + ss * 1000 + mss)
-                            as f64,
-                    );
+                    let nms = set.apply(ms, &comps);
                     self.realm.set_date_ms(handle, nms);
                     NanBox::number(nms)
                 }

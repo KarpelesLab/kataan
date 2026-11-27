@@ -40,12 +40,12 @@ use crate::heap::Handle;
 use crate::ic::PropertyCache;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::nbexec::{
-    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_GEN_NEXT, N_GEN_RETURN,
-    N_GEN_THROW, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN, N_NUMBER, N_NUMBER_PROTO_FN,
-    N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES, N_OBJECT_GET_OWN_NAMES,
-    N_OBJECT_GET_PROTO, N_OBJECT_HAS_OWN, N_OBJECT_KEYS, N_OBJECT_VALUES, N_REFLECT_GET_PROTO,
-    N_REFLECT_HAS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD, N_STRING_PROTO_FN,
-    N_WEAKMAP_PROTO_FN, N_WEAKREF_DEREF, N_WEAKSET_PROTO_FN,
+    N_ARRAY_IS_ARRAY, N_ARRAY_PROTO_FN, N_DATA_VIEW_PROTO_FN, N_DATE_PROTO_FN, N_GEN_NEXT,
+    N_GEN_RETURN, N_GEN_THROW, N_JSON_PARSE, N_JSON_STRINGIFY, N_MAP_PROTO_FN, N_NUMBER,
+    N_NUMBER_PROTO_FN, N_OBJ_PROTO_HASOWN, N_OBJECT_ASSIGN, N_OBJECT_CREATE, N_OBJECT_ENTRIES,
+    N_OBJECT_GET_OWN_NAMES, N_OBJECT_GET_PROTO, N_OBJECT_HAS_OWN, N_OBJECT_KEYS, N_OBJECT_VALUES,
+    N_REFLECT_GET_PROTO, N_REFLECT_HAS, N_REGEXP_PROTO_FN, N_SET_PROTO_FN, N_STATIC_METHOD,
+    N_STRING_PROTO_FN, N_WEAKMAP_PROTO_FN, N_WEAKREF_DEREF, N_WEAKSET_PROTO_FN,
 };
 use crate::realm::Realm;
 use crate::realm::builtins_fast::MethodSiteCache;
@@ -95,6 +95,10 @@ enum FastOp {
     WeakColl(CollOp),
     /// `WeakRef.prototype.deref`.
     WeakRefDeref,
+    /// A `Date.prototype` getter.
+    DateGet(crate::realm::date_fields::DateGet),
+    /// A `Date.prototype` component setter (served for Number arguments).
+    DateSet(crate::realm::date_fields::DateSet),
     /// `Object.prototype.hasOwnProperty`.
     ObjHasOwn,
     /// `RegExp.prototype.test` / `exec`: the resolved function called through
@@ -441,6 +445,13 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_SET_PROTO_FN, b"has") => FastOp::SetHas,
         (N_MAP_PROTO_FN, b"delete") => FastOp::MapDelete,
         (N_SET_PROTO_FN, b"delete") => FastOp::SetDelete,
+        (N_DATE_PROTO_FN, n) => match core::str::from_utf8(n) {
+            Ok(n) if let Some(g) = crate::realm::date_fields::DateGet::of(n) => FastOp::DateGet(g),
+            Ok(n) if let Some(st) = crate::realm::date_fields::DateSet::of(n) => {
+                FastOp::DateSet(st)
+            }
+            _ => FastOp::HostDirect,
+        },
         (N_WEAKMAP_PROTO_FN, b"get") => FastOp::WeakColl(CollOp::MapGet),
         (N_WEAKMAP_PROTO_FN, b"set") => FastOp::WeakColl(CollOp::MapSet),
         (N_WEAKMAP_PROTO_FN, b"has") => FastOp::WeakColl(CollOp::MapHas),
@@ -1940,6 +1951,20 @@ fn run_op(
             realm.weak_coll_fast(h, op, a, arg(1))?
         }
         FastOp::WeakRefDeref => realm.weak_ref_target(h)?,
+        FastOp::DateGet(g) => NanBox::number(g.get(realm.date_at(h)?)),
+        FastOp::DateSet(set) => {
+            // Number arguments (ToNumber the identity; an absent primary one
+            // is `undefined`'s NaN), the date value read before them.
+            let ms = realm.date_at(h)?;
+            let take = set.max_components().min(args.len().max(1));
+            let mut comps = [f64::NAN; 4];
+            for (i, c) in comps.iter_mut().enumerate().take(take.min(args.len())) {
+                *c = arg(i).as_number()?;
+            }
+            let nms = set.apply(ms, &comps[..take]);
+            realm.set_date_ms(h, nms);
+            NanBox::number(nms)
+        }
         FastOp::ObjHasOwn => NanBox::boolean(obj_has_own_fast(realm, h, arg(0))?),
         FastOp::StrSlice | FastOp::StrSubstring | FastOp::StrSubstr => {
             // A `Concat` is sliced by walking its tree when that is cheap (see

@@ -327,6 +327,12 @@ pub struct Interp {
     /// run the string algorithm: the method-dispatch delegate then does not look
     /// the symbol method up a second time (a getter / Proxy `get` saw two reads).
     string_symbol_checked: bool,
+    /// Set by the first-class `Date.prototype.<method>` call path, whose
+    /// method is the built-in itself (already resolved): the by-name dispatch
+    /// then runs it rather than re-resolving `<method>` on the receiver's
+    /// chain, which for a subclass overriding it (`super.getUTCDate()` in
+    /// its override) would call the override again, without end.
+    date_method_resolved: bool,
     /// The template-cache epoch of the currently executing eval body (0 at the top
     /// level / outside any eval). Set for the dynamic extent of one `run_eval_body`.
     eval_site_epoch: u64,
@@ -1304,7 +1310,7 @@ pub(crate) const N_OBJECT_ENTRIES: u16 = 19;
 pub(crate) const N_ARRAY_FROM: u16 = 20;
 const N_ARRAY_OF: u16 = 21;
 pub(crate) const N_PROMISE: u16 = 22;
-const N_DATE: u16 = 25;
+pub(crate) const N_DATE: u16 = 25;
 const N_REGEXP: u16 = 26;
 pub(crate) const N_MATH_POW: u16 = 28;
 pub(crate) const N_MATH_SIGN: u16 = 29;
@@ -1894,7 +1900,7 @@ const N_BIGINT_PROTO_FN: u16 = 240;
 /// (i.e. be a Date), else a `TypeError`; otherwise it re-dispatches through
 /// `call_method` so `Date.prototype.getTime.call(d)` and direct `d.getTime()`
 /// share one implementation.
-const N_DATE_PROTO_FN: u16 = 242;
+pub(crate) const N_DATE_PROTO_FN: u16 = 242;
 /// The `Date.prototype` methods exposed as first-class values.
 const DATE_PROTO_METHODS: &[&str] = &[
     "toTemporalInstant",
@@ -2775,7 +2781,7 @@ pub(crate) const N_MATH_CLZ32: u16 = 156;
 pub(crate) const N_MATH_IMUL: u16 = 157;
 const N_MATH_F16ROUND: u16 = 248;
 /// `Date.prototype[Symbol.toPrimitive]` (a named native, length 1).
-const N_DATE_TO_PRIMITIVE: u16 = 243;
+pub(crate) const N_DATE_TO_PRIMITIVE: u16 = 243;
 /// `Date.prototype.toJSON` — a generic method (length 1) callable on any object.
 const N_DATE_TO_JSON: u16 = 244;
 /// A first-class `String.prototype.<method>`: applies RequireObjectCoercible and
@@ -3142,6 +3148,7 @@ impl Interp {
             has_instance_key: None,
             tagged_template_cache: alloc::collections::BTreeMap::new(),
             string_symbol_checked: false,
+            date_method_resolved: false,
             eval_site_epoch: 0,
             eval_site_counter: 0,
             regexp_proto: None,

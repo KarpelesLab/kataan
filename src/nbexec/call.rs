@@ -759,9 +759,10 @@ impl Interp {
                         "Date.prototype.{name} is not a Date object"
                     )));
                 }
-                return Ok(self
-                    .call_method(this_val, &name, args)?
-                    .unwrap_or(NanBox::undefined()));
+                self.date_method_resolved = true;
+                let r = self.call_method(this_val, &name, args);
+                self.date_method_resolved = false;
+                return Ok(r?.unwrap_or(NanBox::undefined()));
             }
             // A first-class `Temporal.<Type>.prototype.<method>`: the `this` must
             // be a branded Temporal instance; route to the per-type logic.

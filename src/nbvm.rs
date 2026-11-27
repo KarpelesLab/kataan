@@ -11286,12 +11286,13 @@ fn run_frame_at_ic(
                     }
                     continue;
                 }
-                // `new Map()` / `new Set()` of the default constructors, and
-                // `new Set(array)`.
+                // `new Map()` / `new Set()` of the default constructors,
+                // `new Set(array)`, and `new Date(...)`.
                 if let Some(v) = ctx
                     .realm
                     .new_default_collection(c, &argv)
                     .or_else(|| coll_from::new_set_from_array(ctx, c, &argv))
+                    .or_else(|| ctx.realm.new_default_date(c, &argv))
                 {
                     regs[*dst as usize] = v;
                     continue;

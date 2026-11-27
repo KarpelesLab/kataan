@@ -53,14 +53,29 @@ fn enabled() -> bool {
 }
 
 /// Whether `v` is an operand this module converts: an ordinary object cell
-/// (not host-exotic) in a hosted single-realm run.
+/// (not host-exotic), or a Date owning no property (whose `[[Get]]` starts
+/// at its `[[Prototype]]`), in a hosted single-realm run.
 fn candidate(ctx: &Ctx, v: NanBox) -> bool {
     ctx.host.is_some()
         && !ctx.realm.multi_realm
         && v.as_handle().is_some_and(|h| {
             let h = Handle::from_raw(h);
-            ctx.realm.is_object_cell(h) && !ctx.realm.is_host_exotic(h)
+            !ctx.realm.is_host_exotic(h)
+                && (ctx.realm.is_object_cell(h)
+                    || (ctx.realm.date_at(h).is_some() && !ctx.realm.has_aux_object(h)))
         })
+}
+
+/// [`plain_get`] on a [`candidate`] receiver `o`.
+fn get(realm: &Realm, o: Handle, key: &str) -> Option<NanBox> {
+    if realm.is_object_cell(o) {
+        return plain_get(realm, o, key);
+    }
+    // A Date with no own property: the lookup continues at its prototype.
+    match realm.object_proto(o) {
+        Some(p) => plain_get(realm, p, key),
+        None => Some(NanBox::undefined()),
+    }
 }
 
 /// Whether the value `v` is an Object (for a conversion method's result).
@@ -113,9 +128,20 @@ pub(super) fn to_primitive(
     // 1.a-b: GetMethod(input, @@toPrimitive).
     let exotic = {
         let key = ctx.realm.to_primitive_key()?;
-        plain_get(&ctx.realm, o, key)?
+        get(&ctx.realm, o, key)?
     };
-    if !matches!(exotic.unpack(), Unpacked::Undefined | Unpacked::Null) {
+    let mut hint = hint;
+    if exotic
+        .as_handle()
+        .is_some_and(|f| ctx.realm.native_at(Handle::from_raw(f)) == Some(DATE_TO_PRIMITIVE))
+    {
+        // `Date.prototype[@@toPrimitive](hint)` (§21.4.4.45) on an Object:
+        // OrdinaryToPrimitive with `string` for "string" or "default", else
+        // `number` — its steps, run here.
+        if hint == Hint::Default {
+            hint = Hint::String;
+        }
+    } else if !matches!(exotic.unpack(), Unpacked::Undefined | Unpacked::Null) {
         // (A non-callable one is the host's TypeError.)
         if callable(&ctx.realm, exotic) != Some(true) {
             return None;
@@ -137,7 +163,7 @@ pub(super) fn to_primitive(
     };
     let mut ran = false;
     for name in order {
-        let method = match plain_get(&ctx.realm, o, name) {
+        let method = match get(&ctx.realm, o, name) {
             Some(m) => m,
             // A getter or an exotic object on the chain: the host's whole
             // conversion, while nothing has run; else this `[[Get]]`.
@@ -167,6 +193,14 @@ pub(super) fn to_primitive(
         {
             continue;
         }
+        // `%Date.prototype.valueOf%` / `getTime` of a Date: its time value.
+        if let Some(ms) = ctx.realm.date_at(o)
+            && method
+                .as_handle()
+                .is_some_and(|m| is_date_time_getter(&ctx.realm, m))
+        {
+            return Some(Ok(NanBox::number(ms)));
+        }
         ran = true;
         match call(ctx, funcs, regs, method, &[], v) {
             Ok(r) if !is_object(&ctx.realm, r) => return Some(Ok(r)),
@@ -193,6 +227,20 @@ fn call(
         return r;
     }
     call_closure_pub(ctx, funcs, regs, f, args, this)
+}
+
+/// `Date.prototype[@@toPrimitive]`'s native id.
+const DATE_TO_PRIMITIVE: u16 = crate::nbexec::N_DATE_TO_PRIMITIVE;
+
+/// Whether the function cell `m` is `%Date.prototype.valueOf%` or
+/// `%Date.prototype.getTime%` (thisTimeValue, no other step).
+fn is_date_time_getter(realm: &Realm, m: u64) -> bool {
+    realm
+        .bound_native_at(Handle::from_raw(m))
+        .is_some_and(|(id, name)| {
+            id == crate::nbexec::N_DATE_PROTO_FN
+                && matches!(realm.string_leaf_bytes(name), Some(b"valueOf" | b"getTime"))
+        })
 }
 
 /// `%Object.prototype.valueOf%`'s native id.
