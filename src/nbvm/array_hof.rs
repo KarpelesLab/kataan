@@ -306,7 +306,7 @@ pub(super) fn run(
     }
     let this_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
     #[cfg(all(feature = "jit", jit_native))]
-    if let Some(r) = run_direct(ctx, funcs, regs, recv, h, len, op, cb, this_arg) {
+    if let Some(r) = run_direct(ctx, funcs, regs, recv, h, len, op, cb, this_arg, args) {
         return Some(r);
     }
     // Publish the caller's registers (unless they are a GC root already)
@@ -340,7 +340,8 @@ pub(super) fn run(
     Some(r)
 }
 
-/// [`run`]'s lean lane for `forEach`, `map`, `filter`, `some` and `every`:
+/// [`run`]'s lean lane for `forEach`, `map`, `filter`, `some`, `every`, the
+/// `find` family and `reduce` / `reduceRight`:
 /// a caller whose window is a GC root already (on the register stack) and
 /// a callback whose compiled body is entered through its native-call entry
 /// (`jit_tier::DirectCallee`), the steps [`Loop::iterate`] takes with none of
@@ -357,13 +358,9 @@ fn run_direct(
     op: Hof,
     cb: NanBox,
     this_arg: NanBox,
+    args: &[NanBox],
 ) -> Option<Result<NanBox, VmError>> {
-    if !matches!(
-        op,
-        Hof::ForEach | Hof::Map | Hof::Filter | Hof::Some | Hof::Every
-    ) || !lean_on()
-        || !super::jit_tier::on_register_stack(ctx, regs)
-    {
+    if op == Hof::Sort || !lean_on() || !super::jit_tier::on_register_stack(ctx, regs) {
         return None;
     }
     let (fid, _) = ctx.realm.vm_function(Handle::from_raw(cb.as_handle()?))?;
@@ -379,7 +376,15 @@ fn run_direct(
     if op == Hof::Map {
         ctx.frame_shadow.reserve(len);
     }
-    let r = direct_steps(ctx, funcs, &direct, recv, h, len, op, cb, this_arg);
+    let r = match op {
+        Hof::Find | Hof::FindIndex | Hof::FindLast | Hof::FindLastIndex => {
+            direct_find(ctx, funcs, &direct, recv, h, len, op, cb, this_arg)
+        }
+        Hof::Reduce | Hof::ReduceRight => {
+            direct_reduce(ctx, funcs, &direct, recv, h, len, op, cb, args)
+        }
+        _ => direct_steps(ctx, funcs, &direct, recv, h, len, op, cb, this_arg),
+    };
     let r = r.map(|v| match op {
         Hof::Map | Hof::Filter => {
             let elems = ctx.frame_shadow.split_off(out);
@@ -445,6 +450,124 @@ fn direct_steps(
         Hof::Every => NanBox::boolean(true),
         _ => NanBox::undefined(),
     })
+}
+
+/// [`run_direct`]'s `find` / `findIndex` / `findLast` / `findLastIndex`
+/// (23.1.3.9-12): every index of `0..len` (descending for the last two)
+/// read with a plain `Get` — a present dense slot, else the host's
+/// (`element_general`) — and the callback called on it; the first truthy
+/// result decides. (`kValue` is the callee's argument, so a value a getter
+/// produced stays rooted across the call it is returned after.)
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn direct_find(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    direct: &super::jit_tier::DirectCallee,
+    recv: NanBox,
+    h: Handle,
+    len: usize,
+    op: Hof,
+    cb: NanBox,
+    this_arg: NanBox,
+) -> Result<NanBox, VmError> {
+    let back = matches!(op, Hof::FindLast | Hof::FindLastIndex);
+    let index = matches!(op, Hof::FindIndex | Hof::FindLastIndex);
+    for n in 0..len {
+        let k = if back { len - 1 - n } else { n };
+        let present = ctx
+            .realm
+            .array_elements(h)
+            .and_then(|e| e.get(k).copied())
+            .filter(|v| !v.is_hole());
+        let v = match present {
+            Some(v) => v,
+            None => element_general(ctx, recv, k, false)?.unwrap_or(NanBox::undefined()),
+        };
+        let a = [v, NanBox::number(k as f64), recv];
+        let r = match direct.call(ctx, funcs, cb, this_arg, &a) {
+            Some(r) => r?,
+            None => call_closure(ctx, funcs, cb, &a, this_arg)?,
+        };
+        if ctx.realm.truthy(r) {
+            return Ok(if index { NanBox::number(k as f64) } else { v });
+        }
+    }
+    Ok(if index {
+        NanBox::number(-1.0)
+    } else {
+        NanBox::undefined()
+    })
+}
+
+/// [`run_direct`]'s `reduce` / `reduceRight` (23.1.3.24-25): the accumulator
+/// (the initial value, else the first present element; none is a
+/// TypeError) folded over the present indices of `0..len`, each
+/// `HasProperty` + `Get` a present dense slot or the host's. The
+/// accumulator stays rooted on the frame shadow (the slot pushed here)
+/// while the host may run code between calls.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn direct_reduce(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    direct: &super::jit_tier::DirectCallee,
+    recv: NanBox,
+    h: Handle,
+    len: usize,
+    op: Hof,
+    cb: NanBox,
+    args: &[NanBox],
+) -> Result<NanBox, VmError> {
+    let right = op == Hof::ReduceRight;
+    let at = |n: usize| if right { len - 1 - n } else { n };
+    let slot = ctx.frame_shadow.len();
+    ctx.frame_shadow.push(NanBox::undefined());
+    let element = |ctx: &mut Ctx, k: usize| -> Result<Option<NanBox>, VmError> {
+        match ctx
+            .realm
+            .array_elements(h)
+            .and_then(|e| e.get(k).copied())
+            .filter(|v| !v.is_hole())
+        {
+            Some(v) => Ok(Some(v)),
+            None => element_general(ctx, recv, k, true),
+        }
+    };
+    let mut n = 0;
+    let mut acc = if args.len() >= 2 {
+        args[1]
+    } else {
+        loop {
+            if n >= len {
+                let e = vm_error(
+                    ctx,
+                    "TypeError",
+                    "Reduce of empty array with no initial value",
+                );
+                return Err(VmError::Thrown(e));
+            }
+            let k = at(n);
+            n += 1;
+            if let Some(v) = element(ctx, k)? {
+                break v;
+            }
+        }
+    };
+    while n < len {
+        let k = at(n);
+        n += 1;
+        ctx.frame_shadow[slot] = acc;
+        let Some(v) = element(ctx, k)? else {
+            continue;
+        };
+        let a = [acc, v, NanBox::number(k as f64), recv];
+        acc = match direct.call(ctx, funcs, cb, NanBox::undefined(), &a) {
+            Some(r) => r?,
+            None => call_closure(ctx, funcs, cb, &a, NanBox::undefined())?,
+        };
+    }
+    Ok(acc)
 }
 
 /// `HasProperty(O, k)` (when `probe`) then `Get(O, k)` of the array `recv`
