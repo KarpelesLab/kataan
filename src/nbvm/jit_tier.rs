@@ -3536,7 +3536,7 @@ impl DirectCallee {
     /// native call makes it (the caller published its own frame); `None`
     /// (nothing done) when the register stack has no room or the closure's
     /// captures are not all there.
-    #[inline]
+    #[inline(always)]
     pub(super) fn call(
         &self,
         ctx: &mut Ctx,
