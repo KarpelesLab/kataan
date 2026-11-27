@@ -2647,6 +2647,19 @@ fn vm_set_prop_mode(
     strict: bool,
     regs: Option<&[NanBox]>,
 ) -> Result<(), VmError> {
+    // `re.lastIndex = n`: OrdinarySet finds the RegExp's own writable data
+    // property (no descriptor of its own in the auxiliary object, the
+    // object not frozen) and writes it; a canonical index is the cell's slot.
+    if key == "lastIndex"
+        && let Some(h) = recv.as_handle().map(Handle::from_raw)
+        && ctx.realm.regexp_flags(h).is_some()
+        && let Some(n) = canonical_last_index(value)
+        && !ctx.realm.regex_aux_last_index_defined(h)
+        && !ctx.realm.is_frozen(h)
+    {
+        ctx.realm.set_regex_last_index(h, n);
+        return Ok(());
+    }
     // Inline-cache hit first: an in-place write to an existing own data slot of
     // an ordinary `Cell::Object` (`object_cached_set` declines a frozen object,
     // a read-only key and a dictionary object, and never adds a property).
@@ -8023,6 +8036,15 @@ fn vm_get_prop(
         {
             return Ok(NanBox::number(n as f64));
         }
+        // A RegExp's `lastIndex` is an own data property (made by
+        // RegExpAlloc, non-configurable): without a descriptor of its own in
+        // the auxiliary object, its value is the cell's slot.
+        if key == "lastIndex"
+            && ctx.realm.regexp_flags(h).is_some()
+            && !ctx.realm.regex_aux_last_index_defined(h)
+        {
+            return Ok(NanBox::number(ctx.realm.regex_last_index(h) as f64));
+        }
         if let Some(v) = ctx.realm.object_cached_get(h, key, cache) {
             return Ok(v);
         }
@@ -9371,6 +9393,22 @@ pub(crate) fn jit_helper_call_native(
 }
 }
 
+/// The `lastIndex` value `v` as the RegExp cell's compact slot holds it: a
+/// non-negative integer Number fitting uint32. `-0` is *not* canonical: the
+/// slot cannot carry its sign, and a non-global `exec` must leave
+/// `re.lastIndex` exactly as written.
+fn canonical_last_index(v: NanBox) -> Option<usize> {
+    v.as_number()
+        .filter(|n| {
+            n.is_finite()
+                && *n >= 0.0
+                && n.is_sign_positive()
+                && *n == (*n as u64 as f64)
+                && *n <= u32::MAX as f64
+        })
+        .map(|n| n as usize)
+}
+
 /// `regex.lastIndex = v` for the bytecode VM. `lastIndex` is an ordinary data
 /// property that may hold any value (it is only `ToLength`'d at `exec` time): a
 /// canonical non-negative integer (fitting uint32) is stored compactly in the
@@ -9379,21 +9417,12 @@ pub(crate) fn jit_helper_call_native(
 /// time, not at assignment). A non-writable own `lastIndex` is honored by the
 /// slow interpreter path; the VM hot path follows the common writable case.
 fn set_regex_last_index_value(realm: &mut Realm, handle: Handle, v: NanBox) {
-    // `-0` is *not* canonical: the compact `usize` field cannot carry its sign,
-    // and a non-global `exec` must leave `re.lastIndex` exactly as written.
-    let canonical = v.as_number().filter(|n| {
-        n.is_finite()
-            && *n >= 0.0
-            && n.is_sign_positive()
-            && *n == (*n as u64 as f64)
-            && *n <= u32::MAX as f64
-    });
-    match canonical {
+    match canonical_last_index(v) {
         Some(n) => {
             if realm.regex_aux_last_index_defined(handle) {
                 realm.set_property(handle, "lastIndex", v);
             }
-            realm.set_regex_last_index(handle, n as usize);
+            realm.set_regex_last_index(handle, n);
         }
         None => {
             // The materialized aux slot is the *same* own property as the
