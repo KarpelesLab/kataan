@@ -116,12 +116,6 @@ impl Realm {
     #[inline]
     pub(crate) fn add_str_str(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
         let (x, y) = (a.as_handle()?, b.as_handle()?);
-        let ra = self.heap.get_hot(Handle::from_raw(x))?.as_str()?;
-        let rb = self.heap.get_hot(Handle::from_raw(y))?.as_str()?;
-        if self.str_special && (self.aux_props.contains_key(&x) || self.aux_props.contains_key(&y))
-        {
-            return None;
-        }
         // Two short texts joined into one node: a recent join of the very
         // same two cells is handed out again (`str_str_memo`, the
         // `StrIntMemo` scheme keyed by both operands' handle bits), so a
@@ -129,24 +123,42 @@ impl Realm {
         // (`name += String.fromCharCode(c)`, each piece an interned unit
         // string and each prefix then itself a memoized result) allocates
         // nothing. Not while a string cell may carry an auxiliary object
-        // (`str_special`), nor during incremental marking.
+        // (`str_special`, which empties the memo for good), nor during
+        // incremental marking. Only small joins of two string cells are
+        // ever entered, and within the epoch both cells are still those, so
+        // a hit needs neither of them read.
+        let slot = memo_index(x, y);
+        let epoch = self.heap.epoch();
+        let mut probed = false;
+        if !self.jit_marking
+            && let Some(m) = self.str_str_memo.as_deref_mut()
+            && m.credit > 0
+            && m.epoch == epoch
+        {
+            let [ms, mk, mr] = m.ents[slot];
+            if ms == x && mk == y && mr != 0 {
+                m.credit = (m.credit + CREDIT_HIT).min(CREDIT_MAX);
+                return Some(NanBox::from_bits(mr));
+            }
+            probed = true;
+        }
+        let ra = self.heap.get_hot(Handle::from_raw(x))?.as_str()?;
+        let rb = self.heap.get_hot(Handle::from_raw(y))?.as_str()?;
+        if self.str_special && (self.aux_props.contains_key(&x) || self.aux_props.contains_key(&y))
+        {
+            return None;
+        }
         if !small_join_enabled() || !ra.small_join_fits(rb) {
             let joined = ra.try_concat(rb)?;
             return Some(NanBox::handle(self.heap.alloc(Cell::Str(joined)).to_raw()));
         }
         let memo = !self.str_special && !self.jit_marking && str_memo_enabled();
-        let slot = memo_index(x, y);
-        let epoch = self.heap.epoch();
         if memo && let Some(m) = self.str_str_memo.as_deref_mut() {
             if m.credit > 0 {
-                if m.epoch == epoch {
-                    let [ms, mk, mr] = m.ents[slot];
-                    if ms == x && mk == y && mr != 0 {
-                        m.credit = (m.credit + CREDIT_HIT).min(CREDIT_MAX);
-                        return Some(NanBox::from_bits(mr));
-                    }
+                // (A miss of the probe above, or a memo of an older epoch.)
+                if probed || m.epoch == epoch {
+                    m.credit -= 1;
                 }
-                m.credit -= 1;
             } else {
                 m.paused += 1;
                 if m.paused >= PAUSE {
