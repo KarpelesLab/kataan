@@ -17,7 +17,7 @@
 //!
 //! * program text of any kind is lexed (scripts, modules, `eval`,
 //!   `new Function`, …: every path that turns text into bytecode goes
-//!   through the lexer, see [`note_token`]) that names `caller` anywhere, an
+//!   through the lexer, see `note_token`) that names `caller` anywhere, an
 //!   `arguments` property (`x.arguments`, an object literal's or pattern's
 //!   `arguments` key), a `with` statement, a string or template literal
 //!   containing either word (code to `eval`, or a computed key), or `eval`,
