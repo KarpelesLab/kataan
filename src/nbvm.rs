@@ -2892,6 +2892,10 @@ fn vm_set_elem_mode(
     if !to_host && (key.as_number().is_none() || non_index_on_array) {
         // A string (or symbol) key is an ordinary property write: the static-key
         // store handles its setter, read-only and host cases.
+        if let Some(ks) = SymKey::of(&ctx.realm, key) {
+            let mut cache = PropertyCache::new();
+            return vm_set_prop_mode(ctx, funcs, recv, &ks, value, &mut cache, strict, regs);
+        }
         match vm_property_key(ctx, key, regs) {
             Ok(ks) => {
                 let mut cache = PropertyCache::new();
@@ -13216,6 +13220,49 @@ fn spread_plain_vm(ctx: &mut Ctx, target: NanBox, src: NanBox, excluded: &[Strin
     }
 }
 
+/// A Symbol's property-storage key (`"\0sym:<id>"`) built on the stack:
+/// what `vm_property_key` returns for a Symbol, for the computed accesses
+/// that only borrow it (`o[sym]`, `o[sym] = v`), so they allocate nothing.
+struct SymKey {
+    buf: [u8; 32],
+    len: usize,
+}
+
+impl SymKey {
+    /// The storage key of `key` when it is a Symbol.
+    fn of(realm: &Realm, key: NanBox) -> Option<Self> {
+        let id = realm.symbol_id(Handle::from_raw(key.as_handle()?))?;
+        let mut k = Self {
+            buf: [0; 32],
+            len: 0,
+        };
+        k.buf[..5].copy_from_slice(b"\0sym:");
+        let mut digits = [0u8; 20];
+        let (mut n, mut d) = (id, 0);
+        loop {
+            digits[d] = b'0' + (n % 10) as u8;
+            d += 1;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        for (i, c) in digits[..d].iter().rev().enumerate() {
+            k.buf[5 + i] = *c;
+        }
+        k.len = 5 + d;
+        Some(k)
+    }
+}
+
+impl core::ops::Deref for SymKey {
+    type Target = str;
+    fn deref(&self) -> &str {
+        // ASCII only (a NUL, `sym:` and digits).
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
 /// `ToPropertyKey(key)` as the VM's internal storage-key string. A primitive
 /// Symbol becomes the `"\0sym:<id>"` name the object layer stores symbol-keyed
 /// properties under; a String / Number / Boolean / null / undefined is its display
@@ -13226,8 +13273,8 @@ fn spread_plain_vm(ctx: &mut Ctx, target: NanBox, src: NanBox, excluded: &[Strin
 fn vm_property_key(ctx: &mut Ctx, key: NanBox, regs: Option<&[NanBox]>) -> Result<String, VmError> {
     if let Some(raw) = key.as_handle() {
         let h = Handle::from_raw(raw);
-        if let Some(id) = ctx.realm.symbol_id(h) {
-            return Ok(crate::shape::symbol_key(id));
+        if let Some(k) = SymKey::of(&ctx.realm, key) {
+            return Ok(String::from(&*k));
         }
         if !ctx.realm.is_string_handle(h) {
             // Hosted: the host runs the full ToPrimitive(key, string) once.
@@ -13420,14 +13467,23 @@ fn vm_get_elem_from(
             // ToPropertyKey: a Symbol keys on its `\0sym:` name; any other object
             // key needs the full ToPrimitive (its `@@toPrimitive`/`toString`, which
             // may be inherited or user-written), which the interpreter owns.
-            let ks = match vm_property_key(ctx, key, regs) {
-                Ok(ks) => ks,
-                // A hosted run hands the whole read to the host.
-                Err(_) if ctx.host.is_some() => return host_get(ctx, recv, key, regs),
-                Err(e) => return Err(e),
+            // (A Symbol's key is built on the stack.)
+            let sym = SymKey::of(&ctx.realm, key);
+            let owned;
+            let ks: &str = match &sym {
+                Some(k) => k,
+                None => {
+                    owned = match vm_property_key(ctx, key, regs) {
+                        Ok(ks) => ks,
+                        // A hosted run hands the whole read to the host.
+                        Err(_) if ctx.host.is_some() => return host_get(ctx, recv, key, regs),
+                        Err(e) => return Err(e),
+                    };
+                    &owned
+                }
             };
             // (A closure's owed `prototype` is made when first read.)
-            ctx.realm.materialize_fn_proto_for(handle, &ks);
+            ctx.realm.materialize_fn_proto_for(handle, ks);
             // A canonical numeric string key on an array (`arr["0"]`) reads the
             // element, like `arr[0]` — for a valid array index [0, 2**32−1); the
             // boundary value is an ordinary property.
@@ -13446,13 +13502,13 @@ fn vm_get_elem_from(
             {
                 // Computed `arr["length"]` / `str["length"]`.
                 Ok(NanBox::number(len as f64))
-            } else if let Some((getter, _)) = ctx.realm.accessor(handle, &ks)
+            } else if let Some((getter, _)) = ctx.realm.accessor(handle, ks)
                 && getter.as_handle().is_some()
             {
                 // A getter accessor under a (possibly numeric) string key — invoke
                 // it with the receiver as `this`.
                 call_closure_pub(ctx, funcs, regs, getter, &[], recv)
-            } else if let Some(v) = ctx.realm.get_property(handle, &ks) {
+            } else if let Some(v) = ctx.realm.get_property(handle, ks) {
                 Ok(v)
             } else if ctx.host.is_some() {
                 // Not an own property: the host walks the prototype chain (with
@@ -13460,7 +13516,7 @@ fn vm_get_elem_from(
                 // an inherited method reached by a computed key. An object key
                 // was already converted (its ToPropertyKey runs once).
                 let key = if is_object_value(&ctx.realm, key) {
-                    ctx.realm.key_value(&ks)
+                    ctx.realm.key_value(ks)
                 } else {
                     key
                 };
