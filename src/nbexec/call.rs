@@ -3975,6 +3975,11 @@ impl Interp {
             self.sort_run(left, bl, cmp, has_cmp, numeric)?;
             self.sort_run(right, br, cmp, has_cmp, numeric)?;
         }
+        // Halves already in order (a sorted or nearly sorted input): the
+        // merge would only copy them back. One comparison decides it.
+        if self.sort_compare(v[mid - 1], v[mid], cmp, has_cmp, numeric)? <= 0.0 {
+            return Ok(());
+        }
         let (mut i, mut j, mut k) = (0usize, mid, 0usize);
         while i < mid && j < n {
             if self.sort_compare(v[i], v[j], cmp, has_cmp, numeric)? <= 0.0 {

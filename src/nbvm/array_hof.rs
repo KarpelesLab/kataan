@@ -1135,8 +1135,8 @@ impl Loop<'_> {
 
     /// Stable merge sort of `v` (`buf` is same-length scratch): the same
     /// algorithm, and so the same comparator call sequence, as the host's
-    /// `Interp::sort_run` — insertion sort for short runs, and merges that take
-    /// from the left on ties.
+    /// `Interp::sort_run` — insertion sort for short runs, no merge for two
+    /// halves already in order, and merges that take from the left on ties.
     fn sort_run(
         &mut self,
         ctx: &mut Ctx,
@@ -1184,6 +1184,12 @@ impl Loop<'_> {
             let (bl, br) = buf.split_at_mut(mid);
             self.sort_run(ctx, left, bl)?;
             self.sort_run(ctx, right, br)?;
+        }
+        // Halves already in order (a sorted or nearly sorted input): the
+        // merge would only copy them back. One comparison decides it (as
+        // the host's `sort_run`).
+        if self.compare(ctx, v[mid - 1], v[mid])? <= 0.0 {
+            return Ok(());
         }
         let (mut i, mut j, mut k) = (0usize, mid, 0usize);
         while i < mid && j < n {
