@@ -2584,7 +2584,25 @@ impl Interp {
                     if y.is_negative() {
                         return Err(range_throw(self, "Exponent must be non-negative"));
                     }
-                    let e = y.to_i128().and_then(|v| u64::try_from(v).ok()).unwrap_or(0);
+                    let Some(e) = y.to_i128().and_then(|v| u64::try_from(v).ok()) else {
+                        // An exponent of 2^64 or more: only 0, 1 and -1 have a
+                        // power of a representable size (it was taken as 0,
+                        // making every such power 1).
+                        let p = if x.is_zero() {
+                            crate::bignum::BigInt::zero()
+                        } else if x.bit_len() == 1 {
+                            let odd = !y.bitand(&crate::bignum::BigInt::from_i128(1)).is_zero();
+                            if x.is_negative() && odd {
+                                x.clone()
+                            } else {
+                                crate::bignum::BigInt::from_i128(1)
+                            }
+                        } else {
+                            let m = self.new_str("Maximum BigInt size exceeded");
+                            return Err(ExecError::Throw(self.make_error(N_RANGE_ERROR, Some(m))));
+                        };
+                        return Ok(Some(val(self, p)));
+                    };
                     // Projected result size ≈ bit_len(x) × e. `try_pow` rejects
                     // before the (possibly multi-GB) allocation, else `2n ** 1e10n`
                     // OOMs. Belt and suspenders: the same cap is enforced here so
