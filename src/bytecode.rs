@@ -905,6 +905,23 @@ fn verify_op_with(
             reg(*iter)?;
             reg(*next)
         }
+        Op::CallSpreadMid {
+            dst,
+            callee,
+            this,
+            items,
+            src,
+            after,
+            ok,
+        } => {
+            reg(*dst)?;
+            reg(*callee)?;
+            reg(*this)?;
+            regs(items)?;
+            reg(*src)?;
+            regs(after)?;
+            reg(*ok)
+        }
         Op::ArrayUnpack {
             ok,
             src,
@@ -2118,6 +2135,24 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*iter, out);
             w_reg(*next, out);
         }
+        Op::CallSpreadMid {
+            dst,
+            callee,
+            this,
+            items,
+            src,
+            after,
+            ok,
+        } => {
+            w_u8(232, out);
+            w_reg(*dst, out);
+            w_reg(*callee, out);
+            w_reg(*this, out);
+            w_regs(items, out);
+            w_reg(*src, out);
+            w_regs(after, out);
+            w_reg(*ok, out);
+        }
         Op::ArrayUnpack {
             ok,
             src,
@@ -2999,6 +3034,15 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             done: r.reg()?,
             iter: r.reg()?,
             next: r.reg()?,
+        },
+        232 => Op::CallSpreadMid {
+            dst: r.reg()?,
+            callee: r.reg()?,
+            this: r.reg()?,
+            items: r.regs()?,
+            src: r.reg()?,
+            after: r.regs()?,
+            ok: r.reg()?,
         },
         231 => Op::ArrayUnpack {
             ok: r.reg()?,

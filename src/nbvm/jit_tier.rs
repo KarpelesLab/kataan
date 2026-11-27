@@ -2713,6 +2713,28 @@ pub(crate) fn jit_helper_exec_op(
                 })
             }
         },
+        // `f(...xs, a)` over a plain array: as `CallSpreadPlain` above.
+        Op::CallSpreadMid {
+            dst,
+            callee,
+            this,
+            items,
+            src,
+            after,
+            ok,
+        } => match super::plain_spread_mid_argv(ctx, regs, items, regs[*src as usize], after) {
+            None => {
+                regs[*ok as usize] = NanBox::boolean(false);
+                Some(Ok(()))
+            }
+            Some(argv) => {
+                let (f, t) = (regs[*callee as usize], regs[*this as usize]);
+                call_compiled_with(ctx, funcs, Some(regs), f, t, &argv).map(|r| {
+                    regs[*ok as usize] = NanBox::boolean(true);
+                    r.map(|v| regs[*dst as usize] = v)
+                })
+            }
+        },
         // An inlined spread's elements (its interpreter arm, which cannot
         // fail).
         Op::SpreadInto { ok, src, dsts } => {

@@ -587,6 +587,22 @@ pub enum Op {
         src: Reg,
         ok: Reg,
     },
+    /// `f(items…, ...src, after…)` when spreading `src` runs no code (as for
+    /// [`Op::CallSpreadPlain`]): `dst = callee.call(this, items…,
+    /// ...elements, after…)` and `ok = true`; otherwise nothing happens and
+    /// `ok = false`, and the general spread call that follows runs (reading
+    /// `after` again, after the iteration). The `after` arguments are reads
+    /// that run no code and cannot throw (`Compiler::inert_arg`), so reading
+    /// them before a spread that runs no code is not observable.
+    CallSpreadMid {
+        dst: Reg,
+        callee: Reg,
+        this: Reg,
+        items: Vec<Reg>,
+        src: Reg,
+        after: Vec<Reg>,
+        ok: Reg,
+    },
     /// The spread of an inlined `f(...src)` (machine-code tier only, see
     /// `jit::inline`): when spreading `src` runs no code (as for
     /// [`Op::CallSpreadPlain`]) and yields exactly `dsts.len()` elements,
@@ -11403,6 +11419,45 @@ fn run_frame_at_ic(
                     Err(e) => handle_throw!(e),
                 }
             }
+            Op::CallSpreadMid {
+                dst,
+                callee,
+                this,
+                items,
+                src,
+                after,
+                ok,
+            } => {
+                let Some(argv) =
+                    plain_spread_mid_argv(ctx, regs, items, regs[*src as usize], after)
+                else {
+                    regs[*ok as usize] = NanBox::boolean(false);
+                    continue;
+                };
+                regs[*ok as usize] = NanBox::boolean(true);
+                let (f, t) = (regs[*callee as usize], regs[*this as usize]);
+                // The callee feedback the machine-code tier inlines from.
+                if let Some((fid, c)) = f
+                    .as_handle()
+                    .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+                {
+                    site_cache!(site).note_callee(u64::from(fid) | ((c.len() as u64) << 32));
+                }
+                let pub_mark = ctx.frame_shadow.len();
+                ctx.frame_shadow.extend_from_slice(regs);
+                ctx.frames_published += 1;
+                let r = call_closure(ctx, funcs, f, &argv, t);
+                ctx.frames_published -= 1;
+                ctx.frame_shadow.truncate(pub_mark);
+                match r {
+                    Ok(v) => regs[*dst as usize] = v,
+                    // (As for `CallSpreadPlain`: the general call names it.)
+                    Err(_) if !callee_is_callable(ctx, f) => {
+                        regs[*ok as usize] = NanBox::boolean(false);
+                    }
+                    Err(e) => handle_throw!(e),
+                }
+            }
             Op::ConstructSpread { dst, ctor, args } => {
                 let argv = spread_argv(ctx, regs[*args as usize])?;
                 let c = regs[*ctor as usize];
@@ -13658,6 +13713,22 @@ fn spread_argv(ctx: &Ctx, args: NanBox) -> Result<Vec<NanBox>, VmError> {
 /// its length is a present own data element, so iterating it reads exactly
 /// those values and runs no code. `None` otherwise (nothing observable has
 /// happened).
+/// [`plain_spread_argv`] followed by the values of the `after` registers
+/// ([`Op::CallSpreadMid`]).
+fn plain_spread_mid_argv(
+    ctx: &mut Ctx,
+    regs: &[NanBox],
+    items: &[Reg],
+    src: NanBox,
+    after: &[Reg],
+) -> Option<ArgBuf> {
+    let mut argv = plain_spread_argv(ctx, regs, items, src)?;
+    for r in after {
+        argv.extend_from_slice(core::slice::from_ref(&regs[*r as usize]));
+    }
+    Some(argv)
+}
+
 fn plain_spread_argv(ctx: &mut Ctx, regs: &[NanBox], items: &[Reg], src: NanBox) -> Option<ArgBuf> {
     // The common case — a plain array under a warm memo — in one heap lookup.
     if let Some(elems) = iter_fast::plain_spread_elems(&ctx.realm, src) {
@@ -21336,6 +21407,23 @@ impl Compiler {
         Ok(())
     }
 
+    /// Whether evaluating the argument `e` runs no code and cannot throw: a
+    /// literal (as [`inert_default`] takes it), or a read of a resolved
+    /// local binding that needs no TDZ check (see [`Op::CallSpreadMid`]).
+    fn inert_arg(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Ident(id) => {
+                !self.dyn_fn
+                    && !self.models_not(&id.name)
+                    && !self.env_resolves(&id.name)
+                    && self
+                        .lookup(&id.name)
+                        .is_some_and(|b| b.global.is_none() && !b.tdz)
+            }
+            _ => inert_default(e),
+        }
+    }
+
     /// Whether the array pattern `els` may take [`Op::ArrayUnpack`]: every
     /// element a hole, or a plain name (declared here as a local, or an
     /// assignment to a resolved local) with no default or an inert one
@@ -25393,6 +25481,82 @@ impl Compiler {
             }
             let rest = self.iterate_to_array(src)?;
             self.ops.push(Op::ArrayExtend { arr, src: rest });
+            self.ops.push(Op::CallSpread {
+                dst,
+                callee: f,
+                this,
+                args: arr,
+                name,
+            });
+            self.patch(done);
+            return Ok(dst);
+        }
+        // `f(items…, ...src, after…)`, the later arguments inert reads
+        // (`inert_arg`): the call made directly whenever spreading runs no
+        // code (`Op::CallSpreadMid`).
+        if !tail
+            && self.hosted
+            && let Some(at) = arguments
+                .iter()
+                .position(|a| matches!(a, crate::ast::Argument::Spread(_)))
+            && at + 1 < arguments.len()
+            && arguments.len() <= ARGBUF_INLINE
+            && arguments[..at]
+                .iter()
+                .all(|a| matches!(a, crate::ast::Argument::Item(_)))
+            && arguments[at + 1..].iter().all(|a| match a {
+                crate::ast::Argument::Item(e) => self.inert_arg(e),
+                crate::ast::Argument::Spread(_) => false,
+            })
+        {
+            let mut items = Vec::with_capacity(at);
+            for (i, a) in arguments[..at].iter().enumerate() {
+                let crate::ast::Argument::Item(e) = a else {
+                    return Err(CompileError::Unsupported("spread argument"));
+                };
+                let r = self.expr(e)?;
+                let r = self.pin_operand(r, args_may_assign(&arguments[i + 1..]));
+                items.push(r);
+            }
+            let crate::ast::Argument::Spread(se) = &arguments[at] else {
+                return Err(CompileError::Unsupported("spread argument"));
+            };
+            let src = self.expr(se)?;
+            let mut after = Vec::with_capacity(arguments.len() - at - 1);
+            for a in &arguments[at + 1..] {
+                let crate::ast::Argument::Item(e) = a else {
+                    return Err(CompileError::Unsupported("spread argument"));
+                };
+                after.push(self.expr(e)?);
+            }
+            let ok = self.alloc();
+            self.ops.push(Op::CallSpreadMid {
+                dst,
+                callee: f,
+                this,
+                items: items.clone(),
+                src,
+                after,
+                ok,
+            });
+            let slow = self.emit_jump_if_false(ok);
+            let done = self.emit_jump();
+            self.patch(slow);
+            let arr = self.alloc();
+            self.ops.push(Op::NewArray { dst: arr, len: 0 });
+            for v in items {
+                self.ops.push(Op::ArrayPush { arr, src: v });
+            }
+            let rest = self.iterate_to_array(src)?;
+            self.ops.push(Op::ArrayExtend { arr, src: rest });
+            // (Read again: after the iteration, which may have run code.)
+            for a in &arguments[at + 1..] {
+                let crate::ast::Argument::Item(e) = a else {
+                    return Err(CompileError::Unsupported("spread argument"));
+                };
+                let v = self.expr(e)?;
+                self.ops.push(Op::ArrayPush { arr, src: v });
+            }
             self.ops.push(Op::CallSpread {
                 dst,
                 callee: f,
