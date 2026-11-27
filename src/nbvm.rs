@@ -57,6 +57,7 @@ mod global_obj;
 pub(crate) use global_mirror::plan_body as plan_global_mirrors;
 #[cfg(all(feature = "jit", jit_native))]
 mod await_fast;
+mod coll_hof;
 mod gen_fast;
 mod iter_fast;
 #[cfg(all(feature = "jit", jit_native))]

@@ -153,6 +153,9 @@ enum FastOp {
     /// `Map.prototype` / `Set.prototype` (whether a Set's) `keys` / `values`
     /// / `entries` (the iterator's kind, as for [`FastOp::ArrIter`]).
     CollIter(bool, u8),
+    /// `Map.prototype.forEach` / `Set.prototype.forEach` (whether a Set's),
+    /// whose walk runs in the VM (`coll_hof`).
+    CollForEach(bool),
     /// `Array.prototype.lastIndexOf`.
     ArrLastIndexOf,
     /// `Array.prototype.reverse`.
@@ -451,6 +454,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"at") => FastOp::ArrAt,
         (N_ARRAY_PROTO_FN, b"toString") => FastOp::ArrToString,
         (N_NUMBER_PROTO_FN, b"toPrecision") => FastOp::NumToPrecision,
+        (N_MAP_PROTO_FN, b"forEach") => FastOp::CollForEach(false),
+        (N_SET_PROTO_FN, b"forEach") => FastOp::CollForEach(true),
         (N_MAP_PROTO_FN, b"keys") => FastOp::CollIter(false, 0),
         (N_MAP_PROTO_FN, b"values") => FastOp::CollIter(false, 1),
         (N_MAP_PROTO_FN, b"entries") => FastOp::CollIter(false, 2),
@@ -1666,6 +1671,10 @@ fn run_op(
         let argv = super::ArgBuf::from_regs(regs, args);
         return super::array_hof::run(ctx, funcs, regs, recv, op, &argv);
     }
+    if let FastOp::CollForEach(set) = op {
+        let argv = super::ArgBuf::from_regs(regs, args);
+        return super::coll_hof::for_each(ctx, funcs, regs, recv, h, set, &argv);
+    }
     // A RegExp and a VM function: the replacer calls run here
     // (`str_replace`).
     if matches!(op, FastOp::StrReplace | FastOp::StrReplaceAll) {
@@ -1734,6 +1743,7 @@ fn run_op(
         | FastOp::PromiseResolve
         | FastOp::ObjAssign
         | FastOp::ArrayHof(_)
+        | FastOp::CollForEach(_)
         | FastOp::StrReplaceAll
         | FastOp::StrMatch
         | FastOp::GenResume(_)
