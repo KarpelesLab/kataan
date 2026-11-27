@@ -91,10 +91,10 @@ mod iter_reuse;
 mod key_probe;
 #[cfg(all(feature = "alloc", jit_native))]
 mod key_reuse;
-#[cfg(test)]
-mod numeric_diff_tests;
 #[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod legacy_hl;
+#[cfg(test)]
+mod numeric_diff_tests;
 #[cfg(all(feature = "alloc", jit_native))]
 mod pin;
 #[cfg(all(feature = "alloc", jit_native))]
