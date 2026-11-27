@@ -300,6 +300,52 @@ pub struct ChainCache {
     /// `C.kind` with `kind` on a parent class), which `shapes` cannot describe:
     /// the links instead (see `Realm::fn_chain_get`). `None` otherwise.
     pub fn_links: Option<alloc::boxed::Box<crate::realm::FnChain>>,
+    /// The entry this one replaced, for a site whose receivers come in a few
+    /// layouts (a base-class method reached by its subclasses' instances, each
+    /// with a layout of its own): the walk tries each in turn, newest first
+    /// (at most [`CHAIN_WAYS`] in all).
+    pub alt: Option<alloc::boxed::Box<ChainCache>>,
+}
+
+/// How many entries a site's [`ChainCache`] list holds.
+pub const CHAIN_WAYS: usize = 4;
+
+impl ChainCache {
+    /// Whether any entry of the list is an accessor's.
+    #[must_use]
+    pub fn any_accessor(&self) -> bool {
+        let mut c = Some(self);
+        while let Some(e) = c {
+            if e.accessor {
+                return true;
+            }
+            c = e.alt.as_deref();
+        }
+        false
+    }
+
+    /// The list `old` as the tail of a new entry: its first
+    /// `CHAIN_WAYS - 1` entries that describe shaped chains (a closure's walk,
+    /// `fn_links`, is kept only at the head).
+    #[must_use]
+    pub fn keep_tail(
+        old: Option<alloc::boxed::Box<ChainCache>>,
+    ) -> Option<alloc::boxed::Box<ChainCache>> {
+        let mut out: alloc::vec::Vec<alloc::boxed::Box<ChainCache>> = alloc::vec::Vec::new();
+        let mut cur = old;
+        while let Some(mut e) = cur {
+            cur = e.alt.take();
+            if e.fn_links.is_none() && out.len() < CHAIN_WAYS - 1 {
+                out.push(e);
+            }
+        }
+        let mut tail = None;
+        while let Some(mut e) = out.pop() {
+            e.alt = tail;
+            tail = Some(e);
+        }
+        tail
+    }
 }
 
 impl PropertyCache {

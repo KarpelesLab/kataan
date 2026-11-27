@@ -7814,7 +7814,24 @@ impl Realm {
         key: &str,
         cache: &crate::ic::PropertyCache,
     ) -> Option<ChainHit> {
-        let chain = cache.chain.as_deref()?;
+        let mut entry = cache.chain.as_deref();
+        while let Some(chain) = entry {
+            if let Some(hit) = self.chain_entry_get(handle, key, chain) {
+                return Some(hit);
+            }
+            entry = chain.alt.as_deref();
+        }
+        None
+    }
+
+    /// [`chain_cached_get`](Self::chain_cached_get) of one entry of the
+    /// site's list.
+    fn chain_entry_get(
+        &self,
+        handle: Handle,
+        key: &str,
+        chain: &crate::ic::ChainCache,
+    ) -> Option<ChainHit> {
         let last = chain.shapes.len().checked_sub(1)?;
         if chain.absent {
             // Every object still lacks the key and the chain still ends here.
@@ -7883,7 +7900,7 @@ impl Realm {
             return;
         }
         cache.chain_fills += 1;
-        cache.chain = None;
+        let old = cache.chain.take();
         let mut shapes = Vec::new();
         let mut cur = handle;
         for _ in 0..8 {
@@ -7918,6 +7935,7 @@ impl Realm {
                             accessor: false,
                             absent: true,
                             fn_links: None,
+                            alt: crate::ic::ChainCache::keep_tail(old),
                         }));
                         return;
                     }
@@ -7929,6 +7947,7 @@ impl Realm {
                 accessor,
                 absent: false,
                 fn_links: None,
+                alt: crate::ic::ChainCache::keep_tail(old),
             }));
             return;
         }

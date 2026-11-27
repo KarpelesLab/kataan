@@ -15,7 +15,7 @@
 //! hands the whole conversion back to the host when nothing has run yet, and
 //! otherwise takes that one step through the host (`[[Get]]`, `Call`).
 
-use super::{Ctx, FnProto, HostError, VmError, call_closure_pub, vm_error, with_host};
+use super::{Ctx, FnProto, HostError, VmError, vm_error, with_host};
 use crate::heap::Handle;
 use crate::nanbox::{NanBox, Unpacked};
 use crate::realm::{ChainHit, Realm};
@@ -147,13 +147,15 @@ pub(super) fn to_primitive(
             return None;
         }
         let h = NanBox::handle(ctx.realm.new_string(hint.text()).to_raw());
-        return Some(call(ctx, funcs, regs, exotic, &[h], v).and_then(|r| {
-            if is_object(&ctx.realm, r) {
-                Err(convert_error(ctx))
-            } else {
-                Ok(r)
-            }
-        }));
+        return Some(
+            super::call_closure_compiled(ctx, funcs, regs, exotic, &[h], v).and_then(|r| {
+                if is_object(&ctx.realm, r) {
+                    Err(convert_error(ctx))
+                } else {
+                    Ok(r)
+                }
+            }),
+        );
     }
     // 1.c-d: OrdinaryToPrimitive(input, hint), `default` taken as `number`.
     let order = if hint == Hint::String {
@@ -202,31 +204,13 @@ pub(super) fn to_primitive(
             return Some(Ok(NanBox::number(ms)));
         }
         ran = true;
-        match call(ctx, funcs, regs, method, &[], v) {
+        match super::call_closure_compiled(ctx, funcs, regs, method, &[], v) {
             Ok(r) if !is_object(&ctx.realm, r) => return Some(Ok(r)),
             Ok(_) => {}
             Err(e) => return Some(Err(e)),
         }
     }
     Some(Err(convert_error(ctx)))
-}
-
-/// `Call(f, this, args)`: a VM function with a compiled body entered
-/// directly (`jit_tier::call_compiled_with`), anything else as
-/// `call_closure_pub` calls it.
-fn call(
-    ctx: &mut Ctx,
-    funcs: &[FnProto],
-    regs: Option<&[NanBox]>,
-    f: NanBox,
-    args: &[NanBox],
-    this: NanBox,
-) -> Result<NanBox, VmError> {
-    #[cfg(all(feature = "jit", jit_native))]
-    if let Some(r) = super::jit_tier::call_compiled_with(ctx, funcs, regs, f, this, args) {
-        return r;
-    }
-    call_closure_pub(ctx, funcs, regs, f, args, this)
 }
 
 /// `Date.prototype[@@toPrimitive]`'s native id.

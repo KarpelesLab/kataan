@@ -3856,7 +3856,7 @@ pub(crate) fn compiled_getter(
 ) -> Option<Result<NanBox, VmError>> {
     // Only a site whose chain cache is armed on an accessor can hit one (and
     // only there is the repeated lookup below worth it).
-    if !cache.chain.as_ref().is_some_and(|c| c.accessor) {
+    if !cache.chain.as_ref().is_some_and(|c| c.any_accessor()) {
         return None;
     }
     let h = recv.as_handle().map(Handle::from_raw)?;
@@ -3900,7 +3900,7 @@ pub(crate) fn compiled_setter(
     cache: &crate::ic::PropertyCache,
     publish: Option<&[NanBox]>,
 ) -> Option<Result<NanBox, VmError>> {
-    if !cache.chain.as_ref().is_some_and(|c| c.accessor) {
+    if !cache.chain.as_ref().is_some_and(|c| c.any_accessor()) {
         return None;
     }
     let h = recv.as_handle().map(Handle::from_raw)?;

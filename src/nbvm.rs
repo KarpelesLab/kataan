@@ -2601,6 +2601,11 @@ fn vm_set_prop_mode(
                 && let Some((f, c)) = ctx.realm.vm_function(Handle::from_raw(s))
             {
                 cache.note_callee(u64::from(f) | ((c.len() as u64) << 32));
+                // The chain cache proves this accessor is what OrdinarySet
+                // finds (no object before its holder has the key, the
+                // receiver owns no accessor of that name): `[[Set]]` is the
+                // setter's call, with the receiver as `this`.
+                return call_closure_compiled(ctx, funcs, regs, setter, &[value], recv).map(|_| ());
             }
             if matches!(hit, Some(crate::realm::ChainHit::Absent))
                 && !typed_proto_numeric_key(&ctx.realm, h, key)
@@ -7738,6 +7743,26 @@ fn call_closure_pub(
     });
     ctx.frames_published -= 1;
     r
+}
+
+/// `Call(f, this, args)` for a VM operation on behalf of the frame whose
+/// register file is `regs` (as [`call_closure_pub`]): a VM function with a
+/// compiled body entered directly (`jit_tier::call_compiled_with`, as a
+/// compiled caller's call sequence enters it), anything else as
+/// [`call_closure_pub`] calls it.
+fn call_closure_compiled(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: Option<&[NanBox]>,
+    f: NanBox,
+    args: &[NanBox],
+    this: NanBox,
+) -> Result<NanBox, VmError> {
+    #[cfg(all(feature = "jit", jit_native))]
+    if let Some(r) = jit_tier::call_compiled_with(ctx, funcs, regs, f, this, args) {
+        return r;
+    }
+    call_closure_pub(ctx, funcs, regs, f, args, this)
 }
 
 /// The interpreter's real property **get** for a static string key

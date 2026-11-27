@@ -4,10 +4,11 @@
 //! byte the element kind), and a private field is stored on its object as an
 //! ordinary (hidden) data slot under that key. Objects built by one
 //! constructor add their fields in one order, so a site sees few layouts: a
-//! [`PrivCache`] remembers the last one, as the layout and the key's slot in
-//! it, plus the key itself, since the same site runs with another class
+//! [`PrivCache`] remembers the last few (a base-class method reached by its
+//! subclasses' instances sees one per subclass), as each layout and the
+//! key's slot in it, plus the key itself, since the same site runs with another class
 //! evaluation's name when a class is evaluated more than once. A hit — the
-//! object is an ordinary shaped object of the recorded layout, and the site's
+//! object is an ordinary shaped object of a recorded layout, and the site's
 //! private name is the recorded one, compared by its text — is exactly the
 //! slow path's: the layout fixes that the object has the key (so the brand
 //! check passes) and in which slot. Anything else (another layout, a
@@ -35,10 +36,18 @@ const PRIV_ACCESSOR: u8 = b'a';
 pub struct PrivCache(core::cell::Cell<Option<Box<PrivEntry>>>);
 
 struct PrivEntry {
-    shape: Rc<Shape>,
-    slot: u32,
+    /// The layouts seen with the key's slot in each, most recently filled
+    /// at `next - 1` (a site reached by the instances of a few classes that
+    /// share a base — each subclass's instances have their own layout —
+    /// keeps them all).
+    ways: [Option<(Rc<Shape>, u32)>; PRIV_WAYS],
+    /// Where the next layout goes (round robin).
+    next: u8,
     key: Box<[u8]>,
 }
+
+/// How many layouts a [`PrivCache`] keeps.
+const PRIV_WAYS: usize = 4;
 
 impl Clone for PrivCache {
     fn clone(&self) -> Self {
@@ -65,24 +74,39 @@ impl Realm {
             return None;
         };
         let shape = obj.shaped_shape()?;
-        let memo = cache.0.take();
+        let mut memo = cache.0.take();
         if let Some(e) = &memo
-            && Rc::ptr_eq(&e.shape, shape)
             && *e.key == *key
+            && let Some(slot) = e
+                .ways
+                .iter()
+                .flatten()
+                .find(|(s, _)| Rc::ptr_eq(s, shape))
+                .map(|(_, slot)| *slot)
         {
-            let slot = e.slot;
             cache.0.set(memo);
             return Some(slot);
         }
         let slot = shape.lookup(core::str::from_utf8(key).ok()?);
-        match slot {
-            Some(slot) => cache.0.set(Some(Box::new(PrivEntry {
-                shape: Rc::clone(shape),
-                slot,
-                key: key.into(),
-            }))),
-            None => cache.0.set(memo),
+        if let Some(slot) = slot {
+            match &mut memo {
+                Some(e) if *e.key == *key => {
+                    let i = usize::from(e.next) % PRIV_WAYS;
+                    e.ways[i] = Some((Rc::clone(shape), slot));
+                    e.next = ((i + 1) % PRIV_WAYS) as u8;
+                }
+                _ => {
+                    let mut ways: [Option<(Rc<Shape>, u32)>; PRIV_WAYS] = Default::default();
+                    ways[0] = Some((Rc::clone(shape), slot));
+                    memo = Some(Box::new(PrivEntry {
+                        ways,
+                        next: 1,
+                        key: key.into(),
+                    }));
+                }
+            }
         }
+        cache.0.set(memo);
         slot
     }
 

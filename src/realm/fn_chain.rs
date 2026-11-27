@@ -197,6 +197,7 @@ impl Realm {
                 slot: 0,
                 accessor,
                 absent: false,
+                alt: None,
                 fn_links: Some(alloc::boxed::Box::new(FnChain {
                     links,
                     holder_props,
