@@ -134,7 +134,7 @@ pub unsafe extern "C" fn kt_version_copy(buf: *mut c_char, len: *mut usize) -> c
         }
         // SAFETY: `buf` has at least `cap >= version.len()` writable bytes.
         unsafe {
-            core::ptr::copy_nonoverlapping(version.as_ptr(), buf as *mut u8, version.len());
+            core::ptr::copy_nonoverlapping(version.as_ptr(), buf.cast::<u8>(), version.len());
         }
         KtStatus::Ok
     })();
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn kt_eval(
         let bytes: &[u8] = if source.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+            unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_len) }
         };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
@@ -305,7 +305,7 @@ unsafe fn stage_dump(
         let bytes: &[u8] = if source.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+            unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_len) }
         };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
@@ -373,7 +373,7 @@ pub unsafe extern "C" fn kt_eval_capture(
         let bytes: &[u8] = if source.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+            unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_len) }
         };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
@@ -439,7 +439,7 @@ pub unsafe extern "C" fn kt_eval_with_buffer(
         let sbytes: &[u8] = if source.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+            unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_len) }
         };
         let Ok(src) = core::str::from_utf8(sbytes) else {
             return KtStatus::InvalidInput;
@@ -504,7 +504,7 @@ pub unsafe extern "C" fn kt_eval_with_external_buffer(
         let sbytes: &[u8] = if source.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+            unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_len) }
         };
         let Ok(src) = core::str::from_utf8(sbytes) else {
             return KtStatus::InvalidInput;
@@ -668,7 +668,7 @@ pub unsafe extern "C" fn kt_compile(
         let bytes: &[u8] = if source.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+            unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_len) }
         };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
@@ -714,7 +714,7 @@ pub unsafe extern "C" fn kt_load_bytecode(
         let bytes: &[u8] = if bytecode.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(bytecode as *const u8, bytecode_len) }
+            unsafe { core::slice::from_raw_parts(bytecode.cast::<u8>(), bytecode_len) }
         };
         let (text, ok) = match run_bytecode_to_string(bytes) {
             Ok(value) => (value, true),
@@ -760,7 +760,7 @@ pub unsafe extern "C" fn kt_snapshot(
         let bytes: &[u8] = if source.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(source as *const u8, source_len) }
+            unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_len) }
         };
         let Ok(src) = core::str::from_utf8(bytes) else {
             return KtStatus::InvalidInput;
@@ -809,7 +809,7 @@ pub unsafe extern "C" fn kt_restore(
         let bytes: &[u8] = if snapshot.is_null() {
             &[]
         } else {
-            unsafe { core::slice::from_raw_parts(snapshot as *const u8, snapshot_len) }
+            unsafe { core::slice::from_raw_parts(snapshot.cast::<u8>(), snapshot_len) }
         };
         let (text, ok) = match restore_to_string(bytes) {
             Ok(value) => (value, true),
@@ -846,7 +846,7 @@ unsafe fn copy_out(data: &[u8], out: *mut c_char, out_len: *mut usize) -> KtStat
     }
     // SAFETY: `out` has at least `cap >= data.len()` writable bytes.
     unsafe {
-        core::ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, data.len());
+        core::ptr::copy_nonoverlapping(data.as_ptr(), out.cast::<u8>(), data.len());
     }
     KtStatus::Ok
 }
@@ -987,10 +987,13 @@ mod tests {
         assert_eq!(len, crate::VERSION.len());
 
         // Copy into an adequately sized buffer.
-        let mut buf = alloc::vec![0i8; len];
+        let mut buf = alloc::vec![0 as c_char; len];
         let rc = unsafe { kt_version_copy(buf.as_mut_ptr(), &mut len) };
         assert_eq!(rc, KtStatus::Ok as i32);
-        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let bytes: alloc::vec::Vec<u8> = buf
+            .iter()
+            .map(|&b| u8::from_ne_bytes(b.to_ne_bytes()))
+            .collect();
         assert_eq!(core::str::from_utf8(&bytes).unwrap(), crate::VERSION);
 
         // NULL len pointer.
@@ -1010,7 +1013,7 @@ mod tests {
                 &mut len,
             )
         };
-        let mut buf = alloc::vec![0i8; len];
+        let mut buf = alloc::vec![0 as c_char; len];
         let rc2 = unsafe {
             kt_eval(
                 src.as_ptr() as *const c_char,
@@ -1021,7 +1024,10 @@ mod tests {
         };
         // The query returns BufferTooSmall (or the final status if len was 0).
         let _ = rc;
-        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let bytes: alloc::vec::Vec<u8> = buf
+            .iter()
+            .map(|&b| u8::from_ne_bytes(b.to_ne_bytes()))
+            .collect();
         let text = alloc::string::String::from_utf8(bytes).unwrap();
         (
             if rc2 == KtStatus::Ok as i32 {
@@ -1051,7 +1057,7 @@ mod tests {
     /// mutates `data` — re-running it would not be idempotent.
     #[cfg(feature = "std")]
     fn eval_buf(src: &str, data: &mut [u8]) -> (KtStatus, alloc::string::String) {
-        let mut buf = alloc::vec![0i8; 256];
+        let mut buf = alloc::vec![0 as c_char; 256];
         let mut len: usize = buf.len();
         let rc = unsafe {
             kt_eval_with_buffer(
@@ -1063,7 +1069,10 @@ mod tests {
                 &mut len,
             )
         };
-        let bytes: alloc::vec::Vec<u8> = buf[..len].iter().map(|&b| b as u8).collect();
+        let bytes: alloc::vec::Vec<u8> = buf[..len]
+            .iter()
+            .map(|&b| u8::from_ne_bytes(b.to_ne_bytes()))
+            .collect();
         let text = alloc::string::String::from_utf8(bytes).unwrap();
         let status = if rc == KtStatus::Ok as i32 {
             KtStatus::Ok
@@ -1107,7 +1116,7 @@ mod tests {
                 &mut len,
             )
         };
-        let mut buf = alloc::vec![0i8; len];
+        let mut buf = alloc::vec![0 as c_char; len];
         let rc = unsafe {
             kt_eval_with_external_buffer(
                 src.as_ptr() as *const c_char,
@@ -1119,7 +1128,10 @@ mod tests {
             )
         };
         assert_eq!(rc, KtStatus::Ok as i32);
-        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let bytes: alloc::vec::Vec<u8> = buf
+            .iter()
+            .map(|&b| u8::from_ne_bytes(b.to_ne_bytes()))
+            .collect();
         assert_eq!(alloc::string::String::from_utf8(bytes).unwrap(), "9");
         assert_eq!(data[5], 77); // the external region itself was mutated
     }
@@ -1135,7 +1147,7 @@ mod tests {
                 &mut len,
             )
         };
-        let mut buf = alloc::vec![0i8; len];
+        let mut buf = alloc::vec![0 as c_char; len];
         let rc = unsafe {
             kt_snapshot(
                 src.as_ptr() as *const c_char,
@@ -1144,7 +1156,10 @@ mod tests {
                 &mut len,
             )
         };
-        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let bytes: alloc::vec::Vec<u8> = buf
+            .iter()
+            .map(|&b| u8::from_ne_bytes(b.to_ne_bytes()))
+            .collect();
         let status = if rc == KtStatus::Ok as i32 {
             KtStatus::Ok
         } else {
@@ -1164,7 +1179,7 @@ mod tests {
                 &mut len,
             )
         };
-        let mut buf = alloc::vec![0i8; len];
+        let mut buf = alloc::vec![0 as c_char; len];
         let rc = unsafe {
             kt_restore(
                 snapshot.as_ptr() as *const c_char,
@@ -1173,7 +1188,10 @@ mod tests {
                 &mut len,
             )
         };
-        let bytes: alloc::vec::Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+        let bytes: alloc::vec::Vec<u8> = buf
+            .iter()
+            .map(|&b| u8::from_ne_bytes(b.to_ne_bytes()))
+            .collect();
         let status = if rc == KtStatus::Ok as i32 {
             KtStatus::Ok
         } else {
