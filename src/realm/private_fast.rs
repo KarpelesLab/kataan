@@ -33,42 +33,76 @@ const PRIV_ACCESSOR: u8 = b'a';
 /// One private-element site's memo (see the module docs). Empty when cold,
 /// and when copied (a fresh copy of the bytecode starts cold).
 #[derive(Default)]
-pub struct PrivCache(core::cell::Cell<Option<Box<PrivEntry>>>, JitPrivWay);
+pub struct PrivCache(
+    core::cell::Cell<Option<Box<PrivEntry>>>,
+    core::cell::OnceCell<Box<JitPrivWay>>,
+);
 
-/// A private-element site's read memo for compiled code (`jit::private`):
-/// the last field or method read it served — the private name's handle
-/// bits and the heap epoch they were taken under (while it is unchanged the
-/// handle still names that string), the layout and the slot. Compiled code
-/// reads it in place (the site's op lives in bytecode its code owns), so
-/// its fields are at fixed offsets; `shape` is the layout's `Rc` word as an
-/// object's shape field holds it (`None` is zero, which no object's is),
-/// keeping that layout alive while the memo names it.
+/// How many layouts a [`JitPrivWay`] keeps (a base-class method reached by
+/// its subclasses' instances sees one per subclass).
+pub const JIT_PRIV_WAYS: usize = 4;
+
+/// A private-element site's memo for compiled code (`jit.rs`, the inline
+/// `o.#x` / `o.#x = v`): the accesses it served last — the private name's
+/// handle bits and the heap epoch they were taken under (while it is
+/// unchanged the handle still names that string), and up to
+/// [`JIT_PRIV_WAYS`] layouts with the name's slot in each. Compiled code
+/// reads it in place (made when the site is compiled, at a fixed address),
+/// so its fields are at fixed offsets.
 #[derive(Default)]
 #[repr(C)]
 pub struct JitPrivWay {
     pub(crate) key_bits: core::cell::Cell<u64>,
     pub(crate) epoch: core::cell::Cell<u64>,
-    pub(crate) slot: core::cell::Cell<u64>,
+    pub(crate) ways: [JitPrivEntry; JIT_PRIV_WAYS],
+    next: core::cell::Cell<u64>,
+}
+
+/// One layout of a [`JitPrivWay`]: `shape` is the layout's `Rc` word as an
+/// object's shape field holds it (`None` is zero, which no object's is),
+/// keeping that layout alive while the memo names it.
+#[derive(Default)]
+#[repr(C)]
+pub struct JitPrivEntry {
     pub(crate) shape: core::cell::Cell<Option<Rc<Shape>>>,
+    pub(crate) slot: core::cell::Cell<u64>,
 }
 
 impl PrivCache {
-    /// The site's memo for compiled code.
+    /// The site's memo for compiled code (made on first use: only a
+    /// compiled copy of the site asks for it).
     #[must_use]
     pub fn jit_way(&self) -> &JitPrivWay {
-        &self.1
+        self.1.get_or_init(Box::default)
     }
 
-    /// Records in [`jit_way`](Self::jit_way) an access the site served:
-    /// name `k` (its handle under heap epoch `epoch`) in layout `shape` at
-    /// `slot`.
+    /// Records in [`jit_way`](Self::jit_way), when compiled code has one,
+    /// an access the site served: name `k` (its handle under heap epoch
+    /// `epoch`) in layout `shape` at `slot`.
     fn note_jit(&self, k: NanBox, epoch: u32, shape: &Rc<Shape>, slot: u32) {
-        let w = &self.1;
-        w.key_bits.set(k.to_bits());
-        w.epoch.set(u64::from(epoch));
-        w.slot.set(u64::from(slot));
-        let same = w.shape.take().filter(|s| Rc::ptr_eq(s, shape));
-        w.shape.set(Some(same.unwrap_or_else(|| Rc::clone(shape))));
+        let Some(w) = self.1.get() else {
+            return;
+        };
+        if w.key_bits.get() != k.to_bits() || w.epoch.get() != u64::from(epoch) {
+            for e in &w.ways {
+                drop(e.shape.take());
+            }
+            w.key_bits.set(k.to_bits());
+            w.epoch.set(u64::from(epoch));
+        }
+        for e in &w.ways {
+            let s = e.shape.take();
+            let hit = s.as_ref().is_some_and(|s| Rc::ptr_eq(s, shape));
+            e.shape.set(s);
+            if hit {
+                e.slot.set(u64::from(slot));
+                return;
+            }
+        }
+        let i = (w.next.get() as usize) % JIT_PRIV_WAYS;
+        w.ways[i].shape.set(Some(Rc::clone(shape)));
+        w.ways[i].slot.set(u64::from(slot));
+        w.next.set(((i + 1) % JIT_PRIV_WAYS) as u64);
     }
 }
 

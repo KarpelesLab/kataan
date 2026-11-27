@@ -49,7 +49,7 @@ mod lit_cells;
 pub(crate) use key_memo::{KeyMemoLayout, jit_key_memo_layout};
 pub use lit_cells::LitCells;
 mod private_fast;
-pub use private_fast::{JitPrivWay, PrivCache};
+pub use private_fast::{JIT_PRIV_WAYS, JitPrivEntry, JitPrivWay, PrivCache};
 mod field_cache;
 pub use field_cache::FieldCache;
 pub(crate) mod hidden_layout;

@@ -12107,6 +12107,36 @@ impl JitFunction {
                 }
             }};
         }
+        // (`rax` = the object's shape word, `r11` = a
+        // `JitPrivWay`): `rax` = the slot of the memo's way
+        // with that layout, else to `$miss`.)
+        #[allow(unused_macros)]
+        macro_rules! priv_way_slot {
+            ($miss:expr) => {{
+                use crate::realm::{JitPrivEntry as E, JitPrivWay as W};
+                use core::mem::{offset_of, size_of};
+                let have = a.new_label();
+                for i in 0..crate::realm::JIT_PRIV_WAYS {
+                    let at = offset_of!(W, ways) + i * size_of::<E>();
+                    let next = a.new_label();
+                    a.g_cmp_mem(
+                        call_seq::r::RAX,
+                        call_seq::r::R11,
+                        i32::try_from(at + offset_of!(E, shape)).ok()?,
+                    );
+                    a.g_jcc(call_seq::cc::NE, next);
+                    a.g_load(
+                        call_seq::r::RAX,
+                        call_seq::r::R11,
+                        i32::try_from(at + offset_of!(E, slot)).ok()?,
+                    );
+                    a.jmp(have);
+                    a.bind(next);
+                }
+                a.jmp($miss);
+                a.bind(have);
+            }};
+        }
         // `rcx = &Slot` of the receiver in `$recv` — the slot of a cell
         // passing `family_checks!($fam)` (so occupied) — for op `$at`, else
         // to `$miss`: through the receiver cache when its plan says so (a hit
@@ -16322,9 +16352,7 @@ impl JitFunction {
                             family_checks!(recv_cache::Family::Obj, slow);
                             a.g_movabs(R::R11, w);
                             a.mov_rax_at_rcx(layout.off_shape);
-                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, shape))?);
-                            a.g_jcc(call_seq::cc::NE, slow);
-                            a.g_load(R::RAX, R::R11, off(offset_of!(W, slot))?);
+                            priv_way_slot!(slow);
                             a.p_obj_slot_load_inline(&layout, slow, spill);
                             a.bind(got);
                             a.store_rax(disp(*dst));
@@ -16368,16 +16396,13 @@ impl JitFunction {
                             a.g_jcc(call_seq::cc::NE, slow);
                             walk_to_slot!(*obj, slow);
                             family_checks!(recv_cache::Family::Obj, slow);
-                            a.g_movabs(R::R11, w);
-                            a.mov_rax_at_rcx(layout.off_shape);
-                            a.g_cmp_mem(R::RAX, R::R11, off(offset_of!(W, shape))?);
-                            a.g_jcc(call_seq::cc::NE, slow);
                             a.load_rax(disp(*src));
                             a.p_barrier_check(&layout, helpers.call_layout.realm, slow);
                             a.g_movabs(R::R11, w);
-                            a.g_load(R::RAX, R::R11, off(offset_of!(W, slot))?);
+                            a.mov_rax_at_rcx(layout.off_shape);
+                            a.g_mov(R::R9, R::RAX);
+                            priv_way_slot!(slow);
                             a.g_load(R::R8, R::RBX, disp(*src));
-                            a.g_load(R::R9, R::R11, off(offset_of!(W, shape))?);
                             a.p_field_rep_dyn(&layout, (R::R8, R::R9, R::RAX, R::R10), slow);
                             a.p_obj_slot_addr(&layout, R::R11, slow);
                             a.load_rdx(disp(*src));
