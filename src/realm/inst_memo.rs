@@ -1,5 +1,5 @@
 //! The `instanceof` right-hand side memo: `x instanceof F` for a VM closure
-//! `F` with the default `[[HasInstance]]` reads `F.prototype` (an own data
+//! (or a built-in constructor, `Array`, `Map`, …) `F` with the default `[[HasInstance]]` reads `F.prototype` (an own data
 //! property of `F`'s auxiliary object) on every evaluation — a by-name
 //! lookup, after a by-name test that `F` owns no `@@hasInstance`. A few
 //! recently asked closures are remembered here with their auxiliary object,
@@ -60,7 +60,7 @@ impl Realm {
     #[inline]
     fn inst_memo_hit(&self, f: Handle, way: usize) -> Option<NanBox> {
         let w = &self.inst_memo.ways[way];
-        if w.f != f.to_raw() || self.multi_realm || !self.is_vm_function(f) {
+        if w.f != f.to_raw() || self.multi_realm || !self.is_plain_fn_cell(f) {
             return None;
         }
         let aux = *self.aux_props.get(&f.to_raw())?;

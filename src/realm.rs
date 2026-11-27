@@ -1928,7 +1928,18 @@ impl Realm {
             .filter(|_| !self.multi_realm)
     }
 
-    /// Whether `GetMethod(f, @@hasInstance)` on the VM function `f` is
+    /// Whether `f` is a VM function or a built-in function cell
+    /// (`Cell::Native`): a function whose own properties are its auxiliary
+    /// object's (the synthesized `name` / `length` / `prototype` aside).
+    #[must_use]
+    pub(crate) fn is_plain_fn_cell(&self, f: Handle) -> bool {
+        matches!(
+            self.heap.get(f),
+            Some(Cell::VmFunction { .. } | Cell::Native(_))
+        )
+    }
+
+    /// Whether `GetMethod(f, @@hasInstance)` on the VM function (or built-in) `f` is
     /// `%Function.prototype%[@@hasInstance]`: `f` owns no such property and
     /// its `[[Prototype]]` is `%Function.prototype%`, whose own one is
     /// non-writable and non-configurable (installed so at setup). Single-realm
@@ -1936,7 +1947,7 @@ impl Realm {
     #[must_use]
     pub(crate) fn inherits_default_has_instance(&self, f: Handle) -> bool {
         !self.multi_realm
-            && self.is_vm_function(f)
+            && self.is_plain_fn_cell(f)
             && self
                 .object_proto(f)
                 .is_some_and(|p| self.is_function_proto_intrinsic(p))
