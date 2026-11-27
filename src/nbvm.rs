@@ -21640,20 +21640,33 @@ impl Compiler {
                 }
             }};
         }
+        // A pattern whose targets are bindings it initializes, with no
+        // default or an inert one (`unpack_ok`, no assignment target), runs
+        // no code between its steps that could complete abruptly: only a
+        // step itself can throw, which leaves the iterator unclosed
+        // (IteratorStep's abrupt completion is not an IteratorClose). Such a
+        // pattern needs no handler, which keeps a function like
+        // `function head([first, second = 0, ...rest])` inlinable.
+        let guarded = unpack.is_none()
+            || els
+                .iter()
+                .any(|e| matches!(e, ArrayDstr::Assign(_) | ArrayDstr::AssignRest(_)));
         let exc = self.alloc();
         let handler = self.ops.len();
-        // A `return` leaving the destructuring (a generator resumed with
-        // `return()` at a `yield` in a default) closes its iterator.
-        self.finally_frames.push(FinallyFrame {
-            loop_len: self.loop_frames.len(),
-            handler_depth: self.handler_depth,
-            action: FinalAction::Close(iter, done),
-        });
-        self.ops.push(Op::PushHandler {
-            target: 0,
-            reg: exc,
-        });
-        self.handler_depth += 1;
+        if guarded {
+            // A `return` leaving the destructuring (a generator resumed with
+            // `return()` at a `yield` in a default) closes its iterator.
+            self.finally_frames.push(FinallyFrame {
+                loop_len: self.loop_frames.len(),
+                handler_depth: self.handler_depth,
+                action: FinalAction::Close(iter, done),
+            });
+            self.ops.push(Op::PushHandler {
+                target: 0,
+                reg: exc,
+            });
+            self.handler_depth += 1;
+        }
         for el in els {
             match el {
                 ArrayDstr::Hole => {
@@ -21700,9 +21713,11 @@ impl Compiler {
                 }
             }
         }
-        self.handler_depth -= 1;
-        self.finally_frames.pop();
-        self.ops.push(Op::PopHandler);
+        if guarded {
+            self.handler_depth -= 1;
+            self.finally_frames.pop();
+            self.ops.push(Op::PopHandler);
+        }
         // (Unpacked: an exhausted iterator, nothing to close.)
         let unpacked = unpack.map(|(not_ok, ..)| self.emit_jump_if_false(not_ok));
         self.ops.push(Op::IterClose {
@@ -21712,6 +21727,9 @@ impl Compiler {
         });
         if let Some(j) = unpacked {
             self.patch(j);
+        }
+        if !guarded {
+            return Ok(());
         }
         let skip = self.ops.len();
         self.ops.push(Op::Jump { target: 0 });

@@ -1232,6 +1232,35 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             *dst = reg(*dst);
             *home = reg(*home);
         }
+        // An array pattern's protocol steps (a fast-mode iterator keeps its
+        // array in the register after `iter`, which the renumbering keeps
+        // adjacent: both are the body's own).
+        Op::IterOpen { iter, next, src } => {
+            *iter = reg(*iter);
+            *next = reg(*next);
+            *src = reg(*src);
+        }
+        Op::IterNext {
+            dst,
+            done,
+            iter,
+            next,
+        }
+        | Op::IterRest {
+            dst,
+            done,
+            iter,
+            next,
+        } => {
+            *dst = reg(*dst);
+            *done = reg(*done);
+            *iter = reg(*iter);
+            *next = reg(*next);
+        }
+        Op::IterClose { iter, done, .. } => {
+            *iter = reg(*iter);
+            *done = reg(*done);
+        }
         // (A private element's site memo starts cold in the splice's copy.)
         Op::PrivateGet { dst, obj, key, .. } | Op::PrivateIn { dst, obj, key, .. } => {
             *dst = reg(*dst);
