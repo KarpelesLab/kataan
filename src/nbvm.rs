@@ -8138,7 +8138,7 @@ fn vm_set_prop(
 /// `cache` that site's `PropertyCache` (also owned by the `JitProto`), with no
 /// other live borrow of it during the call.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_get_prop(
+pub(crate) extern "sysv64" fn jit_helper_get_prop(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8188,7 +8188,7 @@ pub(crate) extern "C" fn jit_helper_get_prop(
 /// # Safety
 /// As [`jit_helper_get_prop`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_set_prop(
+pub(crate) extern "sysv64" fn jit_helper_set_prop(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8203,7 +8203,7 @@ pub(crate) extern "C" fn jit_helper_set_prop(
 /// running the interpreter's [`vm_init_prop`] through the site's persistent
 /// inline cache. Same contract as [`jit_helper_set_prop`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_init_prop(
+pub(crate) extern "sysv64" fn jit_helper_init_prop(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8236,7 +8236,7 @@ pub(crate) extern "C" fn jit_helper_init_prop(
 
 /// [`jit_helper_set_prop`] for strict-mode code (`Op::SetPropStrict`).
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_set_prop_strict(
+pub(crate) extern "sysv64" fn jit_helper_set_prop_strict(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8314,7 +8314,7 @@ fn jit_set_prop_impl(
 /// `ctx` must be the live `Ctx` the dispatcher passed (with `ctx.jit_funcs` set);
 /// the reentrancy is single-threaded (the native caller holds no live `&mut Ctx`).
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_get_elem(
+pub(crate) extern "sysv64" fn jit_helper_get_elem(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -8460,7 +8460,7 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
 /// # Safety
 /// As [`jit_helper_get_elem`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_get_elem_key(
+pub(crate) extern "sysv64" fn jit_helper_get_elem_key(
     ctx_raw: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -8488,7 +8488,7 @@ pub(crate) extern "C" fn jit_helper_get_elem_key(
 /// # Safety
 /// As [`jit_helper_get_elem`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_set_elem(
+pub(crate) extern "sysv64" fn jit_helper_set_elem(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -8529,7 +8529,7 @@ pub(crate) extern "C" fn jit_helper_set_elem(
 /// # Safety
 /// As [`jit_helper_get_elem`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
     // SAFETY: see `jit_helper_get_elem`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -8668,7 +8668,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
 /// single-threaded — the native caller holds no live `&mut Ctx` while this runs
 /// (as [`jit_helper_get_prop`]).
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_arena(
+pub(crate) extern "sysv64" fn jit_arena(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     mode: u64,
@@ -8752,7 +8752,7 @@ fn jit_finish(ctx: &mut Ctx, r: Result<NanBox, VmError>) -> u64 {
 /// Generic-JIT slow path for `-`/`*`/`/`/`%` (`GA_*` discriminant in `op`): runs the
 /// shared [`vm_arith`]. See [`jit_helper_add`] for the reentrancy/safety contract.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_arith(
+pub(crate) extern "sysv64" fn jit_helper_arith(
     ctx: *mut core::ffi::c_void,
     a: u64,
     b: u64,
@@ -8783,7 +8783,7 @@ pub(crate) extern "C" fn jit_helper_arith(
 /// Generic-JIT slow path for `Op::ValueBin` (`**`, bitwise, shifts, loose `==`/`!=`;
 /// `VB_*` discriminant in `op`): runs the shared [`vm_value_bin`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_value_bin(
+pub(crate) extern "sysv64" fn jit_helper_value_bin(
     ctx: *mut core::ffi::c_void,
     a: u64,
     b: u64,
@@ -8813,7 +8813,7 @@ pub(crate) extern "C" fn jit_helper_value_bin(
 
 /// Generic-JIT slow path for relational `<` (`Op::Lt`): runs the shared [`vm_lt`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
     // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -8836,7 +8836,7 @@ pub(crate) extern "C" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u
 /// decline (the caller then runs the interpreter's op). Runs no code,
 /// never throws.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_str_compare(
+pub(crate) extern "sysv64" fn jit_helper_str_compare(
     ctx: *mut core::ffi::c_void,
     a: u64,
     b: u64,
@@ -8870,7 +8870,11 @@ pub(crate) extern "C" fn jit_helper_str_compare(
 /// Generic-JIT slow path for strict equality `===` (`Op::StrictEq`): runs the shared
 /// [`vm_strict_eq`]. Never throws, so it always returns a boolean `NanBox`'s bits.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_strict_eq(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_strict_eq(
+    ctx: *mut core::ffi::c_void,
+    a: u64,
+    b: u64,
+) -> u64 {
     // SAFETY: as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -8884,7 +8888,7 @@ pub(crate) extern "C" fn jit_helper_strict_eq(ctx: *mut core::ffi::c_void, a: u6
 /// the boolean's bits, or `undefined`'s when it cannot tell there (the
 /// caller then runs the interpreter's op). Never throws.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_has_prop(
+pub(crate) extern "sysv64" fn jit_helper_has_prop(
     ctx: *mut core::ffi::c_void,
     key: u64,
     obj: u64,
@@ -8911,7 +8915,7 @@ pub(crate) extern "C" fn jit_helper_has_prop(
 /// (`Realm::truthy`) and returns `1` (truthy) or `0` (falsy). Never throws
 /// (ToBoolean calls no user code), so the caller needs no sentinel check.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_truthy(ctx: *mut core::ffi::c_void, v: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_truthy(ctx: *mut core::ffi::c_void, v: u64) -> u64 {
     // SAFETY: as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -8928,7 +8932,7 @@ pub(crate) extern "C" fn jit_helper_truthy(ctx: *mut core::ffi::c_void, v: u64) 
 /// `ctx` must be the live `Ctx` pointer the dispatcher passed to the native
 /// entry, with `ctx.jit_funcs` set to the running function table.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
     // SAFETY: single-threaded reentrancy — the native caller holds no live
     // `&mut Ctx` while this runs (it passed a raw pointer), so reborrowing it is
     // the same pattern as an ordinary recursive interpreter call.
@@ -8973,7 +8977,7 @@ pub(crate) extern "C" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: 
 /// # Safety
 /// As [`jit_helper_get_prop`].
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_call_native(
+pub(crate) extern "sysv64" fn jit_helper_call_native(
     ctx: *mut core::ffi::c_void,
     native: u64,
     argv: *const u64,

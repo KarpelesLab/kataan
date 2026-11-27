@@ -145,7 +145,7 @@ pub(crate) fn plan_body(bytecode: &[super::Op]) {
 /// pointer into the bytecode the calling `JitProto` owns, and the op's mirror
 /// target validated under the current global binding epoch.
 #[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "C" fn jit_helper_global_mirror(
+pub(crate) extern "sysv64" fn jit_helper_global_mirror(
     ctx: *mut core::ffi::c_void,
     op: u64,
     v: u64,

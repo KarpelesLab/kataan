@@ -1088,7 +1088,7 @@ const RESUME_THRESHOLD: u32 = 32;
 /// # Safety
 /// As [`jit_helper_exec_op`]; `pc` is the op's pc in the function's own
 /// numbering.
-pub(crate) extern "C" fn jit_helper_suspend(
+pub(crate) extern "sysv64" fn jit_helper_suspend(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -1353,7 +1353,7 @@ fn retarget(
 ///
 /// # Safety
 /// `ctx` the live `Ctx`; `word` the polling body's countdown word.
-pub(crate) extern "C" fn jit_helper_entry_poll(ctx: *mut core::ffi::c_void, word: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_entry_poll(ctx: *mut core::ffi::c_void, word: u64) -> u64 {
     // SAFETY: as `jit_helper_exec_op`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -1401,7 +1401,7 @@ pub(crate) extern "C" fn jit_helper_entry_poll(ctx: *mut core::ffi::c_void, word
 ///
 /// # Safety
 /// `ctx` must be the live, otherwise-unborrowed `Ctx` the body was entered with.
-pub(crate) extern "C" fn jit_helper_push_handler(
+pub(crate) extern "sysv64" fn jit_helper_push_handler(
     ctx: *mut core::ffi::c_void,
     target: u64,
     reg: u64,
@@ -1427,7 +1427,7 @@ pub(crate) extern "C" fn jit_helper_push_handler(
 ///
 /// # Safety
 /// As [`jit_helper_push_handler`].
-pub(crate) extern "C" fn jit_helper_push_handler_fast(
+pub(crate) extern "sysv64" fn jit_helper_push_handler_fast(
     ctx: *mut core::ffi::c_void,
     target: u64,
     reg: u64,
@@ -1453,7 +1453,7 @@ pub(crate) extern "C" fn jit_helper_push_handler_fast(
 ///
 /// # Safety
 /// As [`jit_helper_push_handler`].
-pub(crate) extern "C" fn jit_helper_handler_frame(
+pub(crate) extern "sysv64" fn jit_helper_handler_frame(
     ctx: *mut core::ffi::c_void,
     leave: u64,
     saved: u64,
@@ -1477,7 +1477,7 @@ pub(crate) extern "C" fn jit_helper_handler_frame(
 ///
 /// # Safety
 /// As [`jit_helper_push_handler`].
-pub(crate) extern "C" fn jit_helper_pop_handler(ctx: *mut core::ffi::c_void, _: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_pop_handler(ctx: *mut core::ffi::c_void, _: u64) -> u64 {
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -1497,7 +1497,7 @@ pub(crate) extern "C" fn jit_helper_pop_handler(ctx: *mut core::ffi::c_void, _: 
 /// # Safety
 /// As [`jit_helper_exec_op`]: `regs` is the activation's `n_regs`-long register
 /// file.
-pub(crate) extern "C" fn jit_helper_unwind(
+pub(crate) extern "sysv64" fn jit_helper_unwind(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -1560,7 +1560,7 @@ pub(crate) extern "C" fn jit_helper_unwind(
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
 /// pointer into the bytecode the calling `JitProto` owns.
-pub(crate) extern "C" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_global_ref(ctx: *mut core::ffi::c_void, op: u64) -> u64 {
     // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -1693,7 +1693,7 @@ fn global_store_ref(
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
 /// pointer into the bytecode the calling `JitProto` owns.
-pub(crate) extern "C" fn jit_helper_math1(
+pub(crate) extern "sysv64" fn jit_helper_math1(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     x: u64,
@@ -1726,7 +1726,7 @@ pub(crate) extern "C" fn jit_helper_math1(
 ///
 /// # Safety
 /// As [`jit_helper_site_fill`].
-pub(crate) extern "C" fn jit_helper_math_memo(
+pub(crate) extern "sysv64" fn jit_helper_math_memo(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     site: u64,
@@ -1758,7 +1758,7 @@ pub(crate) extern "C" fn jit_helper_math_memo(
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with and `site`
 /// the calling `JitProto`'s method site for the call.
-pub(crate) extern "C" fn jit_helper_site_fill(
+pub(crate) extern "sysv64" fn jit_helper_site_fill(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     site: u64,
@@ -1789,7 +1789,7 @@ pub(crate) extern "C" fn jit_helper_site_fill(
 ///
 /// # Safety
 /// As [`jit_helper_site_fill`].
-pub(crate) extern "C" fn jit_helper_direct_fill(
+pub(crate) extern "sysv64" fn jit_helper_direct_fill(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     site: u64,
@@ -1826,7 +1826,7 @@ pub(crate) extern "C" fn jit_helper_direct_fill(
 ///
 /// # Safety
 /// As [`jit_helper_site_fill`].
-pub(crate) extern "C" fn jit_helper_direct_call(
+pub(crate) extern "sysv64" fn jit_helper_direct_call(
     ctx: *mut core::ffi::c_void,
     kind: u64,
     a0: u64,
@@ -1850,7 +1850,7 @@ pub(crate) extern "C" fn jit_helper_direct_call(
 ///
 /// # Safety
 /// As [`jit_helper_site_fill`].
-pub(crate) extern "C" fn jit_helper_direct_has_own(
+pub(crate) extern "sysv64" fn jit_helper_direct_has_own(
     ctx: *mut core::ffi::c_void,
     o: u64,
     k: u64,
@@ -1878,7 +1878,7 @@ pub(crate) extern "C" fn jit_helper_direct_has_own(
 /// a string is itself, and a primitive is its text (`ToStr`) or itself
 /// (`ToStrLazy`, whose `Concat` makes the text). `0`, having done nothing, for
 /// any other value (and for a `+0` a lazy op keeps: its op does that too).
-pub(crate) extern "C" fn jit_helper_to_str(
+pub(crate) extern "sysv64" fn jit_helper_to_str(
     ctx: *mut core::ffi::c_void,
     v: u64,
     lazy: u64,
@@ -1905,7 +1905,7 @@ pub(crate) extern "C" fn jit_helper_to_str(
 /// With `memo` (the address of the site's three-word memo,
 /// `crate::jit::instof`, else `0`), an answer also records `f`, its
 /// `prototype` and the prototype epoch there, `f` watched first.
-pub(crate) extern "C" fn jit_helper_instance_of(
+pub(crate) extern "sysv64" fn jit_helper_instance_of(
     ctx: *mut core::ffi::c_void,
     x: u64,
     f: u64,
@@ -1975,7 +1975,7 @@ fn instance_of_memo_fill(realm: &mut crate::realm::Realm, f: NanBox, memo: u64) 
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with and `op` a
 /// pointer into the bytecode the calling `JitProto` owns.
-pub(crate) extern "C" fn jit_helper_switch_str(
+pub(crate) extern "sysv64" fn jit_helper_switch_str(
     ctx: *mut core::ffi::c_void,
     v: u64,
     op: u64,
@@ -2000,7 +2000,7 @@ pub(crate) extern "C" fn jit_helper_switch_str(
 /// method the compiled code proved that built-in and whose kind it checked
 /// (`Realm::coll_fast`, which may build the collection's hash index). The
 /// result's bits, or the hole's when it is not served here. Runs no code.
-pub(crate) extern "C" fn jit_helper_coll_lookup(
+pub(crate) extern "sysv64" fn jit_helper_coll_lookup(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -2036,7 +2036,7 @@ pub(crate) extern "C" fn jit_helper_coll_lookup(
 /// and whose kind it checked (`Realm::coll_fast`, which may build the
 /// collection's hash index and does the write barrier). The result's bits,
 /// or the hole's when it is not served here. Runs no code.
-pub(crate) extern "C" fn jit_helper_coll_write(
+pub(crate) extern "sysv64" fn jit_helper_coll_write(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -2067,7 +2067,7 @@ pub(crate) extern "C" fn jit_helper_coll_write(
 
 /// Proves (or finds it cannot) what an inline `s.charCodeAt(i)` relies on:
 /// see [`MethodSite::set_str_proof`](crate::jit::MethodSite::set_str_proof).
-pub(crate) extern "C" fn jit_helper_str_proof(
+pub(crate) extern "sysv64" fn jit_helper_str_proof(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     site: u64,
@@ -2129,7 +2129,10 @@ pub(crate) extern "C" fn jit_helper_str_proof(
 ///
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with.
-pub(crate) extern "C" fn jit_helper_new_object(ctx: *mut core::ffi::c_void, _unused: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_new_object(
+    ctx: *mut core::ffi::c_void,
+    _unused: u64,
+) -> u64 {
     // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -2142,7 +2145,7 @@ pub(crate) extern "C" fn jit_helper_new_object(ctx: *mut core::ffi::c_void, _unu
 ///
 /// # Safety
 /// As [`jit_helper_new_object`].
-pub(crate) extern "C" fn jit_helper_owe_fn_proto(ctx: *mut core::ffi::c_void, f: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_helper_owe_fn_proto(ctx: *mut core::ffi::c_void, f: u64) -> u64 {
     // SAFETY: see the function contract — a live, otherwise-unborrowed `Ctx`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -2161,7 +2164,7 @@ pub(crate) extern "C" fn jit_helper_owe_fn_proto(ctx: *mut core::ffi::c_void, f:
 ///
 /// # Safety
 /// As [`jit_helper_exec_op`].
-pub(crate) extern "C" fn jit_helper_new_array(
+pub(crate) extern "sysv64" fn jit_helper_new_array(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -2233,7 +2236,7 @@ pub(crate) extern "C" fn jit_helper_new_array(
 ///
 /// # Safety
 /// As [`jit_helper_exec_op`].
-pub(crate) extern "C" fn jit_helper_iter_next(
+pub(crate) extern "sysv64" fn jit_helper_iter_next(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -2305,7 +2308,7 @@ pub(crate) extern "C" fn jit_helper_iter_next(
 /// # Safety
 /// As [`jit_helper_exec_op`]; `cells` must be `Rc::as_ptr` of the body's
 /// live `LitCells` (the body's `JitProto` holds it while its code runs).
-pub(crate) extern "C" fn jit_helper_lit_string(
+pub(crate) extern "sysv64" fn jit_helper_lit_string(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -2349,7 +2352,7 @@ pub(crate) extern "C" fn jit_helper_lit_string(
 ///
 /// # Safety
 /// As [`jit_helper_exec_op`]; `site` must be the body's live `ForInSite`.
-pub(crate) extern "C" fn jit_helper_enum_keys(
+pub(crate) extern "sysv64" fn jit_helper_enum_keys(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -2409,7 +2412,7 @@ pub(crate) extern "C" fn jit_helper_enum_keys(
 /// # Safety
 /// As [`jit_helper_exec_op`]; `op` is followed by its pair in the same
 /// bytecode.
-pub(crate) extern "C" fn jit_helper_typeof_test(
+pub(crate) extern "sysv64" fn jit_helper_typeof_test(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -2467,7 +2470,7 @@ fn conv_call_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONV_CALL").is_none_or(|v| v != "0"))
 }
 
-pub(crate) extern "C" fn jit_helper_exec_op(
+pub(crate) extern "sysv64" fn jit_helper_exec_op(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -3785,7 +3788,7 @@ pub(crate) fn compiled_setter(
 /// # Safety
 /// As [`jit_helper_exec_op`]; `cache` is the site's `PropertyCache`, owned by
 /// the calling `JitProto` and not otherwise borrowed while this runs.
-pub(crate) extern "C" fn jit_helper_call_method(
+pub(crate) extern "sysv64" fn jit_helper_call_method(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -3903,7 +3906,7 @@ pub(crate) extern "C" fn jit_helper_call_method(
 ///
 /// # Safety
 /// As [`jit_helper_call_method`] (`call_site` is unused).
-pub(crate) extern "C" fn jit_helper_coll_call(
+pub(crate) extern "sysv64" fn jit_helper_coll_call(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -3950,7 +3953,7 @@ pub(crate) extern "C" fn jit_helper_coll_call(
 ///
 /// # Safety
 /// As [`jit_helper_coll_call`].
-pub(crate) extern "C" fn jit_helper_hof_call(
+pub(crate) extern "sysv64" fn jit_helper_hof_call(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4008,7 +4011,7 @@ pub(crate) extern "C" fn jit_helper_hof_call(
 ///
 /// # Safety
 /// As [`jit_helper_coll_call`].
-pub(crate) extern "C" fn jit_helper_concat(
+pub(crate) extern "sysv64" fn jit_helper_concat(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4053,7 +4056,7 @@ pub(crate) extern "C" fn jit_helper_concat(
 ///
 /// # Safety
 /// As [`jit_helper_coll_call`]; `site` is the op's `MethodSite`.
-pub(crate) extern "C" fn jit_helper_str_call(
+pub(crate) extern "sysv64" fn jit_helper_str_call(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4120,7 +4123,7 @@ pub(crate) extern "C" fn jit_helper_str_call(
 ///
 /// # Safety
 /// As [`jit_helper_call_method`]; `call_site` is the op's own `CallSite`.
-pub(crate) extern "C" fn jit_helper_gen_call(
+pub(crate) extern "sysv64" fn jit_helper_gen_call(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4137,7 +4140,7 @@ pub(crate) extern "C" fn jit_helper_gen_call(
 ///
 /// # Safety
 /// As [`jit_helper_gen_call`].
-pub(crate) extern "C" fn jit_helper_gen_call_reuse(
+pub(crate) extern "sysv64" fn jit_helper_gen_call_reuse(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4159,7 +4162,7 @@ pub(crate) extern "C" fn jit_helper_gen_call_reuse(
 ///
 /// # Safety
 /// As [`jit_helper_gen_call`] (`reuse` is not dereferenced).
-pub(crate) extern "C" fn jit_helper_gen_native_finish(
+pub(crate) extern "sysv64" fn jit_helper_gen_native_finish(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4218,7 +4221,7 @@ pub(crate) extern "C" fn jit_helper_gen_native_finish(
 ///
 /// # Safety
 /// `ctx_raw` is the live `Ctx`; `call_site` the op's own `CallSite`.
-pub(crate) extern "C" fn jit_helper_gen_native_result(
+pub(crate) extern "sysv64" fn jit_helper_gen_native_result(
     ctx_raw: *mut core::ffi::c_void,
     value: u64,
     call_site: *mut core::ffi::c_void,
@@ -4380,7 +4383,7 @@ fn gen_call(
 ///
 /// # Safety
 /// As [`jit_helper_call_method`].
-pub(crate) extern "C" fn jit_helper_call_with_method(
+pub(crate) extern "sysv64" fn jit_helper_call_with_method(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4492,7 +4495,7 @@ pub(crate) extern "C" fn jit_helper_call_with_method(
 ///
 /// # Safety
 /// As [`jit_helper_call_with_method`].
-pub(crate) extern "C" fn jit_helper_call_native_got(
+pub(crate) extern "sysv64" fn jit_helper_call_native_got(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4556,7 +4559,7 @@ pub(crate) extern "C" fn jit_helper_call_native_got(
 ///
 /// # Safety
 /// As [`jit_helper_get_prop_site`].
-pub(crate) extern "C" fn jit_helper_get_method_site(
+pub(crate) extern "sysv64" fn jit_helper_get_method_site(
     ctx_raw: *mut core::ffi::c_void,
     obj: u64,
     site: *mut crate::jit::MethodSite,
@@ -4622,7 +4625,7 @@ fn direct_jit(ctx: &mut Ctx, proto: &FnProto, id: usize) -> Option<Rc<crate::jit
 /// # Safety
 /// As [`jit_helper_exec_op`]; `site` is the op's `CallSite`, owned by the
 /// calling `JitProto` and not otherwise borrowed while this runs.
-pub(crate) extern "C" fn jit_helper_call_value(
+pub(crate) extern "sysv64" fn jit_helper_call_value(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -4765,7 +4768,7 @@ pub(crate) extern "C" fn jit_helper_call_value(
 /// # Safety
 /// As [`jit_helper_exec_op`]; `site` is null or the op's `CallSite`, owned by
 /// the calling `JitProto` and not otherwise borrowed while this runs.
-pub(crate) extern "C" fn jit_helper_tail_call(
+pub(crate) extern "sysv64" fn jit_helper_tail_call(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -5005,7 +5008,10 @@ fn fill_call_site_or_gen(ctx: &mut Ctx, callee: NanBox, site: &mut CallSite) -> 
 ///
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with.
-pub(crate) extern "C" fn jit_callee_info(ctx: *mut core::ffi::c_void, callee: u64) -> CalleeInfo {
+pub(crate) extern "sysv64" fn jit_callee_info(
+    ctx: *mut core::ffi::c_void,
+    callee: u64,
+) -> CalleeInfo {
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     let ctx = unsafe { &*(ctx as *const Ctx) };
@@ -5030,7 +5036,7 @@ pub(crate) extern "C" fn jit_callee_info(ctx: *mut core::ffi::c_void, callee: u6
 ///
 /// # Safety
 /// As [`jit_helper_call_value`].
-pub(crate) extern "C" fn jit_helper_construct(
+pub(crate) extern "sysv64" fn jit_helper_construct(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -5084,7 +5090,7 @@ pub(crate) extern "C" fn jit_helper_construct(
 ///
 /// # Safety
 /// `ctx` must be the live `Ctx` the compiled body was entered with.
-pub(crate) extern "C" fn jit_helper_new_coll(
+pub(crate) extern "sysv64" fn jit_helper_new_coll(
     ctx: *mut core::ffi::c_void,
     ctor: u64,
     argc: u64,
@@ -5111,7 +5117,7 @@ pub(crate) extern "C" fn jit_helper_new_coll(
 ///
 /// # Safety
 /// As [`jit_helper_call_value`].
-pub(crate) extern "C" fn jit_helper_call_spread(
+pub(crate) extern "sysv64" fn jit_helper_call_spread(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -5146,7 +5152,7 @@ pub(crate) extern "C" fn jit_helper_call_spread(
 ///
 /// # Safety
 /// As [`jit_helper_call_value`].
-pub(crate) extern "C" fn jit_helper_super_call(
+pub(crate) extern "sysv64" fn jit_helper_super_call(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -5274,7 +5280,7 @@ fn fill_construct_site(ctx: &mut Ctx, ctor: NanBox, site: &mut CallSite) {
 ///
 /// # Safety
 /// As [`jit_helper_call_value`].
-pub(crate) extern "C" fn jit_helper_ident_op(
+pub(crate) extern "sysv64" fn jit_helper_ident_op(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -5334,7 +5340,7 @@ pub(crate) extern "C" fn jit_helper_ident_op(
 ///
 /// # Safety
 /// As [`jit_helper_call_value`].
-pub(crate) extern "C" fn jit_helper_call_this(
+pub(crate) extern "sysv64" fn jit_helper_call_this(
     ctx_raw: *mut core::ffi::c_void,
     regs_raw: *mut u64,
     n_regs: usize,
@@ -5425,7 +5431,7 @@ fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
 /// # Safety
 /// `ctx` the live `Ctx` (with `jit_funcs` set), `out` writable, `site` the
 /// calling sequence's cache.
-pub(crate) extern "C" fn jit_construct_info(
+pub(crate) extern "sysv64" fn jit_construct_info(
     ctx_raw: *mut core::ffi::c_void,
     ctor: u64,
     nt: u64,
@@ -5714,7 +5720,7 @@ fn fill_construct_fast(
 ///
 /// # Safety
 /// `ctx` the live `Ctx`; `proto` the raw handle of a live object.
-pub(crate) extern "C" fn jit_construct_alloc(ctx: *mut core::ffi::c_void, proto: u64) -> u64 {
+pub(crate) extern "sysv64" fn jit_construct_alloc(ctx: *mut core::ffi::c_void, proto: u64) -> u64 {
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -5730,7 +5736,7 @@ pub(crate) extern "C" fn jit_construct_alloc(ctx: *mut core::ffi::c_void, proto:
 ///
 /// # Safety
 /// `ctx` the live `Ctx`.
-pub(crate) extern "C" fn jit_construct_result(
+pub(crate) extern "sysv64" fn jit_construct_result(
     ctx: *mut core::ffi::c_void,
     result: u64,
     this: u64,
@@ -5768,7 +5774,7 @@ pub(crate) extern "C" fn jit_construct_result(
 ///
 /// # Safety
 /// `ctx` the live `Ctx`.
-pub(crate) extern "C" fn jit_super_twice(ctx: *mut core::ffi::c_void) -> u64 {
+pub(crate) extern "sysv64" fn jit_super_twice(ctx: *mut core::ffi::c_void) -> u64 {
     // SAFETY: see the function contract.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -5793,7 +5799,7 @@ pub(crate) extern "C" fn jit_super_twice(ctx: *mut core::ffi::c_void) -> u64 {
 /// # Safety
 /// `ctx` the live `Ctx`; `site` the calling `JitProto`'s method site; `out`
 /// writable.
-pub(crate) extern "C" fn jit_method_info(
+pub(crate) extern "sysv64" fn jit_method_info(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     site: *mut crate::jit::MethodSite,
@@ -6189,7 +6195,7 @@ fn generic_twin(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
 ///
 /// # Safety
 /// As [`jit_helper_exec_op`]; `ops`/`n_ops` is the running bytecode.
-pub(crate) extern "C" fn jit_helper_backedge(
+pub(crate) extern "sysv64" fn jit_helper_backedge(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -6760,7 +6766,7 @@ pub(super) fn call_generic(
 ///
 /// # Safety
 /// `ctx` the live `Ctx`; `site` the calling `JitProto`'s site for this write.
-pub(crate) extern "C" fn jit_helper_set_prop_site(
+pub(crate) extern "sysv64" fn jit_helper_set_prop_site(
     ctx_raw: *mut core::ffi::c_void,
     obj: u64,
     site: *mut crate::jit::MethodSite,
@@ -6821,7 +6827,7 @@ pub(crate) extern "C" fn jit_helper_set_prop_site(
 /// # Safety
 /// `ctx` the live `Ctx`; `site`/`call` the calling `JitProto`'s caches for
 /// this read.
-pub(crate) extern "C" fn jit_helper_get_prop_site(
+pub(crate) extern "sysv64" fn jit_helper_get_prop_site(
     ctx_raw: *mut core::ffi::c_void,
     obj: u64,
     site: *mut crate::jit::MethodSite,

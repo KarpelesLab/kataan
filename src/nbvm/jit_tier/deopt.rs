@@ -27,7 +27,7 @@ use crate::jit::sink::{MatObj, SinkExits};
 /// `ctx` must be the live, otherwise-unborrowed `Ctx` the body was entered
 /// with, `regs` the activation's window and `info` the body's record (alive
 /// while its code runs).
-pub(crate) extern "C" fn jit_helper_deopt(
+pub(crate) extern "sysv64" fn jit_helper_deopt(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -451,7 +451,7 @@ fn retire_sinking(ctx: &mut Ctx, funcs: &[FnProto], info: &DeoptInfo) {
 ///
 /// # Safety
 /// As `jit_helper_get_method_site`.
-pub(crate) extern "C" fn jit_helper_get_virtual(
+pub(crate) extern "sysv64" fn jit_helper_get_virtual(
     ctx_raw: *mut core::ffi::c_void,
     obj: u64,
     site: *mut crate::jit::MethodSite,

@@ -48,7 +48,7 @@ fn probe(ctx: &Ctx, recv: u64, key: u64) -> Option<Result<NanBox, NanBox>> {
 ///
 /// # Safety
 /// As `jit_helper_get_elem`; `out` is a slot of the caller's native frame.
-pub(crate) extern "C" fn jit_helper_get_elem_acc(
+pub(crate) extern "sysv64" fn jit_helper_get_elem_acc(
     ctx_raw: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -87,7 +87,7 @@ pub(crate) extern "C" fn jit_helper_get_elem_acc(
 /// # Safety
 /// As `jit_helper_get_elem`; `site` is the op's own call site, owned by
 /// the calling `JitProto` and not otherwise borrowed while this runs.
-pub(crate) extern "C" fn jit_helper_get_elem_site(
+pub(crate) extern "sysv64" fn jit_helper_get_elem_site(
     ctx_raw: *mut core::ffi::c_void,
     recv: u64,
     key: u64,

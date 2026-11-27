@@ -67,8 +67,8 @@ fetch = ["host"]
 # pure-Rust `purecrypto` crate.
 crypto = ["host", "dep:purecrypto"]
 # The machine-code JIT (`ROADMAP.md` §2.1). On by default; it only exists on
-# x86-64 Linux (every use is cfg-gated on the `jit_x64` cfg that build.rs sets
-# for such targets), so elsewhere it is inert.
+# x86-64 Linux and Windows (every use is cfg-gated on the `jit_x64` cfg
+# that build.rs sets for such targets), so elsewhere it is inert.
 jit = ["std"]
 # A pure-Rust size-class pooling allocator (`kataan::pool_alloc`), installed
 # as the global allocator by the `kataan` CLI and the Test262 runner.

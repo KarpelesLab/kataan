@@ -6,12 +6,24 @@
 //! W^X (write, then flip to execute) and hands back a callable function pointer.
 //!
 //! **No foreign code.** Executable memory needs the OS, but we never link a C
-//! library: the `mmap`/`mprotect`/`munmap` calls are issued directly through the
-//! Linux x86-64 `syscall` instruction via `core::arch::asm!` — pure Rust over the
-//! kernel ABI. The whole thing is gated to the `jit_x64` cfg (x86-64 Linux; set
-//! by `build.rs`); on every other target `available()` is `false`
-//! and compilation returns `None`, so callers transparently fall back to the
-//! interpreter.
+//! library of our own. On Linux the `mmap`/`mprotect`/`munmap` calls are
+//! issued directly through the x86-64 `syscall` instruction via
+//! `core::arch::asm!` — pure Rust over the kernel ABI. Windows has no stable
+//! syscall ABI, so there the page calls go through the OS's own system
+//! interface (`kernel32`'s `VirtualAlloc`/`VirtualProtect`/`VirtualFree`),
+//! which `std` links on that target anyway (see `exec::os`). The whole thing
+//! is gated to the `jit_x64` cfg (x86-64 Linux and Windows; set by
+//! `build.rs`); on every other
+//! target `available()` is `false` and compilation returns `None`, so callers
+//! transparently fall back to the interpreter.
+//!
+//! **One calling convention everywhere.** Emitted code follows the System V
+//! AMD64 ABI on every OS: every Rust function it calls and every pointer
+//! through which Rust calls it is declared `extern "sysv64"` (on Linux that is
+//! `extern "C"`; on Windows it is not, and Rust then bridges to the native
+//! Win64 convention at those boundaries). Prologues touch each page of a frame
+//! of a page or more on Windows, whose thread stacks commit lazily behind a
+//! single guard page.
 //!
 //! `unsafe` is used — and *only* used — for the three irreducibly-unsafe steps a
 //! JIT requires: the raw syscalls, writing/executing mapped memory, and the
@@ -4112,7 +4124,7 @@ fn len_branch_enabled() -> bool {
     }
 }
 
-/// The generic-tier runtime-helper table: the `extern "C"` slow paths the emitted
+/// The generic-tier runtime-helper table: the `extern "sysv64"` slow paths the emitted
 /// code calls for `+`, property get, and property set. Passed to
 /// [`JitProto::compile_generic`].
 #[cfg(all(feature = "alloc", jit_x64))]
@@ -4267,7 +4279,7 @@ pub struct GenericHelpers {
     /// A native resumption's iterator result for a yielded value
     /// (`jit_helper_gen_native_result(ctx, value, call_site, reuse)`).
     pub gen_native_result:
-        extern "C" fn(*mut core::ffi::c_void, u64, *mut core::ffi::c_void, u64) -> u64,
+        extern "sysv64" fn(*mut core::ffi::c_void, u64, *mut core::ffi::c_void, u64) -> u64,
     /// A method call's callee lookup (`jit_method_info`).
     pub method_info: MethodHelper,
     /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
@@ -4401,12 +4413,12 @@ pub struct GenericHelpers {
 /// or the exit sentinel: see `jit_tier::jit_helper_deopt`).
 #[cfg(all(feature = "alloc", jit_x64))]
 pub type JitDeoptHelper =
-    extern "C" fn(*mut core::ffi::c_void, *mut u64, usize, *const DeoptInfo, u64) -> u64;
+    extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, usize, *const DeoptInfo, u64) -> u64;
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
 /// 0` (or the throw sentinel).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitCallMethodHelper = extern "C" fn(
+pub type JitCallMethodHelper = extern "sysv64" fn(
     *mut core::ffi::c_void,
     *mut u64,
     usize,
@@ -4418,7 +4430,7 @@ pub type JitCallMethodHelper = extern "C" fn(
 /// The runtime-helper ABI for `Op::CallKey`'s call half: `(ctx, regs, n_regs,
 /// op, site, method) -> 0` (or the throw sentinel).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitCallKeyHelper = extern "C" fn(
+pub type JitCallKeyHelper = extern "sysv64" fn(
     *mut core::ffi::c_void,
     *mut u64,
     usize,
@@ -4434,7 +4446,7 @@ pub const NO_HANDLER: u64 = u64::MAX;
 /// The runtime-helper ABI for the throw-exit unwinder: `(ctx, regs, n_regs) ->
 /// catch pc` (or [`NO_HANDLER`]).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitUnwindHelper = extern "C" fn(*mut core::ffi::c_void, *mut u64, usize) -> u64;
+pub type JitUnwindHelper = extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, usize) -> u64;
 
 /// The base pointer + length of the object heap's slot array, returned by the
 /// [`JitArenaHelper`]. `#[repr(C)]` with two integer-class eightbytes, so the
@@ -4454,7 +4466,7 @@ pub struct JitArena {
 /// `(ctx) -> JitArena`. A leaf, non-allocating read that never triggers GC, so the
 /// inline fast path stays GC-safe and realloc-safe.
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitArenaHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> JitArena;
+pub type JitArenaHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64) -> JitArena;
 
 /// `jit_arena` mode: a static-key property read on a shaped object.
 #[cfg(all(feature = "alloc", jit_x64))]
@@ -4664,40 +4676,46 @@ pub(crate) fn concat_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONCAT").is_none_or(|v| v != "0"))
 }
 
-pub type JitBinHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
+#[cfg(all(feature = "alloc", jit_x64))]
+pub type JitBinHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
 
 /// The runtime-helper ABI for a static-key property read through its site:
 /// `(ctx, obj, site, call site) -> NanBox bits` (or the throw sentinel).
 #[cfg(all(feature = "alloc", jit_x64))]
 pub type JitGetSiteHelper =
-    extern "C" fn(*mut core::ffi::c_void, u64, *mut MethodSite, *const CallSite) -> u64;
+    extern "sysv64" fn(*mut core::ffi::c_void, u64, *mut MethodSite, *const CallSite) -> u64;
 
 /// The runtime-helper ABI for a static-key property write through its site:
 /// `(ctx, obj, site, val, strict) -> undefined bits` (or the throw sentinel).
 #[cfg(all(feature = "alloc", jit_x64))]
 pub type JitSetSiteHelper =
-    extern "C" fn(*mut core::ffi::c_void, u64, *mut MethodSite, u64, u64) -> u64;
+    extern "sysv64" fn(*mut core::ffi::c_void, u64, *mut MethodSite, u64, u64) -> u64;
 
 /// The runtime-helper ABI for a computed element write: `(ctx, recv, key, val,
 /// strict) -> undefined bits` (or the throw sentinel).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitSetElemHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64, u64) -> u64;
+pub type JitSetElemHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, u64, u64) -> u64;
 
 /// The runtime-helper ABI for a truthiness test: `(ctx, v) -> 0 | 1`. Never throws.
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitTruthyHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> u64;
+pub type JitTruthyHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64) -> u64;
 
 /// The runtime-helper ABI for a property **get** (`JIT_DESIGN.md` Pass 2):
 /// `(ctx, obj, key_ptr, key_len, cache) -> NanBox bits` (or the throw sentinel).
 /// `cache` is an opaque pointer to the site's `PropertyCache`.
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitGetPropHelper =
-    extern "C" fn(*mut core::ffi::c_void, u64, *const u8, usize, *mut core::ffi::c_void) -> u64;
+pub type JitGetPropHelper = extern "sysv64" fn(
+    *mut core::ffi::c_void,
+    u64,
+    *const u8,
+    usize,
+    *mut core::ffi::c_void,
+) -> u64;
 
 /// The runtime-helper ABI for a property **set**: `(ctx, obj, key_ptr, key_len,
 /// cache, val) -> undefined bits` (or the throw sentinel).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitSetPropHelper = extern "C" fn(
+pub type JitSetPropHelper = extern "sysv64" fn(
     *mut core::ffi::c_void,
     u64,
     *const u8,
@@ -4755,12 +4773,12 @@ struct Baked {
 #[cfg(all(feature = "alloc", jit_x64))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AbiKind {
-    /// Integer ABI: `extern "C" fn(i64, …) -> i64` (an Int-tier body).
+    /// Integer ABI: `extern "sysv64" fn(i64, …) -> i64` (an Int-tier body).
     Int,
-    /// Float ABI: `extern "C" fn(f64, …) -> f64` (a Float-tier body). No intra-JIT
+    /// Float ABI: `extern "sysv64" fn(f64, …) -> f64` (a Float-tier body). No intra-JIT
     /// direct-call path targets it (the Float tier never emits calls).
     Float,
-    /// Generic (NanBox) ABI: `extern "C" fn(ctx, *const u64, usize) -> u64` (a
+    /// Generic (NanBox) ABI: `extern "sysv64" fn(ctx, *const u64, usize) -> u64` (a
     /// generic-tier body). A generic caller may direct-call another generic body.
     Generic,
 }
@@ -4787,19 +4805,20 @@ enum JitKind {
 /// exception the helper stashes the value in the context and returns
 /// `NanBox::jit_throw_bits`(crate::nanbox::NanBox::jit_throw_bits).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitAddHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
+pub type JitAddHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64) -> u64;
 
 /// The ABI of `nbvm::jit_tier::getkey::jit_helper_get_elem_acc`:
 /// `(ctx, recv, key, out) -> value`, `*out` the getter compiled code calls
 /// with the receiver as `this` (`KATAAN_JIT_GETKEY`), or `0` when the
 /// result is the read's value (or the throw sentinel).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitElemAccHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, *mut u64) -> u64;
+pub type JitElemAccHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, *mut u64) -> u64;
 
 /// The ABI of `nbvm::jit_tier::getkey::jit_helper_get_elem_site`:
 /// `(ctx, recv, key, call site) -> value`.
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitElemSiteHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, *mut CallSite) -> u64;
+pub type JitElemSiteHelper =
+    extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, *mut CallSite) -> u64;
 
 /// The runtime-helper ABI for running one bytecode op on the body's register
 /// file: `(ctx, regs, n_regs, op) -> 0` (or the throw sentinel, with the fault in
@@ -4807,7 +4826,7 @@ pub type JitElemSiteHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64, *mu
 /// compiled [`JitProto`].
 #[cfg(all(feature = "alloc", jit_x64))]
 pub type JitExecOpHelper =
-    extern "C" fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op) -> u64;
+    extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op) -> u64;
 
 /// The runtime-helper ABI for a loop back-edge poll: `(ctx, regs, n_regs, ops,
 /// n_ops, header) -> next countdown` (or the throw sentinel, or
@@ -4816,10 +4835,11 @@ pub type JitExecOpHelper =
 /// GC safepoint roots its constants).
 #[cfg(all(feature = "alloc", jit_x64))]
 /// [`GenericHelpers::entry_poll`]'s signature.
-pub type JitEntryPollHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> u64;
+pub type JitEntryPollHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64) -> u64;
 
 /// [`GenericHelpers::backedge`]'s signature.
-pub type JitBackedgeHelper = extern "C" fn(
+#[cfg(all(feature = "alloc", jit_x64))]
+pub type JitBackedgeHelper = extern "sysv64" fn(
     *mut core::ffi::c_void,
     *mut u64,
     usize,
@@ -4836,14 +4856,20 @@ pub type JitBackedgeHelper = extern "C" fn(
 /// what it yields and where it resumes; `pc` is the op's pc in the
 /// function's own numbering).
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitSuspendHelper =
-    extern "C" fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op, usize) -> u64;
+pub type JitSuspendHelper = extern "sysv64" fn(
+    *mut core::ffi::c_void,
+    *mut u64,
+    usize,
+    *const crate::nbvm::Op,
+    usize,
+) -> u64;
 
 /// The runtime-helper ABI for a **native builtin call** (`Op::CallNative`):
 /// `(ctx, native_id, argv_ptr, argc) -> NanBox bits` (or the throw sentinel, with
 /// the fault in `ctx.jit_pending_fault`). `native_id` is the builtin discriminant.
 #[cfg(all(feature = "alloc", jit_x64))]
-pub type JitCallNativeHelper = extern "C" fn(*mut core::ffi::c_void, u64, *const u64, usize) -> u64;
+pub type JitCallNativeHelper =
+    extern "sysv64" fn(*mut core::ffi::c_void, u64, *const u64, usize) -> u64;
 
 #[cfg(all(feature = "alloc", jit_x64))]
 impl JitProto {
@@ -6036,7 +6062,7 @@ impl JitProto {
         // SAFETY: `code` is this body's native-call entry, emitted to the
         // System V signature below (see `call_seq::emit_native_entry`); the
         // pointers satisfy its contract per this function's.
-        let f: extern "C" fn(
+        let f: extern "sysv64" fn(
             *mut core::ffi::c_void,
             *mut u64,
             u64,
@@ -7802,12 +7828,31 @@ impl X64Assembler {
 
     // --- stack-frame (rbp-relative) addressing, for the register compiler ---
 
+    /// `sub rsp, frame` — a prologue's frame allocation. On Windows a thread
+    /// stack is committed lazily behind a single guard page, so a frame of a
+    /// page or more first touches each page it skips, top down (what the
+    /// platform's own stack probe does); elsewhere it is the one `sub`.
+    fn sub_rsp_frame(&mut self, frame: u32) {
+        #[cfg(windows)]
+        let frame = {
+            let mut left = frame;
+            while left >= 4096 {
+                self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, 4096
+                self.code.extend_from_slice(&4096u32.to_le_bytes());
+                self.code.extend_from_slice(&[0x48, 0x85, 0x24, 0x24]); // test [rsp], rsp
+                left -= 4096;
+            }
+            left
+        };
+        self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
+        self.code.extend_from_slice(&frame.to_le_bytes());
+    }
+
     /// `push rbp; mov rbp, rsp; sub rsp, frame` — a standard frame prologue.
     pub fn prologue(&mut self, frame: u32) {
         self.code.push(0x55); // push rbp
         self.code.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
-        self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
-        self.code.extend_from_slice(&frame.to_le_bytes());
+        self.sub_rsp_frame(frame);
     }
 
     /// `leave; ret` — restore `rsp`/`rbp` and return (`rax` holds the result).
@@ -8502,7 +8547,7 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x48, 0x83, 0xc4, imm]);
     }
 
-    // --- generic tier, frame ABI: `extern "C" fn(ctx, regs, entry_pc) -> u64` ---
+    // --- generic tier, frame ABI: `extern "sysv64" fn(ctx, regs, entry_pc) -> u64` ---
 
     /// `push rbp; mov rbp, rsp; push r15; push rbx; sub rsp, frame` — the frame-ABI
     /// prologue. `r15` pins `ctx` and `rbx` the interpreter register file (both
@@ -8513,8 +8558,7 @@ impl X64Assembler {
         self.code.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
         self.code.extend_from_slice(&[0x41, 0x57]); // push r15
         self.code.push(0x53); // push rbx
-        self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
-        self.code.extend_from_slice(&frame.to_le_bytes());
+        self.sub_rsp_frame(frame);
         self.frame_entry_clears();
         // (Then the global binding cache's direct-read base, set where the
         // frame's epoch slot was emptied.)
@@ -8632,7 +8676,7 @@ impl X64Assembler {
             .extend_from_slice(&[0x48, 0x89, 0x45, disp8.to_le_bytes()[0]]);
     }
 
-    // --- generic (NanBox) tier: `extern "C" fn(ctx, args, n) -> u64` ---
+    // --- generic (NanBox) tier: `extern "sysv64" fn(ctx, args, n) -> u64` ---
     //
     // The entry pins `ctx` (rdi) in the callee-saved `r15`, homes the NanBox
     // register file in rbp-relative slots, and calls runtime helpers via the
@@ -8647,8 +8691,7 @@ impl X64Assembler {
         self.code.push(0x55); // push rbp
         self.code.extend_from_slice(&[0x48, 0x89, 0xe5]); // mov rbp, rsp
         self.code.extend_from_slice(&[0x41, 0x57]); // push r15
-        self.code.extend_from_slice(&[0x48, 0x81, 0xec]); // sub rsp, imm32
-        self.code.extend_from_slice(&frame.to_le_bytes());
+        self.sub_rsp_frame(frame);
     }
 
     /// `lea rsp, [rbp-8]; pop r15; pop rbp; ret` — the generic-tier epilogue
@@ -9629,7 +9672,7 @@ impl JitFunction {
     }
 
     /// Compiles a [`GenericOp`] program (the **generic NanBox tier**) to an
-    /// `extern "C" fn(ctx: *mut c_void, regs: *mut u64, entry: u64) -> u64` — the
+    /// `extern "sysv64" fn(ctx: *mut c_void, regs: *mut u64, entry: u64) -> u64` — the
     /// **frame ABI**.
     ///
     /// `regs` is the interpreter's own register file for the activation (`n_regs`
@@ -20599,7 +20642,7 @@ impl JitFunction {
     }
 
     /// Invokes a generic-tier (frame ABI) body:
-    /// `extern "C" fn(ctx, regs, entry) -> u64`.
+    /// `extern "sysv64" fn(ctx, regs, entry) -> u64`.
     #[cfg(all(feature = "alloc", jit_x64))]
     #[must_use]
     pub fn call_generic(&self, ctx: *mut core::ffi::c_void, regs: *mut u64, entry: u64) -> u64 {
@@ -20610,7 +20653,7 @@ impl JitFunction {
         // `entry` is one of the body's entry pcs (any other value makes the body
         // return the throw sentinel without touching `regs`).
         #[allow(unsafe_code)]
-        let f: extern "C" fn(*mut core::ffi::c_void, *mut u64, u64) -> u64 =
+        let f: extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, u64) -> u64 =
             unsafe { core::mem::transmute(self.buf.ptr()) };
         f(ctx, regs, entry)
     }
@@ -20647,10 +20690,10 @@ impl JitFunction {
         #[cfg(jit_x64)]
         {
             // SAFETY: the compiled code follows the System V ABI for
-            // `extern "C" fn(f64 x4) -> f64` (args in xmm0..xmm3, result in xmm0);
+            // `extern "sysv64" fn(f64 x4) -> f64` (args in xmm0..xmm3, result in xmm0);
             // unused register args are ignored by the callee.
             #[allow(unsafe_code)]
-            let f: extern "C" fn(f64, f64, f64, f64) -> f64 =
+            let f: extern "sysv64" fn(f64, f64, f64, f64) -> f64 =
                 unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a[0], a[1], a[2], a[3])
         }
@@ -20681,10 +20724,10 @@ impl JitFunction {
         #[cfg(jit_x64)]
         {
             // SAFETY: the compiled code follows the System V ABI for
-            // `extern "C" fn(i64 x6) -> i64`; reading fewer than 6 args is sound
+            // `extern "sysv64" fn(i64 x6) -> i64`; reading fewer than 6 args is sound
             // (extra register args are simply ignored by the callee).
             #[allow(unsafe_code)]
-            let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+            let f: extern "sysv64" fn(i64, i64, i64, i64, i64, i64) -> i64 =
                 unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a[0], a[1], a[2], a[3], a[4], a[5])
         }
@@ -20701,10 +20744,10 @@ impl JitFunction {
         #[cfg(jit_x64)]
         {
             // SAFETY: `buf` holds verified, self-emitted machine code following the
-            // System V ABI for `extern "C" fn(i64) -> i64`; the memory is mapped
+            // System V ABI for `extern "sysv64" fn(i64) -> i64`; the memory is mapped
             // executable and outlives the call (it is owned by `self`).
             #[allow(unsafe_code)]
-            let f: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(self.buf.ptr()) };
+            let f: extern "sysv64" fn(i64) -> i64 = unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a)
         }
         #[cfg(not(jit_x64))]
@@ -20719,9 +20762,10 @@ impl JitFunction {
     pub fn call2(&self, a: i64, b: i64) -> i64 {
         #[cfg(jit_x64)]
         {
-            // SAFETY: as `call1`, for `extern "C" fn(i64, i64) -> i64`.
+            // SAFETY: as `call1`, for `extern "sysv64" fn(i64, i64) -> i64`.
             #[allow(unsafe_code)]
-            let f: extern "C" fn(i64, i64) -> i64 = unsafe { core::mem::transmute(self.buf.ptr()) };
+            let f: extern "sysv64" fn(i64, i64) -> i64 =
+                unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a, b)
         }
         #[cfg(not(jit_x64))]
@@ -20771,52 +20815,166 @@ mod numeric;
 
 #[cfg(jit_x64)]
 mod exec {
-    //! W^X executable memory, mapped via direct Linux x86-64 syscalls (no libc).
+    //! W^X executable memory. The page primitives (`os`) are the only
+    //! OS-specific part:
+    //!
+    //! - Linux: direct x86-64 `mmap`/`mprotect`/`munmap` syscalls (no libc).
+    //! - Windows: `VirtualAlloc`/`VirtualProtect`/`VirtualFree` from
+    //!   `kernel32`, the documented (and only stable) way to get executable
+    //!   pages there — Windows has no stable syscall ABI. `kernel32` is the
+    //!   OS's own interface, which `std` already links on every Windows
+    //!   target, so this adds no library and no foreign code to the build.
 
-    /// `PROT_READ | PROT_WRITE`
-    const PROT_RW: usize = 0x1 | 0x2;
-    /// `PROT_READ | PROT_EXEC`
-    const PROT_RX: usize = 0x1 | 0x4;
-    /// `MAP_PRIVATE | MAP_ANONYMOUS`
-    const MAP_PRIVATE_ANON: usize = 0x02 | 0x20;
+    #[cfg(target_os = "linux")]
+    mod os {
+        /// `PROT_READ | PROT_WRITE`
+        const PROT_RW: usize = 0x1 | 0x2;
+        /// `PROT_READ | PROT_EXEC`
+        const PROT_RX: usize = 0x1 | 0x4;
+        /// `MAP_PRIVATE | MAP_ANONYMOUS`
+        const MAP_PRIVATE_ANON: usize = 0x02 | 0x20;
 
-    const SYS_MMAP: usize = 9;
-    const SYS_MPROTECT: usize = 10;
-    const SYS_MUNMAP: usize = 11;
+        const SYS_MMAP: usize = 9;
+        const SYS_MPROTECT: usize = 10;
+        const SYS_MUNMAP: usize = 11;
 
-    /// Issues a Linux x86-64 syscall with up to six arguments.
-    ///
-    /// SAFETY: caller must pass a valid syscall number and arguments; this just
-    /// executes the `syscall` instruction with the System V syscall ABI register
-    /// assignment and clobbers `rcx`/`r11` as the kernel does.
-    #[allow(unsafe_code)]
-    unsafe fn syscall6(
-        n: usize,
-        a1: usize,
-        a2: usize,
-        a3: usize,
-        a4: usize,
-        a5: usize,
-        a6: usize,
-    ) -> isize {
-        let ret: isize;
-        // SAFETY: a single `syscall` with the documented register inputs/clobbers.
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") n as isize => ret,
-                in("rdi") a1,
-                in("rsi") a2,
-                in("rdx") a3,
-                in("r10") a4,
-                in("r8") a5,
-                in("r9") a6,
-                out("rcx") _,
-                out("r11") _,
-                options(nostack, preserves_flags),
-            );
+        /// Issues a Linux x86-64 syscall with up to six arguments.
+        ///
+        /// SAFETY: caller must pass a valid syscall number and arguments; this just
+        /// executes the `syscall` instruction with the System V syscall ABI register
+        /// assignment and clobbers `rcx`/`r11` as the kernel does.
+        #[allow(unsafe_code)]
+        unsafe fn syscall6(
+            n: usize,
+            a1: usize,
+            a2: usize,
+            a3: usize,
+            a4: usize,
+            a5: usize,
+            a6: usize,
+        ) -> isize {
+            let ret: isize;
+            // SAFETY: a single `syscall` with the documented register inputs/clobbers.
+            unsafe {
+                core::arch::asm!(
+                    "syscall",
+                    inlateout("rax") n as isize => ret,
+                    in("rdi") a1,
+                    in("rsi") a2,
+                    in("rdx") a3,
+                    in("r10") a4,
+                    in("r8") a5,
+                    in("r9") a6,
+                    out("rcx") _,
+                    out("r11") _,
+                    options(nostack, preserves_flags),
+                );
+            }
+            ret
         }
-        ret
+
+        /// Maps `len` (a page multiple) fresh read-write bytes.
+        pub(super) fn map_rw(len: usize) -> Option<*mut u8> {
+            // mmap(NULL, len, PROT_RW, MAP_PRIVATE|ANON, -1, 0)
+            // SAFETY: a standard anonymous mmap; the kernel returns a new mapping
+            // or a small negative errno.
+            #[allow(unsafe_code)]
+            let raw = unsafe {
+                syscall6(
+                    SYS_MMAP,
+                    0,
+                    len,
+                    PROT_RW,
+                    MAP_PRIVATE_ANON,
+                    usize::MAX, // fd = -1
+                    0,
+                )
+            };
+            // mmap returns the address, or -errno in [-4095, -1].
+            if (-4095..0).contains(&raw) {
+                return None;
+            }
+            Some(raw as *mut u8)
+        }
+
+        /// Flips the mapping `base..base+len` from [`map_rw`] to read+execute.
+        pub(super) fn protect_rx(base: *mut u8, len: usize) -> bool {
+            // SAFETY: `base`/`len` describe a mapping the caller owns.
+            #[allow(unsafe_code)]
+            let prot = unsafe { syscall6(SYS_MPROTECT, base as usize, len, PROT_RX, 0, 0, 0) };
+            prot >= 0
+        }
+
+        /// Unmaps the mapping `base..base+len` from [`map_rw`].
+        pub(super) fn unmap(base: *mut u8, len: usize) {
+            // SAFETY: unmapping exactly a region the caller owns.
+            #[allow(unsafe_code)]
+            unsafe {
+                syscall6(SYS_MUNMAP, base as usize, len, 0, 0, 0, 0);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    mod os {
+        /// `MEM_COMMIT | MEM_RESERVE`
+        const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
+        /// `MEM_RELEASE`
+        const MEM_RELEASE: u32 = 0x8000;
+        /// `PAGE_READWRITE`
+        const PAGE_READWRITE: u32 = 0x04;
+        /// `PAGE_EXECUTE_READ`
+        const PAGE_EXECUTE_READ: u32 = 0x20;
+
+        #[allow(unsafe_code)]
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
+            fn VirtualProtect(addr: *mut u8, size: usize, protect: u32, old: *mut u32) -> i32;
+            fn VirtualFree(addr: *mut u8, size: usize, kind: u32) -> i32;
+            fn FlushInstructionCache(process: isize, addr: *const u8, size: usize) -> i32;
+            fn GetCurrentProcess() -> isize;
+        }
+
+        /// Commits `len` (a page multiple) fresh read-write bytes.
+        pub(super) fn map_rw(len: usize) -> Option<*mut u8> {
+            // SAFETY: a fresh private allocation at an address of the OS's
+            // choosing; returns null on failure.
+            #[allow(unsafe_code)]
+            let p = unsafe {
+                VirtualAlloc(
+                    core::ptr::null_mut(),
+                    len,
+                    MEM_COMMIT_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            (!p.is_null()).then_some(p)
+        }
+
+        /// Flips the region `base..base+len` from [`map_rw`] to read+execute.
+        pub(super) fn protect_rx(base: *mut u8, len: usize) -> bool {
+            let mut old = 0u32;
+            // SAFETY: `base`/`len` describe a region the caller owns; `old`
+            // is a valid out-pointer. Flushing the instruction cache after
+            // writing code is what Windows documents for generated code (a
+            // no-op on x86-64 hardware, kept for the contract).
+            #[allow(unsafe_code)]
+            unsafe {
+                VirtualProtect(base, len, PAGE_EXECUTE_READ, &mut old) != 0
+                    && FlushInstructionCache(GetCurrentProcess(), base, len) != 0
+            }
+        }
+
+        /// Releases the region at `base` from [`map_rw`].
+        pub(super) fn unmap(base: *mut u8, _len: usize) {
+            // SAFETY: releasing exactly a whole region the caller owns
+            // (`MEM_RELEASE` takes size 0 and the allocation base).
+            #[allow(unsafe_code)]
+            unsafe {
+                VirtualFree(base, 0, MEM_RELEASE);
+            }
+        }
     }
 
     /// An executable code region of its own pages. Maps RW, copies the code,
@@ -20853,26 +21011,7 @@ mod exec {
             let colour = NEXT_COLOUR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let offset = (colour * COLOUR_STEP_LINES * 64) % page;
             let len = (offset + code.len()).div_ceil(page) * page;
-            // mmap(NULL, len, PROT_RW, MAP_PRIVATE|ANON, -1, 0)
-            // SAFETY: a standard anonymous mmap; the kernel returns a new mapping
-            // or a small negative errno.
-            #[allow(unsafe_code)]
-            let raw = unsafe {
-                syscall6(
-                    SYS_MMAP,
-                    0,
-                    len,
-                    PROT_RW,
-                    MAP_PRIVATE_ANON,
-                    usize::MAX, // fd = -1
-                    0,
-                )
-            };
-            // mmap returns the address, or -errno in [-4095, -1].
-            if (-4095..0).contains(&raw) {
-                return None;
-            }
-            let base = raw as *mut u8;
+            let base = os::map_rw(len)?;
             // SAFETY: `offset < page <= len`, inside the mapping.
             #[allow(unsafe_code)]
             let ptr = unsafe { base.add(offset) };
@@ -20882,17 +21021,10 @@ mod exec {
             unsafe {
                 core::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
             }
-            // mprotect(base, len, PROT_RX): drop write, gain execute (W^X).
-            // SAFETY: `base`/`len` describe the mapping just created.
-            #[allow(unsafe_code)]
-            let prot = unsafe { syscall6(SYS_MPROTECT, base as usize, len, PROT_RX, 0, 0, 0) };
-            if prot < 0 {
+            // Drop write, gain execute (W^X).
+            if !os::protect_rx(base, len) {
                 // Best-effort unmap before bailing.
-                // SAFETY: unmapping the mapping we own.
-                #[allow(unsafe_code)]
-                unsafe {
-                    syscall6(SYS_MUNMAP, base as usize, len, 0, 0, 0, 0);
-                }
+                os::unmap(base, len);
                 return None;
             }
             Some(Self {
@@ -20918,11 +21050,7 @@ mod exec {
 
     impl Drop for ExecBuffer {
         fn drop(&mut self) {
-            // SAFETY: unmapping exactly the region this buffer owns.
-            #[allow(unsafe_code)]
-            unsafe {
-                syscall6(SYS_MUNMAP, self.base as usize, self.len, 0, 0, 0, 0);
-            }
+            os::unmap(self.base, self.len);
         }
     }
 }
@@ -20973,6 +21101,30 @@ mod tests {
         assert_eq!(code[2], 0xc3);
         assert_eq!(&code[3..6], &[0x48, 0x31, 0xc0]);
         assert_eq!(&code[6..8], &[0xeb, (2i8 - 8).to_le_bytes()[0]]);
+    }
+
+    /// A frame far larger than a page, written at its bottom, on a fresh
+    /// thread's stack: on Windows that stack is committed lazily behind one
+    /// guard page, so this only works because the prologue touches every
+    /// page it skips (`sub_rsp_frame`).
+    #[cfg(all(feature = "std", jit_x64))]
+    #[test]
+    fn large_frame_on_fresh_thread_stack() {
+        let out = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(|| {
+                let mut a = X64Assembler::new();
+                a.prologue(256 * 1024 + 8);
+                a.code.extend_from_slice(&[0x48, 0x89, 0x3c, 0x24]); // mov [rsp], rdi
+                a.code.extend_from_slice(&[0x48, 0x8b, 0x04, 0x24]); // mov rax, [rsp]
+                a.epilogue();
+                let f = JitFunction::from_machine_code(&a.finish()).expect("maps");
+                f.call1(41) + 1
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert_eq!(out, 42);
     }
 
     #[test]

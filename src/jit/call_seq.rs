@@ -814,7 +814,7 @@ pub struct CalleeInfo {
 
 /// The leaf helper the call sequence identifies its callee with: `(ctx,
 /// callee) -> CalleeInfo`. Never allocates, never throws.
-pub type CalleeHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> CalleeInfo;
+pub type CalleeHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64) -> CalleeInfo;
 
 /// The leaf helper a method call finds its callee with when the inline
 /// lookup misses: `(ctx, recv, site, out) -> CalleeInfo` — the method
@@ -823,7 +823,7 @@ pub type CalleeHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> CalleeInfo
 /// interpreter's method call would enter directly (its value stored to
 /// `*out`), else the not-a-closure key. Never allocates (beyond refilling the
 /// caches), never throws, never runs user code.
-pub type MethodHelper = extern "C" fn(
+pub type MethodHelper = extern "sysv64" fn(
     *mut core::ffi::c_void,
     u64,
     *mut super::props::MethodSite,
@@ -843,24 +843,24 @@ pub type MethodHelper = extern "C" fn(
 /// is reported without creating anything (the sequence then takes the slow
 /// path, which constructs it itself).
 pub type ConstructHelper =
-    extern "C" fn(*mut core::ffi::c_void, u64, u64, *mut u64, *const CallSite) -> CalleeInfo;
+    extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, *mut u64, *const CallSite) -> CalleeInfo;
 
 /// The helper that throws `super(…)`'s "already bound" `ReferenceError`:
 /// `(ctx) -> the throw sentinel`, the error pending.
-pub type SuperTwiceHelper = extern "C" fn(*mut core::ffi::c_void) -> u64;
+pub type SuperTwiceHelper = extern "sysv64" fn(*mut core::ffi::c_void) -> u64;
 
 /// The helper that finishes a `new` whose body returned the heap value
 /// `result`, or whose `this` started unbound (a derived constructor):
 /// `(ctx, result, this) -> result if it is an object, else this` — for a
 /// derived constructor, else the throw sentinel with the `ReferenceError` or
 /// `TypeError` pending.
-pub type ConstructResultHelper = extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u64;
+pub type ConstructResultHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64) -> u64;
 
 /// The helper a `new` served by the site's [`ConstructFast`] allocates its
 /// `this` with: `(ctx, proto) -> the handle bits of a fresh ordinary object
 /// whose [[Prototype]] is the raw handle proto`. Never throws, never runs
 /// user code.
-pub type ConstructAllocHelper = extern "C" fn(*mut core::ffi::c_void, u64) -> u64;
+pub type ConstructAllocHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64) -> u64;
 
 /// `CallSite` field offsets for emitted code.
 fn site_off(f: usize) -> i32 {
@@ -1483,7 +1483,7 @@ impl X64Assembler {
     }
 }
 
-/// Emits a generic body's **native-call entry**: `extern "C" fn(ctx, window,
+/// Emits a generic body's **native-call entry**: `extern "sysv64" fn(ctx, window,
 /// argc, argv, caps, this) -> u64`, the target of the call sequence, at
 /// `native` — where the context is already in `r15` (the caller's own,
 /// callee-saved), so `ctx` is not read — and at `rust`, out of line, for a
