@@ -3352,6 +3352,82 @@ unsafe fn enter_native(
     Some(Ok(nb))
 }
 
+/// A callee an array built-in's lean loop (`super::array_hof::run_direct`)
+/// calls through its native-call entry: its compiled generic body and that
+/// body's window size. Only for a closure that [`CompiledCallback`] would
+/// call the same way and that has no Int/Float-tier code (whose loop
+/// `array_hof` runs itself).
+pub(super) struct DirectCallee {
+    jit: Rc<crate::jit::JitProto>,
+    n_regs: usize,
+    n_caps: usize,
+}
+
+impl DirectCallee {
+    /// The direct call of the VM closure `callee` (function `id`), when its
+    /// compiled body has a native-call entry right now.
+    pub(super) fn new(ctx: &mut Ctx, proto: &FnProto, id: usize) -> Option<Self> {
+        if ctx.realm.multi_realm || ctx.call_depth == 0 || unboxed_target(proto).is_some() {
+            return None;
+        }
+        let jit = direct_jit(ctx, proto, id)?;
+        let n_regs = jit.n_regs();
+        (jit.native_entry().is_some() && n_regs >= proto.n_regs).then_some(Self {
+            jit,
+            n_regs,
+            n_caps: proto.n_captures,
+        })
+    }
+
+    /// `Call(callee, this, args)`, exactly as [`CompiledCallback::call`]'s
+    /// native call makes it (the caller published its own frame); `None`
+    /// (nothing done) when the register stack has no room or the closure's
+    /// captures are not all there.
+    #[inline]
+    pub(super) fn call(
+        &self,
+        ctx: &mut Ctx,
+        funcs: &[FnProto],
+        callee: NanBox,
+        this: NanBox,
+        args: &[NanBox],
+    ) -> Option<Result<NanBox, VmError>> {
+        if ctx.call_depth >= ctx.realm.limits.max_call_depth
+            || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
+            || crate::stack::exhausted()
+            || super::args_exhausted(ctx, args.len())
+        {
+            let e = vm_error(ctx, "RangeError", "Maximum call stack size exceeded");
+            return Some(Err(VmError::Thrown(e)));
+        }
+        let (_, caps) = ctx
+            .realm
+            .vm_function(Handle::from_raw(callee.as_handle()?))?;
+        if caps.len() < self.n_caps {
+            return None;
+        }
+        let caps = caps.as_ptr();
+        // SAFETY: `jit` is the callee's compiled body with a native-call
+        // entry over `n_regs` registers; `caps` points at the closure's
+        // captures, which the callee value (rooted by the caller) keeps
+        // alive, and nothing runs between taking it and the entry copying
+        // them (as `call_hosted`).
+        #[allow(unsafe_code)]
+        unsafe {
+            enter_native(
+                ctx,
+                funcs,
+                &self.jit,
+                self.n_regs,
+                callee,
+                caps.cast::<u64>(),
+                this,
+                args,
+            )
+        }
+    }
+}
+
 /// One callee, called many times from a Rust loop (the array higher-order
 /// built-ins, `super::array_hof`), entered as [`call_compiled_with`] enters
 /// it — with the lookups that cannot change between calls done once: the

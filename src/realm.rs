@@ -6551,6 +6551,9 @@ impl Realm {
         match self.heap.get(handle)? {
             Cell::Array(a) => {
                 let dense = a.len();
+                if self.sparse_array_lengths.is_empty() {
+                    return Some(dense);
+                }
                 // A `length` set above the dense capacity (a valid uint32 beyond the
                 // storage cap) is recorded as a logical override; report whichever is
                 // larger so a later element write (growing the dense `Vec`) still wins.

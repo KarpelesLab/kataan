@@ -305,6 +305,10 @@ pub(super) fn run(
         return None;
     }
     let this_arg = args.get(1).copied().unwrap_or(NanBox::undefined());
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    if let Some(r) = run_direct(ctx, funcs, regs, recv, h, len, op, cb, this_arg) {
+        return Some(r);
+    }
     // Publish the caller's registers (unless they are a GC root already)
     // and everything the loop holds.
     let mark = ctx.frame_shadow.len();
@@ -334,6 +338,135 @@ pub(super) fn run(
     ctx.frames_published -= 1;
     ctx.frame_shadow.truncate(mark);
     Some(r)
+}
+
+/// [`run`]'s lean lane for `forEach`, `map`, `filter`, `some` and `every`:
+/// a caller whose window is a GC root already (on the register stack) and
+/// a callback whose compiled body is entered through its native-call entry
+/// (`jit_tier::DirectCallee`), the steps [`Loop::iterate`] takes with none of
+/// its per-call setup. `None`, having done nothing, for anything else.
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn run_direct(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    recv: NanBox,
+    h: Handle,
+    len: usize,
+    op: Hof,
+    cb: NanBox,
+    this_arg: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    if !matches!(
+        op,
+        Hof::ForEach | Hof::Map | Hof::Filter | Hof::Some | Hof::Every
+    ) || !lean_on()
+        || !super::jit_tier::on_register_stack(ctx, regs)
+    {
+        return None;
+    }
+    let (fid, _) = ctx.realm.vm_function(Handle::from_raw(cb.as_handle()?))?;
+    let id = fid as usize;
+    let proto = funcs.get(id).filter(|p| !p.class_ctor)?;
+    let direct = super::jit_tier::DirectCallee::new(ctx, proto, id)?;
+    // The loop's roots: the receiver, callback and `thisArg`, then (`map`,
+    // `filter`) the result's elements, as `Loop::iterate` keeps them.
+    let mark = ctx.frame_shadow.len();
+    ctx.frame_shadow.extend_from_slice(&[recv, cb, this_arg]);
+    ctx.frames_published += 1;
+    let out = ctx.frame_shadow.len();
+    if op == Hof::Map {
+        ctx.frame_shadow.reserve(len);
+    }
+    let r = direct_steps(ctx, funcs, &direct, recv, h, len, op, cb, this_arg);
+    let r = r.map(|v| match op {
+        Hof::Map | Hof::Filter => {
+            let elems = ctx.frame_shadow.split_off(out);
+            NanBox::handle(ctx.realm.new_array(elems).to_raw())
+        }
+        _ => v,
+    });
+    ctx.frames_published -= 1;
+    ctx.frame_shadow.truncate(mark);
+    Some(r)
+}
+
+/// [`run_direct`]'s steps `0..len`: the built-in's result for `some` /
+/// `every` / `forEach` (`map` / `filter` leave theirs on the frame shadow).
+#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn direct_steps(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    direct: &super::jit_tier::DirectCallee,
+    recv: NanBox,
+    h: Handle,
+    len: usize,
+    op: Hof,
+    cb: NanBox,
+    this_arg: NanBox,
+) -> Result<NanBox, VmError> {
+    for k in 0..len {
+        // `HasProperty(O, k)` + `Get(O, k)`: a present dense slot is both;
+        // anything else is the host's (`element_general`).
+        let present = ctx
+            .realm
+            .array_elements(h)
+            .and_then(|e| e.get(k).copied())
+            .filter(|v| !v.is_hole());
+        let v = match present {
+            Some(v) => v,
+            None => match element_general(ctx, recv, k, true)? {
+                Some(v) => v,
+                None => {
+                    if op == Hof::Map {
+                        ctx.frame_shadow.push(NanBox::hole());
+                    }
+                    continue;
+                }
+            },
+        };
+        let a = [v, NanBox::number(k as f64), recv];
+        let r = match direct.call(ctx, funcs, cb, this_arg, &a) {
+            Some(r) => r?,
+            None => call_closure(ctx, funcs, cb, &a, this_arg)?,
+        };
+        match op {
+            Hof::Map => ctx.frame_shadow.push(r),
+            Hof::Filter if ctx.realm.truthy(r) => ctx.frame_shadow.push(v),
+            Hof::Some if ctx.realm.truthy(r) => return Ok(NanBox::boolean(true)),
+            Hof::Every if !ctx.realm.truthy(r) => return Ok(NanBox::boolean(false)),
+            _ => {}
+        }
+    }
+    Ok(match op {
+        Hof::Some => NanBox::boolean(false),
+        Hof::Every => NanBox::boolean(true),
+        _ => NanBox::undefined(),
+    })
+}
+
+/// `HasProperty(O, k)` (when `probe`) then `Get(O, k)` of the array `recv`
+/// by the host's full `[[HasProperty]]` / `[[Get]]`: `None` for an absent
+/// index.
+#[cold]
+fn element_general(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    k: usize,
+    probe: bool,
+) -> Result<Option<NanBox>, VmError> {
+    let key = NanBox::handle(ctx.realm.new_string(&alloc::format!("{k}")).to_raw());
+    if probe {
+        let has = with_host(ctx, |host| host.relational(false, key, recv))
+            .unwrap_or(Err(HostError::Fault))
+            .map_err(VmError::from)?;
+        if !ctx.realm.truthy(has) {
+            return Ok(None);
+        }
+    }
+    host_get(ctx, recv, key, None).map(Some)
 }
 
 /// The callback, and how [`Callee::invoke`] calls it.
@@ -545,17 +678,7 @@ impl Loop<'_> {
         k: usize,
         probe: bool,
     ) -> Result<Option<NanBox>, VmError> {
-        let key = NanBox::handle(ctx.realm.new_string(&alloc::format!("{k}")).to_raw());
-        if probe {
-            let recv = self.recv;
-            let has = with_host(ctx, |host| host.relational(false, key, recv))
-                .unwrap_or(Err(HostError::Fault))
-                .map_err(VmError::from)?;
-            if !ctx.realm.truthy(has) {
-                return Ok(None);
-            }
-        }
-        host_get(ctx, self.recv, key, None).map(Some)
+        element_general(ctx, self.recv, k, probe)
     }
 
     /// `Call(callbackfn, thisArg, « kValue, k, O »)`.
