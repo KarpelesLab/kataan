@@ -409,3 +409,112 @@ pub(super) fn has(
     }
     None
 }
+
+/// `proxy.[[Delete]](key)` for the proxy `obj` with a `deleteProperty` trap
+/// (`delete obj[key]`; `strict`: a false result throws). `None`: the host's
+/// (a trapless forward included).
+pub(super) fn delete(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: Option<&[NanBox]>,
+    obj: NanBox,
+    key: NanBox,
+    strict: bool,
+) -> Option<Result<bool, VmError>> {
+    if ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
+        return None;
+    }
+    let h = Handle::from_raw(obj.as_handle()?);
+    let (target, handler) = live_proxy(&ctx.realm, h)?;
+    let Trap::Fn(f) = trap_quiet(&ctx.realm, funcs, handler, "deleteProperty")? else {
+        return None;
+    };
+    if ctx.realm.proxy_at(target).is_some() {
+        return None;
+    }
+    let (ks, kv) = elem_key(&mut ctx.realm, key)?;
+    let (t, hd) = (hv(target), hv(handler));
+    let r = match call_trap(ctx, funcs, regs, &[t, hd, kv, obj], f, hd, &[t, kv]) {
+        Ok(v) => ctx.realm.truthy(v),
+        Err(e) => return Some(Err(e)),
+    };
+    if r {
+        // The invariants of a true result (10.5.10 steps 10-13): the host's.
+        let realm = &ctx.realm;
+        let present = realm.has_own(target, &ks) || realm.accessor(target, &ks).is_some();
+        if present && realm.property_is_non_configurable(target, &ks) {
+            return Some(Err(type_error(
+                ctx,
+                "proxy 'deleteProperty' trap removed a non-configurable property",
+            )));
+        }
+        if present && !realm.is_extensible(target) {
+            return Some(Err(type_error(
+                ctx,
+                "proxy 'deleteProperty' trap removed a property of a non-extensible target",
+            )));
+        }
+    } else if strict {
+        return Some(Err(type_error(
+            ctx,
+            "Cannot delete property of a non-configurable object",
+        )));
+    }
+    Some(Ok(r))
+}
+
+/// `proxy.[[Call]](this, args)` for the proxy `f` (see the module docs): its
+/// `apply` trap with a fresh array of the arguments, or the target's call.
+/// Only a VM function or built-in target is taken. `None`: the host's.
+pub(super) fn apply(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: Option<&[NanBox]>,
+    f: NanBox,
+    this: NanBox,
+    args: &[NanBox],
+) -> Option<Result<NanBox, VmError>> {
+    if ctx.host.is_none() || ctx.realm.multi_realm || !enabled() {
+        return None;
+    }
+    let h = Handle::from_raw(f.as_handle()?);
+    let (target, handler) = live_proxy(&ctx.realm, h)?;
+    let vm_target = match ctx.realm.vm_function(target) {
+        Some((id, _)) => {
+            if funcs.get(id as usize).is_none_or(|p| p.class_ctor) {
+                return None;
+            }
+            true
+        }
+        None if ctx.realm.native_at(target).is_some() => false,
+        None => return None,
+    };
+    match trap_quiet(&ctx.realm, funcs, handler, "apply")? {
+        Trap::Absent => {
+            if !vm_target {
+                return None;
+            }
+            Some(super::call_closure_compiled(
+                ctx,
+                funcs,
+                regs,
+                hv(target),
+                args,
+                this,
+            ))
+        }
+        Trap::Fn(trap) => {
+            let arr = hv(ctx.realm.new_array(args.to_vec()));
+            let (t, hd) = (hv(target), hv(handler));
+            Some(call_trap(
+                ctx,
+                funcs,
+                regs,
+                &[t, hd, arr, this, f],
+                trap,
+                hd,
+                &[t, this, arr],
+            ))
+        }
+    }
+}

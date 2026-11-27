@@ -10421,6 +10421,16 @@ fn run_frame_at_ic(
                 strict,
             } => {
                 let (o, k) = (regs[*obj as usize], regs[*key as usize]);
+                // A proxy's `deleteProperty` trap, called in the VM.
+                if is_proxy(ctx, o)
+                    && let Some(r) = proxy_ops::delete(ctx, funcs, Some(&*regs), o, k, *strict)
+                {
+                    match r {
+                        Ok(b) => regs[*dst as usize] = NanBox::boolean(b),
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 match with_host_regs(ctx, regs, |h| h.delete_member(o, k, *strict)) {
                     Some(Ok(b)) => regs[*dst as usize] = NanBox::boolean(b),
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -12332,7 +12342,14 @@ fn run_frame_at_ic(
                 // `call_closure`'s host call, lending this frame's registers:
                 // a built-in called here may let what it re-enters collect
                 // (`crate::realm::host_roots`).
-                let r = if let Some((t, bthis, all)) =
+                let proxied = if is_proxy(ctx, f) {
+                    proxy_ops::apply(ctx, funcs, Some(&*regs), f, NanBox::undefined(), &argv)
+                } else {
+                    None
+                };
+                let r = if let Some(r) = proxied {
+                    r
+                } else if let Some((t, bthis, all)) =
                     bound_vm_target(&mut ctx.realm, funcs, f, &argv)
                 {
                     // A bound VM function: its target's call, this frame
