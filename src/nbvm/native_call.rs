@@ -206,6 +206,8 @@ enum FastOp {
     ObjCreate,
     /// `Array.from(items)` (no `mapFn`).
     ArrayFrom,
+    /// `String.prototype.search`.
+    StrSearch,
     /// `Object.assign(target, …sources)`: plain copies done in the VM
     /// ([`obj_assign_fast`]), anything else through the host directly (as
     /// [`FastOp::HostDirect`]).
@@ -448,6 +450,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_STRING_PROTO_FN, b"split") => FastOp::StrSplit,
         (N_STRING_PROTO_FN, b"replace") => FastOp::StrReplace,
         (N_STRING_PROTO_FN, b"match") => FastOp::StrMatch,
+        (N_STRING_PROTO_FN, b"search") => FastOp::StrSearch,
         (N_STRING_PROTO_FN, b"replaceAll") => FastOp::StrReplaceAll,
         #[cfg(feature = "std")]
         (N_NUMBER_PROTO_FN, b"toFixed") => FastOp::NumToFixed,
@@ -1721,6 +1724,29 @@ fn run_op(
                 .map_err(VmError::from),
         );
     }
+    // A string searched with a RegExp whose `@@search` and `exec` are the
+    // intrinsics: that `@@search`, without the general call's GetMethod and
+    // second call.
+    if matches!(op, FastOp::StrSearch) {
+        let rx = arg(0);
+        if !ctx.realm.multi_realm
+            && ctx.realm.is_string_handle(h)
+            && ctx.realm.typeof_is_string(h)
+            && rx
+                .as_handle()
+                .is_some_and(|r| ctx.realm.regexp_flags(Handle::from_raw(r)).is_some())
+            && let Some(Some(r)) = with_host(ctx, |host| host.string_search(recv, rx))
+        {
+            return Some(r.map_err(VmError::from));
+        }
+        let method = NanBox::from_bits(method);
+        let argv = super::ArgBuf::from_regs(regs, args);
+        return Some(
+            with_host_regs(ctx, regs, |host| host.call(method, recv, &argv))
+                .unwrap_or(Err(super::HostError::Fault))
+                .map_err(VmError::from),
+        );
+    }
     if matches!(op, FastOp::PromiseResolve) {
         if let Some(p) = promise_resolve_fast(ctx, h, arg(0)) {
             return Some(Ok(p));
@@ -1754,6 +1780,7 @@ fn run_op(
         | FastOp::CollForEach(_)
         | FastOp::StrReplaceAll
         | FastOp::StrMatch
+        | FastOp::StrSearch
         | FastOp::GenResume(_)
         | FastOp::ObjStaticHasOwn => {
             return None;

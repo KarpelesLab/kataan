@@ -1355,6 +1355,14 @@ pub trait VmHost {
     ///
     /// # Errors
     /// A host fault (a pristine match runs no user code).
+    /// `String.prototype.search(rx)` of the string `recv` when `rx` is a
+    /// RegExp whose `@@search` and `exec` are the intrinsics (no code runs
+    /// to find them): the result; `None` when the host declines (the
+    /// general call then runs).
+    fn string_search(&mut self, _recv: NanBox, _rx: NanBox) -> Option<Result<NanBox, HostError>> {
+        None
+    }
+
     fn string_match(&mut self, _recv: NanBox, _rx: NanBox) -> Option<Result<NanBox, HostError>> {
         None
     }

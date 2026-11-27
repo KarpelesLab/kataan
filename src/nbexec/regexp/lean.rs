@@ -26,9 +26,9 @@ pub(crate) struct RegexpProtoProof {
     stamp: (usize, u64, u32, u32),
     /// Per method: where the prototype holds it (see
     /// `Realm::own_data_probe`) and the intrinsic function found there.
-    keys: [(u32, u64); 4],
+    keys: [(u32, u64); 5],
     /// Each method's storage key (a symbol's is its registered key string).
-    names: [alloc::rc::Rc<str>; 4],
+    names: [alloc::rc::Rc<str>; 5],
     /// What [`Interp::regexp_species_default`] proved under this stamp: the
     /// slot of the prototype's `constructor` and the value there (`%RegExp%`),
     /// and the key epoch of the object holding `%RegExp%`'s own properties
@@ -39,8 +39,8 @@ pub(crate) struct RegexpProtoProof {
 }
 
 /// The prototype's methods the protocol reads, by intrinsic name: `exec`,
-/// `[@@replace]`, `[@@match]`, `[@@split]`.
-const PROOF_METHODS: [&[u8]; 4] = [b"exec", b"replace", b"match", b"split"];
+/// `[@@replace]`, `[@@match]`, `[@@split]`, `[@@search]`.
+const PROOF_METHODS: [&[u8]; 5] = [b"exec", b"replace", b"match", b"split", b"search"];
 
 /// A one-step operation's subject: a flat all-ASCII string, matched as its
 /// bytes (each byte is the code unit at its index) — no conversion at all;
@@ -88,6 +88,8 @@ pub(crate) const NEED_REPLACE: u32 = 2;
 pub(crate) const NEED_MATCH: u32 = 4;
 /// … for `[@@split]`.
 pub(crate) const NEED_SPLIT: u32 = 8;
+/// … for `[@@search]`.
+pub(crate) const NEED_SEARCH: u32 = 16;
 
 impl Interp {
     /// Whether `h` is a RegExp whose every protocol read is an intrinsic's
@@ -147,13 +149,14 @@ impl Interp {
         if self.regexp_flags_check(proto).is_none() {
             return false;
         }
-        let names: [alloc::rc::Rc<str>; 4] = [
+        let names: [alloc::rc::Rc<str>; 5] = [
             alloc::rc::Rc::from("exec"),
             self.regexp_symbol_key(0),
             self.regexp_symbol_key(1),
             self.regexp_symbol_key(2),
+            self.regexp_symbol_key(4),
         ];
-        let mut keys = [(0u32, 0u64); 4];
+        let mut keys = [(0u32, 0u64); 5];
         for ((key, name), method) in keys.iter_mut().zip(&names).zip(PROOF_METHODS) {
             let Some((slot, v)) = self.realm.own_data_probe(proto, name) else {
                 return false;

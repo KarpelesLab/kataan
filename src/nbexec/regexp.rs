@@ -3,7 +3,9 @@ use super::*;
 #[cfg(feature = "regex")]
 mod lean;
 #[cfg(feature = "regex")]
-pub(crate) use lean::{NEED_EXEC, NEED_MATCH, NEED_REPLACE, NEED_SPLIT, RegexpProtoProof};
+pub(crate) use lean::{
+    NEED_EXEC, NEED_MATCH, NEED_REPLACE, NEED_SEARCH, NEED_SPLIT, RegexpProtoProof,
+};
 
 impl Interp {
     /// Builds a match-result array from a `Captures` whose spans are **code-unit**
@@ -1234,14 +1236,14 @@ impl Interp {
     }
 
     /// The storage key of `RegExp.prototype[@@replace]` (`which` 0),
-    /// `[@@match]` (1) or `[@@split]` (2), or of `RegExp[@@species]` (3),
-    /// memoized per realm.
+    /// `[@@match]` (1), `[@@split]` (2) or `[@@search]` (4), or of
+    /// `RegExp[@@species]` (3), memoized per realm.
     pub(crate) fn regexp_symbol_key(&mut self, which: usize) -> alloc::rc::Rc<str> {
         let rp = core::ptr::from_ref::<Realm>(&self.realm) as usize;
         match &self.regexp_symbol_keys[which] {
             Some((p, k)) if *p == rp => alloc::rc::Rc::clone(k),
             _ => {
-                let name = ["replace", "match", "split", "species"][which];
+                let name = ["replace", "match", "split", "species", "search"][which];
                 let sym = self.well_known_symbol(name);
                 let k: alloc::rc::Rc<str> = self.member_key(sym).into();
                 self.regexp_symbol_keys[which] = Some((rp, alloc::rc::Rc::clone(&k)));
@@ -1322,8 +1324,15 @@ impl Interp {
         Ok(n.max(0.0).min(9_007_199_254_740_991.0) as usize)
     }
 
-    /// `RegExp.prototype[@@search](string)`.
-    fn regexp_symbol_search(&mut self, rx: NanBox, string: NanBox) -> Result<NanBox, ExecError> {
+    /// `RegExp.prototype[@@search]` of `rx` on `string` (also
+    /// `String.prototype.search` of a string whose RegExp argument is
+    /// pristine, `VmHost::string_search`: its GetMethod of `@@search` reads
+    /// that intrinsic).
+    pub(crate) fn regexp_symbol_search(
+        &mut self,
+        rx: NanBox,
+        string: NanBox,
+    ) -> Result<NanBox, ExecError> {
         if !self.is_object_value(rx) {
             return Err(self.type_error("RegExp.prototype[Symbol.search] called on a non-object"));
         }

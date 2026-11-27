@@ -587,7 +587,7 @@ pub struct Interp {
     /// `RegExp.prototype[@@replace]` / `[@@match]` / `[@@split]` lookup memos
     /// (see `regexp_symbol_method`), and those keys' storage strings.
     regexp_symbol_lookup: [crate::realm::builtins_fast::MethodSiteCache; 3],
-    regexp_symbol_keys: [Option<(usize, alloc::rc::Rc<str>)>; 4],
+    regexp_symbol_keys: [Option<(usize, alloc::rc::Rc<str>)>; 5],
     /// The layout of a RegExp match array's `index`/`input`/`groups`.
     #[cfg(feature = "regex")]
     match_array_shape: crate::realm::builtins_fast::AuxShapeCache,
@@ -3105,7 +3105,7 @@ impl Interp {
             #[cfg(feature = "regex")]
             regexp_split_memo: None,
             regexp_symbol_lookup: Default::default(),
-            regexp_symbol_keys: [None, None, None, None],
+            regexp_symbol_keys: [None, None, None, None, None],
             #[cfg(feature = "regex")]
             match_array_shape: Default::default(),
             current: Scope::root(),
@@ -9816,6 +9816,26 @@ impl crate::nbvm::VmHost for Interp {
             self.regexp_match_pristine(h, recv)
                 .map_err(exec_to_host)
                 .transpose()
+        }
+        #[cfg(not(feature = "regex"))]
+        {
+            let _ = (recv, rx);
+            None
+        }
+    }
+
+    fn string_search(
+        &mut self,
+        recv: NanBox,
+        rx: NanBox,
+    ) -> Option<Result<NanBox, crate::nbvm::HostError>> {
+        #[cfg(feature = "regex")]
+        {
+            let h = Handle::from_raw(rx.as_handle()?);
+            if !self.regexp_pristine(h, regexp::NEED_EXEC | regexp::NEED_SEARCH) {
+                return None;
+            }
+            Some(self.regexp_symbol_search(rx, recv).map_err(exec_to_host))
         }
         #[cfg(not(feature = "regex"))]
         {

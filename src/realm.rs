@@ -96,7 +96,7 @@ const REGEXP_LEND_POOL: usize = 4;
 /// `Realm::regexp_proof_mirror`'s copy of the host's RegExp-protocol proof:
 /// the prototype, its key epoch, per proved method its slot and value bits,
 /// and the cell-swap count.
-pub(crate) type RegexpProofMirror = (Handle, u32, [(u32, u64); 4], u32);
+pub(crate) type RegexpProofMirror = (Handle, u32, [(u32, u64); 5], u32);
 
 /// One `Realm::regexp_literal_memo` entry: a literal's source, its flags and
 /// the program they compile to once known.
