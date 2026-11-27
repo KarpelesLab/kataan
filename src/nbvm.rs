@@ -17089,7 +17089,7 @@ fn refs_expr_w(
                 direct.insert(String::from(THIS_NAME));
             }
             Expr::Super(_) => {
-                for n in [THIS_NAME, HOME_NAME, CTOR_NAME, NT_NAME] {
+                for n in [THIS_NAME, HOME_NAME, CTOR_NAME, NT_NAME, FINIT_NAME] {
                     direct.insert(String::from(n));
                 }
             }
@@ -18590,26 +18590,14 @@ impl Compiler {
                 }
             }
         }
-        // A base class constructor whose class has instance elements runs its
-        // field initializer itself, first (InitializeInstanceElements precedes
-        // the body's FunctionDeclarationInstantiation, parameter defaults
-        // included): a plain call of the initializer closure, with `this`,
-        // which the class handed it through the hidden cell `FINIT_NAME`
+        // A base class constructor runs its class's field initializer itself,
+        // first (InitializeInstanceElements precedes the body's
+        // FunctionDeclarationInstantiation, parameter defaults included),
+        // when the class handed it one through the hidden cell `FINIT_NAME`
         // (see `class_value`).
-        if class_ctor == Some(false)
-            && captures.iter().any(|n| n == FINIT_NAME)
-            && let Some(b) = c.lookup(FINIT_NAME)
-        {
-            let callee = c.read_var(b);
-            let dst = c.alloc();
-            let recv = c.this_reg;
-            c.ops.push(Op::CallWithMethod {
-                dst,
-                callee,
-                recv,
-                key: String::new(),
-                args: Vec::new(),
-            });
+        if class_ctor == Some(false) && captures.iter().any(|n| n == FINIT_NAME) {
+            let this = c.this_reg;
+            c.call_field_init(this);
         }
         // Left to right (IteratorBindingInitialization): apply `= default` to a
         // (non-rest) parameter left `undefined` — so a default may reference
@@ -26388,13 +26376,13 @@ impl Compiler {
                 ClassMember::Method(m) => !m.is_static && matches!(m.key, PropertyKey::Private(_)),
                 _ => false,
             });
-            let finit_b = if !derived && has_instance_elems && !uses_dynamic_scope(cparams, cbody) {
-                Some(self.bind_hidden_cell(FINIT_NAME, true, false)?)
-            } else {
-                None
-            };
+            // Every class binds the cell (`undefined` without instance
+            // elements), so that a `super()` in a nested class's constructor
+            // never reaches an enclosing class's.
+            let finit_b = self.bind_hidden_cell(FINIT_NAME, true, false)?;
+            let dyn_ctor = uses_dynamic_scope(cparams, cbody);
             let mut ctor_free = BTreeSet::new();
-            if finit_b.is_some() {
+            if has_instance_elems && !derived && !dyn_ctor {
                 ctor_free.insert(String::from(FINIT_NAME));
             }
             // The class's text is its whole definition.
@@ -26646,13 +26634,22 @@ impl Compiler {
                     PROTO_NAME,
                     ClosureSpec::class_element(&[], &[], "", None, &fields, field_free),
                 )?;
-                match finit_b {
-                    Some(b) => self.write_var(b, init),
-                    None => self.ops.push(Op::SetHidden {
+                // Who runs it: a base class's constructor prologue (through
+                // the cell), or `vm_construct` (through `\0fields`) when the
+                // constructor uses dynamic scoping; a derived class's
+                // `super()` (the cell, compiled in; `Op::InitFields`, which
+                // reads `\0fields`, from code that cannot see the cell, such
+                // as eval code). `\0fields` also tells that a derived
+                // class's constructor is not merely forwarding.
+                if derived || !dyn_ctor {
+                    self.write_var(finit_b, init);
+                }
+                if derived || dyn_ctor {
+                    self.ops.push(Op::SetHidden {
                         obj: f,
                         key: String::from(FIELDS_KEY),
                         src: init,
-                    }),
+                    });
                 }
             }
             if let Some(b) = inner_b {
@@ -27753,7 +27750,9 @@ impl Compiler {
             });
             self.ops.push(super_op(dst, this));
             self.write_var(Binding { tdz: false, ..tb }, this);
-            self.ops.push(Op::InitFields { ctor, this });
+            if !self.call_field_init(this) {
+                self.ops.push(Op::InitFields { ctor, this });
+            }
             return Ok(dst);
         }
         let this = self.this_reg;
@@ -27765,7 +27764,9 @@ impl Compiler {
         if let Some(b) = self.scopes[0].get(THIS_NAME).copied() {
             self.write_var(Binding { tdz: false, ..b }, this);
         }
-        self.ops.push(Op::InitFields { ctor, this });
+        if !self.call_field_init(this) {
+            self.ops.push(Op::InitFields { ctor, this });
+        }
         Ok(dst)
     }
 
@@ -27854,6 +27855,31 @@ impl Compiler {
             r
         };
         Ok(alloc::vec![self.emit_jump_if_false(cond)])
+    }
+
+    /// InitializeInstanceElements(`this`, F) for the class constructor F
+    /// being compiled (or an arrow in it): a call of the instance-field
+    /// initializer the class left in its hidden cell [`FINIT_NAME`], with
+    /// `this`, when the cell holds one (it holds `undefined` for a class
+    /// without instance elements, and for one whose initializer the
+    /// constructor's `\0fields` slot keeps instead). `false` when no such
+    /// cell is in scope (nothing emitted).
+    fn call_field_init(&mut self, this: Reg) -> bool {
+        let Some(b) = self.lookup(FINIT_NAME).filter(|b| b.cell) else {
+            return false;
+        };
+        let callee = self.read_var(b);
+        let skip = self.emit_jump_if_false(callee);
+        let dst = self.alloc();
+        self.ops.push(Op::CallWithMethod {
+            dst,
+            callee,
+            recv: this,
+            key: String::new(),
+            args: Vec::new(),
+        });
+        self.patch(skip);
+        true
     }
 
     /// Emits a `JumpIfFalse` with a placeholder target; returns its index.
