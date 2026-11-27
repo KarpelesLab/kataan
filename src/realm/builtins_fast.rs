@@ -539,16 +539,29 @@ impl Realm {
         shape: &Rc<Shape>,
         values: &[NanBox],
     ) -> Option<Handle> {
+        let proto = self.default_object_proto;
+        self.new_object_in_shape_proto(root, shape, values, proto)
+    }
+
+    /// [`new_object_in_shape`](Self::new_object_in_shape) with `proto` as
+    /// the `[[Prototype]]` (what `new_object_with_proto(proto)` followed by
+    /// the shape's plain data adds leaves).
+    pub fn new_object_in_shape_proto(
+        &mut self,
+        root: &Rc<Shape>,
+        shape: &Rc<Shape>,
+        values: &[NanBox],
+        proto: Option<Handle>,
+    ) -> Option<Handle> {
         if !Rc::ptr_eq(root, &self.root_shape)
             || values.len() >= self.limits.object_dictionary_threshold
         {
             return None;
         }
         let mut obj = crate::object::Object::with_data(Rc::clone(shape), values)?;
-        // As `new_object` would: the default `[[Prototype]]`, shaded for an
-        // incremental cycle, then each stored value through the barrier as
-        // `init_data_property_cached` would.
-        let proto = self.default_object_proto;
+        // As `new_object_with_proto` would: the `[[Prototype]]`, shaded for
+        // an incremental cycle, then each stored value through the barrier
+        // as `init_data_property_cached` would.
         obj.set_proto(proto);
         let h = self.heap.alloc(Cell::Object(obj));
         if let (Some(p), Some(marker)) = (proto, self.incremental.as_mut()) {
@@ -577,6 +590,31 @@ impl Realm {
         (o.is_plain_fresh_data()
             && o.len() as usize == keys.len()
             && o.proto() == self.default_object_proto
+            && keys
+                .iter()
+                .enumerate()
+                .all(|(i, k)| shape.lookup(k) == Some(i as u32)))
+        .then(|| Rc::clone(shape))
+    }
+
+    /// The shape of the object at `handle` when it is a plain shaped data
+    /// object with `[[Prototype]]` `proto` whose `i`th key is `keys[i]` in
+    /// slot `i` — one [`new_object_in_shape_proto`](Self::new_object_in_shape_proto)
+    /// can remake from its keys' values.
+    #[must_use]
+    pub fn plain_shape_with_keys(
+        &self,
+        handle: Handle,
+        keys: &[&str],
+        proto: Option<Handle>,
+    ) -> Option<Rc<Shape>> {
+        let Some(Cell::Object(o)) = self.heap.get(handle) else {
+            return None;
+        };
+        let shape = o.shaped_shape()?;
+        (o.is_plain_fresh_data()
+            && o.len() as usize == keys.len()
+            && o.proto() == proto
             && keys
                 .iter()
                 .enumerate()

@@ -1,6 +1,10 @@
 use super::*;
 
 #[cfg(feature = "regex")]
+mod groups;
+#[cfg(feature = "regex")]
+pub(crate) use groups::GroupsShape;
+#[cfg(feature = "regex")]
 mod lean;
 #[cfg(feature = "regex")]
 pub(crate) use lean::{
@@ -28,7 +32,7 @@ impl Interp {
         units: &[u16],
         input: NanBox,
         caps: &crate::regex::Captures,
-        group_names: &[(usize, String)],
+        re: &alloc::rc::Rc<crate::regex::Regex>,
         has_indices: bool,
     ) -> NanBox {
         let elems: Vec<NanBox> = caps
@@ -42,7 +46,9 @@ impl Interp {
         let index = caps.groups.first().and_then(|g| *g).map_or(0, |(s, _)| s);
         // Every result array gains the same three keys in the same order, so
         // after the first one each is built with its layout in one step.
-        let groups = self.regex_groups_object(units, caps, group_names);
+        let groups = self.named_groups_object(re, &elems, |i| {
+            caps.groups.get(i).is_some_and(Option::is_some)
+        });
         let obj = self.realm.new_array_with_named(
             elems,
             &["index", "input", "groups"],
@@ -64,21 +70,10 @@ impl Interp {
                 }
             };
             let idx_elems: Vec<NanBox> = caps.groups.iter().map(|g| pair(self, *g)).collect();
-            let indices = self.realm.new_array(idx_elems);
-            let idx_groups = if group_names.is_empty() {
-                NanBox::undefined()
-            } else {
-                let g = self.realm.new_object_with_proto(None);
-                for (idx, name) in group_names {
-                    let span = caps.groups.get(*idx).copied().flatten();
-                    let v = pair(self, span);
-                    // Duplicate names: the participating occurrence wins (see `groups`).
-                    if span.is_some() || self.realm.get_property(g, name).is_none() {
-                        self.realm.set_property(g, name, v);
-                    }
-                }
-                NanBox::handle(g.to_raw())
-            };
+            let indices = self.realm.new_array(idx_elems.clone());
+            let idx_groups = self.named_groups_object(re, &idx_elems, |i| {
+                caps.groups.get(i).is_some_and(Option::is_some)
+            });
             self.realm.set_property(indices, "groups", idx_groups);
             self.realm
                 .set_property(obj, "indices", NanBox::handle(indices.to_raw()));
@@ -120,28 +115,24 @@ impl Interp {
         &mut self,
         units: &[u16],
         caps: &crate::regex::Captures,
-        group_names: &[(usize, String)],
+        re: &alloc::rc::Rc<crate::regex::Regex>,
     ) -> NanBox {
-        if group_names.is_empty() {
+        if re.group_names().is_empty() {
             return NanBox::undefined();
         }
-        // Named-group container is a null-prototype object (per spec). A name may
-        // occur more than once (duplicate named groups in disjoint alternatives):
-        // whichever occurrence participated in the match wins. Create each name on
-        // its first occurrence (preserving key order) with its value; a later
-        // duplicate overwrites the value only when *it* participated (`Some`), so a
-        // non-participating `None` never clobbers the matched capture.
-        let g = self.realm.new_object_with_proto(None);
-        for (idx, name) in group_names {
-            let v = match caps.groups.get(*idx).and_then(|x| *x) {
+        // Named-group container is a null-prototype object (per spec); see
+        // `named_groups_object` for duplicate names.
+        let vals: Vec<NanBox> = caps
+            .groups
+            .iter()
+            .map(|g| match *g {
                 Some((s, e)) => self.units_str(units, s, e),
                 None => NanBox::undefined(),
-            };
-            if !v.is_undefined() || self.realm.get_property(g, name).is_none() {
-                self.realm.set_property(g, name, v);
-            }
-        }
-        NanBox::handle(g.to_raw())
+            })
+            .collect();
+        self.named_groups_object(re, &vals, |i| {
+            caps.groups.get(i).is_some_and(Option::is_some)
+        })
     }
 
     /// `IsRegExp(argument)` (ECMA-262 22.2.7.2), spec-faithful: for an object, read
@@ -995,13 +986,7 @@ impl Interp {
     /// The result array `RegExpBuiltinExec` returns for match `m`.
     #[cfg(feature = "regex")]
     pub(crate) fn regexp_match_array(&mut self, m: &RegexMatch) -> NanBox {
-        self.regex_match_object_u16_indices(
-            &m.units,
-            m.input,
-            &m.caps,
-            m.re.group_names(),
-            m.has_indices,
-        )
+        self.regex_match_object_u16_indices(&m.units, m.input, &m.caps, &m.re, m.has_indices)
     }
 
     /// Updates the Annex B.2.5 RegExp legacy static match record from a successful
@@ -2210,7 +2195,7 @@ impl Interp {
                     }
                     call_args.push(NanBox::number(pos as f64));
                     call_args.push(str_v);
-                    let named = self.regex_groups_object(&m.units, &m.caps, m.re.group_names());
+                    let named = self.regex_groups_object(&m.units, &m.caps, &m.re);
                     if !named.is_undefined() {
                         call_args.push(named);
                     }
@@ -2244,7 +2229,7 @@ impl Interp {
                         .skip(1)
                         .map(|g| g.map(|(a, b)| u16_slice(&m.units, a, b)))
                         .collect();
-                    let named = self.regex_groups_object(&m.units, &m.caps, m.re.group_names());
+                    let named = self.regex_groups_object(&m.units, &m.caps, &m.re);
                     let replacement = self.regexp_replacement(
                         func_replace,
                         replace,

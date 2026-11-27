@@ -601,6 +601,10 @@ pub struct Interp {
     /// The layout of a RegExp match array's `index`/`input`/`groups`.
     #[cfg(feature = "regex")]
     match_array_shape: crate::realm::builtins_fast::AuxShapeCache,
+    /// The layouts of recent RegExps' named-groups objects (see
+    /// `regexp/groups.rs`).
+    #[cfg(feature = "regex")]
+    groups_shapes: Vec<regexp::GroupsShape>,
     /// **Mapped `arguments` exotic objects** (sloppy-mode functions with a simple
     /// parameter list): the arguments object's heap-handle (raw) maps each
     /// currently-mapped integer index to the `(scope, parameter name)` binding it
@@ -3118,6 +3122,8 @@ impl Interp {
             regexp_symbol_keys: [None, None, None, None, None],
             #[cfg(feature = "regex")]
             match_array_shape: Default::default(),
+            #[cfg(feature = "regex")]
+            groups_shapes: Vec::new(),
             current: Scope::root(),
             var_scope: Scope::root(),
             eval_var_scope: None,

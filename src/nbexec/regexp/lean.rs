@@ -772,13 +772,12 @@ impl Interp {
             self.realm.set_regex_last_index(h, end);
         }
         let result = if array {
-            let names = re.group_names();
             let (elems, groups) = match &sub {
                 Subject::Ascii(rope) => {
                     let units = rope.as_leaf_bytes().unwrap_or_default();
-                    self.lean_match_parts(units, &spans, names)
+                    self.lean_match_parts(units, &spans, &re)
                 }
-                _ => self.lean_match_parts(sub.units(), &spans, names),
+                _ => self.lean_match_parts(sub.units(), &spans, &re),
             };
             let obj = self.realm.new_array_with_named(
                 elems,
@@ -802,7 +801,7 @@ impl Interp {
         &mut self,
         units: &[T],
         spans: &[Option<(usize, usize)>],
-        names: &[(usize, alloc::string::String)],
+        re: &alloc::rc::Rc<crate::regex::Regex>,
     ) -> (Vec<NanBox>, NanBox) {
         let len = units.len();
         let text = |realm: &mut Realm, g: Option<(usize, usize)>| match g {
@@ -814,23 +813,12 @@ impl Interp {
             None => NanBox::undefined(),
         };
         let elems: Vec<NanBox> = spans.iter().map(|&g| text(&mut self.realm, g)).collect();
-        if names.is_empty() {
-            return (elems, NanBox::undefined());
-        }
         // A null-prototype object; of duplicate names (in disjoint
         // alternatives) the participating occurrence wins, keeping the
         // first occurrence's key position.
-        let g = self.realm.new_object_with_proto(None);
-        for (idx, name) in names {
-            let v = match spans.get(*idx).copied().flatten() {
-                Some(_) => elems[*idx],
-                None => NanBox::undefined(),
-            };
-            if !v.is_undefined() || self.realm.get_property(g, name).is_none() {
-                self.realm.set_property(g, name, v);
-            }
-        }
-        (elems, NanBox::handle(g.to_raw()))
+        let groups =
+            self.named_groups_object(re, &elems, |i| spans.get(i).is_some_and(Option::is_some));
+        (elems, groups)
     }
 
     /// `String.prototype.match` of the string `o` with the pristine RegExp
