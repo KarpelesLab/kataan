@@ -344,6 +344,17 @@ fn runaway_js_recursion_is_a_range_error_on_any_stack() {
 
 #[test]
 fn deep_js_recursion_runs_on_the_cli_stack() {
-    let got = on_stack(512 << 20, || run(DEEP_CASES));
+    // The CLI is a release build on a 512 MiB stack, where an interpreted
+    // activation costs ~2.7 KiB. A debug build's interpreter frames are ~20x
+    // larger (~54 KiB per plain call: 512 MiB holds ~8 300), and only
+    // linux/x86_64 has the JIT that shrinks hot frames, so a debug build
+    // elsewhere (CI's macOS and Windows jobs, or KATAAN_JIT=0) needs 1 GiB to
+    // reach the same depth.
+    let stack = if cfg!(debug_assertions) {
+        1 << 30
+    } else {
+        512 << 20
+    };
+    let got = on_stack(stack, || run(DEEP_CASES));
     assert_eq!(got.as_deref(), Ok("10000 10000 5000 2500 5000"));
 }
