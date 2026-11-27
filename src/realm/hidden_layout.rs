@@ -109,6 +109,32 @@ impl<const N: usize> HiddenLayout<N> {
         Some(out)
     }
 
+    /// [`Realm::set_hidden_property`]`(handle, key, value)` for the layout's
+    /// key `i` (named `key`), by slot when the object still has exactly the
+    /// layout's shape and may be rewritten directly (as [`read`](Self::read)
+    /// checks), else by name.
+    pub(crate) fn write_checked(
+        &self,
+        realm: &mut Realm,
+        handle: Handle,
+        i: usize,
+        key: &str,
+        value: NanBox,
+    ) {
+        let direct = matches!(
+            realm.heap.get(handle),
+            Some(Cell::Object(o))
+                if o.shaped_shape().is_some_and(|s| Rc::ptr_eq(s, &self.shape))
+                    && !o.is_frozen()
+                    && o.jit_flags() & JIT_FLAG_READONLY == 0
+        );
+        if direct {
+            self.write(realm, handle, i, value);
+        } else {
+            realm.set_hidden_property(handle, key, value);
+        }
+    }
+
     /// Writes `value` to the layout's key `i` on the object at `handle` — what
     /// [`Realm::set_hidden_property`] does for that existing key. Only for an
     /// object [`read`](Self::read) just accepted, with nothing in between that

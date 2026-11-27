@@ -62,6 +62,7 @@ mod coll_hof;
 mod dstr_fast;
 mod gen_fast;
 mod iter_fast;
+mod iter_helper;
 #[cfg(all(feature = "jit", jit_native))]
 mod jit_tier;
 #[cfg(feature = "std")]
@@ -2465,6 +2466,12 @@ fn vm_iter_step(
         ctx.realm.native_at(Handle::from_raw(n)) == Some(crate::nbexec::N_GEN_NEXT)
     }) && let Some(r) = gen_fast::for_of_step(ctx, funcs, regs, it)
     {
+        let step = r?;
+        regs[done as usize] = NanBox::boolean(step.is_none());
+        return Ok(step);
+    }
+    // An iterator helper with the intrinsic `next`: stepped here.
+    if let Some(r) = iter_helper::for_of_step(ctx, funcs, regs, it, nx) {
         let step = r?;
         regs[done as usize] = NanBox::boolean(step.is_none());
         return Ok(step);

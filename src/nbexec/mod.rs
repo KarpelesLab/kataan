@@ -1489,7 +1489,7 @@ pub(crate) const N_BASE_ARRAY: u16 = 480;
 const N_BASE_OBJECT: u16 = 481;
 /// `%IteratorHelperPrototype%.next` — drives a lazy ES2025 iterator-helper object
 /// (`map`/`filter`/`take`/`drop`/`flatMap`) one step at a time.
-const N_ITER_HELPER_NEXT: u16 = 340;
+pub(crate) const N_ITER_HELPER_NEXT: u16 = 340;
 /// `%IteratorHelperPrototype%.return` — closes the helper's underlying iterator.
 const N_ITER_HELPER_RETURN: u16 = 341;
 /// `%WrapForValidIteratorPrototype%.next` — the `Iterator.from` wrapper's `next`.
@@ -1856,7 +1856,7 @@ const N_ITERATOR_FROM: u16 = 237;
 pub(crate) const N_ITERATOR_PROTO_SELF: u16 = 238;
 // A first-class `Iterator.prototype.<helper>` (map/filter/take/…) bound native:
 // the method name rides in the bound target, the receiver is `this`.
-const N_ITERATOR_PROTO_FN: u16 = 239;
+pub(crate) const N_ITERATOR_PROTO_FN: u16 = 239;
 
 /// The ES2025 `Iterator.prototype` helper method names installed on
 /// `%IteratorPrototype%` as first-class functions.
@@ -2582,25 +2582,25 @@ const SAFE_ALL_TARGET: &str = "\u{0}spatgt";
 /// time, so it interleaves correctly with direct `.next()` calls and never
 /// over-consumes (it works on infinite iterators).
 /// The helper kind discriminant (see `HelperKind`).
-const HELPER_KIND: &str = "\u{0}hkind";
+pub(crate) const HELPER_KIND: &str = "\u{0}hkind";
 /// The underlying iterator *object* (what `next`/`return` are invoked on).
-const HELPER_SOURCE: &str = "\u{0}hsrc";
+pub(crate) const HELPER_SOURCE: &str = "\u{0}hsrc";
 /// The cached `next` method of the underlying iterator (looked up once).
-const HELPER_NEXT: &str = "\u{0}hnext";
+pub(crate) const HELPER_NEXT: &str = "\u{0}hnext";
 /// The mapper/filter/flatMap callback (absent for take/drop/from).
-const HELPER_FN: &str = "\u{0}hfn";
+pub(crate) const HELPER_FN: &str = "\u{0}hfn";
 /// A numeric helper parameter: the remaining count for take/drop.
-const HELPER_LIMIT: &str = "\u{0}hlimit";
+pub(crate) const HELPER_LIMIT: &str = "\u{0}hlimit";
 /// The element counter passed to the callback (`fn(value, counter)`).
-const HELPER_COUNTER: &str = "\u{0}hcounter";
+pub(crate) const HELPER_COUNTER: &str = "\u{0}hcounter";
 /// Set once the helper is exhausted/closed; further `next` returns `{done:true}`.
-const HELPER_DONE: &str = "\u{0}hdone";
+pub(crate) const HELPER_DONE: &str = "\u{0}hdone";
 /// Set while an iterator helper's `next` is executing; a reentrant `next` (a
 /// callback that resumes the same helper) sees it and throws a TypeError
 /// (GeneratorValidate: state is executing).
-const HELPER_RUNNING: &str = "\u{0}hrun";
+pub(crate) const HELPER_RUNNING: &str = "\u{0}hrun";
 /// For flatMap: the current inner iterator being drained (absent when none).
-const HELPER_INNER: &str = "\u{0}hinner";
+pub(crate) const HELPER_INNER: &str = "\u{0}hinner";
 const HELPER_INNER_NEXT: &str = "\u{0}hinnext";
 /// Parallel array of the per-item `@@iterator` methods captured once at
 /// `Iterator.concat` call time (`undefined` for a built-in iterable drained

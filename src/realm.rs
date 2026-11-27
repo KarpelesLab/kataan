@@ -520,6 +520,11 @@ pub struct Realm {
     /// The hidden-state layout of a bound function (`[[BoundTargetFunction]]`,
     /// `[[BoundThis]]`, `[[BoundArguments]]`), learned likewise.
     pub(crate) bound_fn_layout: Option<hidden_layout::HiddenLayout<3>>,
+    /// The hidden-state layouts of an iterator helper (`nbvm::iter_helper`):
+    /// a `map`/`filter` one (with its callback) and a `take`/`drop` one,
+    /// learned from the first stepped there once its running mark exists.
+    pub(crate) iter_helper_fn_layout: Option<hidden_layout::HiddenLayout<7>>,
+    pub(crate) iter_helper_lim_layout: Option<hidden_layout::HiddenLayout<6>>,
     /// Shared prototype-chain lookup memos (see
     /// `builtins_fast::shared_chain_lookup`), one per fixed lookup site.
     chain_lookups: core::cell::RefCell<alloc::vec::Vec<builtins_fast::ChainKeyCache>>,
@@ -1289,6 +1294,8 @@ impl Realm {
             str_iter_layout: None,
             arr_iter_layout: None,
             bound_fn_layout: None,
+            iter_helper_fn_layout: None,
+            iter_helper_lim_layout: None,
             chain_lookups: core::cell::RefCell::new(alloc::vec::Vec::new()),
             sparse_array_lengths: alloc::collections::BTreeMap::new(),
             default_object_proto: None,

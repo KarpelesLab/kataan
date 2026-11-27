@@ -226,6 +226,10 @@ enum FastOp {
     ReflectSet,
     /// `Reflect.apply(f, this, list)`: `FnApply` with `f` its receiver.
     ReflectApply,
+    /// `%IteratorHelperPrototype%.next` (`iter_helper`).
+    IterHelperNext,
+    /// A consuming `Iterator.prototype` method (`iter_helper::consume`).
+    IterConsume(super::iter_helper::Consume),
     /// `Object.entries`.
     ObjEntries,
     /// `Object.values`.
@@ -403,6 +407,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(crate::nbexec::N_REFLECT_GET) => return FastOp::ReflectGet,
         Some(crate::nbexec::N_REFLECT_SET) => return FastOp::ReflectSet,
         Some(crate::nbexec::N_REFLECT_APPLY) => return FastOp::ReflectApply,
+        Some(crate::nbexec::N_ITER_HELPER_NEXT) => return FastOp::IterHelperNext,
         Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
         Some(N_OBJECT_VALUES) => return FastOp::ObjValues,
         Some(N_OBJECT_HAS_OWN) => return FastOp::ObjStaticHasOwn,
@@ -453,6 +458,11 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         return FastOp::None;
     };
     match (id, name) {
+        (crate::nbexec::N_ITERATOR_PROTO_FN, n)
+            if let Some(c) = super::iter_helper::Consume::of(n) =>
+        {
+            FastOp::IterConsume(c)
+        }
         (N_DATA_VIEW_PROTO_FN, n) => {
             crate::nbexec::dv_access_any(n).map_or(FastOp::HostDirect, FastOp::DataView)
         }
@@ -1740,6 +1750,13 @@ fn run_op(
     if let FastOp::GenResume(mode) = op {
         return super::gen_fast::call(ctx, funcs, regs, recv, mode, arg(0));
     }
+    if matches!(op, FastOp::IterHelperNext) {
+        return super::iter_helper::site_next(ctx, funcs, regs, recv, NanBox::from_bits(method));
+    }
+    if let FastOp::IterConsume(c) = op {
+        let argv = super::ArgBuf::from_regs(regs, args);
+        return super::iter_helper::consume(ctx, funcs, regs, recv, c, &argv);
+    }
     // `Object.prototype.hasOwnProperty.call(o, k)` (the `for-in` idiom):
     // `hasOwnProperty`'s own fast op, with `o` its receiver — what the call
     // amounts to once `Function.prototype.call` (which the site proved) has
@@ -1803,6 +1820,8 @@ fn run_op(
                 | FastOp::FnApply
                 | FastOp::FnBind
                 | FastOp::ReflectApply
+                | FastOp::IterHelperNext
+                | FastOp::IterConsume(_)
                 | FastOp::ObjStaticHasOwn
                 | FastOp::NumToFixed
                 | FastOp::NumToString
@@ -1929,6 +1948,8 @@ fn run_op(
         | FastOp::StrSearch
         | FastOp::GenResume(_)
         | FastOp::ReflectApply
+        | FastOp::IterHelperNext
+        | FastOp::IterConsume(_)
         | FastOp::ObjStaticHasOwn => {
             return None;
         }

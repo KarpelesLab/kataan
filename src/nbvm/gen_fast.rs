@@ -1408,6 +1408,12 @@ fn direct_target(ctx: &mut Ctx, funcs: &[FnProto], g: NanBox) -> Option<Handle> 
     (id < funcs.len()).then_some(fh)
 }
 
+/// Whether `g` is a VM generator this module resumes directly (see
+/// [`delegate_next`]).
+pub(super) fn direct_target_ok(ctx: &mut Ctx, funcs: &[FnProto], g: NanBox) -> bool {
+    direct_target(ctx, funcs, g).is_some()
+}
+
 /// The method names of the resumption modes.
 const MODE_KEYS: [&str; 3] = ["next", "throw", "return"];
 
