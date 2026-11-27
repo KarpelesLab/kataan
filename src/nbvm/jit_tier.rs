@@ -2820,6 +2820,39 @@ pub(crate) fn jit_helper_exec_op(
         | Op::PrivateSet { .. }
         | Op::PrivateIn { .. }
         | Op::PrivateDefine { .. } => Some(super::private_ops::exec(ctx, funcs, op, regs)),
+        // `super.k` / `super.k = v` over ordinary prototypes: exactly the
+        // interpreter arm's first step.
+        Op::SuperGet {
+            dst,
+            home,
+            key,
+            this,
+            cache,
+        } => {
+            let (h, k, t) = (
+                regs[*home as usize],
+                regs[*key as usize],
+                regs[*this as usize],
+            );
+            super::super_fast::get(ctx, funcs, regs, (h, k, t), cache)
+                .map(|r| r.map(|v| regs[*dst as usize] = v))
+        }
+        Op::SuperSet {
+            home,
+            key,
+            src,
+            this,
+            cache,
+            ..
+        } => {
+            let (h, k, v, t) = (
+                regs[*home as usize],
+                regs[*key as usize],
+                regs[*src as usize],
+                regs[*this as usize],
+            );
+            super::super_fast::set(ctx, funcs, regs, (h, k, v, t), cache)
+        }
         // `x instanceof F` decided from the heap alone (the interpreter arm's
         // own first step); anything else takes the one-op frame.
         Op::Relational {

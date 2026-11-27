@@ -1125,6 +1125,42 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             *dst = reg(*dst);
             *obj = reg(*obj);
         }
+        // (A `super` site's chain cache starts cold in the splice's copy.)
+        Op::SuperGet {
+            dst,
+            home,
+            key,
+            this,
+            ..
+        } => {
+            *dst = reg(*dst);
+            *home = reg(*home);
+            *key = reg(*key);
+            *this = reg(*this);
+        }
+        Op::SuperSet {
+            home,
+            key,
+            src,
+            this,
+            ..
+        } => {
+            *home = reg(*home);
+            *key = reg(*key);
+            *src = reg(*src);
+            *this = reg(*this);
+        }
+        // (A private element's site memo starts cold in the splice's copy.)
+        Op::PrivateGet { dst, obj, key, .. } | Op::PrivateIn { dst, obj, key, .. } => {
+            *dst = reg(*dst);
+            *obj = reg(*obj);
+            *key = reg(*key);
+        }
+        Op::PrivateSet { obj, key, src, .. } => {
+            *obj = reg(*obj);
+            *key = reg(*key);
+            *src = reg(*src);
+        }
         // A call the callee's body inlined itself (see `Candidate::nested`).
         Op::InlineGuard {
             dst,
@@ -2097,7 +2133,9 @@ fn writes_reg(op: &Op, r: Reg) -> bool {
         | Op::Jump { .. }
         | Op::JumpIfFalse { .. }
         | Op::InlineLeave
-        | Op::InitFields { .. } => false,
+        | Op::InitFields { .. }
+        | Op::PrivateSet { .. }
+        | Op::SuperSet { .. } => false,
         Op::BindThis { this } => *this == r,
         Op::SuperCallArgs { dst, this, .. } => *dst == r || *this == r,
         Op::SuperCtor { dst, .. } | Op::DerivedResult { dst, .. } => *dst == r,
@@ -2151,6 +2189,9 @@ fn writes_reg(op: &Op, r: Reg) -> bool {
         | Op::Construct { dst, .. }
         | Op::CallWithMethod { dst, .. }
         | Op::CallKey { dst, .. }
+        | Op::PrivateGet { dst, .. }
+        | Op::PrivateIn { dst, .. }
+        | Op::SuperGet { dst, .. }
         | Op::LoadNewTarget { dst } => *dst == r,
         // (Not one the splice takes: assume the worst.)
         _ => true,

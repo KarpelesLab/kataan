@@ -70,6 +70,7 @@ pub(crate) mod num_switch;
 pub mod objlit;
 mod private_ops;
 mod str_replace;
+mod super_fast;
 mod to_prim;
 mod typeof_fast;
 pub use str_replace::{PlanText, ReplacePlan, ReplaceStep};
@@ -329,6 +330,8 @@ pub enum Op {
         home: Reg,
         key: Reg,
         this: Reg,
+        /// The site's chain cache (`super_fast::SuperCache`).
+        cache: super_fast::SuperCache,
     },
     /// `home.[[Prototype]].[[Set]](key, src, this)` (`super[key] = src`); a
     /// failed write throws only in `strict` code.
@@ -338,6 +341,8 @@ pub enum Op {
         src: Reg,
         this: Reg,
         strict: bool,
+        /// The site's chain cache (`super_fast::SuperCache`).
+        cache: super_fast::SuperCache,
     },
     /// A derived constructor's completion value `src`: an object is the
     /// result, `undefined` is the (bound) `this`, anything else a `TypeError`.
@@ -11121,8 +11126,18 @@ fn run_frame_at_ic(
                 home,
                 key,
                 this,
+                cache,
             } => {
                 let (k, t) = (regs[*key as usize], regs[*this as usize]);
+                if let Some(r) =
+                    super_fast::get(ctx, funcs, regs, (regs[*home as usize], k, t), cache)
+                {
+                    match r {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 match super_base(ctx, regs[*home as usize]) {
                     Ok(base) => {
                         match with_host_regs(ctx, regs, |h| h.get_with_receiver(base, k, t)) {
@@ -11140,12 +11155,21 @@ fn run_frame_at_ic(
                 src,
                 this,
                 strict,
+                cache,
             } => {
                 let (k, v, t) = (
                     regs[*key as usize],
                     regs[*src as usize],
                     regs[*this as usize],
                 );
+                if let Some(r) =
+                    super_fast::set(ctx, funcs, regs, (regs[*home as usize], k, v, t), cache)
+                {
+                    if let Err(e) = r {
+                        handle_throw!(e);
+                    }
+                    continue;
+                }
                 match super_base(ctx, regs[*home as usize]) {
                     Ok(base) => {
                         match with_host_regs(ctx, regs, |h| {
@@ -17205,6 +17229,15 @@ fn refs_expr_w(
                     }
                     _ => {}
                 }
+                // `super.k` reads `this` and the home object (its class
+                // too, for a static one), not `new.target`: only `super(…)`
+                // does (the `Expr::Super` arm below).
+                if matches!(&**object, Expr::Super(_)) {
+                    for n in [THIS_NAME, HOME_NAME, CTOR_NAME] {
+                        direct.insert(String::from(n));
+                    }
+                    break;
+                }
                 e = object;
                 continue;
             }
@@ -20537,6 +20570,7 @@ impl Compiler {
             } if self.hosted && matches!(&**object, Expr::Super(_)) => {
                 let (home, this, key) = self.super_reference(property)?;
                 self.ops.push(Op::SuperSet {
+                    cache: Default::default(),
                     home,
                     key,
                     src: value_reg,
@@ -20944,6 +20978,7 @@ impl Compiler {
                 cache: crate::realm::PrivCache::default(),
             }),
             MemberPlace::Super(home, this, key) => self.ops.push(Op::SuperSet {
+                cache: Default::default(),
                 home,
                 key,
                 src,
@@ -23491,6 +23526,7 @@ impl Compiler {
                 let (home, this, key) = self.super_reference(property)?;
                 let dst = self.alloc();
                 self.ops.push(Op::SuperGet {
+                    cache: Default::default(),
                     dst,
                     home,
                     key,
@@ -23756,6 +23792,30 @@ impl Compiler {
                 {
                     let f = self.expr(callee)?;
                     let this = self.this_value();
+                    // Plain arguments: the ordinary call of a method already
+                    // read (as for `o.#m(args)`).
+                    if arguments
+                        .iter()
+                        .all(|a| matches!(a, crate::ast::Argument::Item(_)))
+                    {
+                        let args = self.call_args(arguments)?;
+                        if tail {
+                            self.ops.push(Op::TailCallGuard {
+                                callee: f,
+                                this,
+                                args: args.clone(),
+                            });
+                        }
+                        let dst = self.alloc();
+                        self.ops.push(Op::CallWithMethod {
+                            dst,
+                            callee: f,
+                            recv: this,
+                            key: String::new(),
+                            args,
+                        });
+                        return Ok(dst);
+                    }
                     let args = self.spread_args(arguments)?;
                     if tail {
                         self.ops.push(Op::TailSpreadGuard {
@@ -23955,6 +24015,12 @@ impl Compiler {
                     } = &**callee
                 {
                     let recv = self.expr(object)?;
+                    let plain = arguments
+                        .iter()
+                        .all(|a| matches!(a, crate::ast::Argument::Item(_)));
+                    // (The receiver is read when the call runs: an argument
+                    // that assigns its variable must not change it.)
+                    let recv = self.pin_operand(recv, args_may_assign(arguments));
                     let key = self.private_key(n)?;
                     let f = self.alloc();
                     self.ops.push(Op::PrivateGet {
@@ -23963,6 +24029,28 @@ impl Compiler {
                         key,
                         cache: crate::realm::PrivCache::default(),
                     });
+                    // Plain arguments: the ordinary call of a method already
+                    // read (`EvaluateCall` read the callee first), with its
+                    // fast paths and callee feedback.
+                    if plain {
+                        let args = self.call_args(arguments)?;
+                        if tail {
+                            self.ops.push(Op::TailCallGuard {
+                                callee: f,
+                                this: recv,
+                                args: args.clone(),
+                            });
+                        }
+                        let dst = self.alloc();
+                        self.ops.push(Op::CallWithMethod {
+                            dst,
+                            callee: f,
+                            recv,
+                            key: String::new(),
+                            args,
+                        });
+                        return Ok(dst);
+                    }
                     let args = self.spread_args(arguments)?;
                     if tail {
                         self.ops.push(Op::TailSpreadGuard {
@@ -24061,6 +24149,7 @@ impl Compiler {
                             let (home, this, key) = self.super_place(property, true)?;
                             let dst = self.alloc();
                             self.ops.push(Op::SuperGet {
+                                cache: Default::default(),
                                 dst,
                                 home,
                                 key,
@@ -24070,6 +24159,7 @@ impl Compiler {
                             let jf = self.emit_jump_if_false(c);
                             let v = self.expr(value)?;
                             self.ops.push(Op::SuperSet {
+                                cache: Default::default(),
                                 home,
                                 key,
                                 src: v,
@@ -24145,6 +24235,7 @@ impl Compiler {
                             let (home, this, key) = self.super_place(property, true)?;
                             let cur = self.alloc();
                             self.ops.push(Op::SuperGet {
+                                cache: Default::default(),
                                 dst: cur,
                                 home,
                                 key,
@@ -24153,6 +24244,7 @@ impl Compiler {
                             let v = self.expr(value)?;
                             let src = self.emit_binop(Self::compound_binop(*op)?, cur, v)?;
                             self.ops.push(Op::SuperSet {
+                                cache: Default::default(),
                                 home,
                                 key,
                                 src,
@@ -24164,6 +24256,7 @@ impl Compiler {
                         let (home, this, key) = self.super_place(property, false)?;
                         let src = self.expr(value)?;
                         self.ops.push(Op::SuperSet {
+                            cache: Default::default(),
                             home,
                             key,
                             src,
@@ -24348,6 +24441,7 @@ impl Compiler {
                     let (home, this, key) = self.super_place(property, true)?;
                     let raw = self.alloc();
                     self.ops.push(Op::SuperGet {
+                        cache: Default::default(),
                         dst: raw,
                         home,
                         key,
@@ -24362,6 +24456,7 @@ impl Compiler {
                         dec: matches!(op, crate::ast::UpdateOp::Dec),
                     });
                     self.ops.push(Op::SuperSet {
+                        cache: Default::default(),
                         home,
                         key,
                         src: next,

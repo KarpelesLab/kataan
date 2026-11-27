@@ -650,6 +650,7 @@ fn verify_op_with(
             home,
             key,
             this,
+            ..
         } => {
             reg(*dst)?;
             reg(*home)?;
@@ -1710,6 +1711,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             home,
             key,
             this,
+            ..
         } => {
             w_u8(94, out);
             for r in [dst, home, key, this] {
@@ -1722,6 +1724,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             src,
             this,
             strict,
+            ..
         } => {
             w_u8(95, out);
             for r in [home, key, src, this] {
@@ -2666,6 +2669,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             home: r.reg()?,
             key: r.reg()?,
             this: r.reg()?,
+            cache: Default::default(),
         },
         95 => Op::SuperSet {
             home: r.reg()?,
@@ -2673,6 +2677,7 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             src: r.reg()?,
             this: r.reg()?,
             strict: r.boolean()?,
+            cache: Default::default(),
         },
         104 => Op::Yield {
             dst: r.reg()?,
