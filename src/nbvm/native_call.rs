@@ -100,6 +100,9 @@ enum FastOp {
     TypedArr(crate::realm::typed_methods::TaMethod),
     /// `Date.UTC` (served for Number arguments).
     DateUtc,
+    /// `Object.fromEntries` over a plain array of plain `[key, value]`
+    /// arrays (`obj_from_entries_fast`).
+    ObjFromEntries,
     /// A `Date.prototype` getter.
     DateGet(crate::realm::date_fields::DateGet),
     /// A `Date.prototype` component setter (served for Number arguments).
@@ -393,6 +396,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_OBJECT_ASSIGN) => return FastOp::ObjAssign,
         Some(N_JSON_STRINGIFY | N_JSON_PARSE) => return FastOp::HostDirect,
         Some(N_WEAKREF_DEREF) => return FastOp::WeakRefDeref,
+        Some(crate::nbexec::N_OBJECT_FROM_ENTRIES) => return FastOp::ObjFromEntries,
         Some(N_GEN_NEXT) => return FastOp::GenResume(0),
         Some(N_GEN_THROW) => return FastOp::GenResume(1),
         Some(N_GEN_RETURN) => return FastOp::GenResume(2),
@@ -1533,6 +1537,46 @@ fn promise_resolve_fast(ctx: &mut Ctx, h: Handle, x: NanBox) -> Option<NanBox> {
     super::settle_unwatched(ctx, p, x).then_some(p)
 }
 
+/// `Object.fromEntries(src)` when iterating `src` and reading its entries
+/// runs no code: `src` a plain array whose iteration is the built-in one
+/// (`iter_fast::plain_array_values`), each entry a plain array of at least
+/// two present elements (so `Get(entry, "0")` / `Get(entry, "1")` read them)
+/// whose key is a String, a Symbol or another primitive held in the value
+/// (ToPropertyKey runs no code). The new object, made as the host makes it;
+/// `None`, having done nothing observable, for anything else.
+fn obj_from_entries_fast(realm: &mut Realm, src: NanBox) -> Option<NanBox> {
+    let entries: alloc::vec::Vec<NanBox> =
+        super::iter_fast::plain_array_values(realm, src)?.to_vec();
+    let mut pairs: alloc::vec::Vec<(NanBox, NanBox)> =
+        alloc::vec::Vec::with_capacity(entries.len());
+    for e in entries {
+        let (_, el) = realm.plain_root_array_elems(Handle::from_raw(e.as_handle()?))?;
+        match el {
+            [k, v, ..] if !k.is_hole() && !v.is_hole() => pairs.push((*k, *v)),
+            _ => return None,
+        }
+        let k = pairs.last()?.0;
+        if let Some(kh) = k.as_handle().map(Handle::from_raw)
+            && !realm.is_string_handle(kh)
+            && realm.symbol_at(kh).is_none()
+        {
+            return None;
+        }
+    }
+    let obj = realm.new_object();
+    for (k, v) in pairs {
+        let key = match k
+            .as_handle()
+            .and_then(|h| realm.symbol_at(Handle::from_raw(h)))
+        {
+            Some((_, id)) => alloc::format!("\u{0}sym:{id}"),
+            None => realm.display_key(k),
+        };
+        realm.set_property(obj, &key, v);
+    }
+    Some(NanBox::handle(obj.to_raw()))
+}
+
 /// `Object.prototype.hasOwnProperty` on the receiver `h` for the key value
 /// `k` ([`FastOp::ObjHasOwn`]) when that runs no code; `None`, having done
 /// nothing observable, otherwise.
@@ -1965,6 +2009,7 @@ fn run_op(
             let argv = [arg(0), arg(1), arg(2)];
             realm.ta_method(h, m, &argv[..n])?
         }
+        FastOp::ObjFromEntries => obj_from_entries_fast(realm, arg(0))?,
         FastOp::DateUtc => {
             // Number arguments (ToNumber the identity), the seven read.
             let mut nums = [0.0; 7];
