@@ -1912,6 +1912,12 @@ fn run_op(
         let argv = super::ArgBuf::from_regs(regs, args);
         return super::array_hof::run(ctx, funcs, regs, recv, op, &argv);
     }
+    // `Array.from(s, mapFn)` of a string: the VM's loop (`array_hof`).
+    if matches!(op, FastOp::ArrayFrom)
+        && let Some(r) = super::array_hof::from_string(ctx, funcs, regs, h, arg(0), arg(1), arg(2))
+    {
+        return Some(r);
+    }
     if let FastOp::CollForEach(set) = op {
         let argv = super::ArgBuf::from_regs(regs, args);
         return super::coll_hof::for_each(ctx, funcs, regs, recv, h, set, &argv);

@@ -10350,6 +10350,13 @@ fn run_frame_at_ic(
             }
             Op::IterOpen { iter, next, src } => {
                 let v = regs[*src as usize];
+                // A string over the built-in String Iterator: by code point
+                // (see `iter_fast`).
+                if *next == iter.wrapping_add(1) && iter_fast::open_string(&mut ctx.realm, v) {
+                    regs[*next as usize] = v;
+                    regs[*iter as usize] = NanBox::number(0.0);
+                    continue;
+                }
                 if let Some(n) = gen_fast::open(ctx, funcs, v) {
                     regs[*iter as usize] = v;
                     regs[*next as usize] = n;

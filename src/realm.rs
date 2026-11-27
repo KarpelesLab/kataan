@@ -1127,6 +1127,11 @@ pub struct VmArrayIterIntrinsics {
     pub set_iter_proto: Option<Handle>,
     /// See [`Self::set_iter_proto`].
     pub map_iter_proto: Option<Handle>,
+    /// `%StringIteratorPrototype%` and its intrinsic `next`, once created
+    /// (the VM's by-index string iteration, `nbvm::iter_fast`).
+    pub str_iter_proto: Option<Handle>,
+    /// See [`Self::str_iter_proto`].
+    pub str_next_fn: Option<Handle>,
 }
 
 /// A snapshot of a realm's intrinsic prototype pointers (the realm-wide

@@ -2331,6 +2331,20 @@ pub(crate) fn jit_helper_iter_next(
     #[allow(unsafe_code)]
     let regs = unsafe { core::slice::from_raw_parts_mut(regs.cast::<NanBox>(), n_regs) };
     let (dst, done, iter, next) = (*dst, *done, *iter, *next);
+    // A by-index iteration (`iter_fast`; an array's that compiled code did
+    // not step inline, or a string's): its step, with nothing else tried.
+    if regs[iter as usize].is_number() {
+        return match super::iter_fast::step(ctx, regs, done, iter) {
+            Ok(v) => {
+                regs[dst as usize] = v.unwrap_or(NanBox::undefined());
+                0
+            }
+            Err(e) => {
+                ctx.jit_pending_fault = Some(e);
+                NanBox::jit_throw_bits()
+            }
+        };
+    }
     // A built-in Set/Map (or snapshot) iterator whose `next` is the one the
     // last such step confirmed (`nbexec::builtin_iter_next`): the step that
     // `vm_iter_step` would come to, with no generator test first.
@@ -3085,6 +3099,15 @@ pub(crate) fn jit_helper_exec_op(
             Some(Ok(()))
         }
         // A generator's open (the interpreter arm's first step).
+        // A string's by-index open (the interpreter arm's first step).
+        Op::IterOpen { iter, next, src }
+            if *next == iter.wrapping_add(1)
+                && super::iter_fast::open_string(&mut ctx.realm, regs[*src as usize]) =>
+        {
+            regs[*next as usize] = regs[*src as usize];
+            regs[*iter as usize] = NanBox::number(0.0);
+            Some(Ok(()))
+        }
         Op::IterOpen { iter, next, src } => {
             let v = regs[*src as usize];
             super::gen_fast::open(ctx, funcs, v)

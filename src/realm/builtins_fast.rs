@@ -1865,6 +1865,14 @@ pub(crate) struct ArrayIterMemo {
     /// The epoch at which `GetMethod(%ArrayIteratorPrototype%, "return")` was
     /// validated to find nothing (`0`: never).
     pub(crate) close_stamp: u64,
+    /// The epoch at which `str_open` was validated (`0`: never).
+    pub(crate) str_stamp: u64,
+    /// `[[Get]](%String.prototype%, @@iterator)` and
+    /// `[[Get]](%StringIteratorPrototype%, "next")`.
+    pub(crate) str_open: Option<(StampedSlot, StampedSlot)>,
+    /// The epoch at which `GetMethod(%StringIteratorPrototype%, "return")`
+    /// was validated to find nothing (`0`: never).
+    pub(crate) str_close_stamp: u64,
 }
 
 impl Realm {

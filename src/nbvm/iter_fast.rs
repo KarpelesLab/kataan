@@ -26,6 +26,14 @@
 //! builds the very live `%ArrayIterator%` the fast path stood in for, positioned
 //! at the cursor.
 //!
+//! A **string** iterates the same way when its `@@iterator` (from
+//! `%String.prototype%`) is the intrinsic one and the fresh String Iterator's
+//! `next` would be the intrinsic `%StringIteratorPrototype%.next`
+//! ([`open_string`]): `next` then holds the (flattened) string and `iter` the
+//! byte offset of the next code point in its WTF-8 storage, which is exactly
+//! the state of the lazy String Iterator it stands in for. A string never
+//! changes, so the step only decodes one code point.
+//!
 //! Every check is an identity comparison against handles the host recorded
 //! while installing the intrinsics ([`crate::realm::VmArrayIterIntrinsics`]),
 //! made at each `GetIterator`, so a later `Array.prototype[Symbol.iterator] =
@@ -89,6 +97,137 @@ const SLOT_RETURN: usize = 2;
 /// re-read.
 pub(super) fn can_open(realm: &mut Realm, v: NanBox) -> bool {
     can_open_array(realm, v)
+}
+
+/// Whether `GetIterator(v)` would yield a built-in String Iterator over the
+/// string primitive `v` whose `next` is the intrinsic one, so that [`step`]
+/// may stand in for it (see the module docs): then `v` is flattened in place
+/// (its contents unchanged) for the steps to decode.
+pub(super) fn open_string(realm: &mut Realm, v: NanBox) -> bool {
+    let Some(h) = v.as_handle().map(Handle::from_raw) else {
+        return false;
+    };
+    if realm.multi_realm || !realm.typeof_is_string(h) || !string_open_ok(realm) {
+        return false;
+    }
+    realm.flatten_string(h);
+    realm.string_leaf_bytes(h).is_some()
+}
+
+/// Whether `%String.prototype%[@@iterator]` is (by an ordinary data-property
+/// lookup) the intrinsic `String.prototype[Symbol.iterator]` and
+/// `%StringIteratorPrototype%.next` the intrinsic `next`: memoized at the
+/// prototype epoch with both chains watched, so a hit re-reads the two found
+/// values only.
+fn string_open_ok(realm: &mut Realm) -> bool {
+    let m = &realm.array_iter_memo;
+    if m.str_stamp == crate::object::proto_epoch()
+        && let Some((iter_at, next_at)) = &m.str_open
+        && let (Some(f), Some(n)) = (realm.stamped_slot(iter_at), realm.stamped_slot(next_at))
+    {
+        return string_pair_ok(realm, f, n);
+    }
+    let ai = realm.vm_array_iter();
+    let (Some(sp), Some(proto), Some(key)) = (
+        realm.string_proto_intrinsic,
+        ai.str_iter_proto,
+        ai.iter_key.clone(),
+    ) else {
+        return false;
+    };
+    let (Some(Some(f)), Some(Some(n))) = (
+        plain_lookup(realm, sp, &key),
+        plain_lookup(realm, proto, "next"),
+    ) else {
+        return false;
+    };
+    if !string_pair_ok(realm, f, n) {
+        return false;
+    }
+    realm.array_iter_memo.str_stamp = 0;
+    if let Some(Some(iter_at)) = realm.watch_get_chain(sp, &key)
+        && let Some(Some(next_at)) = realm.watch_get_chain(proto, "next")
+    {
+        let m = &mut realm.array_iter_memo;
+        m.str_open = Some((iter_at, next_at));
+        m.str_stamp = crate::object::proto_epoch();
+    }
+    true
+}
+
+/// Whether `f` is the intrinsic `String.prototype[Symbol.iterator]` and `n`
+/// the intrinsic `%StringIteratorPrototype%.next`.
+fn string_pair_ok(realm: &Realm, f: NanBox, n: NanBox) -> bool {
+    f.as_handle().is_some_and(|fh| {
+        realm.native_at(Handle::from_raw(fh)) == Some(crate::nbexec::N_STRING_PROTO_ITER)
+    }) && realm
+        .vm_array_iter()
+        .str_next_fn
+        .is_some_and(|nf| n.as_handle() == Some(nf.to_raw()))
+}
+
+/// The string of a fast-mode iterator (`regs[iter]` a Number), when it is a
+/// string iteration rather than an array's.
+fn string_of(realm: &Realm, regs: &[NanBox], iter: Reg) -> Option<Handle> {
+    let h = Handle::from_raw(regs.get(iter as usize + 1)?.as_handle()?);
+    realm.is_string_handle(h).then_some(h)
+}
+
+/// One step of a by-index string iteration over the string `s` (its byte
+/// cursor in `regs[iter]`): the next code point as a string (a lone
+/// surrogate as its own one-unit string), or `None` at the end, latching
+/// `done`.
+fn string_step(
+    realm: &mut Realm,
+    regs: &mut [NanBox],
+    done: Reg,
+    iter: Reg,
+    s: Handle,
+) -> Result<Option<NanBox>, VmError> {
+    let mut idx = regs[iter as usize].as_number().unwrap_or(0.0) as usize;
+    match string_code_point(realm, s, &mut idx)? {
+        Some(v) => {
+            regs[iter as usize] = NanBox::number(idx as f64);
+            Ok(Some(v))
+        }
+        None => {
+            regs[done as usize] = NanBox::boolean(true);
+            Ok(None)
+        }
+    }
+}
+
+/// The code point of the flat string `s` at the byte offset `idx` (moved
+/// past it) as a string — what the String Iterator's step yields, a lone
+/// surrogate as its own one-unit string — or `None` at the end.
+pub(super) fn string_code_point(
+    realm: &mut Realm,
+    s: Handle,
+    idx: &mut usize,
+) -> Result<Option<NanBox>, VmError> {
+    let i = *idx;
+    // (Flattened at the open; a string never becomes a rope again.)
+    let Some(bytes) = realm.string_leaf_bytes(s) else {
+        return Err(VmError::Unsupported);
+    };
+    let Some(&b0) = bytes.get(i) else {
+        return Ok(None);
+    };
+    let v = if b0 < 0x80 {
+        *idx = i + 1;
+        realm.unit_string(u16::from(b0))
+    } else {
+        let (cp, n) = crate::wtf8::decode_code_point(bytes, i);
+        let mut one = [0u8; 4];
+        one[..n].copy_from_slice(&bytes[i..i + n]);
+        *idx = i + n;
+        if cp < 256 {
+            realm.unit_string(cp as u16)
+        } else {
+            realm.new_string_from_rope(crate::rope::Rope::from_bytes(&one[..n]))
+        }
+    };
+    Ok(Some(NanBox::handle(v.to_raw())))
 }
 
 /// `GetIterator(v)` of an iterator object whose `@@iterator` is
@@ -467,6 +606,9 @@ pub(super) fn step(
     if regs[done as usize].as_boolean() == Some(true) {
         return Ok(None);
     }
+    if let Some(s) = string_of(&ctx.realm, regs, iter) {
+        return string_step(&mut ctx.realm, regs, done, iter, s);
+    }
     let arr_v = array_of(regs, iter)?;
     let arr = Handle::from_raw(arr_v.as_handle().unwrap_or_default());
     let idx = regs[iter as usize].as_number().unwrap_or(0.0) as usize;
@@ -521,6 +663,13 @@ pub(super) fn drain_plain_prefix(
     if regs[done as usize].as_boolean() == Some(true) {
         return;
     }
+    // A string's steps run no code either: every remaining code point.
+    if let Some(s) = string_of(&ctx.realm, regs, iter) {
+        while let Ok(Some(v)) = string_step(&mut ctx.realm, regs, done, iter, s) {
+            out.push(v);
+        }
+        return;
+    }
     let Ok(arr_v) = array_of(regs, iter) else {
         return;
     };
@@ -557,11 +706,13 @@ pub(super) fn materialize(
     iter: Reg,
 ) -> Result<NanBox, VmError> {
     let arr = array_of(regs, iter)?;
-    let next_fn = ctx
-        .realm
-        .vm_array_iter()
-        .next_fn
-        .ok_or(VmError::Unsupported)?;
+    let ai = ctx.realm.vm_array_iter();
+    let next_fn = if string_of(&ctx.realm, regs, iter).is_some() {
+        ai.str_next_fn
+    } else {
+        ai.next_fn
+    }
+    .ok_or(VmError::Unsupported)?;
     let idx = regs[iter as usize].as_number().unwrap_or(0.0) as usize;
     let it = with_host(ctx, |h| h.array_iterator_at(arr, idx)).ok_or(VmError::Unsupported)?;
     if it.as_handle().is_none() {
@@ -577,6 +728,9 @@ pub(super) fn materialize(
 /// there is nothing to call; otherwise the iterator is made real and closed
 /// through the host.
 pub(super) fn close(ctx: &mut Ctx, regs: &mut [NanBox], iter: Reg) -> Result<(), HostError> {
+    if string_of(&ctx.realm, regs, iter).is_some() {
+        return close_string(ctx, regs, iter);
+    }
     // No `return` anywhere on the chain, validated at the current epoch.
     if ctx.realm.array_iter_memo.close_stamp == crate::object::proto_epoch() {
         return Ok(());
@@ -623,4 +777,44 @@ pub(super) fn close_is_noop(realm: &mut Realm) -> bool {
         Some(Some(v)) => v.is_undefined() || v.is_null(),
         None => false,
     }
+}
+
+/// [`close`] of a by-index string iteration: `GetMethod(iterator, "return")`
+/// resolves on `%StringIteratorPrototype%`'s chain, absent in the built-in
+/// case; otherwise the iterator is made real and closed through the host.
+fn close_string(ctx: &mut Ctx, regs: &mut [NanBox], iter: Reg) -> Result<(), HostError> {
+    if ctx.realm.array_iter_memo.str_close_stamp == crate::object::proto_epoch() {
+        return Ok(());
+    }
+    if let Some(proto) = ctx.realm.vm_array_iter().str_iter_proto {
+        match plain_lookup(&ctx.realm, proto, "return") {
+            Some(None) => {
+                if let Some(None) = ctx.realm.watch_get_chain(proto, "return") {
+                    ctx.realm.array_iter_memo.str_close_stamp = crate::object::proto_epoch();
+                }
+                return Ok(());
+            }
+            Some(Some(v)) if v.is_undefined() || v.is_null() => return Ok(()),
+            _ => {}
+        }
+    }
+    let it = match materialize(ctx, regs, iter) {
+        Ok(it) => it,
+        Err(VmError::Thrown(e)) => return Err(HostError::Thrown(e)),
+        Err(_) => return Err(HostError::Fault),
+    };
+    with_host(ctx, |h| h.iter_close(it)).unwrap_or(Err(HostError::Fault))
+}
+
+/// Whether `GetMethod(iterator, "return")` of a fresh String Iterator finds
+/// nothing (nothing on `%StringIteratorPrototype%`'s chain), decided without
+/// running code: `false` when something is found or it cannot be told.
+pub(super) fn string_return_absent(realm: &Realm) -> bool {
+    if realm.array_iter_memo.str_close_stamp == crate::object::proto_epoch() {
+        return true;
+    }
+    realm
+        .vm_array_iter()
+        .str_iter_proto
+        .is_some_and(|p| matches!(plain_lookup(realm, p, "return"), Some(None)))
 }

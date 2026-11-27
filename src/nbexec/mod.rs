@@ -3001,7 +3001,7 @@ const N_ERROR_PROTO_STACK_SET: u16 = 670;
 /// `"[Symbol.iterator]"`, length 0). RequireObjectCoercible + ToString the
 /// receiver (so a poisoned `toString` propagates), then return a
 /// `%StringIteratorPrototype%` iterator over the string's code points.
-const N_STRING_PROTO_ITER: u16 = 962;
+pub(crate) const N_STRING_PROTO_ITER: u16 = 962;
 /// Hidden array property holding a `FinalizationRegistry`'s `[[Cells]]`: each
 /// cell is a 3-element array `[target, heldValue, unregisterToken]` where an
 /// absent (~empty~) token is stored as `undefined` (safe: `undefined` can never
@@ -5578,6 +5578,8 @@ impl Interp {
         // array (often its longest) otherwise ran the generic protocol, with
         // a result object per step, to the end.
         self.builtin_iterator_proto("Array Iterator");
+        // `%StringIteratorPrototype%` too, for the by-index string `for-of`.
+        self.builtin_iterator_proto("String Iterator");
     }
 
     /// The running realm's intrinsic global `name` (`"Map"`, `"TypeError"`,
@@ -10111,6 +10113,16 @@ impl crate::nbvm::VmHost for Interp {
         let Some(h) = arr.as_handle().map(Handle::from_raw) else {
             return NanBox::undefined();
         };
+        // A by-index string iteration (a flat string, `index` its byte
+        // cursor): the String Iterator it stood in for.
+        if self.realm.is_string_handle(h) {
+            let it = self.make_string_iterator(arr);
+            if let Some(ih) = it.as_handle().map(Handle::from_raw) {
+                self.realm
+                    .set_hidden_property(ih, GEN_IDX, NanBox::number(index as f64));
+            }
+            return it;
+        }
         let it = self.make_live_array_iterator(h, 1);
         if let Some(ih) = it.as_handle().map(Handle::from_raw) {
             self.realm

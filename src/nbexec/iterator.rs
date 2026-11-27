@@ -1317,9 +1317,9 @@ impl Interp {
                 None => Err(self.type_error("[Symbol.iterator] did not return an object")),
             };
         }
-        if self.realm.array_elements(vh).is_some()
-            || self.realm.is_string_handle(vh)
-            || self.realm.collection_entries(vh).is_some()
+        // (An Array or a string with no `@@iterator` anywhere on its chain is
+        // not iterable: `GetMethod` found nothing to call.)
+        if self.realm.collection_entries(vh).is_some()
             || self.realm.get_property(vh, GEN_BUF).is_some()
         {
             let vals = self.iterate_values(value)?;

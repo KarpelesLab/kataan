@@ -352,6 +352,96 @@ pub(super) fn run(
     Some(r)
 }
 
+/// `Array.from(items, mapFn, thisArg)` with `this` the (single) realm's own
+/// `%Array%`, `items` a string primitive whose iteration is the built-in
+/// String Iterator (`iter_fast::open_string`), and `mapFn` absent /
+/// `undefined` or a VM closure: `Construct(%Array%)` makes a fresh array no
+/// code can see, each step decodes one code point (the String Iterator's
+/// `next`, captured at `GetIterator`, runs no code), each mapped value is an
+/// append, and a throwing `mapFn` closes the iterator (calling a `return`
+/// that some code put on `%StringIteratorPrototype%`'s chain, made real at
+/// its position first) before the throw propagates. `None` for anything
+/// else (the host's built-in).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn from_string(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    ctor: Handle,
+    items: NanBox,
+    map_fn: NanBox,
+    this_arg: NanBox,
+) -> Option<Result<NanBox, VmError>> {
+    if ctx.realm.multi_realm || ctx.realm.native_at(ctor) != Some(N_BASE_ARRAY) {
+        return None;
+    }
+    let mapping = !map_fn.is_undefined();
+    if mapping
+        && !map_fn
+            .as_handle()
+            .is_some_and(|c| ctx.realm.is_vm_function(Handle::from_raw(c)))
+    {
+        return None;
+    }
+    if !super::iter_fast::open_string(&mut ctx.realm, items) {
+        return None;
+    }
+    let s = Handle::from_raw(items.as_handle()?);
+    // Publish the caller's registers (unless a GC root already) and what
+    // the loop holds; the result's elements follow on the frame shadow.
+    let mark = ctx.frame_shadow.len();
+    #[cfg(all(feature = "jit", jit_native))]
+    let rooted = lean_on() && super::jit_tier::on_register_stack(ctx, regs);
+    #[cfg(not(all(feature = "jit", jit_native)))]
+    let rooted = false;
+    if !rooted {
+        ctx.frame_shadow.extend_from_slice(regs);
+    }
+    ctx.frame_shadow
+        .extend_from_slice(&[items, map_fn, this_arg]);
+    ctx.frames_published += 1;
+    let out = ctx.frame_shadow.len();
+    let mut callee = mapping.then(|| Callee::new(ctx, funcs, map_fn));
+    let mut cursor = 0usize;
+    let mut k = 0usize;
+    let r = loop {
+        let v = match super::iter_fast::string_code_point(&mut ctx.realm, s, &mut cursor) {
+            Ok(Some(v)) => v,
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        };
+        let v = match &mut callee {
+            None => v,
+            Some(c) => match c.invoke(ctx, &[v, NanBox::number(k as f64)], this_arg) {
+                Ok(r) => r,
+                Err(e) => {
+                    // `IteratorClose(iteratorRecord, completion)` with a throw
+                    // completion: a `return` found is called (its outcome
+                    // ignored), then the throw goes on.
+                    if matches!(e, VmError::Thrown(_))
+                        && !super::iter_fast::string_return_absent(&ctx.realm)
+                        && let Some(it) = with_host(ctx, |h| h.array_iterator_at(items, cursor))
+                        && it.as_handle().is_some()
+                    {
+                        ctx.frame_shadow.push(it);
+                        let _ = with_host(ctx, |h| h.iter_close(it));
+                    }
+                    break Err(e);
+                }
+            },
+        };
+        ctx.frame_shadow.push(v);
+        k += 1;
+    };
+    let r = r.map(|()| {
+        let elems = ctx.frame_shadow.split_off(out);
+        NanBox::handle(ctx.realm.new_array(elems).to_raw())
+    });
+    ctx.frames_published -= 1;
+    ctx.frame_shadow.truncate(mark);
+    Some(r)
+}
+
 /// [`run`]'s lean lane for `forEach`, `map`, `filter`, `some`, `every`, the
 /// `find` family and `reduce` / `reduceRight`:
 /// a caller whose window is a GC root already (on the register stack) and

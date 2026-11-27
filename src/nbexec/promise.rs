@@ -334,6 +334,12 @@ impl Interp {
         if tag == "Map Iterator" {
             self.realm.vm_array_iter_mut().map_iter_proto = Some(proto);
         }
+        // And for the VM's by-index string iteration (`iter_fast`).
+        if tag == "String Iterator" {
+            let ai = self.realm.vm_array_iter_mut();
+            ai.str_iter_proto = Some(proto);
+            ai.str_next_fn = Some(next);
+        }
         proto
     }
 

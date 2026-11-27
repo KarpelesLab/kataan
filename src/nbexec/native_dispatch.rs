@@ -2449,8 +2449,9 @@ impl Interp {
                         // down the iterator path here: with that method deleted a
                         // string is a plain array-like and `Array.from("𝄞")`
                         // yields the two lone surrogates, not one code point.
+                        // So is an Array whose `@@iterator` was removed from
+                        // its whole chain (`GetMethod` found nothing to call).
                         has_iter
-                            || self.realm.is_array_like(h)
                             || self.realm.collection_is_set(h).is_some()
                             || self.realm.get_property(h, GEN_BUF).is_some()
                     }
