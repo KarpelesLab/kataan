@@ -383,6 +383,52 @@ fn emit_body(a: &mut X64Assembler, e: &DirectEmit<'_>, general: Label) {
                 a.store_rax(disp(e.dst));
                 a.jmp(e.done);
             }
+            if let (K_FROM_CHAR_CODE, Some(x), 72) = (e.kind, x, e.layout.slot_stride) {
+                // A Number whose truncation is a unit below 256 (ToUint16 of
+                // it is that truncation) whose interned string exists: the
+                // realm's `unit_bits` entry, its handle still naming a live
+                // string cell (its slot's generation and kind checked, as
+                // `Realm::interned_unit_string` revalidates the entry). A
+                // NaN, an infinity or any other value is the helper's.
+                const QNAN: i64 = 0x7ffc_0000_0000_0000;
+                let l = e.layout;
+                a.p_arena(e.realm, &l.props);
+                a.load_rax(disp(x));
+                a.movabs_r11(QNAN);
+                a.and_rax_r11();
+                a.cmp_rax_r11();
+                a.je(helper);
+                a.movsd_xmm0_mem(disp(x));
+                a.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xc8]); // cvttsd2si rcx, xmm0
+                a.raw(&[0x48, 0x81, 0xf9, 0xff, 0x00, 0x00, 0x00]); // cmp rcx, 255
+                a.g_jcc(cc::A, helper);
+                a.g_load(r::R9, r::R15, e.realm);
+                a.g_load(
+                    r::R9,
+                    r::R9,
+                    crate::realm::Realm::jit_unit_bits_offset() as i32,
+                );
+                a.raw(&[0x49, 0x8b, 0x04, 0xc9]); // mov rax, [r9 + rcx*8]
+                a.raw(&[0x48, 0x85, 0xc0]); // test rax, rax
+                a.je(helper);
+                // (The slot found by hand, not by the rooted walk: the
+                // entry is revalidated, not assumed live.)
+                a.raw(&[0x89, 0xc1]); // mov ecx, eax
+                a.p_cmp_arena_len(r::RCX);
+                a.g_jcc(cc::AE, helper);
+                a.p_slot_lea72(r::RCX);
+                a.cmp_byte_at_rcx_imm(l.off_slot_occ, l.slot_occupied_disc);
+                a.jne(helper);
+                a.raw(&[0x49, 0x89, 0xc3]); // mov r11, rax
+                a.raw(&[0x49, 0xc1, 0xeb, 0x20]); // shr r11, 32
+                a.raw(&[0x66, 0x44, 0x39, 0x99]); // cmp word [rcx + disp32], r11w
+                a.raw(&l.off_slot_gen.to_le_bytes());
+                a.jne(helper);
+                a.cmp_byte_at_rcx_imm(l.off_cell_tag, l.cell_str_disc);
+                a.jne(helper);
+                a.store_rax(disp(e.dst));
+                a.jmp(e.done);
+            }
             a.bind(helper);
             let undef = NanBox::undefined().to_bits() as i64;
             a.mov_rdi_r15();

@@ -399,6 +399,11 @@ pub struct Realm {
     /// roots ([`gc_roots`](Realm::gc_roots), and the minor path's side-table
     /// roots) and the table is dropped by a moving [`compact`](Realm::compact).
     unit_strings: alloc::vec::Vec<Option<Handle>>,
+    /// [`unit_strings`](Self::unit_strings) as `NanBox` bits (`0`: none),
+    /// at a fixed address for compiled code's in-line
+    /// `String.fromCharCode(c)` (`jit::direct_call`), which revalidates an
+    /// entry's handle generation and cell kind before using it.
+    unit_bits: alloc::boxed::Box<[u64; 256]>,
     /// The interned `typeof` result strings, by `TYPE_NAMES` index (see
     /// [`type_name_string`](Realm::type_name_string)), filled on first use.
     type_name_strings: alloc::vec::Vec<Option<Handle>>,
@@ -1251,6 +1256,7 @@ impl Realm {
             no_then_stamp: 0,
             regex_subject_units: None,
             unit_strings: alloc::vec::Vec::new(),
+            unit_bits: alloc::boxed::Box::new([0; 256]),
             type_name_strings: alloc::vec::Vec::new(),
             unit_cursor: None,
             slice_cursor: None,
@@ -1667,6 +1673,14 @@ impl Realm {
             }
         }
         self.jit_typed_len_stamp = crate::object::proto_epoch();
+    }
+
+    /// The byte offset, within a `Realm`, of the pointer to its interned
+    /// unit strings' `NanBox` bits (`unit_bits`, 256 `u64`s).
+    #[cfg(all(feature = "jit", jit_native))]
+    #[must_use]
+    pub(crate) fn jit_unit_bits_offset() -> usize {
+        core::mem::offset_of!(Realm, unit_bits)
     }
 
     /// The byte offset, within a `Realm`, of `jit_typed_len_stamp` (a `u64`),
@@ -3018,6 +3032,7 @@ impl Realm {
                 self.unit_strings.resize(256, None);
             }
             self.unit_strings[i] = Some(h);
+            self.unit_bits[i] = NanBox::handle(h.to_raw()).to_bits();
             return h;
         }
         self.new_string_wtf8(crate::wtf8::from_utf16(&[unit]))
@@ -10264,6 +10279,7 @@ impl Realm {
         // The interned one-unit strings are a cache too: drop them rather than
         // forward them.
         self.unit_strings.clear();
+        *self.unit_bits = [0; 256];
         self.type_name_strings.clear();
         self.literal_ropes.clear();
         self.lit_cells_retire();
