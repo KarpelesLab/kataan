@@ -594,7 +594,8 @@ impl Interp {
         self.realm
             .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
         let result = self.iter_helper_next_body(this);
-        self.realm.delete_property(h, HELPER_RUNNING);
+        self.realm
+            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(false));
         result
     }
 
@@ -1735,7 +1736,8 @@ impl Interp {
         self.realm
             .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
         let result = self.zip_step(h);
-        self.realm.delete_property(h, HELPER_RUNNING);
+        self.realm
+            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(false));
         match result {
             Ok(Some(v)) => {
                 // A yielded value moves the generator to "suspended-yield".
@@ -1950,7 +1952,8 @@ impl Interp {
                     }
                     let r = self.zip_close_open_normal(iters, fin);
                     if started {
-                        self.realm.delete_property(h, HELPER_RUNNING);
+                        self.realm
+                            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(false));
                     }
                     r?;
                 }
@@ -1985,7 +1988,8 @@ impl Interp {
                 self.realm
                     .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
                 let r = self.iterator_close(inner);
-                self.realm.delete_property(h, HELPER_RUNNING);
+                self.realm
+                    .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(false));
                 r?;
             }
         }
@@ -2008,7 +2012,8 @@ impl Interp {
         self.realm
             .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(true));
         let result = self.iter_concat_next_body(this);
-        self.realm.delete_property(h, HELPER_RUNNING);
+        self.realm
+            .set_hidden_property(h, HELPER_RUNNING, NanBox::boolean(false));
         result
     }
 
