@@ -2993,20 +2993,22 @@ pub(crate) fn jit_helper_exec_op(
         };
     }
     // A property op keeps its inline cache across executions, in a table
-    // keyed by the op's address: the op lives in bytecode the `JitProto` owns,
-    // which the function's tier slot keeps alive for longer than the `Ctx`, so the address
-    // names this one site for as long as the table exists. (A fresh cache per
-    // execution would miss, and re-arm, every single time.)
-    let cached = matches!(
-        op,
-        Op::GetProp { .. }
-            | Op::SetProp { .. }
-            | Op::SetPropStrict { .. }
-            | Op::InitProp { .. }
-            | Op::CallMethod { .. }
-            | Op::CallWithMethod { .. }
-    );
-    let r = if cached {
+    // keyed by the op's address: the op lives in bytecode the `JitProto` owns.
+    // That bytecode can be freed while the table lives (a recompiled body's,
+    // a `Function`-made function's that died) and its address reused by
+    // another op, so each entry also records which op it is (kind and
+    // property name) and a mismatch starts from an empty cache. (A fresh
+    // cache per execution would miss, and re-arm, every single time.)
+    let sig = match op {
+        Op::GetProp { key, .. } => Some((0u8, key)),
+        Op::SetProp { key, .. } => Some((1, key)),
+        Op::SetPropStrict { key, .. } => Some((2, key)),
+        Op::InitProp { key, .. } => Some((3, key)),
+        Op::CallMethod { key, .. } => Some((4, key)),
+        Op::CallWithMethod { key, .. } => Some((5, key)),
+        _ => None,
+    };
+    let r = if let Some((kind, name)) = sig {
         let key = core::ptr::from_ref(op) as usize;
         let mut ic = core::mem::take(&mut ctx.exec_op_ic);
         ic.clear();
@@ -3016,7 +3018,8 @@ pub(crate) fn jit_helper_exec_op(
         ic.push(
             ctx.exec_op_ics
                 .get_mut(&key)
-                .map(core::mem::take)
+                .filter(|e| e.0 == kind && e.1 == *name)
+                .map(|e| core::mem::take(&mut e.2))
                 .unwrap_or_default(),
         );
         let r = super::run_frame_at_ic(
@@ -3031,9 +3034,10 @@ pub(crate) fn jit_helper_exec_op(
         );
         if let Some(c) = ic.pop() {
             match ctx.exec_op_ics.get_mut(&key) {
-                Some(slot) => *slot = c,
+                Some(slot) if slot.0 == kind && slot.1 == *name => slot.2 = c,
+                Some(slot) => *slot = (kind, name.clone(), c),
                 None => {
-                    ctx.exec_op_ics.insert(key, c);
+                    ctx.exec_op_ics.insert(key, (kind, name.clone(), c));
                 }
             }
         }

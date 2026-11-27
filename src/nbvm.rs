@@ -5789,9 +5789,12 @@ struct Ctx<'a> {
     pending_new_target: Option<NanBox>,
     /// Inline caches of the property ops the generic JIT tier runs one at a
     /// time through the interpreter (`jit_tier::jit_helper_exec_op`), keyed by
-    /// the op's address, plus a scratch one-entry cache vector for that call.
+    /// the op's address and tagged with the op's kind and property name (an
+    /// address can be reused by another op), plus a scratch one-entry cache
+    /// vector for that call.
     #[cfg(all(feature = "jit", jit_native))]
-    exec_op_ics: alloc::collections::BTreeMap<usize, PropertyCache>,
+    #[allow(clippy::type_complexity)]
+    exec_op_ics: alloc::collections::BTreeMap<usize, (u8, String, PropertyCache)>,
     #[cfg(all(feature = "jit", jit_native))]
     exec_op_ic: Vec<PropertyCache>,
     /// The host realm (a `$262.createRealm()` index) this run executes in,
@@ -34363,6 +34366,48 @@ mod generic_jit_tests {
             .unwrap();
         assert_eq!(interp.as_number(), Some(11.0)); // "object".length + 5
         assert_eq!(interp.to_bits(), jitted.to_bits());
+    }
+
+    /// The handed-back ops' inline caches are keyed by the op's address,
+    /// which freed bytecode (a recompiled body's, a dead `Function`-made
+    /// function's) can hand to another op: an entry made for a different op
+    /// at that address is not used.
+    #[test]
+    fn exec_op_cache_ignores_another_op_at_its_address() {
+        let (funcs, _) = compile_named("function f(){ return 1; }", "f");
+        let mut ctx = mk_ctx(Realm::new());
+        ctx.jit_funcs = Some(&funcs[..] as *const [FnProto]);
+        let o = ctx.realm.new_object();
+        ctx.realm.set_property(o, "a", NanBox::number(1.0));
+        ctx.realm.set_property(o, "b", NanBox::number(2.0));
+        let mut regs = [NanBox::handle(o.to_raw()), NanBox::undefined()];
+        let run = |ctx: &mut Ctx, regs: &mut [NanBox], op: &Op| {
+            jit_tier::jit_helper_exec_op(
+                (ctx as *mut Ctx).cast(),
+                regs.as_mut_ptr().cast(),
+                regs.len(),
+                op,
+            )
+        };
+        let mut op = Box::new(Op::GetProp {
+            dst: 1,
+            obj: 0,
+            key: "a".into(),
+        });
+        for _ in 0..4 {
+            assert_eq!(run(&mut ctx, &mut regs, &op), 0);
+            assert_eq!(regs[1].as_number(), Some(1.0));
+        }
+        // Another op at the same address.
+        *op = Op::GetProp {
+            dst: 1,
+            obj: 0,
+            key: "b".into(),
+        };
+        for _ in 0..4 {
+            assert_eq!(run(&mut ctx, &mut regs, &op), 0);
+            assert_eq!(regs[1].as_number(), Some(2.0), "o.b, not the cache of o.a");
+        }
     }
 
     /// A throw raised by an interpreter-run op propagates out of the native body
