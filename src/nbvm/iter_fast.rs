@@ -277,7 +277,7 @@ pub(super) fn open_vm_call(
     let key = ctx.realm.vm_array_iter().iter_key.as_deref()?;
     let f = super::array_hof::chain_data(&ctx.realm, h, key).ok()??;
     ctx.realm.vm_function(Handle::from_raw(f.as_handle()?))?;
-    let it = match super::call_closure_pub(ctx, funcs, regs, f, &[], v) {
+    let it = match super::call_closure_compiled(ctx, funcs, regs, f, &[], v) {
         Ok(it) => it,
         Err(e) => return Some(Err(e)),
     };
@@ -290,6 +290,37 @@ pub(super) fn open_vm_call(
         return Some(Err(VmError::Thrown(e)));
     }
     Some(Ok(it))
+}
+
+/// IteratorStep (ECMA-262 7.4.8) of the iterator `it` whose `next` method
+/// `nx` is a VM function (a hand-written iterator's): `next` called in the
+/// VM with no argument (`regs`, the calling frame's register file, published
+/// for it), its result required to be an object, then `Get(result, "done")`
+/// and — while not done — `Get(result, "value")`, each a plain data read
+/// when it is one and the host's `[[Get]]` otherwise (whose getters run
+/// without lending registers: the result object, held here, needs no root
+/// while nothing collects). `Some(Ok(None))` once done; `None` (nothing
+/// run) when `nx` is not a VM function.
+pub(super) fn vm_next_step(
+    ctx: &mut Ctx,
+    funcs: &[super::FnProto],
+    regs: &[NanBox],
+    it: NanBox,
+    nx: NanBox,
+) -> Option<Result<Option<NanBox>, VmError>> {
+    ctx.realm.vm_function(Handle::from_raw(nx.as_handle()?))?;
+    Some((|| {
+        let res = super::call_closure_compiled(ctx, funcs, Some(regs), nx, &[], it)?;
+        if !super::is_object_value(&ctx.realm, res) {
+            let e = super::vm_error(ctx, "TypeError", "Iterator result is not an object");
+            return Err(VmError::Thrown(e));
+        }
+        let d = super::get_str_plain(ctx, res, "done")?;
+        if ctx.realm.truthy(d) {
+            return Ok(None);
+        }
+        super::get_str_plain(ctx, res, "value").map(Some)
+    })())
 }
 
 /// The second half of [`open_vm_call`]'s `GetIterator`: `Get(it, "next")`

@@ -2476,6 +2476,12 @@ fn vm_iter_step(
         regs[done as usize] = NanBox::boolean(step.is_none());
         return Ok(step);
     }
+    // A user-written `next` (a VM function): IteratorStep in the VM.
+    if let Some(step) = iter_fast::vm_next_step(ctx, funcs, regs, it, nx) {
+        let step = step?;
+        regs[done as usize] = NanBox::boolean(step.is_none());
+        return Ok(step);
+    }
     match with_host_regs(ctx, regs, |h| h.iter_step(it, nx)) {
         Some(Ok(Some(v))) => {
             regs[done as usize] = NanBox::boolean(false);
