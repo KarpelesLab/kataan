@@ -50,6 +50,8 @@ mod a64_numeric;
 #[cfg(all(feature = "alloc", jit_native))]
 mod arr_push;
 #[cfg(all(feature = "alloc", jit_native))]
+mod bool_thread;
+#[cfg(all(feature = "alloc", jit_native))]
 mod call_seq;
 #[cfg(all(feature = "alloc", jit_native))]
 mod chase;
@@ -19625,7 +19627,36 @@ impl JitFunction {
                     if target <= op_idx {
                         backedge!(target);
                     }
-                    a.jmp(num.branch_label(&labels, op_idx, target)?);
+                    // A proven boolean's test at the target, on this jump
+                    // (`bool_thread`).
+                    let thread = bool_thread::plan(
+                        ops,
+                        op_idx,
+                        target,
+                        &fused_test,
+                        &|q| rc.sites.get(q).is_some_and(Option::is_none) && !num.in_any_region(q),
+                        &|r| ok(r) && num.is_bool_at(op_idx, r),
+                    )
+                    .filter(|t| {
+                        (tag_true as u8) != (tag_false as u8)
+                            && (t.not_dst.is_none() || (tag_true ^ tag_false) < 0x80)
+                            && t.not_dst.is_none_or(ok)
+                    });
+                    if let Some(t) = thread {
+                        let on_false = num.branch_label(&labels, op_idx, t.on_false)?;
+                        let on_true = num.branch_label(&labels, op_idx, t.on_true)?;
+                        if let Some(nd) = t.not_dst {
+                            a.load_rax(disp(t.cond));
+                            // xor rax, imm8: a boolean's bits flipped to the other's.
+                            a.raw(&[0x48, 0x83, 0xf0, (tag_true ^ tag_false) as u8]);
+                            a.store_rax(disp(nd));
+                        }
+                        a.g_cmp_byte_imm(call_seq::r::RBX, disp(t.cond), tag_false as u8);
+                        a.g_jcc(call_seq::cc::E, on_false);
+                        a.jmp(on_true);
+                    } else {
+                        a.jmp(num.branch_label(&labels, op_idx, target)?);
+                    }
                 }
                 // Fused into the inlined call's guard just before: its miss
                 // took this branch, its hit falls through.
