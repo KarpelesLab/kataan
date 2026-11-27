@@ -106,6 +106,8 @@ mod props;
 #[cfg(all(feature = "alloc", jit_native))]
 mod recv_cache;
 #[cfg(all(feature = "alloc", jit_native))]
+mod scalar_args;
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod sink;
 #[cfg(all(feature = "alloc", jit_native))]
 mod str_cmp;
@@ -10244,6 +10246,23 @@ impl JitFunction {
         }
         // A hoisted array's sites walk nothing (`NumGen::hoisted_array`).
         num.drop_hoisted_array_sites(ops, &mut rc);
+        // An `arguments` object read only for `length` and indices is not
+        // made on a native entry (`ScalarArgs`).
+        let scalar_args = if plain_call && deopt_info.is_none() {
+            scalar_args::ScalarArgs::plan(ops, bytecode, |pc| num.in_any_region(pc))
+        } else {
+            None
+        };
+        if let Some(s) = &scalar_args {
+            for &pc in &s.uses {
+                if let Some(site) = rc.sites.get_mut(pc) {
+                    *site = None;
+                }
+            }
+        }
+        let scalar_reg = scalar_args.as_ref().map(|s| s.reg);
+        let scalar_regs: Vec<u16> = scalar_args.as_ref().map_or(Vec::new(), |s| s.regs.clone());
+        let scalar_mapped = scalar_args.as_ref().is_some_and(|s| s.mapped);
         // The ways whose every site compiles in one layout `S` (see
         // `recv_cache::shape_ways`): a hit there proves the receiver has `S`.
         let way_shape = recv_cache::shape_ways(&rc, ops, |op| match *op {
@@ -12393,6 +12412,7 @@ impl JitFunction {
                 dst: fixed,
                 arg: fixed as u64,
                 rest: true,
+                scalar: false,
                 helper: helpers.make_rest as usize as u64,
             });
         }
@@ -12403,6 +12423,7 @@ impl JitFunction {
                 dst: usize::from(*dst),
                 arg: u64::from(*mapped),
                 rest: false,
+                scalar: scalar_reg.is_some(),
                 helper: helpers.make_arguments as usize as u64,
             });
         }
@@ -18160,6 +18181,58 @@ impl JitFunction {
                     if !ok(dst) || !ok(obj) || !ok(index) {
                         return None;
                     }
+                    // An unmade `arguments` object (`ScalarArgs`): an index
+                    // below the argument count (in its register) is that
+                    // argument, right below the window; anything else makes
+                    // the object (into the register) and reads it as usual.
+                    let scalar_done = scalar_regs.contains(&obj).then(|| a.new_label());
+                    if let Some(sdone) = scalar_done {
+                        use call_seq::r::{R8, R11, RBX, RCX, RDX};
+                        let made = a.new_label();
+                        let make = a.new_label();
+                        a.load_rax(disp(obj));
+                        a.g_mov(call_seq::r::RDX, call_seq::r::RAX);
+                        a.movabs_r11(QNAN as i64);
+                        a.g_and(RDX, R11);
+                        a.g_cmp(RDX, R11);
+                        a.je(made);
+                        a.g_load(RCX, RBX, disp(index));
+                        a.g_mov(RDX, RCX);
+                        a.g_and(RDX, R11);
+                        a.g_cmp(RDX, R11);
+                        a.je(make);
+                        a.raw(&[0x66, 0x48, 0x0f, 0x6e, 0xc9]); // movq xmm1, rcx
+                        a.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xd1]); // cvttsd2si rdx, xmm1
+                        a.raw(&[0xf2, 0x48, 0x0f, 0x2a, 0xd2]); // cvtsi2sd xmm2, rdx
+                        a.raw(&[0x66, 0x0f, 0x2e, 0xca]); // ucomisd xmm1, xmm2
+                        a.g_jcc(call_seq::cc::NE, make);
+                        a.g_jcc(0xa, make); // jp: NaN
+                        a.raw(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+                        a.raw(&[0xf2, 0x4c, 0x0f, 0x2c, 0xc0]); // cvttsd2si r8, xmm0
+                        a.g_cmp(RDX, R8);
+                        a.g_jcc(call_seq::cc::AE, make); // unsigned: i < 0 too
+                        a.raw(&[0x4c, 0x29, 0xc2]); // sub rdx, r8
+                        a.raw(&[0x48, 0x8b, 0x04, 0xd3]); // mov rax, [rbx + rdx*8]
+                        a.store_rax(disp(dst));
+                        a.jmp(sdone);
+                        // Make the object: argc = the count, argv = window - 8 argc.
+                        a.bind(make);
+                        a.load_rax(disp(obj));
+                        a.raw(&[0x66, 0x48, 0x0f, 0x6e, 0xc0]); // movq xmm0, rax
+                        a.raw(&[0xf2, 0x48, 0x0f, 0x2c, 0xf0]); // cvttsd2si rsi, xmm0
+                        a.raw(&[0x48, 0x89, 0xf2]); // mov rdx, rsi
+                        a.raw(&[0x48, 0xc1, 0xe2, 0x03]); // shl rdx, 3
+                        a.raw(&[0x48, 0xf7, 0xda]); // neg rdx
+                        a.raw(&[0x48, 0x01, 0xda]); // add rdx, rbx
+                        a.movabs_argreg(3, i64::from(scalar_mapped));
+                        a.mov_rdi_r15();
+                        a.movabs_rax(helpers.make_arguments as usize as i64);
+                        a.call_rax();
+                        for &r in &scalar_regs {
+                            a.store_rax(disp(r));
+                        }
+                        a.bind(made);
+                    }
                     // (In a speculative loop's fast version every miss
                     // leaves for the plain copy, which runs the op.)
                     let bail = num.spec_bail(&mut a, op_idx);
@@ -18617,6 +18690,9 @@ impl JitFunction {
                         }
                     }
                     a.bind(done);
+                    if let Some(sdone) = scalar_done {
+                        a.bind(sdone);
+                    }
                 }
                 GenericOp::SetElem {
                     obj,
@@ -18933,6 +19009,20 @@ impl JitFunction {
                     }
                     let helper = a.new_label();
                     let done = a.new_label();
+                    // An unmade `arguments` object (`ScalarArgs`): its
+                    // register holds the argument count.
+                    if scalar_regs.contains(&arr) {
+                        let made = a.new_label();
+                        a.load_rax(disp(arr));
+                        a.g_mov(call_seq::r::RDX, call_seq::r::RAX);
+                        a.movabs_r11(QNAN as i64);
+                        a.g_and(call_seq::r::RDX, call_seq::r::R11);
+                        a.g_cmp(call_seq::r::RDX, call_seq::r::R11);
+                        a.je(made);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        a.bind(made);
+                    }
                     let bail = num.spec_bail(&mut a, op_idx);
                     // A typed-array view's length (`typed::t_len`) where the
                     // array path misses (as for `GetElem`, one walk serves

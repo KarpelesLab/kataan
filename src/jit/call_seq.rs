@@ -1496,6 +1496,12 @@ pub(crate) struct MadeArgs {
     pub arg: u64,
     /// A rest parameter's array (else the `arguments` object).
     pub rest: bool,
+    /// An `arguments` object the body only reads `length` and indices of
+    /// (`jit::ScalarArgs`): the entry stores the argument count (a Number)
+    /// in its register instead of an object, when the arguments lie right
+    /// below the window as the header lays them out (else it makes the
+    /// object).
+    pub scalar: bool,
     /// The helper's address.
     pub helper: u64,
 }
@@ -1700,6 +1706,18 @@ pub(crate) fn emit_native_entry(
         if m.dst >= n_regs || (m.rest != (m.dst < this_slot)) {
             return None;
         }
+        let have = a.new_label();
+        if m.scalar && !m.rest {
+            let eager = a.new_label();
+            a.raw(&[0x48, 0x8d, 0x04, 0xd1]); // lea rax, [rcx + rdx*8]
+            a.g_cmp(r::RAX, r::RBX);
+            a.g_jcc(cc::NE, eager);
+            a.raw(&[0xf2, 0x48, 0x0f, 0x2a, 0xc2]); // cvtsi2sd xmm0, rdx
+            a.raw(&[0x66, 0x49, 0x0f, 0x7e, 0xc1]); // movq r9, xmm0
+            args_obj = Some(m.dst);
+            a.jmp(have);
+            a.bind(eager);
+        }
         a.raw(&[0x51, 0x52]); // push rcx; push rdx (rsp stays 16-aligned)
         a.g_mov(r::RSI, r::RDX);
         a.g_mov(r::RDX, r::RCX);
@@ -1715,6 +1733,7 @@ pub(crate) fn emit_native_entry(
         }
         a.raw(&[0x5a, 0x59]); // pop rdx; pop rcx
         a.pin_reload();
+        a.bind(have);
     }
     // `new.target` (before the fill below reuses `rcx`; the fill skips it):
     // a construct's header word, else `undefined` (see `HDR_CONSTRUCT`).
