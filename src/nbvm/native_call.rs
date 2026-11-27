@@ -1110,6 +1110,9 @@ pub(crate) fn str_call_code(key: &str) -> Option<u8> {
         "match" => 17,
         "replaceAll" => 18,
         "substr" => 19,
+        "charCodeAt" => 20,
+        "codePointAt" => 21,
+        "at" => 22,
         _ => return None,
     })
 }
@@ -1137,6 +1140,9 @@ fn str_call_op(code: u8) -> Option<FastOp> {
         17 => FastOp::StrMatch,
         18 => FastOp::StrReplaceAll,
         19 => FastOp::StrSubstr,
+        20 => FastOp::StrCharCodeAt,
+        21 => FastOp::StrCodePointAt,
+        22 => FastOp::StrAt,
         _ => return None,
     })
 }
