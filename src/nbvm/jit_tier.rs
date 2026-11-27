@@ -3121,10 +3121,6 @@ fn call_compiled(
     call_compiled_with(ctx, funcs, Some(regs), callee_val, this, &argv)
 }
 
-/// The most fixed parameters before a rest parameter for which
-/// [`call_compiled_with`] enters the body's native-call entry.
-const REST_NATIVE_FIXED: usize = 8;
-
 /// [`call_compiled`] with the arguments `args`, and the caller's registers
 /// `publish` published for the GC — or, for a call from a Rust frame that
 /// holds values the collector cannot see (`None`), not, which declines
@@ -3150,13 +3146,8 @@ pub(super) fn call_compiled_with(
     if ctx.realm.multi_realm || ctx.call_depth == 0 {
         return None;
     }
-    // (A rest-parameter body has no native-call entry to enter: its call
-    // here binds the rest array as `call_with_inner` does.)
     let rest = proto.rest_from;
-    let jit = match rest {
-        None => direct_jit(ctx, proto, id)?,
-        Some(fixed) => rest_direct_target(proto, fixed)?,
-    };
+    let jit = direct_jit(ctx, proto, id)?;
     // `call_with`'s recursion guard.
     if ctx.call_depth >= ctx.realm.limits.max_call_depth
         || ctx.realm.vm_total_depth >= ctx.realm.limits.max_call_depth
@@ -3177,59 +3168,9 @@ pub(super) fn call_compiled_with(
         }
         ctx.frames_published += 1;
     }
-    // A rest-parameter body whose activation's arguments nothing can read
-    // (not `legacy`: no `f.arguments`; an `arguments` object, which reads
-    // them, makes no `rest_direct_target`): its native-call entry, given its
-    // parameters as `call_with_inner` binds them — the fixed ones, then the
-    // rest array — which it copies into its window like any others.
-    if let Some(fixed) = rest
-        && fixed < REST_NATIVE_FIXED
-        && !proto.legacy
-        && jit.native_entry().is_some()
-        && jit.n_regs() >= proto.n_regs
-        && ctx
-            .realm
-            .vm_function(handle)
-            .is_some_and(|(_, c)| c.len() >= proto.n_captures)
-    {
-        let mut params = [NanBox::undefined(); REST_NATIVE_FIXED + 1];
-        for (slot, a) in params.iter_mut().zip(args.iter().take(fixed)) {
-            *slot = *a;
-        }
-        // (Nothing collects between the array's allocation and the entry's
-        // copy of it onto the register stack.)
-        let arr = ctx
-            .realm
-            .new_array(args.get(fixed..).unwrap_or(&[]).to_vec());
-        params[fixed] = NanBox::handle(arr.to_raw());
-        if let Some((_, caps)) = ctx.realm.vm_function(handle) {
-            let caps = caps.as_ptr();
-            // SAFETY: as the call below: `jit` is the callee's compiled body
-            // with a native-call entry over its own register count; `caps`
-            // points at the closure's captures, which the callee value (held
-            // by the caller) keeps alive, read right before the entry.
-            #[allow(unsafe_code)]
-            let r = unsafe {
-                enter_native(
-                    ctx,
-                    funcs,
-                    &jit,
-                    jit.n_regs(),
-                    callee_val,
-                    caps.cast::<u64>(),
-                    this,
-                    &params[..=fixed],
-                )
-            };
-            if let Some(r) = r {
-                ctx.frames_published = published;
-                ctx.frame_shadow.truncate(mark);
-                return Some(r);
-            }
-        }
-    }
-    if rest.is_none()
-        && jit.native_entry().is_some()
+    // (A rest-parameter body's native-call entry makes its rest array from
+    // the arguments itself: `crate::jit::call_seq::MadeArgs`.)
+    if jit.native_entry().is_some()
         && jit.n_regs() >= proto.n_regs
         && let Some(caps) = ctx
             .realm
@@ -4850,44 +4791,6 @@ pub(crate) fn jit_helper_call_value(
                 return 0;
             }
         }
-        // A rest-parameter closure, which no call site is filled for:
-        // `call_compiled` straight away, as the one-op interpreter's arm
-        // below would begin.
-        if let Some((fid, _)) = NanBox::from_bits(callee_val)
-            .as_handle()
-            .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
-        {
-            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
-            #[allow(unsafe_code)]
-            let funcs = unsafe {
-                &*ctx
-                    .jit_funcs
-                    .expect("jit_funcs set before generic dispatch")
-            };
-            if funcs
-                .get(fid as usize)
-                .is_some_and(|p| p.rest_from.is_some())
-            {
-                // SAFETY: as `jit_helper_exec_op`'s register file.
-                #[allow(unsafe_code)]
-                let regs =
-                    unsafe { core::slice::from_raw_parts_mut(regs_raw.cast::<NanBox>(), n_regs) };
-                let callee = NanBox::from_bits(callee_val);
-                if let Some(r) = call_compiled(ctx, funcs, regs, callee, args, NanBox::undefined())
-                {
-                    return match r {
-                        Ok(v) => {
-                            regs[*dst as usize] = v;
-                            0
-                        }
-                        Err(e) => {
-                            ctx.jit_pending_fault = Some(e);
-                            NanBox::jit_throw_bits()
-                        }
-                    };
-                }
-            }
-        }
         // SAFETY: the site's own cache (see the function contract).
         #[allow(unsafe_code)]
         let site = unsafe { &mut *site.cast::<CallSite>() };
@@ -5598,7 +5501,7 @@ pub(crate) fn jit_helper_call_this(
 fn construct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     if proto.is_async
         || proto.is_generator
-        || proto.rest_from.is_some()
+        || (proto.rest_from.is_some() && !rest_direct_on())
         || !call_is_hot(proto.tier.has_body())
     {
         return None;
@@ -5941,6 +5844,33 @@ pub(crate) fn jit_helper_make_arguments(
             .unwrap_or(NanBox::undefined())
             .to_bits(),
     }
+}
+}
+
+jit_extern! {
+/// The rest parameter's array a native-call entry makes for its body
+/// (`crate::jit::call_seq::MadeArgs`), as `call_with_inner` binds it: the
+/// arguments past the `fixed` parameters before it (`argc` of them in all
+/// at `argv`). Never runs user code, never collects.
+///
+/// # Safety
+/// `ctx` the live `Ctx`; `argv` points at `argc` arguments.
+pub(crate) fn jit_helper_make_rest(
+    ctx: *mut core::ffi::c_void,
+    argc: u64,
+    argv: *const u64,
+    fixed: u64,
+) -> u64 {
+    // SAFETY: see the function contract.
+    #[allow(unsafe_code)]
+    let (ctx, args) = unsafe {
+        (
+            &mut *(ctx as *mut Ctx),
+            core::slice::from_raw_parts(argv.cast::<NanBox>(), argc as usize),
+        )
+    };
+    let rest = args.get(fixed as usize..).unwrap_or(&[]).to_vec();
+    NanBox::handle(ctx.realm.new_array(rest).to_raw()).to_bits()
 }
 }
 
@@ -6332,9 +6262,8 @@ pub(super) fn callee_view(
 }
 
 /// Whether the function `proto` may be entered by [`call_compiled`]: a plain
-/// VM closure body (not a class constructor, async, generator, rest-parameter
-/// or `arguments` one) that is hot and already compiled to the generic tier —
-/// its compiled body, if so.
+/// VM closure body (not a class constructor, async or generator one) that is
+/// hot and already compiled to the generic tier — its compiled body, if so.
 fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     // (`new.target` is fine: the callee's register starts `undefined`, a
     // call's `new.target`. So is an `arguments` object: a native-call entry
@@ -6343,7 +6272,7 @@ fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     if proto.class_ctor
         || proto.is_async
         || proto.is_generator
-        || proto.rest_from.is_some()
+        || (proto.rest_from.is_some() && !rest_direct_on())
         || !call_is_hot(proto.tier.has_body())
     {
         return None;
@@ -6355,35 +6284,8 @@ fn direct_target(proto: &FnProto) -> Option<Rc<crate::jit::JitProto>> {
     }
 }
 
-/// [`direct_target`] for a body with a rest parameter after `fixed` others
-/// (`KATAAN_JIT_REST_DIRECT=0`: none): [`call_compiled_with`] runs it on a
-/// fresh register file, never through a native-call entry or a compiled
-/// call sequence (so it is not cached in `TierRuntime::direct`, which arms
-/// those).
-fn rest_direct_target(proto: &FnProto, fixed: usize) -> Option<Rc<crate::jit::JitProto>> {
-    if !rest_direct_on()
-        || proto.n_params != fixed + 1
-        || proto.class_ctor
-        || proto.is_async
-        || proto.is_generator
-        || proto
-            .ops
-            .iter()
-            .take(2)
-            .any(|o| matches!(o, Op::MakeArguments { .. }))
-        || !call_is_hot(proto.tier.has_body())
-    {
-        return None;
-    }
-    match proto.tier.jit() {
-        Some(Some(j)) if j.is_generic() => Some(j),
-        Some(Some(_)) => generic_twin(proto),
-        _ => None,
-    }
-}
-
-/// Whether a compiled caller's call of a rest-parameter function enters its
-/// compiled body directly ([`rest_direct_target`]; `KATAAN_JIT_REST_DIRECT=0`
+/// Whether a call of a rest-parameter function may enter its compiled body
+/// directly ([`direct_target`], [`construct_target`]; `KATAAN_JIT_REST_DIRECT=0`
 /// turns it off, read once per process).
 fn rest_direct_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

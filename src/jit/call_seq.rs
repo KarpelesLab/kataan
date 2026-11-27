@@ -1480,17 +1480,22 @@ impl X64Assembler {
     }
 }
 
-/// A body's `arguments` object, which its native-call entry makes
-/// ([`emit_native_entry`]): the register (`Op::MakeArguments`'s `dst`), the
-/// object's kind, and the helper making it
-/// (`jit_helper_make_arguments(ctx, argc, argv, mapped) -> bits`, the callee
-/// read from the native-call header just below `argv`).
+/// An object a body's native-call entry makes from the call's arguments
+/// ([`emit_native_entry`]), as `call_with_inner` binds it on entry: a rest
+/// parameter's array (`rest`: `dst` is the rest parameter's register, `arg`
+/// the count of fixed parameters before it;
+/// `jit_helper_make_rest(ctx, argc, argv, fixed)`), or the `arguments` object
+/// (`dst` is `Op::MakeArguments`'s, `arg` whether it is mapped;
+/// `jit_helper_make_arguments(ctx, argc, argv, mapped)`, the callee read
+/// from the native-call header just below `argv`).
 #[derive(Clone, Copy)]
 pub(crate) struct MadeArgs {
     /// The register the object goes in.
     pub dst: usize,
-    /// A mapped (sloppy) object.
-    pub mapped: bool,
+    /// The helper's last argument.
+    pub arg: u64,
+    /// A rest parameter's array (else the `arguments` object).
+    pub rest: bool,
     /// The helper's address.
     pub helper: u64,
 }
@@ -1537,7 +1542,7 @@ pub(crate) fn emit_native_entry(
     (direct, direct_pinned): (Option<Label>, Option<Label>),
     body: Label,
     inline_ok: Option<(InlineOk, &CallLayout)>,
-    made_args: Option<MadeArgs>,
+    made: &[MadeArgs],
 ) -> Option<()> {
     let undefined = crate::nanbox::NanBox::undefined().to_bits();
     let slot = |i: usize| i32::try_from(i * 8).ok();
@@ -1683,21 +1688,31 @@ pub(crate) fn emit_native_entry(
     if this_slot < n_regs {
         a.g_store(r::RBX, slot(this_slot)?, r::R9);
     }
-    // The `arguments` object (`Op::MakeArguments`, the body's first op):
-    // made from every argument passed (`argc` in `rdx`, `argv` in `rcx`)
-    // and the callee (the header's), kept in `r9` until the fill below is
-    // done. Nothing collects while the window is incomplete (an allocation
-    // never does); the call may grow the heap arena, which is reloaded.
-    let made_args = made_args.filter(|m| m.dst > this_slot && m.dst < n_regs);
-    if let Some(m) = made_args {
+    // The objects made from every argument passed (`argc` in `rdx`, `argv`
+    // in `rcx`): a rest parameter's array, stored at once over its
+    // parameter register (which the fill below does not touch), then the
+    // `arguments` object (with the header's callee), kept in `r9` until the
+    // fill is done. Nothing collects while the window is incomplete (an
+    // allocation never does); a call may grow the heap arena, which is
+    // reloaded.
+    let mut args_obj = None;
+    for m in made {
+        if m.dst >= n_regs || (m.rest != (m.dst < this_slot)) {
+            return None;
+        }
         a.raw(&[0x51, 0x52]); // push rcx; push rdx (rsp stays 16-aligned)
         a.g_mov(r::RSI, r::RDX);
         a.g_mov(r::RDX, r::RCX);
-        a.g_movabs(r::RCX, u64::from(m.mapped));
+        a.g_movabs(r::RCX, m.arg);
         a.g_mov(r::RDI, r::R15);
         a.g_movabs(r::RAX, m.helper);
         a.g_call_rax();
-        a.g_mov(r::R9, r::RAX);
+        if m.rest {
+            a.g_store(r::RBX, slot(m.dst)?, r::RAX);
+        } else {
+            a.g_mov(r::R9, r::RAX);
+            args_obj = Some(m.dst);
+        }
         a.raw(&[0x5a, 0x59]); // pop rdx; pop rcx
         a.pin_reload();
     }
@@ -1750,8 +1765,8 @@ pub(crate) fn emit_native_entry(
     if let Some(nt) = nt {
         a.g_store(r::RBX, slot(nt)?, r::R10);
     }
-    if let Some(m) = made_args {
-        a.g_store(r::RBX, slot(m.dst)?, r::R9);
+    if let Some(dst) = args_obj {
+        a.g_store(r::RBX, slot(dst)?, r::R9);
     }
     if let Some(countdown) = countdown {
         a.mov_frame8_imm32(countdown, 1); // poll at the first back-edge

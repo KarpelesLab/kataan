@@ -4325,6 +4325,9 @@ pub struct GenericHelpers {
     /// A native-call entry's `arguments` object (`call_seq::MadeArgs`,
     /// `jit_helper_make_arguments(ctx, argc, argv, mapped)`).
     pub make_arguments: jit_abi!(fn(*mut core::ffi::c_void, u64, *const u64, u64) -> u64),
+    /// A native-call entry's rest-parameter array (`call_seq::MadeArgs`,
+    /// `jit_helper_make_rest(ctx, argc, argv, fixed)`).
+    pub make_rest: jit_abi!(fn(*mut core::ffi::c_void, u64, *const u64, u64) -> u64),
     /// `super(…)`'s "already bound" `ReferenceError` (`jit_super_twice`).
     pub super_twice: SuperTwiceHelper,
     /// `Op::SuperCallArgs`'s slow path (`jit_helper_super_call(ctx, regs,
@@ -5732,6 +5735,7 @@ impl JitProto {
             &osr_entries,
             &call_sites,
             (proto.n_params, proto.n_captures, new_target, proto.legacy),
+            (proto.rest_from, !proto.is_async && !proto.is_generator),
             &inline_closures,
             pc_map.as_ref().map_or(&[][..], |m| &m.1[..]),
             &no_spec_body,
@@ -9892,6 +9896,7 @@ impl JitFunction {
         osr_entries: &[usize],
         call_sites: &[*const CallSite],
         (n_params, n_caps, new_target, legacy): (usize, usize, Option<usize>, bool),
+        (rest_from, plain_call): (Option<usize>, bool),
         inline_closures: &[bool],
         pc_orig: &[u32],
         no_spec: &[usize],
@@ -12379,19 +12384,30 @@ impl JitFunction {
         // direct`): not for a body whose activation needs its header. (A
         // sloppy ordinary body's is handed out only while no code can read
         // the legacy `f.caller` / `f.arguments`: `JitProto::call_target`.)
-        // A body making an `arguments` object: its entry makes it from the
-        // header's arguments and callee (`call_seq::MadeArgs`), so it has no
-        // headerless entry either.
-        let made_args = match bytecode.first() {
-            Some(crate::nbvm::Op::MakeArguments { dst, mapped }) => Some(call_seq::MadeArgs {
+        // A body with a rest parameter, or making an `arguments` object:
+        // its entry makes them from the header's arguments (and callee)
+        // (`call_seq::MadeArgs`), so it has no headerless entry either.
+        let mut made_args: Vec<call_seq::MadeArgs> = Vec::new();
+        if let Some(fixed) = rest_from.filter(|_| plain_call) {
+            made_args.push(call_seq::MadeArgs {
+                dst: fixed,
+                arg: fixed as u64,
+                rest: true,
+                helper: helpers.make_rest as usize as u64,
+            });
+        }
+        if let Some(crate::nbvm::Op::MakeArguments { dst, mapped }) = bytecode.first()
+            && plain_call
+        {
+            made_args.push(call_seq::MadeArgs {
                 dst: usize::from(*dst),
-                mapped: *mapped,
+                arg: u64::from(*mapped),
+                rest: false,
                 helper: helpers.make_arguments as usize as u64,
-            }),
-            _ => None,
-        };
+            });
+        }
         let native_direct =
-            (call_seq::headerless_enabled() && new_target.is_none() && made_args.is_none())
+            (call_seq::headerless_enabled() && new_target.is_none() && made_args.is_empty())
                 .then(|| a.new_label());
         let native_direct_pinned = native_direct.and_then(|_| a.pinned().then(|| a.new_label()));
         let native_room = if has_inline && !has_handlers {
@@ -12429,7 +12445,7 @@ impl JitFunction {
                 },
                 &helpers.call_layout,
             )),
-            made_args,
+            &made_args,
         )?;
         // A speculative region's plain copy is emitted right after it
         // (`numeric::NumGen::schedule`).
