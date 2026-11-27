@@ -3756,7 +3756,12 @@ impl Interp {
                 next,
             ]);
             while let Some(entry) = sc.step(it, next)? {
-                let call_res = if is_set {
+                // (The intrinsic adder's call is unobservable: its effect,
+                // straight on the fresh collection.)
+                let call_res = if is_set && intrinsic_adder {
+                    sc.realm.collection_set(handle, entry, entry);
+                    Ok(NanBox::undefined())
+                } else if is_set {
                     sc.call_with_this(adder, map_val, &[entry])
                 } else if !sc.is_object_value(entry) {
                     let _ = sc.iterator_close(it);
@@ -3777,7 +3782,12 @@ impl Interp {
                             return Err(e);
                         }
                     };
-                    sc.call_with_this(adder, map_val, &[k, v])
+                    if intrinsic_adder {
+                        sc.realm.collection_set(handle, k, v);
+                        Ok(NanBox::undefined())
+                    } else {
+                        sc.call_with_this(adder, map_val, &[k, v])
+                    }
                 };
                 if let Err(e) = call_res {
                     let _ = sc.iterator_close(it);
