@@ -1866,8 +1866,8 @@ const ITERATOR_PROTO_METHODS: &[&str] = &[
 ];
 const N_OBJECT_DEFINE_PROPS: u16 = 124;
 const N_WEAKSET: u16 = 113;
-const N_REFLECT_GET: u16 = 114;
-const N_REFLECT_SET: u16 = 115;
+pub(crate) const N_REFLECT_GET: u16 = 114;
+pub(crate) const N_REFLECT_SET: u16 = 115;
 pub(crate) const N_REFLECT_HAS: u16 = 116;
 const N_REFLECT_OWN_KEYS: u16 = 117;
 const N_REFLECT_DELETE: u16 = 118;

@@ -220,6 +220,12 @@ enum FastOp {
     ObjGetProto,
     /// `Reflect.has`.
     ReflectHas,
+    /// `Reflect.get`.
+    ReflectGet,
+    /// `Reflect.set`.
+    ReflectSet,
+    /// `Reflect.apply(f, this, list)`: `FnApply` with `f` its receiver.
+    ReflectApply,
     /// `Object.entries`.
     ObjEntries,
     /// `Object.values`.
@@ -394,6 +400,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         Some(N_OBJECT_GET_OWN_NAMES) => return FastOp::ObjNames,
         Some(N_OBJECT_GET_PROTO | N_REFLECT_GET_PROTO) => return FastOp::ObjGetProto,
         Some(N_REFLECT_HAS) => return FastOp::ReflectHas,
+        Some(crate::nbexec::N_REFLECT_GET) => return FastOp::ReflectGet,
+        Some(crate::nbexec::N_REFLECT_SET) => return FastOp::ReflectSet,
+        Some(crate::nbexec::N_REFLECT_APPLY) => return FastOp::ReflectApply,
         Some(N_OBJECT_ENTRIES) => return FastOp::ObjEntries,
         Some(N_OBJECT_VALUES) => return FastOp::ObjValues,
         Some(N_OBJECT_HAS_OWN) => return FastOp::ObjStaticHasOwn,
@@ -780,6 +789,16 @@ fn str_parts_lean_on() -> bool {
 fn str_arg(realm: &mut Realm, v: NanBox) -> Option<crate::rope::Rope> {
     let h = v.as_handle().map(Handle::from_raw)?;
     str_parts(realm, h)
+}
+
+/// The storage key of a `Reflect` key argument whose ToPropertyKey runs no
+/// code: a String (escaped into the user namespace) or a Symbol.
+fn reflect_key(realm: &Realm, k: NanBox) -> Option<alloc::string::String> {
+    let kh = Handle::from_raw(k.as_handle()?);
+    if let Some(id) = realm.symbol_id(kh) {
+        return Some(crate::shape::symbol_key(id));
+    }
+    realm.string_key(kh)
 }
 
 /// Calls the VM function `f` with `this` and `argv`, publishing the calling
@@ -1708,6 +1727,25 @@ fn run_op(
     // `Object.hasOwn(o, k)` likewise (`o` an object, `k` a key whose
     // ToPropertyKey runs no code: the order of the two conversions is then
     // unobservable).
+    // `Reflect.apply(f, this, list)` with `list` an object (a primitive one
+    // is the host's TypeError): `f.apply(this, list)`'s op.
+    if matches!(op, FastOp::ReflectApply) {
+        let f = arg(0).as_handle()?;
+        // (`FnApply` takes only an array or an `arguments` object then.)
+        arg(2).as_handle()?;
+        let rest = args.get(1..).unwrap_or(&[]);
+        return run_op(
+            ctx,
+            funcs,
+            FastOp::FnApply,
+            method,
+            arg(0),
+            Handle::from_raw(f),
+            false,
+            regs,
+            rest,
+        );
+    }
     if matches!(op, FastOp::ObjStaticHasOwn) {
         let t = arg(0).as_handle()?;
         let rest = args.get(1..).unwrap_or(&[]);
@@ -1744,6 +1782,7 @@ fn run_op(
                 | FastOp::FnCall
                 | FastOp::FnApply
                 | FastOp::FnBind
+                | FastOp::ReflectApply
                 | FastOp::ObjStaticHasOwn
                 | FastOp::NumToFixed
                 | FastOp::NumToString
@@ -1869,6 +1908,7 @@ fn run_op(
         | FastOp::StrMatch
         | FastOp::StrSearch
         | FastOp::GenResume(_)
+        | FastOp::ReflectApply
         | FastOp::ObjStaticHasOwn => {
             return None;
         }
@@ -2994,6 +3034,45 @@ fn run_op(
                 return None;
             }
             p.map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()))
+        }
+        FastOp::ReflectGet => {
+            // `target.[[Get]](key, receiver)` over an ordinary chain that
+            // finds a data property or nothing (the receiver plays no part).
+            let t = arg(0).as_handle().map(Handle::from_raw)?;
+            let key = reflect_key(realm, arg(1))?;
+            match realm.ordinary_chain_get(t, &key)?.0 {
+                crate::realm::ChainHit::Data(v) => v,
+                crate::realm::ChainHit::Absent => NanBox::undefined(),
+                crate::realm::ChainHit::Accessor(..) => return None,
+            }
+        }
+        FastOp::ReflectSet => {
+            // `target.[[Set]](key, value, receiver)` (OrdinarySet) over an
+            // ordinary chain where the key is an own data property of the
+            // target or on no object of it: the receiver's define — a plain
+            // store on the target itself, or on a proxy receiver that
+            // forwards the define to an ordinary object without a trap
+            // (`Realm::proxy_receiver_define_quiet`).
+            let t = arg(0).as_handle().map(Handle::from_raw)?;
+            let key = reflect_key(realm, arg(1))?;
+            match realm.ordinary_chain_get(t, &key)?.0 {
+                crate::realm::ChainHit::Data(_) if realm.has_own(t, &key) => {}
+                crate::realm::ChainHit::Absent => {}
+                _ => return None,
+            }
+            let value = arg(2);
+            let receiver = if args.len() > 3 { arg(3) } else { arg(0) };
+            let r = Handle::from_raw(receiver.as_handle()?);
+            if r == t {
+                if !realm.create_data_property_plain(t, &key, value) {
+                    return None;
+                }
+            } else if realm.proxy_at(r).is_some() {
+                realm.proxy_receiver_define_quiet(r, &key, value)?;
+            } else {
+                return None;
+            }
+            NanBox::boolean(true)
         }
         FastOp::ReflectHas => {
             // `HasProperty(target, key)` for a String key that is its own

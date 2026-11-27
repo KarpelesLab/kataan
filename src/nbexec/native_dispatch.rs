@@ -1849,7 +1849,10 @@ impl Interp {
                     if !self.can_write_property(rh, &key) {
                         return Ok(NanBox::boolean(false));
                     }
-                    self.assign_member_value(rh, arg(1), value)?;
+                    // (The key is coerced once, above: ToPropertyKey runs
+                    // a key object's `toString` exactly once.)
+                    let key_box = self.key_to_value(&key);
+                    self.assign_member_value(rh, key_box, value)?;
                 }
                 NanBox::boolean(true)
             }
