@@ -129,7 +129,7 @@ pub(crate) fn hof_for(name: &[u8]) -> Option<Hof> {
 /// is ordinary and holds no accessor for it: `Ok(Some(v))` for a data
 /// property, `Ok(None)` when absent. `Err(())` when the lookup could run code
 /// or be exotic (an accessor, a proxy, a module namespace, …).
-fn chain_data(realm: &Realm, h: Handle, key: &str) -> Result<Option<NanBox>, ()> {
+pub(super) fn chain_data(realm: &Realm, h: Handle, key: &str) -> Result<Option<NanBox>, ()> {
     let mut cur = Some(h);
     let mut depth = 0usize;
     while let Some(c) = cur {

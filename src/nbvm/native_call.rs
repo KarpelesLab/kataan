@@ -137,6 +137,26 @@ enum FastOp {
     ArrSlice,
     /// `Array.prototype.flat`.
     ArrFlat,
+    /// `Array.prototype.concat`.
+    ArrConcat,
+    /// `Array.prototype.fill`.
+    ArrFill,
+    /// `Array.prototype.at`.
+    ArrAt,
+    /// `Array.prototype.lastIndexOf`.
+    ArrLastIndexOf,
+    /// `Array.prototype.reverse`.
+    ArrReverse,
+    /// `String.prototype.at`.
+    StrAt,
+    /// `String.prototype.codePointAt`.
+    StrCodePointAt,
+    /// `String.prototype.concat`.
+    StrConcat,
+    /// `String.prototype.repeat`.
+    StrRepeat,
+    /// `String.prototype.lastIndexOf`.
+    StrLastIndexOf,
     /// `String.prototype.toUpperCase` / `toLowerCase`.
     StrCase(bool),
     /// `String.prototype.trim` / `trimStart` / `trimEnd` (which ends).
@@ -416,6 +436,16 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"join") => FastOp::ArrJoin,
         (N_ARRAY_PROTO_FN, b"slice") => FastOp::ArrSlice,
         (N_ARRAY_PROTO_FN, b"flat") => FastOp::ArrFlat,
+        (N_ARRAY_PROTO_FN, b"concat") => FastOp::ArrConcat,
+        (N_ARRAY_PROTO_FN, b"fill") => FastOp::ArrFill,
+        (N_ARRAY_PROTO_FN, b"at") => FastOp::ArrAt,
+        (N_ARRAY_PROTO_FN, b"lastIndexOf") => FastOp::ArrLastIndexOf,
+        (N_ARRAY_PROTO_FN, b"reverse") => FastOp::ArrReverse,
+        (N_STRING_PROTO_FN, b"at") => FastOp::StrAt,
+        (N_STRING_PROTO_FN, b"codePointAt") => FastOp::StrCodePointAt,
+        (N_STRING_PROTO_FN, b"concat") => FastOp::StrConcat,
+        (N_STRING_PROTO_FN, b"repeat") => FastOp::StrRepeat,
+        (N_STRING_PROTO_FN, b"lastIndexOf") => FastOp::StrLastIndexOf,
         // `Function.prototype`'s methods share the Array methods' dispatch id.
         (N_ARRAY_PROTO_FN, b"call") => FastOp::FnCall,
         (N_ARRAY_PROTO_FN, b"apply") => FastOp::FnApply,
@@ -2174,6 +2204,272 @@ fn run_op(
             let part = elems.get(a..b.max(a)).unwrap_or(&[]).to_vec();
             NanBox::handle(realm.new_array(part).to_raw())
         }
+        FastOp::ArrConcat => {
+            // `O` an array with no own named property (so no own
+            // `constructor` or `@@isConcatSpreadable`) and its default
+            // prototype, `ArraySpeciesCreate(O, 0)` the plain `ArrayCreate`,
+            // and `@@isConcatSpreadable` absent along that prototype's
+            // chain of ordinary data properties: every array item of that
+            // same kind is spread (`IsArray`), every other item that is not
+            // an object appended. Each array is dense with no hole, so its
+            // `HasProperty`/`Get` per index are its elements. Anything else
+            // (another object, a hole, a proxy) is the host's.
+            let p = realm.plain_array_root_proto(h)?;
+            if realm.is_host_exotic(h) || !super::array_hof::default_species_armed(realm, h) {
+                return None;
+            }
+            let epoch = crate::object::proto_epoch();
+            if realm.vm_array_iter().concat_spread_absent != Some((p.to_raw(), epoch)) {
+                let key: alloc::boxed::Box<str> =
+                    realm.vm_array_iter().concat_spreadable_key.clone()?;
+                if !matches!(super::array_hof::chain_data(realm, p, &key), Ok(None))
+                    || !matches!(realm.watch_get_chain(p, &key), Some(None))
+                {
+                    return None;
+                }
+                // (Watching may itself have moved the epoch.)
+                realm.vm_array_iter_mut().concat_spread_absent =
+                    Some((p.to_raw(), crate::object::proto_epoch()));
+            }
+            let item = |i: usize| {
+                if i == 0 {
+                    recv
+                } else {
+                    regs[args[i - 1] as usize]
+                }
+            };
+            let mut total = 0usize;
+            for i in 0..=args.len() {
+                let v = item(i);
+                total += match v.as_handle().map(Handle::from_raw) {
+                    Some(e) if realm.typeof_is_string(e) => 1,
+                    Some(e) => {
+                        if realm.plain_array_root_proto(e) != Some(p) || realm.is_host_exotic(e) {
+                            return None;
+                        }
+                        dense_elements(realm, e)?.len()
+                    }
+                    None => 1,
+                };
+            }
+            if total > realm.limits.max_array_len {
+                return None;
+            }
+            let mut out = alloc::vec::Vec::with_capacity(total);
+            for i in 0..=args.len() {
+                let v = item(i);
+                match v.as_handle().map(Handle::from_raw) {
+                    Some(e) if !realm.typeof_is_string(e) => {
+                        out.extend_from_slice(realm.array_elements(e)?);
+                    }
+                    _ => out.push(v),
+                }
+            }
+            NanBox::handle(realm.new_array(out).to_raw())
+        }
+        FastOp::ArrFill => {
+            // Positions that convert without running code, over an array
+            // whose every `Set(O, k, value, true)` is its store
+            // (`Realm::array_fill_plain`).
+            let len = realm.array_length(h)?;
+            let a = rel_index(arg(1), len, 0)?;
+            let b = rel_index(arg(2), len, len)?;
+            if !realm.array_fill_plain(h, a, b, arg(0)) {
+                return None;
+            }
+            recv
+        }
+        FastOp::ArrAt => {
+            // `k` outside `0..len` is `undefined` with no `Get`; inside, a
+            // present slot with no per-index attribute is an own data read
+            // (a hole is the host's: its `Get` walks the prototype chain).
+            let e = realm.array_elements(h)?;
+            if realm.array_has_index_overrides(h) || realm.array_length(h) != Some(e.len()) {
+                return None;
+            }
+            let len = e.len();
+            let rel = int_arg(arg(0))?.unwrap_or(0.0);
+            let k = if rel < 0.0 { len as f64 + rel } else { rel };
+            if !(0.0..len as f64).contains(&k) {
+                NanBox::undefined()
+            } else {
+                let v = e[k as usize];
+                if v.is_hole() {
+                    return None;
+                }
+                v
+            }
+        }
+        FastOp::ArrLastIndexOf => {
+            // As `indexOf`, searching down from `fromIndex` (when given:
+            // `undefined` converts to 0, unlike an absent one).
+            let elems = realm.array_elements(h)?;
+            if realm.array_has_index_overrides(h)
+                || realm.proto_index_accessor_dirty()
+                || realm.array_length(h) != Some(elems.len())
+            {
+                return None;
+            }
+            let len = elems.len();
+            if len == 0 {
+                return Some(Ok(NanBox::number(-1.0)));
+            }
+            let from = if args.len() >= 2 {
+                let n = int_arg(arg(1))?.unwrap_or(0.0);
+                if n >= 0.0 {
+                    n.min(len as f64 - 1.0)
+                } else {
+                    len as f64 + n
+                }
+            } else {
+                len as f64 - 1.0
+            };
+            if from < 0.0 {
+                return Some(Ok(NanBox::number(-1.0)));
+            }
+            let target = arg(0);
+            let head = &elems[..=from as usize];
+            let pos = if target.as_handle().is_none() {
+                head.iter()
+                    .rposition(|e| e.is_hole() || e.strict_equals(target))
+            } else {
+                head.iter()
+                    .rposition(|e| e.is_hole() || realm.strict_equals(*e, target))
+            };
+            if pos.is_some_and(|i| head[i].is_hole()) {
+                return None;
+            }
+            NanBox::number(pos.map_or(-1.0, |i| i as f64))
+        }
+        FastOp::ArrReverse => {
+            // Every `[[Get]]` / `[[Set]]` an own data element
+            // (`Realm::array_reverse_plain`).
+            if !realm.array_reverse_plain(h) {
+                return None;
+            }
+            recv
+        }
+        FastOp::StrAt => {
+            if !realm.typeof_is_string(h) {
+                return None;
+            }
+            let units = realm.string_utf16_len(h)?;
+            let rel = int_arg(arg(0))?.unwrap_or(0.0);
+            let k = if rel < 0.0 { units as f64 + rel } else { rel };
+            if !(0.0..units as f64).contains(&k) {
+                NanBox::undefined()
+            } else {
+                match realm.string_unit_at_index(h, Some(k as usize))? {
+                    Some(u) => NanBox::handle(realm.unit_string(u).to_raw()),
+                    None => NanBox::undefined(),
+                }
+            }
+        }
+        FastOp::StrCodePointAt => {
+            if !realm.typeof_is_string(h) {
+                return None;
+            }
+            let n = int_arg(arg(0))?.unwrap_or(0.0);
+            if n < 0.0 {
+                return Some(Ok(NanBox::undefined()));
+            }
+            let i = n as usize;
+            match realm.string_unit_at_index(h, Some(i))? {
+                None => NanBox::undefined(),
+                Some(u) if (0xD800..0xDC00).contains(&u) => {
+                    let cp = match realm.string_unit_at_index(h, i.checked_add(1))? {
+                        Some(low) if (0xDC00..0xE000).contains(&low) => {
+                            0x1_0000 + ((u32::from(u) - 0xD800) << 10) + (u32::from(low) - 0xDC00)
+                        }
+                        _ => u32::from(u),
+                    };
+                    NanBox::number(f64::from(cp))
+                }
+                Some(u) => NanBox::number(f64::from(u)),
+            }
+        }
+        FastOp::StrConcat => {
+            // String and Number arguments (whose ToString runs no code),
+            // appended in order; past the length cap the host throws.
+            if !realm.typeof_is_string(h) {
+                return None;
+            }
+            let mut acc = recv;
+            for i in 0..args.len() {
+                let a = arg(i);
+                let ok = a.is_number()
+                    || a.as_handle()
+                        .is_some_and(|x| realm.typeof_is_string(Handle::from_raw(x)));
+                if !ok {
+                    return None;
+                }
+                acc = realm.add_checked(acc, a)?;
+            }
+            acc
+        }
+        FastOp::StrRepeat => {
+            let n = int_arg(arg(0))?.unwrap_or(0.0);
+            // A negative or infinite count is the host's RangeError.
+            if !(0.0..=f64::from(u32::MAX)).contains(&n) {
+                return None;
+            }
+            let n = n as usize;
+            let rope = str_parts(realm, h)?;
+            let bytes = rope.as_leaf_bytes()?;
+            if bytes.len().checked_mul(n)? > realm.limits.max_string_len
+                || rope.utf16_len().checked_mul(n)? > realm.limits.max_string_len
+            {
+                return None;
+            }
+            if n == 1 || bytes.is_empty() {
+                return Some(Ok(recv));
+            }
+            if n == 0 {
+                return Some(Ok(NanBox::handle(realm.new_string("").to_raw())));
+            }
+            let mut out = alloc::vec::Vec::with_capacity(bytes.len() * n);
+            for _ in 0..n {
+                crate::wtf8::append(&mut out, bytes);
+            }
+            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+        }
+        FastOp::StrLastIndexOf => {
+            // An ASCII receiver and needle (byte positions are code-unit
+            // positions), and a Number or absent position.
+            if !realm.typeof_is_string(h) {
+                return None;
+            }
+            let needle = arg(0).as_handle().map(Handle::from_raw)?;
+            if !realm.typeof_is_string(needle) {
+                return None;
+            }
+            let pos = arg(1);
+            let pos = match pos.as_number() {
+                // NaN (and `undefined`) mean +Infinity.
+                Some(n) if !n.is_nan() => n,
+                Some(_) => f64::INFINITY,
+                None if pos.is_undefined() => f64::INFINITY,
+                None => return None,
+            };
+            let rope = str_parts(realm, h)?;
+            let pat = str_parts(realm, needle)?;
+            let (hay, pat) = (rope.as_leaf_bytes()?, pat.as_leaf_bytes()?);
+            if !hay.is_ascii() || !pat.is_ascii() {
+                return None;
+            }
+            let len = hay.len();
+            let start = if pos <= 0.0 {
+                0
+            } else {
+                (pos as usize).min(len)
+            };
+            if pat.len() > len {
+                return Some(Ok(NanBox::number(-1.0)));
+            }
+            let top = start.min(len - pat.len());
+            let found = (0..=top).rev().find(|&j| &hay[j..j + pat.len()] == pat);
+            NanBox::number(found.map_or(-1.0, |j| j as f64))
+        }
         FastOp::ArrFlat => {
             // `ArraySpeciesCreate` must be the plain `ArrayCreate`, and the
             // depth a Number (or `undefined`, depth 1).
@@ -2288,7 +2584,21 @@ fn run_op(
                 return None;
             }
             let sep_b = sep.as_leaf_bytes()?;
-            if sep_b.is_empty() || crate::nbexec::split_sensitive(sep_b) {
+            if sep_b.is_empty() {
+                // `s.split('')`: one piece per code unit — of an ASCII text,
+                // each byte's interned one-unit string.
+                let rope = str_parts(realm, h)?;
+                let bytes = rope.as_leaf_bytes()?;
+                if !bytes.is_ascii() || bytes.len() > realm.limits.max_array_len {
+                    return None;
+                }
+                let parts: alloc::vec::Vec<NanBox> = bytes
+                    .iter()
+                    .map(|&b| NanBox::handle(realm.unit_string(u16::from(b)).to_raw()))
+                    .collect();
+                return Some(Ok(NanBox::handle(realm.new_array(parts).to_raw())));
+            }
+            if crate::nbexec::split_sensitive(sep_b) {
                 return None;
             }
             let rope = str_parts(realm, h)?;

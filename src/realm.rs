@@ -1077,6 +1077,13 @@ pub struct VmArrayIterIntrinsics {
     /// installs `get Array[@@species]` (the VM's array higher-order built-ins
     /// use it to recognize the default `ArraySpeciesCreate` without effects).
     pub species_key: Option<alloc::boxed::Box<str>>,
+    /// The property-storage key of `Symbol.isConcatSpreadable`, recorded
+    /// with [`Self::species_key`] (the VM's `concat` proves its absence).
+    pub concat_spreadable_key: Option<alloc::boxed::Box<str>>,
+    /// `(prototype, epoch)`: at that prototype epoch, `@@isConcatSpreadable`
+    /// was absent along that `%Array.prototype%`'s chain, every link of
+    /// which is watched (so any change to their keys moves the epoch).
+    pub concat_spread_absent: Option<(u64, u64)>,
 }
 
 /// A snapshot of a realm's intrinsic prototype pointers (the realm-wide
@@ -6973,6 +6980,72 @@ impl Realm {
         true
     }
 
+    /// `O.fill(value, start, end)` over `start..end` of the array at
+    /// `handle` when each `Set(O, k, value, true)` is exactly the store: the
+    /// array has never had side-table state (no index attributes or
+    /// accessors, sparse length, frozen/sealed/non-extensible mark) and keeps
+    /// its default prototype, `end` is within its dense store, and (when the
+    /// range holds a hole, whose `[[Set]]` consults the prototype chain) no
+    /// object on that chain owns an index. Whether it was done (nothing
+    /// changes otherwise).
+    pub(crate) fn array_fill_plain(
+        &mut self,
+        handle: Handle,
+        start: usize,
+        end: usize,
+        value: NanBox,
+    ) -> bool {
+        let Some(Cell::Array(a)) = self.heap.get(handle) else {
+            return false;
+        };
+        if start >= end {
+            // No index is written.
+            return true;
+        }
+        if a.has_side_state() || a.has_proto_set() || end > a.len() {
+            return false;
+        }
+        let holes = a.as_slice()[start..end].iter().any(|v| v.is_hole());
+        if (!self.host_exotic.is_empty() && self.host_exotic.contains(&handle.to_raw()))
+            || (holes && !self.array_chain_index_free(handle))
+        {
+            return false;
+        }
+        let Some(a) = self
+            .get_mut_storing_from(handle, value, |c| start.min(c.ref_len()))
+            .and_then(Cell::as_array_mut)
+        else {
+            return false;
+        };
+        a.as_mut_slice()[start..end].fill(value);
+        self.shade_stored(value);
+        true
+    }
+
+    /// `O.reverse()` of the array at `handle` when each `[[Get]]` / `[[Set]]`
+    /// is its own data element: no side-table state (no index attributes or
+    /// accessors, sparse length, frozen/sealed mark), its default prototype,
+    /// and no hole (whose `HasProperty` would consult the prototype chain).
+    /// Whether it was done (nothing changes otherwise). The elements only
+    /// move, so the ordinary borrow's barrier (the whole object rescanned)
+    /// covers it.
+    pub(crate) fn array_reverse_plain(&mut self, handle: Handle) -> bool {
+        let Some(Cell::Array(a)) = self.heap.get(handle) else {
+            return false;
+        };
+        if a.has_side_state()
+            || a.has_proto_set()
+            || a.as_slice().iter().any(|v| v.is_hole())
+            || (!self.host_exotic.is_empty() && self.host_exotic.contains(&handle.to_raw()))
+        {
+            return false;
+        }
+        if let Some(Cell::Array(a)) = self.heap.get_mut(handle) {
+            a.as_mut_slice().reverse();
+        }
+        true
+    }
+
     /// Whether growing the dense store of the array `raw` from `dense` to
     /// `new_len` elements is refused (see [`SparseLen`]): past
     /// [`DENSE_GROW_FREE`], a growth by more than the store's own size (which
@@ -10060,6 +10133,7 @@ impl Realm {
         // not forward: drop it (the VM then takes the protocol path). The
         // `@@species` key is a string, not a handle, so it survives.
         let species_key = self.vm_array_iter.species_key.take();
+        let concat_spreadable_key = self.vm_array_iter.concat_spreadable_key.take();
         // The interned one-unit strings are a cache too: drop them rather than
         // forward them.
         self.unit_strings.clear();
@@ -10071,6 +10145,7 @@ impl Realm {
         self.for_in_cache_retire();
         self.vm_array_iter = VmArrayIterIntrinsics {
             species_key,
+            concat_spreadable_key,
             ..VmArrayIterIntrinsics::default()
         };
         // Every table is walked whole below, and every key forwarded (the

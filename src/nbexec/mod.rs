@@ -3424,6 +3424,9 @@ impl Interp {
         // Recorded for the VM's array higher-order built-ins (`array_hof`).
         if ctor_name == "Array" && self.realm.vm_array_iter().species_key.is_none() {
             self.realm.vm_array_iter_mut().species_key = Some(species_key.into());
+            let spreadable = self.well_known_symbol("isConcatSpreadable");
+            let spreadable_key = self.member_key(spreadable);
+            self.realm.vm_array_iter_mut().concat_spreadable_key = Some(spreadable_key.into());
         }
     }
 
