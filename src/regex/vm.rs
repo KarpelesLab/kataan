@@ -320,7 +320,9 @@ pub(crate) fn run_with(
     flags: Flags,
     steps: &Cell<u64>,
     budget: u64,
-) -> Option<Vec<Option<(usize, usize)>>> {
+    guards: Option<&Guards>,
+    out: &mut Vec<Option<(usize, usize)>>,
+) -> bool {
     let Scratch {
         saves,
         marks,
@@ -342,19 +344,146 @@ pub(crate) fn run_with(
         reverse: false,
         steps,
         budget,
+        guards,
     };
     if backtrack(&ctx, 0, start, saves, 0, marks, flag_stack, stack) {
         // Pair the raw save slots into (start, end) spans per group.
-        let mut groups = Vec::with_capacity(group_count + 1);
-        for g in 0..=group_count {
-            groups.push(match (saves[2 * g], saves[2 * g + 1]) {
+        out.extend(
+            (0..=group_count).map(|g| match (saves[2 * g], saves[2 * g + 1]) {
                 (Some(s), Some(e)) => Some((s, e)),
                 _ => None,
-            });
-        }
-        Some(groups)
+            }),
+        );
+        true
     } else {
-        None
+        false
+    }
+}
+
+/// Which branches of the program's ordinary `Split`s certainly fail at a
+/// position, by the code unit there (see [`Guards::build`]).
+pub(crate) struct Guards {
+    /// Per instruction: for a `Split(a, b)`, the indices in `sets` of the
+    /// sets guarding `a` and `b` (`NONE` for an unguarded target).
+    idx: Vec<[u32; 2]>,
+    /// The Latin-1 code units with which a guarded branch can go on.
+    sets: Vec<[u64; 4]>,
+}
+
+impl Guards {
+    const NONE: u32 = u32::MAX;
+
+    /// The guards of `prog` under `flags`, `None` when no `Split` has one.
+    ///
+    /// A target of a `Split` is guarded when every path from it, through
+    /// zero-width instructions only (jumps, splits, capture saves and
+    /// clears, loop marks, assertions, lookarounds — each of which consumes
+    /// nothing and can only make the path fail), reaches a consuming
+    /// instruction before it can reach `Match`, a backreference or anything
+    /// else. Every match through that target then consumes a character at
+    /// the split's position first, one some consuming instruction on those
+    /// paths accepts (by the matcher's own predicate,
+    /// [`single_consume_matches`]). So when the unit there is below 256 and
+    /// none of them accepts it — or the position is the subject's end — the
+    /// branch fails, undoing whatever it did, and skipping it changes no
+    /// outcome. (Units at or above 256 are always let through: a lead
+    /// surrogate's code point is not known from the unit alone.)
+    ///
+    /// Programs with inline-modifier scopes have none: a set is computed
+    /// under the base flags.
+    pub(crate) fn build(prog: &[Inst], flags: Flags) -> Option<Guards> {
+        if prog.len() > 4096
+            || prog
+                .iter()
+                .any(|i| matches!(i, Inst::PushFlags(_) | Inst::PopFlags))
+        {
+            return None;
+        }
+        let mut member: Vec<Option<[u64; 4]>> = alloc::vec![None; prog.len()];
+        let mut idx = alloc::vec![[Self::NONE; 2]; prog.len()];
+        let mut sets: Vec<[u64; 4]> = Vec::new();
+        let mut seen = alloc::vec![false; prog.len()];
+        let mut stack = Vec::new();
+        let mut any = false;
+        for pc in 0..prog.len() {
+            let Inst::Split(a, b) = prog[pc] else {
+                continue;
+            };
+            if simple_loop(prog, pc).is_some() {
+                continue;
+            }
+            for (k, target) in [a, b].into_iter().enumerate() {
+                seen.iter_mut().for_each(|s| *s = false);
+                stack.clear();
+                stack.push(target);
+                let mut set = [0u64; 4];
+                let mut ok = true;
+                while let Some(q) = stack.pop() {
+                    let Some(inst) = prog.get(q) else {
+                        ok = false;
+                        break;
+                    };
+                    if core::mem::replace(&mut seen[q], true) {
+                        continue;
+                    }
+                    match inst {
+                        Inst::Char(_) | Inst::Any | Inst::Class(_) | Inst::ClassSet { .. } => {
+                            let bits = member[q].get_or_insert_with(|| {
+                                let mut m = [0u64; 4];
+                                for u in 0u32..256 {
+                                    if single_consume_matches(inst, u, flags) {
+                                        m[(u >> 6) as usize] |= 1u64 << (u & 63);
+                                    }
+                                }
+                                m
+                            });
+                            for (w, m) in set.iter_mut().zip(bits.iter()) {
+                                *w |= *m;
+                            }
+                        }
+                        Inst::Jmp(t) => stack.push(*t),
+                        Inst::Split(x, y) => {
+                            stack.push(*x);
+                            stack.push(*y);
+                        }
+                        Inst::Save(_)
+                        | Inst::ClearCaptures { .. }
+                        | Inst::Mark
+                        | Inst::EmptyFail
+                        | Inst::Assert(_)
+                        | Inst::Look { .. }
+                        | Inst::LookBehind { .. } => stack.push(q + 1),
+                        Inst::Fail => {}
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && set.iter().any(|w| *w != u64::MAX) {
+                    idx[pc][k] = sets.len() as u32;
+                    sets.push(set);
+                    any = true;
+                }
+            }
+        }
+        any.then_some(Guards { idx, sets })
+    }
+
+    /// Whether the guarded target `k` (0 or 1) of the `Split` at `pc` may
+    /// go on at position `sp` of `input` (`true` for an unguarded one).
+    #[inline(always)]
+    fn allows(&self, pc: usize, k: usize, input: &[u16], sp: usize) -> bool {
+        let i = self.idx[pc][k];
+        if i == Self::NONE {
+            return true;
+        }
+        match input.get(sp) {
+            None => false,
+            Some(&u) => {
+                u >= 256 || self.sets[i as usize][usize::from(u >> 6)] & (1u64 << (u & 63)) != 0
+            }
+        }
     }
 }
 
@@ -377,6 +506,10 @@ struct Ctx<'a> {
     steps: &'a Cell<u64>,
     /// The step ceiling; once `steps` exceeds it the match aborts as no-match.
     budget: u64,
+    /// The program's split guards ([`Guards`]), for the top-level forward
+    /// context only (a lookaround sub-program has its own instruction
+    /// indices).
+    guards: Option<&'a Guards>,
 }
 
 impl Ctx<'_> {
@@ -399,6 +532,19 @@ pub(crate) struct BtStack {
     frames: Vec<Frame>,
     slots: Vec<Option<usize>>,
     positions: Vec<usize>,
+    /// The working buffers of a lookaround sub-match run from this level,
+    /// kept for the next one (a scan runs an assertion at every candidate
+    /// position).
+    sub: Option<alloc::boxed::Box<SubScratch>>,
+}
+
+/// A lookaround sub-match's working buffers (see [`BtStack::sub`]).
+#[derive(Default)]
+struct SubScratch {
+    saves: Vec<Option<usize>>,
+    marks: Vec<usize>,
+    flags: Vec<Flags>,
+    bt: BtStack,
 }
 
 /// One entry of the backtracking executor's explicit stack: either a choice
@@ -466,7 +612,7 @@ fn backtrack(
     ctx: &Ctx,
     mut pc: usize,
     mut sp: usize,
-    saves: &mut Vec<Option<usize>>,
+    saves: &mut [Option<usize>],
     depth: u32,
     // The positions at which the *optional* quantifier iterations enclosing this
     // point began, pushed by [`Inst::Mark`] and consumed by [`Inst::EmptyFail`].
@@ -488,6 +634,7 @@ fn backtrack(
         frames: stack,
         slots,
         positions,
+        sub: sub_pool,
     } = bt;
     stack.clear();
     slots.clear();
@@ -613,6 +760,19 @@ fn backtrack(
                     if stack.len() > MAX_STACK {
                         return false;
                     }
+                    // A branch that certainly fails here is not tried.
+                    if let Some(g) = ctx.guards {
+                        let go_a = g.allows(pc, 0, ctx.input, sp);
+                        let go_b = g.allows(pc, 1, ctx.input, sp);
+                        if !go_a || !go_b {
+                            match (go_a, go_b) {
+                                (true, _) => pc = *a,
+                                (_, true) => pc = *b,
+                                _ => break,
+                            }
+                            continue;
+                        }
+                    }
                     stack.push(Frame::Alt { pc: *b, sp });
                     pc = *a;
                 }
@@ -701,32 +861,43 @@ fn backtrack(
                         reverse: matches!(&ctx.prog[pc], Inst::LookBehind { .. }),
                         steps: ctx.steps,
                         budget: ctx.budget,
+                        guards: None,
                     };
-                    let mut sub_saves = saves.clone();
-                    let mut sub_marks = Vec::new();
+                    let mut sc = sub_pool.take().unwrap_or_default();
+                    sc.saves.clear();
+                    sc.saves.extend_from_slice(saves);
+                    sc.marks.clear();
                     // The sub-program starts under the flags in effect at the
                     // assertion (so an enclosing `(?i:…(?=…)…)` is honored).
-                    let mut sub_flags = alloc::vec![cur];
+                    sc.flags.clear();
+                    sc.flags.push(cur);
+                    let SubScratch {
+                        saves: sub_saves,
+                        marks: sub_marks,
+                        flags: sub_flags,
+                        bt: sub_bt,
+                    } = &mut *sc;
                     let matched = backtrack(
                         &sub,
                         0,
                         sp,
-                        &mut sub_saves,
+                        sub_saves,
                         depth + 1,
-                        &mut sub_marks,
-                        &mut sub_flags,
-                        &mut BtStack::default(),
+                        sub_marks,
+                        sub_flags,
+                        sub_bt,
                     );
-                    if matched == *neg {
-                        break;
-                    }
-                    if !*neg {
+                    if matched != *neg && !*neg {
                         // Positive: adopt the sub-match's captures; a later failure
                         // restores the originals so backtracking past the assertion
                         // is sound.
                         slots.extend_from_slice(saves);
-                        *saves = sub_saves;
+                        saves.copy_from_slice(&sc.saves);
                         stack.push(Frame::Saves);
+                    }
+                    *sub_pool = Some(sc);
+                    if matched == *neg {
+                        break;
                     }
                     pc += 1;
                 }

@@ -200,6 +200,16 @@ pub struct Regex {
     /// The program as a straight step sequence, when it is one (see
     /// [`linear`]): the same matches as `prog`, without the recursive VM.
     linear: Option<linear::Linear>,
+    /// The code units a match must be preceded by, when the program begins
+    /// with a positive lookbehind of a plain literal (see
+    /// [`program_lookbehind_literal`]).
+    lb_literal: Option<alloc::vec::Vec<u16>>,
+    /// The VM program's split guards ([`vm::Guards`]), built on the first
+    /// scan that runs the VM.
+    guards: core::cell::OnceCell<Option<vm::Guards>>,
+    /// The VM's working buffers, kept between scans (a scan that finds them
+    /// in use takes fresh ones).
+    vm_scratch: core::cell::RefCell<vm::Scratch>,
     /// Number of capturing groups (excluding the whole-match group 0).
     group_count: usize,
     /// `(group index, name)` pairs for named capture groups (`(?<name>…)`).
@@ -317,6 +327,11 @@ impl Regex {
         let (ast, _, group_names) = parser::parse(pattern, flags.unicode, flags.unicode_sets)?;
         let (prog, group_count) = compile::compile(&ast, &group_names, flags.unicode)?;
         let first_unit = program_first_unit(&prog);
+        let lb_literal = if flags.ignore_case {
+            None
+        } else {
+            program_lookbehind_literal(&prog)
+        };
         Ok(Regex {
             anchored: program_is_anchored(&prog),
             // The single-unit filter is a specialized equality scan, so it stays
@@ -335,6 +350,9 @@ impl Regex {
             scalar_prog: core::cell::OnceCell::new(),
             atom_latin1: core::cell::OnceCell::new(),
             source: alloc::string::String::from(pattern),
+            lb_literal,
+            guards: core::cell::OnceCell::new(),
+            vm_scratch: core::cell::RefCell::default(),
             group_count,
             group_names,
             flags,
@@ -919,8 +937,28 @@ impl Regex {
         // The VM reads UTF-16 code units (a byte subject is only matched here
         // by a program the linear matcher does not cover, widened once).
         let units: &[u16] = &T::wide(units);
-        // One set of working buffers for the whole scan (see `vm::Scratch`).
-        let mut scratch = vm::Scratch::default();
+        // One set of working buffers for the whole scan (see `vm::Scratch`),
+        // the regex's own unless a scan already holds them.
+        let mut own;
+        let mut fresh;
+        let scratch: &mut vm::Scratch = match self.vm_scratch.try_borrow_mut() {
+            Ok(b) => {
+                own = b;
+                &mut own
+            }
+            Err(_) => {
+                fresh = vm::Scratch::default();
+                &mut fresh
+            }
+        };
+        // Guards hold for the main program under the flags it was built with.
+        let guards = if core::ptr::eq(prog, self.prog.as_slice()) && flags_same(flags, self.flags) {
+            self.guards
+                .get_or_init(|| vm::Guards::build(&self.prog, self.flags))
+                .as_ref()
+        } else {
+            None
+        };
         // Only offsets in `s..=last` are candidate starts, so both filters below
         // search *that* range, not the rest of the subject. An anchored or sticky
         // pattern has `last == start`, and scanning megabytes for a start unit
@@ -930,7 +968,43 @@ impl Regex {
         let candidate_end = |units: &[u16]| last.saturating_add(1).min(units.len());
         let mut s = start;
         while s <= last {
-            if let Some(want) = filter {
+            // Only a position right after the lookbehind's literal can start
+            // a match: the next occurrence of the literal ending at or past
+            // `s` names the next candidate.
+            if let Some(lit) = &self.lb_literal
+                && core::ptr::eq(prog, self.prog.as_slice())
+            {
+                let n = lit.len();
+                let end = candidate_end(units);
+                let mut from = s.saturating_sub(n);
+                let found = loop {
+                    if from + n > end {
+                        break None;
+                    }
+                    let Some(k) = linear::find_unit(&units[from..end], lit[0]) else {
+                        break None;
+                    };
+                    let at = from + k;
+                    if at + n > end {
+                        break None;
+                    }
+                    if units[at..at + n] == lit[..] {
+                        break Some(at + n);
+                    }
+                    from = at + 1;
+                };
+                let Some(next) = found else {
+                    return false;
+                };
+                s = next;
+                if s > last {
+                    return false;
+                }
+                if flags.unicode && !is_char_boundary(units, s) {
+                    s += 1;
+                    continue;
+                }
+            } else if let Some(want) = filter {
                 let end = candidate_end(units);
                 if s >= end {
                     return false;
@@ -962,8 +1036,8 @@ impl Regex {
                     continue;
                 }
             }
-            if let Some(groups) = vm::run_with(
-                &mut scratch,
+            if vm::run_with(
+                scratch,
                 prog,
                 units,
                 s,
@@ -971,8 +1045,9 @@ impl Regex {
                 flags,
                 steps,
                 budget,
+                guards,
+                out,
             ) {
-                out.extend(groups);
                 return true;
             }
             // A failed attempt at the head of a `C+x` run (`x` outside `C`)
@@ -1392,4 +1467,53 @@ fn expand_replacement(template: &str, chars: &[char], caps: &Captures, out: &mut
         out.push(t[i]);
         i += 1;
     }
+}
+
+/// The literal a match must be preceded by when `prog` begins — past capture
+/// saves — with a positive lookbehind whose body is a plain non-empty
+/// literal of BMP non-surrogate characters (`(?<=latency=)…`): the
+/// lookbehind holds at `s` exactly when the subject's units ending at `s`
+/// are that literal, so no other position can start a match. Compiled in
+/// reverse, the body is its characters last-first, then `Match`. (The
+/// caller rules out `i`, under which a literal is a class.)
+fn program_lookbehind_literal(prog: &[vm::Inst]) -> Option<alloc::vec::Vec<u16>> {
+    use vm::Inst;
+    let mut pc = 0;
+    while matches!(prog.get(pc), Some(Inst::Save(_))) {
+        pc += 1;
+    }
+    let Some(Inst::LookBehind {
+        neg: false,
+        prog: body,
+    }) = prog.get(pc)
+    else {
+        return None;
+    };
+    let (Inst::Match, chars) = body.split_last()? else {
+        return None;
+    };
+    if chars.is_empty() {
+        return None;
+    }
+    let mut lit = alloc::vec::Vec::with_capacity(chars.len());
+    for inst in chars.iter().rev() {
+        let Inst::Char(c) = inst else {
+            return None;
+        };
+        let u = u16::try_from(*c).ok()?;
+        if (0xD800..0xE000).contains(&u) {
+            return None;
+        }
+        lit.push(u);
+    }
+    Some(lit)
+}
+
+/// Whether a set of consuming instructions accepts the same code units under
+/// `a` as under `b`: the flags [`vm::single_consume_matches`] reads agree.
+fn flags_same(a: Flags, b: Flags) -> bool {
+    a.ignore_case == b.ignore_case
+        && a.dotall == b.dotall
+        && a.unicode == b.unicode
+        && a.unicode_sets == b.unicode_sets
 }
