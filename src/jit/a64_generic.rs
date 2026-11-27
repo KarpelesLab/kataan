@@ -137,6 +137,16 @@ pub(crate) struct Layout {
     pub off_box_val: i32,
     /// The global binding epoch's address (`env`).
     pub global_epoch: u64,
+    /// The flags-byte bits that keep a store out of line
+    /// (`props::FLAGS_NO_INLINE_STORE`), and the shape's brand byte (bit 0:
+    /// a primitive wrapper), shape-word-relative.
+    pub no_inline_store: u8,
+    pub shape_brands: i32,
+    /// `Realm`-relative: the incremental marker's running byte; slot-
+    /// relative: the GC age byte and the dirty-state byte.
+    pub marking: i32,
+    pub off_slot_age: i32,
+    pub off_slot_dirty: i32,
 }
 
 /// The per-site state a body's code points into: one `PropertyCache` per
@@ -499,6 +509,67 @@ pub(crate) fn compile(
         a.ldr(13, 14, i64::from(l.off_arr_ptr));
         a.bind(have);
     };
+    // `x15` = the address of the value slot the property cache at `cache`
+    // names on the object whose handle is in `x9` (an ordinary, shaped, not
+    // host-exotic object of the cached shape; for a `store`, also none of
+    // the flags that keep stores out of line and no primitive wrapper),
+    // else to `miss`. `x14` = its arena slot. Clobbers `x10..x13`.
+    let prop_slot = |a: &mut A64Assembler, cache: u64, store: bool, miss: Label| {
+        let spill = a.new_label();
+        let far = a.new_label();
+        let have = a.new_label();
+        walk(a, miss);
+        a.ldrb(10, 14, i64::from(l.off_cell_tag));
+        a.cmp_imm(10, i64::from(l.cell_object_disc));
+        a.b_cond(Cond::Ne, miss);
+        if (l.off_od_tag, l.obj_shaped_disc) != (l.off_cell_tag, l.cell_object_disc) {
+            a.ldrb(10, 14, i64::from(l.off_od_tag));
+            a.cmp_imm(10, i64::from(l.obj_shaped_disc));
+            a.b_cond(Cond::Ne, miss);
+        }
+        a.ldrb(10, 14, i64::from(l.off_jit_flags));
+        if store {
+            a.mov_imm(11, u64::from(l.no_inline_store));
+            a.tst(10, 11);
+            a.b_cond(Cond::Ne, miss);
+        } else {
+            a.tbnz(
+                10,
+                crate::object::JIT_FLAG_EXOTIC.trailing_zeros() as u8,
+                miss,
+            );
+        }
+        a.ldr(10, 14, i64::from(l.off_shape));
+        a.mov_imm(11, cache);
+        a.ldr(12, 11, i64::from(l.cache_shape_off));
+        a.cmp(10, 12);
+        a.b_cond(Cond::Ne, miss);
+        if store {
+            a.ldrb(13, 10, i64::from(l.shape_brands));
+            a.tbnz(13, 0, miss);
+        }
+        a.ldr_w(12, 11, i64::from(l.cache_slot_off));
+        a.ldrh(13, 14, i64::from(l.off_slots_len));
+        a.cmp(12, 13);
+        a.b_cond(Cond::Hs, miss);
+        a.cmp_imm(12, INLINE);
+        a.b_cond(Cond::Hs, spill);
+        a.add_shifted(15, 14, 12, Shift::Lsl, 3);
+        a.add_imm(15, 15, i64::from(l.off_inline));
+        a.b(have);
+        a.bind(spill);
+        a.ldr(15, 14, i64::from(l.off_extra));
+        a.cmp_imm(12, FAR_FROM);
+        a.b_cond(Cond::Hs, far);
+        a.add_shifted(15, 15, 12, Shift::Lsl, 3);
+        a.add_imm(15, 15, i64::from(l.extra_near) - 8 * INLINE);
+        a.b(have);
+        a.bind(far);
+        a.ldr(15, 15, i64::from(l.extra_far_ptr));
+        a.add_shifted(15, 15, 12, Shift::Lsl, 3);
+        a.sub_imm(15, 15, 8 * FAR_FROM);
+        a.bind(have);
+    };
     for (pc, op) in ops.iter().enumerate() {
         a.bind(labels[pc]);
         let cache = if cache_op(op) {
@@ -676,53 +747,10 @@ pub(crate) fn compile(
                 // is the helper, which also arms the cache.
                 let miss = a.new_label();
                 let done = a.new_label();
-                let spill = a.new_label();
-                let far = a.new_label();
                 let got = a.new_label();
                 a.ldr(9, REGS, slot(obj));
-                // A heap handle: its arena slot (`x14`).
-                walk(&mut a, miss);
-                // An ordinary, shaped, not host-exotic object.
-                a.ldrb(10, 14, i64::from(l.off_cell_tag));
-                a.cmp_imm(10, i64::from(l.cell_object_disc));
-                a.b_cond(Cond::Ne, miss);
-                if (l.off_od_tag, l.obj_shaped_disc) != (l.off_cell_tag, l.cell_object_disc) {
-                    a.ldrb(10, 14, i64::from(l.off_od_tag));
-                    a.cmp_imm(10, i64::from(l.obj_shaped_disc));
-                    a.b_cond(Cond::Ne, miss);
-                }
-                a.ldrb(10, 14, i64::from(l.off_jit_flags));
-                a.tbnz(
-                    10,
-                    crate::object::JIT_FLAG_EXOTIC.trailing_zeros() as u8,
-                    miss,
-                );
-                // Its shape is the cache's: the cached slot.
-                a.ldr(10, 14, i64::from(l.off_shape));
-                a.mov_imm(11, cache);
-                a.ldr(12, 11, i64::from(l.cache_shape_off));
-                a.cmp(10, 12);
-                a.b_cond(Cond::Ne, miss);
-                a.ldr_w(12, 11, i64::from(l.cache_slot_off));
-                a.ldrh(13, 14, i64::from(l.off_slots_len));
-                a.cmp(12, 13);
-                a.b_cond(Cond::Hs, miss);
-                a.cmp_imm(12, INLINE);
-                a.b_cond(Cond::Hs, spill);
-                a.add_shifted(15, 14, 12, Shift::Lsl, 3);
-                a.ldr(0, 15, i64::from(l.off_inline));
-                a.b(got);
-                a.bind(spill);
-                a.ldr(15, 14, i64::from(l.off_extra));
-                a.cmp_imm(12, FAR_FROM);
-                a.b_cond(Cond::Hs, far);
-                a.add_shifted(15, 15, 12, Shift::Lsl, 3);
-                a.ldr(0, 15, i64::from(l.extra_near) - 8 * INLINE);
-                a.b(got);
-                a.bind(far);
-                a.ldr(15, 15, i64::from(l.extra_far_ptr));
-                a.add_shifted(15, 15, 12, Shift::Lsl, 3);
-                a.ldr(0, 15, -8 * FAR_FROM);
+                prop_slot(&mut a, cache, false, miss);
+                a.ldr(0, 15, 0);
                 a.b(got);
                 a.bind(miss);
                 a.mov(0, CTX);
@@ -755,6 +783,25 @@ pub(crate) fn compile(
                     Op::SetPropStrict { .. } => h.set_strict,
                     _ => h.init_prop,
                 };
+                let miss = a.new_label();
+                let done = a.new_label();
+                if !matches!(op, Op::InitProp { .. }) {
+                    // A Number into an existing writable data slot of the
+                    // cache's shape, in place (as the x86-64 tier's Number
+                    // store: nothing for the write barrier, and the layout's
+                    // record of Number-only slots holds either way). Any
+                    // other value or object is the helper's.
+                    a.ldr(9, REGS, slot(src));
+                    a.and(11, 9, QNAN_R);
+                    a.cmp(11, QNAN_R);
+                    a.b_cond(Cond::Eq, miss);
+                    a.mov(8, 9);
+                    a.ldr(9, REGS, slot(obj));
+                    prop_slot(&mut a, cache, true, miss);
+                    a.str(8, 15, 0);
+                    a.b(done);
+                }
+                a.bind(miss);
                 a.mov(0, CTX);
                 a.ldr(1, REGS, slot(obj));
                 a.mov_imm(2, key.as_ptr() as u64);
@@ -765,6 +812,7 @@ pub(crate) fn compile(
                 a.mov_imm(9, throw_bits);
                 a.cmp(0, 9);
                 a.b_cond(Cond::Eq, thrown);
+                a.bind(done);
             }
             Op::CallMethod { .. } | Op::CallWithMethod { .. } => {
                 a.mov(0, CTX);
@@ -886,6 +934,67 @@ pub(crate) fn compile(
                 a.bind(done);
             }
             Op::SetKey { obj, key, src } | Op::SetKeyStrict { obj, key, src } => {
+                // A plain array's present element at an integral in-bounds
+                // index, overwritten in place when the write barrier has
+                // nothing to do (as the x86-64 tier's: a non-handle value; or
+                // no incremental marking, and a young container, one its next
+                // minor collection rescans whole, or an old target). Anything
+                // else is the helper's.
+                let miss = a.new_label();
+                let done = a.new_label();
+                let no_barrier = a.new_label();
+                let old = crate::gc::OLD_AGE;
+                a.ldr(9, REGS, slot(obj));
+                walk(&mut a, miss);
+                array(&mut a, miss);
+                // The barrier (x0..x3 scratch; x12/x13/x14 kept).
+                a.ldr(8, REGS, slot(src));
+                a.mov_imm(0, NanBox::handle(0).to_bits());
+                a.cmp(8, 0);
+                a.b_cond(Cond::Lo, no_barrier);
+                a.ldr(1, CTX, i64::from(l.realm));
+                a.ldrb(2, 1, i64::from(l.marking));
+                a.cbnz(2, miss);
+                a.ldrb(2, 14, i64::from(l.off_slot_age));
+                a.cmp_imm(2, i64::from(old));
+                a.b_cond(Cond::Lo, no_barrier);
+                a.ldrb(2, 14, i64::from(l.off_slot_dirty));
+                a.mov_imm(3, u64::from(crate::heap::JIT_DIRTY_WHOLE));
+                a.tst(2, 3);
+                a.b_cond(Cond::Ne, no_barrier);
+                // The target (rooted: the value being stored): its age.
+                a.ldr(2, 1, i64::from(l.heap_ptr));
+                a.ldr(3, 1, i64::from(l.heap_len));
+                a.mov_w(0, 8);
+                a.cmp(0, 3);
+                a.b_cond(Cond::Hs, miss);
+                a.mov_imm(3, l.stride as u64);
+                a.mul(0, 0, 3);
+                a.add(0, 0, 2);
+                a.ldrb(2, 0, i64::from(l.off_slot_age));
+                a.cmp_imm(2, i64::from(old));
+                a.b_cond(Cond::Lo, miss);
+                a.bind(no_barrier);
+                // The index: an integral Number below the length.
+                a.ldr(10, REGS, slot(key));
+                a.and(11, 10, QNAN_R);
+                a.cmp(11, QNAN_R);
+                a.b_cond(Cond::Eq, miss);
+                a.fmov_from_x(0, 10);
+                a.fcvtzs(11, 0);
+                a.scvtf(1, 11);
+                a.fcmp(0, 1);
+                a.b_cond(Cond::Ne, miss);
+                a.cmp(11, 12);
+                a.b_cond(Cond::Hs, miss); // (also a negative index)
+                // Over no hole (an own data element, so no setter can run).
+                a.ldr_idx(10, 13, 11);
+                a.mov_imm(15, hole_bits);
+                a.cmp(10, 15);
+                a.b_cond(Cond::Eq, miss);
+                a.str_idx(8, 13, 11);
+                a.b(done);
+                a.bind(miss);
                 a.mov(0, CTX);
                 a.ldr(1, REGS, slot(obj));
                 a.ldr(2, REGS, slot(key));
@@ -895,6 +1004,7 @@ pub(crate) fn compile(
                 a.mov_imm(9, throw_bits);
                 a.cmp(0, 9);
                 a.b_cond(Cond::Eq, thrown);
+                a.bind(done);
             }
             Op::ArrayLen { dst, arr } => {
                 let miss = a.new_label();
@@ -1287,6 +1397,11 @@ impl super::JitProto {
             box_disc: jl.props.box_disc,
             off_box_val: jl.props.off_box_val,
             global_epoch: crate::env::global_binding_epoch_addr() as u64,
+            no_inline_store: super::props::FLAGS_NO_INLINE_STORE,
+            shape_brands: jl.props.shape_brands,
+            marking: jl.props.marking,
+            off_slot_age: jl.props.off_slot_age,
+            off_slot_dirty: jl.props.off_slot_dirty,
         };
         let sites = alloc::boxed::Box::new(Sites::for_ops(&bytecode));
         // A native-call entry (what `jit_tier::call_compiled_with` enters a
@@ -1407,6 +1522,11 @@ mod tests {
         box_disc: 4,
         off_box_val: 8,
         global_epoch: 0x2_0000,
+        no_inline_store: 0x3e,
+        shape_brands: 16,
+        marking: 32,
+        off_slot_age: 60,
+        off_slot_dirty: 61,
     };
 
     #[test]
