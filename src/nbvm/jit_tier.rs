@@ -2906,13 +2906,20 @@ pub(crate) fn jit_helper_exec_op(
             instanceof: false,
             a,
             b,
-        } => ctx
-            .realm
-            .has_property_by_string_noting(regs[*a as usize], regs[*b as usize])
-            .map(|r| {
+        } => {
+            let (x, y) = (regs[*a as usize], regs[*b as usize]);
+            if let Some(r) = ctx.realm.has_property_by_string_noting(x, y) {
                 regs[*dst as usize] = NanBox::boolean(r);
-                Ok(())
-            }),
+                Some(Ok(()))
+            } else if super::is_proxy(ctx, y) {
+                // `key in proxy`: its `has` trap (or the forward) in the VM.
+                let lent = super::jit_lent(ctx);
+                super::proxy_ops::has(ctx, funcs, lent, y, x)
+                    .map(|r| r.map(|b| regs[*dst as usize] = NanBox::boolean(b)))
+            } else {
+                None
+            }
+        }
         // A `for-in`'s memoized key list (the hosted interpreter arm's first
         // step).
         Op::EnumKeys { dst, obj } if ctx.host.is_some() => regs[*obj as usize]

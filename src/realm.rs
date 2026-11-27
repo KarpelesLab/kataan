@@ -4284,6 +4284,38 @@ impl Realm {
         false
     }
 
+    /// The write of OrdinarySetWithOwnDescriptor's final steps
+    /// (`Receiver.[[GetOwnProperty]](P)` then a value-only define or
+    /// `CreateDataProperty(Receiver, P, V)`) for a **proxy** Receiver, when it
+    /// needs no code: every proxy on the way is live with neither a
+    /// `getOwnPropertyDescriptor` nor a `defineProperty` trap (so both internal
+    /// methods are the target's), and the final ordinary target takes the
+    /// write as a plain store. `Some(true)` once written; `None` (nothing
+    /// done, nothing observed) for the full protocol.
+    pub fn proxy_receiver_define_quiet(
+        &mut self,
+        receiver: Handle,
+        key: &str,
+        value: NanBox,
+    ) -> Option<bool> {
+        let mut r = receiver;
+        for _ in 0..64 {
+            let Some((target, handler)) = self.proxy_at(r) else {
+                return self
+                    .create_data_property_plain(r, key, value)
+                    .then_some(true);
+            };
+            if self.proxy_revoked(r)
+                || !self.proxy_trap_absent_quiet(handler, "getOwnPropertyDescriptor")
+                || !self.proxy_trap_absent_quiet(handler, "defineProperty")
+            {
+                return None;
+            }
+            r = target;
+        }
+        None
+    }
+
     /// Whether the proxy at `handle` has been revoked.
     #[must_use]
     pub fn proxy_revoked(&self, handle: Handle) -> bool {

@@ -70,6 +70,7 @@ pub(crate) mod native_call;
 pub(crate) mod num_switch;
 pub mod objlit;
 mod private_ops;
+mod proxy_ops;
 mod str_replace;
 mod super_fast;
 mod to_prim;
@@ -2201,6 +2202,13 @@ fn read_needs_host(ctx: &Ctx, recv: NanBox) -> bool {
     }
 }
 
+/// Whether `v` is a Proxy (live or revoked).
+#[inline]
+fn is_proxy(ctx: &Ctx, v: NanBox) -> bool {
+    v.as_handle()
+        .is_some_and(|h| ctx.realm.proxy_at(Handle::from_raw(h)).is_some())
+}
+
 /// The host's `[[Get]]` of `recv[key]` (see [`VmHost::get_member`]).
 /// From a VM frame's operation (`regs`, its register file), the frame lends
 /// its registers, so a getter or proxy trap the host runs may collect (see
@@ -2703,6 +2711,13 @@ fn vm_set_prop_mode(
     if ctx.host.is_none() {
         return vm_set_prop(ctx, funcs, recv, key, value, cache, regs);
     }
+    // A proxy's `[[Set]]` (its `set` trap, or the forward), when the VM can
+    // run it without the host (`proxy_ops`).
+    if is_proxy(ctx, recv)
+        && let Some(r) = proxy_ops::set(ctx, funcs, regs, recv, key, None, value, strict)
+    {
+        return r;
+    }
     // A write to an existing plain data property of the running realm's
     // global object (`global_obj`), mirrored into a like-named `var`
     // binding as the host would.
@@ -2809,6 +2824,12 @@ fn vm_set_elem_mode(
     }
     if ctx.host.is_none() {
         return vm_set_elem(ctx, funcs, recv, key, value, regs);
+    }
+    if is_proxy(ctx, recv)
+        && let Some((ks, kv)) = proxy_ops::elem_key(&mut ctx.realm, key)
+        && let Some(r) = proxy_ops::set(ctx, funcs, regs, recv, &ks, Some(kv), value, strict)
+    {
+        return r;
     }
     // An argument of a mapped `arguments` object, and the parameter it
     // aliases.
@@ -8024,6 +8045,13 @@ fn vm_get_prop(
     {
         return Ok(v);
     }
+    // A proxy's `[[Get]]` (its `get` trap, or the forward), when the VM can
+    // run it without the host (`proxy_ops`).
+    if is_proxy(ctx, recv)
+        && let Some(r) = proxy_ops::get(ctx, funcs, regs, recv, key, None)
+    {
+        return r;
+    }
     // A static-key read of an array's `length` or an index (`let {length} = a`,
     // `{0: x} = a`) lives in the element store, not the named properties.
     if read_needs_host(ctx, recv)
@@ -11550,6 +11578,17 @@ fn run_frame_at_ic(
                     regs[*dst as usize] = NanBox::boolean(r);
                     continue;
                 }
+                // `key in proxy`: its `has` trap (or the forward) in the VM.
+                if !*instanceof
+                    && is_proxy(ctx, y)
+                    && let Some(r) = proxy_ops::has(ctx, funcs, Some(&*regs), y, x)
+                {
+                    match r {
+                        Ok(b) => regs[*dst as usize] = NanBox::boolean(b),
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 match with_host_regs(ctx, regs, |h| h.relational(*instanceof, x, y)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
@@ -13425,6 +13464,12 @@ fn vm_get_elem_from(
         ) || ctx.realm.key_text_note_absent(recv, key))
     {
         return Ok(NanBox::undefined());
+    }
+    if is_proxy(ctx, recv)
+        && let Some((ks, kv)) = proxy_ops::elem_key(&mut ctx.realm, key)
+        && let Some(r) = proxy_ops::get(ctx, funcs, regs, recv, &ks, Some(kv))
+    {
+        return r;
     }
     if read_needs_host(ctx, recv)
         || (ctx.host.is_some() && is_mapped_arguments(&ctx.realm, recv))

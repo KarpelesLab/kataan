@@ -1728,7 +1728,7 @@ impl Interp {
                         // the receiver via `[[DefineOwnProperty]]` (CreateDataProperty
                         // / value update) — NOT `[[Set]]`, which would re-enter the
                         // set trap and recurse forever.
-                        if let Some(ok) = self.proxy_receiver_define_quiet(rh, &key, value) {
+                        if let Some(ok) = self.realm.proxy_receiver_define_quiet(rh, &key, value) {
                             return Ok(NanBox::boolean(ok));
                         }
                         let existing = self.descriptor_of(rh, &key)?;
