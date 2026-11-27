@@ -4948,8 +4948,15 @@ fn run_fields(ctx: &mut Ctx, funcs: &[FnProto], f: NanBox, obj: NanBox) -> Resul
 }
 
 /// The hidden slot of a VM class constructor holding its instance-field
-/// initializer closure.
+/// initializer closure (a derived class's, run by `Op::InitFields` after
+/// `super()`; a base class's runs from its constructor's own prologue, through
+/// [`FINIT_NAME`], unless the constructor uses dynamic scoping).
 const FIELDS_KEY: &str = "\0fields";
+
+/// The hidden class-scope binding (a cell the constructor captures) holding a
+/// base class's instance-field initializer closure, which the constructor
+/// calls first (see `Compiler::class_value`).
+const FINIT_NAME: &str = "\0finit";
 
 /// GetSuperBase: the `[[Prototype]]` of the method's home object `home` (a
 /// `TypeError` when it is `null`).
@@ -18583,6 +18590,27 @@ impl Compiler {
                 }
             }
         }
+        // A base class constructor whose class has instance elements runs its
+        // field initializer itself, first (InitializeInstanceElements precedes
+        // the body's FunctionDeclarationInstantiation, parameter defaults
+        // included): a plain call of the initializer closure, with `this`,
+        // which the class handed it through the hidden cell `FINIT_NAME`
+        // (see `class_value`).
+        if class_ctor == Some(false)
+            && captures.iter().any(|n| n == FINIT_NAME)
+            && let Some(b) = c.lookup(FINIT_NAME)
+        {
+            let callee = c.read_var(b);
+            let dst = c.alloc();
+            let recv = c.this_reg;
+            c.ops.push(Op::CallWithMethod {
+                dst,
+                callee,
+                recv,
+                key: String::new(),
+                args: Vec::new(),
+            });
+        }
         // Left to right (IteratorBindingInitialization): apply `= default` to a
         // (non-rest) parameter left `undefined` — so a default may reference
         // earlier parameters; written back through the binding (honoring cells) —
@@ -26349,18 +26377,31 @@ impl Compiler {
                 None if derived => (&default_params, &default_body),
                 None => (&[], &[]),
             };
+            // A base class with instance elements (fields, private methods or
+            // accessors): its constructor calls the field initializer itself,
+            // through a hidden cell it captures, so that a `new` of it is an
+            // ordinary constructor call (no step of its own between creating
+            // `this` and the body). Not under dynamic scoping in the
+            // constructor, whose bindings the host's environments hold.
+            let has_instance_elems = class.body.iter().any(|m| match m {
+                ClassMember::Field(fd) => !fd.is_static,
+                ClassMember::Method(m) => !m.is_static && matches!(m.key, PropertyKey::Private(_)),
+                _ => false,
+            });
+            let finit_b = if !derived && has_instance_elems && !uses_dynamic_scope(cparams, cbody) {
+                Some(self.bind_hidden_cell(FINIT_NAME, true, false)?)
+            } else {
+                None
+            };
+            let mut ctor_free = BTreeSet::new();
+            if finit_b.is_some() {
+                ctor_free.insert(String::from(FINIT_NAME));
+            }
             // The class's text is its whole definition.
             self.next_closure_span = Some(class.span);
             let f = self.class_element_closure(
                 PROTO_NAME,
-                ClosureSpec::class_element(
-                    cparams,
-                    cbody,
-                    &fname,
-                    Some(derived),
-                    &[],
-                    BTreeSet::new(),
-                ),
+                ClosureSpec::class_element(cparams, cbody, &fname, Some(derived), &[], ctor_free),
             )?;
             let proto = self.alloc();
             self.ops.push(Op::MakeClass { dst: proto, f, sup });
@@ -26605,11 +26646,14 @@ impl Compiler {
                     PROTO_NAME,
                     ClosureSpec::class_element(&[], &[], "", None, &fields, field_free),
                 )?;
-                self.ops.push(Op::SetHidden {
-                    obj: f,
-                    key: String::from(FIELDS_KEY),
-                    src: init,
-                });
+                match finit_b {
+                    Some(b) => self.write_var(b, init),
+                    None => self.ops.push(Op::SetHidden {
+                        obj: f,
+                        key: String::from(FIELDS_KEY),
+                        src: init,
+                    }),
+                }
             }
             if let Some(b) = inner_b {
                 self.write_var(Binding { tdz: false, ..b }, f);
