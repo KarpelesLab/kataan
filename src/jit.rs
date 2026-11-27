@@ -64,6 +64,8 @@ mod key_probe;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod key_reuse;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+pub(crate) mod legacy_hl;
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 mod pin;
 #[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod poly;
@@ -3671,10 +3673,10 @@ pub struct NativeEntries {
     exact_pinned: Option<usize>,
     /// For such a site's headerless call (`call_seq::emit_enter`), which
     /// leaves the arguments in the window's parameter registers already —
-    /// `None` for a body whose activation needs its header (a sloppy
-    /// ordinary function's, which the legacy `f.caller` / `f.arguments`
-    /// find; one reading `new.target`, which the entry takes from the
-    /// header; one with `try` regions).
+    /// `None` for a body whose activation needs its header (one reading
+    /// `new.target`, which the entry takes from the header; one with `try`
+    /// regions). A sloppy ordinary function's has one, entered only while
+    /// [`NativeEntries::legacy`] allows.
     direct: Option<usize>,
     /// [`NativeEntries::direct`] for a caller pinned as this body is
     /// (as [`NativeEntries::exact_pinned`]).
@@ -3682,6 +3684,11 @@ pub struct NativeEntries {
     /// The bytes the call sequence reserves above the register window for
     /// the inlined calls' headers (see `emit_native_entry`'s `inline_ok`).
     room: usize,
+    /// The body is a sloppy ordinary function's, whose activations the
+    /// legacy `f.caller` / `f.arguments` find by their headers: its direct
+    /// entries are handed out only while no code can read those
+    /// (`crate::legacy_reach`).
+    legacy: bool,
 }
 
 /// A generic body's pc maps when it inlined calls (`JitProto::pc_map`): per
@@ -3754,9 +3761,10 @@ struct GenericSites {
     /// call sequence, by pc.
     call_pcs: Vec<(u32, u16)>,
     /// The `CallValue` sites' one-entry callee caches (the emitted code holds
-    /// their addresses; the site helper refills them).
+    /// their addresses; the site helper refills them). Shared with
+    /// `legacy_hl`'s registry, which may drop their headerless ways.
     #[allow(dead_code)]
-    calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]>,
+    calls: alloc::rc::Rc<[core::cell::UnsafeCell<CallSite>]>,
     /// The method-call chain caches, one per site (the emitted code holds
     /// their addresses; the method helper refills them).
     #[allow(dead_code)]
@@ -5315,9 +5323,10 @@ impl JitProto {
             }
         }
         // One persistent cache per `CallValue` site (stable addresses, as below).
-        let calls: alloc::boxed::Box<[core::cell::UnsafeCell<CallSite>]> = (0..n_calls)
+        let calls: alloc::rc::Rc<[core::cell::UnsafeCell<CallSite>]> = (0..n_calls)
             .map(|_| core::cell::UnsafeCell::new(CallSite::new()))
             .collect();
+        legacy_hl::register(&calls);
         let call_sites: Vec<*const CallSite> = calls.iter().map(|c| c.get().cast_const()).collect();
         let bytecode: alloc::boxed::Box<[crate::nbvm::Op]> = proto.ops.clone().into_boxed_slice();
         global_mirror::plan(&bytecode);
@@ -6097,6 +6106,7 @@ impl JitProto {
         if call_seq::headerless_enabled()
             && usize::try_from(site.entry_argc).ok() == Some(self.n_params)
             && self.n_params <= self.n_regs
+            && !(e.legacy && crate::legacy_reach::reachable())
         {
             let off = match (e.direct_pinned, e.direct) {
                 (Some(p), _) if site.entry_pinned => Some(p),
@@ -6105,6 +6115,9 @@ impl JitProto {
             if let Some(off) = off {
                 t.hl_code = (self.func.code_ptr() + off) as u64;
                 t.hl_frame = frame;
+                if e.legacy {
+                    legacy_hl::note_code(t.hl_code);
+                }
             }
         }
         Some(t)
@@ -12237,9 +12250,11 @@ impl JitFunction {
             .iter()
             .any(|o| matches!(o, GenericOp::PushHandler { .. } | GenericOp::PopHandler));
         // The direct entries a headerless call enters (`NativeEntries::
-        // direct`): not for a body whose activation needs its header.
-        let native_direct = (call_seq::headerless_enabled() && !legacy && new_target.is_none())
-            .then(|| a.new_label());
+        // direct`): not for a body whose activation needs its header. (A
+        // sloppy ordinary body's is handed out only while no code can read
+        // the legacy `f.caller` / `f.arguments`: `JitProto::call_target`.)
+        let native_direct =
+            (call_seq::headerless_enabled() && new_target.is_none()).then(|| a.new_label());
         let native_direct_pinned = native_direct.and_then(|_| a.pinned().then(|| a.new_label()));
         let native_room = if has_inline && !has_handlers {
             inl_slots.levels() * (call_seq::FRAME_HEADER + inl_slots.max_argc) * 8
@@ -20673,6 +20688,7 @@ impl JitFunction {
             direct: direct.map(|_| at[n - 2]),
             direct_pinned: direct_pinned.map(|_| at[n - 1]),
             room: native_room,
+            legacy,
         };
         f.map(|f| (f, entries, spec_heads, gen_tab))
     }

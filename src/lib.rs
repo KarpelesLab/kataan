@@ -49,6 +49,8 @@ pub mod ast;
 #[doc(hidden)]
 pub mod common;
 pub mod error;
+#[doc(hidden)]
+pub mod legacy_reach;
 pub mod lexer;
 #[doc(hidden)]
 pub mod nanbox;

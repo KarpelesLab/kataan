@@ -9442,6 +9442,10 @@ fn fold2(dst: Reg, a: Option<f64>, b: Option<f64>, f: impl Fn(f64, f64) -> NanBo
 /// of those lies between the two.
 #[allow(clippy::type_complexity)]
 fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>, Vec<u32>) {
+    // (Sloppy activations entered from now on keep their records — a key
+    // built at run time reaches here without having turned it on before:
+    // see `crate::legacy_reach`.)
+    crate::legacy_reach::note();
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
     if let Some(v) = jit_tier::callee_view(ctx) {
         return v;

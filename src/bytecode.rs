@@ -1091,6 +1091,8 @@ pub fn serialize(protos: &[FnProto]) -> Vec<u8> {
 /// # Errors
 /// Returns [`DecodeError`] for a bad magic/version, truncation, or corrupt tag.
 pub fn deserialize(bytes: &[u8]) -> Result<Vec<FnProto>, DecodeError> {
+    // (Code no lexer saw may read a legacy `f.caller`: `crate::legacy_reach`.)
+    crate::legacy_reach::note();
     let mut r = Reader { bytes, pos: 0 };
     if r.take(4)? != MAGIC {
         return Err(DecodeError::BadMagic);

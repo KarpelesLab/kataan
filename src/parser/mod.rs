@@ -32,6 +32,28 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 
+/// [`cook::identifier_name`], for `crate::legacy_reach`.
+pub(crate) fn cook_identifier_name(raw: &str) -> alloc::string::String {
+    cook::identifier_name(raw)
+}
+
+/// The cooked value of a string or template token's raw text (its
+/// delimiters — a quote, a backtick, the `}` and `${` of a template part —
+/// dropped), `None` when an escape does not decode: for
+/// `crate::legacy_reach`, which only asks what words it contains.
+pub(crate) fn cook_escapes(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut b = raw;
+    if let [b'"' | b'\'' | b'`' | b'}', rest @ ..] = b {
+        b = rest;
+    }
+    if let [rest @ .., b'$', b'{'] = b {
+        b = rest;
+    } else if let [rest @ .., b'"' | b'\'' | b'`'] = b {
+        b = rest;
+    }
+    cook::decode_escapes(b, Span::new(0, 0)).ok()
+}
+
 /// Maximum recursive-descent nesting depth, in levels counted at the
 /// recursion hubs. Deeply nested source (a long run of unary operators,
 /// brackets, parens, or destructuring patterns) drives the parser into native

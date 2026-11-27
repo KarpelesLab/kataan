@@ -33,8 +33,9 @@
 //!   the register stack — the previous header, the callee, where the realm's
 //!   stack stood, and the arguments — and a reader merges the two stacks only
 //!   when it needs them (`jit_tier::callee_view`). An activation whose
-//!   callee no legacy read can name (not a sloppy ordinary function) needs
-//!   no header at all: it is entered **headerless** ([`emit_headerless`]),
+//!   callee no legacy read can name (not a sloppy ordinary function, or
+//!   one while no code can read those: `crate::legacy_reach`) needs no
+//!   header at all: it is entered **headerless** ([`emit_headerless`]),
 //!   its arguments laid straight into its window's parameter registers, and
 //!   only counted, in the realm's `vm_mark`, which every visible activation
 //!   records — so a legacy `f.caller` that would skip past an invisible
@@ -3223,8 +3224,8 @@ pub(crate) fn headerless_enabled() -> bool {
 /// A **headerless** call (from [`emit_enter`]'s step 2, with no pending
 /// activations and a static argument count): for a way whose callee's
 /// activation needs no native-call header (`CallTarget::hl_frame`: not a
-/// sloppy ordinary function, which the legacy `f.caller` / `f.arguments`
-/// look for, nor one reading `new.target`, and called with exactly its
+/// sloppy ordinary function while the legacy `f.caller` / `f.arguments`
+/// may look for it (`crate::legacy_reach`), nor one reading `new.target`, and called with exactly its
 /// parameter count), the arguments go straight into the parameter
 /// registers of the callee's window, laid out at the stack top, and the
 /// callee is entered at its direct entry, which copies none. The stack top

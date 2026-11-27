@@ -6426,8 +6426,9 @@ fn inline_enabled() -> bool {
 
 /// Per pc of a body whose call sites' callee feedback is `hints`: whether
 /// every callee the site called needs a native-call header (`crate::jit::
-/// with_call_hdr`): a sloppy ordinary function (the legacy `f.caller` /
-/// `f.arguments` find its activation by it), one reading `new.target`, or
+/// with_call_hdr`): a sloppy ordinary function while code can read its
+/// legacy `f.caller` / `f.arguments` (`crate::legacy_reach`: they find
+/// its activation by it), one reading `new.target`, or
 /// one with `try` regions (entered through its handler-segment entry).
 pub(super) fn call_hdr_pcs(
     funcs: &[FnProto],
@@ -6436,7 +6437,7 @@ pub(super) fn call_hdr_pcs(
     use crate::ic::CalleeHint;
     let needs = |fid: u32| {
         funcs.get(fid as usize).is_some_and(|p| {
-            p.legacy
+            (p.legacy && crate::legacy_reach::reachable())
                 || p.ops.iter().any(|o| {
                     matches!(o, Op::LoadNewTarget { .. })
                         || (!crate::jit::inline_hframe_enabled()

@@ -1784,6 +1784,17 @@ impl<'src> Lexer<'src> {
                     self.pend_gen = false;
                 }
             }
+            // (Whether the program can name a legacy `f.caller` /
+            // `f.arguments`: see `crate::legacy_reach`.)
+            if !crate::legacy_reach::reachable() {
+                crate::legacy_reach::note_token(
+                    kind,
+                    self.bytes.get(start..self.pos).unwrap_or(&[]),
+                    self.cur_had_escape,
+                    self.prev_significant,
+                    matches!(self.brace_stack.last(), Some(BraceKind::ExprObject)),
+                );
+            }
             self.prev_significant = Some(kind);
         }
         let had_escape = core::mem::take(&mut self.cur_had_escape);
