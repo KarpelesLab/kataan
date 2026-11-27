@@ -11361,6 +11361,11 @@ mod tests;
 #[cfg(test)]
 mod difftest_tests;
 
+/// Programs whose loops the compiled tier keeps integer values (and the
+/// fields they carry) in registers for, with the results pinned.
+#[cfg(test)]
+mod smallint_tests;
+
 impl Interp {
     /// A VM-supplied member key: an *object* key runs its full ToPropertyKey
     /// here (once), so the member operation sees the resulting string/symbol

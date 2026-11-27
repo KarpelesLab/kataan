@@ -10098,6 +10098,14 @@ fn fcarry_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FCARRY").is_none_or(|v| v != "0"))
 }
 
+/// Whether a receiver register written only by moves takes its sources'
+/// class ([`receiver_class`]): unless `KATAAN_JIT_RCLASSMOVE=0`. Read once
+/// per process.
+fn rclass_move_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_RCLASSMOVE").is_none_or(|v| v != "0"))
+}
+
 /// Whether `KATAAN_JIT_FCARRY=log`: report each carried field kept.
 fn fcarry_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -10237,6 +10245,12 @@ fn defs_exact(op: &Op, d: &mut Vec<u16>, u: &mut Vec<u16>) {
 /// the loop never stores. Either holds one value in every run of a
 /// speculative version's fast version (only Rust code changes a binding
 /// otherwise). `None` for another, or one of `carried_r`.
+///
+/// A register whose every write is a move takes its sources' class, when
+/// they all have the same one (`const p = o; p.x = p.x + 1`, an inlined
+/// accessor's `this`): not carried, it is written in every iteration
+/// before it is read, from a register that holds one value in the run
+/// (`KATAAN_JIT_RCLASSMOVE=0` turns this off).
 fn receiver_class(
     bytecode: &[Op],
     (head, end): (usize, usize),
@@ -10245,12 +10259,45 @@ fn receiver_class(
     d: &mut Vec<u16>,
     u: &mut Vec<u16>,
 ) -> Option<(bool, usize)> {
+    receiver_class_at(bytecode, (head, end), carried_r, r, d, u, 0)
+}
+
+/// [`receiver_class`], `depth` moves deep.
+fn receiver_class_at(
+    bytecode: &[Op],
+    (head, end): (usize, usize),
+    carried_r: &dyn Fn(u16) -> bool,
+    r: u16,
+    d: &mut Vec<u16>,
+    u: &mut Vec<u16>,
+    depth: u32,
+) -> Option<(bool, usize)> {
     let ds = defs_in(bytecode, (head, end), r, d, u);
     if ds.is_empty() {
         return Some((true, r as usize));
     }
     if carried_r(r) {
         return None;
+    }
+    if rclass_move_enabled()
+        && depth < 4
+        && ds.iter().all(|&pc| matches!(bytecode[pc], Op::Move { .. }))
+    {
+        let mut class = None;
+        for pc in ds {
+            let Op::Move { src, .. } = bytecode[pc] else {
+                return None;
+            };
+            if src == r {
+                return None;
+            }
+            let c = receiver_class_at(bytecode, (head, end), carried_r, src, d, u, depth + 1)?;
+            if class.is_some_and(|k| k != c) {
+                return None;
+            }
+            class = Some(c);
+        }
+        return class;
     }
     let mut name: Option<&str> = None;
     for &pc in &ds {
