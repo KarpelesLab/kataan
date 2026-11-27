@@ -3,8 +3,6 @@ use super::*;
 #[cfg(feature = "regex")]
 mod groups;
 #[cfg(feature = "regex")]
-pub(crate) use groups::GroupsShape;
-#[cfg(feature = "regex")]
 mod lean;
 #[cfg(feature = "regex")]
 pub(crate) use lean::{
@@ -2054,6 +2052,8 @@ impl Interp {
                     text: crate::nbvm::PlanText::Units(units_rc.clone()),
                     stride,
                     spans,
+                    #[cfg(feature = "regex")]
+                    named: None,
                 }));
             }
             results = spans
@@ -2184,6 +2184,8 @@ impl Interp {
                 text: crate::nbvm::PlanText::Units(units_rc.clone()),
                 stride,
                 spans,
+                #[cfg(feature = "regex")]
+                named: None,
             }));
         }
         self.regexp_replace_build(results, func_replace, replace, &repl_str, str_v, units)

@@ -58,6 +58,8 @@ mod inst_memo;
 pub(crate) mod json_fast;
 mod msg_text;
 mod pow5_tables;
+#[cfg(feature = "regex")]
+mod regex_groups;
 pub(crate) mod ryu;
 #[cfg(test)]
 mod shortest;
@@ -520,6 +522,10 @@ pub struct Realm {
     /// The hidden-state layout of a live RegExp String Iterator (matcher,
     /// subject, flag bits; not done), learned likewise.
     pub(crate) rsi_layout: Option<hidden_layout::HiddenLayout<3>>,
+    /// The layouts of recent RegExps' named-groups objects (see
+    /// `regex_groups`).
+    #[cfg(feature = "regex")]
+    groups_shapes: alloc::vec::Vec<regex_groups::GroupsShape>,
     /// The hidden-state layout of a live Array Iterator (see
     /// `hidden_layout`), learned likewise.
     pub(crate) arr_iter_layout: Option<hidden_layout::HiddenLayout<3>>,
@@ -1300,6 +1306,8 @@ impl Realm {
             buf_iter_layout: None,
             str_iter_layout: None,
             rsi_layout: None,
+            #[cfg(feature = "regex")]
+            groups_shapes: alloc::vec::Vec::new(),
             arr_iter_layout: None,
             bound_fn_layout: None,
             iter_helper_fn_layout: None,

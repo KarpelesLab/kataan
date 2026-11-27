@@ -491,7 +491,8 @@ impl Interp {
         let Some(re) = self.realm.regex_compiled(h) else {
             return Ok(None);
         };
-        if !re.group_names().is_empty() {
+        // (A template's `$<name>` is the general path's.)
+        if !re.group_names().is_empty() && !func {
             return Ok(None);
         }
         // The program was compiled from the RegExp's own flags.
@@ -582,6 +583,7 @@ impl Interp {
                     text,
                     stride,
                     spans,
+                    named: (!re.group_names().is_empty()).then(|| re.clone()),
                 })));
             }
             LeanReplace::Out(out, stride) | LeanReplace::TooLong(out, stride) => {

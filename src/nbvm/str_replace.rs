@@ -48,6 +48,10 @@ pub struct ReplacePlan {
     /// Every match's spans, `stride` per match (code-unit offsets; `None` for
     /// a group that did not participate).
     pub(crate) spans: Vec<Option<(usize, usize)>>,
+    /// The program, when it has named groups: each call then gets the
+    /// match's groups object as its last argument.
+    #[cfg(feature = "regex")]
+    pub(crate) named: Option<Rc<crate::regex::Regex>>,
 }
 
 /// The subject text of a [`ReplacePlan`]: its UTF-16 code units, or a flat
@@ -298,6 +302,15 @@ fn replace_matches_on<T: PlanUnits>(
         }
         argv.push(NanBox::number(pos as f64));
         argv.push(plan.subject);
+        // `namedCaptures` (when the pattern has group names): the groups
+        // object of this match, from the captures just made.
+        #[cfg(feature = "regex")]
+        if let Some(re) = &plan.named {
+            let groups = ctx.realm.named_groups_object(re, &argv[..m.len()], |i| {
+                m.get(i).is_some_and(Option::is_some)
+            });
+            argv.push(groups);
+        }
         let r = callee.invoke(ctx, &argv, NanBox::undefined())?;
         if pos >= next {
             T::append(&mut out, &units[next.min(pos)..pos]);
