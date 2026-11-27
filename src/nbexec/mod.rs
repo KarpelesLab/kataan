@@ -8737,8 +8737,15 @@ pub(crate) fn case_map_wtf8(bytes: &[u8], upper: bool) -> alloc::vec::Vec<u8> {
 /// while a surrogate-bearing string normalizes each maximal run of scalars and
 /// re-emits each lone surrogate unchanged. The result is WTF-8.
 #[cfg(feature = "intl")]
-fn normalize_wtf8(bytes: &[u8], form: &str) -> alloc::vec::Vec<u8> {
+pub(crate) fn normalize_wtf8(bytes: &[u8], form: &str) -> alloc::vec::Vec<u8> {
     use intl::unicode::normalize;
+    // Already in the form (the quick check's `Yes`: every character stable
+    // and the combining classes in order): the text itself.
+    if let Some(s) = crate::wtf8::as_str(bytes)
+        && already_normalized(s, form)
+    {
+        return bytes.to_vec();
+    }
     let norm = |chars: core::str::Chars<'_>| -> String {
         match form {
             "NFC" => normalize::nfc(chars).collect(),
@@ -8772,6 +8779,34 @@ fn normalize_wtf8(bytes: &[u8], form: &str) -> alloc::vec::Vec<u8> {
         out.extend_from_slice(norm(run.chars()).as_bytes());
     }
     out
+}
+
+/// The longest text (in bytes) [`already_normalized`] quick-checks.
+#[cfg(feature = "intl")]
+const QUICK_CHECK_MAX: usize = 256;
+
+/// Whether `s` is certainly in the normalization `form` (one of the four
+/// names): all ASCII (every form fixes it), or — for a text of at most
+/// [`QUICK_CHECK_MAX`] bytes — the form's quick check says `Yes`. `false`
+/// means "normalize to find out".
+#[cfg(feature = "intl")]
+pub(crate) fn already_normalized(s: &str, form: &str) -> bool {
+    use intl::unicode::normalize::{self, IsNormalized};
+    if s.is_ascii() {
+        return true;
+    }
+    // (The quick check reads every character even after a `Maybe`, so on a
+    // long text that then needs normalizing it is pure overhead.)
+    if s.len() > QUICK_CHECK_MAX {
+        return false;
+    }
+    let qc = match form {
+        "NFC" => normalize::quick_check_nfc(s.chars()),
+        "NFD" => normalize::quick_check_nfd(s.chars()),
+        "NFKC" => normalize::quick_check_nfkc(s.chars()),
+        _ => normalize::quick_check_nfkd(s.chars()),
+    };
+    matches!(qc, IsNormalized::Yes)
 }
 
 /// Slices a pre-collected `&[u16]` subject over the **code-unit** range

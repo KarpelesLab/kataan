@@ -2982,13 +2982,18 @@ impl Realm {
         if rope.is_ascii() {
             return bytes.get(i).map(|b| u16::from(*b));
         }
-        let (b0, u0) = match &self.unit_cursor {
-            Some((r, b, u)) if r.ptr_eq(rope) && *u <= i => (*b, *u),
-            _ => (0, 0),
+        let (b0, u0, same) = match &self.unit_cursor {
+            Some((r, b, u)) if r.ptr_eq(rope) && *u <= i => (*b, *u, true),
+            _ => (0, 0, false),
         };
         let (unit, b, u) = crate::wtf8::utf16_index_from(bytes, b0, u0, i)?;
-        let rope = rope.clone();
-        self.unit_cursor = Some((rope, b, u));
+        // (The cursor already holds this string: only its position moves.)
+        if same && let Some((_, cb, cu)) = &mut self.unit_cursor {
+            (*cb, *cu) = (b, u);
+        } else {
+            let rope = rope.clone();
+            self.unit_cursor = Some((rope, b, u));
+        }
         Some(unit)
     }
 

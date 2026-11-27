@@ -196,6 +196,10 @@ enum FastOp {
     StrLastIndexOf,
     /// `String.prototype.toUpperCase` / `toLowerCase`.
     StrCase(bool),
+    /// `String.prototype.isWellFormed` (`true`) / `toWellFormed`.
+    StrWellFormed(bool),
+    /// `String.prototype.normalize`.
+    StrNormalize,
     /// `String.prototype.trim` / `trimStart` / `trimEnd` (which ends).
     StrTrim(bool, bool),
     /// `String.prototype.padStart` / `padEnd` (whether at the start).
@@ -506,6 +510,9 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_STRING_PROTO_FN, b"includes") => FastOp::StrIncludes,
         (N_STRING_PROTO_FN, b"toUpperCase") => FastOp::StrCase(true),
         (N_STRING_PROTO_FN, b"toLowerCase") => FastOp::StrCase(false),
+        (N_STRING_PROTO_FN, b"isWellFormed") => FastOp::StrWellFormed(true),
+        (N_STRING_PROTO_FN, b"toWellFormed") => FastOp::StrWellFormed(false),
+        (N_STRING_PROTO_FN, b"normalize") => FastOp::StrNormalize,
         (N_STRING_PROTO_FN, b"trim") => FastOp::StrTrim(true, true),
         (N_STRING_PROTO_FN, b"trimStart") => FastOp::StrTrim(true, false),
         (N_STRING_PROTO_FN, b"trimEnd") => FastOp::StrTrim(false, true),
@@ -1113,6 +1120,9 @@ pub(crate) fn str_call_code(key: &str) -> Option<u8> {
         "charCodeAt" => 20,
         "codePointAt" => 21,
         "at" => 22,
+        "isWellFormed" => 23,
+        "toWellFormed" => 24,
+        "normalize" => 25,
         _ => return None,
     })
 }
@@ -1143,6 +1153,9 @@ fn str_call_op(code: u8) -> Option<FastOp> {
         20 => FastOp::StrCharCodeAt,
         21 => FastOp::StrCodePointAt,
         22 => FastOp::StrAt,
+        23 => FastOp::StrWellFormed(true),
+        24 => FastOp::StrWellFormed(false),
+        25 => FastOp::StrNormalize,
         _ => return None,
     })
 }
@@ -1181,6 +1194,11 @@ pub(super) fn str_call(
     let h = Handle::from_raw(recv.as_handle()?);
     if ctx.host.is_none() || ctx.realm.multi_realm || args.len() > 2 {
         return None;
+    }
+    if matches!(op, FastOp::StrCharCodeAt | FastOp::StrCodePointAt)
+        && let Some(v) = str_unit_call(&mut ctx.realm, h, op, regs, args)
+    {
+        return Some(Ok(v));
     }
     #[cfg(feature = "regex")]
     if matches!(op, FastOp::StrReplace)
@@ -1223,7 +1241,48 @@ pub(super) fn str_call(
             return Some(r.map_err(VmError::from));
         }
     }
-    run_op(ctx, funcs, op, method, recv, h, false, regs, args)
+    // (Out of line: inlined, the general op's frame would be every call's.)
+    run_op_out_of_line(ctx, funcs, op, method, recv, h, regs, args)
+}
+
+/// [`str_call`]'s `s.charCodeAt(i)` / `s.codePointAt(i)` with `i` a
+/// non-negative integer Number below 2^31 (ToIntegerOrInfinity is then the
+/// identity and runs no code): [`run_op`]'s answer, read from the string's
+/// units in order (`Realm::string_unit_at_seq`) without the general op's
+/// dispatch. `None`, having done nothing, for anything else.
+#[cfg(all(feature = "jit", jit_native))]
+#[inline]
+fn str_unit_call(
+    realm: &mut Realm,
+    h: Handle,
+    op: FastOp,
+    regs: &[NanBox],
+    args: &[Reg],
+) -> Option<NanBox> {
+    let &[a] = args else {
+        return None;
+    };
+    let n = regs[a as usize].as_number()?;
+    if !(0.0..2_147_483_648.0).contains(&n) || n.fract() != 0.0 || !realm.typeof_is_string(h) {
+        return None;
+    }
+    let i = n as usize;
+    let unit = realm.string_unit_at_seq(h, i);
+    Some(match (op, unit) {
+        (FastOp::StrCharCodeAt, Some(u)) => NanBox::number(f64::from(u)),
+        (FastOp::StrCharCodeAt, None) => NanBox::number(f64::NAN),
+        (_, None) => NanBox::undefined(),
+        (_, Some(u)) if (0xD800..0xDC00).contains(&u) => {
+            let cp = match realm.string_unit_at_seq(h, i + 1) {
+                Some(low) if (0xDC00..0xE000).contains(&low) => {
+                    0x1_0000 + ((u32::from(u) - 0xD800) << 10) + (u32::from(low) - 0xDC00)
+                }
+                _ => u32::from(u),
+            };
+            NanBox::number(f64::from(cp))
+        }
+        (_, Some(u)) => NanBox::number(f64::from(u)),
+    })
 }
 
 /// The flag of a [`str_call`] code for a call whose first argument the op
@@ -2901,6 +2960,49 @@ fn run_op(
             let out = crate::nbexec::case_map_wtf8(bytes, upper);
             NanBox::handle(realm.new_string_wtf8(out).to_raw())
         }
+        FastOp::StrWellFormed(is) => {
+            let rope = str_parts(realm, h)?;
+            let bytes = rope.as_leaf_bytes()?;
+            let ok = rope.is_ascii() || crate::wtf8::is_well_formed_utf16(bytes);
+            match (is, ok) {
+                (true, _) => NanBox::boolean(ok),
+                // Nothing to replace: the receiver itself (a string is a
+                // value; which cell holds it is not observable).
+                (false, true) => recv,
+                (false, false) => return None,
+            }
+        }
+        // `normalize(form)` with the form absent or one of the four names
+        // as a string (anything else is the general path's: a `ToString`
+        // that may run code, or the RangeError).
+        #[cfg(feature = "intl")]
+        FastOp::StrNormalize => {
+            let form = match arg(0) {
+                f if f.is_undefined() => "NFC",
+                f => {
+                    let fh = Handle::from_raw(f.as_handle()?);
+                    match realm.flat_plain_string_rope(fh)?.as_leaf_bytes()? {
+                        b"NFC" => "NFC",
+                        b"NFD" => "NFD",
+                        b"NFKC" => "NFKC",
+                        b"NFKD" => "NFKD",
+                        _ => return None,
+                    }
+                }
+            };
+            let rope = str_parts(realm, h)?;
+            let bytes = rope.as_leaf_bytes()?;
+            if rope.is_ascii()
+                || crate::wtf8::as_str(bytes)
+                    .is_some_and(|s| crate::nbexec::already_normalized(s, form))
+            {
+                return Some(Ok(recv));
+            }
+            let out = crate::nbexec::normalize_wtf8(bytes, form);
+            NanBox::handle(realm.new_string_wtf8(out).to_raw())
+        }
+        #[cfg(not(feature = "intl"))]
+        FastOp::StrNormalize => return None,
         FastOp::StrTrim(start, end) => {
             // The kept part shares the receiver's bytes or subtrees; a
             // `Concat` too deep to walk is flattened first.
