@@ -3018,14 +3018,14 @@ mod intl_aliases;
 mod intl_fmt;
 mod iter_plain;
 mod iterator;
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) use iterator::coll_iter_step_lean;
 pub(crate) use iterator::{realm_builtin_entry_step, realm_builtin_iter_step};
 mod dataview_fast;
 mod json;
 mod json_parse;
 mod method_dispatch;
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) use dataview_fast::dv_view_facts;
 pub(crate) use dataview_fast::{DvAccess, dataview_fast, dv_access_for};
 #[cfg(all(feature = "module", feature = "std"))]

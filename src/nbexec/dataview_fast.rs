@@ -75,7 +75,7 @@ pub(crate) fn dv_access_for(name: &[u8]) -> Option<DvAccess> {
 /// is made. `None` for anything else, a buffer detached now, or, for a
 /// `set*` (`set`), an immutable buffer (a buffer is made immutable only when
 /// it is made, before any view of it exists).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) fn dv_view_facts(realm: &Realm, h: Handle, set: bool) -> Option<(Handle, u64, u64)> {
     let slot_handle = |realm: &Realm, h: Handle, key: &str| {
         realm

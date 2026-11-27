@@ -82,7 +82,7 @@ impl Default for KeyMemo {
 /// field holding the entries' address (`0` before the memo is made), the
 /// entry stride and the entry's rope, layout and slot fields. An entry's
 /// index is `index` of the rope's address.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KeyMemoLayout {
     pub(crate) entries: i32,
@@ -93,7 +93,7 @@ pub(crate) struct KeyMemoLayout {
 }
 
 /// [`KeyMemoLayout`], and the index's mask (`CAP - 1`).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[must_use]
 pub(crate) fn jit_key_memo_layout() -> (KeyMemoLayout, i32) {
     use core::mem::{offset_of, size_of};

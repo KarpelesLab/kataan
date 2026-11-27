@@ -69,10 +69,7 @@ const MAX_LINKS: usize = 8;
 
 /// One memoized key list (see the module docs). (Its key slots serve the
 /// compiled code's helpers only.)
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 struct Entry {
     /// The receiver's shape (held, so its address is not reused).
     shape: Rc<Shape>,
@@ -103,10 +100,7 @@ struct Entry {
 /// layout `shape` ([`NO_SLOT`] for none). While anything holds the table,
 /// `array` (once made) and the key Strings are GC roots.
 #[repr(C)]
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 pub(crate) struct KeyTable {
     /// The bits of the entry's key array (`0`: not made yet, or retired
     /// before a compaction: then no loop's array is this table's).
@@ -138,10 +132,7 @@ pub(crate) struct KeyTable {
     pub(crate) shape_len: u64,
 }
 
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 impl KeyTable {
     fn new(shape: Rc<Shape>, bits: Box<[u64]>, slots: Box<[u64]>) -> Self {
         Self {
@@ -186,10 +177,7 @@ impl KeyTable {
 /// docs): the key table of its array, or an empty one. Compiled code reads
 /// the table through `table`, never null.
 #[repr(C)]
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 pub(crate) struct ForInSite {
     /// The held table's address (else `empty`'s).
     pub(crate) table: core::cell::Cell<*const KeyTable>,
@@ -197,10 +185,7 @@ pub(crate) struct ForInSite {
     empty: Box<KeyTable>,
 }
 
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 impl ForInSite {
     /// A site holding no table.
     #[must_use]
@@ -235,10 +220,7 @@ impl Default for ForInSite {
 }
 
 /// The handle bits of a `NanBox` handle (`NanBox::as_handle`).
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 const HANDLE_BITS: u64 = 0x0000_ffff_ffff_ffff;
 
 /// A [`KeyTable`] slot for a key with no slot of its own there.
@@ -480,10 +462,7 @@ impl Realm {
     /// whose `[[Prototype]]` is the one the table's chain was last found
     /// unchanged for, at the prototype epoch that still is current (every
     /// link is watched).
-    #[cfg_attr(
-        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
     pub(crate) fn for_in_table_hit(&self, h: Handle, t: &KeyTable) -> Option<NanBox> {
         let a = t.array.get();
         if a == 0 || t.stamp.get() != crate::object::proto_epoch() {
@@ -855,10 +834,7 @@ impl Realm {
     /// near the entry's hint only (see the module docs); `None` otherwise
     /// (the ordinary lookup decides).
     #[inline]
-    #[cfg_attr(
-        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
     pub(crate) fn for_in_key_slot(
         &self,
         obj: NanBox,
@@ -874,10 +850,7 @@ impl Realm {
 
     /// [`for_in_key_slot`](Self::for_in_key_slot) once the key's bit is set.
     #[inline(never)]
-    #[cfg_attr(
-        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
     fn for_in_key_slot_of<'a>(
         &'a self,
         cache: &'a ForInCache,

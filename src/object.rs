@@ -282,10 +282,7 @@ pub(crate) fn bump_proto_epoch() {
 /// The address of [`PROTO_EPOCH`], which compiled code reads with a plain
 /// load (an `AtomicU64` has `u64`'s layout).
 #[must_use]
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(jit_x64), allow(dead_code))]
 pub(crate) fn proto_epoch_addr() -> usize {
     PROTO_EPOCH.as_ptr() as usize
 }
@@ -933,7 +930,7 @@ impl ExtraPool {
     /// length, for compiled code's inline pop: `(ptr, len)`. `vec_ptr_off`
     /// and `vec_len_off` are a `Vec`'s probed word offsets
     /// ([`ObjectLayout`]), the same whatever its element type.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     #[must_use]
     pub(crate) fn jit_offsets(vec_ptr_off: usize, vec_len_off: usize) -> (usize, usize) {
         let f = core::mem::offset_of!(ExtraPool, boxes);
@@ -954,7 +951,7 @@ impl ExtraPool {
     }
 
     /// The pool's `Vec` data pointer and length, for the layout test.
-    #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(test, feature = "jit", jit_x64))]
     pub(crate) fn raw_parts(&self) -> (usize, usize) {
         (self.boxes.as_ptr() as usize, self.boxes.len())
     }
@@ -2398,7 +2395,7 @@ impl Object {
     /// object watched and unchanged: the object's cell moves only when the
     /// heap arena grows, is compacted or swaps cells, and its spill array only
     /// when a slot is added or removed — each of which bumps the epoch.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     #[must_use]
     pub(crate) fn jit_slot_ptr(&self, slot: u32) -> Option<*const NanBox> {
         if self.is_dict() || slot >= u32::from(self.len) {
@@ -2415,7 +2412,7 @@ impl Object {
     /// The address of accessor `i`'s getter, under the same terms as
     /// [`jit_slot_ptr`](Self::jit_slot_ptr) (the accessor list changes only
     /// with the object's key epoch, a layout change).
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     #[must_use]
     pub(crate) fn jit_getter_ptr(&self, i: usize) -> Option<*const NanBox> {
         self.ex()
@@ -2425,7 +2422,7 @@ impl Object {
     }
 
     /// [`jit_getter_ptr`](Self::jit_getter_ptr) for accessor `i`'s setter.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     #[must_use]
     pub(crate) fn jit_setter_ptr(&self, i: usize) -> Option<*const NanBox> {
         self.ex()
@@ -3071,10 +3068,7 @@ impl Object {
     /// (`nbvm::global_mirror`): the address stays put until the dictionary
     /// gains or loses a key (a key epoch bump), and the facts hold until a
     /// [`global_attrs_changed`](Self::global_attrs_changed) one.
-    #[cfg_attr(
-        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
     pub(crate) fn jit_data_ptr(&mut self, key: &str) -> Option<*mut NanBox> {
         if !self.is_dict()
             || self.is_frozen()
@@ -3283,7 +3277,7 @@ impl crate::gc::Trace for Object {
 /// verification tests cross-check each against a safe read, so a layout drift
 /// fails loudly instead of corrupting a raw memory read. Offsets are relative
 /// to the `Object` base unless noted.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ObjectLayout {
     /// Byte offset of the storage-mode byte.
@@ -3360,7 +3354,7 @@ pub(crate) struct ObjectLayout {
 /// Derives [`ObjectLayout`] from a real shaped object with enough own data
 /// properties to fill both the near and the far spill (so the far `Vec` is
 /// populated).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) fn jit_object_layout() -> ObjectLayout {
     // Two properties past the near spill, so the far `Vec` is populated.
     let mut obj = Object::new(Shape::root());

@@ -332,10 +332,7 @@ const MAX_HINTED: usize = 64;
 /// that held a view test that view's kind first. A hint only: a function
 /// whose address another one has since taken reads that one's hints,
 /// which changes only the order the kinds are tested in.
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 pub(crate) fn set_kind_hints(proto: *const crate::nbvm::FnProto, hints: alloc::vec::Vec<u8>) {
     let key = proto as usize;
     KIND_HINTS.with(|h| {

@@ -89,7 +89,7 @@ pub(super) fn set_prop(ctx: &mut Ctx, recv: NanBox, key: &str, v: NanBox) -> boo
 
 /// Whether `g` is a global object whose key changes the global binding epoch
 /// tracks (`crate::object::JIT_FLAG_GLOBAL`).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn tracked(ctx: &Ctx, g: Handle) -> bool {
     ctx.realm
         .jit_object(g)
@@ -99,7 +99,7 @@ fn tracked(ctx: &Ctx, g: Handle) -> bool {
 /// `jit_helper_global_ref` of an `Op::LoadGlobal` of a name the global scope
 /// does not bind: the address of the global object's own data property's
 /// value (see the module docs).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn jit_load_ref(ctx: &mut Ctx, name: &str, slot: &SlotCache) -> Option<*mut NanBox> {
     let g = record_for(ctx, name, slot)?;
     if !tracked(ctx, g) {
@@ -112,7 +112,7 @@ pub(super) fn jit_load_ref(ctx: &mut Ctx, name: &str, slot: &SlotCache) -> Optio
 /// does not bind, for an op whose compiled code mirrors the write: the op's
 /// sink as its binding address, the property value's address left as its
 /// mirror target (see the module docs).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn jit_store_ref(
     ctx: &mut Ctx,
     name: &str,

@@ -72,10 +72,7 @@ fn note_typed_access() {
 
 /// Whether a typed-array element access has been seen (see
 /// [`TYPED_ELEMS_SEEN`]).
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 pub(crate) fn typed_elems_seen() -> bool {
     TYPED_ELEMS_SEEN.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -86,10 +83,7 @@ impl Realm {
     #[inline]
     /// The element kind of `v` when it is a typed-array view of a kind the
     /// fast helpers serve (a hint for the machine-code tier, `jit::typed`).
-    #[cfg_attr(
-        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
     pub(crate) fn typed_kind_of(&self, v: NanBox) -> Option<u8> {
         let (_, _, _, kind) = self
             .heap

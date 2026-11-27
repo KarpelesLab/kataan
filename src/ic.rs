@@ -582,7 +582,7 @@ impl WarmEntry {
 /// (never hand-baked); verified by the JIT layout test. `PropertyCache` is
 /// `#[repr(C)]`, so the field order is stable, but the offsets are still probed
 /// rather than assumed.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CacheLayout {
     /// Byte offset of the `shape: Option<Rc<Shape>>` field (the 8-byte word the
@@ -596,7 +596,7 @@ pub(crate) struct CacheLayout {
 }
 
 /// Derives [`CacheLayout`] from a real [`PropertyCache`].
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) fn jit_cache_layout() -> CacheLayout {
     let pc = PropertyCache::new();
     let base = core::ptr::addr_of!(pc) as usize;

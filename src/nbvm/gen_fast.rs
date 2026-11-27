@@ -53,7 +53,7 @@ const S_COMPLETED: u8 = GEN_COMPLETED as u8;
 /// values (rooted by the cell, so they stay valid) instead of being cut off at
 /// each `yield` and refilled with `undefined` at each resumption. Every path
 /// that hands the file to the interpreter cuts it back to the function's own.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn keep_regs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENKEEP").is_none_or(|v| v != "0"))
@@ -62,7 +62,7 @@ fn keep_regs() -> bool {
 /// Whether a hot resumption writes its frame back at a `yield` through the
 /// pointer its first borrow of the cell gave when no sweep ran meanwhile
 /// (`KATAAN_JIT_GENPTR`, default on), rather than looking the cell up again.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn reuse_frame_ptr() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENPTR").is_none_or(|v| v != "0"))
@@ -72,7 +72,7 @@ fn reuse_frame_ptr() -> bool {
 /// `jit_helper_call_method`, whose register window is a GC root already)
 /// skips publishing its caller's registers: it only counts as published
 /// (`KATAAN_JIT_GENSITE`, default on).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn jit_site_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENSITE").is_none_or(|v| v != "0"))
@@ -81,7 +81,7 @@ pub(super) fn jit_site_on() -> bool {
 /// Whether compiled code's call of a sync generator function whose prologue
 /// is plain makes the generator directly ([`create`], `KATAAN_JIT_GENNEW`,
 /// default on).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn create_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENNEW").is_none_or(|v| v != "0"))
@@ -89,12 +89,12 @@ fn create_on() -> bool {
 
 /// The most ops a plain prologue ([`create`]) runs before its
 /// `Op::GeneratorStart`.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 const PLAIN_PROLOGUE_MAX: usize = 8;
 
 /// The index of the `Op::GeneratorStart` that ends a plain prologue at the
 /// start of `ops` (see [`create`]), if it is one.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn plain_prologue(ops: &[Op]) -> Option<usize> {
     ops.iter()
         .take(PLAIN_PROLOGUE_MAX + 1)
@@ -119,7 +119,7 @@ fn plain_prologue(ops: &[Op]) -> Option<usize> {
 /// generator made, with nothing else of an activation. `None` (nothing done)
 /// for anything else, including a call at the recursion limits (whose
 /// `RangeError` the general path throws).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[inline(never)]
 pub(super) fn create(
     ctx: &mut Ctx,
@@ -306,7 +306,7 @@ fn resume_state_at(
         let e = vm_error(ctx, "TypeError", "Generator is already running");
         return Err(VmError::Thrown(e));
     }
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     if mode == 0
         && let Some(r) = hot_next(ctx, funcs, fh, id, state, pc, dst, v)
     {
@@ -372,11 +372,11 @@ fn resume_state_at(
     // calls (see `TierState`): taken out for the run (a nested resume of
     // the same function runs cold) and put back after it.
     let body = proto.ops.as_ptr() as usize;
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     let (mut hot, mut resumes) = (false, 0);
     let mut ic = match proto.tier.0.try_borrow_mut() {
         Ok(mut t) => {
-            #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(all(feature = "jit", jit_x64))]
             {
                 t.resumes = t.resumes.saturating_add(1);
                 resumes = t.resumes;
@@ -394,13 +394,13 @@ fn resume_state_at(
     };
     // A hot generator's body resumes in native code (see
     // `jit_tier::resume_generator`), on the same register file.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     let compiled = if hot {
         super::jit_tier::resume_generator(ctx, funcs, id, &mut regs, pc, &handlers, &ic, resumes)
     } else {
         None
     };
-    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(all(feature = "jit", jit_x64)))]
     let compiled = None;
     let r = match compiled {
         Some(r) => r,
@@ -471,7 +471,7 @@ fn finish(
 /// compiled code does not use them). `None` (nothing done) for anything
 /// else, including a resumption due to recompile or exit-stress the body,
 /// which the general path makes.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn hot_next(
@@ -520,7 +520,7 @@ fn hot_next(
 /// Where a `next(v)` resumption's sent value lands: a capturing
 /// `YieldResume`'s `dst` and its `mode` register (set to 0 = next), or the
 /// frame's `dst`; `None` at the generator's start.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 type Land = Option<(u16, Option<u16>)>;
 
 /// The run of a hot generator's compiled body for a `next(v)` resumption
@@ -533,7 +533,7 @@ type Land = Option<(u16, Option<u16>)>;
 /// before touching them. At a `yield` they stay there (truncated back to
 /// the function's own); any other end moves them out for [`finish`] (or,
 /// for a body that refuses to run, the interpreter).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn run_in_cell(
@@ -628,7 +628,7 @@ fn run_in_cell(
 /// `yield`: the register file moved out of the cell (cut back to the
 /// function's own) for [`finish`] — after the interpreter's run from `pc`
 /// for a body that refused to run.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[cold]
 #[inline(never)]
 fn cell_exit(
@@ -665,7 +665,7 @@ fn cell_exit(
 }
 
 /// What [`lean_next`] did.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 enum Lean {
     /// Nothing: the generator is not one it resumes (the general path does).
     Untaken,
@@ -677,7 +677,7 @@ enum Lean {
 
 /// Whether compiled code's `g.next(v)` resumes a hot generator through
 /// [`lean_next`] (`KATAAN_JIT_GENLEAN`, default on).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn lean_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GENLEAN").is_none_or(|v| v != "0"))
@@ -692,7 +692,7 @@ fn lean_on() -> bool {
 /// or capturing `yield`, one past the recursion limits, a body not compiled
 /// or not hot, a resumption that may recompile it, or a register file of
 /// another size.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[inline(always)]
 fn lean_next(ctx: &mut Ctx, funcs: &[FnProto], fh: Handle, v: NanBox) -> Lean {
     use super::jit_tier::GenRun;
@@ -816,7 +816,7 @@ fn lean_next(ctx: &mut Ctx, funcs: &[FnProto], fh: Handle, v: NanBox) -> Lean {
 /// iterator result, or `None` (nothing done) for the site's ordinary call.
 /// [`site_call`] for mode 0, a hot generator resumed by [`lean_next`] when
 /// the caller's registers (`rooted`) are a GC root already.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn jit_next(
     ctx: &mut Ctx,
@@ -843,7 +843,7 @@ pub(super) fn jit_next(
 /// The iterator result of a plain `yield value` at a compiled `g.next(v)`
 /// site: with `reuse` (a site whose results never escape) its one result
 /// object while it lives, else a fresh one.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[inline]
 pub(super) fn yield_result(ctx: &mut Ctx, value: NanBox, reuse: Option<&mut u64>) -> NanBox {
     match reuse {
@@ -874,7 +874,7 @@ pub(super) fn yield_result(ctx: &mut Ctx, value: NanBox, reuse: Option<&mut u64>
 /// natively (`crate::jit::gen_native`): enabled, the register files kept at
 /// the body's size ([`keep_regs`], which the native sequence relies on),
 /// the lean path on and the tier's settings allowing it.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn native_resume_on() -> bool {
     crate::jit::gen_native::enabled()
         && keep_regs()
@@ -896,7 +896,7 @@ pub(super) fn native_resume_on() -> bool {
 /// natively for the next [`RUNS`](crate::jit::gen_native::RUNS) slow
 /// resumptions of the way (it is recorded with no epoch: the sequence
 /// declines it at once, and this path counts down before it tries again).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn native_fill(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -990,7 +990,7 @@ pub(super) fn native_fill(
 /// for, its register file at the body's size. `Err(true)` when the frame's
 /// suspension is one the sequence declines (a handler on its stack, a pc
 /// without a stub, a body not generic), `Err(false)` for anything else.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn native_way(ctx: &Ctx, funcs: &[FnProto], fh: Handle) -> Result<(u64, u64, u64, u64, u64), bool> {
     let f = ctx.realm.vm_frame(fh).ok_or(false)?;
     let (id, pc, len) = (f.func as usize, f.pc as usize, f.regs.len());
@@ -1030,7 +1030,7 @@ fn native_way(ctx: &Ctx, funcs: &[FnProto], fh: Handle) -> Result<(u64, u64, u64
 /// the same run (whose bookkeeping before it, the running list, the depth
 /// and the rooted file, the sequence has undone already): the iterator
 /// result.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn native_finish(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -1092,7 +1092,7 @@ pub(super) fn native_finish(
 
 /// [`run_in_cell`] for a register file not of the function's own size:
 /// moved out of the cell and run on a window of the register stack.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[allow(clippy::too_many_arguments)]
 #[cold]
 fn run_on_window(
@@ -1168,7 +1168,7 @@ fn run_on_window(
 /// register as `vm_iter_step` writes it, with the checks and the resume
 /// folded into one pass. `None` (nothing done) for anything else, which
 /// takes the general step.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn jit_for_of_step(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -1225,7 +1225,7 @@ pub(super) fn jit_for_of_step(
 
 /// [`jit_for_of_step`]'s outcome of a resumption that ran: the step's value
 /// (`None` once done), with the loop's `done` register written.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn for_of_outcome(
     ctx: &mut Ctx,
     regs: &mut [NanBox],
@@ -1378,9 +1378,9 @@ fn nested<T>(
 #[inline]
 pub(super) fn publish(ctx: &mut Ctx, regs: &[NanBox], g: NanBox, v: NanBox) -> usize {
     let mark = ctx.frame_shadow.len();
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     let rooted = super::jit_tier::on_register_stack(ctx, regs);
-    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(all(feature = "jit", jit_x64)))]
     let rooted = false;
     if !rooted {
         ctx.frame_shadow.extend_from_slice(regs);
@@ -1523,9 +1523,9 @@ fn site_resume(
     v: NanBox,
     rooted: bool,
 ) -> Option<Result<NanBox, VmError>> {
-    #[cfg(not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(all(feature = "jit", jit_x64)))]
     let _ = rooted;
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     if mode == 0
         && let Some(r) = site_next_hot(ctx, funcs, regs, rooted, recv, fh, v)
     {
@@ -1549,7 +1549,7 @@ fn site_resume(
 /// pass over the frame cell, the iterator result made straight from the
 /// yielded value. `None` (nothing done) for anything else, including a
 /// resumption past the recursion limits (the general path throws).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[inline]
 fn site_next_hot(
     ctx: &mut Ctx,

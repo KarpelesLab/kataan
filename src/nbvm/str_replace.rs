@@ -102,7 +102,7 @@ pub(super) fn try_run(
 
 /// Whether a direct string call of `replace` tries [`try_lean`] first
 /// (`KATAAN_REPLACE_LEAN=0` never does).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn lean_on() -> bool {
     #[cfg(feature = "std")]
     {
@@ -122,7 +122,7 @@ pub(super) fn lean_on() -> bool {
 /// algorithm over a pristine RegExp ([`VmHost::replace_lean`](super::VmHost::replace_lean)),
 /// the call's result. `None`, with nothing done, otherwise ([`try_run`]
 /// then takes it from the top).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[inline]
 pub(super) fn try_lean(
     ctx: &mut Ctx,

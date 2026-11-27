@@ -57,13 +57,13 @@ impl<const N: usize> HiddenLayout<N> {
     }
 
     /// The layout's shape.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     pub(crate) fn shape(&self) -> &Rc<Shape> {
         &self.shape
     }
 
     /// The layout's slots, in `keys` order.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     pub(crate) fn slots(&self) -> [u32; N] {
         self.slots
     }

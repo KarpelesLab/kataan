@@ -65,7 +65,7 @@ impl Realm {
     /// Whether the cell at `h` is a strong `Set` (`Some(true)`) or `Map`
     /// (`Some(false)`); `None` for anything else.
     #[inline]
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     pub(crate) fn collection_kind(&self, h: Handle) -> Option<bool> {
         match self.heap.get(h)? {
             Cell::Collection {

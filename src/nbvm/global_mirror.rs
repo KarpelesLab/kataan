@@ -52,10 +52,7 @@ pub(crate) struct MirrorCache {
     /// The write-only "binding" a write of a name the global scope does not
     /// bind stores into before its mirror store reaches the global object's
     /// property (`super::global_obj`). Never read: it may hold a stale handle.
-    #[cfg_attr(
-        not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
     sink: Cell<u64>,
 }
 
@@ -65,10 +62,7 @@ impl Clone for MirrorCache {
     }
 }
 
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 impl MirrorCache {
     /// Whether the op's compiled code mirrors the write.
     pub(crate) fn on(&self) -> bool {
@@ -76,7 +70,7 @@ impl MirrorCache {
     }
 
     /// The address of the op's write-only sink (see `sink`).
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     pub(crate) fn sink_ptr(&self) -> *mut crate::nanbox::NanBox {
         self.sink.as_ptr().cast()
     }
@@ -88,7 +82,7 @@ impl MirrorCache {
     }
 
     /// The state this op's target lives in.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     fn canonical(&self) -> &MirrorCache {
         let c = self.canon.get();
         if c == 0 {
@@ -104,7 +98,7 @@ impl MirrorCache {
     }
 
     /// Records a validated target (`0`: none).
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     pub(crate) fn set(&self, ptr: u64) {
         self.canonical().ptr.set(ptr);
     }
@@ -115,10 +109,7 @@ impl MirrorCache {
 /// ([`MirrorCache::on`]: every write of a name one of whose writes the
 /// interpreter has not seen go to a global object without the name) and,
 /// per name, the op whose state they share.
-#[cfg_attr(
-    not(all(feature = "jit", target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
 pub(crate) fn plan_body(bytecode: &[super::Op]) {
     // A name mirrors in all of the body's writes of it or in none: they may
     // share one validated binding address.
@@ -153,7 +144,7 @@ pub(crate) fn plan_body(bytecode: &[super::Op]) {
 /// `ctx` must be the live `Ctx` the compiled body was entered with, `op` a
 /// pointer into the bytecode the calling `JitProto` owns, and the op's mirror
 /// target validated under the current global binding epoch.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) extern "C" fn jit_helper_global_mirror(
     ctx: *mut core::ffi::c_void,
     op: u64,
@@ -205,7 +196,7 @@ pub(crate) extern "C" fn jit_helper_global_mirror(
 /// (filling `StoreGlobalCache::owned`, the interpreter's own cache of that
 /// answer), so that the mirror plan ([`MirrorCache::on`]) also knows about
 /// code that has not run — top-level code compiled at its first loop, say.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(super) fn prefill(ctx: &super::Ctx, proto: &super::FnProto) {
     let Some((_, global)) = ctx.host.as_deref().and_then(|h| h.global_env()) else {
         return;

@@ -128,10 +128,10 @@ const APPENDED: u8 = 4;
 
 /// [`Slot::dirty`]'s bits that say a store into the object has nothing to
 /// record: a whole-object rescan is already due ([`DIRTY`], [`STICKY`]).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) const JIT_DIRTY_WHOLE: u8 = DIRTY | STICKY;
 /// [`APPENDED`], for compiled code.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) const JIT_DIRTY_APPENDED: u8 = APPENDED;
 
 /// [`Slot::occupied`] of a live slot.
@@ -212,7 +212,7 @@ impl<T> Slot<T> {
 /// property-get fast path. Every field is derived by pointer arithmetic on a real
 /// `Slot::Occupied` instance (never hand-baked), so a layout change is caught by
 /// the JIT layout verification test rather than silently corrupting a raw read.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SlotLayout {
     /// `size_of::<Slot<T>>()` — the arena stride (`base + index * stride`).
@@ -243,7 +243,7 @@ pub(crate) struct SlotLayout {
 
 /// The offsets of a [`Handle`]'s arena index (`u32`) and generation (`u16`)
 /// within it, for compiled code that walks a handle stored in a cell.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) const fn jit_handle_offsets() -> (usize, usize) {
     (
         core::mem::offset_of!(Handle, index),
@@ -253,7 +253,7 @@ pub(crate) const fn jit_handle_offsets() -> (usize, usize) {
 
 /// Derives [`SlotLayout`] for `Slot<T>` from a real live instance. `value`
 /// supplies a `T` so the slot can be built; only its byte layout is inspected.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
     let slot: Slot<T> = Slot::live(0, 0, value);
     let base = core::ptr::addr_of!(slot) as usize;
@@ -277,7 +277,7 @@ pub(crate) fn jit_slot_layout<T>(value: T) -> SlotLayout {
 /// The byte at the value offset of `slot` once vacated (see
 /// [`SlotLayout::vacant_tag`]), asserting it is a niche: no longer the live
 /// value's tag byte.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 fn vacant_tag_byte<T>(slot: Slot<T>) -> u8 {
     let mut v = alloc::vec![slot];
     let value_off = {
@@ -310,7 +310,7 @@ fn vacant_tag_byte<T>(slot: Slot<T>) -> u8 {
 /// calling [`Heap::slots_raw`]. The field offset is `offset_of!`; the `Vec`'s
 /// word order (unspecified) is probed on a live `Vec<Slot<Cell>>` whose
 /// length, capacity and pointer all differ. `(ptr_off, len_off)`.
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[must_use]
 pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {
     use crate::cell::Cell;
@@ -346,7 +346,7 @@ pub(crate) fn jit_heap_slots_offsets() -> (usize, usize) {
 /// The byte offsets, within the object heap (`Heap<Cell>`), of its handle
 /// epoch ([`Heap::epoch`], a `u32`) and of its GC-verification state (an
 /// `Option<Box<_>>`: one word, null while the mode is off).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[must_use]
 pub(crate) fn jit_heap_epoch_poison_offsets() -> (usize, usize) {
     use crate::cell::Cell;
@@ -362,7 +362,7 @@ pub(crate) fn jit_heap_epoch_poison_offsets() -> (usize, usize) {
 
 /// Where compiled code finds what [`Heap::alloc`]'s free-list path touches,
 /// as byte offsets within a `Heap<Cell>` (see [`jit_heap_alloc_offsets`]).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HeapAllocOffsets {
     /// The free list's data pointer.
@@ -379,7 +379,7 @@ pub(crate) struct HeapAllocOffsets {
 }
 
 /// The [`HeapAllocOffsets`], probed (a `Vec`'s word order is unspecified).
-#[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(feature = "jit", jit_x64))]
 #[must_use]
 pub(crate) fn jit_heap_alloc_offsets() -> HeapAllocOffsets {
     use crate::cell::Cell;
@@ -693,7 +693,7 @@ impl<T> Heap<T> {
 
     /// The offset of [`allocs_since_gc`](Heap::allocs_since_gc)'s counter in
     /// the heap (compiled code reads it inline).
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     #[must_use]
     pub(crate) const fn allocs_since_gc_offset() -> usize {
         core::mem::offset_of!(Self, allocs_since_gc)
@@ -786,12 +786,12 @@ impl<T> Heap<T> {
     /// fast-path entry because [`alloc`](Heap::alloc)'s `push` may reallocate the
     /// `Vec`; the JIT never caches this across a call.
     /// The `extra`-part pool's data pointer and length, for the layout test.
-    #[cfg(all(test, feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(test, feature = "jit", jit_x64))]
     pub(crate) fn extra_pool_raw(&self) -> (usize, usize) {
         self.extra_pool.raw_parts()
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     #[must_use]
     pub(crate) fn slots_raw(&self) -> (*const u8, usize) {
         (self.slots.as_ptr().cast::<u8>(), self.slots.len())
@@ -978,7 +978,7 @@ impl<T> Heap<T> {
     /// object — in verification mode too, where a freed object stays in its
     /// slot, listed (see `Heap::poison`), and resolving it here is not a
     /// use of a collected handle but the holder finding it gone.
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(feature = "jit", jit_x64))]
     #[inline]
     pub fn get_mut_weak(&mut self, handle: Handle) -> Option<&mut T> {
         if self
