@@ -205,10 +205,10 @@ impl Interp {
             // runs `Get(O, @@toPrimitive)` / `valueOf` / `toString` through its
             // traps (or the target) — returning it as-is would make `proxy == 0`
             // skip the coercion entirely.
-            if self.realm.is_object_cell(h)
-                || self.realm.get_property(h, PRIM_WRAP).is_some()
-                || self.realm.proxy_at(h).is_some()
-            {
+            // Any other object too (a Date, Map, RegExp, function, typed
+            // array, …): an own or inherited `valueOf`/`toString`/
+            // `@@toPrimitive` a program installed on it is honored.
+            if self.is_object_value(v) {
                 return self.coerce_primitive(v, hint);
             }
         }
