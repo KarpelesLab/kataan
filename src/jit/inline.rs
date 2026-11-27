@@ -1125,6 +1125,21 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             *dst = reg(*dst);
             *obj = reg(*obj);
         }
+        Op::ArrayUnpack {
+            ok,
+            src,
+            dsts,
+            rest,
+        } => {
+            *ok = reg(*ok);
+            *src = reg(*src);
+            for d in dsts.iter_mut() {
+                *d = reg(*d);
+            }
+            if let Some(r) = rest {
+                *r = reg(*r);
+            }
+        }
         // (A `super` site's chain cache starts cold in the splice's copy.)
         Op::SuperGet {
             dst,

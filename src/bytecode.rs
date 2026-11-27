@@ -905,6 +905,17 @@ fn verify_op_with(
             reg(*iter)?;
             reg(*next)
         }
+        Op::ArrayUnpack {
+            ok,
+            src,
+            dsts,
+            rest,
+        } => {
+            reg(*ok)?;
+            reg(*src)?;
+            regs(dsts)?;
+            rest.map_or(Ok(()), reg)
+        }
         Op::IterNextEntry {
             dst,
             fused,
@@ -2107,6 +2118,24 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*iter, out);
             w_reg(*next, out);
         }
+        Op::ArrayUnpack {
+            ok,
+            src,
+            dsts,
+            rest,
+        } => {
+            w_u8(231, out);
+            w_reg(*ok, out);
+            w_reg(*src, out);
+            w_regs(dsts, out);
+            match rest {
+                Some(r) => {
+                    w_u8(1, out);
+                    w_reg(*r, out);
+                }
+                None => w_u8(0, out),
+            }
+        }
         Op::IterClose { iter, done, quiet } => {
             w_u8(77, out);
             w_reg(*iter, out);
@@ -2970,6 +2999,12 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             done: r.reg()?,
             iter: r.reg()?,
             next: r.reg()?,
+        },
+        231 => Op::ArrayUnpack {
+            ok: r.reg()?,
+            src: r.reg()?,
+            dsts: r.regs()?,
+            rest: if r.u8()? == 1 { Some(r.reg()?) } else { None },
         },
         77 => Op::IterClose {
             iter: r.reg()?,

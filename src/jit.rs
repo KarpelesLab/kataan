@@ -4747,6 +4747,15 @@ pub(crate) fn concat_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONCAT").is_none_or(|v| v != "0"))
 }
 
+/// Whether an array destructuring's unpack (`Op::ArrayUnpack`) runs inline
+/// over a plain array (`KATAAN_JIT_UNPACK=0` turns it off, read once per
+/// process).
+fn unpack_inline_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_UNPACK").is_none_or(|v| v != "0"))
+}
+
 #[cfg(all(feature = "alloc", jit_native))]
 pub type JitBinHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, u64, u64) -> u64);
 
@@ -16269,6 +16278,71 @@ impl JitFunction {
                             a.store_rax(disp(*flag));
                             a.jmp(fused.unwrap_or(fin));
                             a.cold_end(cold);
+                        }
+                        // An array destructuring's values at once
+                        // (`Op::ArrayUnpack`) with no rest element, over a
+                        // plain array as an inline open finds it (above)
+                        // whose iteration is also left with nothing to close
+                        // (the close memo is current), with at least `dsts.len()`
+                        // elements and none of those a hole: the elements
+                        // and `true` inline. Anything else is the
+                        // interpreter's op (which also takes the rest of
+                        // the cases, and publishes the memo this reads).
+                        crate::nbvm::Op::ArrayUnpack {
+                            ok: flag,
+                            src,
+                            dsts,
+                            rest: None,
+                        } if unpack_inline_enabled()
+                            && ok(*flag)
+                            && ok(*src)
+                            && !dsts.is_empty()
+                            && dsts.len() <= 16
+                            && dsts.iter().all(|&r| ok(r)) =>
+                        {
+                            use call_seq::r as R;
+                            let slow = a.new_label();
+                            let fin = a.new_label();
+                            a.p_array_iter_open(helpers.call_layout.realm, slow);
+                            // (`r9` is still the realm.) Nothing to close:
+                            // the memo `iter_fast::close_is_noop` arms.
+                            a.g_load_abs(R::RAX, crate::object::proto_epoch_addr() as u64);
+                            a.g_cmp_mem(
+                                R::RAX,
+                                R::R9,
+                                i32::try_from(
+                                    core::mem::offset_of!(crate::realm::Realm, array_iter_memo)
+                                        + core::mem::offset_of!(
+                                            crate::realm::builtins_fast::ArrayIterMemo,
+                                            close_stamp
+                                        ),
+                                )
+                                .ok()?,
+                            );
+                            a.g_jcc(call_seq::cc::NE, slow);
+                            walk_to_slot!(*src, slow);
+                            family_checks!(recv_cache::Family::Arr, slow);
+                            a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
+                            a.jne(slow);
+                            // r8 = the count, r11 = the first element.
+                            a.p_arr_len_ptr(&layout);
+                            a.g_cmp_imm(R::R8, i32::try_from(dsts.len()).ok()?);
+                            a.g_jcc(call_seq::cc::B, slow);
+                            a.g_movabs(R::RDX, NanBox::hole().to_bits());
+                            for i in 0..dsts.len() {
+                                a.g_cmp_mem(R::RDX, R::R11, 8 * i as i32);
+                                a.g_jcc(call_seq::cc::E, slow);
+                            }
+                            for (i, &d) in dsts.iter().enumerate() {
+                                a.g_load(R::RAX, R::R11, 8 * i as i32);
+                                a.g_store(R::RBX, disp(d), R::RAX);
+                            }
+                            a.movabs_rax(NanBox::boolean(true).to_bits() as i64);
+                            a.store_rax(disp(*flag));
+                            a.jmp(fin);
+                            a.bind(slow);
+                            exec_op!(pc);
+                            a.bind(fin);
                         }
                         crate::nbvm::Op::FreshArrayIterPlain { dst } if ok(*dst) => {
                             // Its `JumpIfFalse`, fused (`forin_fuse`): `true`

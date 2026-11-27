@@ -59,6 +59,7 @@ pub(crate) use global_mirror::plan_body as plan_global_mirrors;
 mod await_fast;
 mod coll_from;
 mod coll_hof;
+mod dstr_fast;
 mod gen_fast;
 mod iter_fast;
 #[cfg(all(feature = "jit", jit_native))]
@@ -216,6 +217,21 @@ pub enum Op {
         done: Reg,
         iter: Reg,
         next: Reg,
+    },
+    /// An array destructuring's values read at once (`dstr_fast`): when
+    /// iterating `src` would run no code and observe nothing — a plain array
+    /// with no hole whose iteration is the built-in one, and (without `rest`)
+    /// no `return` to call when it is left unfinished — `dsts[i]` = element
+    /// `i` (`undefined` past the end), `rest` = a fresh array of the elements
+    /// after them, and `ok` = `true`; otherwise only `ok` = `false` (the
+    /// iterator protocol then runs). Emitted only before a pattern whose
+    /// defaults and targets cannot observe the order (see
+    /// `Compiler::unpack_plan`).
+    ArrayUnpack {
+        ok: Reg,
+        src: Reg,
+        dsts: Vec<Reg>,
+        rest: Option<Reg>,
     },
     /// `IteratorClose` unless `done`: calls the iterator's `return`. `quiet`
     /// closes on an abrupt completion, whose own error wins over any from
@@ -10282,6 +10298,15 @@ fn run_frame_at_ic(
                     }
                 }
             }
+            Op::ArrayUnpack {
+                ok,
+                src,
+                dsts,
+                rest,
+            } => {
+                let r = dstr_fast::unpack(ctx, regs, *src, dsts, *rest);
+                regs[*ok as usize] = NanBox::boolean(r);
+            }
             Op::IterRest {
                 dst,
                 done,
@@ -17979,6 +18004,23 @@ enum ArrayDstr<'e> {
     AssignRest(&'e Expr),
 }
 
+/// Whether a destructuring default `e` is evaluated without running code
+/// or failing (a literal, a negated number, an empty array or object
+/// literal): see `Compiler::unpack_ok`.
+fn inert_default(e: &Expr) -> bool {
+    match e {
+        Expr::Null(_) | Expr::Bool { .. } | Expr::Number { .. } | Expr::Str { .. } => true,
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Minus | crate::ast::UnaryOp::Plus,
+            argument,
+            ..
+        } => matches!(&**argument, Expr::Number { .. }),
+        Expr::Array { elements, .. } => elements.is_empty(),
+        Expr::Object { members, .. } => members.is_empty(),
+        _ => false,
+    }
+}
+
 /// How a write to a [`Binding::global`] binding is emitted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GlobalWrite {
@@ -21100,13 +21142,108 @@ impl Compiler {
         let iter = self.alloc();
         let next = self.alloc();
         let done = self.alloc();
-        self.ops.push(Op::IterOpen {
-            iter,
-            next,
-            src: value_reg,
-        });
-        let f = self.constant(NanBox::boolean(false))?;
-        self.ops.push(Op::Move { dst: done, src: f });
+        // A pattern whose steps may all run first (`Op::ArrayUnpack`): its
+        // values' registers, the rest's, and the "not unpacked" flag each
+        // step's protocol form is skipped on.
+        let mut unpack: Option<(Reg, alloc::collections::VecDeque<Reg>, Option<Reg>)> = None;
+        if self.unpack_ok(&els) {
+            let ok = self.alloc();
+            let n = els
+                .iter()
+                .filter(|e| !matches!(e, ArrayDstr::BindRest(_) | ArrayDstr::AssignRest(_)))
+                .count();
+            let dsts: Vec<Reg> = (0..n).map(|_| self.alloc()).collect();
+            let rest = els
+                .iter()
+                .any(|e| matches!(e, ArrayDstr::BindRest(_) | ArrayDstr::AssignRest(_)))
+                .then(|| self.alloc());
+            self.ops.push(Op::ArrayUnpack {
+                ok,
+                src: value_reg,
+                dsts: dsts.clone(),
+                rest,
+            });
+            let not_ok = self.alloc();
+            self.ops.push(Op::Not { dst: not_ok, a: ok });
+            let fast = self.emit_jump_if_false(not_ok);
+            self.ops.push(Op::IterOpen {
+                iter,
+                next,
+                src: value_reg,
+            });
+            let f = self.constant(NanBox::boolean(false))?;
+            self.ops.push(Op::Move { dst: done, src: f });
+            let open = self.emit_jump();
+            // Unpacked: an exhausted iterator (nothing to step or close).
+            self.patch(fast);
+            let t = self.constant(NanBox::boolean(true))?;
+            self.ops.push(Op::Move { dst: done, src: t });
+            let z = self.constant(NanBox::number(0.0))?;
+            self.ops.push(Op::Move { dst: iter, src: z });
+            self.patch(open);
+            unpack = Some((not_ok, dsts.into(), rest));
+        } else {
+            self.ops.push(Op::IterOpen {
+                iter,
+                next,
+                src: value_reg,
+            });
+            let f = self.constant(NanBox::boolean(false))?;
+            self.ops.push(Op::Move { dst: done, src: f });
+        }
+        // One step (`rest`: the rest element's drain) into a register: the
+        // unpacked value's when the pattern was unpacked.
+        macro_rules! step {
+            ($rest:expr) => {{
+                match &mut unpack {
+                    Some((not_ok, dsts, rest)) => {
+                        let not_ok = *not_ok;
+                        let v = if $rest {
+                            rest.expect("a rest register")
+                        } else {
+                            dsts.pop_front().expect("a value register")
+                        };
+                        let skip = self.emit_jump_if_false(not_ok);
+                        self.ops.push(if $rest {
+                            Op::IterRest {
+                                dst: v,
+                                done,
+                                iter,
+                                next,
+                            }
+                        } else {
+                            Op::IterNext {
+                                dst: v,
+                                done,
+                                iter,
+                                next,
+                            }
+                        });
+                        self.patch(skip);
+                        v
+                    }
+                    None => {
+                        let v = self.alloc();
+                        self.ops.push(if $rest {
+                            Op::IterRest {
+                                dst: v,
+                                done,
+                                iter,
+                                next,
+                            }
+                        } else {
+                            Op::IterNext {
+                                dst: v,
+                                done,
+                                iter,
+                                next,
+                            }
+                        });
+                        v
+                    }
+                }
+            }};
+        }
         let exc = self.alloc();
         let handler = self.ops.len();
         // A `return` leaving the destructuring (a generator resumed with
@@ -21124,22 +21261,10 @@ impl Compiler {
         for el in els {
             match el {
                 ArrayDstr::Hole => {
-                    let t = self.alloc();
-                    self.ops.push(Op::IterNext {
-                        dst: t,
-                        done,
-                        iter,
-                        next,
-                    });
+                    step!(false);
                 }
                 ArrayDstr::Bind(target, default) => {
-                    let v = self.alloc();
-                    self.ops.push(Op::IterNext {
-                        dst: v,
-                        done,
-                        iter,
-                        next,
-                    });
+                    let v = step!(false);
                     self.apply_default_named(v, default, Some(target))?;
                     self.bind_pattern(target, v)?;
                 }
@@ -21156,13 +21281,7 @@ impl Compiler {
                         _ => (e, None),
                     };
                     let place = self.member_place(inner)?;
-                    let v = self.alloc();
-                    self.ops.push(Op::IterNext {
-                        dst: v,
-                        done,
-                        iter,
-                        next,
-                    });
+                    let v = step!(false);
                     match place {
                         Some(place) => {
                             self.apply_default(v, default)?;
@@ -21172,24 +21291,12 @@ impl Compiler {
                     }
                 }
                 ArrayDstr::BindRest(target) => {
-                    let r = self.alloc();
-                    self.ops.push(Op::IterRest {
-                        dst: r,
-                        done,
-                        iter,
-                        next,
-                    });
+                    let r = step!(true);
                     self.bind_pattern(target, r)?;
                 }
                 ArrayDstr::AssignRest(e) => {
                     let place = self.member_place(e)?;
-                    let r = self.alloc();
-                    self.ops.push(Op::IterRest {
-                        dst: r,
-                        done,
-                        iter,
-                        next,
-                    });
+                    let r = step!(true);
                     match place {
                         Some(place) => self.store_place(place, r),
                         None => self.assign_pattern(e, r)?,
@@ -21200,11 +21307,16 @@ impl Compiler {
         self.handler_depth -= 1;
         self.finally_frames.pop();
         self.ops.push(Op::PopHandler);
+        // (Unpacked: an exhausted iterator, nothing to close.)
+        let unpacked = unpack.map(|(not_ok, ..)| self.emit_jump_if_false(not_ok));
         self.ops.push(Op::IterClose {
             iter,
             done,
             quiet: false,
         });
+        if let Some(j) = unpacked {
+            self.patch(j);
+        }
         let skip = self.ops.len();
         self.ops.push(Op::Jump { target: 0 });
         let at = self.ops.len();
@@ -21222,6 +21334,46 @@ impl Compiler {
             *target = end;
         }
         Ok(())
+    }
+
+    /// Whether the array pattern `els` may take [`Op::ArrayUnpack`]: every
+    /// element a hole, or a plain name (declared here as a local, or an
+    /// assignment to a resolved local) with no default or an inert one
+    /// ([`inert_default`]), the rest element likewise — so no default or
+    /// target runs code, and nothing between the steps can observe or
+    /// change the array they read.
+    fn unpack_ok(&self, els: &[ArrayDstr<'_>]) -> bool {
+        use crate::ast::VarDeclKind;
+        if !self.hosted || self.dyn_fn || els.is_empty() || els.len() > 16 {
+            return false;
+        }
+        // A declaration that binds in the global environment (a script's
+        // `var`, or its top-level `let`/`const`) is a write the host makes.
+        let local_decl =
+            !(self.is_main && (self.decl_kind == Some(VarDeclKind::Var) || self.scopes.len() == 1));
+        let local_ref = |e: &Expr| match e {
+            Expr::Ident(id) => {
+                !self.models_not(&id.name)
+                    && !self.env_resolves(&id.name)
+                    && self.lookup(&id.name).is_some_and(|b| b.global.is_none())
+            }
+            _ => false,
+        };
+        els.iter().all(|el| match el {
+            ArrayDstr::Hole => true,
+            ArrayDstr::Bind(BindingTarget::Ident(_), d) => {
+                local_decl && d.is_none_or(inert_default)
+            }
+            ArrayDstr::BindRest(BindingTarget::Ident(_)) => local_decl,
+            ArrayDstr::Assign(Expr::Assign {
+                op: crate::ast::AssignOp::Assign,
+                target,
+                value,
+                ..
+            }) => local_ref(target) && inert_default(value),
+            ArrayDstr::Assign(e) | ArrayDstr::AssignRest(e) => local_ref(e),
+            _ => false,
+        })
     }
 
     /// If `reg` holds `undefined` and a `default` exists, overwrites `reg` with

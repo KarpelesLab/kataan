@@ -3028,6 +3028,17 @@ pub(crate) fn jit_helper_exec_op(
             regs[*iter as usize] = NanBox::number(0.0);
             Some(Ok(()))
         }
+        // An array destructuring's values at once: its interpreter arm.
+        Op::ArrayUnpack {
+            ok,
+            src,
+            dsts,
+            rest,
+        } => {
+            let r = super::dstr_fast::unpack(ctx, regs, *src, dsts, *rest);
+            regs[*ok as usize] = NanBox::boolean(r);
+            Some(Ok(()))
+        }
         // A generator's open (the interpreter arm's first step).
         Op::IterOpen { iter, next, src } => {
             let v = regs[*src as usize];

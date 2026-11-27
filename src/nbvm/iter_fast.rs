@@ -600,3 +600,27 @@ pub(super) fn close(ctx: &mut Ctx, regs: &mut [NanBox], iter: Reg) -> Result<(),
     };
     with_host(ctx, |h| h.iter_close(it)).unwrap_or(Err(HostError::Fault))
 }
+
+/// Whether `IteratorClose` of a built-in `%ArrayIterator%` left unfinished
+/// would call nothing (no `return` reachable from
+/// `%ArrayIteratorPrototype%`), decided without running code: [`close`]'s
+/// own first test (which arms the same memo), for a caller that must know
+/// before it starts.
+pub(super) fn close_is_noop(realm: &mut Realm) -> bool {
+    if realm.array_iter_memo.close_stamp == crate::object::proto_epoch() {
+        return true;
+    }
+    let Some(proto) = realm.vm_array_iter().iter_proto else {
+        return false;
+    };
+    match plain_lookup_cached(realm, SLOT_RETURN, proto, "return") {
+        Some(None) => {
+            if let Some(None) = realm.watch_get_chain(proto, "return") {
+                realm.array_iter_memo.close_stamp = crate::object::proto_epoch();
+            }
+            true
+        }
+        Some(Some(v)) => v.is_undefined() || v.is_null(),
+        None => false,
+    }
+}
