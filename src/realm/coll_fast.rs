@@ -107,19 +107,18 @@ impl Realm {
         a: NanBox,
         b: NanBox,
     ) -> Option<NanBox> {
-        self.coll_fast_of(h, op, a, b, false)
+        self.coll_fast_of::<false>(h, op, a, b)
     }
 
-    /// [`coll_fast`](Self::coll_fast) on a strong (`weak` false) or weak
-    /// collection.
+    /// [`coll_fast`](Self::coll_fast) on a strong (`WEAK` false) or weak
+    /// collection (one copy each).
     #[inline(always)]
-    fn coll_fast_of(
+    fn coll_fast_of<const WEAK: bool>(
         &mut self,
         h: Handle,
         op: CollOp,
         a: NanBox,
         b: NanBox,
-        weak: bool,
     ) -> Option<NanBox> {
         let lean = lean_enabled();
         // One read of the cell: its kind, and for a collection with a hash
@@ -132,7 +131,7 @@ impl Realm {
                 index,
                 entries,
                 ..
-            } if *is_set == op.on_set() && *is_weak == weak => {
+            } if *is_set == op.on_set() && *is_weak == WEAK => {
                 // The entry the last lookup found, when it is this
                 // collection's entry for this key (see `Realm::coll_hint`).
                 let hinted = (lean
@@ -300,7 +299,7 @@ impl Realm {
         a: NanBox,
         b: NanBox,
     ) -> Option<NanBox> {
-        self.coll_fast_of(h, op, a, b, true)
+        self.coll_fast_of::<true>(h, op, a, b)
     }
 
     /// `WeakRef.prototype.deref()` on `h`: its target when `h` is a WeakRef
