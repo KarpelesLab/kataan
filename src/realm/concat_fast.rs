@@ -103,17 +103,41 @@ impl Realm {
     #[inline]
     pub(crate) fn add_fast(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
         match (a.as_handle(), b.as_handle()) {
-            (Some(_), Some(_)) => self.add_str_str(a, b),
+            (Some(x), Some(y)) => match self.str_memo_hit(x, y) {
+                Some(v) => Some(v),
+                None => self.add_str_str(a, b),
+            },
             (Some(_), None) | (None, Some(_)) => self.add_str_int(a, b),
             (None, None) => None,
         }
+    }
+
+    /// [`add_str_str`](Self::add_str_str)'s memo hit for the operands'
+    /// handle bits `x`, `y` (see there), in its caller's line: a few
+    /// compares and no frame. `None` (the memo untouched) for anything else.
+    #[inline(always)]
+    fn str_memo_hit(&mut self, x: u64, y: u64) -> Option<NanBox> {
+        if self.jit_marking {
+            return None;
+        }
+        let epoch = self.heap.epoch();
+        let m = self.str_str_memo.as_deref_mut()?;
+        if m.credit <= 0 || m.epoch != epoch {
+            return None;
+        }
+        let [ms, mk, mr] = m.ents[memo_index(x, y)];
+        if ms != x || mk != y || mr == 0 {
+            return None;
+        }
+        m.credit = (m.credit + CREDIT_HIT).min(CREDIT_MAX);
+        Some(NanBox::from_bits(mr))
     }
 
     /// `a + b` for two plain string cells (no auxiliary object, which may
     /// carry a function marker): their concatenation, in one step. `None`,
     /// having done nothing, for any other operands or a result past the
     /// maximum string length (the general `+` then runs, and throws).
-    #[inline]
+    #[inline(never)]
     pub(crate) fn add_str_str(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
         let (x, y) = (a.as_handle()?, b.as_handle()?);
         // Two short texts joined into one node: a recent join of the very
