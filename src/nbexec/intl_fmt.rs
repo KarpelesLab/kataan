@@ -309,31 +309,54 @@ pub(crate) struct CollatorParams {
     alternate: intl::unicode::collate::AlternateHandling,
     /// The resolved locale's CLDR tailoring, when it serves these settings.
     tailoring: Option<alloc::rc::Rc<intl::unicode::collate::Tailoring>>,
+    /// The sort keys made so far, by string ([`CollatorParams::key`]).
+    keys: core::cell::RefCell<alloc::collections::BTreeMap<String, alloc::rc::Rc<[u16]>>>,
 }
 
 #[cfg(feature = "intl")]
 impl CollatorParams {
-    /// The ordering of `a` and `b` (see `Interp::collator_ordering`).
+    /// The ordering of `a` and `b` (see `Interp::collator_ordering`): the
+    /// order of their sort keys, which is how the crate's collators compare.
     fn compare(&self, a: &str, b: &str) -> core::cmp::Ordering {
-        use intl::unicode::collate::Collator;
-        let (swapped_a, swapped_b);
-        let (a, b) = if self.upper_first {
-            swapped_a = swap_letter_case(a);
-            swapped_b = swap_letter_case(b);
-            (swapped_a.as_str(), swapped_b.as_str())
-        } else {
-            (a, b)
-        };
-        if let Some(t) = &self.tailoring {
-            return t.compare(a, b);
+        self.key(a).cmp(&self.key(b))
+    }
+
+    /// The sort key of `s` under these settings, remembered (a sort compares
+    /// each element `O(log n)` times, and building a key — normalization,
+    /// collation-element lookup — dwarfs the comparison of two keys).
+    fn key(&self, s: &str) -> alloc::rc::Rc<[u16]> {
+        if let Some(k) = self.keys.borrow().get(s) {
+            return alloc::rc::Rc::clone(k);
         }
-        Collator::new(self.alternate)
-            .with_strength(self.strength)
-            .with_case_level(self.case_level)
-            .with_numeric(self.numeric)
-            .compare(a, b)
+        use intl::unicode::collate::Collator;
+        let swapped;
+        let t = if self.upper_first {
+            swapped = swap_letter_case(s);
+            swapped.as_str()
+        } else {
+            s
+        };
+        let key: alloc::rc::Rc<[u16]> = match &self.tailoring {
+            Some(tl) => tl.sort_key(t).into(),
+            None => Collator::new(self.alternate)
+                .with_strength(self.strength)
+                .with_case_level(self.case_level)
+                .with_numeric(self.numeric)
+                .sort_key(t)
+                .into(),
+        };
+        let mut keys = self.keys.borrow_mut();
+        if keys.len() >= COLLATOR_KEY_MEMO {
+            keys.clear();
+        }
+        keys.insert(String::from(s), alloc::rc::Rc::clone(&key));
+        key
     }
 }
+
+/// How many sort keys a [`CollatorParams`] remembers before starting over.
+#[cfg(feature = "intl")]
+const COLLATOR_KEY_MEMO: usize = 4096;
 
 /// The CLDR collation tailoring for a resolved locale tag, memoized.
 ///
@@ -5882,7 +5905,25 @@ impl Interp {
         a: &str,
         b: &str,
     ) -> core::cmp::Ordering {
-        self.collator_params(ch).compare(a, b)
+        // A collator's resolved slots are fixed once it is initialized, and a
+        // handle names one object for good (a freed slot's next tenant has
+        // another generation): its settings, and the sort keys they made, are
+        // kept for the last few collators used.
+        let Some(raw) = ch.map(Handle::to_raw) else {
+            return self.collator_params(ch).compare(a, b);
+        };
+        let params = match self.collator_memo.iter().find(|(r, _)| *r == raw) {
+            Some((_, p)) => alloc::rc::Rc::clone(p),
+            None => {
+                let p = alloc::rc::Rc::new(self.collator_params(ch));
+                if self.collator_memo.len() >= 4 {
+                    self.collator_memo.remove(0);
+                }
+                self.collator_memo.push((raw, alloc::rc::Rc::clone(&p)));
+                p
+            }
+        };
+        params.compare(a, b)
     }
 
     /// `String.prototype.localeCompare(that)` with `locales` and `options`
@@ -5998,6 +6039,7 @@ impl Interp {
             upper_first,
             alternate,
             tailoring,
+            keys: Default::default(),
         }
     }
 

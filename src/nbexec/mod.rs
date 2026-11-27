@@ -217,6 +217,10 @@ pub struct Interp {
     /// locales and no options (`default_locale_compare`), once made.
     #[cfg(feature = "intl")]
     default_collator: Option<alloc::rc::Rc<intl_fmt::CollatorParams>>,
+    /// The settings of the last few collators compared with, by handle
+    /// (`Interp::collator_ordering`).
+    #[cfg(feature = "intl")]
+    collator_memo: alloc::vec::Vec<(u64, alloc::rc::Rc<intl_fmt::CollatorParams>)>,
     /// Intrinsic `Temporal.<Type>.prototype` handles, indexed by `TemporalKind`.
     temporal_protos: Vec<Option<Handle>>,
     /// Whether `new.target` is lexically in scope at the current execution point —
@@ -3122,6 +3126,8 @@ impl Interp {
             builtin_iter_protos: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "intl")]
             default_collator: None,
+            #[cfg(feature = "intl")]
+            collator_memo: alloc::vec::Vec::new(),
             temporal_protos: Vec::new(),
             new_target_in_scope: false,
             super_call_in_scope: false,
