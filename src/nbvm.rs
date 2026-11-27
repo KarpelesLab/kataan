@@ -13445,6 +13445,30 @@ fn vm_get_elem_from(
     own_done: bool,
     regs: Option<&[NanBox]>,
 ) -> Result<NanBox, VmError> {
+    // A Symbol key over an ordinary chain (`o[sym]`): the chain walk by its
+    // storage key, built without an allocation; a data property, nothing,
+    // or a getter that is a VM function (called with the receiver).
+    if let (Some(kh), Some(h)) = (key.as_handle(), recv.as_handle())
+        && let Some(id) = ctx.realm.symbol_id(Handle::from_raw(kh))
+    {
+        let mut buf = [0u8; 32];
+        let ks = crate::shape::symbol_key_in(id, &mut buf);
+        match ctx
+            .realm
+            .ordinary_chain_get(Handle::from_raw(h), ks)
+            .map(|x| x.0)
+        {
+            Some(crate::realm::ChainHit::Data(v)) => return Ok(v),
+            Some(crate::realm::ChainHit::Absent) => return Ok(NanBox::undefined()),
+            Some(crate::realm::ChainHit::Accessor(g, _, _))
+                if g.as_handle()
+                    .is_some_and(|gh| ctx.realm.is_vm_function(Handle::from_raw(gh))) =>
+            {
+                return call_closure_pub(ctx, funcs, regs, g, &[], recv);
+            }
+            _ => {}
+        }
+    }
     // A present element of a plain dense array: nothing can intercept it.
     if let (Some(h), Some(n)) = (recv.as_handle(), key.as_number())
         && let Some(v) = ctx.realm.plain_array_get(Handle::from_raw(h), n)

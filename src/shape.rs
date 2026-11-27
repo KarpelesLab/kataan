@@ -319,6 +319,28 @@ pub fn symbol_key(id: u64) -> alloc::string::String {
     s
 }
 
+/// [`symbol_key`] written into `buf` (no allocation): the key as a `&str`
+/// borrowed from it.
+#[must_use]
+pub fn symbol_key_in(id: u64, buf: &mut [u8; 32]) -> &str {
+    let p = SYMBOL_KEY_PREFIX.as_bytes();
+    buf[..p.len()].copy_from_slice(p);
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut n = id;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let len = p.len() + digits.len() - i;
+    buf[p.len()..len].copy_from_slice(&digits[i..]);
+    core::str::from_utf8(&buf[..len]).unwrap_or(SYMBOL_KEY_PREFIX)
+}
+
 /// The `brands` bit recording that a layout holds at least one Symbol key
 /// ([`SYMBOL_KEY_PREFIX`]), so the collector's symbol-liveness scan can skip
 /// every object whose layout has none without walking its keys. Kept clear of
