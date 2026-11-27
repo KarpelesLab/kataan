@@ -889,6 +889,26 @@ impl Rope {
         self.concat_with(other, true)
     }
 
+    /// Whether [`try_concat_small`](Self::try_concat_small) of `self` and
+    /// `other` joins them (both texts held in their nodes, the join fitting
+    /// one), without building anything.
+    #[must_use]
+    #[inline]
+    pub fn small_join_fits(&self, other: &Rope) -> bool {
+        match (&*self.0, &*other.0) {
+            (
+                Node::Small { len: la, .. },
+                Node::Small {
+                    len: lb, buf: bb, ..
+                },
+            ) => {
+                let (la, lb) = (usize::from(*la), usize::from(*lb));
+                la + lb <= SMALL_CAP && lb <= 32 && bb[0] != 0xED
+            }
+            _ => false,
+        }
+    }
+
     /// [`try_concat`](Self::try_concat) of two texts held in their nodes
     /// whose join fits one (and is at most 32 bytes per side): written
     /// straight into one new inline node, its UTF-16 length the sum of

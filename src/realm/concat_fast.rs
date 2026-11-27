@@ -65,6 +65,21 @@ fn memo_index(s: u64, key: u64) -> usize {
     (h >> (64 - MEMO_LEN.trailing_zeros())) as usize
 }
 
+/// Whether `+` of two short strings may hand out a recent equal result
+/// ([`Realm::add_str_str`]): `KATAAN_STR_MEMO=0` turns it off; read once per
+/// process.
+fn str_memo_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("KATAAN_STR_MEMO").is_none_or(|v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether `+` of two short strings held in their rope nodes joins them in
 /// one step (`Rope::try_concat_small`): `KATAAN_SMALL_JOIN=0` turns it off;
 /// read once per process.
@@ -107,16 +122,81 @@ impl Realm {
         {
             return None;
         }
-        let small = if small_join_enabled() {
-            ra.try_concat_small(rb)
-        } else {
-            None
-        };
-        let joined = match small {
-            Some(j) => j,
-            None => ra.try_concat(rb)?,
-        };
+        // Two short texts joined into one node: a recent join of the very
+        // same two cells is handed out again (`str_str_memo`, the
+        // `StrIntMemo` scheme keyed by both operands' handle bits), so a
+        // loop assembling the same few short strings piece by piece
+        // (`name += String.fromCharCode(c)`, each piece an interned unit
+        // string and each prefix then itself a memoized result) allocates
+        // nothing. Not while a string cell may carry an auxiliary object
+        // (`str_special`), nor during incremental marking.
+        if !small_join_enabled() || !ra.small_join_fits(rb) {
+            let joined = ra.try_concat(rb)?;
+            return Some(NanBox::handle(self.heap.alloc(Cell::Str(joined)).to_raw()));
+        }
+        let memo = !self.str_special && !self.jit_marking && str_memo_enabled();
+        let slot = memo_index(x, y);
+        let epoch = self.heap.epoch();
+        if memo && let Some(m) = self.str_str_memo.as_deref_mut() {
+            if m.credit > 0 {
+                if m.epoch == epoch {
+                    let [ms, mk, mr] = m.ents[slot];
+                    if ms == x && mk == y && mr != 0 {
+                        m.credit = (m.credit + CREDIT_HIT).min(CREDIT_MAX);
+                        return Some(NanBox::from_bits(mr));
+                    }
+                }
+                m.credit -= 1;
+            } else {
+                m.paused += 1;
+                if m.paused >= PAUSE {
+                    m.paused = 0;
+                    m.credit = CREDIT_START;
+                }
+                return self.add_small_join(a, b);
+            }
+        }
+        let v = self.add_small_join(a, b)?;
+        if memo {
+            let m = match self.str_str_memo.as_deref_mut() {
+                Some(m) => m,
+                None => self.str_str_memo.insert(Self::new_str_memo(epoch)),
+            };
+            if m.epoch != epoch {
+                m.ents = [[0; 3]; MEMO_LEN];
+                m.epoch = epoch;
+            }
+            m.ents[slot] = [x, y, v.to_bits()];
+        }
+        Some(v)
+    }
+
+    /// The small join of the string cells `a` and `b` (which
+    /// `Rope::small_join_fits`), in a new cell.
+    #[inline]
+    fn add_small_join(&mut self, a: NanBox, b: NanBox) -> Option<NanBox> {
+        let ra = self
+            .heap
+            .get_hot(Handle::from_raw(a.as_handle()?))?
+            .as_str()?;
+        let rb = self
+            .heap
+            .get_hot(Handle::from_raw(b.as_handle()?))?
+            .as_str()?;
+        let joined = ra.try_concat_small(rb)?;
         Some(NanBox::handle(self.heap.alloc(Cell::Str(joined)).to_raw()))
+    }
+
+    /// An empty memo for [`Realm::add_str_str`].
+    #[cold]
+    #[inline(never)]
+    fn new_str_memo(epoch: u32) -> alloc::boxed::Box<StrIntMemo> {
+        alloc::boxed::Box::new(StrIntMemo {
+            epoch,
+            credit: CREDIT_START,
+            paused: 0,
+            ents: [[0; 3]; MEMO_LEN],
+        })
     }
 
     /// `a + b` when one operand is a string cell whose `typeof` is `"string"`
