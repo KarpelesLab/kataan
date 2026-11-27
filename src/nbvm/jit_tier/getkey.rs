@@ -41,6 +41,7 @@ fn probe(ctx: &Ctx, recv: u64, key: u64) -> Option<Result<NanBox, NanBox>> {
     }
 }
 
+jit_extern! {
 /// `recv[key]` for compiled code that can call a getter itself: `*out`
 /// (the frame's method scratch slot) is set to the VM-function getter to
 /// call with the receiver as `this`, or to `0` when the result is the
@@ -48,7 +49,7 @@ fn probe(ctx: &Ctx, recv: u64, key: u64) -> Option<Result<NanBox, NanBox>> {
 ///
 /// # Safety
 /// As `jit_helper_get_elem`; `out` is a slot of the caller's native frame.
-pub(crate) extern "sysv64" fn jit_helper_get_elem_acc(
+pub(crate) fn jit_helper_get_elem_acc(
     ctx_raw: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -78,7 +79,9 @@ pub(crate) extern "sysv64" fn jit_helper_get_elem_acc(
     }
     v
 }
+}
 
+jit_extern! {
 /// `recv[key]` where compiled code's call of the getter
 /// [`jit_helper_get_elem_acc`] found could not be made: the op's call site
 /// is filled for that getter and the read made here, its getter called
@@ -87,7 +90,7 @@ pub(crate) extern "sysv64" fn jit_helper_get_elem_acc(
 /// # Safety
 /// As `jit_helper_get_elem`; `site` is the op's own call site, owned by
 /// the calling `JitProto` and not otherwise borrowed while this runs.
-pub(crate) extern "sysv64" fn jit_helper_get_elem_site(
+pub(crate) fn jit_helper_get_elem_site(
     ctx_raw: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -122,4 +125,5 @@ pub(crate) extern "sysv64" fn jit_helper_get_elem_site(
             NanBox::jit_throw_bits()
         }
     }
+}
 }

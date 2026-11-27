@@ -8,6 +8,7 @@ use crate::heap::Handle;
 use crate::jit::DeoptInfo;
 use crate::jit::sink::{MatObj, SinkExits};
 
+jit_extern! {
 /// A deoptimization exit (`crate::jit::GenericHelpers::deopt`): the
 /// activation whose `n_regs`-word window is `regs` leaves its compiled body
 /// at body pc `at` (low 32 bits) with `at >> 32` inlined activations
@@ -27,7 +28,7 @@ use crate::jit::sink::{MatObj, SinkExits};
 /// `ctx` must be the live, otherwise-unborrowed `Ctx` the body was entered
 /// with, `regs` the activation's window and `info` the body's record (alive
 /// while its code runs).
-pub(crate) extern "sysv64" fn jit_helper_deopt(
+pub(crate) fn jit_helper_deopt(
     ctx: *mut core::ffi::c_void,
     regs: *mut u64,
     n_regs: usize,
@@ -182,6 +183,7 @@ pub(crate) extern "sysv64" fn jit_helper_deopt(
         Some(Ok(_)) | None => throw(ctx, VmError::Unsupported),
         Some(Err(e)) => throw(ctx, e),
     }
+}
 }
 
 /// Runs `program` (a prefix of a spliced body, ending at an inlined body's
@@ -440,6 +442,7 @@ fn retire_sinking(ctx: &mut Ctx, funcs: &[FnProto], info: &DeoptInfo) {
     }
 }
 
+jit_extern! {
 /// `Op::GetMethod`'s slow path on a sunk object's stand-in
 /// (`crate::jit::sink`: the prototype the object would have, whose own
 /// properties are the object's inherited ones): the property, through the
@@ -451,7 +454,7 @@ fn retire_sinking(ctx: &mut Ctx, funcs: &[FnProto], info: &DeoptInfo) {
 ///
 /// # Safety
 /// As `jit_helper_get_method_site`.
-pub(crate) extern "sysv64" fn jit_helper_get_virtual(
+pub(crate) fn jit_helper_get_virtual(
     ctx_raw: *mut core::ffi::c_void,
     obj: u64,
     site: *mut crate::jit::MethodSite,
@@ -485,4 +488,5 @@ pub(crate) extern "sysv64" fn jit_helper_get_virtual(
         }
     }
     super::jit_helper_get_method_site(ctx_raw, obj, site, call)
+}
 }

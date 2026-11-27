@@ -31,7 +31,7 @@ pub struct LitCells {
     registered: core::cell::Cell<bool>,
 }
 
-#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+#[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
 impl LitCells {
     /// `n` empty words.
     pub(crate) fn new(n: usize) -> Self {
@@ -56,7 +56,7 @@ impl LitCells {
     }
 }
 
-#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+#[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
 impl Realm {
     /// The value of literal site `i` of `cells` whose text is `text`: the
     /// literal's String (`new_literal_string`), now also kept in word `i`

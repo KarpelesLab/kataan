@@ -9,7 +9,7 @@
 //! search over the literals sorted by length and bytes instead of one
 //! comparison per case.
 
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 use super::text_memo::TEXT_MAX;
 use super::text_memo::Text;
 use super::{Cell, NanBox, Realm, rope_bytes};
@@ -72,7 +72,7 @@ impl Default for SwitchMemo {
 /// hash's multiplier ([`switch_hash`]), whose top five bits are the first way
 /// and the next five the second. (A text longer than any way holds,
 /// `text_memo::TEXT_MAX`, matches no way's length.)
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SwitchMemoLayout {
     pub(crate) words: i32,
@@ -83,7 +83,7 @@ pub(crate) struct SwitchMemoLayout {
 }
 
 /// Derives [`SwitchMemoLayout`].
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[must_use]
 pub(crate) fn jit_switch_memo_layout() -> SwitchMemoLayout {
     use core::mem::{offset_of, size_of};

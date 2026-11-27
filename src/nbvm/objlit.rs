@@ -50,10 +50,10 @@ pub struct LitShapeCache {
 
 impl LitShapeCache {
     /// The byte offset of the root shape's `Rc` pointer.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) const ROOT_OFF: i32 = 0;
     /// The byte offset of the literal's shape's `Rc` pointer.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) const SHAPE_OFF: i32 = core::mem::size_of::<usize>() as i32;
 
     /// `(root, shape)` when armed (clones; the cache keeps its own).

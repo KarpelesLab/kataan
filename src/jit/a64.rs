@@ -22,6 +22,16 @@
 //! stays in the interpreter (or a lower tier): a partial port is always
 //! correct, only slower.
 //!
+//! State of the port: the Int and Float tiers are complete
+//! (`a64_numeric`). The generic tier starts as a *baseline* body compiled
+//! straight from the bytecode (`a64_generic`): the same frame ABI, entries,
+//! polls, handlers and suspensions as the x86-64 body, with branches,
+//! moves, constants and the Number fast paths of arithmetic and compares
+//! inline, and every other op handed to the interpreter on the shared
+//! register file (`jit_helper_exec_op`). Its ops gain inline fast paths one
+//! at a time (property access through the inline caches next), and it is
+//! opt-in (`KATAAN_JIT_A64GEN=1`) until those make it pay.
+//!
 //! # Encoding notes
 //!
 //! Every instruction is one little-endian 32-bit word. Register number 31 is

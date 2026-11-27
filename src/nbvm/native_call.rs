@@ -306,7 +306,7 @@ impl NativeSite {
 
 /// The bits of `%Function.prototype.call%` when the site `cache` resolved
 /// its method to it (as [`try_call`] serves it).
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 pub(super) fn fn_call_method(cache: &PropertyCache) -> Option<u64> {
     cache
         .native
@@ -550,7 +550,7 @@ fn length_arg(v: NanBox) -> Option<usize> {
 /// re-resolves or retires the site).
 /// The resumption mode and method of a site whose built-in is a generator's
 /// `next` / `throw` / `return` (`FastOp::GenResume`).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[inline]
 pub(super) fn gen_resume_site(cache: &PropertyCache) -> Option<(u8, u64)> {
     match cache.native.as_deref() {
@@ -564,7 +564,7 @@ pub(super) fn gen_resume_site(cache: &PropertyCache) -> Option<(u8, u64)> {
 }
 
 /// [`gen_resume_site`]'s mode.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[inline]
 pub(super) fn gen_resume_mode(cache: &PropertyCache) -> Option<u8> {
     gen_resume_site(cache).map(|(m, _)| m)
@@ -587,7 +587,7 @@ pub(super) fn is_native_site(cache: &PropertyCache) -> bool {
 /// calls do: any call op inlined is compiled with its full slow path.
 /// `false` when neither knows anything (a copy of the function, whose tier
 /// state starts empty).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn no_script_callee(proto: &FnProto, pc: usize) -> bool {
     use crate::ic::CalleeHint;
     let mut known = false;
@@ -716,10 +716,10 @@ pub(super) fn try_call(
             .first()
             .map_or(NanBox::undefined(), |r| regs[*r as usize]);
         // (Compiled code's register window is a GC root already.)
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         let rooted =
             from_jit && super::gen_fast::jit_site_on() && super::jit_tier::window_rooted(ctx);
-        #[cfg(not(all(feature = "jit", jit_x64)))]
+        #[cfg(not(all(feature = "jit", jit_native)))]
         let rooted = {
             let _ = from_jit;
             false
@@ -809,7 +809,7 @@ pub(super) fn try_call(
 /// What compiled code's inline `s.charCodeAt(i)` relies on, for `site`: the
 /// method a plain string's lookup finds, an own data property of
 /// `%String.prototype%`, is the built-in (`MethodSite::set_str_proof`).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_char_code_at(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
     // (`%String.prototype%` is a String wrapper, whose string only owns
     // indices and `length`.)
@@ -822,7 +822,7 @@ pub(super) fn prove_char_code_at(realm: &mut Realm, site: &mut crate::jit::Metho
 /// finds (`plain_recv_lookup_start`: an own data property of the realm's
 /// first `%Array.prototype%`) is the built-in `push` (as
 /// [`prove_char_code_at`]).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_array_push(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
     // (`%Array.prototype%` is an array, whose named properties are its
     // auxiliary object's: the object watched and read here. An array keeps
@@ -842,7 +842,7 @@ pub(super) fn prove_array_push(realm: &mut Realm, site: &mut crate::jit::MethodS
 /// collection `recv` (`crate::jit::coll`): the proof
 /// that a collection of `recv`'s kind with the default `[[Prototype]]`
 /// finds the built-in. Whether it was made.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_coll(
     realm: &mut Realm,
     site: &mut crate::jit::MethodSite,
@@ -868,7 +868,7 @@ pub(super) fn prove_coll(
 /// and the view `recv` (`crate::jit::dataview`): its memo of the view, whose
 /// method the lookup proves the built-in accessor `acc`. Whether it was
 /// filled.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_dataview(
     realm: &mut Realm,
     site: &mut crate::jit::MethodSite,
@@ -884,7 +884,7 @@ pub(super) fn prove_dataview(
 /// What compiled code's direct call of an array higher-order built-in
 /// relies on (`jit_tier::jit_helper_hof_call`), for `site`: as
 /// [`prove_array_push`], of the built-in the site's key names.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_array_hof(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
     let start = realm
         .root_array_proto()
@@ -901,7 +901,7 @@ pub(super) fn prove_array_hof(realm: &mut Realm, site: &mut crate::jit::MethodSi
 
 /// What compiled code's inline `a.pop()` relies on, for `site`: as
 /// [`prove_array_push`], of the built-in `pop`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_array_pop(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
     let start = realm
         .root_array_proto()
@@ -946,7 +946,7 @@ fn ascii_case_enabled() -> bool {
 /// [`str_call`] (`crate::jit`'s direct string call): each a [`run_op`]
 /// string op that runs no code (it declines whatever input could). The
 /// code of `key`, or `None`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn str_call_code(key: &str) -> Option<u8> {
     Some(match key {
         "indexOf" => 1,
@@ -973,7 +973,7 @@ pub(crate) fn str_call_code(key: &str) -> Option<u8> {
 }
 
 /// The op of a [`str_call_code`].
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn str_call_op(code: u8) -> Option<FastOp> {
     Some(match code {
         1 => FastOp::StrIndexOf,
@@ -1003,7 +1003,7 @@ fn str_call_op(code: u8) -> Option<FastOp> {
 /// key has a [`str_call_code`]): as [`prove_char_code_at`], of that
 /// built-in. Whether it was made (the site's key one and the method
 /// found).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_str_method(realm: &mut Realm, site: &mut crate::jit::MethodSite) -> bool {
     let Some(want) = str_call_code(site.key()).and_then(str_call_op) else {
         return false;
@@ -1018,7 +1018,7 @@ pub(super) fn prove_str_method(realm: &mut Realm, site: &mut crate::jit::MethodS
 /// a plain string cell whose lookup of the key the site proved finds the
 /// built-in `method` (`code`'s, [`str_call_code`]): that op's answer
 /// ([`run_op`]), or `None`, having done nothing, for the general call.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn str_call(
     ctx: &mut Ctx,
     funcs: &[FnProto],
@@ -1085,12 +1085,12 @@ pub(super) fn str_call(
 /// pristine RegExp — which hands the object to no code and gives it no
 /// property — nothing can reach it, and it goes back to the realm's lending
 /// pool (`Realm::regexp_lend_return`).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) const STR_CALL_LENT: u8 = 0x80;
 
 /// What compiled code's inline `a.shift()` relies on, for `site`: as
 /// [`prove_array_push`], of the built-in `shift`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn prove_array_shift(realm: &mut Realm, site: &mut crate::jit::MethodSite) {
     let start = realm
         .root_array_proto()
@@ -1104,7 +1104,7 @@ pub(super) fn prove_array_shift(realm: &mut Realm, site: &mut crate::jit::Method
 /// The proof of [`prove_char_code_at`] / [`prove_array_push`]: `key` is a
 /// data property of the ordinary object `start` (watched), the built-in
 /// `want`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn prove_proto_method(
     realm: &mut Realm,
     site: &mut crate::jit::MethodSite,
@@ -2020,7 +2020,7 @@ fn run_op(
             }
             // A callee with a compiled body is entered directly, as a
             // compiled caller's `f(...)` enters it.
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             if let Some(r) =
                 super::jit_tier::call_compiled_with(ctx, funcs, Some(regs), recv, this, &argv)
             {
@@ -2548,14 +2548,14 @@ pub(super) fn try_call_value(realm: &mut Realm, f: NanBox, args: &[NanBox]) -> O
 /// Whether the method value `v` is the built-in a direct call site of kind
 /// `kind` (`crate::jit::direct_call`) serves: what its proof
 /// (`MethodSite::fill_direct`) records.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn direct_proves(realm: &Realm, v: NanBox, kind: u8) -> bool {
     kind != 0 && direct_kind(realm, v) == kind
 }
 
 /// The direct kind (`crate::jit::direct_call`) of the function value `v`,
 /// or `0` when it is none of those built-ins.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn direct_kind(realm: &Realm, v: NanBox) -> u8 {
     use crate::jit::direct_call as d;
     match classify(realm, v) {
@@ -2584,7 +2584,7 @@ pub(super) fn direct_kind(realm: &Realm, v: NanBox) -> u8 {
 /// built-in's answer for them runs no code, allocates nothing and cannot
 /// throw; `None`, having done nothing, for anything else (the site's general
 /// call then makes it).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn direct_run(realm: &mut Realm, kind: u8, a0: NanBox, a1: NanBox) -> Option<NanBox> {
     use crate::jit::direct_call as d;
     match kind {

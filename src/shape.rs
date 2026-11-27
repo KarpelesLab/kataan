@@ -381,7 +381,7 @@ impl Shape {
 
     /// The byte offset of the brand bits within a `Shape` (read by compiled
     /// code: bit 0 is [`is_wrapper`](Self::is_wrapper)).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn brands_offset() -> usize {
         core::mem::offset_of!(Shape, brands)
@@ -389,7 +389,7 @@ impl Shape {
 
     /// The byte offset of the [`any`](Self::may_be_non_number) slot mask (a
     /// `u64`) within a `Shape`, read by compiled code.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn any_offset() -> usize {
         core::mem::offset_of!(Shape, any)
@@ -491,7 +491,7 @@ impl Shape {
 
     /// The byte offset of [`first`](Self::first)'s word within a [`Shape`],
     /// read by compiled code (`jit::poly`'s prefix way).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) fn first_offset() -> usize {
         core::mem::offset_of!(Shape, first)
     }
@@ -526,7 +526,7 @@ impl Shape {
     /// The byte offset of the `parent` link (an `Option<Rc<Shape>>`, one
     /// nullable pointer word) within a [`Shape`], for compiled code's
     /// transition check.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) fn parent_offset() -> usize {
         core::mem::offset_of!(Shape, parent)
     }

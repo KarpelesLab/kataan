@@ -48,7 +48,7 @@ use alloc::vec::Vec;
 /// stack (a GC root already) is not published again, a present dense
 /// element is read once (no absent-run probe first), and a compiled
 /// callback keeps a few captures in place (`jit_tier::CompiledCallback`).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn lean_on() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -56,7 +56,7 @@ pub(super) fn lean_on() -> bool {
 }
 
 /// See the JIT build's.
-#[cfg(not(all(feature = "jit", jit_x64)))]
+#[cfg(not(all(feature = "jit", jit_native)))]
 #[inline]
 pub(super) fn lean_on() -> bool {
     false
@@ -80,14 +80,14 @@ pub(crate) enum Hof {
 }
 
 /// `op`'s code for compiled code's direct call (`jit_tier::jit_helper_hof_call`).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[must_use]
 pub(crate) fn hof_code(op: Hof) -> usize {
     op as usize
 }
 
 /// The built-in of a [`hof_code`].
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(super) fn hof_of_code(code: usize) -> Option<Hof> {
     const ALL: [Hof; 12] = [
         Hof::ForEach,
@@ -312,9 +312,9 @@ pub(super) fn run(
     // Publish the caller's registers (unless they are a GC root already)
     // and everything the loop holds.
     let mark = ctx.frame_shadow.len();
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     let rooted = lean_on() && super::jit_tier::on_register_stack(ctx, regs);
-    #[cfg(not(all(feature = "jit", jit_x64)))]
+    #[cfg(not(all(feature = "jit", jit_native)))]
     let rooted = false;
     if !rooted {
         ctx.frame_shadow.extend_from_slice(regs);
@@ -475,26 +475,26 @@ pub(super) struct Callee<'f> {
     cb: NanBox,
     /// The callback's function, when it is one of `funcs` and callable (not a
     /// class constructor): the candidate for the direct compiled calls.
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     proto: Option<&'f FnProto>,
     /// The prepared direct call into its compiled generic body, once it has one.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     compiled: Option<super::jit_tier::CompiledCallback>,
     /// Its Int/Float-tier code, once it has some (`jit_tier::unboxed_target`).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     unboxed: Option<alloc::rc::Rc<crate::jit::JitProto>>,
     /// Calls that found no compiled body to enter; past [`COMPILED_MISS_LIMIT`]
     /// the loop stops looking (a callee that has not compiled by then — the
     /// tier-up threshold is a handful of calls — will not).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     misses: u32,
     /// `proto`'s parameter count: the arguments an unboxed tier is called with.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     n_params: usize,
 }
 
 /// See [`Callee::misses`].
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 const COMPILED_MISS_LIMIT: u32 = 64;
 
 impl<'f> Callee<'f> {
@@ -508,13 +508,13 @@ impl<'f> Callee<'f> {
             funcs,
             cb,
             proto,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             compiled: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             unboxed: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             misses: 0,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             n_params: proto.map_or(0, |p| p.n_params),
         }
     }
@@ -531,7 +531,7 @@ impl<'f> Callee<'f> {
         args: &[NanBox],
         this: NanBox,
     ) -> Result<NanBox, VmError> {
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         {
             if let Some(c) = &mut self.compiled {
                 return c.call(ctx, self.funcs, this, args);
@@ -546,7 +546,7 @@ impl<'f> Callee<'f> {
     /// The resolved Int/Float-tier call of [`Self::invoke`]: `None` when there
     /// is none (yet), the depth limit is reached, or its guard declines these
     /// arguments.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[inline(always)]
     fn unboxed_call(&self, ctx: &Ctx, args: &[NanBox]) -> Option<NanBox> {
         let j = self.unboxed.as_ref()?;
@@ -561,7 +561,7 @@ impl<'f> Callee<'f> {
     /// The callee's Int/Float-tier code when it is resolved and may be called
     /// right now (the depth limits, which no such call changes, not reached),
     /// with its parameter count: what a loop needs to call it directly.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[inline]
     fn unboxed_ready(&self, ctx: &Ctx) -> Option<(alloc::rc::Rc<crate::jit::JitProto>, usize)> {
         let j = self.unboxed.as_ref()?;
@@ -579,7 +579,7 @@ impl<'f> Callee<'f> {
         args: &[NanBox],
         this: NanBox,
     ) -> Result<NanBox, VmError> {
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if let Some(proto) = self.proto
             && self.compiled.is_none()
             && self.unboxed.is_none()
@@ -712,7 +712,7 @@ impl Loop<'_> {
             // A callee on an unboxed tier runs as many elements as it can
             // straight off the dense storage, then (if any are left) the
             // element it stopped at takes the ordinary step below.
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             if !backwards && let Some((j, np)) = self.callee.unboxed_ready(ctx) {
                 let (next, done) = self.unboxed_run(ctx, &j, np, n, len, op);
                 if let Some(r) = done {
@@ -812,7 +812,7 @@ impl Loop<'_> {
     /// nothing can change the array between steps and its storage is read in
     /// place. Returns the first index not done, and the built-in's result if
     /// it is decided.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn unboxed_run(
         &mut self,
         ctx: &mut Ctx,
@@ -915,7 +915,7 @@ impl Loop<'_> {
             // An unboxed-tier callee (see `unboxed_run`) folds straight over
             // the dense storage while the accumulator and elements stay
             // within its guard.
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             if !right
                 && let Some((j, np)) = self.callee.unboxed_ready(ctx)
                 && np <= 4

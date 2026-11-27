@@ -84,7 +84,7 @@ impl Realm {
     /// first).
     #[must_use]
     #[inline]
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     pub(crate) fn for_in_key_value(&self, obj: NanBox, key: NanBox) -> Option<NanBox> {
         if let Some((o, slot)) = self.for_in_key_slot(obj, key) {
             return o.slot(slot);
@@ -366,7 +366,7 @@ impl Realm {
     /// String of its list on an object of the list's layout is an own key
     /// (`forin_cache`), tried first.
     #[must_use]
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     pub(crate) fn has_property_by_for_in_key(&mut self, key: NanBox, obj: NanBox) -> Option<bool> {
         if self.for_in_key_slot(obj, key).is_some() || self.for_in_dict_own_key(obj, key).is_some()
         {

@@ -84,7 +84,7 @@ impl Realm {
     /// cell borrowed mutably (through the generational barrier) while it
     /// stands is still in the remembered set, and its box still at the same
     /// address.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[inline]
     pub(crate) fn heap_epoch(&self) -> u32 {
         self.heap.epoch()
@@ -381,7 +381,7 @@ impl Realm {
     /// no code runs while one is live: `crate::jit`'s `iter_noescape`), the
     /// one object serves every call. Whether it was stored (else the caller
     /// makes a fresh one).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[inline]
     pub(crate) fn reuse_iter_result(&mut self, h: Handle, value: NanBox, done: bool) -> bool {
         let Some(shape) = self.iter_result_shape.as_ref().map(Rc::as_ptr) else {
@@ -407,7 +407,7 @@ impl Realm {
 
     /// The shape word ([`crate::jit::shape_word`]) of the iterator-result
     /// layout [`new_iter_result`](Self::new_iter_result) makes, once made.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn iter_result_shape_word(&self) -> Option<u64> {
         self.iter_result_shape.as_ref().map(crate::jit::shape_word)

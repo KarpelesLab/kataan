@@ -976,10 +976,13 @@ fn manage_shard(
             break;
         }
         // Launch the worker through `sh` so we can apply `ulimit -v` before exec.
+        // `KATAAN_T262_RUNNER`, when set, is a command prefix for the worker
+        // (as cargo's target runner is for this process): an emulator such as
+        // qemu-user when the test binary is for another architecture.
         let spawn = Command::new("sh")
             .arg("-c")
             .arg(format!(
-                "ulimit -v {MAX_ADDRESS_SPACE_KIB} 2>/dev/null; exec \"$@\""
+                "ulimit -v {MAX_ADDRESS_SPACE_KIB} 2>/dev/null; exec $KATAAN_T262_RUNNER \"$@\""
             ))
             .arg("sh") // $0 for the inner shell
             .arg(exe)

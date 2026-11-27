@@ -1022,7 +1022,7 @@ impl<'a> IntoIterator for &'a mut ArrayElems {
 /// Runtime-probed byte layout of the `Cell::Object` variant for the generic-JIT
 /// inline property-get fast path. Derived by pointer arithmetic on a real
 /// `Cell::Object` instance (never hand-baked); verified by the JIT layout test.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CellLayout {
     /// The `Cell::Object` discriminant byte value (tag at offset 0).
@@ -1052,7 +1052,7 @@ pub(crate) struct CellLayout {
 
 /// The offsets of a [`Captures`]' `Vec`, `inline_len` byte and inline
 /// values, relative to the `Captures`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_captures_offsets() -> (usize, usize, usize) {
     use core::mem::offset_of;
     (
@@ -1066,7 +1066,7 @@ pub(crate) fn jit_captures_offsets() -> (usize, usize, usize) {
 /// callee without a helper: `(discriminant, func_off, captures_off, owes_proto_off)`, the
 /// offsets relative to the `Cell` (the captures being a [`Captures`]: see
 /// [`jit_captures_offsets`] for its fields).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize, usize) {
     let cell = Cell::VmFunction {
         func: 7,
@@ -1096,7 +1096,7 @@ pub(crate) fn jit_vm_function_layout() -> (u8, usize, usize, usize) {
 
 /// The `Cell::Box` discriminant byte and the offset of its value within the
 /// `Cell` (for the generic JIT's inline binding-cell reads and writes).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_box_layout() -> (u8, usize) {
     let cell = Cell::Box(NanBox::number(1.5));
     let base = core::ptr::addr_of!(cell) as usize;
@@ -1116,7 +1116,7 @@ pub(crate) fn jit_box_layout() -> (u8, usize) {
 /// fields' offsets within the boxed [`VmFrame`] — its register file's buffer
 /// pointer and length words and its handler stack's length word found on a
 /// probe.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameCellLayout {
     /// The `Cell::Frame` discriminant byte.
@@ -1138,7 +1138,7 @@ pub(crate) struct FrameCellLayout {
 }
 
 /// The [`FrameCellLayout`], probed.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[allow(unsafe_code)]
 pub(crate) fn jit_frame_layout() -> FrameCellLayout {
     use core::mem::offset_of;
@@ -1196,7 +1196,7 @@ pub(crate) fn jit_frame_layout() -> FrameCellLayout {
 
 /// The `Cell::Native` discriminant byte and the offset of its `u16` id within
 /// the `Cell` (for the generic JIT's built-in identity check).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_native_layout() -> (u8, usize) {
     let cell = Cell::Native(0x1234);
     let base = core::ptr::addr_of!(cell) as usize;
@@ -1213,7 +1213,7 @@ pub(crate) fn jit_native_layout() -> (u8, usize) {
 /// The byte layout compiled code reads a typed-array element through
 /// (offsets relative to the `Cell`): a `Cell::TypedArray` view's fields, and
 /// the `Vec` of the `Cell::Bytes` it views when that store is `Owned`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TypedCellLayout {
     /// The `Cell::TypedArray` discriminant byte.
@@ -1242,7 +1242,7 @@ pub(crate) struct TypedCellLayout {
 
 /// Derives [`TypedCellLayout`] from real `Cell::TypedArray` and `Cell::Bytes`
 /// instances.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_typed_layout() -> TypedCellLayout {
     let (index_in_handle, gen_in_handle) = crate::heap::jit_handle_offsets();
     let view = Cell::TypedArray {
@@ -1335,7 +1335,7 @@ pub(crate) fn jit_typed_layout() -> TypedCellLayout {
 
 /// What compiled code's inline `Map`/`Set` lookup (`crate::jit::coll`)
 /// reads of a `Cell::Collection`, as offsets from the cell.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CollCellLayout {
     /// The `Cell::Collection` discriminant byte.
@@ -1361,7 +1361,7 @@ pub(crate) struct CollCellLayout {
 }
 
 /// Derives [`CollCellLayout`] from a real `Cell::Collection`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_coll_layout() -> CollCellLayout {
     let mut entries = Vec::with_capacity(16);
     entries.push((NanBox::number(1.0), NanBox::number(2.0)));
@@ -1456,7 +1456,7 @@ pub(crate) fn jit_coll_layout() -> CollCellLayout {
 }
 
 /// `Cell::Str`'s tag byte and the offset of its rope in the cell.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_str_layout() -> (u8, usize) {
     let cell = Cell::Str(crate::rope::Rope::from("s"));
     let base = core::ptr::addr_of!(cell) as usize;
@@ -1471,7 +1471,7 @@ pub(crate) fn jit_str_layout() -> (u8, usize) {
 }
 
 /// Derives [`CellLayout`] from real `Cell::Object` and `Cell::Array` instances.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn jit_cell_layout() -> CellLayout {
     let cell = Cell::Object(Object::new(crate::shape::Shape::root()));
     let base = core::ptr::addr_of!(cell) as usize;

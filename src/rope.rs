@@ -257,7 +257,7 @@ const BUILD_MIN_CAP: usize = 128;
 
 /// Byte offsets within a rope's node, from the pointer a [`Rope`] holds, for
 /// compiled code reading a flat string (`jit::props`). Probed on live nodes.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RopeLayout {
     /// The node's tag byte.
@@ -292,7 +292,7 @@ pub(crate) struct RopeLayout {
 }
 
 /// Derives [`RopeLayout`].
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[must_use]
 pub(crate) fn jit_rope_layout() -> RopeLayout {
     let long = [b'x'; SMALL_CAP + 9];

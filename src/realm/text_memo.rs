@@ -142,7 +142,7 @@ const HASH_MUL: u64 = 0x9e37_79b9_7f4a_7c15;
 /// entry's index ([`Text::index`]): the rotations, the multiplier and the
 /// mask (`CAP - 1`). A key held in its rope node (`Node::Small`, whose bytes
 /// past its length are zero) has its text's words at its buffer's start.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct KeyTextLayout {
     pub(crate) entries: i32,
@@ -166,7 +166,7 @@ pub(crate) struct KeyTextLayout {
 }
 
 /// Derives [`KeyTextLayout`].
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[must_use]
 pub(crate) fn jit_key_text_layout() -> KeyTextLayout {
     use core::mem::{offset_of, size_of};
@@ -526,7 +526,7 @@ impl Realm {
     /// Records what [`key_text_probe_acc`](Self::key_text_probe_acc) missed
     /// for `obj[key]` (`own_data_lookup` records an own data slot): a key on
     /// no object of the chain, or one a prototype has as an accessor.
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     pub(crate) fn key_text_note_acc(&mut self, obj: NanBox, key: NanBox) {
         if getkey_enabled() {
             let _ = self.key_text_note_chain(obj, key, true);
@@ -542,7 +542,7 @@ enum ChainNote {
 
 /// What [`Realm::key_text_probe_acc`] found. (The values are read by
 /// compiled code's helpers alone.)
-#[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+#[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
 pub(crate) enum AccHit<'a> {
     /// An own data property: the receiver and the key's slot in its
     /// layout.

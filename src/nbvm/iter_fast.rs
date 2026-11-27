@@ -163,7 +163,7 @@ pub(super) fn plain_array_values(realm: &mut Realm, v: NanBox) -> Option<&[NanBo
 /// — to compiled code ([`ArrayIterJit`](crate::realm::builtins_fast::ArrayIterJit)),
 /// with whether a fresh array's destructuring is plain at this epoch too.
 fn publish_open(realm: &mut Realm, f: NanBox, n: NanBox) {
-    #[cfg(all(feature = "jit", feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "jit", feature = "alloc", jit_native))]
     {
         let m = &realm.array_iter_memo;
         let stamp = m.open_stamp;
@@ -196,7 +196,7 @@ fn publish_open(realm: &mut Realm, f: NanBox, n: NanBox) {
             };
         }
     }
-    #[cfg(not(all(feature = "jit", feature = "alloc", jit_x64)))]
+    #[cfg(not(all(feature = "jit", feature = "alloc", jit_native)))]
     let _ = (realm, f, n);
 }
 

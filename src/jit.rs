@@ -44,98 +44,99 @@ use alloc::vec::Vec;
 /// numeric tiers' AArch64 lowerings. Pure byte emission, built on every host
 /// (its encodings are checked on any host); only aarch64 runs the code.
 mod a64;
+mod a64_generic;
 mod a64_numeric;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod arr_push;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod call_seq;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod chase;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod coll;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod dataview;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod deopt;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod direct_call;
 /// W^X executable memory on AArch64 (Linux, macOS).
 #[cfg(jit_a64)]
 mod exec_a64;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod fieldrep;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod forin;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod fused;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod gelim;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod gen_native;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod gforward;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod global_mirror;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod global_persist;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod handle;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub mod inline;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod instof;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod iter_reuse;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod key_probe;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod key_reuse;
 #[cfg(test)]
 mod numeric_diff_tests;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod legacy_hl;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod pin;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod poly;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod prologue;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod props;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod recv_cache;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod sink;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod str_cmp;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod switch_tree;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod tierup;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) mod typed;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod typeof_test;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub use call_seq::{
     CallLayout, CallMemo, CallSite, CallTarget, CalleeHelper, CalleeInfo, ConstructAllocHelper,
     ConstructFast, ConstructHelper, ConstructResultHelper, FRAME_HEADER, FnCallMemo, HDR_CONSTRUCT,
     IdentMemo, JitStack, MethodHelper, PollLayout, SuperTwiceHelper, header_argc,
     inline_hframe_enabled, watch_memo_enabled,
 };
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub use deopt::DeoptInfo;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) use deopt::{
     AFTER_SHIFT as DEOPT_AFTER_SHIFT, leave_of as deopt_leave_of, site_end as deopt_site_end,
 };
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub use gen_native::{GenLayout, GenMemo, GenWay};
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub use props::MethodSite;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) use props::shape_word;
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub use tierup::{
     MAX_GENERATION, cold_inl_enabled, inl_warm_enabled, with_call_hdr, with_entry_poll,
 };
@@ -885,7 +886,7 @@ pub fn dce_reg(ops: &[RegOp]) -> Vec<RegOp> {
 /// table: a string literal, or a BigInt literal (an immutable value whose
 /// identity no operation observes either: `===`, `SameValueZero` and every
 /// other comparison look at its value) unless `KATAAN_JIT_LIT_BIGINT=0`.
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 fn lit_site(op: &crate::nbvm::Op) -> bool {
     match op {
         crate::nbvm::Op::NewString { .. } => true,
@@ -896,7 +897,7 @@ fn lit_site(op: &crate::nbvm::Op) -> bool {
 
 /// Whether BigInt literals share one cell per site in compiled code
 /// (`KATAAN_JIT_LIT_BIGINT=0` turns it off; read once per process).
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 fn lit_bigint_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -906,7 +907,7 @@ fn lit_bigint_enabled() -> bool {
 /// Whether compiled code makes an empty array literal (`NewArray` of
 /// length 0) inline, as it does a small one (`KATAAN_JIT_EMPTY_ARRAY=0`
 /// turns it off; read once per process).
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 fn empty_array_inline_on() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -1964,7 +1965,7 @@ pub fn lower_nbvm_float(proto: &crate::nbvm::FnProto) -> Option<Vec<FloatOp>> {
 /// ordinary object compiles as the named read it is (`KATAAN_JIT_LENGTH_GET=0`:
 /// no, it keeps the array-length helper's uncached `[[Get]]`).
 #[must_use]
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) fn length_get_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LENGTH_GET").is_none_or(|v| v != "0"))
@@ -1979,7 +1980,7 @@ pub(crate) fn length_get_enabled() -> bool {
 /// two are the same `[[Get]]` (hosted: an array's, string's and typed
 /// array's `length` are what `vm_get_prop` reads too); unhosted code leaves
 /// no feedback.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn length_get_sites<'a>(
     proto: &crate::nbvm::FnProto,
     warm: &[Option<crate::ic::WarmEntry>],
@@ -2025,7 +2026,7 @@ fn length_get_sites<'a>(
 /// runtime-helper slow path, or is executed by the interpreter itself
 /// ([`GenericOp::Interp`]) on that same register file. Register operands are
 /// bytecode registers (`u16`).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GenericOp {
     /// `reg[dst] = imm` — load an immediate NanBox word.
@@ -2479,7 +2480,7 @@ pub enum GenericOp {
 }
 
 /// How the generic tier computes a one-argument built-in `Math` call inline.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy)]
 enum MathInline {
     /// `sqrtsd`.
@@ -2501,7 +2502,7 @@ enum MathInline {
     RoundHalf,
 }
 
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 impl MathInline {
     /// Whether the result is a NaN exactly when the argument is (a function
     /// of one argument computed in SSE registers): what lets its argument
@@ -2521,7 +2522,7 @@ impl MathInline {
 /// x))`, `Math.abs(p.x - q.x)`) computes inline when its callee is that
 /// built-in and its arguments Numbers: the [`inline_math`] functions, by
 /// the same rules.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn inline_math_got(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
     let crate::nbvm::Op::CallWithMethod { key, args, .. } = op else {
         return None;
@@ -2539,7 +2540,7 @@ fn inline_math_got(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
 /// [`emit_got_math`]'s check that register `callee` holds built-in `id`
 /// (through the site's identity memo at `site`), else to `miss`. Clobbers
 /// `rax` and `r11` only.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn emit_got_ident(a: &mut X64Assembler, id: u16, callee: u16, site: u64, miss: Label) {
     use call_seq::r::{R11, RAX};
     a.load_rax(i32::from(callee) * 8);
@@ -2554,7 +2555,7 @@ fn emit_got_ident(a: &mut X64Assembler, id: u16, callee: u16, site: u64, miss: L
     a.jne(miss);
 }
 
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn emit_got_math(
     a: &mut X64Assembler,
     (id, f): (u16, MathInline),
@@ -2677,7 +2678,7 @@ fn emit_got_math(
 /// own call op — the fallback of its guards (`Op::InlineGuard::call`) —
 /// right after the last way's jump past it (`inline::expand`), so only a
 /// guard's miss reaches it.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn fallback_ops(ops: &[crate::nbvm::Op]) -> Vec<bool> {
     use crate::nbvm::Op;
     let mut out = alloc::vec![false; ops.len()];
@@ -2696,7 +2697,7 @@ fn fallback_ops(ops: &[crate::nbvm::Op]) -> Vec<bool> {
 /// The built-in id and inline form of a `CallMethod` of one argument (for
 /// `max`/`min`, one to four) whose key names a `Math` function the generic
 /// tier computes inline.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
     let crate::nbvm::Op::CallMethod { key, args, .. } = op else {
         return None;
@@ -2705,7 +2706,7 @@ fn inline_math(op: &crate::nbvm::Op) -> Option<(u16, MathInline)> {
 }
 
 /// [`inline_math`] by the method's key and argument count.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn inline_math_key(key: &str, argc: usize) -> Option<(u16, MathInline)> {
     use crate::nbexec::{
         N_MATH_ABS, N_MATH_CEIL, N_MATH_CLZ32, N_MATH_FLOOR, N_MATH_IMUL, N_MATH_MAX, N_MATH_MIN,
@@ -2741,7 +2742,7 @@ fn inline_math_key(key: &str, argc: usize) -> Option<(u16, MathInline)> {
 /// bytecode op), the per-site property-key strings (owned so the emitted code can
 /// hold stable pointers into them for the inline caches), and the per-call-site
 /// argument-register lists.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 type GenericLowering = (
     Vec<GenericOp>,
     Vec<alloc::boxed::Box<str>>,
@@ -2755,7 +2756,7 @@ type GenericLowering = (
 /// register file: a suspension (`Yield`/`Await`/generator and async-iteration steps), a proper
 /// tail call through a `with` object's binding (which replaces the frame), and direct
 /// `eval`/environment ops (which can reach the frame's scope by name).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
     use crate::nbvm::Op;
     match op {
@@ -2780,7 +2781,7 @@ fn generic_refuses(op: &crate::nbvm::Op) -> Option<&'static str> {
 /// ([`GenericHelpers::suspend`]): each leaves the compiled code with the
 /// generator's frame entirely in the register file, which the resumption
 /// re-enters after it (`YieldDelegate` re-runs on resumption).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn sync_generator_suspension(op: &crate::nbvm::Op) -> bool {
     use crate::nbvm::Op;
     matches!(
@@ -2793,7 +2794,7 @@ fn sync_generator_suspension(op: &crate::nbvm::Op) -> bool {
 /// only in a sync generator, `await` only in an async function, and in an
 /// async generator its start, its `yield`s and its `await`s — not an async
 /// `yield*`, whose steps are not these ops).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn generic_accepts(proto: &crate::nbvm::FnProto, op: &crate::nbvm::Op) -> bool {
     use crate::nbvm::Op;
     generic_refuses(op).is_none()
@@ -2811,7 +2812,7 @@ fn generic_accepts(proto: &crate::nbvm::FnProto, op: &crate::nbvm::Op) -> bool {
 /// on resumption, in the function's own numbering: after each `yield` and
 /// after the body's start, and at each (sync) `yield*` step (which runs
 /// again); after each `await`.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[must_use]
 pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
     use crate::nbvm::Op;
@@ -2837,7 +2838,7 @@ pub fn generator_resume_pcs(proto: &crate::nbvm::FnProto) -> Vec<usize> {
 /// through every branch), so past this a compile takes longer (hundreds of ms,
 /// seconds at a few times this) than it is likely to win back; such a body
 /// stays in the interpreter.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 const MAX_GENERIC_OPS: usize = 8192;
 
 /// Lowers a `nbvm::FnProto` to the generic-tier IR, one [`GenericOp`] per
@@ -2848,7 +2849,7 @@ const MAX_GENERIC_OPS: usize = 8192;
 /// file). `None` if any op is one `generic_refuses` names, or a register/branch is
 /// out of range (the verifier's invariants, re-checked so the emitter can index
 /// the register file without bounds checks).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[must_use]
 pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowering> {
     use crate::nbvm::Op;
@@ -3315,7 +3316,7 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
 /// `Op::InitFields`): those sites
 /// come after every other one, in pc order, so they are the last of the
 /// `n_args` argument lists and `n_sites` sites.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn interp_sites(
     bytecode: &[crate::nbvm::Op],
     n_args: usize,
@@ -3359,7 +3360,7 @@ fn interp_sites(
 /// Per bytecode op, the call site of an `Op::GetKey` (a keyed read's getter
 /// call, `KATAAN_JIT_GETKEY`): the sites `lower_nbvm_generic` puts just before
 /// the interpreter ops' own (`interp_sites`), in pc order.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn key_sites(bytecode: &[crate::nbvm::Op], n_sites: usize) -> Option<Vec<Option<u16>>> {
     use crate::nbvm::Op;
     let (mut keys, mut extra) = (0usize, 0usize);
@@ -3397,7 +3398,7 @@ fn key_sites(bytecode: &[crate::nbvm::Op], n_sites: usize) -> Option<Vec<Option<
 /// No other code reads a register by number: an op names every register it
 /// touches (the verifier's operand list), and a catch binding is named by its
 /// `PushHandler`.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn drop_dead_stores(
     ops: &mut [GenericOp],
     bytecode: &[crate::nbvm::Op],
@@ -3456,7 +3457,7 @@ fn drop_dead_stores(
 /// Whether a generic body compiles to nothing the `LoadConst`s and `Move`s
 /// whose value no path reads ([`dead_inits`]; `KATAAN_JIT_DEADINIT=0`
 /// keeps them). Read once per process.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn dead_init_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_DEADINIT").is_none_or(|v| v != "0"))
@@ -3464,7 +3465,7 @@ fn dead_init_enabled() -> bool {
 
 /// A body's backward register liveness, as `numeric::liveness` gives it:
 /// the words per pc and the live-in bitsets.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 type Liveness = (usize, Vec<u64>);
 
 /// The generic ops `ops` (lowered from `bytecode`) with a `Nop` for every
@@ -3487,7 +3488,7 @@ type Liveness = (usize, Vec<u64>);
 /// stack never holds a handle to a collected object, see
 /// `prologue`'s docs), so the older value it keeps instead is harmless.
 /// The native entry's fill (`prologue::entry_fill`) sees the `Nop`s.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn dead_inits(
     ops: &[GenericOp],
     bytecode: &[crate::nbvm::Op],
@@ -3582,7 +3583,7 @@ fn dead_inits(
 /// its site's identity memo (whose miss leaves likewise), and — as a region
 /// op that is a call ([`numeric::SA_CALL`]) — an inlined `super(…)`'s call
 /// op, its guard's fallback arm.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn spec_alloc_inline(
     ops: &[GenericOp],
     bytecode: &[crate::nbvm::Op],
@@ -3650,7 +3651,7 @@ fn spec_alloc_inline(
 
 /// Why [`lower_nbvm_generic`] rejects `proto` — a human-readable diagnostic for
 /// the `KATAAN_JIT_LOG` knob (never consulted for a compile decision).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[must_use]
 pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::String {
     use alloc::format;
@@ -3672,7 +3673,7 @@ pub fn generic_reject_reason(proto: &crate::nbvm::FnProto) -> alloc::string::Str
 /// speculative loops' `(header, region)`
 /// (`tierup::TierUp::spec_regions`) and its integer versions' overflow
 /// bail sites (`tierup::TierUp::int_regions`).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 type GenericCompiled = (
     JitFunction,
     NativeEntries,
@@ -3682,7 +3683,7 @@ type GenericCompiled = (
 
 /// A generic body's native-call entries (`call_seq::emit_native_entry`), as
 /// byte offsets into its code.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub struct NativeEntries {
     /// The call sequence's.
@@ -3716,7 +3717,7 @@ pub struct NativeEntries {
 /// A generic body's pc maps when it inlined calls (`JitProto::pc_map`): per
 /// own pc its body pc, per body pc the own pc (`u32::MAX` inside an inlined
 /// body), per body pc an inlined op's origin (`inline::Expanded::src_of`).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 type PcMap = (Vec<u32>, Vec<u32>, Vec<u64>);
 
 /// A bytecode-VM function compiled to native code, callable from the VM with
@@ -3724,7 +3725,7 @@ type PcMap = (Vec<u32>, Vec<u32>, Vec<u64>);
 /// machine code and performs the unbox→native→rebox round-trip with an integer
 /// **type guard** at the boundary (a non-integer argument deopts to the
 /// interpreter, exactly as the optimizing tier's guards will).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub struct JitProto {
     func: JitFunction,
     n_params: usize,
@@ -3772,7 +3773,7 @@ pub struct JitProto {
 /// the move into the `JitProto` (only the owning pointers move; the heap
 /// allocations do not). The caches are interior-mutable because a runtime helper
 /// re-arms them through the raw pointer while the (shared) `JitProto` is borrowed.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 struct GenericSites {
     /// Stable-address key strings, one per site.
     #[allow(dead_code)]
@@ -3819,7 +3820,7 @@ struct GenericSites {
 /// leaves (`call_rax_pure`: nothing the body caches is dropped after them;
 /// `KATAAN_JIT_PUREHANDLER=0` makes them ordinary calls, read once per
 /// process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn pure_handlers_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3836,7 +3837,7 @@ fn pure_handlers_enabled() -> bool {
 /// push and pop the compiled activations' handler stack in line, calling
 /// the lean helper only to grow it (`KATAAN_JIT_INLHANDLER=0` keeps the
 /// calls, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn inline_handlers_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3852,7 +3853,7 @@ fn inline_handlers_enabled() -> bool {
 /// Whether by-index array iteration steps keep a shadow integer cursor in
 /// the native frame (`KATAAN_JIT_ITERSHADOW=0` turns it off, read once per
 /// process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn iter_shadow_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3869,7 +3870,7 @@ fn iter_shadow_enabled() -> bool {
 /// the code's constant words (`cmp rax, [rip + c]`, one instruction) rather
 /// than through a scratch register, as does an inline `a.pop()` its element
 /// (`KATAAN_JIT_ITERCONST=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn iter_const_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3901,7 +3902,7 @@ fn push_n_enabled() -> bool {
 /// Whether an inline `a.push(x)` whose result nothing reads (the register
 /// dead past the op, by the body's liveness) skips making the new length's
 /// Number (`KATAAN_JIT_PUSHDEAD=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn push_dead_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3917,7 +3918,7 @@ fn push_dead_enabled() -> bool {
 /// Whether an inline `a.push(x)` / `a.pop()` / `a.shift()` in a loop that
 /// makes no call keeps a run proof of its checks in a frame slot
 /// (`KATAAN_JIT_APPROOF=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn ap_proof_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3935,7 +3936,7 @@ fn ap_proof_enabled() -> bool {
 /// helper, past the general call's method lookup
 /// (`jit_tier::jit_helper_hof_call`; `KATAAN_JIT_HOFDIRECT=0` turns it off,
 /// read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn hof_direct_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3953,7 +3954,7 @@ fn hof_direct_enabled() -> bool {
 /// `%Function.prototype%` or holds a function or `[[IsHTMLDDA]]` marker,
 /// which take the helper) instead of the helper (`KATAAN_JIT_TYPEOFOBJ=0`
 /// turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn typeof_obj_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3969,7 +3970,7 @@ fn typeof_obj_enabled() -> bool {
 /// Whether an inline `m.has(k)` / `m.get(k)` in a loop that makes no call
 /// keeps a run proof of its checks in a frame slot, as an inline `a.push(x)`
 /// does (`KATAAN_JIT_COLLPROOF=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn coll_proof_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -3989,7 +3990,7 @@ fn coll_proof_enabled() -> bool {
 /// step, a global access or a coercibility check, nor anything else that
 /// usually runs Rust code (only a guess of the profit: a call just empties
 /// the proof, see `ap_slot`).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize, coll: bool) -> bool {
     use crate::nbvm::Op;
     let Some((h, e)) = bytecode
@@ -4049,7 +4050,7 @@ fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize, coll: bool) -> boo
 /// `if (!x)`) branches on each answer it finds, with no `0`/`1` made and
 /// tested again (`KATAAN_JIT_TRUTHYBR=0` turns it off, read once per
 /// process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn truthy_br_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -4065,7 +4066,7 @@ fn truthy_br_enabled() -> bool {
 /// Whether a property read's data-property hit also does the same read on
 /// the same receiver right after it, which it then skips
 /// (`KATAAN_JIT_GETCSE=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn get_cse_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -4081,7 +4082,7 @@ fn get_cse_enabled() -> bool {
 /// Whether an inline property store of an immediate the `LoadConst` right
 /// before it set (`o.flag = false`) skips the write barrier's test of the
 /// value (`KATAAN_JIT_SETIMM=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn set_imm_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -4097,7 +4098,7 @@ fn set_imm_enabled() -> bool {
 /// Whether an inline `Math.imul` / `Math.clz32` skips its arguments' Number
 /// tests, which their truncation's "indefinite" check covers
 /// (`KATAAN_JIT_INTMATHTAG=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn int_math_tag_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -4113,7 +4114,7 @@ fn int_math_tag_enabled() -> bool {
 /// Whether a `PlainPrims` guard branches for the test right after it on the
 /// answers it finds itself, and tests a register it names twice once
 /// (`KATAAN_JIT_PLAINTEST=0` turns it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn plain_test_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -4130,7 +4131,7 @@ fn plain_test_enabled() -> bool {
 /// tests (`while (q.length)`) branches on the length its fast path read,
 /// skipping the test's general truthiness (`KATAAN_JIT_LENBRANCH=0` turns
 /// it off, read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn len_branch_enabled() -> bool {
     #[cfg(feature = "std")]
     {
@@ -4146,7 +4147,7 @@ fn len_branch_enabled() -> bool {
 /// The generic-tier runtime-helper table: the `extern "sysv64"` slow paths the emitted
 /// code calls for `+`, property get, and property set. Passed to
 /// [`JitProto::compile_generic`].
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub struct GenericHelpers {
     /// The `+` helper (`jit_helper_add`).
     pub add: JitAddHelper,
@@ -4298,7 +4299,7 @@ pub struct GenericHelpers {
     /// A native resumption's iterator result for a yielded value
     /// (`jit_helper_gen_native_result(ctx, value, call_site, reuse)`).
     pub gen_native_result:
-        extern "sysv64" fn(*mut core::ffi::c_void, u64, *mut core::ffi::c_void, u64) -> u64,
+        jit_abi!(fn(*mut core::ffi::c_void, u64, *mut core::ffi::c_void, u64) -> u64),
     /// A method call's callee lookup (`jit_method_info`).
     pub method_info: MethodHelper,
     /// `Op::Construct`'s slow path (`jit_helper_construct(ctx, regs, n_regs,
@@ -4430,48 +4431,52 @@ pub struct GenericHelpers {
 /// The runtime-helper ABI for a deoptimization exit: `(ctx, regs, n_regs,
 /// info, at) -> bits` (a value, the throw sentinel, the fall-off sentinel
 /// or the exit sentinel: see `jit_tier::jit_helper_deopt`).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub type JitDeoptHelper =
-    extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, usize, *const DeoptInfo, u64) -> u64;
+    jit_abi!(fn(*mut core::ffi::c_void, *mut u64, usize, *const DeoptInfo, u64) -> u64);
 
 /// The runtime-helper ABI for a method call: `(ctx, regs, n_regs, op, cache) ->
 /// 0` (or the throw sentinel).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitCallMethodHelper = extern "sysv64" fn(
-    *mut core::ffi::c_void,
-    *mut u64,
-    usize,
-    *const crate::nbvm::Op,
-    *mut core::ffi::c_void,
-    *mut core::ffi::c_void,
-) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitCallMethodHelper = jit_abi!(
+    fn(
+        *mut core::ffi::c_void,
+        *mut u64,
+        usize,
+        *const crate::nbvm::Op,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> u64
+);
 
 /// The runtime-helper ABI for `Op::CallKey`'s call half: `(ctx, regs, n_regs,
 /// op, site, method) -> 0` (or the throw sentinel).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitCallKeyHelper = extern "sysv64" fn(
-    *mut core::ffi::c_void,
-    *mut u64,
-    usize,
-    *const crate::nbvm::Op,
-    *mut core::ffi::c_void,
-    u64,
-) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitCallKeyHelper = jit_abi!(
+    fn(
+        *mut core::ffi::c_void,
+        *mut u64,
+        usize,
+        *const crate::nbvm::Op,
+        *mut core::ffi::c_void,
+        u64,
+    ) -> u64
+);
 
 /// The [`JitUnwindHelper`] result meaning "no handler caught it: propagate".
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub const NO_HANDLER: u64 = u64::MAX;
 
 /// The runtime-helper ABI for the throw-exit unwinder: `(ctx, regs, n_regs) ->
 /// catch pc` (or [`NO_HANDLER`]).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitUnwindHelper = extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, usize) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitUnwindHelper = jit_abi!(fn(*mut core::ffi::c_void, *mut u64, usize) -> u64);
 
 /// The base pointer + length of the object heap's slot array, returned by the
 /// [`JitArenaHelper`]. `#[repr(C)]` with two integer-class eightbytes, so the
 /// System V ABI returns it in `rax:rdx` (base in `rax`, `len` in `rdx`) — which
 /// the emitted fast path reads directly after the `call`.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[repr(C)]
 pub struct JitArena {
     /// `slots.as_ptr()` — the arena base (`base + index * SLOT_STRIDE` addresses a
@@ -4484,20 +4489,20 @@ pub struct JitArena {
 /// The runtime-helper ABI for the heap-arena accessor (`JIT_DESIGN.md` Pass 6):
 /// `(ctx) -> JitArena`. A leaf, non-allocating read that never triggers GC, so the
 /// inline fast path stays GC-safe and realloc-safe.
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitArenaHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64) -> JitArena;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitArenaHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, u64) -> JitArena);
 
 /// `jit_arena` mode: a static-key property read on a shaped object.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub const ARENA_GET: u64 = 0;
 /// `jit_arena` mode: a static-key property write on a shaped object.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub const ARENA_SET: u64 = 1;
 /// `jit_arena` mode: a dense-array element / `.length` read.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub const ARENA_ELEM_GET: u64 = 2;
 /// `jit_arena` mode: an in-bounds dense-array element write.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub const ARENA_ELEM_SET: u64 = 3;
 
 /// The byte offsets + discriminant values the inline monomorphic property-get
@@ -4509,7 +4514,7 @@ pub const ARENA_ELEM_SET: u64 = 3;
 /// hand-written. If any offset is wrong the JIT layout verification test
 /// (`jit_layout_matches_safe_reads`) fails loudly rather than the JIT silently
 /// corrupting a raw read.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JitLayout {
     /// `size_of::<Slot<Cell>>()` — the arena stride.
@@ -4593,7 +4598,7 @@ pub(crate) struct JitLayout {
 /// Assembles the [`JitLayout`] from the four per-type probes, combining the
 /// nested field offsets into slot-relative offsets. Computed once (memoized) and
 /// baked into every emitted property-get site.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) fn compute_jit_layout() -> &'static JitLayout {
     use std::sync::OnceLock;
     static LAYOUT: OnceLock<JitLayout> = OnceLock::new();
@@ -4664,7 +4669,7 @@ pub(crate) fn compute_jit_layout() -> &'static JitLayout {
 /// bits` (or the throw sentinel). `op` selects the concrete operation (a `GA_*` or
 /// `VB_*` code). Used by both the arithmetic (`jit_helper_arith`) and the
 /// `Op::ValueBin` (`jit_helper_value_bin`) slow paths.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 /// Whether a relational `Op::Compare` that is not of two Numbers tries
 /// `jit_helper_str_compare` before the interpreter's op
 /// (`KATAAN_JIT_STRCMP=0` turns it off; read once per process).
@@ -4678,7 +4683,7 @@ pub(crate) fn str_compare_enabled() -> bool {
 /// built-in directly when the site proves it (`jit_helper_str_call`)
 /// rather than through the general call (`KATAAN_JIT_STRCALL=0` turns it
 /// off; read once per process).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn str_call_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -4688,64 +4693,53 @@ pub(crate) fn str_call_enabled() -> bool {
 /// Whether a template literal's `Op::Concat` joins its parts through
 /// `jit_helper_concat` before the interpreter's op (`KATAAN_JIT_CONCAT=0`
 /// turns it off; read once per process).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn concat_fast_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_CONCAT").is_none_or(|v| v != "0"))
 }
 
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitBinHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, u64) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitBinHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, u64, u64) -> u64);
 
 /// The runtime-helper ABI for a static-key property read through its site:
 /// `(ctx, obj, site, call site) -> NanBox bits` (or the throw sentinel).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub type JitGetSiteHelper =
-    extern "sysv64" fn(*mut core::ffi::c_void, u64, *mut MethodSite, *const CallSite) -> u64;
+    jit_abi!(fn(*mut core::ffi::c_void, u64, *mut MethodSite, *const CallSite) -> u64);
 
 /// The runtime-helper ABI for a static-key property write through its site:
 /// `(ctx, obj, site, val, strict) -> undefined bits` (or the throw sentinel).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub type JitSetSiteHelper =
-    extern "sysv64" fn(*mut core::ffi::c_void, u64, *mut MethodSite, u64, u64) -> u64;
+    jit_abi!(fn(*mut core::ffi::c_void, u64, *mut MethodSite, u64, u64) -> u64);
 
 /// The runtime-helper ABI for a computed element write: `(ctx, recv, key, val,
 /// strict) -> undefined bits` (or the throw sentinel).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitSetElemHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, u64, u64) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitSetElemHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, u64, u64, u64) -> u64);
 
 /// The runtime-helper ABI for a truthiness test: `(ctx, v) -> 0 | 1`. Never throws.
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitTruthyHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitTruthyHelper = jit_abi!(fn(*mut core::ffi::c_void, u64) -> u64);
 
 /// The runtime-helper ABI for a property **get** (`JIT_DESIGN.md` Pass 2):
 /// `(ctx, obj, key_ptr, key_len, cache) -> NanBox bits` (or the throw sentinel).
 /// `cache` is an opaque pointer to the site's `PropertyCache`.
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitGetPropHelper = extern "sysv64" fn(
-    *mut core::ffi::c_void,
-    u64,
-    *const u8,
-    usize,
-    *mut core::ffi::c_void,
-) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitGetPropHelper =
+    jit_abi!(fn(*mut core::ffi::c_void, u64, *const u8, usize, *mut core::ffi::c_void) -> u64);
 
 /// The runtime-helper ABI for a property **set**: `(ctx, obj, key_ptr, key_len,
 /// cache, val) -> undefined bits` (or the throw sentinel).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitSetPropHelper = extern "sysv64" fn(
-    *mut core::ffi::c_void,
-    u64,
-    *const u8,
-    usize,
-    *mut core::ffi::c_void,
-    u64,
-) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitSetPropHelper =
+    jit_abi!(fn(*mut core::ffi::c_void, u64, *const u8, usize, *mut core::ffi::c_void, u64) -> u64);
 
 /// Resolved per-site call data the emitter bakes into a property-access site: the
 /// key string's raw pointer/length and the site's inline-cache pointer.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy)]
 pub struct SiteInfo {
     key_ptr: *const u8,
@@ -4769,7 +4763,7 @@ pub struct SiteInfo {
 /// word is `shape` has the site's key as a data property in slot `slot`
 /// (a fact of that immutable shape, which the owning [`JitProto`] keeps
 /// alive). Any other receiver takes the site's cache path.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy)]
 struct Baked {
     shape: u64,
@@ -4789,7 +4783,7 @@ struct Baked {
 /// per callee so a JIT→JIT direct call is only ever emitted at the matching ABI (a
 /// wrong-ABI direct call would mis-dispatch). Used to build the per-tier call
 /// registries in `nbvm::ensure_jit`.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AbiKind {
     /// Integer ABI: `extern "sysv64" fn(i64, …) -> i64` (an Int-tier body).
@@ -4803,7 +4797,7 @@ pub enum AbiKind {
 }
 
 /// Which native fast path a [`JitProto`] holds.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JitKind {
     /// Integer arithmetic + branches/loops; guards args to exact integers and
@@ -4823,49 +4817,43 @@ enum JitKind {
 /// reconstructs; the operands and result are raw `NanBox` words. On a thrown
 /// exception the helper stashes the value in the context and returns
 /// `NanBox::jit_throw_bits`(crate::nanbox::NanBox::jit_throw_bits).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitAddHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitAddHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, u64) -> u64);
 
 /// The ABI of `nbvm::jit_tier::getkey::jit_helper_get_elem_acc`:
 /// `(ctx, recv, key, out) -> value`, `*out` the getter compiled code calls
 /// with the receiver as `this` (`KATAAN_JIT_GETKEY`), or `0` when the
 /// result is the read's value (or the throw sentinel).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitElemAccHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, *mut u64) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitElemAccHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, u64, *mut u64) -> u64);
 
 /// The ABI of `nbvm::jit_tier::getkey::jit_helper_get_elem_site`:
 /// `(ctx, recv, key, call site) -> value`.
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitElemSiteHelper =
-    extern "sysv64" fn(*mut core::ffi::c_void, u64, u64, *mut CallSite) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitElemSiteHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, u64, *mut CallSite) -> u64);
 
 /// The runtime-helper ABI for running one bytecode op on the body's register
 /// file: `(ctx, regs, n_regs, op) -> 0` (or the throw sentinel, with the fault in
 /// `ctx.jit_pending_fault`). `op` points at the `nbvm::Op`, owned by the
 /// compiled [`JitProto`].
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub type JitExecOpHelper =
-    extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op) -> u64;
+    jit_abi!(fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op) -> u64);
 
 /// The runtime-helper ABI for a loop back-edge poll: `(ctx, regs, n_regs, ops,
 /// n_ops, header) -> next countdown` (or the throw sentinel, or
 /// `NanBox::jit_exit_bits`: leave for the interpreter at loop header pc
 /// `header`, the branch's target). `ops`/`n_ops` is the running bytecode (the
 /// GC safepoint roots its constants).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 /// [`GenericHelpers::entry_poll`]'s signature.
-pub type JitEntryPollHelper = extern "sysv64" fn(*mut core::ffi::c_void, u64) -> u64;
+pub type JitEntryPollHelper = jit_abi!(fn(*mut core::ffi::c_void, u64) -> u64);
 
 /// [`GenericHelpers::backedge`]'s signature.
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitBackedgeHelper = extern "sysv64" fn(
-    *mut core::ffi::c_void,
-    *mut u64,
-    usize,
-    *const crate::nbvm::Op,
-    usize,
-    usize,
-) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitBackedgeHelper = jit_abi!(
+    fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op, usize, usize) -> u64
+);
 
 /// The runtime-helper ABI for a sync generator's suspension op
 /// (`Op::YieldResume`, `Op::GeneratorStart`, `Op::YieldDelegate`): `(ctx,
@@ -4874,23 +4862,17 @@ pub type JitBackedgeHelper = extern "sysv64" fn(
 /// `NanBox::jit_exit_bits` (the generator suspended there: the context holds
 /// what it yields and where it resumes; `pc` is the op's pc in the
 /// function's own numbering).
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitSuspendHelper = extern "sysv64" fn(
-    *mut core::ffi::c_void,
-    *mut u64,
-    usize,
-    *const crate::nbvm::Op,
-    usize,
-) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitSuspendHelper =
+    jit_abi!(fn(*mut core::ffi::c_void, *mut u64, usize, *const crate::nbvm::Op, usize) -> u64);
 
 /// The runtime-helper ABI for a **native builtin call** (`Op::CallNative`):
 /// `(ctx, native_id, argv_ptr, argc) -> NanBox bits` (or the throw sentinel, with
 /// the fault in `ctx.jit_pending_fault`). `native_id` is the builtin discriminant.
-#[cfg(all(feature = "alloc", jit_x64))]
-pub type JitCallNativeHelper =
-    extern "sysv64" fn(*mut core::ffi::c_void, u64, *const u64, usize) -> u64;
+#[cfg(all(feature = "alloc", jit_native))]
+pub type JitCallNativeHelper = jit_abi!(fn(*mut core::ffi::c_void, u64, *const u64, usize) -> u64);
 
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 impl JitProto {
     /// Compiles a `nbvm::FnProto` to native code if it is JIT-eligible.
     /// Prefers the integer path ([`lower_nbvm`], which handles branches/loops);
@@ -5132,6 +5114,15 @@ impl JitProto {
         demote: &[(usize, u16)],
         sink: bool,
     ) -> Option<Self> {
+        // AArch64: the baseline body (`a64_generic`), when it is on; the
+        // x86-64 emitter below never runs there.
+        if cfg!(target_arch = "aarch64") {
+            return if a64_generic::enabled() {
+                Self::compile_a64_baseline(proto, helpers)
+            } else {
+                None
+            };
+        }
         EMIT_ATTEMPTS.with(|c| c.set(c.get() + 1));
         // The register `call_with_inner` puts `new.target` in, if any (a
         // native-call entry fills it from the call header; one at or below the
@@ -6081,14 +6072,9 @@ impl JitProto {
         // SAFETY: `code` is this body's native-call entry, emitted to the
         // System V signature below (see `call_seq::emit_native_entry`); the
         // pointers satisfy its contract per this function's.
-        let f: extern "sysv64" fn(
-            *mut core::ffi::c_void,
-            *mut u64,
-            u64,
-            *const u64,
-            *const u64,
-            u64,
-        ) -> u64 = unsafe { core::mem::transmute(code) };
+        let f: jit_abi!(
+            fn(*mut core::ffi::c_void, *mut u64, u64, *const u64, *const u64, u64) -> u64
+        ) = unsafe { core::mem::transmute(code) };
         Some(f(ctx, window, argc, argv, caps, this))
     }
 
@@ -6238,11 +6224,11 @@ pub struct X64Assembler {
     code: Vec<u8>,
     /// Profiling marks (`KATAAN_JIT_OPMAP`): labels bound inside an op's
     /// code, reported with the op offsets.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) dbg_marks: Vec<(Label, &'static str, Option<usize>)>,
     /// The op being emitted, which profiling marks are reported against
     /// (`name@op`), wherever their code ends up (a cold region).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) dbg_op: Option<usize>,
     /// The code-size attribution (`KATAAN_JIT_SIZEMAP`), when on.
     pub(crate) size_map: Option<alloc::boxed::Box<SizeMap>>,
@@ -6266,20 +6252,20 @@ pub struct X64Assembler {
     /// The receiver-cache ways a `call` emitted now keeps rather than
     /// empties: re-validated after it returns (`recv_cache::SurviveWay`).
     /// Set per op by the generic tier; empty elsewhere.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     recv_survive: Vec<recv_cache::SurviveWay>,
     /// The heap layout the [`recv_survive`](Self::recv_survive) checks read.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     recv_survive_layout: Option<JitLayout>,
     /// In a body some of whose calls keep ways: the frame slot (`[rbp+disp]`)
     /// holding the arena base as of the latest call (or
     /// [`RECV_CACHE_EMPTY`] from the prologue on), which every call
     /// updates (`recv_cache::survive_reload`).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     recv_seen: Option<i32>,
     /// The generic tier's collection lookup memo (`coll`'s
     /// `CollMemo`), when the body has one: its frame slots.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) coll_memo: Option<coll::CollMemo>,
     /// Frame slots (`[rbp+disp]`) the frame prologue alone sets to
     /// [`RECV_CACHE_EMPTY`]: the generic tier's global binding cache, which
@@ -6288,7 +6274,7 @@ pub struct X64Assembler {
     /// The global binding cache's direct reads (`global_persist::
     /// direct_enabled`), which the frame prologue starts (through `r11`,
     /// which no entry passes anything in).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     entry_globals: Option<global_persist::DirectEntry>,
     /// Where the most recent [`bind`](Self::bind) bound its label (no label
     /// is bound past it, as `bind` binds at the end of the code).
@@ -6297,57 +6283,57 @@ pub struct X64Assembler {
     /// (`numeric`): the SSE registers every `call` stores to the register
     /// file first (when the flag is set) and reloads after, as `(xmm,
     /// register-file displacement, store)`.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     call_spill: Vec<(u8, i32, bool)>,
     /// While the generic tier emits an op inside a promoted loop with no
     /// speculative version (`numeric`): its global binding epoch slot and
     /// validated binding address slots (`[rbp+disp]`), the epoch first,
     /// which every `call` re-checks after it returns (see
     /// `numeric::NumGen::call_globals`). Empty elsewhere.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     call_globals: Vec<i32>,
     /// In a generic body with a global binding cache: the frame slot of the
     /// epoch its slots were validated under and the stub that empties them,
     /// which every `call` runs when the epoch changed under it (see
     /// [`recheck_body_globals`](Self::recheck_body_globals)).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     gc_body: Option<(i32, Label)>,
     /// In a body that inlines calls (`inline`): the native-frame slot of a
     /// pending inlined activation's materialization stub, which every
     /// `call` first runs when set (`call_seq::emit_inline_guard`).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     inline_pend: Option<i32>,
     /// The inlined calls' state slots only the prologue empties.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     inline_clear: Vec<i32>,
     /// The inlined activations enclosing the op being emitted, outer first
     /// (`call_seq::InlineCtx`): a call sequence there pushes them with its
     /// own header while they are all still pending.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     inline_ctx: Option<call_seq::InlineCtx>,
     /// The body's frame slot where a headerless call keeps the register
     /// stack's top it restores (`call_seq::emit_enter`); `None`: the body
     /// makes no headerless calls.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) call_saved_top: Option<i32>,
     /// Whether the call op being emitted makes only calls with a header
     /// (its callee feedback names only callees that need one: see
     /// `tierup::CALL_HDR`).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) call_hdr_only: bool,
     /// Out-of-line code moved off the hot path ([`cold_end`](Self::cold_end)),
     /// placed after everything else by [`finish`](Self::finish).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     cold: Vec<ColdChunk>,
     /// While a cold region is open: the labels bound since it began.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     cold_binds: Option<Vec<usize>>,
     /// The enclosing cold regions' bound labels, outermost first, while a
     /// region nested in them is open ([`cold_begin`](Self::cold_begin)).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     cold_outer: Vec<Vec<usize>>,
     /// A generic body's heap arena, pinned in `r12`/`r13` (`pin`).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pin: Option<pin::PinArena>,
     /// Whether a back-edge poll's countdown decrement was emitted
     /// ([`dec_frame8`](Self::dec_frame8)).
@@ -6356,7 +6342,7 @@ pub struct X64Assembler {
     /// [`finish`](Self::finish) places after all the code: what
     /// `rip`-relative operands read (`handle::p_rip_const`), such as the
     /// least heap handle's bits for a two-instruction handle test.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     consts: Vec<(u64, Label)>,
     /// The last instruction, when it is a 64-bit store of a GPR to memory:
     /// `(where it ends, base register, displacement, source register)`
@@ -6373,7 +6359,7 @@ pub struct X64Assembler {
     /// slot, which a `call` emitted there sets first
     /// ([`inline_frame_hook`](Self::inline_frame_hook)), and a run-proved
     /// guard's callee copy (`(from, to)` slots, `numeric::plan_run_proofs`).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     /// Nested lazily pending activations (an inner level's inside its
     /// enclosing one's body), outermost first; each with its inner level's
     /// `save` slot (`call_seq::LazyPend`).
@@ -6382,36 +6368,36 @@ pub struct X64Assembler {
     /// With `lazy_pend`: the activations' arguments still held in SSE
     /// registers, as `(xmm, register-file disp)`, which a call in their
     /// bodies stores first (`numeric::NumGen::guard_args`).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     lazy_args: Vec<(u8, i32)>,
     /// Per entry of `lazy_pend`, how many of `lazy_args` are its.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     lazy_args_at: Vec<usize>,
     /// Inside the windows of plainly lazy pending activations
     /// (`call_seq::PlainLazy`), outermost first, which a `call` emitted
     /// there makes pending first
     /// ([`inline_frame_hook`](Self::inline_frame_hook)).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     plain_lazy: Vec<call_seq::PlainLazy>,
     /// The body's shared **post-call stubs** (each once, with its label):
     /// what a `call` would otherwise expand after it at every site
     /// ([`X64Assembler::post_call_outlined`]), placed by
     /// [`finish`](Self::finish) after the cold chunks.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     post_stubs: Vec<(PostCall, Label)>,
     /// Emitting the body's out-of-line tail (its slow paths after the
     /// ops' code, which is no cold region but runs as rarely): its calls'
     /// after-sequences may be shared stubs too
     /// ([`post_call_outlined`](Self::post_call_outlined)).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) ool_tail: bool,
     /// The shared lookup subroutines out-of-line code calls
     /// ([`props::LookupSub`]), placed by [`finish`](Self::finish).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) lookup_subs: Vec<props::LookupSub>,
     /// The shared callee identifications call sequences call
     /// ([`call_seq::IdentSub`]), placed by [`finish`](Self::finish).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) ident_subs: Vec<call_seq::IdentSub>,
     /// The latest 10-byte `movabs rax, imm64` (`mov_imm64`): where it
     /// starts and its value ([`call_rax`](Self::call_rax)).
@@ -6424,7 +6410,7 @@ pub struct X64Assembler {
 /// (`globals`, see `X64Assembler::recheck_body_globals`); then `ret`. It
 /// keeps `rax`/`rdx` (a call's results) and clobbers what the inline
 /// sequence would: `r11`, `r12`/`r13` (reloaded) and the flags.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 #[derive(Clone, PartialEq)]
 struct PostCall {
     keys: Vec<i32>,
@@ -6457,7 +6443,7 @@ struct StoreFwd {
 /// A run of code [`X64Assembler::cold_end`] cut out of the main stream: its
 /// bytes, the labels bound in it and the jump fixups in it (both at offsets
 /// relative to the chunk's start).
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 struct ColdChunk {
     code: Vec<u8>,
     labels: Vec<(usize, usize)>,
@@ -6470,7 +6456,7 @@ struct ColdChunk {
 /// ([`X64Assembler::dbg_mark`]; an `x-`/`o-`/`n-` one names an out-of-line
 /// section, any other a part of it) and whether a cold region holds them.
 /// Each compile reports its table to stderr as `[size]` lines.
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct SizeMap {
     bytes: alloc::collections::BTreeMap<
@@ -6490,7 +6476,7 @@ pub(crate) struct SizeMap {
     cut: usize,
 }
 
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 impl SizeMap {
     /// A map when `KATAAN_JIT_SIZEMAP` is set.
     pub(crate) fn new_if_on() -> Option<alloc::boxed::Box<Self>> {
@@ -6563,7 +6549,7 @@ impl SizeMap {
 }
 
 /// Where a cold region began ([`X64Assembler::cold_begin`]).
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 pub(crate) struct ColdMark {
     start: usize,
     fixups: usize,
@@ -7036,7 +7022,7 @@ std::thread_local! {
 /// receiver cache's sites from tables listed once (`typed::relied_all`,
 /// each way's family) rather than a scan of every site per op (unless
 /// `KATAAN_JIT_SCANMEMO=0`). Read once.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 pub(crate) fn scan_memo_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SCANMEMO").is_none_or(|v| v != "0"))
@@ -7046,7 +7032,7 @@ pub(crate) fn scan_memo_enabled() -> bool {
 /// line only at a site that has seen one (`MethodSite::saw_getter`); at
 /// any other the getter's call is the read helper's, which needs none of
 /// the call sequence's code (unless `KATAAN_JIT_GETSEEN=0`). Read once.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn get_seen_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_GETSEEN").is_none_or(|v| v != "0"))
@@ -7060,7 +7046,7 @@ const RECV_CACHE_EMPTY: i32 = -1;
 /// Whether the frame prologue empties its slots two at a time through
 /// `xmm15` (`X64Assembler::frame_prologue`); `KATAAN_JIT_SSECLR=0` turns it
 /// off (read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn prologue_sse_clear() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_SSECLR").is_none_or(|v| v != "0"))
@@ -7069,7 +7055,7 @@ fn prologue_sse_clear() -> bool {
 /// Whether a generic body's global binding cache resets (each read site's
 /// out-of-line path when the binding epoch moved) call one shared copy of
 /// the reset (`KATAAN_JIT_EPOCHSUB=0` disables). Read once.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn epoch_sub_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_EPOCHSUB").is_none_or(|v| v != "0"))
@@ -7078,7 +7064,7 @@ fn epoch_sub_enabled() -> bool {
 /// Whether the out-of-line tail of a generic body counts as cold code for
 /// [`X64Assembler::post_call_outlined`] (`KATAAN_JIT_POSTOOL=0` disables).
 /// Read once.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn post_ool_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_POSTOOL").is_none_or(|v| v != "0"))
@@ -7087,13 +7073,13 @@ fn post_ool_enabled() -> bool {
 /// The least number of bytes (roughly) of in-line post-call code that a
 /// shared stub replaces (`X64Assembler::post_call_outlined`): below it the
 /// in-line sequence is about as short as the stub's `call`.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 const POST_CALL_MIN: usize = 32;
 
 /// Whether some op of `bytecode` can store property `key` without a call
 /// (an inline store or definition of it): an inline `Math.f(x)` site's
 /// proved method is then re-checked on every call.
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 fn math_stores_key(bytecode: &[crate::nbvm::Op], key: &str) -> bool {
     bytecode.iter().any(|o| {
         matches!(o,
@@ -7111,7 +7097,7 @@ fn math_stores_key(bytecode: &[crate::nbvm::Op], key: &str) -> bool {
 /// so that the callee value that guard left in the inline slots is the
 /// call's: the op before it is the previous way's closing jump and nothing
 /// else branches to it.
-#[cfg_attr(not(jit_x64), allow(dead_code))]
+#[cfg_attr(not(jit_native), allow(dead_code))]
 fn chained_guard_ok(ops: &[crate::nbvm::Op], pc: usize) -> bool {
     use crate::nbvm::Op;
     let Some(Op::InlineGuard { call, poly, .. }) = ops.get(pc) else {
@@ -7141,7 +7127,7 @@ fn chained_guard_ok(ops: &[crate::nbvm::Op], pc: usize) -> bool {
 /// `2` inside another inlined body: see `inline::Candidate::nested`); `0`
 /// for any other op. Every inlined body is its guard, then its ops, then its
 /// one leave (`inline::expand`), so guards and leaves nest as brackets.
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn inline_levels(ops: &[GenericOp]) -> Vec<u8> {
     let mut depth = 0u8;
     ops.iter()
@@ -7162,7 +7148,7 @@ fn inline_levels(ops: &[GenericOp]) -> Vec<u8> {
 
 /// Whether inlined activations may be plainly lazy (`call_seq::PlainLazy`;
 /// `KATAAN_JIT_PLAINLAZY=0` turns it off; read once per process).
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 fn plain_lazy_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_PLAINLAZY").is_none_or(|v| v != "0"))
@@ -7180,7 +7166,7 @@ impl X64Assembler {
     }
 
     /// A profiling mark here (only under `KATAAN_JIT_OPMAP`).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn dbg_mark(&mut self, name: &'static str) {
         if self.size_map.is_some() {
             self.size_flush();
@@ -7207,7 +7193,7 @@ impl X64Assembler {
     }
 
     /// [`SizeMap`]: the code from here on is op `name`'s.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn size_op(&mut self, name: &str) {
         self.size_flush();
         if let Some(m) = self.size_map.as_mut() {
@@ -7256,33 +7242,33 @@ impl X64Assembler {
     }
 
     /// Sets the receiver-cache key slots (see the `recv_cache_keys` field).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn set_recv_cache_keys(&mut self, keys: Vec<i32>) {
         self.recv_cache_keys = keys;
     }
 
     /// Sets the promoted registers every `call` brackets (see the
     /// `call_spill` field).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn set_call_spill(&mut self, spill: Vec<(u8, i32, bool)>) {
         self.call_spill = spill;
     }
 
     /// The promoted registers every `call` currently brackets.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn call_spill_now(&self) -> Vec<(u8, i32, bool)> {
         self.call_spill.clone()
     }
 
     /// Sets the global binding slots every `call` re-checks (see the
     /// `call_globals` field).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn set_call_globals(&mut self, slots: Vec<i32>) {
         self.call_globals = slots;
     }
 
     /// The global binding slots every `call` currently re-checks.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn call_globals_now(&self) -> Vec<i32> {
         self.call_globals.clone()
     }
@@ -7291,7 +7277,7 @@ impl X64Assembler {
     /// global binding cache (see the `gc_body` field): `epoch` is its epoch
     /// slot, `stub` the label of its emptying stub
     /// ([`emit_body_globals_stub`](Self::emit_body_globals_stub)).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) fn set_body_globals(&mut self, on: Option<(i32, Label)>) {
         self.gc_body = on;
     }
@@ -7303,7 +7289,7 @@ impl X64Assembler {
     /// is still current — and the slots' reads need no epoch check of their
     /// own. Clobbers only `r11` and the flags (the call's results in
     /// `rax`/`rdx` survive).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     fn recheck_body_globals(&mut self) {
         let Some((noted, stub)) = self.gc_body else {
             return;
@@ -7325,7 +7311,7 @@ impl X64Assembler {
     /// slot of `slots` emptied, then `ret` to the call site. It writes only
     /// the frame (its caller's `rbp` is the body's) and keeps every register
     /// and the stack.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) fn emit_body_globals_stub(
         &mut self,
         stub: Label,
@@ -7348,14 +7334,14 @@ impl X64Assembler {
 
     /// Sets the slots only the frame prologue empties (see the `entry_clear`
     /// field).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn set_entry_clear(&mut self, slots: Vec<i32>) {
         self.entry_clear = slots;
     }
 
     /// Sets the direct global reads the frame prologue starts (see the
     /// `entry_globals` field).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     fn set_entry_globals(&mut self, e: Option<global_persist::DirectEntry>) {
         self.entry_globals = e;
     }
@@ -7370,7 +7356,7 @@ impl X64Assembler {
         let mut keys = core::mem::take(&mut self.recv_cache_keys);
         // (A way the call keeps is re-validated after it instead:
         // `survive_reload`.)
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         if !self.recv_survive.is_empty() {
             let kept: Vec<i32> = keys
                 .iter()
@@ -7443,7 +7429,7 @@ impl X64Assembler {
 
     /// Empties every [`entry_clear`](Self::set_entry_clear) slot but those
     /// of `keep`.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) fn clear_entry_slots_except(&mut self, keep: &[i32]) {
         for i in 0..self.entry_clear.len() {
             let d = self.entry_clear[i];
@@ -7469,7 +7455,7 @@ impl X64Assembler {
     }
 
     /// Whether a cold region ([`cold_begin`](Self::cold_begin)) is open.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn in_cold(&self) -> bool {
         self.cold_binds.is_some()
     }
@@ -7477,7 +7463,7 @@ impl X64Assembler {
     /// Whether the code emitted last is an unconditional `jmp` (the 5-byte
     /// `E9 rel32` whose fixup is the last one): nothing falls through past
     /// it.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn ends_in_jmp(&self) -> bool {
         let n = self.code.len();
         n >= 5 && self.code[n - 5] == 0xe9 && self.fixups.last().is_some_and(|f| f.0 == n - 4)
@@ -7542,11 +7528,11 @@ impl X64Assembler {
                 self.fixups.push((base + at, label, st));
             }
         }
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.place_lookup_subs();
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.place_ident_subs();
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.place_post_stubs();
         // The constant words (data, after the last instruction: nothing
         // falls through into them), 8-byte aligned within the code.
@@ -7592,7 +7578,7 @@ impl X64Assembler {
     /// region's end belong to the code after it. Regions nest: one begun
     /// inside another becomes a chunk of its own, and the enclosing region
     /// goes on where it began.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     #[track_caller]
     pub(crate) fn cold_begin(&mut self) -> ColdMark {
         self.size_flush();
@@ -7628,7 +7614,7 @@ impl X64Assembler {
     /// an op's code, whose labels bound at this point (where that code
     /// ends, maybe with nothing after them) mark the code after the region,
     /// not the region's first instruction.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     #[track_caller]
     pub(crate) fn cold_begin_after(&mut self) -> ColdMark {
         let mut m = self.cold_begin();
@@ -7637,7 +7623,7 @@ impl X64Assembler {
     }
 
     /// Ends the cold region `mark` began (see [`cold_begin`](Self::cold_begin)).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn cold_end(&mut self, mark: ColdMark) {
         self.size_flush();
         if let Some(m) = self.size_map.as_mut() {
@@ -8092,7 +8078,7 @@ impl X64Assembler {
     /// sum stays itself) is at least a half; a zero result takes `x`'s
     /// sign (`-0.5 <= x < 0` rounds to `-0`). Clobbers `xmm1`, `rax`,
     /// `rcx`, `r11`.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) fn round_half_xmm0(&mut self) {
         let skip = self.new_label();
         let done = self.new_label();
@@ -8310,9 +8296,9 @@ impl X64Assembler {
             }
             _ => None,
         };
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.inline_frame_hook();
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.spill_before_call();
         match direct {
             Some(imm) => {
@@ -8329,16 +8315,16 @@ impl X64Assembler {
             }
             None => self.code.extend_from_slice(&[0xff, 0xd0]),
         }
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         if self.post_call_outlined(true) {
             return;
         }
         self.clear_recv_cache(true);
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.survive_reload();
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.reload_after_call();
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.recheck_body_globals();
     }
 
@@ -8357,7 +8343,7 @@ impl X64Assembler {
     ///
     /// (The stub's own `call` pushes its return address where the call just
     /// made pushed its own, so it disturbs nothing the call did not.)
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) fn post_call_outlined(&mut self, globals: bool) -> bool {
         if self.cold_binds.is_none() && !(self.ool_tail && post_ool_enabled()) {
             return false;
@@ -8427,7 +8413,7 @@ impl X64Assembler {
     }
 
     /// The label of the body's stub doing `req` (made once).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     fn post_stub(&mut self, req: PostCall) -> Label {
         match self.post_stubs.iter().find(|(p, _)| *p == req) {
             Some(&(_, l)) => l,
@@ -8440,7 +8426,7 @@ impl X64Assembler {
     }
 
     /// Places every post-call stub ([`PostCall`]) at the end of the code.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     fn place_post_stubs(&mut self) {
         let stubs = core::mem::take(&mut self.post_stubs);
         let (pin, gc_body) = (self.pin, self.gc_body);
@@ -8471,7 +8457,7 @@ impl X64Assembler {
     /// keys and the global binding caches stay valid across it, and no
     /// pending inlined activation needs materializing for it. Only the
     /// promoted SSE registers (caller-saved) are spilled and reloaded.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     pub(crate) fn call_rax_pure(&mut self) {
         self.spill_before_call();
         self.code.extend_from_slice(&[0xff, 0xd0]);
@@ -8581,7 +8567,7 @@ impl X64Assembler {
         self.frame_entry_clears();
         // (Then the global binding cache's direct-read base, set where the
         // frame's epoch slot was emptied.)
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         if let Some(e) = self.entry_globals {
             self.gp_entry(e);
         }
@@ -8591,7 +8577,7 @@ impl X64Assembler {
     /// entry-cleared slots.
     fn frame_entry_clears(&mut self) {
         // (The entry empties every way.)
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         if prologue_sse_clear() {
             // Every slot the entry empties, two side by side at a time
             // through `xmm15` (`clear_keys`): nothing lives in an SSE
@@ -8608,7 +8594,7 @@ impl X64Assembler {
             self.clear_keys(&all, true);
             return;
         }
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         {
             self.recv_survive.clear();
             if let Some(d) = self.recv_seen {
@@ -8617,7 +8603,7 @@ impl X64Assembler {
         }
         self.clear_recv_cache(false);
         self.clear_entry_slots();
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         for i in 0..self.inline_clear.len() {
             let d = self.inline_clear[i];
             self.store_empty(d);
@@ -8627,7 +8613,7 @@ impl X64Assembler {
     /// `lea rsp, [rbp-16]; pop rbx; pop r15; pop rbp; ret` — the frame-ABI
     /// epilogue (the result is already in `rax`).
     pub fn frame_epilogue(&mut self) {
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         self.pin_leave();
         self.code.extend_from_slice(&[0x48, 0x8d, 0x65, 0xf0]); // lea rsp, [rbp-16]
         self.code.push(0x5b); // pop rbx
@@ -8818,9 +8804,9 @@ impl X64Assembler {
         // A heap handle first: the usual condition that is neither a Number
         // nor a boolean is an object (`if (node)`, `if (!p) return`), and a
         // proven Number or boolean never gets here (`numeric`).
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         let heap = self.new_label();
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         {
             self.p_cmp_handle_floor(call_seq::r::RAX);
             self.g_jcc(call_seq::cc::AE, heap);
@@ -8837,7 +8823,7 @@ impl X64Assembler {
         self.jne(numl); // a number → numeric truthiness
         // boolean? compare the raw word against the two boolean tags (an
         // ordinary object or a VM function inline above).
-        #[cfg(not(all(feature = "alloc", jit_x64)))]
+        #[cfg(not(all(feature = "alloc", jit_native)))]
         {
             self.movabs_r11(tag_true as i64);
             self.cmp_rax_r11();
@@ -8846,14 +8832,14 @@ impl X64Assembler {
             self.cmp_rax_r11();
             self.je(set0);
         }
-        #[cfg(all(feature = "alloc", jit_x64))]
+        #[cfg(all(feature = "alloc", jit_native))]
         {
             let _ = (tag_true, tag_false);
             self.jmp(helper);
             self.bind(heap);
             self.p_truthy_handle(realm_off, set1, helper);
         }
-        #[cfg(not(all(feature = "alloc", jit_x64)))]
+        #[cfg(not(all(feature = "alloc", jit_native)))]
         let _ = realm_off;
         self.bind(helper);
         if let Some(slow) = slow {
@@ -8884,7 +8870,7 @@ impl X64Assembler {
     /// to `yes` when the value at `disp` is truthy, to `no` when it is falsy,
     /// with no `0`/`1` made (`KATAAN_JIT_TRUTHYBR`). With `slow`, a value
     /// the inline cases do not decide goes there instead of the helper.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     #[allow(clippy::too_many_arguments)]
     pub fn emit_truthy_branch(
         &mut self,
@@ -9073,6 +9059,15 @@ impl X64Assembler {
         self.code
             .extend_from_slice(&[0x0f, 0x57, 0xc9, 0xf2, 0x48, 0x0f, 0x2a, 0xc8]);
     }
+}
+
+/// Whether this target's backend is switched on: always on x86-64; on
+/// AArch64 only when its baseline generic tier is (`KATAAN_JIT_A64GEN=1`,
+/// or the crate's own tests), the port being opt-in until that tier pays.
+#[cfg(jit_native)]
+#[must_use]
+pub(crate) fn backend_enabled() -> bool {
+    !cfg!(target_arch = "aarch64") || a64_generic::enabled()
 }
 
 /// Whether the JIT can emit and run native code on this target.
@@ -9734,7 +9729,7 @@ impl JitFunction {
     ///
     /// `ops` is the bytecode the stream was lowered from; it must outlive the
     /// returned code (the `Interp` sites bake pointers into it).
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compile_generic(
@@ -9758,7 +9753,8 @@ impl JitFunction {
         lits: &alloc::rc::Rc<crate::realm::LitCells>,
     ) -> Option<GenericCompiled> {
         use crate::nanbox::NanBox;
-        if ops.len() != bytecode.len() || n_regs > 0xffff {
+        // (x86-64 code: never mapped on another architecture.)
+        if !cfg!(target_arch = "x86_64") || ops.len() != bytecode.len() || n_regs > 0xffff {
             return None;
         }
         // (The body's liveness is computed once per question while this
@@ -20694,7 +20690,7 @@ impl JitFunction {
 
     /// Invokes a generic-tier (frame ABI) body:
     /// `extern "sysv64" fn(ctx, regs, entry) -> u64`.
-    #[cfg(all(feature = "alloc", jit_x64))]
+    #[cfg(all(feature = "alloc", jit_native))]
     #[must_use]
     pub fn call_generic(&self, ctx: *mut core::ffi::c_void, regs: *mut u64, entry: u64) -> u64 {
         // SAFETY: `buf` holds verified, self-emitted machine code following the
@@ -20704,7 +20700,7 @@ impl JitFunction {
         // `entry` is one of the body's entry pcs (any other value makes the body
         // return the throw sentinel without touching `regs`).
         #[allow(unsafe_code)]
-        let f: extern "sysv64" fn(*mut core::ffi::c_void, *mut u64, u64) -> u64 =
+        let f: jit_abi!(fn(*mut core::ffi::c_void, *mut u64, u64) -> u64) =
             unsafe { core::mem::transmute(self.buf.ptr()) };
         f(ctx, regs, entry)
     }
@@ -20744,7 +20740,7 @@ impl JitFunction {
             // `extern "sysv64" fn(f64 x4) -> f64` (args in xmm0..xmm3, result in xmm0);
             // unused register args are ignored by the callee.
             #[allow(unsafe_code)]
-            let f: extern "sysv64" fn(f64, f64, f64, f64) -> f64 =
+            let f: jit_abi!(fn(f64, f64, f64, f64) -> f64) =
                 unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a[0], a[1], a[2], a[3])
         }
@@ -20778,7 +20774,7 @@ impl JitFunction {
             // `extern "sysv64" fn(i64 x6) -> i64`; reading fewer than 6 args is sound
             // (extra register args are simply ignored by the callee).
             #[allow(unsafe_code)]
-            let f: extern "sysv64" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+            let f: jit_abi!(fn(i64, i64, i64, i64, i64, i64) -> i64) =
                 unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a[0], a[1], a[2], a[3], a[4], a[5])
         }
@@ -20798,7 +20794,7 @@ impl JitFunction {
             // System V ABI for `extern "sysv64" fn(i64) -> i64`; the memory is mapped
             // executable and outlives the call (it is owned by `self`).
             #[allow(unsafe_code)]
-            let f: extern "sysv64" fn(i64) -> i64 = unsafe { core::mem::transmute(self.buf.ptr()) };
+            let f: jit_abi!(fn(i64) -> i64) = unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a)
         }
         #[cfg(not(jit_native))]
@@ -20815,8 +20811,7 @@ impl JitFunction {
         {
             // SAFETY: as `call1`, for `extern "sysv64" fn(i64, i64) -> i64`.
             #[allow(unsafe_code)]
-            let f: extern "sysv64" fn(i64, i64) -> i64 =
-                unsafe { core::mem::transmute(self.buf.ptr()) };
+            let f: jit_abi!(fn(i64, i64) -> i64) = unsafe { core::mem::transmute(self.buf.ptr()) };
             f(a, b)
         }
         #[cfg(not(jit_native))]
@@ -20861,7 +20856,7 @@ pub enum BinOp {
     Mul,
 }
 
-#[cfg(all(feature = "alloc", jit_x64))]
+#[cfg(all(feature = "alloc", jit_native))]
 mod numeric;
 
 #[cfg(jit_a64)]
@@ -21430,7 +21425,7 @@ mod tests {
         assert!(tested, "expected an integer arithmetic proto to lower");
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn jit_deopts_on_overflow_and_range() {
         use crate::nanbox::{NanBox, Unpacked};
@@ -21465,7 +21460,7 @@ mod tests {
         );
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn jit_compiles_a_real_loop() {
         use crate::nanbox::{NanBox, Unpacked};
@@ -21539,7 +21534,7 @@ mod tests {
         }
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn float_jitproto_runs_division_function() {
         use crate::nanbox::{NanBox, Unpacked};
@@ -21573,7 +21568,7 @@ mod tests {
         );
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn jit_proto_end_to_end_with_deopt_guard() {
         use crate::nanbox::{NanBox, Unpacked};
@@ -21668,7 +21663,7 @@ mod tests {
         assert!(lower_nbvm(&ok).is_some(), "written-then-read should lower");
     }
 
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn lower_nbvm_wires_a_static_call() {
         use crate::nbvm::{FnProto, Op};
@@ -22827,7 +22822,7 @@ mod tests {
 
     /// A body past the size limit stays in the interpreter: the tier's
     /// analyses are not linear in the body.
-    #[cfg(jit_x64)]
+    #[cfg(jit_native)]
     #[test]
     fn generic_tier_refuses_a_huge_body() {
         let lowers = |n: usize| {

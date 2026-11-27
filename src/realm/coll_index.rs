@@ -60,7 +60,7 @@ fn home(h: u32, mask: usize) -> usize {
 /// index, of its slot buffer's pointer word and its slot count word
 /// (`slots`, a `Vec<u64>`, whose words are found on a probe). `None` when
 /// they cannot be told apart.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[must_use]
 pub(crate) fn jit_slots_layout() -> Option<(usize, usize)> {
     use core::mem::{offset_of, size_of};

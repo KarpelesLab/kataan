@@ -53,13 +53,13 @@ mod free_memo;
 mod fresh_lit;
 mod global_mirror;
 mod global_obj;
-#[cfg(jit_x64)]
+#[cfg(jit_native)]
 pub(crate) use global_mirror::plan_body as plan_global_mirrors;
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 mod await_fast;
 mod gen_fast;
 mod iter_fast;
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 mod jit_tier;
 #[cfg(feature = "std")]
 mod math_fast;
@@ -72,7 +72,7 @@ mod typeof_fast;
 pub use str_replace::{PlanText, ReplacePlan, ReplaceStep};
 pub use typeof_fast::TypeofGlobalCache;
 mod vm_eval;
-#[cfg(all(test, feature = "jit", jit_x64))]
+#[cfg(all(test, feature = "jit", jit_native))]
 use jit_tier::call_generic;
 pub(crate) use vm_eval::{
     EVAL_DERIVED, EVAL_DYN_FN, EVAL_FIELD_INIT, EVAL_HOME, EVAL_NEW_TARGET, EVAL_SCRIPT,
@@ -1929,7 +1929,7 @@ pub(crate) fn call_vm_function_in(
         core::mem::swap(&mut ctx.realm, host.realm_slot());
         ctx.host = Some(host);
         ctx.in_realm = in_realm;
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         {
             ctx.jit_rt.main_realm = in_realm.is_none();
         }
@@ -1975,12 +1975,12 @@ fn run_vm_callback(
 ) -> Result<NanBox, VmError> {
     // A closure with a compiled body is entered there directly, as a
     // compiled caller enters it; anything else is the ordinary VM call.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     let r = match jit_tier::call_hosted(ctx, table, f, this, args) {
         Some(r) => r,
         None => call_closure(ctx, table, f, args, this),
     };
-    #[cfg(not(all(feature = "jit", jit_x64)))]
+    #[cfg(not(all(feature = "jit", jit_native)))]
     let r = call_closure(ctx, table, f, args, this);
     if r.is_ok() && !ctx.microtasks.is_empty() {
         Err(VmError::Unsupported)
@@ -2046,7 +2046,7 @@ mod hosted_pool {
         c.pending_new_target = None;
         c.gen_open_memo = None;
         c.gen_site_memo = super::gen_fast::SiteMemo::default();
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         {
             c.jit_pending = None;
             c.jit_pending_fault = None;
@@ -2078,7 +2078,7 @@ fn hosted_ctx<'a>(realm: Box<Realm>, host: &'a mut dyn VmHost) -> Ctx<'a> {
     let in_realm = host.realm_index();
     let mut ctx = hosted_ctx_in(realm, Some(host));
     ctx.in_realm = in_realm;
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     {
         ctx.jit_rt.main_realm = in_realm.is_none();
     }
@@ -2096,15 +2096,15 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: Option<&'a mut dyn VmHost>) -> Ctx
         gen_site_memo: gen_fast::SiteMemo::default(),
         gen_proto_ic: PropertyCache::new(),
         agen_ic: PropertyCache::new(),
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         jit_pending: None,
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         jit_pending_fault: None,
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         jit_funcs: None,
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         jit_rt: jit_tier::TierRuntime::hosted(),
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         jit_shadow: alloc::vec::Vec::new(),
         call_depth: 0,
         gc_enabled: false,
@@ -2115,9 +2115,9 @@ fn hosted_ctx_in<'a>(realm: Box<Realm>, host: Option<&'a mut dyn VmHost>) -> Ctx
         top_frame_roots: Vec::new(),
         pending_callee: None,
         pending_new_target: None,
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         exec_op_ic: Vec::new(),
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         exec_op_ics: alloc::collections::BTreeMap::new(),
         in_realm: None,
     }
@@ -3723,7 +3723,7 @@ fn resume_async_frame(
     fulfilled: bool,
     v: NanBox,
 ) -> Result<(), VmError> {
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     if fulfilled
         && let Some(fh) = state
         && crate::nbexec::promise::await_lean_on()
@@ -3741,7 +3741,7 @@ fn resume_async_frame(
 /// [`resume_async_frame`]'s fulfilled resumption of the frame cell `fh` by
 /// the general path (`await_fast`'s, for a frame it continued in place and
 /// then declined).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn resume_parked(
     ctx: &mut Ctx,
     table: &FnTable,
@@ -3805,12 +3805,12 @@ fn resume_async_general(
         let (mut pc, mut handlers, mut inject) = (pc, handlers, inject);
         // A settled value to continue with by the lean resumption, the frame
         // parked in its cell for it (see below).
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         let mut handoff = None;
         let r = loop {
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             let (mut hot, mut resumes) = (false, 0);
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             if let Ok(mut t) = proto.tier.0.try_borrow_mut() {
                 t.resumes = t.resumes.saturating_add(1);
                 {
@@ -3822,13 +3822,13 @@ fn resume_async_general(
             }
             // A hot body resumes in native code, on the same register file (a
             // rejection, thrown at the `await`, is the interpreter's).
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             let compiled = if hot {
                 jit_tier::resume_frame(ctx, table, id, &mut regs, pc, &mut handlers, &ic, resumes)
             } else {
                 None
             };
-            #[cfg(not(all(feature = "jit", jit_x64)))]
+            #[cfg(not(all(feature = "jit", jit_native)))]
             let compiled = None;
             let r = match compiled {
                 Some(r) => r,
@@ -3856,7 +3856,7 @@ fn resume_async_general(
                     Some(w) => {
                         // Once the body runs hot in place, the frame goes to
                         // the lean resumption, parked as at a suspension.
-                        #[cfg(all(feature = "jit", jit_x64))]
+                        #[cfg(all(feature = "jit", jit_native))]
                         if crate::nbexec::promise::await_lean_on()
                             && await_fast::lean_ready(proto, regs.len())
                         {
@@ -3892,7 +3892,7 @@ fn resume_async_general(
             t.ic = ic;
             t.ic_body = body;
         }
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if let Some(w) = handoff {
             ctx.frame_shadow.truncate(mark);
             return resume_async_frame(ctx, table, controller, Some(fh), true, w);
@@ -4224,7 +4224,7 @@ fn agen_drain(
         }
         // Resume the body: a hot one resumed by `next(v)`, in place
         // (`await_fast`).
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         let (lands, nland) = {
             let u = (0, NanBox::undefined());
             match captured {
@@ -4233,7 +4233,7 @@ fn agen_drain(
                 None => ([u, u], 0),
             }
         };
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if (captured.is_some() || kind != 1)
             && crate::nbexec::promise::await_lean_on()
             && let Some(r) = await_fast::agen_lean_run(
@@ -4540,7 +4540,7 @@ fn resume_agen_frame_inner(
             }
         } else {
             // A hot body resumed fulfilled runs in place (`await_fast`).
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             if fulfilled
                 && crate::nbexec::promise::await_lean_on()
                 && let Some(r) = await_fast::agen_lean_run(
@@ -4604,11 +4604,11 @@ fn run_suspended(
 ) -> Result<FrameExit, VmError> {
     let proto = funcs.get(id).ok_or(VmError::Unsupported)?;
     let body = proto.ops.as_ptr() as usize;
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     let (mut hot, mut resumes) = (false, 0);
     let mut ic = match proto.tier.0.try_borrow_mut() {
         Ok(mut t) => {
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             {
                 t.resumes = t.resumes.saturating_add(1);
                 resumes = t.resumes;
@@ -4624,15 +4624,15 @@ fn run_suspended(
         }
         _ => Vec::new(),
     };
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     let mut handlers = handlers;
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     let compiled = if hot {
         jit_tier::resume_frame(ctx, funcs, id, regs, pc, &mut handlers, &ic, resumes)
     } else {
         None
     };
-    #[cfg(not(all(feature = "jit", jit_x64)))]
+    #[cfg(not(all(feature = "jit", jit_native)))]
     let compiled = None;
     let r = match compiled {
         Some(r) => r,
@@ -5262,7 +5262,7 @@ pub struct StoreGlobalCache {
     pub(crate) jit: global_mirror::MirrorCache,
     /// Compiled code's memo of its last write validation
     /// (`jit_tier::global_store_ref`).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) jit_memo: StoreRefMemo,
 }
 
@@ -5276,7 +5276,7 @@ pub struct StoreGlobalCache {
 /// (the epoch is bumped whenever the global scope is swapped, its bindings
 /// change, or the global object's own keys may have changed). A clone starts
 /// empty (its op's mirror state does too).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[derive(Debug, Default)]
 pub(crate) struct StoreRefMemo {
     /// `(epoch, global, binding address, mirror target)`; epoch `0` (never
@@ -5284,7 +5284,7 @@ pub(crate) struct StoreRefMemo {
     pub(crate) v: core::cell::Cell<(u64, u64, u64, u64)>,
 }
 
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 impl Clone for StoreRefMemo {
     fn clone(&self) -> Self {
         Self::default()
@@ -5704,7 +5704,7 @@ struct Ctx<'a> {
     /// [`jit_helper_add`]). The helper returns the reserved throw sentinel and
     /// leaves the value here; [`call_generic`] takes it back out as
     /// `Err(VmError::Thrown(..))`. `None` between helper faults.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     jit_pending: Option<NanBox>,
     /// An in-flight non-throw fault (or thrown value) stashed by a generic-JIT
     /// property helper ([`jit_helper_get_prop`]/[`jit_helper_set_prop`]). Unlike
@@ -5712,19 +5712,19 @@ struct Ctx<'a> {
     /// full [`VmError`], so a `VmError::Unsupported` from `vm_set_prop` (a
     /// descriptor-aware case the interpreter owns) propagates out of the JIT
     /// exactly as it would from the interpreter. `None` between helper faults.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     jit_pending_fault: Option<VmError>,
     /// The function table the currently-running generic-JIT body belongs to, as a
     /// raw pointer so a runtime helper (which only receives `ctx`) can reconstruct
     /// `&[FnProto]` to re-enter the interpreter (e.g. to run a user `valueOf`). Set
     /// by [`call_generic`] immediately before invoking native code; the whole
     /// program shares one table, so it is invariant across nested calls.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     jit_funcs: Option<*const [FnProto]>,
     /// The exception-handler stacks of the running generic-JIT activations (the
     /// interpreter keeps its own in `run_frame_at`) and the compiled-call cache;
     /// see `jit_tier::TierRuntime`.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     jit_rt: jit_tier::TierRuntime,
     /// Forward-safety GC root hook (`JIT_DESIGN.md` §5): a helper-call sequence
     /// would spill live NanBox temps here before re-entering, so an
@@ -5733,7 +5733,7 @@ struct Ctx<'a> {
     /// exposed to a moving collection; the field is landed (and mirrored into the
     /// realm root set via `Realm::jit_shadow_roots`) so the wiring exists ahead of
     /// an allocation-triggered GC. The emitted code does not populate it yet.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[allow(dead_code)]
     jit_shadow: alloc::vec::Vec<u64>,
     /// Function-call nesting depth (recursion guard).
@@ -5790,9 +5790,9 @@ struct Ctx<'a> {
     /// Inline caches of the property ops the generic JIT tier runs one at a
     /// time through the interpreter (`jit_tier::jit_helper_exec_op`), keyed by
     /// the op's address, plus a scratch one-entry cache vector for that call.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     exec_op_ics: alloc::collections::BTreeMap<usize, PropertyCache>,
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     exec_op_ic: Vec<PropertyCache>,
     /// The host realm (a `$262.createRealm()` index) this run executes in,
     /// when not the main one: closures it creates belong to that realm.
@@ -5836,26 +5836,26 @@ struct TierState {
     /// the compiled code or `None` (not eligible). Compiled code may call the
     /// code of the functions it statically calls by address; those live in
     /// the same table, which outlives any activation running from it.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     jit: Option<Option<alloc::rc::Rc<crate::jit::JitProto>>>,
     /// Native code a recompilation replaced (see [`TierSlot::replace_jit`]).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     retired_jit: Vec<alloc::rc::Rc<crate::jit::JitProto>>,
     /// For a function whose native code is an Int/Float-tier body (which has
     /// no native-call entry): its generic-tier compilation, which compiled
     /// callers enter instead (`None` until tried, then the outcome; see
     /// `jit_tier::direct_target`). Kept with the function for the same reason
     /// as `jit`: compiled call sites hold its address.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     twin: Option<Option<alloc::rc::Rc<crate::jit::JitProto>>>,
     /// A generator function's resumptions so far (its generators' hotness:
     /// see `jit_tier::resume_is_hot`).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     resumes: u32,
     /// A generator function's plain prologue (see `gen_fast::create`): `0`
     /// until looked at, then its `Op::GeneratorStart`'s index plus one, or
     /// `u32::MAX` when the prologue is not plain.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     gen_plain: u32,
 }
 
@@ -5912,14 +5912,14 @@ impl core::fmt::Debug for TierSlot {
 
 impl TierSlot {
     /// Whether the function tiered up (has an optimized body).
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     fn has_body(&self) -> bool {
         self.0.try_borrow().is_ok_and(|t| t.body.is_some())
     }
 
     /// Counts an activation that bypassed `call_with_inner` (a compiled call
     /// entering a compiled callee directly).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn bump(&self) {
         if let Ok(mut t) = self.0.try_borrow_mut() {
             t.calls = t.calls.saturating_add(1);
@@ -5927,20 +5927,20 @@ impl TierSlot {
     }
 
     /// The optimized body, if the function tiered up.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn body(&self) -> Option<alloc::rc::Rc<Vec<Op>>> {
         self.0.try_borrow().ok().and_then(|t| t.body.clone())
     }
 
     /// The cached native-code compilation outcome, if one was attempted.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[inline(always)]
     fn jit(&self) -> Option<Option<alloc::rc::Rc<crate::jit::JitProto>>> {
         self.0.try_borrow().ok().and_then(|t| t.jit.clone())
     }
 
     /// Records the native-code compilation outcome.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn set_jit(&self, j: Option<alloc::rc::Rc<crate::jit::JitProto>>) {
         if let Ok(mut t) = self.0.try_borrow_mut() {
             t.jit = Some(j);
@@ -5949,13 +5949,13 @@ impl TierSlot {
 
     /// The generic-tier twin of an Int/Float-tier function, if one was
     /// attempted (see [`TierState::twin`]).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn twin(&self) -> Option<Option<alloc::rc::Rc<crate::jit::JitProto>>> {
         self.0.try_borrow().ok().and_then(|t| t.twin.clone())
     }
 
     /// Records the generic-tier twin's compilation outcome.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn set_twin(&self, j: Option<alloc::rc::Rc<crate::jit::JitProto>>) {
         if let Ok(mut t) = self.0.try_borrow_mut() {
             t.twin = Some(j);
@@ -5965,7 +5965,7 @@ impl TierSlot {
     /// Every generic body the function has had: its code, its twin and
     /// the code recompilations replaced (all of which compiled callers may
     /// still enter or be running).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn bodies(&self) -> Vec<alloc::rc::Rc<crate::jit::JitProto>> {
         let Ok(t) = self.0.try_borrow() else {
             return Vec::new();
@@ -5983,7 +5983,7 @@ impl TierSlot {
     /// Makes `j` (a recompilation) the function's native code; the code it
     /// replaces is kept alive with the function, since compiled callers may
     /// hold its address (`jit_tier::recompile` bounds how many there are).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn replace_jit(&self, j: alloc::rc::Rc<crate::jit::JitProto>) {
         if let Ok(mut t) = self.0.try_borrow_mut()
             && let Some(Some(old)) = t.jit.replace(Some(j))
@@ -6025,15 +6025,15 @@ pub fn run_program(
             gen_site_memo: gen_fast::SiteMemo::default(),
             gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_pending: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_pending_fault: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_funcs: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_rt: jit_tier::TierRuntime::default(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
             gc_enabled: true,
@@ -6044,9 +6044,9 @@ pub fn run_program(
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ic: Vec::new(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         };
@@ -6079,15 +6079,15 @@ pub fn run_program_capturing(
             gen_site_memo: gen_fast::SiteMemo::default(),
             gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_pending: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_pending_fault: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_funcs: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_rt: jit_tier::TierRuntime::default(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
             gc_enabled: true,
@@ -6098,9 +6098,9 @@ pub fn run_program_capturing(
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ic: Vec::new(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         };
@@ -6358,13 +6358,13 @@ fn call_with_inner(
         }
         // A hot function with Int/Float-tier native code runs on its
         // arguments alone: no register window to build.
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if let Some(v) = unboxed_fast_call(proto, &args) {
             return Ok(v);
         }
         // A hot async function: its compiled body entered directly
         // (`KATAAN_ASYNC_CALL`).
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if proto.is_async
             && !proto.is_generator
             && crate::nbexec::promise::async_call_lean_on()
@@ -6489,7 +6489,7 @@ fn call_with_inner(
         // (A switch of body leaves the old body's caches behind; the
         // compiler below may still learn from them, since it re-derives every
         // memo from its shape and the site's own key.)
-        #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(unused_variables))]
+        #[cfg_attr(not(all(feature = "jit", jit_native)), allow(unused_variables))]
         let stale_ic = if ic_body == body.as_ptr() as usize {
             Vec::new()
         } else {
@@ -6499,7 +6499,7 @@ fn call_with_inner(
         // to machine code and run that on this activation's register file (see
         // `jit_tier`). A compiled body's proper tail call comes back as
         // `FrameExit::Tail`, for this trampoline.
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if jit_tier::call_is_hot(optimized.is_some())
             && let Some(outcome) = jit_tier::enter_on_call(
                 ctx,
@@ -6555,7 +6555,7 @@ fn call_with_inner(
             ctx.frame_shadow.push(p);
             // A hot body runs in native code (to its first `await` or its
             // end), else interpreted on the function's persistent caches.
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             let compiled = if jit_tier::call_is_hot(optimized.is_some()) {
                 jit_tier::enter_async_on_call(
                     ctx,
@@ -6567,7 +6567,7 @@ fn call_with_inner(
             } else {
                 None
             };
-            #[cfg(not(all(feature = "jit", jit_x64)))]
+            #[cfg(not(all(feature = "jit", jit_native)))]
             let compiled = None;
             let (r, ic_for) = match compiled {
                 Some(r) => (r, ic_body),
@@ -6661,7 +6661,7 @@ fn call_with_inner(
 /// allocate), so it is called on the argument values directly. `None` — not
 /// such a function, or a deopt (an argument it cannot represent, an
 /// overflow) — runs the ordinary activation.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn unboxed_fast_call(proto: &FnProto, args: &[NanBox]) -> Option<NanBox> {
     if proto.rest_from.is_some() || proto.n_captures != 0 || proto.is_async || proto.is_generator {
         return None;
@@ -6679,7 +6679,7 @@ fn unboxed_fast_call(proto: &FnProto, args: &[NanBox]) -> Option<NanBox> {
 
 /// Function `id`'s native code (`None` if it is not JIT-eligible), compiled on
 /// first use and kept in the function's [`TierSlot`] thereafter.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 ///
 /// `ic` is the running activation's inline caches, if it holds them (they
 /// are out of the function's tier state while it runs): the compiled code
@@ -6705,7 +6705,7 @@ fn jit_for(
 
 /// Function `proto`'s persistent inline caches' memos, by pc (empty while
 /// an activation has them out, or before any ran).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn tier_warm(proto: &FnProto) -> Vec<Option<crate::ic::WarmEntry>> {
     proto.tier.0.try_borrow().map_or_else(
         |_| Vec::new(),
@@ -6715,7 +6715,7 @@ fn tier_warm(proto: &FnProto) -> Vec<Option<crate::ic::WarmEntry>> {
 
 /// Function `proto`'s persistent element access sites' feedback
 /// (`ic::elem_fb`): `(pc, feedback)` for each site that has some.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn tier_elem_kinds(proto: &FnProto) -> Vec<(usize, u8)> {
     proto
         .tier
@@ -6726,7 +6726,7 @@ pub(crate) fn tier_elem_kinds(proto: &FnProto) -> Vec<(usize, u8)> {
 
 /// The element access sites' feedback (`ic::elem_fb`) in caches `ic` (by
 /// pc): `(pc, feedback)` for each site that has some.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) fn elem_kinds_of(ic: &[PropertyCache]) -> Vec<(usize, u8)> {
     ic.iter()
         .enumerate()
@@ -6737,7 +6737,7 @@ pub(crate) fn elem_kinds_of(ic: &[PropertyCache]) -> Vec<(usize, u8)> {
 
 /// Function `proto`'s persistent call sites' callee feedback, by pc (as
 /// [`tier_warm`]).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn tier_hints(proto: &FnProto) -> Vec<crate::ic::CalleeHint> {
     proto.tier.0.try_borrow().map_or_else(
         |_| Vec::new(),
@@ -6752,7 +6752,7 @@ fn tier_hints(proto: &FnProto) -> Vec<crate::ic::CalleeHint> {
 /// `stack` guards against recursion: a function reached while already being
 /// compiled (direct or mutual recursion) is left unregistered, so the recursive
 /// call simply bails the caller's JIT — sound, just not accelerated.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn ensure_jit(
     cache: &mut alloc::collections::BTreeMap<usize, Option<alloc::rc::Rc<crate::jit::JitProto>>>,
     funcs: &[FnProto],
@@ -6935,15 +6935,15 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             gen_site_memo: gen_fast::SiteMemo::default(),
             gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_pending: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_pending_fault: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_funcs: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_rt: jit_tier::TierRuntime::default(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_shadow: alloc::vec::Vec::new(),
             call_depth: 0,
             // Hand-built op arrays may embed heap handles as `LoadConst` values that
@@ -6956,9 +6956,9 @@ pub fn run(realm: &mut Realm, program: &[Op], register_count: usize) -> Result<N
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ic: Vec::new(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         };
@@ -8126,6 +8126,7 @@ fn vm_set_prop(
     Ok(())
 }
 
+jit_extern! {
 /// The generic-JIT runtime helper for a property **get**. Reconstructs `&mut Ctx`
 /// and the running function table from the opaque pointers, runs the shared
 /// [`vm_get_prop`] through the site's persistent inline cache, and returns the
@@ -8137,8 +8138,8 @@ fn vm_set_prop(
 /// `key_ptr`/`key_len` a valid UTF-8 slice owned by the calling `JitProto`; and
 /// `cache` that site's `PropertyCache` (also owned by the `JitProto`), with no
 /// other live borrow of it during the call.
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_get_prop(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_get_prop(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8179,7 +8180,9 @@ pub(crate) extern "sysv64" fn jit_helper_get_prop(
         }
     }
 }
+}
 
+jit_extern! {
 /// The generic-JIT runtime helper for a property **set**. Mirrors
 /// [`jit_helper_get_prop`], running the interpreter's [`vm_set_prop_mode`]; returns
 /// `undefined`'s bits on success, or the throw/deopt sentinel (with the fault in
@@ -8187,8 +8190,8 @@ pub(crate) extern "sysv64" fn jit_helper_get_prop(
 ///
 /// # Safety
 /// As [`jit_helper_get_prop`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_set_prop(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_set_prop(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8198,12 +8201,14 @@ pub(crate) extern "sysv64" fn jit_helper_set_prop(
 ) -> u64 {
     jit_set_prop_impl(ctx, obj, key_ptr, key_len, cache, val, false)
 }
+}
 
+jit_extern! {
 /// The generic-JIT helper for `Op::InitProp` (a literal's own data property),
 /// running the interpreter's [`vm_init_prop`] through the site's persistent
 /// inline cache. Same contract as [`jit_helper_set_prop`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_init_prop(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_init_prop(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8233,10 +8238,12 @@ pub(crate) extern "sysv64" fn jit_helper_init_prop(
         }
     }
 }
+}
 
+jit_extern! {
 /// [`jit_helper_set_prop`] for strict-mode code (`Op::SetPropStrict`).
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_set_prop_strict(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_set_prop_strict(
     ctx: *mut core::ffi::c_void,
     obj: u64,
     key_ptr: *const u8,
@@ -8246,8 +8253,9 @@ pub(crate) extern "sysv64" fn jit_helper_set_prop_strict(
 ) -> u64 {
     jit_set_prop_impl(ctx, obj, key_ptr, key_len, cache, val, true)
 }
+}
 
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn jit_set_prop_impl(
     ctx: *mut core::ffi::c_void,
     obj: u64,
@@ -8303,6 +8311,7 @@ fn jit_set_prop_impl(
     }
 }
 
+jit_extern! {
 /// The generic-JIT runtime helper for a computed element **get** `obj[key]`.
 /// Reconstructs `&mut Ctx` + the running function table from the opaque pointers,
 /// runs the shared [`vm_get_elem`], and returns the result's `NanBox` bits — or,
@@ -8313,8 +8322,8 @@ fn jit_set_prop_impl(
 /// # Safety
 /// `ctx` must be the live `Ctx` the dispatcher passed (with `ctx.jit_funcs` set);
 /// the reentrancy is single-threaded (the native caller holds no live `&mut Ctx`).
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_get_elem(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_get_elem(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -8361,10 +8370,11 @@ pub(crate) extern "sysv64" fn jit_helper_get_elem(
     }
     jit_get_elem_general(ctx, recv, key)
 }
+}
 
 /// Whether compiled code's general element read answers a string's index
 /// first (`KATAAN_STR_INDEX=0` takes it after the other kinds' checks).
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn str_index_on() -> bool {
     #[cfg(feature = "std")]
     {
@@ -8378,7 +8388,7 @@ fn str_index_on() -> bool {
 }
 
 /// [`jit_helper_get_elem`] past its memoized String-key read.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[inline(never)]
 fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64 {
     // SAFETY: single-threaded reentrancy — as `jit_helper_get_prop`.
@@ -8453,14 +8463,15 @@ fn jit_get_elem_general(ctx: *mut core::ffi::c_void, recv: u64, key: u64) -> u64
     }
 }
 
+jit_extern! {
 /// [`jit_helper_get_elem`] at a site whose key is likely a `for-in`'s: a key
 /// String of the loop's list on an object of its layout first
 /// (`Realm::for_in_key_value`, which `vm_get_elem` would reach for it).
 ///
 /// # Safety
 /// As [`jit_helper_get_elem`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_get_elem_key(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_get_elem_key(
     ctx_raw: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -8478,7 +8489,9 @@ pub(crate) extern "sysv64" fn jit_helper_get_elem_key(
     }
     jit_helper_get_elem(ctx_raw, recv, key)
 }
+}
 
+jit_extern! {
 /// The generic-JIT runtime helper for a computed element **set** `obj[key] = val`.
 /// Mirrors [`jit_helper_get_elem`], running the interpreter's [`vm_set_elem_mode`]
 /// (`strict` nonzero for strict code); returns
@@ -8487,8 +8500,8 @@ pub(crate) extern "sysv64" fn jit_helper_get_elem_key(
 ///
 /// # Safety
 /// As [`jit_helper_get_elem`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_set_elem(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_set_elem(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     key: u64,
@@ -8520,7 +8533,9 @@ pub(crate) extern "sysv64" fn jit_helper_set_elem(
         }
     }
 }
+}
 
+jit_extern! {
 /// The generic-JIT runtime helper for a `.length` read (`Op::ArrayLen`): runs the
 /// shared [`vm_array_len`]. Mirrors [`jit_helper_get_elem`] — the result bits, or
 /// the throw/deopt sentinel with the fault (a non-object receiver) in
@@ -8528,8 +8543,8 @@ pub(crate) extern "sysv64" fn jit_helper_set_elem(
 ///
 /// # Safety
 /// As [`jit_helper_get_elem`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_array_len(ctx: *mut core::ffi::c_void, recv: u64) -> u64 {
     // SAFETY: see `jit_helper_get_elem`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -8563,11 +8578,12 @@ pub(crate) extern "sysv64" fn jit_helper_array_len(ctx: *mut core::ffi::c_void, 
         }
     }
 }
+}
 
 /// The generic-tier runtime-helper table (`+`, property get/set, element get/set,
 /// `.length`, arithmetic, comparisons, calls), passed to
 /// [`crate::jit::JitProto::compile_generic`].
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn jit_generic_helpers() -> crate::jit::GenericHelpers {
     crate::jit::GenericHelpers {
         add: jit_helper_add,
@@ -8656,6 +8672,7 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
     }
 }
 
+jit_extern! {
 /// The generic-JIT heap-arena accessor for the inline monomorphic property-get
 /// fast path. Reconstructs `&Ctx` from the opaque pointer and returns the object
 /// heap's slot-array base pointer + length. A leaf read: it allocates nothing and
@@ -8667,8 +8684,8 @@ fn jit_generic_helpers() -> crate::jit::GenericHelpers {
 /// `ctx` must be the live `Ctx` the dispatcher passed. The reentrancy is
 /// single-threaded — the native caller holds no live `&mut Ctx` while this runs
 /// (as [`jit_helper_get_prop`]).
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_arena(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_arena(
     ctx: *mut core::ffi::c_void,
     recv: u64,
     mode: u64,
@@ -8711,6 +8728,7 @@ pub(crate) extern "sysv64" fn jit_arena(
         len: if plain { len } else { 0 },
     }
 }
+}
 
 /// The register file a generic-JIT runtime helper lends the VM operation it
 /// runs (`regs` of `vm_add`, `vm_get_prop`, …): an empty one when the calling
@@ -8718,7 +8736,7 @@ pub(crate) extern "sysv64" fn jit_arena(
 /// ([`jit_tier::window_rooted`]), which lets the coercion, accessor, proxy
 /// trap or constructor the operation runs collect as from an interpreted
 /// frame; `None` (no collection inside) otherwise.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 #[inline(always)]
 fn jit_lent(ctx: &Ctx) -> Option<&'static [NanBox]> {
     if jit_tier::window_rooted(ctx) {
@@ -8733,7 +8751,7 @@ fn jit_lent(ctx: &Ctx) -> Option<&'static [NanBox]> {
 /// `ctx.jit_pending` and the reserved throw sentinel returned (mirrors the tail of
 /// [`jit_helper_add`]). A non-throw fault is surfaced as a thrown generic error, as
 /// it cannot travel through a `NanBox`.
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 fn jit_finish(ctx: &mut Ctx, r: Result<NanBox, VmError>) -> u64 {
     match r {
         Ok(v) => v.to_bits(),
@@ -8749,10 +8767,11 @@ fn jit_finish(ctx: &mut Ctx, r: Result<NanBox, VmError>) -> u64 {
     }
 }
 
+jit_extern! {
 /// Generic-JIT slow path for `-`/`*`/`/`/`%` (`GA_*` discriminant in `op`): runs the
 /// shared [`vm_arith`]. See [`jit_helper_add`] for the reentrancy/safety contract.
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_arith(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_arith(
     ctx: *mut core::ffi::c_void,
     a: u64,
     b: u64,
@@ -8779,11 +8798,13 @@ pub(crate) extern "sysv64" fn jit_helper_arith(
     );
     jit_finish(ctx, r)
 }
+}
 
+jit_extern! {
 /// Generic-JIT slow path for `Op::ValueBin` (`**`, bitwise, shifts, loose `==`/`!=`;
 /// `VB_*` discriminant in `op`): runs the shared [`vm_value_bin`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_value_bin(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_value_bin(
     ctx: *mut core::ffi::c_void,
     a: u64,
     b: u64,
@@ -8810,10 +8831,12 @@ pub(crate) extern "sysv64" fn jit_helper_value_bin(
     );
     jit_finish(ctx, r)
 }
+}
 
+jit_extern! {
 /// Generic-JIT slow path for relational `<` (`Op::Lt`): runs the shared [`vm_lt`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
     // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
@@ -8828,15 +8851,17 @@ pub(crate) extern "sysv64" fn jit_helper_lt(ctx: *mut core::ffi::c_void, a: u64,
     let r = vm_lt(ctx, funcs, NanBox::from_bits(a), NanBox::from_bits(b), lent);
     jit_finish(ctx, r)
 }
+}
 
+jit_extern! {
 /// Generic-JIT slow path for a relational `Op::Compare` (`op` 0 `<`, 1 `>`,
 /// 2 `<=`, 3 `>=`) of two strings, as the interpreter's arm decides it
 /// first (two BigInts by `Realm::bigint_binary_try`, two strings by
 /// [`string_compare`]): the boolean's bits, or the hole's when those
 /// decline (the caller then runs the interpreter's op). Runs no code,
 /// never throws.
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_str_compare(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_str_compare(
     ctx: *mut core::ffi::c_void,
     a: u64,
     b: u64,
@@ -8866,11 +8891,13 @@ pub(crate) extern "sysv64" fn jit_helper_str_compare(
         .unwrap_or(NanBox::hole())
         .to_bits()
 }
+}
 
+jit_extern! {
 /// Generic-JIT slow path for strict equality `===` (`Op::StrictEq`): runs the shared
 /// [`vm_strict_eq`]. Never throws, so it always returns a boolean `NanBox`'s bits.
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_strict_eq(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_strict_eq(
     ctx: *mut core::ffi::c_void,
     a: u64,
     b: u64,
@@ -8880,15 +8907,17 @@ pub(crate) extern "sysv64" fn jit_helper_strict_eq(
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
     vm_strict_eq(&ctx.realm, NanBox::from_bits(a), NanBox::from_bits(b)).to_bits()
 }
+}
 
+jit_extern! {
 /// `key in obj` (`Op::Relational`, not `instanceof`) in compiled code where
 /// the key is likely a `for-in`'s (the loop's per-key liveness check), as
 /// the interpreter arm's first step decides it from the heap alone
 /// (`Realm::has_property_by_for_in_key`, then `has_property_by_string`):
 /// the boolean's bits, or `undefined`'s when it cannot tell there (the
 /// caller then runs the interpreter's op). Never throws.
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_has_prop(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_has_prop(
     ctx: *mut core::ffi::c_void,
     key: u64,
     obj: u64,
@@ -8909,19 +8938,23 @@ pub(crate) extern "sysv64" fn jit_helper_has_prop(
         None => NanBox::undefined().to_bits(),
     }
 }
+}
 
+jit_extern! {
 /// Generic-JIT slow path for a truthiness test (`JumpIfFalse`/`Op::Not` on a
 /// non-number/non-boolean operand): runs the interpreter's `ToBoolean`
 /// (`Realm::truthy`) and returns `1` (truthy) or `0` (falsy). Never throws
 /// (ToBoolean calls no user code), so the caller needs no sentinel check.
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_truthy(ctx: *mut core::ffi::c_void, v: u64) -> u64 {
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_truthy(ctx: *mut core::ffi::c_void, v: u64) -> u64 {
     // SAFETY: as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
     u64::from(ctx.realm.truthy(NanBox::from_bits(v)))
 }
+}
 
+jit_extern! {
 /// The generic-JIT runtime helper for `+`: the slow path the native code calls
 /// when an operand isn't a number. Reconstructs `&mut Ctx` from the opaque
 /// pointer, runs the shared [`vm_add`], and either returns the result's `NanBox`
@@ -8931,8 +8964,8 @@ pub(crate) extern "sysv64" fn jit_helper_truthy(ctx: *mut core::ffi::c_void, v: 
 /// # Safety
 /// `ctx` must be the live `Ctx` pointer the dispatcher passed to the native
 /// entry, with `ctx.jit_funcs` set to the running function table.
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64 {
     // SAFETY: single-threaded reentrancy — the native caller holds no live
     // `&mut Ctx` while this runs (it passed a raw pointer), so reborrowing it is
     // the same pattern as an ordinary recursive interpreter call.
@@ -8969,15 +9002,17 @@ pub(crate) extern "sysv64" fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64
         }
     }
 }
+}
 
+jit_extern! {
 /// The generic-JIT runtime helper for a native builtin call (`Op::CallNative`):
 /// runs the shared [`vm_call_native`]. Mirrors [`jit_helper_get_prop`] — success bits,
 /// or the throw/deopt sentinel with the fault in `ctx.jit_pending_fault`.
 ///
 /// # Safety
 /// As [`jit_helper_get_prop`].
-#[cfg(all(feature = "jit", jit_x64))]
-pub(crate) extern "sysv64" fn jit_helper_call_native(
+#[cfg(all(feature = "jit", jit_native))]
+pub(crate) fn jit_helper_call_native(
     ctx: *mut core::ffi::c_void,
     native: u64,
     argv: *const u64,
@@ -9007,6 +9042,7 @@ pub(crate) extern "sysv64" fn jit_helper_call_native(
             NanBox::jit_throw_bits()
         }
     }
+}
 }
 
 /// `regex.lastIndex = v` for the bytecode VM. `lastIndex` is an ordinary data
@@ -9444,7 +9480,7 @@ fn legacy_activations(ctx: &Ctx) -> (Vec<NanBox>, Vec<usize>, Vec<NanBox>, Vec<u
     // built at run time reaches here without having turned it on before:
     // see `crate::legacy_reach`.)
     crate::legacy_reach::note();
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     if let Some(v) = jit_tier::callee_view(ctx) {
         return v;
     }
@@ -9525,7 +9561,7 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
     }
     // Compiled activations' windows and native-call headers (`jit_tier`);
     // what finished ones left above them is zeroed first.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     {
         jit_tier::scrub_stack(ctx);
         for r in jit_tier::stack_roots(ctx) {
@@ -9609,7 +9645,7 @@ fn link_roots(ctx: &mut Ctx, roots: &mut Vec<Handle>) {
             push(roots, t.value);
             roots.push(t.result);
         }
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if ctx.jit_rt.stack.0.is_null() {
             ctx.jit_rt.stack.0 = below.jit_rt.stack.0;
         }
@@ -9694,7 +9730,7 @@ fn run_frame_at_ic(
     // (`ic` itself is the caller's: see `TierState` for the cross-activation
     // reuse.)
     // Loop back-edges taken in this activation, for on-stack replacement.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     let mut osr_count: u32 = 0;
 
     let num = |v: NanBox| v.as_number().ok_or(VmError::NotANumber);
@@ -11311,7 +11347,7 @@ fn run_frame_at_ic(
                     vm_safepoint(ctx, funcs, program, regs);
                     // A hot loop continues in native code from its header
                     // (on-stack replacement); `u32::MAX` = tried, not eligible.
-                    #[cfg(all(feature = "jit", jit_x64))]
+                    #[cfg(all(feature = "jit", jit_native))]
                     if osr_count != u32::MAX {
                         osr_count += 1;
                         if osr_count >= jit_tier::osr_threshold() {
@@ -31488,7 +31524,7 @@ mod tests {
 /// shaped body through the JIT-forced generic path and asserts it is identical
 /// to the interpreter (same value, or same thrown exception with the
 /// side-effecting `valueOf` run exactly once).
-#[cfg(all(test, feature = "jit", jit_x64))]
+#[cfg(all(test, feature = "jit", jit_native))]
 mod generic_jit_tests {
     use super::*;
     use crate::nanbox::NanBox;
@@ -31505,7 +31541,7 @@ mod generic_jit_tests {
             gen_proto_ic: PropertyCache::new(),
             agen_ic: PropertyCache::new(),
             jit_pending: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             jit_pending_fault: None,
             jit_funcs: None,
             jit_rt: jit_tier::TierRuntime::default(),
@@ -31519,9 +31555,9 @@ mod generic_jit_tests {
             top_frame_roots: Vec::new(),
             pending_callee: None,
             pending_new_target: None,
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ic: Vec::new(),
-            #[cfg(all(feature = "jit", jit_x64))]
+            #[cfg(all(feature = "jit", jit_native))]
             exec_op_ics: alloc::collections::BTreeMap::new(),
             in_realm: None,
         }
@@ -31851,6 +31887,8 @@ mod generic_jit_tests {
 
     /// `o.x` read: JIT-forced === interpreter, and the monomorphic shape fast path
     /// is genuinely taken — a repeat access on a same-shape object hits the IC.
+    // (Checks the x86-64 body's inline caches / recompilation.)
+    #[cfg(jit_x64)]
     #[test]
     fn generic_get_prop_monomorphic_fast_path() {
         let funcs = build_prop();
@@ -31888,7 +31926,7 @@ mod generic_jit_tests {
     /// match the cached shape), a dictionary-mode object (must miss), and a
     /// post-reallocation re-read (proving the arena base is reloaded, not cached).
     /// If any offset/discriminant is wrong this fails loudly.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn jit_layout_matches_safe_reads() {
         use crate::ic::PropertyCache;
@@ -32047,7 +32085,7 @@ mod generic_jit_tests {
     /// writability-gate fields) must, by pointer arithmetic on real heap instances,
     /// match the safe Rust read. If any is wrong this fails loudly rather than the
     /// JIT corrupting a raw store/load.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn jit_set_and_array_layout_matches_safe_reads() {
         let layout = crate::jit::compute_jit_layout();
@@ -32233,7 +32271,7 @@ mod generic_jit_tests {
     /// cache, and every other receiver — another shape, a dictionary, a
     /// frozen object of the very layout, a non-object — still gets exactly
     /// the interpreter's answer.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn generic_props_compiled_in_layout() {
         let funcs = build_prop();
@@ -32341,6 +32379,8 @@ mod generic_jit_tests {
     /// The inline property-SET fast path genuinely fires: repeated same-shape
     /// `o.x = v` stores hit the site IC (they never re-enter the helper), and every
     /// write lands correctly (JIT-forced === interpreter).
+    // (Checks the x86-64 body's inline caches / recompilation.)
+    #[cfg(jit_x64)]
     #[test]
     fn generic_set_prop_inline_fires() {
         let funcs = build_prop();
@@ -33173,7 +33213,7 @@ mod generic_jit_tests {
     /// value (-0, NaN, ±∞, int32 bounds and overflow, shifts by ≥ 32, fractions,
     /// huge magnitudes) — bit-identical to the interpreter. Each call compiles
     /// afresh, so the interpreter side never runs a tiered-up body.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn generic_numeric_loops_match_interpreter() {
         let src = "
@@ -33238,7 +33278,7 @@ mod generic_jit_tests {
     /// values of every edge kind, a getter, a setter, a string field, a
     /// prototype field and non-Number fields (which leave the speculative
     /// version for its plain copy) — bit-identical to the interpreter.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn generic_field_loops_match_interpreter() {
         let src = "
@@ -33293,7 +33333,7 @@ mod generic_jit_tests {
     /// `-`, `*`, `++`, unary `-`; `-0` from `0 * -k`, `-0`, `-4 % 2`; `% 0`;
     /// non-int carried values and arguments. Every result must be bit-identical
     /// to the interpreter's.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn generic_int32_speculation_matches_interpreter() {
         let src = "
@@ -33358,7 +33398,7 @@ mod generic_jit_tests {
     /// and the ops that make `-0` out of other integers (`0 * -5`, `-0` from
     /// `-x`, `-4 % 2`) are not lowered or deopt — so the hot tiered-up body
     /// returns exactly what the interpreter does.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn int_tier_keeps_the_sign_of_zero() {
         let src = "
@@ -33430,7 +33470,7 @@ mod generic_jit_tests {
     // --- Pass 4: function calls in the generic tier ---
 
     /// Compiles `src` and returns `(funcs, id_of(name))`.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     fn compile_named(src: &str, name: &str) -> (Vec<FnProto>, usize) {
         let program = crate::parser::Parser::parse_program(src).expect("parse");
         let funcs = compile_program(&program).expect("compile");
@@ -34395,6 +34435,8 @@ mod generic_jit_tests {
     /// leaves at the loop's header, is compiled again with them, and finishes
     /// in the new code with the interpreter's result. The recompilations stop
     /// at the budget, however often the layouts change.
+    // (Checks the x86-64 body's inline caches / recompilation.)
+    #[cfg(jit_x64)]
     #[test]
     fn generic_recompiles_at_a_loop_header() {
         let (funcs, f) = compile_named(
@@ -34438,7 +34480,7 @@ mod generic_jit_tests {
             let (funcs, f) = compile_named(src, "f");
             assert!(crate::jit::lower_nbvm(&funcs[f]).is_some(), "{src}");
             assert!(crate::jit::lower_nbvm_float(&funcs[f]).is_none(), "{src}");
-            #[cfg(jit_x64)]
+            #[cfg(jit_native)]
             {
                 let jit = crate::jit::JitProto::compile(&funcs[f]).expect("Int tier");
                 assert!(jit.returns_bool(), "{src}");

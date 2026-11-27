@@ -37,6 +37,32 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+/// The calling convention between JIT-emitted code and Rust (the runtime
+/// helpers it calls, the entry points Rust calls into): System V on x86-64
+/// on every OS (on Windows rustc bridges at the boundary), the platform's C
+/// ABI (AAPCS64) on AArch64. An ABI string cannot be a macro argument, so
+/// the two spellings are two macros: `jit_abi!(fn(A) -> R)` is the function
+/// pointer type, `jit_extern! { fn name(..) { .. } }` the function item.
+#[cfg(target_arch = "x86_64")]
+macro_rules! jit_abi {
+    ($($t:tt)*) => { extern "sysv64" $($t)* };
+}
+#[cfg(not(target_arch = "x86_64"))]
+macro_rules! jit_abi {
+    ($($t:tt)*) => { extern "C" $($t)* };
+}
+/// See [`jit_abi`].
+#[cfg(target_arch = "x86_64")]
+macro_rules! jit_extern {
+    ($(#[$m:meta])* $v:vis unsafe fn $($r:tt)*) => { $(#[$m])* $v unsafe extern "sysv64" fn $($r)* };
+    ($(#[$m:meta])* $v:vis fn $($r:tt)*) => { $(#[$m])* $v extern "sysv64" fn $($r)* };
+}
+#[cfg(not(target_arch = "x86_64"))]
+macro_rules! jit_extern {
+    ($(#[$m:meta])* $v:vis unsafe fn $($r:tt)*) => { $(#[$m])* $v unsafe extern "C" fn $($r)* };
+    ($(#[$m:meta])* $v:vis fn $($r:tt)*) => { $(#[$m])* $v extern "C" fn $($r)* };
+}
+
 // Public API vs engine internals: the modules marked `#[doc(hidden)]` below
 // are the engine's implementation (bytecode, VM, JIT, heap/object layout, the
 // interpreter's built-ins). They stay `pub` so this crate's own tests, examples

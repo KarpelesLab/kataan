@@ -33,7 +33,7 @@ mod concat_fast;
 mod fn_chain;
 mod forin_cache;
 pub use fn_chain::FnChain;
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) use forin_cache::{ForInSite, KeyTable, NO_SLOT};
 mod gen_state;
 mod key_memo;
@@ -41,10 +41,10 @@ mod method_names;
 use method_names::MethodNames;
 mod text_memo;
 pub(crate) use text_memo::{AccHit, TextHit, getkey_enabled};
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) use text_memo::{KeyTextLayout, jit_key_text_layout};
 mod lit_cells;
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) use key_memo::{KeyMemoLayout, jit_key_memo_layout};
 pub use lit_cells::LitCells;
 mod private_fast;
@@ -62,14 +62,14 @@ mod str_key_fast;
 mod str_switch;
 mod typed_fast;
 pub use coll_index::CollIndex;
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) use coll_index::jit_counts_layout as jit_coll_index_counts;
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) use coll_index::jit_slots_layout as jit_coll_index_layout;
 pub use str_switch::{SwitchMemo, switch_key_order};
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) use str_switch::{SwitchMemoLayout, jit_switch_memo_layout};
-#[cfg(all(feature = "jit", jit_x64))]
+#[cfg(all(feature = "jit", jit_native))]
 pub(crate) use typed_fast::typed_elems_seen;
 mod handle_map;
 pub(crate) mod host_roots;
@@ -240,7 +240,7 @@ pub struct Realm {
     /// (see [`new_array`](Realm::new_array)): the running realm's
     /// `%Array.prototype%` is the derived default. Compiled code's inline
     /// array allocation tests it.
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     jit_array_proto_default: bool,
     /// Whether [`link_vm_fn_proto`](Realm::link_vm_fn_proto) is a no-op in
     /// this (single) realm: a new VM closure's `[[Prototype]]` is the
@@ -249,7 +249,7 @@ pub struct Realm {
     jit_vmfn_plain: bool,
     /// `default_object_proto` as an object's raw `proto` word (`NO_PROTO` for
     /// none): what compiled code's inline `Op::NewObject` gives the new object.
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     jit_default_proto: u64,
     /// Monotonic counter giving each `Symbol` a unique identity.
     next_symbol_id: u64,
@@ -360,7 +360,7 @@ pub struct Realm {
     /// to be its `[[ArrayLength]]` slot (see
     /// [`jit_typed_len_refresh`](Realm::jit_typed_len_refresh)); `0` = not
     /// proved. Compiled code's inline typed `.length` requires it current.
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     jit_typed_len_stamp: u64,
     /// The prototype epoch at which [`iter_result_thenless`]
     /// (Realm::iter_result_thenless) last proved that no object on the
@@ -495,9 +495,9 @@ pub struct Realm {
     /// For compiled code: the shape word of `coll_iter_layout` (0 while
     /// none is learned) and its two slots, in its keys' order
     /// ([`Realm::set_coll_iter_layout`]).
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     pub(crate) coll_iter_shape: u64,
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     pub(crate) coll_iter_slots: [u32; 2],
     /// The hidden-state layout of a snapshot-buffer built-in iterator (see
     /// `hidden_layout`), learned likewise.
@@ -1594,7 +1594,7 @@ impl Realm {
     /// ([`JIT_FLAG_WATCHED`](crate::object::JIT_FLAG_WATCHED)) from here on, so
     /// any change to one of them — a `length` defined or deleted, an accessor
     /// redefined, a `[[Prototype]]` set — bumps the epoch past the stamp.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) fn jit_typed_len_refresh(&mut self) {
         if self.typed_len_tainted
             || self.typed_len_protos.is_empty()
@@ -1630,7 +1630,7 @@ impl Realm {
     /// The byte offset, within a `Realm`, of `jit_typed_len_stamp` (a `u64`),
     /// which compiled code's inline typed-array `.length` requires equal to
     /// the prototype epoch.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_typed_len_stamp_offset() -> usize {
         core::mem::offset_of!(Realm, jit_typed_len_stamp)
@@ -2001,7 +2001,7 @@ impl Realm {
     /// Flags the object at `handle` watched by a prototype-chain cache
     /// ([`JIT_FLAG_WATCHED`](crate::object::JIT_FLAG_WATCHED)); a no-op for
     /// any other cell.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) fn jit_watch(&mut self, handle: Handle) {
         if let Some(o) = self.heap.get_mut(handle).and_then(Cell::as_object_mut) {
             o.watch();
@@ -2011,7 +2011,7 @@ impl Realm {
     /// The kind (`is_set`) of the strong collection at `handle`, and the
     /// default `[[Prototype]]` of that kind (`coll_default`), for compiled
     /// code's inline lookup proof (`crate::jit::coll`).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_coll_default(&self, handle: Handle) -> Option<(bool, Option<Handle>)> {
         match self.heap.get(handle) {
@@ -2029,7 +2029,7 @@ impl Realm {
 
     /// Whether `handle` is an engine-owned byte store (`ByteStore::Owned`),
     /// the only kind compiled code reads in place.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_owned_bytes(&self, handle: Handle) -> bool {
         matches!(
@@ -2039,7 +2039,7 @@ impl Realm {
     }
 
     /// The object at `handle`, if it is one (for the compiled tier's caches).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_object(&self, handle: Handle) -> Option<&crate::object::Object> {
         self.heap.get(handle)?.as_object()
@@ -2048,7 +2048,7 @@ impl Realm {
     /// The auxiliary property object of the non-object cell at `handle`, if it
     /// has one. A cell keeps its auxiliary object for life, except across a
     /// [`swap_cell_state`](Self::swap_cell_state) (see [`jit_cell_swaps`](Self::jit_cell_swaps)).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_aux_of(&self, handle: Handle) -> Option<Handle> {
         // (An owing closure has none: compiled code's paths over one take
@@ -2058,7 +2058,7 @@ impl Realm {
 
     /// How many [`swap_cell_state`](Self::swap_cell_state)s have run: while it is
     /// unchanged, a handle names the same cell and auxiliary object.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_cell_swaps(&self) -> u32 {
         self.cell_swaps
@@ -2067,7 +2067,7 @@ impl Realm {
     /// A new ordinary object whose `[[Prototype]]` is `proto` (what
     /// [`new_object`](Self::new_object) and then
     /// [`set_object_proto`](Self::set_object_proto) make).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) fn jit_new_object_with_proto(&mut self, proto: Handle) -> Handle {
         let mut obj = Object::new(Rc::clone(&self.root_shape));
         obj.set_proto(Some(proto));
@@ -2084,7 +2084,7 @@ impl Realm {
     /// shape `to` (see [`Object::jit_adopt_child`](crate::object::Object::jit_adopt_child)),
     /// unless the object has reached the dictionary threshold; `false`, having
     /// changed nothing, otherwise.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     pub(crate) fn jit_add_transition(
         &mut self,
         handle: Handle,
@@ -2108,7 +2108,7 @@ impl Realm {
     /// The object at `handle` when compiled code may cache a property lookup
     /// through it: an ordinary shaped object, neither host-exotic nor a
     /// primitive wrapper (the objects the prototype-chain cache accepts).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_chain_object(&self, handle: Handle) -> Option<&crate::object::Object> {
         let o = self.heap.get(handle)?.as_object()?;
@@ -2119,7 +2119,7 @@ impl Realm {
     /// The byte offset, within a `Realm`, of the "incremental marking is
     /// running" flag compiled code tests before a store that skips the write
     /// barrier's helper.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_marking_offset() -> usize {
         core::mem::offset_of!(Realm, jit_marking)
@@ -2128,7 +2128,7 @@ impl Realm {
     /// The byte offset, within a `Realm`, of `proto_index_accessor_dirty` (a
     /// `bool`), which compiled code's inline `push` requires clear (as
     /// [`array_push_plain`](Self::array_push_plain) does).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_proto_index_dirty_offset() -> usize {
         core::mem::offset_of!(Realm, proto_index_accessor_dirty)
@@ -2137,7 +2137,7 @@ impl Realm {
     /// The byte offset, within a `Realm`, of `jit_function_proto` (a
     /// `u64`: `%Function.prototype%`'s value bits), which compiled code's
     /// inline `typeof` of an ordinary object compares with.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_function_proto_offset() -> usize {
         core::mem::offset_of!(Realm, jit_function_proto)
@@ -2145,7 +2145,7 @@ impl Realm {
 
     /// The byte offset, within a `Realm`, of `jit_array_proto_default` (a
     /// `bool`), which compiled code's inline array allocation requires set.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_array_proto_default_offset() -> usize {
         core::mem::offset_of!(Realm, jit_array_proto_default)
@@ -2153,7 +2153,7 @@ impl Realm {
 
     /// The byte offset, within a `Realm`, of `jit_vmfn_plain` (a `bool`),
     /// which compiled code's inline closure allocation requires set.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_vmfn_plain_offset() -> usize {
         core::mem::offset_of!(Realm, jit_vmfn_plain)
@@ -2162,7 +2162,7 @@ impl Realm {
     /// Where compiled code's inline back-edge poll reads the collection
     /// trigger: the offsets of [`gc_pressure`](Self::gc_pressure)'s counter
     /// and of [`gc_next_threshold`](Self::gc_next_threshold)'s field.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_gc_trigger_offsets() -> (usize, usize) {
         (
@@ -2184,7 +2184,7 @@ impl Realm {
     /// [`crate::heap::HeapAllocOffsets`], here `Realm`-relative) and the root
     /// shape's `Rc` word and the default object prototype's raw word,
     /// `(heap, root_shape, default_proto)`.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_alloc_offsets() -> (crate::heap::HeapAllocOffsets, usize, usize) {
         let h = crate::heap::jit_heap_alloc_offsets();
@@ -2207,7 +2207,7 @@ impl Realm {
     /// `Vec`'s word order is unspecified), for compiled code that appends a
     /// closure it just made to it while it has room (see
     /// [`defer_vm_fn_prototype`](Self::defer_vm_fn_prototype)).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_owed_offsets() -> (usize, usize, usize) {
         // Length 1, capacity 16: the three words all differ.
@@ -2240,7 +2240,7 @@ impl Realm {
     /// count, the heap's handle epoch (`u32`) and its GC-verification state
     /// word (null when off): what a natively resumed generator's emitted code
     /// reads (`crate::jit::gen_native`).
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_gen_native_offsets() -> (usize, usize, usize, usize) {
         let heap = core::mem::offset_of!(Realm, heap);
@@ -2256,7 +2256,7 @@ impl Realm {
     /// The byte offsets, within a `Realm`, of the object heap's slot-array
     /// data-pointer and length words (see [`jit_arena_slots`](Self::jit_arena_slots)),
     /// for compiled code that reads them directly: `(ptr_off, len_off)`.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_heap_offsets() -> (usize, usize) {
         let (p, l) = crate::heap::jit_heap_slots_offsets();
@@ -2399,7 +2399,7 @@ impl Realm {
     /// data properties. `false` for any other cell.
     #[must_use]
     #[cfg(test)]
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn array_is_side_free(&self, handle: Handle) -> bool {
         matches!(self.heap.get(handle), Some(Cell::Array(a)) if !a.has_side_state())
     }
@@ -2895,7 +2895,7 @@ impl Realm {
     /// [`unit_string`](Self::unit_string) when it allocates nothing: the
     /// interned string of a unit below 256 that is still the table's (as that
     /// function revalidates it). `None` otherwise.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn interned_unit_string(&self, unit: u16) -> Option<Handle> {
         let i = usize::from(unit);
         if i >= 256 {
@@ -4986,7 +4986,7 @@ impl Realm {
     /// Records the learned layout of a live Set/Map iterator
     /// (`coll_iter_layout`), and its shape word and slots for compiled code.
     pub(crate) fn set_coll_iter_layout(&mut self, l: Option<hidden_layout::HiddenLayout<2>>) {
-        #[cfg(all(feature = "jit", jit_x64))]
+        #[cfg(all(feature = "jit", jit_native))]
         if let Some(l) = &l {
             self.coll_iter_shape = crate::jit::shape_word(l.shape());
             self.coll_iter_slots = l.slots();
@@ -5434,7 +5434,7 @@ impl Realm {
     /// the object to no code and leaves it owning no property — so nothing
     /// holds it but that call's dead argument register. (Taking it again
     /// resets its `lastIndex`.) A full pool keeps what it has.
-    #[cfg_attr(not(jit_x64), allow(dead_code))]
+    #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn regexp_lend_return(&mut self, re: NanBox) {
         let Some(raw) = re.as_handle() else {
             return;
@@ -7969,12 +7969,12 @@ impl Realm {
     /// base; the length is the raw slot count (the handle-index bound).
     /// The heap's `extra`-part pool's data pointer and length, for the
     /// layout test.
-    #[cfg(all(test, feature = "jit", jit_x64))]
+    #[cfg(all(test, feature = "jit", jit_native))]
     pub(crate) fn jit_extra_pool_raw(&self) -> (usize, usize) {
         self.heap.extra_pool_raw()
     }
 
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_arena_slots(&self) -> (*const u8, usize) {
         self.heap.slots_raw()
@@ -7990,7 +7990,7 @@ impl Realm {
     /// non-array. The sparse-length probe is skipped while no array has one (the
     /// common case), so a hot `arr[i]`/`arr.length` pays one heap lookup plus an
     /// O(1) aux miss.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_array_len_is_dense(&self, handle: Handle) -> bool {
         let raw = handle.to_raw();
@@ -8007,7 +8007,7 @@ impl Realm {
     /// the host's `[[Get]]` only if it is host-exotic; a property *store* (`set`)
     /// additionally refuses a String wrapper (own `\0prim`), whose index and
     /// `length` keys are exotic.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_plain_object(&self, handle: Handle, set: bool) -> Option<bool> {
         let Some(Cell::Object(o)) = self.heap.get(handle) else {
@@ -8026,7 +8026,7 @@ impl Realm {
     /// [`array_index_has_override`](Realm::array_index_has_override) consults plus
     /// the length bound, evaluated once per store (a leaf, non-allocating read, so
     /// it never reallocates the arena). Returns `false` for any non-array receiver.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[must_use]
     pub(crate) fn jit_array_unrestricted(&self, handle: Handle) -> bool {
         let raw = handle.to_raw();
@@ -8966,7 +8966,7 @@ impl Realm {
     /// The address of the global object `g`'s own data property `key`'s value
     /// when [`set_property`](Self::set_property) of it would store exactly
     /// there (plus the write barrier): see `Object::jit_data_ptr`.
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     pub(crate) fn jit_data_ptr(&mut self, g: Handle, key: &str) -> Option<*mut NanBox> {
         self.heap.get_mut(g)?.as_object_mut()?.jit_data_ptr(key)
     }
@@ -9007,7 +9007,7 @@ impl Realm {
 
     /// The write barrier of a store of `value` into `container` that
     /// compiled code made itself (`nbvm::global_mirror`).
-    #[cfg_attr(not(all(feature = "jit", jit_x64)), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "jit", jit_native)), allow(dead_code))]
     pub(crate) fn jit_write_barrier(&mut self, container: Handle, value: NanBox) {
         self.write_barrier(container, value);
     }
@@ -12288,7 +12288,7 @@ mod tests {
 
     /// An array without side-table state is one the side-table probes the
     /// compiled element paths used to make would also have let through.
-    #[cfg(all(feature = "jit", jit_x64))]
+    #[cfg(all(feature = "jit", jit_native))]
     #[test]
     fn side_free_arrays_pass_the_side_table_probes() {
         let mut realm = Realm::new();
