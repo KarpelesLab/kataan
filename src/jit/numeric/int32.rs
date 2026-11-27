@@ -111,6 +111,14 @@ fn imod_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_IMODFAST").is_none_or(|v| v != "0"))
 }
 
+/// Whether a speculative region's integer version may hold a named
+/// property read's value in an int register (`plan`; `KATAAN_JIT_INTPROP=0`
+/// turns it off; read once).
+fn prop_reads_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_INTPROP").is_none_or(|v| v != "0"))
+}
+
 /// How many times in a row an integer version's entry may find a
 /// loop-carried value that is not an int32 and have it tried again after an
 /// iteration elsewhere (`NumGen::entry_retry`).
@@ -459,7 +467,54 @@ pub(super) fn plan(
         }
         true
     };
-    let elem_def = |op: &Op| matches!(op, Op::GetKey { .. } | Op::ArrayLen { .. });
+    // Whether a named read's value (or a copy of it) reaches an arithmetic,
+    // bitwise or index use: the conversion each read makes buys nothing for
+    // a value only compared (a heap's `a[i].dist < a[j].dist` compares
+    // doubles as cheaply).
+    let feeds_arith = |r: u16| {
+        let mut work = alloc::vec![r];
+        let mut seen: Vec<u16> = Vec::new();
+        let (mut d, mut u) = (Vec::new(), Vec::new());
+        while let Some(x) = work.pop() {
+            if seen.contains(&x) || seen.len() > 8 {
+                continue;
+            }
+            seen.push(x);
+            for op in body {
+                def_use(op, &mut d, &mut u);
+                if !u.contains(&x) {
+                    continue;
+                }
+                match op {
+                    Op::Move { dst, .. } | Op::ToNumeric { dst, .. } => work.push(*dst),
+                    Op::Add { .. }
+                    | Op::AddValue { .. }
+                    | Op::Sub { .. }
+                    | Op::Mul { .. }
+                    | Op::Mod { .. }
+                    | Op::Neg { .. }
+                    | Op::Step { .. } => return true,
+                    Op::ValueBin { op, .. } if (1..=VB_USHR).contains(op) => return true,
+                    Op::GetKey { key, .. } if *key == x => return true,
+                    _ => {}
+                }
+            }
+        }
+        false
+    };
+    // Whether a named read of `key` may be an int register: no op of the
+    // loop stores `key` (a field the loop also writes is carried through
+    // the object's slot, where a conversion at every read would sit on its
+    // chain).
+    let prop_read_ok = |key: &str| {
+        !body.iter().any(|op| {
+            matches!(op, Op::SetProp { key: k, .. } | Op::SetPropStrict { key: k, .. } if k.as_str() == key)
+        })
+    };
+    let elem_def = |op: &Op| {
+        matches!(op, Op::GetKey { .. } | Op::ArrayLen { .. })
+            || (spec && matches!(op, Op::GetProp { .. }))
+    };
     // Promoted global bindings: each named global the loop reads or writes is
     // a pseudo-register `n_regs + k`, loop-carried, written back at exits and
     // before calls (see `PGlobal`).
@@ -670,6 +725,17 @@ pub(super) fn plan(
                         && elem_reader_ok(*dst, *obj, &inn, spec && inn(*key))
                 }
                 Op::ArrayLen { .. } => elems || spec,
+                // (In a speculative region's, a named property read whose
+                // value only int ops read, some of them arithmetic, checked
+                // after the generic emitter's read like an element's:
+                // `NumGen::int_post`. A copy the fast version makes of it
+                // instead, `plan_reuse`, is checked the same way.)
+                Op::GetProp { dst, obj, key } => {
+                    spec && prop_reads_enabled()
+                        && prop_read_ok(key)
+                        && feeds_arith(*dst)
+                        && elem_reader_ok(*dst, *obj, &inn, true)
+                }
                 // A promoted global reads / writes its pseudo-register.
                 Op::LoadGlobal { name, .. } if spec => carrier(name).is_some_and(inn),
                 Op::LoadGlobal { name, .. } => vreg_of(name).is_none_or(inn),
@@ -3835,15 +3901,53 @@ impl NumGen {
         if !matches!(ops[pc], GenericOp::InlineGuard { .. }) && !forin_leaves {
             self.ishadow_uses(a, pc)?;
         }
+        // A property read the fast version replaces by a copy of a register
+        // (`plan_reuse`, `emit_dbl`) with an int register on either side.
+        // The copy's source is an earlier read of the key (whose double
+        // location its own read wrote, or such a copy) or a store's value
+        // (converted there into its double location, `ishadow_uses`),
+        // unwritten since: its double location holds its value, even past
+        // the end of its int interval (where no GPR holds it any more).
+        // So the double locations are copied as `emit_dbl` would (an int
+        // source converted into its own first while a GPR still holds it),
+        // and an int destination takes the source's int, or the copied
+        // value checked into it as the read's own would be (`int_post`).
+        if let GenericOp::GetProp { dst, .. } = ops[pc]
+            && reg.is_some_and(|ri| self.regions[ri].spec.is_some())
+            && let Some(src) = self.reuse_planned(pc)
+            && (self.is_int(dst) || self.is_int(src))
+        {
+            if (dst as usize) >= self.env.n_regs || (src as usize) >= self.env.n_regs {
+                return None;
+            }
+            let held = self.is_int(src) && self.ik(src).is_some();
+            if held {
+                self.ishadow(a, self.imode, src)?;
+            }
+            if self.is_int(dst) {
+                self.copy_reg(a, reg, dst, src);
+                if held {
+                    let g = self.ival(a, src, RAX)?;
+                    self.iput(a, dst, g)?;
+                } else {
+                    self.int_post = Some(dst);
+                    self.after_generic_post(a);
+                }
+                return Some(true);
+            }
+        }
         if self.emit_dbl(a, labels, throw_exit, pc, ops, reg)? {
             return Some(true);
         }
         if !super::generic_region_op(&ops[pc], self.bc(pc)?, self.sa(pc)) {
             return None;
         }
-        // An element or `.length` read into an int register: the generic
-        // emitter's read, then checked (`after_generic_op`).
-        if let GenericOp::GetElem { dst, .. } | GenericOp::ArrayLen { dst, .. } = ops[pc]
+        // An element, `.length` or named property read into an int
+        // register: the generic emitter's read, then checked
+        // (`after_generic_op`).
+        if let GenericOp::GetElem { dst, .. }
+        | GenericOp::ArrayLen { dst, .. }
+        | GenericOp::GetProp { dst, .. } = ops[pc]
             && self.is_int(dst)
         {
             self.int_post = Some(dst);

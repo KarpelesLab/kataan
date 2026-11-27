@@ -12682,8 +12682,18 @@ mod tests {
         let Op::GetProp { dst, obj, .. } = q.ops[get] else {
             unreachable!()
         };
-        // (Its counter may have an integer version; the field never.)
-        assert!(r.int.as_ref().is_none_or(|p| !p.has_int(dst)));
+        // (Its counter may have an integer version, and so may the sum, the
+        // field's read then held as an int32 too, checked where it is read:
+        // `int32::plan`'s named reads. Never the field alone.)
+        let sum = match q.ops[pc_of(&q, |o| matches!(o, Op::AddValue { .. }))] {
+            Op::AddValue { dst, .. } => dst,
+            _ => unreachable!(),
+        };
+        assert!(
+            r.int
+                .as_ref()
+                .is_none_or(|p| !p.has_int(dst) || p.has_int(sum))
+        );
         assert!(r.slots.iter().all(|s| s.reg != obj), "the object is pinned");
         assert!(
             r.slots.iter().any(|s| s.reg == dst && s.dirty),
