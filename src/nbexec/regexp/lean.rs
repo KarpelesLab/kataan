@@ -722,6 +722,14 @@ impl Interp {
     /// match's end (both only when global or sticky), the legacy match
     /// record updated on success.
     pub(crate) fn regexp_exec_lean(&mut self, h: Handle, o: NanBox, array: bool) -> Option<NanBox> {
+        // (The protocol proof, made once if no protocol operation has made
+        // it yet, leaves the realm its mirror, with which compiled code
+        // reads a pristine RegExp's `exec` without a lookup:
+        // `Realm::regexp_pristine_exec`. A few tries at most.)
+        if self.realm.regexp_proof_mirror.is_none() && self.exec_mirror_tries < 8 {
+            self.exec_mirror_tries += 1;
+            let _ = self.regexp_pristine(h, NEED_EXEC);
+        }
         let raw = o.as_handle()?;
         let sh = Handle::from_raw(raw);
         if !self.realm.is_string_handle(sh)

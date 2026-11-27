@@ -4832,6 +4832,15 @@ pub(crate) fn jit_helper_get_method_site(
         if let Some(v) = super::native_call::try_get_coll(ctx, NanBox::from_bits(obj), cache) {
             return v.to_bits();
         }
+        // `re.exec` of a pristine RegExp (the realm's mirror of the host's
+        // proof): the intrinsic, with no lookup (no inline chain cache can
+        // serve a RegExp receiver either).
+        if site_ref.key() == "exec"
+            && let Some(h) = NanBox::from_bits(obj).as_handle()
+            && let Some(v) = ctx.realm.regexp_pristine_exec(Handle::from_raw(h))
+        {
+            return v.to_bits();
+        }
         if let Some(v) =
             super::native_call::try_get_general(ctx, NanBox::from_bits(obj), site_ref.key(), cache)
         {

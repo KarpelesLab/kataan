@@ -421,6 +421,20 @@ impl Realm {
             && self.own_data_epoch_hold(*proto, *epoch, keys, need)
     }
 
+    /// `handle.exec` when the RegExp at `handle` is pristine by the mirrored
+    /// proof ([`regexp_pristine_mirrored`](Self::regexp_pristine_mirrored)
+    /// with the host's `exec` bit): the receiver owns no `exec`, so the
+    /// [[Get]] finds the proved `%RegExp.prototype%`'s data property, the
+    /// intrinsic recorded in the proof. `None` (look it up) otherwise.
+    #[cfg_attr(not(jit_native), allow(dead_code))]
+    #[inline]
+    pub(crate) fn regexp_pristine_exec(&self, handle: Handle) -> Option<NanBox> {
+        let (_, _, keys, _) = self.regexp_proof_mirror.as_ref()?;
+        let exec = keys[0].1;
+        self.regexp_pristine_mirrored(handle, 1)
+            .then(|| NanBox::from_bits(exec))
+    }
+
     /// Whether no match of the RegExp at `handle` can begin anywhere in the
     /// string at `subject`, a flat all-ASCII string
     /// (`Regex::ascii_never_matches`), the RegExp's program compiled already

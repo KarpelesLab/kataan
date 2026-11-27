@@ -600,6 +600,10 @@ pub struct Interp {
     /// `%String.prototype%[@@iterator]`'s lookup memo (`find_iterator_fn_recv`
     /// for a string) and `@@iterator`'s storage key in a realm.
     str_iter_site: crate::realm::builtins_fast::MethodSiteCache,
+    /// How many times `regexp_exec_lean` has made the RegExp protocol proof
+    /// for its realm mirror (bounded: a failing proof is not retried forever).
+    #[cfg(feature = "regex")]
+    exec_mirror_tries: u8,
     iter_symbol_key: Option<(usize, alloc::rc::Rc<str>)>,
     regexp_symbol_keys: [Option<(usize, alloc::rc::Rc<str>)>; 5],
     /// The layout of a RegExp match array's `index`/`input`/`groups`.
@@ -3126,6 +3130,8 @@ impl Interp {
             regexp_split_memo: None,
             regexp_symbol_lookup: Default::default(),
             str_iter_site: Default::default(),
+            #[cfg(feature = "regex")]
+            exec_mirror_tries: 0,
             iter_symbol_key: None,
             regexp_symbol_keys: [None, None, None, None, None],
             #[cfg(feature = "regex")]
