@@ -2771,7 +2771,18 @@ fn vm_set_elem_mode(
                 }
             })
         });
-    if !to_host && key.as_number().is_none() {
+    // A Number key that is not an array index (`a[-1]`, `a[1.5]`, `a[2**32]`)
+    // on an array names an ordinary property ("-1", "1.5"): its write is the
+    // static-key store's too, which honours a non-extensible (frozen, sealed)
+    // array, setters and read-only properties — `vm_set_elem`'s fallback
+    // would add the property unconditionally.
+    let non_index_on_array = key.as_number().is_some_and(|n| {
+        !(n >= 0.0 && n == (n as u64) as f64 && (n as u64) < u64::from(u32::MAX))
+            && recv
+                .as_handle()
+                .is_some_and(|h| ctx.realm.is_array(Handle::from_raw(h)))
+    });
+    if !to_host && (key.as_number().is_none() || non_index_on_array) {
         // A string (or symbol) key is an ordinary property write: the static-key
         // store handles its setter, read-only and host cases.
         match vm_property_key(ctx, key, regs) {
