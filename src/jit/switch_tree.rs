@@ -18,7 +18,7 @@
 //! temporaries unwritten: [`pick_chain`] takes a chain only when no other op
 //! reads one.
 
-use super::call_seq::{cc, r};
+use super::call_seq::cc;
 use super::{Label, X64Assembler};
 use crate::nbvm::Op;
 use alloc::vec::Vec;
@@ -107,12 +107,24 @@ const LEAF: usize = 3;
 
 impl X64Assembler {
     /// To the label of `keys` (sorted by their bits) whose bits are `rax`'s,
-    /// else to `miss`. Clobbers `r11`.
+    /// else to `miss`. Each test compares `rax` with the code's constant
+    /// word for the key (`cmp rax, [rip + c]`: one instruction, no `movabs`);
+    /// a test whose key the flags already compared (a node's split key, on
+    /// its upper side) is just its branch. Clobbers nothing but the flags.
     pub(super) fn pick_tree(&mut self, keys: &[(u64, Label)], miss: Label) {
+        self.pick_tree_from(keys, miss, None);
+    }
+
+    /// [`pick_tree`](Self::pick_tree), the flags holding `rax`'s compare
+    /// with `flags` (when `Some`).
+    fn pick_tree_from(&mut self, keys: &[(u64, Label)], miss: Label, flags: Option<u64>) {
         if keys.len() <= LEAF {
+            let mut flags = flags;
             for &(bits, to) in keys {
-                self.g_movabs(r::R11, bits);
-                self.g_cmp(r::RAX, r::R11);
+                if flags != Some(bits) {
+                    self.cmp_rax_const(bits);
+                    flags = Some(bits);
+                }
                 self.g_jcc(cc::E, to);
             }
             self.jmp(miss);
@@ -120,11 +132,12 @@ impl X64Assembler {
         }
         let mid = keys.len() / 2;
         let lower = self.new_label();
-        self.g_movabs(r::R11, keys[mid].0);
-        self.g_cmp(r::RAX, r::R11);
+        if flags != Some(keys[mid].0) {
+            self.cmp_rax_const(keys[mid].0);
+        }
         self.g_jcc(cc::B, lower);
-        self.pick_tree(&keys[mid..], miss);
+        self.pick_tree_from(&keys[mid..], miss, Some(keys[mid].0));
         self.bind(lower);
-        self.pick_tree(&keys[..mid], miss);
+        self.pick_tree_from(&keys[..mid], miss, Some(keys[mid].0));
     }
 }
