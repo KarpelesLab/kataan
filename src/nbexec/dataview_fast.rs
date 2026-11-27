@@ -225,6 +225,11 @@ pub(crate) fn dataview_fast(
             } else {
                 v.to_bits()
             }
+        } else if v.abs() < 9_223_372_036_854_775_808.0 {
+            // Below 2^63 in magnitude the truncation is exact as an `i64`,
+            // whose two's-complement low bits are the value modulo
+            // 2^(8*size) (a NaN fails the bound).
+            (v as i64 as u64) & ((1u64 << (8 * size)) - 1)
         } else if v.is_finite() {
             // The integer types take the value modulo 2^(8*size), as the
             // general path does.
@@ -237,18 +242,23 @@ pub(crate) fn dataview_fast(
         };
         let bytes = realm.bytes_at_mut(bh)?;
         let dst = bytes.get_mut(abs..abs + size)?;
-        for (i, slot) in dst.iter_mut().enumerate() {
-            let shift = if le { i } else { size - 1 - i };
-            *slot = ((bits >> (8 * shift)) & 0xff) as u8;
+        // The low `size` bytes of `bits`, in the requested order.
+        if le {
+            dst.copy_from_slice(&bits.to_le_bytes()[..size]);
+        } else {
+            dst.copy_from_slice(&bits.to_be_bytes()[8 - size..]);
         }
         return Some(NanBox::undefined());
     }
     let src = realm.bytes_at(bh)?.get(abs..abs + size)?;
-    let mut bits: u64 = 0;
-    for (i, &b) in src.iter().enumerate() {
-        let shift = if le { i } else { size - 1 - i };
-        bits |= u64::from(b) << (8 * shift);
-    }
+    let mut word = [0u8; 8];
+    let bits = if le {
+        word[..size].copy_from_slice(src);
+        u64::from_le_bytes(word)
+    } else {
+        word[8 - size..].copy_from_slice(src);
+        u64::from_be_bytes(word)
+    };
     if acc.big {
         let v = if acc.signed {
             i128::from(bits as i64)
