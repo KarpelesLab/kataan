@@ -417,6 +417,21 @@ pub(crate) fn jit_rope_layout() -> RopeLayout {
 /// larger than `Node::Concat`, keeping every node the same size.
 pub const SMALL_CAP: usize = 37;
 
+/// Whether a `Node::Small` buffer (zero past its length) holds only ASCII
+/// bytes.
+#[inline]
+fn small_buf_ascii(buf: &[u8; SMALL_CAP]) -> bool {
+    let mut any = 0u64;
+    let (words, rest) = buf.as_chunks::<8>();
+    for w in words {
+        any |= u64::from_le_bytes(*w);
+    }
+    for &b in rest {
+        any |= u64::from(b);
+    }
+    any & 0x8080_8080_8080_8080 == 0
+}
+
 /// `Node::Small`'s "UTF-16 length not computed yet" marker (a real one is at
 /// most [`SMALL_CAP`]).
 const SMALL_U16_UNKNOWN: u8 = u8::MAX;
@@ -489,9 +504,18 @@ impl Node {
         if bytes.len() <= SMALL_CAP {
             let mut buf = [0u8; SMALL_CAP];
             buf[..bytes.len()].copy_from_slice(bytes);
+            // An all-ASCII text (tested on the zero-padded buffer, a few
+            // word ORs) has as many UTF-16 units as bytes: recorded now, so
+            // its `.length` and indexed reads (compiled code's inline ones
+            // need the memo) never count.
+            let u16 = if small_buf_ascii(&buf) {
+                bytes.len() as u8
+            } else {
+                SMALL_U16_UNKNOWN
+            };
             Node::Small {
                 len: bytes.len() as u8,
-                u16: core::cell::Cell::new(SMALL_U16_UNKNOWN),
+                u16: core::cell::Cell::new(u16),
                 buf,
             }
         } else {
@@ -612,9 +636,15 @@ impl Rope {
         }
         let mut buf = [0u8; SMALL_CAP];
         fill(&mut buf[..len]);
+        // (As `Node::flat`: an all-ASCII text's UTF-16 length recorded.)
+        let u16 = if small_buf_ascii(&buf) {
+            len as u8
+        } else {
+            SMALL_U16_UNKNOWN
+        };
         Some(Rope(Rc::new(Node::Small {
             len: len as u8,
-            u16: core::cell::Cell::new(SMALL_U16_UNKNOWN),
+            u16: core::cell::Cell::new(u16),
             buf,
         })))
     }
