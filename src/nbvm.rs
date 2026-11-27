@@ -8975,6 +8975,16 @@ pub(crate) fn jit_helper_arith(
     // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // Two BigInts: `vm_arith`'s first step for them, before its frame.
+    let bop = match op as u8 {
+        GA_SUB => crate::ast::BinaryOp::Sub,
+        GA_MUL => crate::ast::BinaryOp::Mul,
+        GA_DIV => crate::ast::BinaryOp::Div,
+        _ => crate::ast::BinaryOp::Mod,
+    };
+    if let Some(v) = bigint_early(ctx, bop, NanBox::from_bits(a), NanBox::from_bits(b)) {
+        return v.to_bits();
+    }
     // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
     #[allow(unsafe_code)]
     let funcs = unsafe {
@@ -9008,6 +9018,21 @@ pub(crate) fn jit_helper_value_bin(
     // SAFETY: single-threaded reentrancy — as `jit_helper_add`.
     #[allow(unsafe_code)]
     let ctx = unsafe { &mut *(ctx as *mut Ctx) };
+    // Two BigInts under a bitwise operator or a shift: `vm_value_bin`'s
+    // first step for them, before its frame.
+    let bop = match op as u8 {
+        VB_BIT_AND => Some(crate::ast::BinaryOp::BitAnd),
+        VB_BIT_OR => Some(crate::ast::BinaryOp::BitOr),
+        VB_BIT_XOR => Some(crate::ast::BinaryOp::BitXor),
+        VB_SHL => Some(crate::ast::BinaryOp::Shl),
+        VB_SHR => Some(crate::ast::BinaryOp::Shr),
+        _ => None,
+    };
+    if let Some(bop) = bop
+        && let Some(v) = bigint_early(ctx, bop, NanBox::from_bits(a), NanBox::from_bits(b))
+    {
+        return v.to_bits();
+    }
     // SAFETY: `jit_funcs` outlives this call (borrowed down the whole call tree).
     #[allow(unsafe_code)]
     let funcs = unsafe {
@@ -9171,6 +9196,10 @@ pub(crate) fn jit_helper_add(ctx: *mut core::ffi::c_void, a: u64, b: u64) -> u64
     // Two strings, or a string and an integer (compiled code adds Numbers
     // itself): `vm_add`'s first case, before anything else is looked up.
     if let Some(v) = ctx.realm.add_fast(av, bv) {
+        return v.to_bits();
+    }
+    // Two BigInts (what `vm_add` reaches for them after its string probes).
+    if let Some(v) = bigint_early(ctx, crate::ast::BinaryOp::Add, av, bv) {
         return v.to_bits();
     }
     // SAFETY: `jit_funcs` points at the function table for the whole program run,
