@@ -5259,7 +5259,7 @@ pub(crate) fn jit_helper_super_call(
     // SAFETY: see the function contract (as `jit_helper_exec_op`).
     #[allow(unsafe_code)]
     let op = unsafe { &*op_raw };
-    if let Op::SuperCallArgs { ctor, .. } = op {
+    if let Op::SuperCallArgs { ctor, .. } | Op::SuperCall { ctor, .. } = op {
         // SAFETY: see the function contract.
         #[allow(unsafe_code)]
         let (ctx, ctor_val, site) = unsafe {

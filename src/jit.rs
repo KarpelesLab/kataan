@@ -3299,6 +3299,14 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
                 call_args.push(args.clone());
                 n_calls += 1;
             }
+            // (Its argument list is its array register, once per element
+            // the call sequence may spread from the native frame's scratch
+            // buffer, which this list's length reserves, plus one for their
+            // address: `SUPER_SPREAD_MAX`.)
+            Op::SuperCall { args, .. } => {
+                call_args.push(alloc::vec![*args; SUPER_SPREAD_MAX + 1]);
+                n_calls += 1;
+            }
             Op::SuperCtor { .. } | Op::InitFields { .. } => n_calls += 1,
             _ => {}
         }
@@ -3311,6 +3319,13 @@ pub fn lower_nbvm_generic(proto: &crate::nbvm::FnProto) -> Option<GenericLowerin
     );
     Some((out, keys, call_args, n_calls))
 }
+
+/// The most array elements a compiled `super(...array)` (`Op::SuperCall`)
+/// passes through its construct sequence (copied into the native frame's
+/// scratch buffer first: the construct's preparation may allocate, which can
+/// move an array's inline elements).
+#[cfg(all(feature = "alloc", jit_native))]
+const SUPER_SPREAD_MAX: usize = 8;
 
 /// Per bytecode pc, the `(argument-list index, call-site index)` of an
 /// interpreter op [`lower_nbvm_generic`] gave a call site of its own
@@ -3328,7 +3343,7 @@ fn interp_sites(
     let (mut extra_args, mut extra_sites) = (0usize, 0usize);
     for op in bytecode {
         match op {
-            Op::SuperCallArgs { .. } | Op::CallSpreadPlain { .. } => {
+            Op::SuperCallArgs { .. } | Op::SuperCall { .. } | Op::CallSpreadPlain { .. } => {
                 extra_args += 1;
                 extra_sites += 1;
             }
@@ -3341,7 +3356,7 @@ fn interp_sites(
     let mut out = Vec::with_capacity(bytecode.len());
     for op in bytecode {
         let here = match op {
-            Op::SuperCallArgs { .. } | Op::CallSpreadPlain { .. } => {
+            Op::SuperCallArgs { .. } | Op::SuperCall { .. } | Op::CallSpreadPlain { .. } => {
                 let v = (u16::try_from(args).ok()?, u16::try_from(site).ok()?);
                 args += 1;
                 site += 1;
@@ -3370,6 +3385,7 @@ fn key_sites(bytecode: &[crate::nbvm::Op], n_sites: usize) -> Option<Vec<Option<
         match op {
             Op::GetKey { .. } => keys += 1,
             Op::SuperCallArgs { .. }
+            | Op::SuperCall { .. }
             | Op::CallSpreadPlain { .. }
             | Op::SuperCtor { .. }
             | Op::InitFields { .. } => extra += 1,
@@ -5532,7 +5548,9 @@ impl JitProto {
         if let Some(own) = interp_sites(&bytecode, call_args.len(), n_calls) {
             for (pc, op) in bytecode.iter().enumerate() {
                 if let (
-                    crate::nbvm::Op::SuperCallArgs { .. } | crate::nbvm::Op::CallSpreadPlain { .. },
+                    crate::nbvm::Op::SuperCallArgs { .. }
+                    | crate::nbvm::Op::SuperCall { .. }
+                    | crate::nbvm::Op::CallSpreadPlain { .. },
                     Some(Some((_, site))),
                 ) = (op, own.get(pc))
                 {
@@ -15596,6 +15614,96 @@ impl JitFunction {
                             a.bind(called);
                             a.movabs_rax(tag_true as i64);
                             a.store_rax(disp(*ok_reg));
+                            a.bind(done);
+                        }
+                        // `super(...array)` (a derived class's default
+                        // constructor forwarding its rest array, or a spread
+                        // the compiler collected into a fresh array): the
+                        // array's elements are the arguments as they are (no
+                        // iteration, `spread_argv`), so those of a plain
+                        // array without holes, at most `SUPER_SPREAD_MAX`,
+                        // copied into the scratch buffer (their address in
+                        // the slot after them, `dst` carrying the count),
+                        // are spread by the construct sequence; anything
+                        // else, or a constructor the sequence does not run,
+                        // is the interpreter's op through the site-filling
+                        // helper. (Nothing collects between the copy and the
+                        // header's.)
+                        crate::nbvm::Op::SuperCall {
+                            dst,
+                            ctor,
+                            new_target,
+                            args,
+                            this,
+                        } if ok(*dst)
+                            && ok(*ctor)
+                            && ok(*new_target)
+                            && ok(*this)
+                            && ok(*args)
+                            && max_argc > SUPER_SPREAD_MAX
+                            && own_site.is_some()
+                            && a.inline_ctx.as_ref().is_none_or(|c| c.acts.is_empty()) =>
+                        {
+                            use call_seq::r as R;
+                            let (args_site, site_ptr) = own_site?;
+                            if call_args.get(args_site as usize)?.iter().any(|r| r != args) {
+                                return None;
+                            }
+                            let slow = a.new_label();
+                            let done = a.new_label();
+                            walk_to_slot!(*args, slow);
+                            family_checks!(recv_cache::Family::Arr, slow);
+                            // r8 = the count, r11 = the first element.
+                            a.p_arr_len_ptr(&layout);
+                            a.g_cmp_imm(R::R8, SUPER_SPREAD_MAX as i32);
+                            a.g_jcc(call_seq::cc::A, slow);
+                            a.g_store(R::RBX, disp(*dst), R::R8);
+                            // The elements into the buffer, none a hole.
+                            let plain = a.new_label();
+                            a.g_movabs(R::RDX, NanBox::hole().to_bits());
+                            for i in 0..SUPER_SPREAD_MAX {
+                                a.g_cmp_imm(R::R8, i as i32);
+                                a.g_jcc(call_seq::cc::BE, plain);
+                                a.g_load(R::RAX, R::R11, (i * 8) as i32);
+                                a.g_cmp(R::RAX, R::RDX);
+                                a.g_jcc(call_seq::cc::E, slow);
+                                a.g_store(R::RBP, argbuf_disp(i), R::RAX);
+                            }
+                            a.bind(plain);
+                            a.g_lea(R::RAX, R::RBP, argbuf_disp(0));
+                            a.g_store(R::RBP, argbuf_disp(SUPER_SPREAD_MAX), R::RAX);
+                            let no_args: Vec<u16> = Vec::new();
+                            call_seq::emit_call(
+                                &mut a,
+                                &call_seq::CallEmit {
+                                    dst: *dst,
+                                    callee: call_seq::CalleeSrc::Construct {
+                                        ctor: *ctor,
+                                        new_target: *new_target,
+                                        scratch: method_scratch,
+                                        helper: construct_helper,
+                                        result: construct_result_helper,
+                                        alloc: construct_alloc_helper,
+                                        bind_this: Some((*this, super_twice_helper)),
+                                    },
+                                    this: None,
+                                    args: &no_args,
+                                    spread: Some(call_seq::SpreadArgs {
+                                        ptr: argbuf_disp(SUPER_SPREAD_MAX),
+                                        len: *dst,
+                                    }),
+                                    site: site_ptr,
+                                    layout: &helpers.call_layout,
+                                    throw_exit,
+                                    slow,
+                                    done,
+                                },
+                            )?;
+                            let cold = a.cold_begin();
+                            a.bind(slow);
+                            site_slow!(helpers.super_call, site_ptr);
+                            a.jmp(done);
+                            a.cold_end(cold);
                             a.bind(done);
                         }
                         crate::nbvm::Op::SuperCallArgs {

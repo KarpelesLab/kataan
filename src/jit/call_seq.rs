@@ -3193,7 +3193,18 @@ fn emit_enter(
     a.g_load(r::RDX, r::R9, l.callee_len);
     a.g_store(r::RCX, 16, r::RDX);
     if let CalleeSrc::Construct { new_target, .. } = e.callee {
-        a.g_store_imm32(r::RCX, 24, argc_word(argc, true)?);
+        match e.spread {
+            // The run-time count, with the construct mark as `argc_word`
+            // makes it (sign-extended).
+            Some(sp) => {
+                a.g_load(r::RDX, r::RBX, reg(sp.len));
+                a.g_lea(r::RDX, r::RDX, i32::try_from(argc).ok()?);
+                a.g_movabs(r::RDI, 0xffff_ffff_8000_0000);
+                a.g_rr(0x09, r::RDX, r::RDI); // or rdx, rdi
+                a.g_store(r::RCX, 24, r::RDX);
+            }
+            None => a.g_store_imm32(r::RCX, 24, argc_word(argc, true)?),
+        }
         a.g_load(r::RDX, r::RBX, reg(new_target));
         a.g_store(r::RCX, 32, r::RDX);
     } else if let Some(sp) = e.spread {
@@ -3235,10 +3246,14 @@ fn emit_enter(
     }
     a.dbg_mark("c-entry");
     // 6. entry(ctx, window, argc, argv, caps, this), `ctx` in `r15`.
-    if e.spread.is_some() {
-        a.g_load(r::RDX, r::RCX, 24);
-    } else {
-        a.g_movabs(r::RDX, argc as u64);
+    match e.spread {
+        // (A construct's header word carries its mark: the count again.)
+        Some(sp) if matches!(e.callee, CalleeSrc::Construct { .. }) => {
+            a.g_load(r::RDX, r::RBX, reg(sp.len));
+            a.g_lea(r::RDX, r::RDX, i32::try_from(argc).ok()?);
+        }
+        Some(_) => a.g_load(r::RDX, r::RCX, 24),
+        None => a.g_movabs(r::RDX, argc as u64),
     }
     a.g_lea(r::RCX, r::RCX, hdr(FRAME_HEADER)?);
     match (&e.callee, e.this) {
