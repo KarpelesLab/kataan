@@ -4071,6 +4071,22 @@ fn in_call_free_loop(bytecode: &[crate::nbvm::Op], pc: usize, coll: bool) -> boo
     })
 }
 
+/// Whether an array step's generic path tests a latched `done` with one
+/// byte compare and stores its cursor's two copies straight from `xmm0`
+/// (`KATAAN_JIT_ITERBYTE`, default on).
+#[cfg(all(feature = "alloc", jit_native))]
+fn iter_byte_done_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_ITERBYTE").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether a generic forward test of a value's truthiness (`if (x)`,
 /// `if (!x)`) branches on each answer it finds, with no `0`/`1` made and
 /// tested again (`KATAAN_JIT_TRUTHYBR=0` turns it off, read once per
@@ -15971,8 +15987,16 @@ impl JitFunction {
                                 // register is read as below and the shadow
                                 // refilled.
                                 use call_seq::r as R;
-                                a.load_rax(disp(done));
-                                iter_cmp_const!(tag_true);
+                                // A latched `done`: one byte compare of the
+                                // register with `true`'s tag byte (any value
+                                // sharing it takes the interpreter's op).
+                                if iter_byte_done_enabled() {
+                                    let d = disp(done);
+                                    a.g_cmp_byte_imm(a.frame_base(d), d, tag_true as u8);
+                                } else {
+                                    a.load_rax(disp(done));
+                                    iter_cmp_const!(tag_true);
+                                }
                                 a.je(slow);
                                 recv_slot!(op_idx, next, slow, recv_cache::Family::Arr);
                                 let resync = a.new_label();
@@ -15996,9 +16020,15 @@ impl JitFunction {
                                 // shadow.
                                 iter_cursor_xmm0!();
                                 a.g_store(R::RBP, sh_int, R::R8);
-                                a.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
-                                a.store_rax(disp(iter));
-                                a.g_store(R::RBP, sh_bits, R::RAX);
+                                if iter_byte_done_enabled() {
+                                    // (Both from `xmm0`: no `movq` through `rax`.)
+                                    a.movsd_mem_xmm0(disp(iter));
+                                    a.movsd_mem_xmm0(sh_bits);
+                                } else {
+                                    a.raw(&[0x66, 0x48, 0x0f, 0x7e, 0xc0]); // movq rax, xmm0
+                                    a.store_rax(disp(iter));
+                                    a.g_store(R::RBP, sh_bits, R::RAX);
+                                }
                                 a.jmp(num.iter_step_body(&labels, op_idx).unwrap_or(fin));
                                 a.bind(end);
                                 a.test_rax_rax();
