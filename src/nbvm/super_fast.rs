@@ -15,7 +15,7 @@
 //! static method's base (a function) — is a miss, for the caller's general
 //! path, which keeps every error and ordering.
 
-use super::{Ctx, FnProto, VmError, call_closure_compiled, private_ops::KeyText, super_base};
+use super::{Ctx, FnProto, VmError, call_closure_compiled, super_base};
 use crate::heap::Handle;
 use crate::ic::PropertyCache;
 use crate::nanbox::NanBox;
@@ -25,7 +25,18 @@ use alloc::boxed::Box;
 /// One `super` property site's chain cache. Empty when cold, and when
 /// copied (a fresh copy of the bytecode starts cold).
 #[derive(Default)]
-pub struct SuperCache(core::cell::Cell<Option<Box<PropertyCache>>>);
+pub struct SuperCache(core::cell::Cell<Option<Box<SiteMemo>>>);
+
+/// A [`SuperCache`]'s contents: the chain cache, and the key the site last
+/// looked up (its value's bits, which name one string cell for as long as
+/// they are a live handle, a recycled slot carrying another generation),
+/// with its text, so a static key's text is not copied and checked on
+/// every access.
+struct SiteMemo {
+    chain: PropertyCache,
+    key_bits: u64,
+    key: Box<str>,
+}
 
 impl Clone for SuperCache {
     fn clone(&self) -> Self {
@@ -39,41 +50,71 @@ impl core::fmt::Debug for SuperCache {
     }
 }
 
-/// The holder of `key` on `base`'s chain, through `cache`: `None` when the
-/// site cannot serve it (see the module docs), having armed the cache for
-/// the next time when the chain allows it.
-fn lookup(ctx: &Ctx, base: Handle, key: &str, cache: &SuperCache) -> Option<ChainHit> {
-    if key.is_empty()
-        || key.starts_with('\0')
-        || key.as_bytes()[0].is_ascii_digit()
-        || ctx.realm.is_host_exotic(base)
-        || ctx.realm.is_vm_function(base)
-    {
+/// The holder of `key`'s text on `base`'s chain, through `cache`: `None`
+/// when the site cannot serve it (see the module docs), having armed the
+/// cache for the next time when the chain allows it.
+fn lookup(ctx: &Ctx, base: Handle, key: NanBox, cache: &SuperCache) -> Option<ChainHit> {
+    let kh = Handle::from_raw(key.as_handle()?);
+    if ctx.realm.is_host_exotic(base) || ctx.realm.is_vm_function(base) {
         return None;
     }
-    let mut c = cache
-        .0
-        .take()
-        .unwrap_or_else(|| Box::new(PropertyCache::new()));
-    let hit = ctx.realm.chain_cached_get(base, key, &c);
-    if hit.is_none() {
-        ctx.realm.chain_cache_fill(base, key, &mut c);
+    let mut m = cache.0.take().unwrap_or_else(|| {
+        Box::new(SiteMemo {
+            chain: PropertyCache::new(),
+            key_bits: 0,
+            key: Box::from(""),
+        })
+    });
+    if m.key_bits != key.to_bits() {
+        let Some(text) = ctx
+            .realm
+            .string_leaf_bytes(kh)
+            .and_then(|b| core::str::from_utf8(b).ok())
+        else {
+            cache.0.set(Some(m));
+            return None;
+        };
+        m.key = Box::from(text);
+        m.key_bits = key.to_bits();
     }
-    cache.0.set(Some(c));
+    let k: &str = &m.key;
+    if k.is_empty() || k.starts_with('\0') || k.as_bytes()[0].is_ascii_digit() {
+        cache.0.set(Some(m));
+        return None;
+    }
+    let hit = ctx.realm.chain_cached_get(base, k, &m.chain);
+    if hit.is_none() {
+        let SiteMemo { chain, key, .. } = &mut *m;
+        ctx.realm.chain_cache_fill(base, key, chain);
+    }
+    cache.0.set(Some(m));
     hit
 }
 
-/// The base and key text of a `super` reference (`None`: not a string key
-/// on an object base).
-fn parts(ctx: &mut Ctx, home: NanBox, key: NanBox) -> Option<Result<(Handle, KeyText), VmError>> {
+/// The base of a `super` reference (`None`: not an object base).
+fn base_of(ctx: &mut Ctx, home: NanBox) -> Option<Result<Handle, VmError>> {
     let base = match super_base(ctx, home) {
         Ok(b) => b,
         Err(e) => return Some(Err(e)),
     };
-    let b = Handle::from_raw(base.as_handle()?);
-    let kh = Handle::from_raw(key.as_handle()?);
-    ctx.realm.string_leaf_bytes(kh)?;
-    Some(Ok((b, KeyText::of(&ctx.realm, key))))
+    Some(Ok(Handle::from_raw(base.as_handle()?)))
+}
+
+/// `super[key] = v` of a captured base (`Op::SuperSetBase`), as [`set`].
+pub(super) fn set_base(
+    ctx: &mut Ctx,
+    funcs: &[FnProto],
+    regs: &[NanBox],
+    (base, key, v, this): (NanBox, NanBox, NanBox, NanBox),
+    cache: &SuperCache,
+) -> Option<Result<(), VmError>> {
+    let base = Handle::from_raw(base.as_handle()?);
+    match lookup(ctx, base, key, cache)? {
+        ChainHit::Accessor(_, setter, _) if setter.as_handle().is_some() => {
+            Some(call_closure_compiled(ctx, funcs, Some(regs), setter, &[v], this).map(|_| ()))
+        }
+        _ => None,
+    }
 }
 
 /// `super[key]` read with receiver `this` (`None`: take the general path,
@@ -85,11 +126,11 @@ pub(super) fn get(
     (home, key, this): (NanBox, NanBox, NanBox),
     cache: &SuperCache,
 ) -> Option<Result<NanBox, VmError>> {
-    let (base, k) = match parts(ctx, home, key)? {
-        Ok(p) => p,
+    let base = match base_of(ctx, home)? {
+        Ok(b) => b,
         Err(e) => return Some(Err(e)),
     };
-    match lookup(ctx, base, k.as_str(), cache)? {
+    match lookup(ctx, base, key, cache)? {
         ChainHit::Data(v) => Some(Ok(v)),
         ChainHit::Absent => Some(Ok(NanBox::undefined())),
         ChainHit::Accessor(getter, _, _) if getter.as_handle().is_some() => Some(
@@ -110,11 +151,11 @@ pub(super) fn set(
     (home, key, v, this): (NanBox, NanBox, NanBox, NanBox),
     cache: &SuperCache,
 ) -> Option<Result<(), VmError>> {
-    let (base, k) = match parts(ctx, home, key)? {
-        Ok(p) => p,
+    let base = match base_of(ctx, home)? {
+        Ok(b) => b,
         Err(e) => return Some(Err(e)),
     };
-    match lookup(ctx, base, k.as_str(), cache)? {
+    match lookup(ctx, base, key, cache)? {
         ChainHit::Accessor(_, setter, _) if setter.as_handle().is_some() => {
             Some(call_closure_compiled(ctx, funcs, Some(regs), setter, &[v], this).map(|_| ()))
         }

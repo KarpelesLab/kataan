@@ -746,9 +746,21 @@ fn verify_op_with(
             Ok(())
         }
         Op::ThrowTypeError { .. } | Op::ThrowReferenceError { .. } => Ok(()),
-        Op::SuperSnapshot { dst, home } => {
+        Op::SuperSnapshot { dst, home } | Op::SuperBase { dst, home } => {
             reg(*dst)?;
             reg(*home)
+        }
+        Op::SuperSetBase {
+            base,
+            key,
+            src,
+            this,
+            ..
+        } => {
+            reg(*base)?;
+            reg(*key)?;
+            reg(*src)?;
+            reg(*this)
         }
         Op::Compare { dst, a, b, .. } => {
             reg(*dst)?;
@@ -1871,6 +1883,25 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             w_reg(*dst, out);
             w_reg(*home, out);
         }
+        Op::SuperBase { dst, home } => {
+            w_u8(233, out);
+            w_reg(*dst, out);
+            w_reg(*home, out);
+        }
+        Op::SuperSetBase {
+            base,
+            key,
+            src,
+            this,
+            strict,
+            ..
+        } => {
+            w_u8(234, out);
+            for r in [base, key, src, this] {
+                w_reg(*r, out);
+            }
+            w_bool(*strict, out);
+        }
         Op::AsyncDisposeStep { state, dst, done } => {
             w_u8(152, out);
             w_reg(*state, out);
@@ -2820,6 +2851,18 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
         171 => Op::SuperSnapshot {
             dst: r.reg()?,
             home: r.reg()?,
+        },
+        233 => Op::SuperBase {
+            dst: r.reg()?,
+            home: r.reg()?,
+        },
+        234 => Op::SuperSetBase {
+            base: r.reg()?,
+            key: r.reg()?,
+            src: r.reg()?,
+            this: r.reg()?,
+            strict: r.boolean()?,
+            cache: Default::default(),
         },
         152 => Op::AsyncDisposeStep {
             state: r.reg()?,

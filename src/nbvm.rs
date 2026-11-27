@@ -482,6 +482,22 @@ pub enum Op {
     /// compound assignment, update or destructuring target, used as the
     /// `home` of later `SuperGet`/`SuperSet`s.
     SuperSnapshot { dst: Reg, home: Reg },
+    /// `dst = home.[[Prototype]]` (an object, or `null`): a plain
+    /// `super[key] = v`'s base (GetSuperBase), captured before the
+    /// right-hand side runs, for the [`Op::SuperSetBase`] after it — the
+    /// value itself, where [`Op::SuperSnapshot`] makes an object to carry it.
+    SuperBase { dst: Reg, home: Reg },
+    /// `super[key] = src` with receiver `this`, its base `base` captured by
+    /// [`Op::SuperBase`]: `base.[[Set]](key, src, this)` (a `null` base
+    /// throws the `TypeError` [`Op::SuperSet`] throws).
+    SuperSetBase {
+        base: Reg,
+        key: Reg,
+        src: Reg,
+        this: Reg,
+        strict: bool,
+        cache: super_fast::SuperCache,
+    },
     /// `dst = a <op> b` for `op` 0 `<`, 1 `>`, 2 `<=`, 3 `>=` (hosted): numbers
     /// directly, anything else through the host's operator.
     Compare { dst: Reg, op: u8, a: Reg, b: Reg },
@@ -2697,7 +2713,14 @@ fn vm_set_prop_mode(
         // That is what the hosted rules (`plain_write_ok` holds) and
         // `vm_set_prop` (no accessor, not own) both reduce to.
         if ctx.realm.object_accepts_new_property(h) {
-            let hit = ctx.realm.chain_cached_get(h, key, cache);
+            let mut hit = ctx.realm.chain_cached_get(h, key, cache);
+            // (A cold or missed site arms its chain cache first: so the
+            // setter it finds is noted from the first write that calls
+            // it, not the second.)
+            if hit.is_none() {
+                ctx.realm.chain_cache_fill(h, key, cache);
+                hit = ctx.realm.chain_cached_get(h, key, cache);
+            }
             // The setter feedback the machine-code tier inlines from.
             if let Some(crate::realm::ChainHit::Accessor(_, setter, _)) = hit
                 && let Some(s) = setter.as_handle()
@@ -2722,7 +2745,6 @@ fn vm_set_prop_mode(
                 }
                 return Ok(());
             }
-            ctx.realm.chain_cache_fill(h, key, cache);
         }
     }
     // An in-place write to an existing writable own data property of a VM
@@ -7068,7 +7090,13 @@ fn ensure_jit(
                         ),
                         None => (tier_warm(&funcs[id]), tier_hints(&funcs[id])),
                     };
-                    let cold = jit_tier::cold_call_pcs(&funcs[id], &hints);
+                    let cold = match ic {
+                        Some(ic) => jit_tier::cold_call_pcs(&funcs[id], &hints, ic),
+                        None => funcs[id].tier.0.try_borrow().map_or_else(
+                            |_| jit_tier::cold_call_pcs(&funcs[id], &hints, &[]),
+                            |t| jit_tier::cold_call_pcs(&funcs[id], &hints, &t.ic),
+                        ),
+                    };
                     // (The running frame's element access feedback: its caches are
                     // out of the function's tier while it runs.)
                     let kinds = ic.map(elem_kinds_of).unwrap_or_default();
@@ -11163,6 +11191,43 @@ fn run_frame_at_ic(
             Op::ThrowReferenceError { msg } => {
                 let e = vm_error(ctx, "ReferenceError", msg);
                 handle_throw!(VmError::Thrown(e));
+            }
+            Op::SuperBase { dst, home } => {
+                let h = object_handle(regs[*home as usize])?;
+                regs[*dst as usize] = ctx
+                    .realm
+                    .object_proto(h)
+                    .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
+            }
+            Op::SuperSetBase {
+                base,
+                key,
+                src,
+                this,
+                strict,
+                cache,
+            } => {
+                let (b, k, v, t) = (
+                    regs[*base as usize],
+                    regs[*key as usize],
+                    regs[*src as usize],
+                    regs[*this as usize],
+                );
+                if let Some(r) = super_fast::set_base(ctx, funcs, regs, (b, k, v, t), cache) {
+                    if let Err(e) = r {
+                        handle_throw!(e);
+                    }
+                    continue;
+                }
+                if b.as_handle().is_none() {
+                    let e = vm_error(ctx, "TypeError", "Cannot access super property of null");
+                    handle_throw!(VmError::Thrown(e));
+                }
+                match with_host_regs(ctx, regs, |h| h.set_with_receiver(b, k, v, t, *strict)) {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => handle_throw!(VmError::from(e)),
+                    None => return Err(VmError::Unsupported),
+                }
             }
             Op::SuperSnapshot { dst, home } => {
                 let h = object_handle(regs[*home as usize])?;
@@ -24752,11 +24817,13 @@ impl Compiler {
                             });
                             return Ok(src);
                         }
-                        let (home, this, key) = self.super_place(property, false)?;
+                        // (The base itself, captured before the right-hand
+                        // side: no snapshot object.)
+                        let (base, this, key) = self.super_base_place(property)?;
                         let src = self.expr(value)?;
-                        self.ops.push(Op::SuperSet {
+                        self.ops.push(Op::SuperSetBase {
                             cache: Default::default(),
-                            home,
+                            base,
                             key,
                             src,
                             this,
@@ -28531,6 +28598,35 @@ impl Compiler {
             }
         };
         Ok((snap, this, key))
+    }
+
+    /// A plain `super[key] = v`'s reference: `this` first, then the key
+    /// expression (converted by the store), then the base captured once (an
+    /// [`Op::SuperBase`]) — returns `(base, this, key)`.
+    fn super_base_place(
+        &mut self,
+        property: &PropertyKey,
+    ) -> Result<(Reg, Reg, Reg), CompileError> {
+        let hb = self
+            .lookup(HOME_NAME)
+            .ok_or(CompileError::Unsupported("super outside a class element"))?;
+        let this = self.this_value();
+        let raw = match property {
+            PropertyKey::Computed(e) => Some(self.expr(e)?),
+            PropertyKey::Private(_) => return Err(CompileError::Unsupported("private name")),
+            _ => None,
+        };
+        let home = self.read_var(hb);
+        let base = self.alloc();
+        self.ops.push(Op::SuperBase { dst: base, home });
+        let key = match raw {
+            Some(k) => k,
+            None => {
+                let k = static_key(property)?;
+                self.key_constant(&k)
+            }
+        };
+        Ok((base, this, key))
     }
 
     /// An assignment to a call (`f() = v`, `f()++`, `for (f() in …)`; Annex B

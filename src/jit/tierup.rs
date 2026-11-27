@@ -794,7 +794,68 @@ impl JitProto {
     pub fn wants_site_recompile(&self) -> bool {
         self.generation() < MAX_GENERATION
             && self.code_len() <= SITE_RECOMPILE_MAX
-            && self.any_site_learned()
+            && (self.any_site_learned() || self.inlined_accessor_learned())
+    }
+
+    /// Whether an inlined accessor's site called an accessor the body did
+    /// not inline (`MethodSite::note_inlined_callee`).
+    fn inlined_accessor_learned(&self) -> bool {
+        self.sites.as_ref().is_some_and(|s| {
+            s.methods.iter().flatten().any(|m| {
+                // SAFETY: the body is not running here (a back-edge poll's
+                // request is served outside it), no other borrow is live.
+                #[allow(unsafe_code)]
+                let m = unsafe { &*m.get() };
+                m.inlined_learned()
+            })
+        })
+    }
+
+    /// What this body's inlined accessors' sites learned, for its
+    /// recompilation: `(function id, its own pc, callee keys)` per site of
+    /// an inlined callee where the body inlined accessors — those, and the
+    /// ones its slow path called since (its property cache's callee
+    /// feedback), so the recompiled body inlines each of them there.
+    #[must_use]
+    pub fn inlined_accessor_hints(&self) -> Vec<(u32, usize, Vec<u64>)> {
+        let Some(s) = self.sites.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (site, m) in s.methods.iter().enumerate() {
+            let Some(m) = m else { continue };
+            // SAFETY: as in `inlined_accessor_learned`.
+            #[allow(unsafe_code)]
+            let m = unsafe { &*m.get() };
+            if m.inlined_keys().is_empty() {
+                continue;
+            }
+            let Some(&pc) = s.tier_up.site_pc.get(site) else {
+                continue;
+            };
+            let Some((f, fpc)) = self.inl_src(pc) else {
+                continue;
+            };
+            let mut keys: Vec<u64> = m.inlined_keys().to_vec();
+            if let Some(c) = s.caches.get(site) {
+                // SAFETY: as above.
+                #[allow(unsafe_code)]
+                let c = unsafe { &*c.get() };
+                match super::poly::hint_of(c) {
+                    crate::ic::CalleeHint::One(k) if !keys.contains(&k) => keys.push(k),
+                    h @ crate::ic::CalleeHint::Poly(_) => {
+                        for f in h.poly_fns() {
+                            if !keys.iter().any(|&x| x as u32 == f) {
+                                keys.push(u64::from(f));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push((f, fpc, keys));
+        }
+        out
     }
 
     /// Whether property site `site` (a write if `write`) learned something a

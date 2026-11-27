@@ -1259,7 +1259,7 @@ fn recompile(
     }
     // (And no speculative version for a loop whose fast version kept
     // leaving it.)
-    let cold = cold_call_pcs(proto, &hints);
+    let cold = cold_call_pcs(proto, &hints, ic);
     // (Its element access feedback: the old body's, and the caches'.)
     let kinds = crate::jit::typed::merge_kinds(old.elem_kinds(), &super::elem_kinds_of(ic));
     // (And what its inlined callees' sites learned.)
@@ -1269,6 +1269,9 @@ fn recompile(
         alloc::vec::Vec::new()
     };
     let prev = INLINED_WARM.with(|iw| core::mem::replace(&mut *iw.borrow_mut(), inl));
+    // (And the accessors its inlined callees' property sites called.)
+    let prev_acc = INLINED_ACCESSORS
+        .with(|ia| core::mem::replace(&mut *ia.borrow_mut(), old.inlined_accessor_hints()));
     let hdr = call_hdr_pcs(funcs, &hints);
     let new = timed_compile(
         proto,
@@ -1297,6 +1300,7 @@ fn recompile(
         },
     );
     INLINED_WARM.with(|iw| *iw.borrow_mut() = prev);
+    INLINED_ACCESSORS.with(|ia| *ia.borrow_mut() = prev_acc);
     let mut new = new?;
     new.note_cold_calls(&cold);
     new.note_function(id);
@@ -2900,6 +2904,34 @@ pub(crate) fn jit_helper_exec_op(
             );
             super::super_fast::set(ctx, funcs, regs, (h, k, v, t), cache)
         }
+        Op::SuperSetBase {
+            base,
+            key,
+            src,
+            this,
+            cache,
+            ..
+        } => {
+            let (b, k, v, t) = (
+                regs[*base as usize],
+                regs[*key as usize],
+                regs[*src as usize],
+                regs[*this as usize],
+            );
+            super::super_fast::set_base(ctx, funcs, regs, (b, k, v, t), cache)
+        }
+        // (Its interpreter arm, which cannot fail on a home object.)
+        Op::SuperBase { dst, home } => regs[*home as usize]
+            .as_handle()
+            .map(Handle::from_raw)
+            .filter(|&h| ctx.realm.jit_object(h).is_some())
+            .map(|h| {
+                regs[*dst as usize] = ctx
+                    .realm
+                    .object_proto(h)
+                    .map_or(NanBox::null(), |p| NanBox::handle(p.to_raw()));
+                Ok(())
+            }),
         // `x instanceof F` decided from the heap alone (the interpreter arm's
         // own first step); anything else takes the one-op frame.
         Op::Relational {
@@ -6834,10 +6866,15 @@ pub(super) fn call_hdr_pcs(
 
 /// The pcs of `proto`'s call sites with no callee feedback in `hints` (none
 /// to inline when it is compiled): a body recompiles when one of them settles
-/// on a single callee (`JitProto::note_cold_calls`).
+/// on a single callee (`JitProto::note_cold_calls`). A property read or
+/// write counts as a call site when its cache in `ic` (the interpreter's)
+/// found an inherited accessor on the chain ([`accessor_site`]): a setter
+/// the site reached once or twice before the body was compiled, too few
+/// times to note it, is inlined once the compiled site's call cache takes it.
 pub(super) fn cold_call_pcs(
     proto: &FnProto,
     hints: &[crate::ic::CalleeHint],
+    ic: &[crate::ic::PropertyCache],
 ) -> alloc::vec::Vec<usize> {
     if !inline_enabled() {
         return alloc::vec::Vec::new();
@@ -6847,7 +6884,7 @@ pub(super) fn cold_call_pcs(
         .iter()
         .enumerate()
         .filter(|&(pc, op)| {
-            matches!(
+            (matches!(
                 op,
                 Op::CallMethod { .. }
                     | Op::CallValue { .. }
@@ -6856,12 +6893,29 @@ pub(super) fn cold_call_pcs(
                     | Op::Construct { .. }
                     | Op::SuperCallArgs { .. }
                     | Op::CallSpreadPlain { .. }
-            ) && hints
-                .get(pc)
-                .is_none_or(|h| *h == crate::ic::CalleeHint::None)
+            ) || (matches!(
+                op,
+                Op::GetProp { .. } | Op::SetProp { .. } | Op::SetPropStrict { .. }
+            ) && ic.get(pc).is_some_and(accessor_site)))
+                && hints
+                    .get(pc)
+                    .is_none_or(|h| *h == crate::ic::CalleeHint::None)
         })
         .map(|(pc, _)| pc)
         .collect()
+}
+
+/// Whether a property site's cache found an accessor on the receiver's
+/// prototype chain (any entry of its chain cache).
+fn accessor_site(c: &crate::ic::PropertyCache) -> bool {
+    let mut e = c.chain.as_deref();
+    while let Some(ch) = e {
+        if ch.accessor {
+            return true;
+        }
+        e = ch.alt.as_deref();
+    }
+    false
 }
 
 /// The callee functions `caller`'s call site at pc `pc` inlines: the VM
@@ -6929,34 +6983,109 @@ fn nested_candidates<'a>(
 ) -> alloc::vec::Vec<(usize, crate::jit::inline::Candidate<'a>)> {
     let fid = (c.key & 0xffff_ffff) as usize;
     let proto = c.proto;
-    let mut own = match proto.tier.jit() {
+    let own = match proto.tier.jit() {
         Some(Some(j)) if j.is_generic() => j.call_hints(),
         _ => alloc::vec::Vec::new(),
     };
     let interp = super::tier_hints(proto);
-    if own.len() < interp.len() {
-        own.resize(interp.len(), crate::ic::CalleeHint::None);
-    }
-    for (h, i) in own.iter_mut().zip(interp) {
-        if *h == crate::ic::CalleeHint::None {
-            *h = i;
+    // (A callee key list of a hint: one function, or a polymorphic site's.)
+    let keys_of = |h: &crate::ic::CalleeHint| -> alloc::vec::Vec<u64> {
+        match *h {
+            crate::ic::CalleeHint::One(k) => alloc::vec![k],
+            crate::ic::CalleeHint::Poly(_) => h
+                .poly_fns()
+                .into_iter()
+                .filter_map(|f| {
+                    let q = funcs.get(f as usize)?;
+                    Some(u64::from(f) | ((q.n_captures as u64) << 32))
+                })
+                .collect(),
+            _ => alloc::vec::Vec::new(),
         }
-    }
-    (0..proto.ops.len())
-        .filter(|&p| !supers || matches!(proto.ops[p], Op::SuperCallArgs { .. }))
-        .filter_map(|p| {
-            let crate::ic::CalleeHint::One(k) = *own.get(p)? else {
-                return None;
+    };
+    let mut out = alloc::vec::Vec::new();
+    for (p, op) in proto.ops.iter().enumerate() {
+        if supers && !matches!(op, Op::SuperCallArgs { .. }) {
+            continue;
+        }
+        let none = crate::ic::CalleeHint::None;
+        let (h_own, h_int) = (own.get(p).unwrap_or(&none), interp.get(p).unwrap_or(&none));
+        let accessor = matches!(
+            op,
+            Op::GetProp { .. } | Op::SetProp { .. } | Op::SetPropStrict { .. }
+        );
+        let keys: alloc::vec::Vec<u64> = if accessor {
+            // A property site's accessors, polymorphic or not (a base-class
+            // method's `this.x = v` over subclasses that override the
+            // setter: each way, as at a site of the caller's own,
+            // `inline::expand`), as the compiled body's and the
+            // interpreter's caches saw them together: the compiled body
+            // may have been made before the site was reached much.
+            let mut ks = keys_of(h_own);
+            for k in keys_of(h_int) {
+                if !ks.contains(&k) {
+                    ks.push(k);
+                }
+            }
+            // (What the copies of this site in the body being recompiled
+            // learned: `INLINED_ACCESSORS`; a key without its capture count
+            // is a polymorphic hint's, completed from the function table.)
+            INLINED_ACCESSORS.with(|ia| {
+                for (f, pc, keys) in ia.borrow().iter() {
+                    if *f as usize != fid || *pc != p {
+                        continue;
+                    }
+                    for &k in keys {
+                        let k = match funcs.get((k & 0xffff_ffff) as usize) {
+                            Some(q) if k >> 32 == 0 => {
+                                (k & 0xffff_ffff) | ((q.n_captures as u64) << 32)
+                            }
+                            _ => k,
+                        };
+                        if !ks.contains(&k) {
+                            ks.push(k);
+                        }
+                    }
+                }
+            });
+            if ks.len() > crate::ic::CalleeHint::POLY_MAX {
+                continue;
+            }
+            ks
+        } else {
+            match (h_own, h_int) {
+                (&crate::ic::CalleeHint::One(k), _)
+                | (&crate::ic::CalleeHint::None, &crate::ic::CalleeHint::One(k)) => {
+                    alloc::vec![k]
+                }
+                _ => continue,
+            }
+        };
+        for k in keys {
+            let Some(n) = inline_candidate_key(funcs, fid, k) else {
+                continue;
             };
-            let n = inline_candidate_key(funcs, fid, k)?;
             // (Within the plain limits: only a call site of the caller's own
             // loops takes the larger ones, `inline::limits`.)
             let plain = crate::jit::inline::callee_ok_plain(n.proto)
                 || crate::jit::inline::construct_ok(n.proto);
             // (Not the outer caller again: its body is being compiled.)
-            (plain && (n.key & 0xffff_ffff) as usize != caller).then_some((p, n))
-        })
-        .collect()
+            if plain && (n.key & 0xffff_ffff) as usize != caller {
+                out.push((p, n));
+            }
+        }
+    }
+    out
+}
+
+std::thread_local! {
+    /// While a body is recompiled: the accessors its inlined callees'
+    /// property sites inlined or called since
+    /// (`JitProto::inlined_accessor_hints`, `(function id, pc, keys)`), which
+    /// [`nested_candidates`] adds to the callees' own feedback: a base-class
+    /// method inlined into a subclass's sees the subclass's override there.
+    static INLINED_ACCESSORS: core::cell::RefCell<alloc::vec::Vec<(u32, usize, alloc::vec::Vec<u64>)>> =
+        const { core::cell::RefCell::new(alloc::vec::Vec::new()) };
 }
 
 std::thread_local! {
@@ -7144,6 +7273,7 @@ pub(crate) fn jit_helper_set_prop_site(
     site: *mut crate::jit::MethodSite,
     val: u64,
     strict: u64,
+    call: *const CallSite,
 ) -> u64 {
     // SAFETY: see the function contract; the site is the calling `JitProto`'s
     // (interior-mutable, touched only by this helper while it runs).
@@ -7195,12 +7325,65 @@ pub(crate) fn jit_helper_set_prop_site(
             .as_ref()
             .is_some_and(|c| c.accessor);
         if accessor {
-            site.fill_set(&mut ctx.realm, h);
+            note_inlined_accessor(ctx, site, site_setter(ctx, h, site));
+        }
+        if accessor
+            && let Some(setter) = site.fill_set(&mut ctx.realm, h)
+            && !call.is_null()
+        {
+            // (The setter's way in the write's call cache: the callee
+            // feedback a caller inlining this body reads, `call_hints`.)
+            // SAFETY: the calling `JitProto`'s call cache for this write
+            // (interior-mutable, touched only by this helper while it runs).
+            #[allow(unsafe_code)]
+            let call = unsafe { &mut *call.cast_mut() };
+            fill_call_site(ctx, setter, call);
         }
         site.fill_add(&mut ctx.realm, h, &before);
     }
     r
 }
+}
+
+/// The setter the chain of `recv` finds for `site`'s key (an inherited
+/// accessor's), if any.
+fn site_setter(ctx: &Ctx, recv: Handle, site: &crate::jit::MethodSite) -> Option<NanBox> {
+    let key = site.key();
+    let mut cur = Some(recv);
+    for _ in 0..16 {
+        let h = cur?;
+        if let Some((_, s)) = ctx.realm.accessor(h, key) {
+            return Some(s);
+        }
+        if ctx.realm.has_own(h, key) {
+            return None;
+        }
+        cur = ctx.realm.object_proto(h);
+    }
+    None
+}
+
+/// An inlined accessor's site (`MethodSite::set_inlined`) whose slow path
+/// just called `f`: when that is a VM function the body did not inline, the
+/// body asks for its recompilation at the next back-edge poll
+/// ([`site_request`]; `JitProto::wants_site_recompile`).
+fn note_inlined_accessor(ctx: &mut Ctx, site: &mut crate::jit::MethodSite, f: Option<NanBox>) {
+    if site.inlined_keys().is_empty() {
+        return;
+    }
+    let Some((fid, caps)) = f
+        .and_then(|f| f.as_handle())
+        .and_then(|h| ctx.realm.vm_function(Handle::from_raw(h)))
+        .map(|(f, c)| (f, c.len()))
+    else {
+        return;
+    };
+    if let Some(body) = site.note_inlined_callee(u64::from(fid) | ((caps as u64) << 32))
+        && site_poll_enabled()
+        && ctx.jit_rt.site_req == 0
+    {
+        ctx.jit_rt.site_req = body;
+    }
 }
 
 jit_extern! {
@@ -7243,6 +7426,7 @@ pub(crate) fn jit_helper_get_prop_site(
         #[allow(unsafe_code)]
         let (ctx, call) = unsafe { (&mut *(ctx_raw as *mut Ctx), &mut *call.cast_mut()) };
         if let Some(getter) = site.fill_get(&mut ctx.realm, h) {
+            note_inlined_accessor(ctx, site, Some(getter));
             fill_call_site(ctx, getter, call);
         }
         site.fill_native_own(&mut ctx.realm, h);

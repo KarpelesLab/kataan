@@ -532,6 +532,28 @@ pub struct MethodSite {
     pub(super) dv: super::dataview::DvMemo,
     /// An inline `Map`/`Set` lookup site's proof (`super::coll`).
     pub(super) coll: super::coll::CollProof,
+    /// For an inlined accessor's property site (the fallback of an
+    /// `Op::InlineGuard` of the body): see [`InlinedAccessors`].
+    inl: InlinedAccessors,
+}
+
+/// The accessors a body inlined at one of its property sites (an inlined
+/// callee's `this.x = v`, whose callee feedback was the callee's own, from
+/// every context it ran in), so the site's slow path can tell when it calls
+/// one the body did not inline (a subclass's override, seen only through
+/// this caller): it then asks for the body's recompilation (the next
+/// back-edge poll's `jit_tier::site_request`), which inlines that one too
+/// (`JitProto::inlined_accessor_hints`).
+#[derive(Clone, Copy, Default)]
+struct InlinedAccessors {
+    /// The inlined callees' keys (function id | capture count << 32).
+    keys: [u64; 4],
+    /// How many (`0`: not an inlined accessor's site).
+    n: u8,
+    /// The body's bytecode address (its request's identity).
+    body: u64,
+    /// Whether the slow path called an accessor none of `keys` names.
+    learned: bool,
 }
 
 /// See [`MethodSite::fill_math`]: while the prototype epoch is `stamp`,
@@ -734,7 +756,40 @@ impl MethodSite {
             },
             dv: super::dataview::DvMemo::EMPTY,
             coll: super::coll::CollProof::EMPTY,
+            inl: InlinedAccessors::default(),
         }
+    }
+
+    /// Records that the body (bytecode at `body`) inlined the accessors
+    /// `keys` at this site ([`InlinedAccessors`]).
+    pub(crate) fn set_inlined(&mut self, keys: &[u64], body: u64) {
+        let n = keys.len().min(4);
+        self.inl.keys[..n].copy_from_slice(&keys[..n]);
+        self.inl.n = n as u8;
+        self.inl.body = body;
+    }
+
+    /// The slow path of an inlined accessor's site called the VM function
+    /// whose key is `key`: when the body inlined others only, the body's
+    /// bytecode address, the first time (its request for a recompilation).
+    pub(crate) fn note_inlined_callee(&mut self, key: u64) -> Option<u64> {
+        let i = &mut self.inl;
+        if i.n == 0 || i.learned || i.keys[..usize::from(i.n)].contains(&key) {
+            return None;
+        }
+        i.learned = true;
+        Some(i.body)
+    }
+
+    /// Whether the slow path called an accessor the body did not inline
+    /// ([`note_inlined_callee`](Self::note_inlined_callee)).
+    pub(crate) fn inlined_learned(&self) -> bool {
+        self.inl.learned
+    }
+
+    /// The accessors the body inlined here, if it is such a site.
+    pub(crate) fn inlined_keys(&self) -> &[u64] {
+        &self.inl.keys[..usize::from(self.inl.n)]
     }
 
     /// For an inline `Math.f(x)` site whose compiled check just proved the
@@ -1111,22 +1166,38 @@ impl MethodSite {
     /// An own or inherited data property (an in-place write, an add, a
     /// read-only failure) is not: the write is then the ordinary one. A
     /// property-write site's entries are read by nothing else.
-    pub(crate) fn fill_set(&mut self, realm: &mut crate::realm::Realm, recv: crate::heap::Handle) {
+    ///
+    /// Returns the setter recorded (for the write's call cache, whose ways
+    /// are the callee feedback a caller inlining this body takes the
+    /// setter's ways from), as [`fill_get`](Self::fill_get) its getter.
+    pub(crate) fn fill_set(
+        &mut self,
+        realm: &mut crate::realm::Realm,
+        recv: crate::heap::Handle,
+    ) -> Option<crate::nanbox::NanBox> {
         let key = self.key();
         if !self.may_fill() || key.starts_with('\0') || key == "__proto__" {
-            return;
+            return None;
         }
         let Some(mut entry) = Self::entry_for(realm, recv, key, Want::Setter) else {
             self.count_fill(false);
-            return;
+            return None;
         };
         if !self.count_fill(self.holds_layout(&entry)) {
-            return;
+            return None;
         }
         watch_levels(realm, &entry.levels[..entry.depth as usize]);
         entry.stamp = crate::object::proto_epoch();
         entry.value = holder_value_addr(realm, &entry, true);
+        let setter = {
+            let h = crate::heap::Handle::from_raw(entry.levels[entry.depth as usize - 1].handle);
+            realm
+                .jit_object(h)
+                .and_then(|o| o.accessor(key))
+                .map(|(_, s)| s)
+        };
         self.store(entry);
+        setter
     }
 
     /// Puts `entry` in the way holding the same receiver layout and

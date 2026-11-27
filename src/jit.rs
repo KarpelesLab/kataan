@@ -4774,10 +4774,11 @@ pub type JitGetSiteHelper =
     jit_abi!(fn(*mut core::ffi::c_void, u64, *mut MethodSite, *const CallSite) -> u64);
 
 /// The runtime-helper ABI for a static-key property write through its site:
-/// `(ctx, obj, site, val, strict) -> undefined bits` (or the throw sentinel).
+/// `(ctx, obj, site, val, strict, call site) -> undefined bits` (or the throw
+/// sentinel).
 #[cfg(all(feature = "alloc", jit_native))]
 pub type JitSetSiteHelper =
-    jit_abi!(fn(*mut core::ffi::c_void, u64, *mut MethodSite, u64, u64) -> u64);
+    jit_abi!(fn(*mut core::ffi::c_void, u64, *mut MethodSite, u64, u64, *const CallSite) -> u64);
 
 /// The runtime-helper ABI for a computed element write: `(ctx, recv, key, val,
 /// strict) -> undefined bits` (or the throw sentinel).
@@ -5532,16 +5533,31 @@ impl JitProto {
                 *w = true;
             }
         }
+        // The accessors inlined at each property site (an `Op::InlineGuard`
+        // whose call is the site's read or write), by site.
+        let mut inl_keys: Vec<Vec<u64>> = alloc::vec![Vec::new(); keys.len()];
+        for op in bytecode.iter() {
+            if let crate::nbvm::Op::InlineGuard { call, key, .. } = op
+                && let Some(GenericOp::GetProp { site, .. } | GenericOp::SetProp { site, .. }) =
+                    ops.get(*call)
+                && let Some(v) = inl_keys.get_mut(*site as usize)
+            {
+                v.push(*key);
+            }
+        }
+        let body_addr = bytecode.as_ptr() as u64;
         let methods: Vec<Option<alloc::boxed::Box<core::cell::UnsafeCell<props::MethodSite>>>> =
             keys.iter()
                 .zip(caches.iter())
                 .zip(wants)
-                .map(|((k, c), want)| {
+                .zip(&inl_keys)
+                .map(|(((k, c), want), inl)| {
                     want.then(|| {
-                        alloc::boxed::Box::new(core::cell::UnsafeCell::new(props::MethodSite::new(
-                            k,
-                            c.get().cast::<core::ffi::c_void>(),
-                        )))
+                        let mut m = props::MethodSite::new(k, c.get().cast::<core::ffi::c_void>());
+                        if !inl.is_empty() {
+                            m.set_inlined(inl, body_addr);
+                        }
+                        alloc::boxed::Box::new(core::cell::UnsafeCell::new(m))
                     })
                 })
                 .collect();
@@ -5903,11 +5919,44 @@ impl JitProto {
                 | crate::nbvm::Op::CallKey { .. }
                 // (A tail call: an ordinary call where its body is inlined,
                 // `inline::untail`.)
-                | crate::nbvm::Op::TailCallValue { .. }
-                | crate::nbvm::Op::GetProp { .. }
+                | crate::nbvm::Op::TailCallValue { .. } => {
+                    if let Some(k) = site_of(pc).map(keys) {
+                        *slot = CalleeHint::of_keys(&k);
+                    }
+                }
+                // A property site's getter or setter: its call cache's ways
+                // (compiled callees only), and what its property cache's
+                // slow path noted (`nbvm::vm_set_prop_mode`), which also
+                // names a callee not compiled yet.
+                crate::nbvm::Op::GetProp { .. }
                 | crate::nbvm::Op::SetProp { .. }
                 | crate::nbvm::Op::SetPropStrict { .. } => {
-                    if let Some(k) = site_of(pc).map(keys) {
+                    let mut k = site_of(pc).map(keys).unwrap_or_default();
+                    let noted = s
+                        .tier_up
+                        .site_pcs
+                        .binary_search_by_key(&pc, |&(p, _)| p)
+                        .ok()
+                        .and_then(|i| s.caches.get(s.tier_up.site_pcs[i].1 as usize))
+                        .map(|c| {
+                            // SAFETY: the body is not running (no other
+                            // borrow is live).
+                            #[allow(unsafe_code)]
+                            let c = unsafe { &*c.get() };
+                            poly::hint_of(c)
+                        });
+                    match noted {
+                        Some(CalleeHint::One(n)) if !k.contains(&n) => k.push(n),
+                        Some(h @ CalleeHint::Poly(_)) => {
+                            for f in h.poly_fns() {
+                                if !k.iter().any(|&x| x as u32 == f) {
+                                    k.push(u64::from(f));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !k.is_empty() {
                         *slot = CalleeHint::of_keys(&k);
                     }
                 }
@@ -17979,12 +18028,17 @@ impl JitFunction {
                     val,
                     site,
                     strict,
+                    call: set_call,
                     ..
                 } => {
                     if !ok(obj) || !ok(val) {
                         return None;
                     }
                     let s = sites.get(site as usize)?;
+                    let set_call_site = call_sites
+                        .get(set_call as usize)
+                        .copied()
+                        .unwrap_or(core::ptr::null());
                     if let Some((head, last, p, _, seen)) = pending_run.as_mut()
                         && (*head + 1..=*last).contains(&op_idx)
                         && *p == pass
@@ -18534,13 +18588,14 @@ impl JitFunction {
                         );
                         a.jmp(done);
                     }
-                    // jit_helper_set_prop_site(ctx, obj, site, val, strict).
+                    // jit_helper_set_prop_site(ctx, obj, site, val, strict, call).
                     a.bind(call_helper);
                     a.mov_rdi_r15();
                     a.load_argreg(1, disp(obj));
                     a.movabs_argreg(2, s.method_ptr as i64);
                     a.load_argreg(3, disp(val));
                     a.movabs_argreg(4, i64::from(strict));
+                    a.movabs_argreg(5, set_call_site as i64);
                     a.movabs_rax(set_site_helper as i64);
                     a.call_rax();
                     throw_check!();

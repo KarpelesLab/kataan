@@ -509,6 +509,18 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
     match inner {
         Some(e) => {
             let mut p = proto.clone();
+            let fallbacks: Vec<(usize, u32)> = e
+                .ops
+                .iter()
+                .enumerate()
+                .filter_map(|(g, op)| match op {
+                    Op::InlineGuard { call, .. } => {
+                        let o = *e.orig_of.get(g)?;
+                        (o != u32::MAX).then_some((*call, o))
+                    }
+                    _ => None,
+                })
+                .collect();
             p.ops = e.ops;
             p.n_regs = e.n_regs;
             let mut derived = e.derived;
@@ -529,7 +541,7 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
             ks.extend(e.kinds);
             // (Its own ops come from it, its inlined calls' from where
             // that splice says.)
-            let src = e
+            let mut src: Vec<u64> = e
                 .src_of
                 .iter()
                 .zip(&e.orig_of)
@@ -541,6 +553,14 @@ fn site_body(c: Candidate<'_>) -> Site<'_> {
                     }
                 })
                 .collect();
+            // (So does the call op an inlined site of its own falls back to,
+            // whose pc is its first guard's: an inlined accessor's site keeps
+            // its origin, `JitProto::inlined_accessor_hints`.)
+            for (call, o) in fallbacks {
+                if src.get(call) == Some(&NO_SRC) {
+                    src[call] = fid << 32 | u64::from(o);
+                }
+            }
             Site {
                 key,
                 proto: alloc::borrow::Cow::Owned(p),
@@ -837,6 +857,40 @@ fn construct_site(op: &Op) -> bool {
     matches!(op, Op::Construct { .. } | Op::SuperCallArgs { .. })
 }
 
+/// Whether call op `o` is one the tier serves without a call sequence when
+/// its callee is the built-in its key names: a `Math` function computed in
+/// line (`super::inline_math`), or a small static built-in called directly
+/// as a pure leaf (`Number.isFinite(v)`, `Array.isArray(x)`:
+/// `super::direct_call`), neither of which pushes the pending activation.
+fn lean_builtin(o: &Op) -> bool {
+    super::inline_math(o).is_some()
+        || match o {
+            Op::CallMethod { key, args, .. } => {
+                super::direct_call::kind_of(key, args.len()).is_some()
+            }
+            _ => false,
+        }
+}
+
+/// Whether op `pc` of `p` is on a straight path to a `throw` (the
+/// `new RangeError(…)` of a setter's validation): the ops after it reach a
+/// `Throw` with no branch or return between, so a call there is made only
+/// when the body throws, which is no path inlining is for.
+fn throw_path(p: &FnProto, pc: usize) -> bool {
+    for o in p.ops.iter().skip(pc + 1) {
+        match o {
+            Op::Throw { .. } => return true,
+            Op::Jump { .. }
+            | Op::JumpIfFalse { .. }
+            | Op::Return { .. }
+            | Op::InlineGuard { .. }
+            | Op::InlineLeave => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether every call op in `p` (a callee body, maybe with calls of its own
 /// spliced in) is the fallback of one of its inlined calls' guards: run as
 /// guarded, it makes no call.
@@ -850,9 +904,11 @@ fn calls_only_inlined(p: &FnProto) -> bool {
         })
         .collect();
     p.ops.iter().enumerate().all(|(pc, o)| {
-        // (A `Math` function the tier computes in line calls nothing when it
-        // is the built-in: `super::inline_math`.)
-        super::inline_math(o).is_some()
+        // (A `Math` function the tier computes in line, or a small static
+        // built-in it calls directly as a leaf, pushes nothing when it is
+        // the built-in: `lean_builtin`.)
+        lean_builtin(o)
+            || throw_path(p, pc)
             || !matches!(
                 o,
                 Op::CallMethod { .. }
@@ -897,7 +953,7 @@ fn call_free_return(p: &FnProto) -> bool {
         }
         seen[pc] = true;
         let op = &p.ops[pc];
-        if is_call(op) && super::inline_math(op).is_none() {
+        if is_call(op) && !lean_builtin(op) {
             continue;
         }
         match op {
@@ -1159,11 +1215,22 @@ fn remap(op: &mut Op, reg: &dyn Fn(Reg) -> Reg, target: &dyn Fn(usize) -> usize)
             src,
             this,
             ..
+        }
+        | Op::SuperSetBase {
+            base: home,
+            key,
+            src,
+            this,
+            ..
         } => {
             *home = reg(*home);
             *key = reg(*key);
             *src = reg(*src);
             *this = reg(*this);
+        }
+        Op::SuperBase { dst, home } => {
+            *dst = reg(*dst);
+            *home = reg(*home);
         }
         // (A private element's site memo starts cold in the splice's copy.)
         Op::PrivateGet { dst, obj, key, .. } | Op::PrivateIn { dst, obj, key, .. } => {
@@ -1484,6 +1551,9 @@ pub fn expand<'a>(
                 | Op::CallValue { .. }
                 | Op::CallWithMethod { .. }
                 | Op::CallKey { .. }
+                | Op::GetProp { .. }
+                | Op::SetProp { .. }
+                | Op::SetPropStrict { .. }
         );
         if cands.len() > 1 && !poly_ok {
             continue;
@@ -2150,7 +2220,8 @@ fn writes_reg(op: &Op, r: Reg) -> bool {
         | Op::InlineLeave
         | Op::InitFields { .. }
         | Op::PrivateSet { .. }
-        | Op::SuperSet { .. } => false,
+        | Op::SuperSet { .. }
+        | Op::SuperSetBase { .. } => false,
         Op::BindThis { this } => *this == r,
         Op::SuperCallArgs { dst, this, .. } => *dst == r || *this == r,
         Op::SuperCtor { dst, .. } | Op::DerivedResult { dst, .. } => *dst == r,
