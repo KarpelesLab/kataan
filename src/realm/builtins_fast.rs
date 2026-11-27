@@ -1001,8 +1001,14 @@ impl Realm {
     /// answered on the same read of the receiver's cell. `None`, having done
     /// nothing, for anything else (the caller's general path, which also
     /// rejects a receiver of the wrong kind).
+    ///
+    /// `WEAK`: the site's method is a `WeakMap.prototype` /
+    /// `WeakSet.prototype` one (`coll_fast_of::<true>`'s lean form, on a
+    /// weak collection of its kind; the caller has turned away an add whose
+    /// key is not an object). An unnoted weak receiver is proved by its
+    /// `[[Prototype]]` link itself.
     #[inline]
-    pub(crate) fn coll_site_call(
+    pub(crate) fn coll_site_call<const WEAK: bool>(
         &mut self,
         recv: Handle,
         cache: &mut MethodSiteCache,
@@ -1034,7 +1040,7 @@ impl Realm {
         }
         let Some(Cell::Collection {
             is_set,
-            is_weak: false,
+            is_weak,
             default_proto,
             entries,
             live,
@@ -1044,7 +1050,7 @@ impl Realm {
         else {
             return None;
         };
-        if *is_set != op.on_set() {
+        if *is_set != op.on_set() || *is_weak != WEAK {
             return None;
         }
         let unnoted = cache.recv_memo != recv.to_raw() || cache.recv_stamp != epoch;
@@ -1057,7 +1063,7 @@ impl Realm {
             if self.aux_props.contains_key(&recv.to_raw()) || self.is_host_exotic(recv) {
                 return None;
             }
-            let proto = if *default_proto {
+            let proto = if *default_proto && !WEAK {
                 self.coll_default[usize::from(*is_set)].map(|(_, p)| p)
             } else {
                 self.coll_recv_proto(recv)
@@ -1098,9 +1104,10 @@ impl Realm {
             }
             cache.last_recv = recv.to_raw();
         }
-        // (The receiver is a strong collection of the method's kind.)
+        // (The receiver is a collection of the method's kind and strength.)
         match (answer, op) {
             (Some(v), _) => Some(v),
+            _ if WEAK => self.weak_coll_fast(recv, op, a, b),
             _ => self.coll_site_update(recv, op, a, b),
         }
     }

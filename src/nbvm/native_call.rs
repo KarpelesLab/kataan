@@ -876,7 +876,7 @@ pub(super) fn try_call(
     if cache
         .native
         .as_deref()
-        .is_some_and(|s| s.op.coll_op().is_some())
+        .is_some_and(|s| s.op.coll_op().is_some() || matches!(s.op, FastOp::WeakColl(_)))
         && let Some(v) = try_coll(ctx, recv, regs, args, cache)
     {
         return Some(Ok(v));
@@ -1332,7 +1332,10 @@ pub(super) fn try_coll_inline(
     cache: &mut PropertyCache,
 ) -> Option<NanBox> {
     let site = cache.native.as_deref_mut()?;
-    let op = site.op.coll_op()?;
+    let (op, weak) = match site.op {
+        FastOp::WeakColl(op) => (op, true),
+        other => (other.coll_op()?, false),
+    };
     let h = Handle::from_raw(recv.as_handle()?);
     if ctx.host.is_none() || ctx.realm.multi_realm {
         return None;
@@ -1341,8 +1344,25 @@ pub(super) fn try_coll_inline(
         args.get(i)
             .map_or(NanBox::undefined(), |r| regs[*r as usize])
     };
+    if weak {
+        // (An add of a non-object key is the general path's TypeError, or
+        // a symbol's registry check.)
+        if matches!(op, CollOp::MapSet | CollOp::SetAdd)
+            && !super::is_object_value(&ctx.realm, arg(0))
+        {
+            return None;
+        }
+        return ctx.realm.coll_site_call::<true>(
+            h,
+            &mut site.chain,
+            site.method,
+            op,
+            arg(0),
+            arg(1),
+        );
+    }
     ctx.realm
-        .coll_site_call(h, &mut site.chain, site.method, op, arg(0), arg(1))
+        .coll_site_call::<false>(h, &mut site.chain, site.method, op, arg(0), arg(1))
 }
 
 /// `Call(method, recv, args…)` for a method value already read (EvaluateCall
