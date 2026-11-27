@@ -10106,6 +10106,14 @@ fn rclass_move_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_RCLASSMOVE").is_none_or(|v| v != "0"))
 }
 
+/// Whether a loop with branches of its own may have carried fields
+/// ([`plan_carried_fields`]): unless `KATAAN_JIT_FCARRYBR=0`. Read once per
+/// process.
+fn fcarry_branchy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_FCARRYBR").is_none_or(|v| v != "0"))
+}
+
 /// Whether `KATAAN_JIT_FCARRY=log`: report each carried field kept.
 fn fcarry_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -10394,7 +10402,12 @@ fn stores_no_key(ops: &[GenericOp], bytecode: &[Op], pc: usize, key: &str) -> bo
 /// the same global binding, which the loop never stores); and between the
 /// store and the read, around the back-edge, only ops that store no
 /// property `x` (stores of other keys, register ops, reads, branches out,
-/// inline guards).
+/// inline guards). A loop with branches of its own (an `if` in the body)
+/// qualifies too when `src`'s write runs straight into the store (no
+/// branch between them, none landing between them: `src` then holds what
+/// the field holds whenever the store has run, whichever iterations ran
+/// it) and no other op of the loop stores `x`
+/// (`KATAAN_JIT_FCARRYBR=0` turns this off).
 ///
 /// `NumGen::new` keeps those of regions that got a speculative version
 /// whose fast version leaves out these very arms, whose read is a
@@ -10413,9 +10426,30 @@ fn plan_carried_fields(
         return out;
     }
     let in_arm = |pc: usize| arms.iter().any(|&(_, f, e)| (f..e).contains(&pc));
-    if !straight_body(ops, (head, end), arms) {
+    let straight = straight_body(ops, (head, end), arms);
+    if !straight && !fcarry_branchy_enabled() {
         return out;
     }
+    // (A body with branches of its own: the pcs some branch of the fast
+    // version lands on, and whether op `q` is one of its branches.)
+    let target = |t: usize| {
+        (head..=end).any(|q| {
+            !in_arm(q)
+                && match ops[q] {
+                    GenericOp::JumpIfFalse { target, .. } => target == t,
+                    GenericOp::Jump { target } => {
+                        target == t && !arms.iter().any(|&(_, f, e)| f == q + 1 && e == target)
+                    }
+                    _ => false,
+                }
+        })
+    };
+    let branch = |q: usize| match ops[q] {
+        GenericOp::JumpIfFalse { .. } => !arms.iter().any(|a| a.0 == q),
+        GenericOp::Jump { target } => !arms.iter().any(|&(_, f, e)| f == q + 1 && e == target),
+        GenericOp::PushHandler { .. } | GenericOp::PopHandler => true,
+        _ => false,
+    };
     let (mut d, mut u) = (Vec::new(), Vec::new());
     let defs_of =
         |r: u16, d: &mut Vec<u16>, u: &mut Vec<u16>| defs_in(bytecode, (head, end), r, d, u);
@@ -10454,6 +10488,18 @@ fn plan_carried_fields(
         };
         // Around the back-edge, from the store to the header.
         if !(store + 1..=end).all(|q| in_arm(q) || harmless(q, key)) {
+            continue;
+        }
+        // In a body with branches of its own, whatever path an iteration
+        // takes: `src`'s write runs straight into the store (no branch
+        // between them, none landing between them), so `src` holds what the
+        // field holds whenever the store has run; and no other op of the
+        // loop stores `key`.
+        if !straight
+            && ((w..store).any(|q| !in_arm(q) && branch(q))
+                || (w + 1..=store).any(&target)
+                || !(head..=end).all(|q| q == store || in_arm(q) || harmless(q, key)))
+        {
             continue;
         }
         for read in head..w {
