@@ -4256,7 +4256,7 @@ mod tests {
         );
         let mut a = X64Assembler::new();
         a.cvttsd2si32_mem(6, 16); // cvttsd2si esi, [rbx+16]
-        assert_eq!(a.code(), &[0xf2, 0x0f, 0x2c, 0xb3, 16, 0, 0, 0]);
+        assert_eq!(a.code(), &[0xf2, 0x0f, 0x2c, 0x73, 16]);
         let mut a = X64Assembler::new();
         a.grp3_32(3, 9); // neg r9d
         assert_eq!(a.code(), &[0x41, 0xf7, 0xd9]);

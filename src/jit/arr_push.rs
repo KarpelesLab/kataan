@@ -109,7 +109,7 @@ impl X64Assembler {
         let stored = self.new_label();
         self.g_load(r::RDX, r::RBX, val_disp);
         self.p_load8(r::R9, r::RCX, l.off_arr_inline_len);
-        self.g_cmp_imm(r::R9, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmp_byte_reg_imm(r::R9, crate::cell::ARRAY_ON_HEAP);
         self.g_jcc(cc::E, heap);
         // Inline: an element left in the cell.
         self.g_cmp_imm(
@@ -187,7 +187,7 @@ impl X64Assembler {
         let heap = self.new_label();
         let stored = self.new_label();
         self.p_load8(r::R9, r::RCX, l.off_arr_inline_len);
-        self.g_cmp_imm(r::R9, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmp_byte_reg_imm(r::R9, crate::cell::ARRAY_ON_HEAP);
         self.g_jcc(cc::E, heap);
         // Inline: room left in the cell for them all.
         let cap = i32::try_from(crate::cell::ARRAY_INLINE_CAP).expect("small");
@@ -296,7 +296,7 @@ impl X64Assembler {
         let out = self.new_label();
         self.g_movabs(r::RDX, crate::nanbox::NanBox::undefined().to_bits());
         self.p_load8(r::R9, r::RCX, l.off_arr_inline_len);
-        self.g_cmp_imm(r::R9, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmp_byte_reg_imm(r::R9, crate::cell::ARRAY_ON_HEAP);
         self.g_jcc(cc::E, heap);
         // Inline: `r9` elements in the cell.
         if at_most_one {

@@ -388,8 +388,7 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.push(0xf6);
-        self.code.push(0x80 | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | (base & 7), disp, true);
         self.code.push(imm);
     }
 
@@ -1285,8 +1284,7 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.extend_from_slice(&[0x0f, 0xb6]);
-        self.code.push(0x80 | (2 << 3) | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | (2 << 3) | (base & 7), disp, true);
     }
 
     /// `movzx r32, word [base+disp32]`.
@@ -1297,8 +1295,7 @@ impl X64Assembler {
             self.code.push(rex);
         }
         self.code.extend_from_slice(&[0x0f, 0xb7]);
-        self.code.push(0x80 | ((dst & 7) << 3) | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | ((dst & 7) << 3) | (base & 7), disp, true);
     }
 
     /// `inc word [base+disp32]`.
@@ -1309,8 +1306,7 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.push(0xff);
-        self.code.push(0x80 | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | (base & 7), disp, true);
     }
 
     /// A 32-bit `op reg, [base+disp32]`.
@@ -1321,8 +1317,7 @@ impl X64Assembler {
             self.code.push(rex);
         }
         self.code.push(opcode);
-        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | ((reg & 7) << 3) | (base & 7), disp, true);
     }
 
     /// `cmp dword [base+disp32], imm8` (sign-extended).
@@ -1332,8 +1327,7 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.push(0x83);
-        self.code.push(0x80 | (7 << 3) | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | (7 << 3) | (base & 7), disp, true);
         self.code.push(imm.cast_unsigned());
     }
 
@@ -1409,9 +1403,9 @@ impl X64Assembler {
             && l.cell_object_disc == 0
             && (l.off_od_tag, l.obj_shaped_disc) == (l.off_cell_tag, l.cell_object_disc)
         {
-            // test word [rcx + disp32], imm16
-            self.code.extend_from_slice(&[0x66, 0xf7, 0x81]);
-            self.code.extend_from_slice(&l.off_cell_tag.to_le_bytes());
+            // test word [rcx + disp], imm16
+            self.code.extend_from_slice(&[0x66, 0xf7]);
+            self.modrm_disp(0x81, l.off_cell_tag, true);
             self.code
                 .extend_from_slice(&(0x00ff_u16 | (u16::from(FLAG_EXOTIC) << 8)).to_le_bytes());
             self.jne(miss);
@@ -1438,9 +1432,9 @@ impl X64Assembler {
     /// a layout [`not_exotic_one_test`](Self::not_exotic_one_test) accepts.
     pub(crate) fn p_object_not_exotic_at(&mut self, l: &JitLayout, base: u8, miss: Label) {
         debug_assert!(Self::not_exotic_one_test(l) && base < 8 && base != 4);
-        // test word [base + disp32], imm16
-        self.code.extend_from_slice(&[0x66, 0xf7, 0x80 | base]);
-        self.code.extend_from_slice(&l.off_cell_tag.to_le_bytes());
+        // test word [base + disp], imm16
+        self.code.extend_from_slice(&[0x66, 0xf7]);
+        self.modrm_disp(0x80 | base, l.off_cell_tag, true);
         self.code
             .extend_from_slice(&(0x00ff_u16 | (u16::from(FLAG_EXOTIC) << 8)).to_le_bytes());
         self.jne(miss);
@@ -1959,8 +1953,7 @@ impl X64Assembler {
             self.code.push(rex);
         }
         self.code.extend_from_slice(&[0x0f, 0xb6]);
-        self.code.push(0x80 | ((dst & 7) << 3) | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | ((dst & 7) << 3) | (base & 7), disp, true);
     }
 
     /// For the array whose heap slot is `rcx`: `reg` = its element count —
@@ -1968,7 +1961,7 @@ impl X64Assembler {
     /// (`crate::cell::ArrayElems`). Clobbers only `reg` (and the flags).
     pub(crate) fn p_arr_len(&mut self, l: &JitLayout, reg: u8) {
         self.p_load8(reg, r::RCX, l.off_arr_inline_len);
-        self.g_cmp_imm(reg, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmp_byte_reg_imm(reg, crate::cell::ARRAY_ON_HEAP);
         self.g_cmove_mem(reg, r::RCX, l.off_arr_len);
     }
 
@@ -1979,7 +1972,7 @@ impl X64Assembler {
     pub(crate) fn p_arr_len_ptr(&mut self, l: &JitLayout) {
         self.p_load8(r::R8, r::RCX, l.off_arr_inline_len);
         self.g_lea(r::R11, r::RCX, l.off_arr_inline);
-        self.g_cmp_imm(r::R8, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmp_byte_reg_imm(r::R8, crate::cell::ARRAY_ON_HEAP);
         self.g_cmove_mem(r::R8, r::RCX, l.off_arr_len);
         self.g_cmove_mem(r::R11, r::RCX, l.off_arr_ptr);
     }
@@ -1989,8 +1982,7 @@ impl X64Assembler {
         debug_assert!(base & 7 != 4, "no SIB form");
         let rex = 0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
         self.code.extend_from_slice(&[rex, 0x0f, 0x44]);
-        self.code.push(0x80 | ((reg & 7) << 3) | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | ((reg & 7) << 3) | (base & 7), disp, true);
     }
 
     /// The common guards of an inline property add, on the object whose heap
@@ -2546,8 +2538,7 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.push(0x83);
-        self.code.push(0x80 | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | (base & 7), disp, true);
         self.code.push(imm.cast_unsigned());
     }
 
@@ -2559,8 +2550,7 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.push(0x83);
-        self.code.push(0x80 | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | (base & 7), disp, true);
         self.code.push(imm.cast_unsigned());
     }
 
@@ -2614,8 +2604,7 @@ impl X64Assembler {
             self.code.push(0x41);
         }
         self.code.push(0xff);
-        self.code.push(0x80 | (base & 7));
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | (base & 7), disp, true);
     }
 
     /// `lea dst, [base + index*8 + disp32]` (`index` not `rsp`).
@@ -2769,8 +2758,7 @@ impl X64Assembler {
             0x0f,
             0x6e,
         ]);
-        self.raw(&[0x80 | ((x & 7) << 3) | (base & 7)]);
-        self.raw(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | ((x & 7) << 3) | (base & 7), disp, true);
     }
 
     /// [`p_obj_fixed_slot_ex`](Self::p_obj_fixed_slot_ex)'s load, straight
@@ -2822,8 +2810,7 @@ impl X64Assembler {
             0x0f,
             0x7e,
         ]);
-        self.raw(&[0x80 | ((x & 7) << 3) | (base & 7)]);
-        self.raw(&disp.to_le_bytes());
+        self.modrm_disp(0x80 | ((x & 7) << 3) | (base & 7), disp, true);
     }
 
     /// The store twin of
@@ -3615,8 +3602,7 @@ impl X64Assembler {
             2 => self.code.extend_from_slice(&[0x66, 0xc7]),
             _ => self.code.push(0xc7),
         }
-        self.code.push(0x81); // mod=10, reg=0, rm=rcx
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.modrm_disp(0x81, disp, true); // reg=0, rm=rcx
         match bytes {
             1 => self.code.push(imm as u8),
             2 => self.code.extend_from_slice(&(imm as u16).to_le_bytes()),
@@ -3996,7 +3982,7 @@ impl X64Assembler {
         // The captures: inline in the cell, or in the `Vec`.
         let on_heap = self.new_label();
         self.p_load_u8_rdx(r::RCX, l.props.off_vmfn_caps_inline_len);
-        self.g_cmp_imm(r::RDX, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmp_byte_reg_imm(r::RDX, crate::cell::ARRAY_ON_HEAP);
         self.g_jcc(cc::E, on_heap);
         self.p_shl_rdx_32();
         self.p_or_rax_rdx();

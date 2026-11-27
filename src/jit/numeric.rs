@@ -12378,9 +12378,8 @@ impl X64Assembler {
         if rex != 0x40 {
             self.code.push(rex);
         }
-        self.code
-            .extend_from_slice(&[0x0f, opc, 0x80 | ((reg & 7) << 3) | 3]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x0f, opc]);
+        self.modrm_disp(0x80 | ((reg & 7) << 3) | 3, disp, true);
     }
 
     /// A hoisted array's entry check ([`ArraySlots`]): when the value (a
@@ -12467,7 +12466,7 @@ impl X64Assembler {
         // (As `p_arr_len_ptr`, the count in `rax`.)
         self.p_load8(r::RAX, r::RCX, l.off_arr_inline_len);
         self.g_lea(r::R11, r::RCX, l.off_arr_inline);
-        self.g_cmp_imm(r::RAX, i32::from(crate::cell::ARRAY_ON_HEAP));
+        self.g_cmp_byte_reg_imm(r::RAX, crate::cell::ARRAY_ON_HEAP);
         self.g_cmove_mem(r::RAX, r::RCX, l.off_arr_len);
         self.g_cmove_mem(r::R11, r::RCX, l.off_arr_ptr);
         self.g_store(r::RBP, s.len, r::RAX);
@@ -12602,17 +12601,15 @@ impl X64Assembler {
     /// `mov gpr, [rbx + disp]` (rax / rcx / rdx).
     fn mov_gpr_mem(&mut self, gpr: u8, disp: i32) {
         let start = self.code.len();
-        self.code
-            .extend_from_slice(&[0x48, 0x8b, 0x80 | ((gpr & 7) << 3) | 3]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0x8b]);
+        self.modrm_disp(0x80 | ((gpr & 7) << 3) | 3, disp, false);
         self.note_load(start, gpr & 7, 3, disp);
     }
 
     /// `mov [rbx + disp], gpr` (rax / rcx / rdx).
     fn mov_mem_gpr(&mut self, disp: i32, gpr: u8) {
-        self.code
-            .extend_from_slice(&[0x48, 0x89, 0x80 | ((gpr & 7) << 3) | 3]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0x89]);
+        self.modrm_disp(0x80 | ((gpr & 7) << 3) | 3, disp, false);
         self.note_store(3, disp, gpr & 7);
     }
 
@@ -12623,22 +12620,22 @@ impl X64Assembler {
 
     /// `cmp qword [rbp + disp32], imm8` (a native frame slot).
     pub(super) fn cmp_frame_imm8(&mut self, disp: i32, imm: i8) {
-        self.code.extend_from_slice(&[0x48, 0x83, 0xbd]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0x83]);
+        self.modrm_disp(0xbd, disp, false);
         self.code.push(imm as u8);
     }
 
     /// `mov qword [rbp + disp32], 0` (a native frame slot).
     fn mov_frame_zero(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0xc7]);
+        self.modrm_disp(0x85, disp, false);
         self.code.extend_from_slice(&0i32.to_le_bytes());
     }
 
     /// `mov qword [rbp + disp], -1` (`u64::MAX`).
     fn mov_frame_all_ones(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x48, 0xc7, 0x85]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0xc7]);
+        self.modrm_disp(0x85, disp, false);
         self.code.extend_from_slice(&(-1i32).to_le_bytes());
     }
 
@@ -13493,10 +13490,10 @@ mod tests {
     fn sse_encodings() {
         let mut a = X64Assembler::new();
         a.movsd_x_mem(2, 8); // movsd xmm2, [rbx+8]
-        assert_eq!(a.code(), &[0xf2, 0x0f, 0x10, 0x93, 8, 0, 0, 0]);
+        assert_eq!(a.code(), &[0xf2, 0x0f, 0x10, 0x53, 8]);
         let mut a = X64Assembler::new();
         a.movsd_mem_x(16, 9); // movsd [rbx+16], xmm9
-        assert_eq!(a.code(), &[0xf2, 0x44, 0x0f, 0x11, 0x8b, 16, 0, 0, 0]);
+        assert_eq!(a.code(), &[0xf2, 0x44, 0x0f, 0x11, 0x4b, 16]);
         let mut a = X64Assembler::new();
         a.movq_gpr_x(RCX, 10); // movq rcx, xmm10
         assert_eq!(a.code(), &[0x66, 0x4c, 0x0f, 0x7e, 0xd1]);
@@ -13517,6 +13514,6 @@ mod tests {
         assert_eq!(a.code(), &[0xf2, 0x0f, 0x11, 0x19]);
         let mut a = X64Assembler::new();
         a.mov_gpr_mem(RDX, 24); // mov rdx, [rbx+24]
-        assert_eq!(a.code(), &[0x48, 0x8b, 0x93, 24, 0, 0, 0]);
+        assert_eq!(a.code(), &[0x48, 0x8b, 0x53, 24]);
     }
 }

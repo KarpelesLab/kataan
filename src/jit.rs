@@ -7380,6 +7380,38 @@ impl X64Assembler {
         self.rbx_frame = on;
     }
 
+    /// The ModRM byte `modrm` (a `mod = 10` form, `[base + disp32]`, no
+    /// SIB) and its displacement, in the shortest encoding `disp` allows: a
+    /// `disp8` when it fits a byte and, with `bare`, no displacement at all
+    /// for `0` — except with an `rbp`/`r13` base, whose `mod = 00` form is
+    /// RIP-relative. (A load the store forwarding may rewrite, `note_load`,
+    /// keeps a displacement: the rewrite needs four bytes.)
+    pub(crate) fn modrm_disp(&mut self, modrm: u8, disp: i32, bare: bool) {
+        debug_assert!(
+            modrm >> 6 == 2 && modrm & 7 != 4,
+            "a mod=10 ModRM without SIB"
+        );
+        if bare && disp == 0 && modrm & 7 != 5 {
+            self.code.push(modrm & 0x3f);
+        } else if let Ok(d) = i8::try_from(disp) {
+            self.code.push((modrm & 0x3f) | 0x40);
+            self.code.push(d.to_le_bytes()[0]);
+        } else {
+            self.code.push(modrm);
+            self.code.extend_from_slice(&disp.to_le_bytes());
+        }
+    }
+
+    /// `cmp reg8, imm8` on the low byte of `reg` — for a register that holds
+    /// a zero-extended byte (`movzx`), whose equality compare this is.
+    pub(crate) fn g_cmp_byte_reg_imm(&mut self, reg: u8, imm: u8) {
+        if reg >= 4 {
+            // (REX for r8b–r15b, and for spl–dil rather than ah–bh.)
+            self.code.push(0x40 | ((reg >> 3) & 1));
+        }
+        self.code.extend_from_slice(&[0x80, 0xf8 | (reg & 7), imm]);
+    }
+
     /// Emits the displacement of a `[rbp+disp32]` frame-slot operand whose
     /// ModRM byte (mod=10) was just pushed, rewriting that ModRM's base from
     /// `rbp` (`101`) to `rbx` (`011`) for a register-file slot in frame mode
@@ -9136,42 +9168,42 @@ impl X64Assembler {
     }
     /// `cmp byte [rcx+disp32], imm8` — compare a tag byte at the slot pointer.
     pub fn cmp_byte_at_rcx_imm(&mut self, disp: i32, imm: u8) {
-        self.code.extend_from_slice(&[0x80, 0xb9]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x80]);
+        self.modrm_disp(0xb9, disp, true);
         self.code.push(imm);
     }
     /// `cmp word [rcx+disp32], r8w` — compare the slot's `generation: u16` against
     /// the handle generation (low 16 bits of `r8`).
     pub fn cmp_word_at_rcx_r8w(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x66, 0x44, 0x39, 0x81]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x66, 0x44, 0x39]);
+        self.modrm_disp(0x81, disp, true);
     }
     /// `mov rax, [rcx+disp32]` — load an 8-byte field at the slot pointer.
     pub fn mov_rax_at_rcx(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x48, 0x8b, 0x81]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0x8b]);
+        self.modrm_disp(0x81, disp, true);
     }
     /// `cmp rax, [rcx+disp32]`.
     pub fn cmp_rax_at_rcx(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x48, 0x3b, 0x81]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0x3b]);
+        self.modrm_disp(0x81, disp, true);
     }
     /// `mov r11, [rcx+disp32]` — load the slot `Vec`'s data pointer.
     pub fn mov_r11_at_rcx(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x4c, 0x8b, 0x99]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x4c, 0x8b]);
+        self.modrm_disp(0x99, disp, true);
     }
     /// `cmp rax, [r11+disp32]` — compare against a `PropertyCache` field (the
     /// cached shape word).
     pub fn cmp_rax_at_r11(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x49, 0x3b, 0x83]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x49, 0x3b]);
+        self.modrm_disp(0x83, disp, true);
     }
     /// `mov eax, [r11+disp32]` — load a 32-bit `PropertyCache` field (the cached
     /// slot index), zero-extended into `rax`.
     pub fn mov_eax_at_r11(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x41, 0x8b, 0x83]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x41, 0x8b]);
+        self.modrm_disp(0x83, disp, true);
     }
     /// `mov rax, [r11 + rax*8]` — load the NanBox at slot index `rax` from the slot
     /// `Vec` data pointer in `r11`.
@@ -9181,8 +9213,8 @@ impl X64Assembler {
     /// `add dword [r11+disp32], imm8` — bump a `PropertyCache` counter in place
     /// (the inline-hit `hits` increment; sign-extended imm8).
     pub fn add_dword_at_r11_imm(&mut self, disp: i32, imm: u8) {
-        self.code.extend_from_slice(&[0x41, 0x83, 0x83]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x41, 0x83]);
+        self.modrm_disp(0x83, disp, true);
         self.code.push(imm);
     }
 
@@ -9211,15 +9243,15 @@ impl X64Assembler {
     /// `cmp qword [rcx+disp32], imm8` — compare an 8-byte field at the slot pointer
     /// against a small sign-extended immediate (the `readonly` Vec length vs 0).
     pub fn cmp_qword_at_rcx_imm(&mut self, disp: i32, imm: u8) {
-        self.code.extend_from_slice(&[0x48, 0x83, 0xb9]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x48, 0x83]);
+        self.modrm_disp(0xb9, disp, true);
         self.code.push(imm);
     }
     /// `mov r8, [rcx+disp32]` — load an 8-byte field at the slot pointer into `r8`
     /// (the array element `Vec`'s dense length).
     pub fn mov_r8_at_rcx(&mut self, disp: i32) {
-        self.code.extend_from_slice(&[0x4c, 0x8b, 0x81]);
-        self.code.extend_from_slice(&disp.to_le_bytes());
+        self.code.extend_from_slice(&[0x4c, 0x8b]);
+        self.modrm_disp(0x81, disp, true);
     }
     /// `cmp rax, r8` — compare the (unsigned) element index in `rax` against the
     /// dense length in `r8`; a following `jae` bails on OOB or a negative index.
