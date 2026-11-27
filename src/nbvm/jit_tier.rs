@@ -314,17 +314,32 @@ unsafe fn reserve(st: *mut JitStack, words: usize) -> usize {
     }
 }
 
-/// Before a collection: zeroes what finished activations left in the
-/// register stack above `top`, so no word of it names an object this
-/// collection frees, and pulls `limit` down to at most a chunk past `top`
-/// (see [`JitStack`]).
-pub(super) fn scrub_stack(ctx: &Ctx) {
-    let p = ctx.jit_rt.stack.0;
+/// Before a collection — **every** collection on this thread, whatever
+/// path asked for it (a VM safepoint, the host's event loop between two
+/// jobs, a host built-in): zeroes what finished activations left in the
+/// thread's register stack above `top`, so no word of it names an object
+/// this collection frees, pulls `limit` down to at most a chunk past `top`
+/// (see [`JitStack`]), and pushes every handle of the live part
+/// (`base..top`: every compiled activation's window and native-call header)
+/// into `roots`. Nothing when the thread never made its stack.
+///
+/// Called from `Realm::maybe_collect_with`, the one door every collection
+/// goes through, rather than from the VM's safepoint: a collection that
+/// skipped the scrub (the event loop's, which sees no VM context) left
+/// what a finished activation had written above `top` naming objects it
+/// freed, and the next activation laid out over those words without
+/// filling them (`prologue::entry_fill`) exposed the dead handles to the
+/// next collection as roots.
+pub(crate) fn collection_roots(roots: &mut alloc::vec::Vec<crate::heap::Handle>) {
+    let p = STACK_PTR.with(core::cell::Cell::get);
     if p.is_null() {
         return;
     }
-    // SAFETY: `p` is this thread's live stack; no compiled code runs while a
-    // safepoint does, and `top..limit` belongs to no activation.
+    // SAFETY: `p` is this thread's live stack (`STACK_PTR` is cleared when
+    // its owner drops); no compiled code runs while a collection does, and
+    // `top..limit` belongs to no activation while `base..top` is initialized
+    // (every word below `top` was written when its activation was laid out,
+    // or is a word the scrub below zeroed before an earlier collection).
     #[allow(unsafe_code)]
     unsafe {
         let top = (*p).top;
@@ -336,6 +351,13 @@ pub(super) fn scrub_stack(ctx: &Ctx) {
         let keep = ((*p).end.offset_from(top) as usize).min(STACK_CHUNK);
         if dirty > keep as isize {
             (*p).limit = top.add(keep);
+        }
+        let base = (*p).base;
+        let n = top.offset_from(base) as usize;
+        for v in core::slice::from_raw_parts(base.cast::<NanBox>(), n) {
+            if let Some(raw) = v.as_handle() {
+                roots.push(crate::heap::Handle::from_raw(raw));
+            }
         }
     }
 }
@@ -368,12 +390,15 @@ impl StackOwner {
             // declared its stack (`crate::stack::set_thread_stack_size`).
             sp_limit: crate::stack::limit_address(),
         }));
+        STACK_PTR.with(|c| c.set(stack));
         Self { stack }
     }
 }
 
 impl Drop for StackOwner {
     fn drop(&mut self) {
+        // (Gone already if the thread's locals are torn down in that order.)
+        let _ = STACK_PTR.try_with(|c| c.set(core::ptr::null_mut()));
         // SAFETY: `stack` came from `Box::into_raw` and its memory from
         // `alloc_zeroed` with this layout; the thread is exiting, so no context
         // (and no compiled code) uses either any more.
@@ -388,6 +413,10 @@ impl Drop for StackOwner {
 
 std::thread_local! {
     static STACK: StackOwner = StackOwner::new();
+    /// [`STACK`]'s register stack once the thread made it (null before and
+    /// after): what [`collection_roots`] reads without making one.
+    static STACK_PTR: core::cell::Cell<*mut JitStack> =
+        const { core::cell::Cell::new(core::ptr::null_mut()) };
 }
 
 /// What a suspending compiled body records ([`TierRuntime::suspended`]):
@@ -486,24 +515,6 @@ pub(super) fn on_register_stack(ctx: &Ctx, regs: &[NanBox]) -> bool {
 #[inline(always)]
 pub(super) fn window_rooted(ctx: &Ctx) -> bool {
     ctx.jit_rt.off_stack == 0
-}
-
-/// The live part of the register stack — every compiled activation's window
-/// and native-call header — as GC roots (empty before first use).
-pub(super) fn stack_roots<'c>(ctx: &'c Ctx<'_>) -> &'c [NanBox] {
-    let p = ctx.jit_rt.stack.0;
-    if p.is_null() {
-        return &[];
-    }
-    // SAFETY: `p` is this thread's live stack; `base..top` is initialized (every
-    // word below `top` was written when its activation was laid out) and no
-    // compiled code runs while the caller (a safepoint) reads it.
-    #[allow(unsafe_code)]
-    unsafe {
-        let st = &*p;
-        let n = st.top.offset_from(st.base) as usize;
-        core::slice::from_raw_parts(st.base.cast::<NanBox>(), n)
-    }
 }
 
 /// Runs compiled `jit` on `regs` from bytecode pc `entry` with the activation's
@@ -7240,5 +7251,69 @@ mod poll_layout_tests {
         realm.interrupt = Some(crate::interrupt::Interrupt::new());
         check(&realm);
         assert!(realm.gc_pressure() >= 5);
+    }
+}
+
+#[cfg(test)]
+mod stack_scrub_tests {
+    use super::{STACK, reserve};
+    use crate::heap::Handle;
+    use crate::nanbox::NanBox;
+    use crate::realm::Realm;
+
+    /// Allocates until the pressure trigger runs a collection through
+    /// `Realm::maybe_collect` — a collection no VM safepoint asked for, as
+    /// the host's event loop runs between two jobs.
+    fn collect_once(realm: &mut Realm, roots: &[Handle]) {
+        for _ in 0..1_000_000 {
+            realm.new_object();
+            if realm.maybe_collect(roots).is_some() {
+                return;
+            }
+        }
+        panic!("no collection ran");
+    }
+
+    /// Every collection, not only a VM safepoint's, zeroes what a finished
+    /// activation left above the register stack's top and roots the words
+    /// below it. (A collection that skipped the scrub freed an object a
+    /// word above `top` still named; the next native-call entry laid its
+    /// window over that word without filling it — a register its body
+    /// writes before reading — and the next collection, at a loop's
+    /// back-edge, found the collected object among its roots.)
+    #[test]
+    fn a_collection_outside_a_safepoint_scrubs_and_roots_the_register_stack() {
+        let st = STACK.with(|o| o.stack);
+        let mut realm = Realm::new();
+        let dead = realm.new_object();
+        let live = realm.new_object();
+        let word = |h: Handle| NanBox::handle(h.to_raw()).to_bits();
+        // SAFETY: this thread's register stack, which nothing else uses
+        // while the test runs; every word touched is in `top..limit`
+        // (reserved first), and `top` is restored below.
+        #[allow(unsafe_code)]
+        let top = unsafe {
+            let top = (*st).top;
+            assert!(reserve(st, 8) >= 8);
+            // `live` in a word of a window (below the new top), `dead` in
+            // a word a finished activation left above it.
+            top.write(word(live));
+            top.add(3).write(word(dead));
+            (*st).top = top.add(1);
+            top
+        };
+        collect_once(&mut realm, &[]);
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let (kept, left) = unsafe {
+            let words = (top.read(), top.add(3).read());
+            (*st).top = top;
+            top.write(0);
+            words
+        };
+        assert_eq!(kept, word(live));
+        assert!(realm.is_live(live), "a window's word was not a root");
+        assert_eq!(left, 0, "the word above top was not scrubbed");
+        assert!(realm.gc_verify() || !realm.is_live(dead));
     }
 }

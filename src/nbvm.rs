@@ -9824,15 +9824,9 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
     if !ctx.realm.host_roots.links.is_empty() {
         link_roots(ctx, &mut roots);
     }
-    // Compiled activations' windows and native-call headers (`jit_tier`);
-    // what finished ones left above them is zeroed first.
-    #[cfg(all(feature = "jit", jit_native))]
-    {
-        jit_tier::scrub_stack(ctx);
-        for r in jit_tier::stack_roots(ctx) {
-            push(&mut roots, *r);
-        }
-    }
+    // (Compiled activations' windows and native-call headers — the thread's
+    // register stack — are rooted by every collection itself:
+    // `jit_stack_collection_roots`.)
     for t in &ctx.microtasks {
         push(&mut roots, t.handler);
         push(&mut roots, t.value);
@@ -9870,9 +9864,8 @@ fn vm_safepoint(ctx: &mut Ctx, funcs: &[FnProto], program: &[Op], regs: &[NanBox
 /// root scope (`crate::realm::host_roots`): each linked context's published
 /// frames and activation inputs, its outermost frame's inputs and its pending
 /// microtasks. (Its compiled windows are on this thread's register stack,
-/// which the safepoint roots whole: adopted here when this context has not
-/// touched it yet.)
-fn link_roots(ctx: &mut Ctx, roots: &mut Vec<Handle>) {
+/// which every collection roots whole: `jit_stack_collection_roots`.)
+fn link_roots(ctx: &Ctx, roots: &mut Vec<Handle>) {
     fn push(roots: &mut Vec<Handle>, v: NanBox) {
         if let Some(raw) = v.as_handle() {
             roots.push(Handle::from_raw(raw));
@@ -9910,11 +9903,19 @@ fn link_roots(ctx: &mut Ctx, roots: &mut Vec<Handle>) {
             push(roots, t.value);
             roots.push(t.result);
         }
-        #[cfg(all(feature = "jit", jit_native))]
-        if ctx.jit_rt.stack.0.is_null() {
-            ctx.jit_rt.stack.0 = below.jit_rt.stack.0;
-        }
     }
+}
+
+/// Before any collection on this thread (`Realm::maybe_collect_with`):
+/// scrubs the thread's JIT register stack above its top and pushes the
+/// handles of its live part — every compiled activation's window and
+/// native-call header, whichever context laid it out — into `roots` (see
+/// `jit_tier::collection_roots`). Nothing without a native JIT.
+pub(crate) fn jit_stack_collection_roots(roots: &mut Vec<Handle>) {
+    #[cfg(all(feature = "jit", jit_native))]
+    jit_tier::collection_roots(roots);
+    #[cfg(not(all(feature = "jit", jit_native)))]
+    let _ = roots;
 }
 
 /// Executes one function body (`program`) against the register file `regs`.

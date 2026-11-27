@@ -86,7 +86,9 @@ pub(crate) mod cc {
 /// **No word of the stack ever names a collected object.** Words below `top`
 /// are roots. Words in `top..limit` may still hold what a finished activation
 /// left there, but the collector zeroes them (and pulls `limit` down) before
-/// every collection, so whatever they name was alive when it was written and
+/// every collection, whichever path asked for it (`Realm::maybe_collect_with`
+/// calls `nbvm::jit_stack_collection_roots`, which also roots `base..top`),
+/// so whatever they name was alive when it was written and
 /// has not been through a collection since. Words from `limit` to `end` hold
 /// no handle at all. So a native-call entry need not fill a register the body
 /// writes before it reads it: until then the GC sees in it, at worst, an

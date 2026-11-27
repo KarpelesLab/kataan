@@ -9638,6 +9638,11 @@ impl Realm {
         if !self.vm_gen_running.is_empty() || self.vm_gen_native_n != 0 {
             self.root_running_frames(&mut all);
         }
+        // The thread's JIT register stack, scrubbed above its top: here, the
+        // door every collection goes through, not at each caller (a caller
+        // that forgot the scrub let a later collection find dead handles in
+        // it).
+        crate::nbvm::jit_stack_collection_roots(&mut all);
         if major {
             self.gc_roots(&mut all);
         } else {
