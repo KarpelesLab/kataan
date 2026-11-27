@@ -8017,10 +8017,14 @@ fn format_exponential(n: f64, frac: Option<usize>) -> String {
 /// with an exact tie going *up* (toExponential/toPrecision: "if there are two
 /// such sets of e and n, pick the e and n for which n × 10^(e–f) is larger"),
 /// and the decimal exponent of the first digit. Rust's correctly rounded
-/// formatter breaks ties to even, so it only supplies digits: `sig + 30` of
-/// them decide the rounding, unless the dropped tail reads exactly `5000…0`,
-/// which a carry inside those guard digits could fake. Then the exact
+/// formatter breaks ties to even, so it only supplies digits: `sig + 3` of
+/// them decide the rounding, unless the dropped tail reads exactly `500`,
+/// which rounding inside those guard digits could fake. Then the exact
 /// expansion (a double has at most 767 significant digits) settles it.
+/// (Any other correctly rounded tail is below `500` exactly when the exact
+/// remainder is below one half — `500` itself is a 3-digit value — so three
+/// guard digits are as exact as thirty; more only make the formatting, which
+/// dominates the cost, slower.)
 fn round_significant_half_up(abs: f64, sig: usize) -> (Vec<u8>, i32) {
     fn split(s: &str) -> (Vec<u8>, i32) {
         let (mant, exp) = s.split_once('e').unwrap_or((s, "0"));
@@ -8029,7 +8033,7 @@ fn round_significant_half_up(abs: f64, sig: usize) -> (Vec<u8>, i32) {
             exp.parse().unwrap_or(0),
         )
     }
-    let (mut digits, mut exp) = split(&alloc::format!("{:.*e}", sig + 29, abs));
+    let (mut digits, mut exp) = split(&alloc::format!("{:.*e}", sig + 2, abs));
     let tail = &digits[sig..];
     let up = if tail[0] != b'5' || tail[1..].iter().any(|&d| d != b'0') {
         tail[0] >= b'5'
@@ -8063,7 +8067,7 @@ fn round_significant_half_up(abs: f64, sig: usize) -> (Vec<u8>, i32) {
 /// `Number.prototype.toPrecision(p)`: render `n` with `p` significant digits
 /// (ties rounding up), in fixed notation unless the exponent is below -6 or
 /// at least `p`.
-fn format_precision(n: f64, p: usize) -> String {
+pub(crate) fn format_precision(n: f64, p: usize) -> String {
     if !n.is_finite() {
         return crate::realm::js_number_string(n);
     }

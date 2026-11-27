@@ -143,6 +143,10 @@ enum FastOp {
     ArrFill,
     /// `Array.prototype.at`.
     ArrAt,
+    /// `Array.prototype.toString` (whose `join` is the built-in one).
+    ArrToString,
+    /// `Number.prototype.toPrecision` on a Number primitive.
+    NumToPrecision,
     /// `Array.prototype.keys` / `values` / `entries` (the iterator's kind:
     /// 0 keys, 1 values, 2 entries).
     ArrIter(u8),
@@ -445,6 +449,8 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
         (N_ARRAY_PROTO_FN, b"concat") => FastOp::ArrConcat,
         (N_ARRAY_PROTO_FN, b"fill") => FastOp::ArrFill,
         (N_ARRAY_PROTO_FN, b"at") => FastOp::ArrAt,
+        (N_ARRAY_PROTO_FN, b"toString") => FastOp::ArrToString,
+        (N_NUMBER_PROTO_FN, b"toPrecision") => FastOp::NumToPrecision,
         (N_MAP_PROTO_FN, b"keys") => FastOp::CollIter(false, 0),
         (N_MAP_PROTO_FN, b"values") => FastOp::CollIter(false, 1),
         (N_MAP_PROTO_FN, b"entries") => FastOp::CollIter(false, 2),
@@ -1578,7 +1584,12 @@ fn run_op(
     // Only the Number methods take a primitive receiver; anything else the
     // chain of `%Number.prototype%` reaches (`hasOwnProperty`, …) would get
     // the prototype as its `this`.
-    if prim != matches!(op, FastOp::NumToFixed | FastOp::NumToString) {
+    if prim
+        != matches!(
+            op,
+            FastOp::NumToFixed | FastOp::NumToString | FastOp::NumToPrecision
+        )
+    {
         return None;
     }
     let arg = |i: usize| {
@@ -1633,6 +1644,7 @@ fn run_op(
                 | FastOp::ObjStaticHasOwn
                 | FastOp::NumToFixed
                 | FastOp::NumToString
+                | FastOp::NumToPrecision
                 | FastOp::GenResume(_)
         ) {
             let rest = args.get(1..).unwrap_or(&[]);
@@ -2309,6 +2321,48 @@ fn run_op(
                 return None;
             }
             NanBox::handle(realm.new_live_array_iterator(h, kind)?.to_raw())
+        }
+        FastOp::ArrToString => {
+            // `func = Get(array, "join")` along a chain of data properties is
+            // the built-in `join`, called with no arguments: its own fast op.
+            let join = super::array_hof::chain_data(realm, h, "join").ok()??;
+            let (id, name) = realm.bound_native_at(Handle::from_raw(join.as_handle()?))?;
+            if id != N_ARRAY_PROTO_FN || realm.string_leaf_bytes(name) != Some(b"join") {
+                return None;
+            }
+            return run_op_out_of_line(
+                ctx,
+                funcs,
+                FastOp::ArrJoin,
+                join.to_bits(),
+                recv,
+                h,
+                regs,
+                &[],
+            );
+        }
+        FastOp::NumToPrecision => {
+            let n = recv.as_number()?;
+            let p = arg(0);
+            if p.is_undefined() || !n.is_finite() && p.is_number() {
+                // No precision (or a non-finite `this` once a Number
+                // precision is converted): ToString of the value.
+                NanBox::handle(
+                    realm
+                        .new_string(&crate::realm::js_number_string(n))
+                        .to_raw(),
+                )
+            } else {
+                let p = int_arg(p)??;
+                if !(1.0..=100.0).contains(&p) {
+                    return None;
+                }
+                NanBox::handle(
+                    realm
+                        .new_string(&crate::nbexec::format_precision(n, p as usize))
+                        .to_raw(),
+                )
+            }
         }
         FastOp::ArrAt => {
             // `k` outside `0..len` is `undefined` with no `Get`; inside, a
