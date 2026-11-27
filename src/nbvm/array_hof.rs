@@ -37,7 +37,10 @@
 //! protocol as a JS-to-JS call), so a collection inside a callback sees every
 //! value the loop still holds.
 
-use super::{Ctx, FnProto, HostError, Realm, VmError, call_closure, host_get, vm_error, with_host};
+use super::{
+    Ctx, FnProto, HostError, Realm, VmError, call_closure, host_get, host_get_str, vm_error,
+    with_host,
+};
 use crate::heap::Handle;
 use crate::nanbox::NanBox;
 use crate::nbexec::{N_ARRAY_PROTO_FN, N_BASE_ARRAY, N_TYPED_ARRAY_SPECIES};
@@ -77,6 +80,7 @@ pub(crate) enum Hof {
     Reduce,
     ReduceRight,
     Sort,
+    FlatMap,
 }
 
 /// `op`'s code for compiled code's direct call (`jit_tier::jit_helper_hof_call`).
@@ -89,7 +93,7 @@ pub(crate) fn hof_code(op: Hof) -> usize {
 /// The built-in of a [`hof_code`].
 #[cfg(all(feature = "jit", jit_native))]
 pub(super) fn hof_of_code(code: usize) -> Option<Hof> {
-    const ALL: [Hof; 12] = [
+    const ALL: [Hof; 13] = [
         Hof::ForEach,
         Hof::Map,
         Hof::Filter,
@@ -102,6 +106,7 @@ pub(super) fn hof_of_code(code: usize) -> Option<Hof> {
         Hof::Reduce,
         Hof::ReduceRight,
         Hof::Sort,
+        Hof::FlatMap,
     ];
     ALL.iter().copied().find(|&h| h as usize == code)
 }
@@ -121,6 +126,7 @@ pub(crate) fn hof_for(name: &[u8]) -> Option<Hof> {
         b"reduce" => Hof::Reduce,
         b"reduceRight" => Hof::ReduceRight,
         b"sort" => Hof::Sort,
+        b"flatMap" => Hof::FlatMap,
         _ => return None,
     })
 }
@@ -289,7 +295,9 @@ pub(super) fn run(
     {
         return None;
     }
-    if matches!(op, Hof::Map | Hof::Filter) && !default_species_armed(&mut ctx.realm, h) {
+    if matches!(op, Hof::Map | Hof::Filter | Hof::FlatMap)
+        && !default_species_armed(&mut ctx.realm, h)
+    {
         return None;
     }
     // `sort` collects then writes back; here only over an array whose every
@@ -332,6 +340,10 @@ pub(super) fn run(
     };
     let r = match op {
         Hof::Sort => l.sort(ctx, len),
+        Hof::FlatMap => {
+            let callee = &mut l.callee;
+            flat_map_steps(ctx, recv, h, len, |ctx, a| callee.invoke(ctx, a, this_arg))
+        }
         Hof::Reduce | Hof::ReduceRight => l.reduce(ctx, len, op == Hof::ReduceRight, args),
         _ => l.iterate(ctx, len, op),
     };
@@ -377,6 +389,12 @@ fn run_direct(
         ctx.frame_shadow.reserve(len);
     }
     let r = match op {
+        Hof::FlatMap => flat_map_steps(ctx, recv, h, len, |ctx, a| {
+            match direct.call(ctx, funcs, cb, this_arg, a) {
+                Some(r) => r,
+                None => call_closure(ctx, funcs, cb, a, this_arg),
+            }
+        }),
         Hof::Find | Hof::FindIndex | Hof::FindLast | Hof::FindLastIndex => {
             direct_find(ctx, funcs, &direct, recv, h, len, op, cb, this_arg)
         }
@@ -568,6 +586,128 @@ fn direct_reduce(
         };
     }
     Ok(acc)
+}
+
+/// `flatMap`'s `FlattenIntoArray(A, O, len, 0, 1, mapper, thisArg)`
+/// (23.1.3.14.1) over the array `recv` (`h`), `A` the default
+/// `ArrayCreate(0)` (checked by the caller): unreachable from user code until
+/// it is returned, so its elements are collected (rooted) on the frame
+/// shadow and the array is made from them at the end — each
+/// `CreateDataPropertyOrThrow(A, targetIndex, …)` is the next entry. Per
+/// present index (`HasProperty` + `Get`: a present dense slot, else the
+/// host's), the mapper (`call`) runs; a result that is an Array (`IsArray`,
+/// which sees through proxies and throws for a revoked one) is spread one
+/// level — its `LengthOfArrayLike` read first, then each index `HasProperty` and
+/// `Get` live (holes inherited or skipped, a getter's mutation observed) —
+/// and anything else is appended as is.
+fn flat_map_steps<F>(
+    ctx: &mut Ctx,
+    recv: NanBox,
+    h: Handle,
+    len: usize,
+    mut call: F,
+) -> Result<NanBox, VmError>
+where
+    F: FnMut(&mut Ctx, &[NanBox]) -> Result<NanBox, VmError>,
+{
+    // The mapper's current result stays rooted while its elements are read
+    // (a getter may collect); the output follows it.
+    let held = ctx.frame_shadow.len();
+    ctx.frame_shadow.push(NanBox::undefined());
+    let out = ctx.frame_shadow.len();
+    let r = (|| {
+        for k in 0..len {
+            let present = ctx
+                .realm
+                .array_elements(h)
+                .and_then(|e| e.get(k).copied())
+                .filter(|v| !v.is_hole());
+            let v = match present {
+                Some(v) => v,
+                None => match element_general(ctx, recv, k, true)? {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+            let r = call(ctx, &[v, NanBox::number(k as f64), recv])?;
+            ctx.frame_shadow[held] = r;
+            let Some(inner) = flatten_source(ctx, r)? else {
+                ctx.frame_shadow.push(r);
+                continue;
+            };
+            // `LengthOfArrayLike(element)`: an Array's own `length` (a data
+            // property), or, through a proxy, `ToLength(Get(element,
+            // "length"))`.
+            let n = match inner {
+                Some(ih) => ctx.realm.array_length(ih).unwrap_or(0),
+                None => {
+                    let l = host_get_str(ctx, r, "length", None)?;
+                    let l = with_host(ctx, |host| host.unary(crate::ast::UnaryOp::Plus, l))
+                        .unwrap_or(Err(HostError::Fault))
+                        .map_err(VmError::from)?;
+                    let l = l.as_number().unwrap_or(0.0);
+                    if l.is_nan() || l <= 0.0 {
+                        0
+                    } else {
+                        l.min(9_007_199_254_740_991.0) as usize
+                    }
+                }
+            };
+            for i in 0..n {
+                let present = inner.and_then(|ih| {
+                    ctx.realm
+                        .array_elements(ih)
+                        .and_then(|e| e.get(i).copied())
+                        .filter(|v| !v.is_hole())
+                });
+                let e = match present {
+                    Some(e) => e,
+                    None => match element_general(ctx, r, i, true)? {
+                        Some(e) => e,
+                        None => continue,
+                    },
+                };
+                ctx.frame_shadow.push(e);
+            }
+        }
+        Ok(())
+    })();
+    let elems = ctx.frame_shadow.split_off(out);
+    ctx.frame_shadow.truncate(held);
+    r.map(|()| NanBox::handle(ctx.realm.new_array(elems).to_raw()))
+}
+
+/// `IsArray(v)` for `flatMap`'s step: `None` when `v` is not an Array;
+/// `Some(Some(h))` for an Array exotic object `h` itself, `Some(None)` for a
+/// proxy whose (innermost) target is one (its reads then go through the
+/// proxy); a `TypeError` for a revoked proxy on the way.
+fn flatten_source(ctx: &mut Ctx, v: NanBox) -> Result<Option<Option<Handle>>, VmError> {
+    let mut cur = v;
+    let mut proxied = false;
+    for _ in 0..1000 {
+        let Some(raw) = cur.as_handle() else {
+            return Ok(None);
+        };
+        let ch = Handle::from_raw(raw);
+        if ctx.realm.proxy_revoked(ch) {
+            let e = vm_error(
+                ctx,
+                "TypeError",
+                "Cannot perform operation on a revoked proxy",
+            );
+            return Err(VmError::Thrown(e));
+        }
+        if let Some((target, _)) = ctx.realm.proxy_at(ch) {
+            proxied = true;
+            cur = NanBox::handle(target.to_raw());
+            continue;
+        }
+        if !ctx.realm.is_array(ch) || ctx.realm.is_vm_function(ch) {
+            return Ok(None);
+        }
+        return Ok(Some((!proxied).then_some(ch)));
+    }
+    Ok(None)
 }
 
 /// `HasProperty(O, k)` (when `probe`) then `Get(O, k)` of the array `recv`
@@ -911,7 +1051,7 @@ impl Loop<'_> {
                         return Ok(NanBox::number(k as f64));
                     }
                 }
-                Hof::Reduce | Hof::ReduceRight | Hof::Sort => unreachable!(),
+                Hof::Reduce | Hof::ReduceRight | Hof::Sort | Hof::FlatMap => unreachable!(),
             }
         }
         Ok(match op {
@@ -1221,6 +1361,30 @@ mod tests {
         let mut interp = Interp::new();
         let value = interp.run(&program).expect("exec");
         interp.realm().to_display_string(value)
+    }
+
+    #[test]
+    fn flat_map_spreads_one_level() {
+        assert_eq!(run("[1,2].flatMap(x => [x, [x]]).length"), "4");
+        assert_eq!(run("[1,,3].flatMap(x => [x,,'z']).join()"), "1,z,3,z");
+        assert_eq!(
+            run(
+                "Array.prototype[1] = 'P'; var r = [0,,2].flatMap(x => [x,,9]).join(); delete Array.prototype[1]; r"
+            ),
+            "0,P,9,P,P,9,2,P,9"
+        );
+        // An array-like is appended as is; a proxy of an array is spread.
+        assert_eq!(run("[1].flatMap(() => ({ length: 1, 0: 5 })).length"), "1");
+        assert_eq!(
+            run("[1].flatMap(() => new Proxy([5, 6], {})).join()"),
+            "5,6"
+        );
+        assert_eq!(
+            run(
+                "var p = Proxy.revocable([1], {}); p.revoke(); try { [1].flatMap(() => p.proxy); 'no' } catch (e) { e.constructor.name }"
+            ),
+            "TypeError"
+        );
     }
 
     #[test]
