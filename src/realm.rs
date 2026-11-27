@@ -619,6 +619,10 @@ pub struct Realm {
     /// non-configurable) is installed, so the VM can tell that a function
     /// inherits it there (see [`Realm::inherits_default_has_instance`]).
     has_instance_key: Option<alloc::string::String>,
+    /// The property key (`"\0sym:<id>"`) of `Symbol.toPrimitive`, recorded
+    /// at global setup, through which the VM's own ToPrimitive of an
+    /// ordinary object looks the method up (`nbvm::to_prim`).
+    to_primitive_key: Option<alloc::string::String>,
     /// Per bytecode-VM function id: its `name` (a string handle) and `length`,
     /// from which a VM closure's own `name`/`length` data properties are
     /// synthesized (no per-closure storage; see [`Realm::vm_fn_meta_value`]).
@@ -1294,6 +1298,7 @@ impl Realm {
             function_proto_intrinsic: None,
             jit_function_proto: u64::MAX,
             has_instance_key: None,
+            to_primitive_key: None,
             vm_fn_meta: Vec::new(),
             vm_fn_meta_old: 0,
             vm_fn_source: Vec::new(),
@@ -1904,6 +1909,21 @@ impl Realm {
     /// [`has_instance_key`](Realm::has_instance_key)).
     pub(crate) fn set_has_instance_key(&mut self, key: &str) {
         self.has_instance_key = Some(alloc::string::String::from(key));
+    }
+
+    /// Records `key` as `Symbol.toPrimitive`'s property key (see
+    /// [`to_primitive_key`](Realm::to_primitive_key)).
+    pub(crate) fn set_to_primitive_key(&mut self, key: &str) {
+        self.to_primitive_key = Some(alloc::string::String::from(key));
+    }
+
+    /// `Symbol.toPrimitive`'s property key, once recorded (single-realm
+    /// runs only: another realm's objects key on another symbol).
+    #[must_use]
+    pub(crate) fn to_primitive_key(&self) -> Option<&str> {
+        self.to_primitive_key
+            .as_deref()
+            .filter(|_| !self.multi_realm)
     }
 
     /// Whether `GetMethod(f, @@hasInstance)` on the VM function `f` is

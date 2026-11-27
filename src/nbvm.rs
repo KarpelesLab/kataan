@@ -70,6 +70,7 @@ pub(crate) mod num_switch;
 pub mod objlit;
 mod private_ops;
 mod str_replace;
+mod to_prim;
 mod typeof_fast;
 pub use str_replace::{PlanText, ReplacePlan, ReplaceStep};
 pub use typeof_fast::TypeofGlobalCache;
@@ -2238,6 +2239,7 @@ fn host_binary(
 /// [`host_binary`] for a unary operator.
 fn host_unary(
     ctx: &mut Ctx,
+    funcs: &[FnProto],
     op: crate::ast::UnaryOp,
     v: NanBox,
     regs: Option<&[NanBox]>,
@@ -2245,7 +2247,39 @@ fn host_unary(
     if ctx.host.is_none() || !host_operand(&ctx.realm, v) {
         return None;
     }
+    // An ordinary object's own conversion methods, run here: then the
+    // operator on the primitive (the host's for a Symbol or a BigInt).
+    if matches!(
+        op,
+        crate::ast::UnaryOp::Plus | crate::ast::UnaryOp::Minus | crate::ast::UnaryOp::BitNot
+    ) && let Some(r) = to_prim::to_primitive(ctx, funcs, v, to_prim::Hint::Number, regs)
+    {
+        let x = match r {
+            Ok(x) => x,
+            Err(e) => return Some(Err(e)),
+        };
+        if host_operand(&ctx.realm, x) {
+            return Some(host_unary_any(ctx, op, x, regs));
+        }
+        return Some(Ok(match op {
+            crate::ast::UnaryOp::Plus => NanBox::number(ctx.realm.to_number(x)),
+            crate::ast::UnaryOp::Minus => ctx.realm.neg(x),
+            _ => unary_bit_not(&mut ctx.realm, x),
+        }));
+    }
     Some(host_unary_any(ctx, op, v, regs))
+}
+
+/// `~x` of a primitive `x` that is neither a Symbol nor a BigInt.
+#[cfg(feature = "std")]
+fn unary_bit_not(realm: &mut Realm, x: NanBox) -> NanBox {
+    realm.bit_not(x)
+}
+
+/// `~x` without `std` (the VM's own `~` is `NaN` there too).
+#[cfg(not(feature = "std"))]
+fn unary_bit_not(_: &mut Realm, _: NanBox) -> NanBox {
+    NanBox::number(f64::NAN)
 }
 
 /// The host's unary operator `op` on `v`, whatever `v` is (`regs`: as
@@ -7261,6 +7295,10 @@ fn vm_add(
     if (a.is_number() || prim_str(a)) && (b.is_number() || prim_str(b)) {
         return vm_add_prims(ctx, a, b);
     }
+    if let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Default, regs) {
+        let (x, y) = r?;
+        return vm_add(ctx, funcs, x, y, regs);
+    }
     if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Add, a, b, regs) {
         return r;
     }
@@ -7344,7 +7382,7 @@ fn vm_call_native(
         let arg = args.first().copied().unwrap_or(NanBox::undefined());
         // Hosted: `+obj` is the host's ToNumber (`Symbol.toPrimitive`, inherited
         // `valueOf`, a throw that propagates).
-        if let Some(r) = host_unary(ctx, crate::ast::UnaryOp::Plus, arg, regs) {
+        if let Some(r) = host_unary(ctx, funcs, crate::ast::UnaryOp::Plus, arg, regs) {
             return r;
         }
         let prim = to_primitive(ctx, funcs, arg, true);
@@ -7395,6 +7433,10 @@ fn vm_arith(
         GA_DIV => crate::ast::BinaryOp::Div,
         _ => crate::ast::BinaryOp::Mod,
     };
+    if let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Number, regs) {
+        let (x, y) = r?;
+        return vm_arith(ctx, funcs, x, y, op, regs);
+    }
     if let Some(r) = host_binary(ctx, bop, a, b, regs) {
         return r;
     }
@@ -7430,6 +7472,10 @@ fn vm_lt(
     }
     if let Some(lt) = string_lt(&mut ctx.realm, a, b) {
         return Ok(NanBox::boolean(lt));
+    }
+    if let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Number, regs) {
+        let (x, y) = r?;
+        return vm_lt(ctx, funcs, x, y, regs);
     }
     if let Some(r) = host_binary(ctx, crate::ast::BinaryOp::Lt, a, b, regs) {
         return r;
@@ -7600,6 +7646,12 @@ fn vm_value_bin(
             VB_LOOSE_EQ => B::EqEq,
             _ => B::NotEq,
         };
+        if !matches!(op, VB_LOOSE_EQ | VB_LOOSE_NEQ)
+            && let Some(r) = to_prim::operands(ctx, funcs, a, b, to_prim::Hint::Number, regs)
+        {
+            let (x, y) = r?;
+            return vm_value_bin(ctx, funcs, x, y, op, regs);
+        }
         if let Some(r) = host_binary(ctx, bop, a, b, regs) {
             return r;
         }
@@ -11306,6 +11358,7 @@ fn run_frame_at_ic(
             Op::BitNot { dst, a } => {
                 if let Some(r) = host_unary(
                     ctx,
+                    funcs,
                     crate::ast::UnaryOp::BitNot,
                     regs[*a as usize],
                     Some(regs),
@@ -11341,6 +11394,7 @@ fn run_frame_at_ic(
             Op::Neg { dst, a } => {
                 if let Some(r) = host_unary(
                     ctx,
+                    funcs,
                     crate::ast::UnaryOp::Minus,
                     regs[*a as usize],
                     Some(regs),
@@ -14709,7 +14763,7 @@ fn vm_object_kv(
             return Err(VmError::Unsupported);
         }
         // Ordinary object: live, getter-invoking, spec-ordered enumeration.
-        if ctx.realm.object_keys(h).is_some() {
+        if ctx.realm.is_object_cell(h) {
             let keys = ctx.realm.own_property_names(h).unwrap_or_default();
             let mut out = Vec::with_capacity(keys.len());
             for k in keys {

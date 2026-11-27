@@ -1031,7 +1031,7 @@ impl Interp {
                 if parsed
                     .as_handle()
                     .map(Handle::from_raw)
-                    .is_some_and(|h| self.realm.is_array(h) || self.realm.object_keys(h).is_some())
+                    .is_some_and(|h| self.realm.is_array(h) || self.realm.is_object_cell(h))
                 {
                     return Err(self.json_error("Raw JSON must be a primitive value"));
                 }

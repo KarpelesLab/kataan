@@ -59,7 +59,7 @@ fn stringify_seen(
             if realm.is_vm_function_value(h) {
                 return Ok(None);
             }
-            let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
+            let is_container = realm.array_elements(h).is_some() || realm.is_object_cell(h);
             if is_container {
                 // A repeated handle is a cycle; depth past the cap is treated the
                 // same (the caller throws) so a deep acyclic structure cannot
@@ -140,7 +140,7 @@ fn stringify_at(
                 return Ok(None);
             }
             let inner = alloc::format!("{cur}{indent}");
-            let is_container = realm.array_elements(h).is_some() || realm.object_keys(h).is_some();
+            let is_container = realm.array_elements(h).is_some() || realm.is_object_cell(h);
             if is_container {
                 if seen.contains(&h)
                     || (seen.len() >= realm.limits.max_json_depth || crate::stack::exhausted())

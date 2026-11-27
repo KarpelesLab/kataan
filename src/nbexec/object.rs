@@ -2972,7 +2972,7 @@ impl Interp {
             }
         } else if self.realm.is_promise(handle) {
             "Promise"
-        } else if self.realm.object_keys(handle).is_some() {
+        } else if self.realm.is_object_cell(handle) {
             // A plain object reports `Object`. (Error objects are handled earlier in
             // `read_member`, before their prototype's generic `constructor`.)
             "Object"

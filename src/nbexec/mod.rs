@@ -1823,7 +1823,7 @@ const N_RETURN_UNDEFINED: u16 = 908;
 /// live in the same `ARRAY_BUFFER_BYTES` slot, so typed arrays and `Atomics`
 /// operate over it unchanged.
 const N_SHARED_ARRAY_BUFFER: u16 = 687;
-const N_OBJ_PROTO_VALUEOF: u16 = 180;
+pub(crate) const N_OBJ_PROTO_VALUEOF: u16 = 180;
 pub(crate) const N_OBJ_PROTO_HASOWN: u16 = 181;
 const N_OBJ_PROTO_ISPROTOTYPEOF: u16 = 182;
 const N_OBJ_PROTO_PROPISENUM: u16 = 183;
@@ -5059,6 +5059,9 @@ impl Interp {
             self.realm.set_readonly_property(func_proto, &key);
             self.realm.set_non_configurable_property(func_proto, &key);
             self.realm.set_has_instance_key(&key);
+            let tp = self.well_known_symbol("toPrimitive");
+            let tp_key = self.member_key(tp);
+            self.realm.set_to_primitive_key(&tp_key);
         }
         self.setup_first_class_prototype_id("Set", SET_PROTO_METHODS, N_SET_PROTO_FN);
         self.setup_first_class_prototype_id("Map", MAP_PROTO_METHODS, N_MAP_PROTO_FN);

@@ -217,7 +217,7 @@ impl Interp {
         // promise, generator, iterator, `arguments`, WeakRef, Intl object, …)
         // is not cloneable; only private fields and symbol keys may be stored
         // as internal keys on an ordinary object.
-        let ordinary = self.realm.object_keys(h).is_some()
+        let ordinary = self.realm.is_object_cell(h)
             && !self.realm.object_all_keys(h).iter().any(|k| {
                 is_internal_key(k) && !k.starts_with("\u{0}#") && !k.starts_with("\u{0}sym:")
             });

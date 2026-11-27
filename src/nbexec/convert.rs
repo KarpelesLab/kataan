@@ -205,7 +205,7 @@ impl Interp {
             // runs `Get(O, @@toPrimitive)` / `valueOf` / `toString` through its
             // traps (or the target) — returning it as-is would make `proxy == 0`
             // skip the coercion entirely.
-            if self.realm.object_keys(h).is_some()
+            if self.realm.is_object_cell(h)
                 || self.realm.get_property(h, PRIM_WRAP).is_some()
                 || self.realm.proxy_at(h).is_some()
             {
@@ -281,7 +281,7 @@ impl Interp {
         // Short-circuiting to the raw display string skipped both.
         if !is_wrapper
             && (self.realm.is_string_handle(h)
-                || (self.realm.object_keys(h).is_none()
+                || (!self.realm.is_object_cell(h)
                     && !self.realm.is_array(h)
                     // A function is an ordinary object for ToPrimitive: it must run
                     // OrdinaryToPrimitive so a user-installed `valueOf`/`toString`

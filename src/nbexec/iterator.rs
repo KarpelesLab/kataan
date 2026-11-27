@@ -3071,7 +3071,7 @@ impl Interp {
         // its indices, already seen.
         if self.realm.array_elements(c).is_some() || self.string_index_count(c).is_some() {
             seen.insert(String::from("length"));
-        } else if self.realm.object_keys(c).is_none()
+        } else if !self.realm.is_object_cell(c)
             && self.realm.typed_len(c).is_none()
             && let Some(names) = self.realm.own_property_names(c)
         {

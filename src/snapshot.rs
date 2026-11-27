@@ -293,7 +293,7 @@ pub fn capture(realm: &Realm, roots: &[Handle]) -> Snapshot {
                 .map(|v| snap_val(*v, &mut index_of, &mut order, &mut intern))
                 .collect();
             SnapCell::Array(vals)
-        } else if realm.object_keys(h).is_some() {
+        } else if realm.is_object_cell(h) {
             // All own *data* properties, including non-enumerable + internal slots
             // (private `#` fields and accessor keys are handled separately). Each
             // pair records whether the property is hidden (non-enumerable).
