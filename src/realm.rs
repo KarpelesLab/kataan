@@ -4151,6 +4151,13 @@ impl Realm {
         out
     }
 
+    /// The id of the Symbol at `handle` (as [`symbol_at`](Self::symbol_at)'s,
+    /// without copying its description).
+    #[must_use]
+    pub fn symbol_id(&self, handle: Handle) -> Option<u64> {
+        self.heap.get(handle)?.as_symbol().map(|(_, id)| id)
+    }
+
     /// The `(description, id)` of the symbol at `handle`, if it is one.
     #[must_use]
     pub fn symbol_at(&self, handle: Handle) -> Option<(alloc::string::String, u64)> {

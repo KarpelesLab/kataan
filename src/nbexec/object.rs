@@ -2545,8 +2545,8 @@ impl Interp {
             if let Some(k) = self.realm.string_key(h) {
                 return k;
             }
-            if let Some((_, id)) = self.realm.symbol_at(h) {
-                return alloc::format!("\u{0}sym:{id}");
+            if let Some(id) = self.realm.symbol_id(h) {
+                return crate::shape::symbol_key(id);
             }
         }
         String::new()

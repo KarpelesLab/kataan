@@ -9877,8 +9877,8 @@ fn run_frame_at_ic(
                         // string. A primitive Symbol keys on its `\0sym:` name.
                         let kv = regs[*key as usize];
                         let k = match kv.as_handle().map(Handle::from_raw) {
-                            Some(kh) => match ctx.realm.symbol_at(kh) {
-                                Some((_, id)) => alloc::format!("\u{0}sym:{id}"),
+                            Some(kh) => match ctx.realm.symbol_id(kh) {
+                                Some(id) => crate::shape::symbol_key(id),
                                 None if ctx.realm.string_value(kh).is_some() => {
                                     ctx.realm.display_key(kv)
                                 }
@@ -12920,8 +12920,8 @@ fn spread_plain_vm(ctx: &mut Ctx, target: NanBox, src: NanBox, excluded: &[Strin
 fn vm_property_key(ctx: &mut Ctx, key: NanBox, regs: Option<&[NanBox]>) -> Result<String, VmError> {
     if let Some(raw) = key.as_handle() {
         let h = Handle::from_raw(raw);
-        if let Some((_, id)) = ctx.realm.symbol_at(h) {
-            return Ok(alloc::format!("\u{0}sym:{id}"));
+        if let Some(id) = ctx.realm.symbol_id(h) {
+            return Ok(crate::shape::symbol_key(id));
         }
         if !ctx.realm.is_string_handle(h) {
             // Hosted: the host runs the full ToPrimitive(key, string) once.

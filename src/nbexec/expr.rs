@@ -162,9 +162,9 @@ impl Interp {
     /// form.
     pub(crate) fn member_key(&self, k: NanBox) -> String {
         if let Some(raw) = k.as_handle()
-            && let Some((_, id)) = self.realm.symbol_at(Handle::from_raw(raw))
+            && let Some(id) = self.realm.symbol_id(Handle::from_raw(raw))
         {
-            return alloc::format!("\u{0}sym:{id}");
+            return crate::shape::symbol_key(id);
         }
         // A String key is escaped into the user namespace (see
         // `realm::is_internal_key`): no string can name an internal slot.

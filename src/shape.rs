@@ -295,6 +295,30 @@ pub const BRAND_KEYS: [&str; 4] = [PRIM_WRAP_KEY, "\u{0}htmldda", "\u{0}bnd_t", 
 /// The prefix of a property key that encodes a Symbol (`\0sym:{id}`).
 pub const SYMBOL_KEY_PREFIX: &str = "\u{0}sym:";
 
+/// The property key of the Symbol whose id is `id`: [`SYMBOL_KEY_PREFIX`]
+/// and the id in decimal — `format!("\0sym:{id}")`, without the formatting
+/// machinery (a Symbol-keyed lookup builds one per access).
+#[must_use]
+pub fn symbol_key(id: u64) -> alloc::string::String {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut n = id;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let mut s = alloc::string::String::with_capacity(SYMBOL_KEY_PREFIX.len() + digits.len() - i);
+    s.push_str(SYMBOL_KEY_PREFIX);
+    for &d in &digits[i..] {
+        s.push(char::from(d));
+    }
+    s
+}
+
 /// The `brands` bit recording that a layout holds at least one Symbol key
 /// ([`SYMBOL_KEY_PREFIX`]), so the collector's symbol-liveness scan can skip
 /// every object whose layout has none without walking its keys. Kept clear of
@@ -795,6 +819,23 @@ impl Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_key_matches_format() {
+        for id in [
+            0u64,
+            1,
+            9,
+            10,
+            99,
+            100,
+            12345,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            assert_eq!(symbol_key(id), alloc::format!("\u{0}sym:{id}"));
+        }
+    }
 
     /// `Object::has_any_brand` callers name brand keys by bit (key `i`'s),
     /// the `[[IsHTMLDDA]]` slot the second.
