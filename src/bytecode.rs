@@ -19,7 +19,42 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 const MAGIC: &[u8; 4] = b"KTBC";
-const VERSION: u16 = 3;
+/// Format version. 4: the `EXT` (255) opcode prefix exists and
+/// `Op::CallSpreadMid` moved from primary tag 232 to extended sub-op 0.
+const VERSION: u16 = 4;
+
+// --- opcode tag allocation ---------------------------------------------------
+//
+// Every op is written as ONE primary tag byte followed by its fields
+// (`write_op` / `read_op` below). Primary tags are never renumbered: changing
+// what a tag means requires bumping `VERSION`.
+//
+// Primary tags (u8), as of VERSION 4:
+//   used   0-122, 140-141, 150-152, 160-164, 169-175, 180-184, 195-197,
+//          200-201, 210-211, 225-231, 233-234
+//   free   123-139, 142-149, 153-159, 165-168, 176-179, 185-194, 198-199,
+//          202-209, 212-224, 232, 235-254 (232 was freed by moving
+//          CallSpreadMid to EXT; 128-144 were handed out to in-flight
+//          branches on 2026-11-28, so prefer EXT for anything new)
+//   255    `EXT`: the extended prefix (below). Never assign 255 to an op.
+//
+// Extended ops: `EXT` + a little-endian `u16` sub-opcode + the op's fields,
+// giving 65536 further encodings. To allocate a new op: take the next free
+// sub-op, add a `const EXT_<NAME>: u16` next to `EXT_CALL_SPREAD_MID`, write
+// it with `w_ext(EXT_<NAME>, out)` in `write_op`, and add an
+// `EXT_<NAME> => Op::...` arm to `read_ext_op`. An unknown sub-op decodes to
+// `DecodeError::BadExtTag`; a stream ending inside the prefix to `Truncated`.
+// Adding a new sub-op does not need a `VERSION` bump (older builds reject it
+// as `BadExtTag`); changing an existing one does.
+//
+// Extended sub-ops (u16):
+//   0        Op::CallSpreadMid
+//   1-65535  free (allocate upward, one per op; record it on this line)
+
+/// The primary tag that introduces an extended (`EXT` + `u16`) opcode.
+const EXT: u8 = 255;
+/// Extended sub-opcode of `Op::CallSpreadMid`.
+const EXT_CALL_SPREAD_MID: u16 = 0;
 
 /// Why a bytecode artifact failed to load.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -32,6 +67,8 @@ pub enum DecodeError {
     Truncated,
     /// An unknown opcode/value tag (a corrupt or incompatible artifact).
     BadTag(u8),
+    /// An unknown extended (`EXT`-prefixed) sub-opcode.
+    BadExtTag(u16),
     /// The artifact decoded cleanly but failed verification (a reference
     /// outside its declared bounds). Returned by load paths that must hand back
     /// a *runnable* function table from untrusted bytes, so verification is not
@@ -58,6 +95,12 @@ fn w_u32(v: u32, out: &mut Vec<u8>) {
 }
 fn w_usize(v: usize, out: &mut Vec<u8>) {
     w_u32(v as u32, out);
+}
+/// Writes the `EXT` prefix and an extended sub-opcode (see the tag table at
+/// the top of this file); the op's fields follow.
+fn w_ext(sub: u16, out: &mut Vec<u8>) {
+    w_u8(EXT, out);
+    w_u16(sub, out);
 }
 fn w_reg(v: Reg, out: &mut Vec<u8>) {
     w_u16(v, out);
@@ -2175,7 +2218,7 @@ fn write_op(op: &Op, out: &mut Vec<u8>) {
             after,
             ok,
         } => {
-            w_u8(232, out);
+            w_ext(EXT_CALL_SPREAD_MID, out);
             w_reg(*dst, out);
             w_reg(*callee, out);
             w_reg(*this, out);
@@ -3078,15 +3121,10 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             iter: r.reg()?,
             next: r.reg()?,
         },
-        232 => Op::CallSpreadMid {
-            dst: r.reg()?,
-            callee: r.reg()?,
-            this: r.reg()?,
-            items: r.regs()?,
-            src: r.reg()?,
-            after: r.regs()?,
-            ok: r.reg()?,
-        },
+        EXT => {
+            let sub = r.u16()?;
+            read_ext_op(sub, r)?
+        }
         231 => Op::ArrayUnpack {
             ok: r.reg()?,
             src: r.reg()?,
@@ -3131,6 +3169,23 @@ fn read_op(r: &mut Reader) -> Result<Op, DecodeError> {
             b: r.reg()?,
         },
         t => return Err(DecodeError::BadTag(t)),
+    })
+}
+
+/// Reads the fields of an extended op whose `EXT` prefix and sub-opcode
+/// `sub` were already consumed (the inverse of `w_ext` + fields).
+fn read_ext_op(sub: u16, r: &mut Reader) -> Result<Op, DecodeError> {
+    Ok(match sub {
+        EXT_CALL_SPREAD_MID => Op::CallSpreadMid {
+            dst: r.reg()?,
+            callee: r.reg()?,
+            this: r.reg()?,
+            items: r.regs()?,
+            src: r.reg()?,
+            after: r.regs()?,
+            ok: r.reg()?,
+        },
+        s => return Err(DecodeError::BadExtTag(s)),
     })
 }
 
@@ -3492,5 +3547,87 @@ mod tests {
             deserialize(&bytes[..bytes.len() - 1]).unwrap_err(),
             DecodeError::Truncated
         );
+    }
+
+    /// A one-proto artifact whose op stream is exactly `op_bytes` (`n_ops`
+    /// ops declared), for hand-built extended-op records.
+    fn artifact_with_ops(n_ops: u32, op_bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 proto
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // n_regs
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_params
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // n_captures
+        bytes.push(0); // rest_from = None
+        bytes.push(0); // is_async = false
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // length
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // name len = 0
+        bytes.extend_from_slice(&n_ops.to_le_bytes());
+        bytes.extend_from_slice(op_bytes);
+        bytes
+    }
+
+    /// The `EXT` prefix: an extended op round-trips through encode, decode,
+    /// and verify, and a malformed prefix is a decode error.
+    #[test]
+    fn extended_ops_round_trip_and_reject_malformed_prefixes() {
+        // A real extended op, compiled from source: `f(items, ...src, after)`
+        // (a hosted compile emits `Op::CallSpreadMid` for it).
+        let src = "function f(a,b,c,d){ return a*1000+b*100+c*10+d; } \
+                   var xs = [2,3]; f(1, ...xs, 4)";
+        let program = Parser::parse_program(src).unwrap();
+        let mut protos = Vec::new();
+        crate::nbvm::compile_program_into(&program, true, &mut protos).unwrap();
+        let mut found = false;
+        for op in protos.iter().flat_map(|p| p.ops.iter()) {
+            if let Op::CallSpreadMid { .. } = op {
+                let mut enc = Vec::new();
+                write_op(op, &mut enc);
+                assert_eq!(enc[0], EXT);
+                assert_eq!(u16::from_le_bytes([enc[1], enc[2]]), EXT_CALL_SPREAD_MID);
+                let mut r = Reader {
+                    bytes: &enc,
+                    pos: 0,
+                };
+                let back = read_op(&mut r).unwrap();
+                assert_eq!(r.remaining(), 0);
+                let mut enc2 = Vec::new();
+                write_op(&back, &mut enc2);
+                assert_eq!(enc, enc2);
+                found = true;
+            }
+        }
+        assert!(found, "expected the compiler to emit CallSpreadMid");
+        let bytes = serialize(&protos);
+        let reloaded = deserialize_verified(&bytes).expect("verified reload");
+        assert_eq!(serialize(&reloaded), bytes);
+        // Every truncation of an artifact holding an extended op is an
+        // error, never a panic.
+        for cut in 0..bytes.len() {
+            assert!(deserialize(&bytes[..cut]).is_err());
+        }
+
+        // Hand-built records: a prefix cut short anywhere is `Truncated`; an
+        // unallocated sub-op is `BadExtTag`.
+        for ops in [&[EXT][..], &[EXT, 0], &[EXT, 0, 0], &[EXT, 0, 0, 1]] {
+            assert_eq!(
+                deserialize(&artifact_with_ops(1, ops)).unwrap_err(),
+                DecodeError::Truncated
+            );
+        }
+        assert_eq!(
+            deserialize(&artifact_with_ops(1, &[EXT, 0xff, 0xff])).unwrap_err(),
+            DecodeError::BadExtTag(0xffff)
+        );
+        assert_eq!(
+            deserialize(&artifact_with_ops(1, &[EXT, 0xfe, 0xff, 0, 0])).unwrap_err(),
+            DecodeError::BadExtTag(0xfffe)
+        );
+        // A freed primary tag (CallSpreadMid's old 232) is now unknown.
+        assert_eq!(
+            deserialize(&artifact_with_ops(1, &[232, 0, 0])).unwrap_err(),
+            DecodeError::BadTag(232)
+        );
+        assert!(deserialize_verified(&artifact_with_ops(1, &[EXT, 0xff, 0xff])).is_err());
     }
 }
