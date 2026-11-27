@@ -25,6 +25,13 @@ use crate::realm::AccHit;
 #[inline]
 fn probe(ctx: &Ctx, recv: u64, key: u64) -> Option<Result<NanBox, NanBox>> {
     let (recv, key) = (NanBox::from_bits(recv), NanBox::from_bits(key));
+    // A Symbol key naming an own data slot (`realm::sym_memo`).
+    if let (Some(r), Some(k)) = (recv.as_handle(), key.as_handle())
+        && let Some(id) = ctx.realm.symbol_id(Handle::from_raw(k))
+        && let Some(v) = ctx.realm.sym_own_data(Handle::from_raw(r), key, id)
+    {
+        return Some(Ok(v));
+    }
     if let Some((o, slot)) = ctx.realm.key_memo_probe(recv, key)
         && let Some(v) = o.slot(slot)
     {

@@ -39,6 +39,7 @@ pub(crate) use forin_cache::{ForInSite, KeyTable, NO_SLOT};
 mod gen_state;
 mod key_memo;
 mod method_names;
+mod sym_memo;
 use method_names::MethodNames;
 mod text_memo;
 pub(crate) use text_memo::{AccHit, TextHit, getkey_enabled};
@@ -438,6 +439,8 @@ pub struct Realm {
     method_names: Option<alloc::boxed::Box<MethodNames>>,
     /// The String-key slot memo (`key_memo`), made on first use.
     key_memo: core::cell::OnceCell<alloc::boxed::Box<key_memo::KeyMemo>>,
+    /// The Symbol-key slot memo (`realm::sym_memo`), made on first use.
+    sym_memo: core::cell::OnceCell<alloc::boxed::Box<sym_memo::SymMemo>>,
     /// The address of the memo's entries once it is made, else `0`: what
     /// compiled code probes (`key_memo::KeyMemoLayout`).
     key_memo_entries: core::cell::Cell<usize>,
@@ -1270,6 +1273,7 @@ impl Realm {
             for_in_cache: None,
             method_names: None,
             key_memo: core::cell::OnceCell::new(),
+            sym_memo: core::cell::OnceCell::new(),
             key_memo_entries: core::cell::Cell::new(0),
             key_text: core::cell::OnceCell::new(),
             key_text_entries: core::cell::Cell::new(0),

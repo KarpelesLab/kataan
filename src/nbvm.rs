@@ -13490,6 +13490,9 @@ fn vm_get_elem_from(
     if let (Some(kh), Some(h)) = (key.as_handle(), recv.as_handle())
         && let Some(id) = ctx.realm.symbol_id(Handle::from_raw(kh))
     {
+        if let Some(v) = ctx.realm.sym_own_data(Handle::from_raw(h), key, id) {
+            return Ok(v);
+        }
         let mut buf = [0u8; 32];
         let ks = crate::shape::symbol_key_in(id, &mut buf);
         match ctx
