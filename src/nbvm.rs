@@ -7741,7 +7741,7 @@ fn vm_value_bin(
                 v.as_handle().map(Handle::from_raw).is_some_and(|h| {
                     !ctx.realm.is_string_handle(h)
                         && ctx.realm.symbol_at(h).is_none()
-                        && ctx.realm.bigint_at(h).is_none()
+                        && !ctx.realm.is_bigint(h)
                 })
             };
             let bare_prim = |v: NanBox| {
@@ -10416,15 +10416,13 @@ fn run_frame_at_ic(
             }
             Op::Step { dst, src, dec } => {
                 let v = regs[*src as usize];
-                let big = v
-                    .as_handle()
-                    .and_then(|h| ctx.realm.bigint_at(Handle::from_raw(h)));
+                let one = crate::bignum::BigInt::from_i128(1);
+                let big = v.as_handle().and_then(|h| {
+                    let n = ctx.realm.bigint_ref(Handle::from_raw(h))?;
+                    Some(if *dec { n.sub(&one) } else { n.add(&one) })
+                });
                 regs[*dst as usize] = match big {
-                    Some(n) => {
-                        let one = crate::bignum::BigInt::from_i128(1);
-                        let r = if *dec { n.sub(&one) } else { n.add(&one) };
-                        NanBox::handle(ctx.realm.new_bigint(r).to_raw())
-                    }
+                    Some(r) => NanBox::handle(ctx.realm.new_bigint(r).to_raw()),
                     None => {
                         let n = v.as_number().unwrap_or(f64::NAN);
                         NanBox::number(if *dec { n - 1.0 } else { n + 1.0 })
@@ -12911,7 +12909,7 @@ fn json_normalize(
     // whose serialization the realm handles).
     if let Some(h) = v.as_handle().map(Handle::from_raw)
         && !ctx.realm.is_string_handle(h)
-        && ctx.realm.bigint_at(h).is_none()
+        && !ctx.realm.is_bigint(h)
         && ctx.realm.date_at(h).is_none()
     {
         let tj = json_read_prop(ctx, funcs, h, "toJSON")?;

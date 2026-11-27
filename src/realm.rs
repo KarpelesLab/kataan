@@ -11044,14 +11044,14 @@ impl Realm {
         // whole string just to test it. `Cell::as_str` + `Rope::is_empty` are
         // both allocation-free, so this runs on every `if`/`while`/`&&`/`||`/
         // `??`/ternary without copying the string.
-        if let Some(r) = self.heap.get(h).and_then(Cell::as_str) {
-            return !r.is_empty();
+        // (One lookup of the cell, its value borrowed, not copied.)
+        match self.heap.get(h) {
+            Some(Cell::Str(r)) => !r.is_empty(),
+            Some(Cell::BigInt(n)) => !n.is_zero(), // `0n` is falsy
+            // An [[IsHTMLDDA]] exotic object (`document.all`) is falsy.
+            Some(Cell::Object(o)) => !o.has_any_brand(1 << 1),
+            _ => true,
         }
-        if let Some(n) = self.bigint_at(h) {
-            return !n.is_zero(); // `0n` is falsy
-        }
-        // An [[IsHTMLDDA]] exotic object (`document.all`) is falsy.
-        !self.is_html_dda(h)
     }
 
     /// Whether the value at `handle` is an **`[[IsHTMLDDA]]`** exotic object (the
