@@ -4157,9 +4157,52 @@ pub(crate) fn jit_helper_call_method(
                     }
                 };
             }
+        } else if ctx.host.is_some() && key != "caller" && host_method_direct_on() {
+            // Not a VM function: the interpreter arm's other steps (`Math.f`,
+            // an array higher-order built-in over a VM callback, then the
+            // host's method call), without setting up a one-op frame.
+            // SAFETY: `jit_funcs` outlives this call (borrowed down the call tree).
+            #[allow(unsafe_code)]
+            let funcs = unsafe {
+                &*ctx
+                    .jit_funcs
+                    .expect("jit_funcs set before generic dispatch")
+            };
+            let r = match super::math_fast::call(&ctx.realm, recv_val, key, args, regs) {
+                Some(v) => Ok(v),
+                None => {
+                    let argv = super::ArgBuf::from_regs(regs, args);
+                    match super::array_hof::try_call(ctx, funcs, regs, recv_val, key, &argv) {
+                        Some(r) => r,
+                        None => super::with_host_regs(ctx, regs, |h| {
+                            h.call_method(recv_val, key, &argv)
+                        })
+                        .unwrap_or(Err(super::HostError::Fault))
+                        .map_err(VmError::from),
+                    }
+                }
+            };
+            return match r {
+                Ok(v) => {
+                    regs[*dst as usize] = v;
+                    0
+                }
+                Err(e) => {
+                    ctx.jit_pending_fault = Some(e);
+                    NanBox::jit_throw_bits()
+                }
+            };
         }
     }
     jit_helper_exec_op(ctx_raw, regs_raw, n_regs, op_raw)
+}
+
+/// Whether compiled code's method call of a non-VM method goes straight to
+/// the host (`KATAAN_JIT_HOSTCALL`, default on) instead of through a one-op
+/// interpreter frame.
+fn host_method_direct_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_HOSTCALL").is_none_or(|v| v != "0"))
 }
 }
 
