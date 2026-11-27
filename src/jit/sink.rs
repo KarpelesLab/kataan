@@ -1433,6 +1433,13 @@ pub(crate) fn log() -> bool {
     *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LOG").is_some_and(|v| v != "0"))
 }
 
+/// Whether `KATAAN_JIT_LOG=3` asks for each compile's spliced bytecode
+/// (read once per process).
+pub(crate) fn log_spliced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("KATAAN_JIT_LOG").is_some_and(|v| v == "3"))
+}
+
 /// Whether the generic tier sinks objects (`KATAAN_JIT_SINK=0` turns it
 /// off; read once per process).
 #[must_use]

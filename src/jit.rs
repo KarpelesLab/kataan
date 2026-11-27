@@ -5313,7 +5313,7 @@ impl JitProto {
             }
             None => (proto, None, None),
         };
-        if std::env::var_os("KATAAN_JIT_LOG").is_some_and(|v| v == "3") {
+        if sink::log_spliced() {
             std::eprintln!("[jit] spliced {} ({} regs):", proto.name, proto.n_regs);
             for (pc, op) in proto.ops.iter().enumerate() {
                 std::eprintln!("[jit]   {pc:4} {op:?}");
@@ -6324,7 +6324,7 @@ pub struct X64Assembler {
     /// Out-of-line code moved off the hot path ([`cold_end`](Self::cold_end)),
     /// placed after everything else by [`finish`](Self::finish).
     #[cfg_attr(not(jit_native), allow(dead_code))]
-    cold: Vec<ColdChunk>,
+    cold: ColdChunk,
     /// While a cold region is open: the labels bound since it began.
     #[cfg_attr(not(jit_native), allow(dead_code))]
     cold_binds: Option<Vec<usize>>,
@@ -6423,7 +6423,48 @@ struct PostCall {
 /// branch emitted right after a 64-bit store with no label bound between
 /// them (so every path through the branch ran the store), that store
 /// (`X64Assembler::note_load`'s forwarding holds across the branch).
-type Fixup = (usize, usize, Option<StoreFwd>);
+/// (Packed in 16 bytes: a large body has a fixup per 20 bytes of code,
+/// and the cold regions copy theirs twice.)
+#[derive(Clone, Copy)]
+struct Fixup {
+    /// The operand's offset.
+    at: u32,
+    /// The target label (an index into the assembler's labels).
+    label: u32,
+    /// The store's displacement (with `st`).
+    disp: i32,
+    /// The store's base register (with `st`).
+    base: u8,
+    /// The store's source register (with `st`).
+    src: u8,
+    /// Whether the branch directly follows a store.
+    st: bool,
+}
+
+impl Fixup {
+    /// The fixup at offset `at` for `label`, after `store` if any.
+    fn new(at: usize, label: usize, store: Option<StoreFwd>) -> Self {
+        let s = store.unwrap_or_default();
+        Self {
+            at: at as u32,
+            label: label as u32,
+            disp: s.disp,
+            base: s.base,
+            src: s.src,
+            st: store.is_some(),
+        }
+    }
+
+    /// The operand's offset.
+    fn at(&self) -> usize {
+        self.at as usize
+    }
+
+    /// The target label.
+    fn label(&self) -> usize {
+        self.label as usize
+    }
+}
 
 /// A load a store just before it may serve (`X64Assembler::note_load`):
 /// `(where it starts, its length, the stored address' base register and
@@ -6440,9 +6481,12 @@ struct StoreFwd {
     src: u8,
 }
 
-/// A run of code [`X64Assembler::cold_end`] cut out of the main stream: its
-/// bytes, the labels bound in it and the jump fixups in it (both at offsets
-/// relative to the chunk's start).
+/// The runs of code [`X64Assembler::cold_end`] cut out of the main stream,
+/// one after another in the order they were cut (the order `finish` places
+/// them in): their bytes, the labels bound in them and the jump fixups in
+/// them (both at offsets relative to the first run's start). (One buffer
+/// for all: a body cuts thousands of runs.)
+#[derive(Default)]
 #[cfg_attr(not(jit_native), allow(dead_code))]
 struct ColdChunk {
     code: Vec<u8>,
@@ -6576,8 +6620,8 @@ struct Jump {
     l: u32,
     /// What it is: `J_*`.
     kind: u8,
-    /// For a branch right after a store (`Fixup`), the store: an index into
-    /// the table's stores, or `u32::MAX`.
+    /// For a branch right after a store, its fixup (an index into the
+    /// fixups, whose entry holds the store), or `u32::MAX`.
     st: u32,
     /// A relaxation candidate's run (an index into the runs), or
     /// `u32::MAX`.
@@ -6642,6 +6686,29 @@ fn finish_jumps(
     offsets: &mut [usize],
     consts: Option<(usize, usize)>,
 ) {
+    // (Its table in the thread's spare buffer: see `Spare`.)
+    let mut ops = SPARE.with(|s| {
+        s.try_borrow_mut()
+            .map(|mut s| core::mem::take(&mut s.jumps))
+            .unwrap_or_default()
+    });
+    finish_jumps_in(&mut ops, code, fixups, labels, pinned, fwd, offsets, consts);
+    ops.clear();
+    Spare::keep(|s| &mut s.jumps, ops);
+}
+
+/// [`finish_jumps`], building its table in `ops` (empty).
+#[allow(clippy::too_many_arguments)]
+fn finish_jumps_in(
+    ops: &mut Vec<Jump>,
+    code: &mut Vec<u8>,
+    fixups: &[Fixup],
+    labels: &[usize],
+    pinned: &[usize],
+    fwd: &[FwdLoad],
+    offsets: &mut [usize],
+    consts: Option<(usize, usize)>,
+) {
     #[inline(always)]
     fn has(set: &[u64], i: usize) -> bool {
         set.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0)
@@ -6663,40 +6730,36 @@ fn finish_jumps(
     // instructions' starts.
     let words = n / 64 + 1;
     let mut jmps = alloc::vec![0u64; words];
-    let mut ops: Vec<Jump> = Vec::with_capacity(fixups.len());
-    let mut stores: Vec<StoreFwd> = Vec::new();
     let mut sorted = true;
-    let mut last = 0usize;
-    for &(at, label, st) in fixups {
-        let t = labels[label];
+    let mut last = 0u32;
+    // (Built whole, from the fixups' own table: no per-entry capacity
+    // check. A branch after a store names its fixup, which holds the
+    // store.)
+    ops.extend(fixups.iter().enumerate().map(|(i, f)| {
+        let at = f.at();
+        let t = labels[f.label()];
         debug_assert_ne!(t, usize::MAX, "unbound label in jump");
         debug_assert!(at >= 1 && at + 4 <= code_end);
-        let kind = if code[at - 1] == 0xe9 {
+        let op = code[at - 1];
+        let kind = if op == 0xe9 {
             put(&mut jmps, at - 1);
             J_JMP
-        } else if at >= 2 && code[at - 2] == 0x0f && (code[at - 1] & 0xf0) == 0x80 {
+        } else if at >= 2 && code[at - 2] == 0x0f && (op & 0xf0) == 0x80 {
             J_JCC
         } else {
             J_OTHER
         };
-        sorted &= at >= last;
-        last = at;
-        let st = match st {
-            Some(s) => {
-                stores.push(s);
-                (stores.len() - 1) as u32
-            }
-            None => u32::MAX,
-        };
-        ops.push(Jump {
-            at: at as u32,
+        sorted &= f.at >= last;
+        last = f.at;
+        Jump {
+            at: f.at,
             t: t as u32,
-            l: label as u32,
+            l: f.label,
             kind,
-            st,
+            st: if f.st { i as u32 } else { u32::MAX },
             run: u32::MAX,
-        });
-    }
+        }
+    }));
     if !sorted {
         ops.sort_unstable_by_key(|j| j.at);
     }
@@ -6736,8 +6799,8 @@ fn finish_jumps(
         if j.st == u32::MAX {
             put(&mut reached, j.t as usize);
         } else {
-            let st = stores[j.st as usize];
-            via_store.push((j.t as usize, st.base, st.disp, st.src));
+            let f = &fixups[j.st as usize];
+            via_store.push((j.t as usize, f.base, f.disp, f.src));
         }
     }
     drop(jmps);
@@ -6861,7 +6924,7 @@ fn finish_jumps(
         }
     };
     if runs.is_empty() {
-        in_place(code, &ops);
+        in_place(code, ops);
         return;
     }
     // `first[b]`: how many runs begin before byte `b * 32` (for `place`).
@@ -6935,7 +6998,7 @@ fn finish_jumps(
         }
     }
     if pre[runs.len()] == 0 {
-        in_place(code, &ops);
+        in_place(code, ops);
         return;
     }
     // The new code, in place (no fresh buffer to fault in): the old with
@@ -6977,7 +7040,7 @@ fn finish_jumps(
     // (`to`, filled as they come up: most labels are some jumps' target).
     let mut to: Vec<u32> = alloc::vec![u32::MAX; labels.len()];
     let mut ri = 0;
-    for j in &ops {
+    for j in ops.iter() {
         let at = j.at as usize;
         if j.kind >= J_DEAD_JMP {
             continue;
@@ -7011,6 +7074,53 @@ fn finish_jumps(
     for o in offsets.iter_mut() {
         *o = map(*o);
     }
+}
+
+/// The thread's spare assembler buffers: a compile's code, fixups and
+/// labels (and `finish_jumps`' table) are handed back when it is done and
+/// the next compile reuses them, instead of growing fresh buffers whose
+/// pages it then faults in (a large body's are hundreds of kilobytes).
+#[derive(Default)]
+struct Spare {
+    code: Vec<u8>,
+    fixups: Vec<Fixup>,
+    labels: Vec<usize>,
+    jumps: Vec<Jump>,
+    cold: ColdChunk,
+}
+
+impl Spare {
+    /// Buffers past this many bytes go back to the allocator instead.
+    const MAX_BYTES: usize = 8 << 20;
+
+    /// Keeps `v` (emptied) as the spare `field`, unless it is too large or
+    /// a larger spare is kept already.
+    fn keep<T>(field: impl FnOnce(&mut Spare) -> &mut Vec<T>, mut v: Vec<T>) {
+        if v.capacity() * core::mem::size_of::<T>() > Self::MAX_BYTES {
+            return;
+        }
+        v.clear();
+        SPARE.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                let f = field(&mut s);
+                if f.capacity() < v.capacity() {
+                    *f = v;
+                }
+            }
+        });
+    }
+}
+
+std::thread_local! {
+    /// See [`Spare`].
+    static SPARE: core::cell::RefCell<Spare> = core::cell::RefCell::new(Spare::default());
+}
+
+/// `KATAAN_JIT_OPMAP`'s file, if set (read once per process).
+fn opmap_path() -> Option<std::ffi::OsString> {
+    static P: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var_os("KATAAN_JIT_OPMAP"))
+        .clone()
 }
 
 std::thread_local! {
@@ -7162,7 +7272,23 @@ impl X64Assembler {
     /// A new, empty assembler.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut a = Self::default();
+        // (The previous compile's buffers, emptied: `Spare`.)
+        SPARE.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                a.code = core::mem::take(&mut s.code);
+                a.fixups = core::mem::take(&mut s.fixups);
+                a.labels = core::mem::take(&mut s.labels);
+                a.cold = core::mem::take(&mut s.cold);
+            }
+        });
+        a
+    }
+
+    /// Hands a finished compile's `code` (copied to its executable
+    /// region) back for the next compile to reuse (`Spare`).
+    pub(crate) fn recycle_code(code: Vec<u8>) {
+        Spare::keep(|s| &mut s.code, code);
     }
 
     /// A profiling mark here (only under `KATAAN_JIT_OPMAP`).
@@ -7382,9 +7508,17 @@ impl X64Assembler {
             }
             return;
         }
-        let mut ks = keys.to_vec();
-        ks.sort_unstable();
-        ks.dedup();
+        // (Most key lists come in order already: no copy then.)
+        let sorted;
+        let ks: &[i32] = if keys.windows(2).all(|w| w[0] < w[1]) {
+            keys
+        } else {
+            let mut v = keys.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            sorted = v;
+            &sorted
+        };
         let mut ones = false;
         let mut i = 0;
         while i < ks.len() {
@@ -7466,7 +7600,7 @@ impl X64Assembler {
     #[cfg_attr(not(jit_native), allow(dead_code))]
     pub(crate) fn ends_in_jmp(&self) -> bool {
         let n = self.code.len();
-        n >= 5 && self.code[n - 5] == 0xe9 && self.fixups.last().is_some_and(|f| f.0 == n - 4)
+        n >= 5 && self.code[n - 5] == 0xe9 && self.fixups.last().is_some_and(|f| f.at() == n - 4)
     }
 
     /// Binds `label` to the current emission point.
@@ -7481,7 +7615,7 @@ impl X64Assembler {
             && self
                 .fixups
                 .last()
-                .is_some_and(|f| (f.0, f.1) == (n - 4, label.0))
+                .is_some_and(|f| (f.at(), f.label()) == (n - 4, label.0))
         {
             self.code.truncate(n - 5);
             self.fixups.pop();
@@ -7518,15 +7652,25 @@ impl X64Assembler {
     ) -> (Vec<u8>, Vec<usize>) {
         // The cold chunks, after everything else (they are position
         // independent: every jump is a `rel32` fixup).
-        for chunk in core::mem::take(&mut self.cold) {
+        {
+            let chunk = core::mem::take(&mut self.cold);
             let base = self.code.len();
             self.code.extend_from_slice(&chunk.code);
-            for (label, at) in chunk.labels {
+            for &(label, at) in &chunk.labels {
                 self.labels[label] = base + at;
             }
-            for (at, label, st) in chunk.fixups {
-                self.fixups.push((base + at, label, st));
-            }
+            self.fixups.extend(chunk.fixups.iter().map(|f| Fixup {
+                at: f.at + base as u32,
+                ..*f
+            }));
+            let ColdChunk {
+                code,
+                labels,
+                fixups,
+            } = chunk;
+            Spare::keep(|s| &mut s.cold.code, code);
+            Spare::keep(|s| &mut s.cold.labels, labels);
+            Spare::keep(|s| &mut s.cold.fixups, fixups);
         }
         #[cfg(all(feature = "alloc", jit_native))]
         self.place_lookup_subs();
@@ -7565,6 +7709,8 @@ impl X64Assembler {
             &mut at,
             consts_at.map(|c| (code_end, c)),
         );
+        Spare::keep(|s| &mut s.fixups, fixups);
+        Spare::keep(|s| &mut s.labels, core::mem::take(&mut self.labels));
         (self.code, at)
     }
 
@@ -7632,7 +7778,10 @@ impl X64Assembler {
         }
         let (start, end) = (mark.start, self.code.len());
         self.last_imm_rax = None;
-        let code = self.code.split_off(start);
+        // (Where the run goes in the cold buffer.)
+        let base = self.cold.code.len();
+        self.cold.code.extend_from_slice(&self.code[start..]);
+        self.code.truncate(start);
         // A label bound in the region, or just before it (at its first
         // instruction), moves with it — unless bound at its end.
         let mut bound = self.cold_binds.take().unwrap_or_default();
@@ -7643,7 +7792,6 @@ impl X64Assembler {
                 }
             }
         }
-        let mut labels = Vec::new();
         let mut at_start = false;
         // (A nested region's enclosing one goes on, with the labels bound
         // at this one's end, which are its own code's.)
@@ -7651,7 +7799,7 @@ impl X64Assembler {
         for i in bound {
             let l = &mut self.labels[i];
             if *l >= start && *l < end {
-                labels.push((i, *l - start));
+                self.cold.labels.push((i, *l - start + base));
                 *l = LABEL_COLD;
             } else if *l == end {
                 *l = start;
@@ -7661,12 +7809,15 @@ impl X64Assembler {
                 }
             }
         }
-        let fixups = self
+        // (Each at its place in the run, from the run's place in the
+        // buffer: `at - start + base`, with `at >= start`.)
+        let (start32, base32) = (start as u32, base as u32);
+        self.cold
             .fixups
-            .split_off(mark.fixups)
-            .into_iter()
-            .map(|(at, label, st)| (at - start, label, st))
-            .collect();
+            .extend(self.fixups.drain(mark.fixups..).map(|f| Fixup {
+                at: f.at - start32 + base32,
+                ..f
+            }));
         // The region's end is now `start`: a label bound there keeps a
         // `bind` from dropping the jump before it.
         self.last_bind = if at_start || (mark.keep && mark.last_bind == start) {
@@ -7676,11 +7827,6 @@ impl X64Assembler {
         } else {
             usize::MAX
         };
-        self.cold.push(ColdChunk {
-            code,
-            labels,
-            fixups,
-        });
         // The main stream goes on from the store it ended with.
         self.last_store = mark.store;
     }
@@ -7739,7 +7885,7 @@ impl X64Assembler {
                 && ((n == op + 1 && self.code[op] == 0xe9)
                     || (n == op + 2 && self.code[op] == 0x0f && self.code[op + 1] & 0xf0 == 0x80))
         });
-        self.fixups.push((n, label.0, store));
+        self.fixups.push(Fixup::new(n, label.0, store));
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
 
@@ -8287,7 +8433,7 @@ impl X64Assembler {
             Some((start, imm))
                 if n == start + 10
                     && self.last_bind != n
-                    && self.fixups.last().is_none_or(|f| f.0 < start)
+                    && self.fixups.last().is_none_or(|f| f.at() < start)
                     && self.code[start..start + 2] == [0x48, 0xb8]
                     && self.code[start + 2..n] == imm.to_le_bytes() =>
             {
@@ -20542,7 +20688,7 @@ impl JitFunction {
             (native, native_rust)
         };
         // (Their offsets are known once `finish` has placed the cold regions.)
-        let opmap = std::env::var_os("KATAAN_JIT_OPMAP");
+        let opmap = opmap_path();
         let mut want = alloc::vec![entries.0, entries.1];
         if opmap.is_some() {
             want.extend(labels.iter().take(ops.len()).copied());
@@ -20667,6 +20813,7 @@ impl JitFunction {
             room: native_room,
             legacy,
         };
+        X64Assembler::recycle_code(code);
         f.map(|f| (f, entries, spec_heads, gen_tab))
     }
 

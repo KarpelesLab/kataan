@@ -428,7 +428,7 @@ fn retire_sinking(ctx: &mut Ctx, funcs: &[FnProto], info: &DeoptInfo) {
     if !old.owns_deopt_info(core::ptr::from_ref(info)) {
         return;
     }
-    let done = super::recompile(ctx, funcs, id, &old, &[]).is_some();
+    let done = super::recompile(ctx, funcs, id, &old, &[], "recompile/deopt").is_some();
     if super::jit_log_enabled() {
         std::eprintln!(
             "[jit] fn {}: its sunk objects' exits keep happening: {}",

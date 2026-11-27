@@ -172,10 +172,76 @@ fn join(a: u8, b: u8) -> u8 {
 
 /// Every register `op` names (read or written), from the verifier's own operand
 /// enumeration.
-fn op_regs(op: &Op) -> Vec<u16> {
-    let out = core::cell::RefCell::new(Vec::new());
+fn op_regs(op: &Op) -> RegList {
+    let out = core::cell::RefCell::new(RegList::default());
     crate::bytecode::op_for_each_reg(op, &|r| out.borrow_mut().push(r));
     out.into_inner()
+}
+
+/// [`op_regs`]' list: most ops name a few registers, kept inline (the
+/// analyses ask for them per op, many times per compile); a longer list
+/// (a call's arguments) goes to the heap.
+#[derive(Default)]
+pub(super) struct RegList {
+    /// The first registers, while `more` is empty.
+    buf: [u16; 6],
+    /// How many of `buf` are in use.
+    n: usize,
+    /// Every register, once more than `buf` holds.
+    more: Vec<u16>,
+}
+
+impl RegList {
+    /// Appends `r`.
+    fn push(&mut self, r: u16) {
+        if self.more.is_empty() && self.n < self.buf.len() {
+            self.buf[self.n] = r;
+            self.n += 1;
+        } else {
+            if self.more.is_empty() {
+                self.more.extend_from_slice(&self.buf[..self.n]);
+            }
+            self.more.push(r);
+        }
+    }
+}
+
+impl core::ops::Deref for RegList {
+    type Target = [u16];
+    fn deref(&self) -> &[u16] {
+        if self.more.is_empty() {
+            &self.buf[..self.n]
+        } else {
+            &self.more
+        }
+    }
+}
+
+/// [`RegList`]'s registers, by value.
+pub(super) struct RegListIter {
+    list: RegList,
+    at: usize,
+}
+
+impl Iterator for RegListIter {
+    type Item = u16;
+    fn next(&mut self) -> Option<u16> {
+        let r = self.list.get(self.at).copied();
+        self.at += 1;
+        r
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.list.len().saturating_sub(self.at);
+        (n, Some(n))
+    }
+}
+
+impl IntoIterator for RegList {
+    type Item = u16;
+    type IntoIter = RegListIter;
+    fn into_iter(self) -> RegListIter {
+        RegListIter { list: self, at: 0 }
+    }
 }
 
 /// Applies `op`'s effect on register types to `s`.

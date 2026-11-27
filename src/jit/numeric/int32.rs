@@ -1354,7 +1354,7 @@ pub(super) struct RegsAt<'a> {
     bytecode: &'a [Op],
     head: usize,
     /// Per pc from `head`: its op's registers (empty when not memoized).
-    regs: Vec<Vec<u16>>,
+    regs: Vec<super::RegList>,
 }
 
 impl<'a> RegsAt<'a> {

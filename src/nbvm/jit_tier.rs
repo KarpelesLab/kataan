@@ -722,7 +722,7 @@ pub(super) fn enter_on_call(
         // first (`JitProto::wants_recompile_on_entry`).
         if jit.wants_recompile_on_entry(u32::try_from(id).unwrap_or(u32::MAX), &|k| {
             could_inline(funcs, k)
-        }) && let Some(new) = recompile(ctx, funcs, id, &jit, ic)
+        }) && let Some(new) = recompile(ctx, funcs, id, &jit, ic, "recompile/entry")
         {
             jit = new;
         }
@@ -1181,7 +1181,8 @@ fn run_tiering(
     // the function's newest code (the old body, which can always be entered
     // there, if the recompilation failed).
     while let Some((pc, h)) = ctx.jit_rt.left.take() {
-        let new = recompile(ctx, funcs, id, &jit, ic).unwrap_or_else(|| Rc::clone(&jit));
+        let new = recompile(ctx, funcs, id, &jit, ic, "recompile/leave")
+            .unwrap_or_else(|| Rc::clone(&jit));
         // (A recompilation with a larger window may not fit a full stack;
         // the old body, which ran here, does.)
         r = match run_compiled_at(ctx, funcs, &new, regs, pc, &h, true, keep) {
@@ -1207,13 +1208,16 @@ fn run_tiering(
 /// caches `ic`): the function's code from now on. If another activation
 /// already replaced `old`, that newer code. `None` if neither has an entry
 /// wherever `old` has (it always does: both are lowered from the same
-/// bytecode), or nothing compiled.
+/// bytecode), or nothing compiled. `why`: what asked for it, for
+/// `KATAAN_JIT_CTIME`'s report (`recompile/leave`, `/entry`, `/poll`,
+/// `/site`, `/demote`).
 fn recompile(
     ctx: &mut Ctx,
     funcs: &[FnProto],
     id: usize,
     old: &Rc<crate::jit::JitProto>,
     ic: &[crate::ic::PropertyCache],
+    why: &str,
 ) -> Option<Rc<crate::jit::JitProto>> {
     let proto = funcs.get(id)?;
     super::global_mirror::prefill(ctx, proto);
@@ -1259,7 +1263,7 @@ fn recompile(
     let hdr = call_hdr_pcs(funcs, &hints);
     let new = timed_compile(
         proto,
-        "recompile",
+        why,
         |j: &Option<crate::jit::JitProto>| j.as_ref().map_or(0, |j| j.code_len()),
         || {
             crate::jit::typed::with_own_kinds(kinds, || {
@@ -1397,7 +1401,7 @@ pub(crate) fn jit_helper_entry_poll(ctx: *mut core::ffi::c_void, word: u64) -> u
         );
     }
     if yes {
-        let _ = recompile(ctx, funcs, id, &jit, &[]);
+        let _ = recompile(ctx, funcs, id, &jit, &[], "recompile/poll");
     }
     0
 }
@@ -6498,7 +6502,7 @@ fn site_request(ctx: &mut Ctx, funcs: &[FnProto], ops: u64) {
     if let Some((id, jit)) = found
         && jit.wants_site_recompile()
     {
-        let _ = recompile(ctx, funcs, id, &jit, &[]);
+        let _ = recompile(ctx, funcs, id, &jit, &[], "recompile/site");
     }
 }
 
@@ -6519,7 +6523,7 @@ fn demote_poll(ctx: &mut Ctx, funcs: &[FnProto], ops: *const Op) {
         return;
     };
     if jit.wants_demote() {
-        let _ = recompile(ctx, funcs, id, &jit, &[]);
+        let _ = recompile(ctx, funcs, id, &jit, &[], "recompile/demote");
     }
 }
 
@@ -7073,7 +7077,7 @@ mod direct_memo_tests {
         let mut cx = ctx();
         cx.jit_rt.direct.resize(funcs.len(), None);
         cx.jit_rt.direct[f] = Some(foreign);
-        let new = recompile(&mut cx, &funcs, f, &own, &[]).expect("recompiled");
+        let new = recompile(&mut cx, &funcs, f, &own, &[], "recompile").expect("recompiled");
         assert!(
             cx.jit_rt.direct[f]
                 .as_ref()
@@ -7086,7 +7090,7 @@ mod direct_memo_tests {
         // No memo: a recompilation does not make one.
         let own_g = compile(g);
         funcs[g].tier.set_jit(Some(Rc::clone(&own_g)));
-        let _ = recompile(&mut cx, &funcs, g, &own_g, &[]).expect("recompiled");
+        let _ = recompile(&mut cx, &funcs, g, &own_g, &[], "recompile").expect("recompiled");
         assert!(cx.jit_rt.direct[g].is_none());
     }
 }
