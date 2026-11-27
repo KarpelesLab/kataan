@@ -204,6 +204,8 @@ enum FastOp {
     ObjStaticHasOwn,
     /// `Object.create(proto)` (no property descriptors).
     ObjCreate,
+    /// `Array.from(items)` (no `mapFn`).
+    ArrayFrom,
     /// `Object.assign(target, …sources)`: plain copies done in the VM
     /// ([`obj_assign_fast`]), anything else through the host directly (as
     /// [`FastOp::HostDirect`]).
@@ -348,6 +350,11 @@ pub(super) fn fn_call_method(cache: &PropertyCache) -> Option<u64> {
         .map(|s| s.method)
 }
 
+/// Whether the function value `v` is the intrinsic `Set.prototype.add`.
+pub(super) fn is_set_add(realm: &Realm, v: NanBox) -> bool {
+    matches!(classify(realm, v), FastOp::SetAdd)
+}
+
 /// The function cell `v` as one of the built-ins served here.
 fn classify(realm: &Realm, v: NanBox) -> FastOp {
     let Some(f) = v.as_handle().map(Handle::from_raw) else {
@@ -356,6 +363,7 @@ fn classify(realm: &Realm, v: NanBox) -> FastOp {
     match realm.native_at(f) {
         Some(N_OBJ_PROTO_HASOWN) => return FastOp::ObjHasOwn,
         Some(N_ARRAY_IS_ARRAY) => return FastOp::ArrayIsArray,
+        Some(crate::nbexec::N_ARRAY_FROM) => return FastOp::ArrayFrom,
         Some(N_OBJECT_KEYS) => return FastOp::ObjKeys,
         Some(N_OBJECT_GET_OWN_NAMES) => return FastOp::ObjNames,
         Some(N_OBJECT_GET_PROTO | N_REFLECT_GET_PROTO) => return FastOp::ObjGetProto,
@@ -2037,6 +2045,25 @@ fn run_op(
             NanBox::handle(realm.new_object_with_proto(proto).to_raw())
         }
         FastOp::NumPred(p) => NanBox::boolean(p.test(arg(0))),
+        FastOp::ArrayFrom => {
+            // `Array.from(items)` (`mapFn` absent or `undefined`) with `this`
+            // the (single) realm's own `%Array%`, of a plain array whose
+            // iteration is the built-in one and has no hole
+            // (`iter_fast::plain_array_values`): `Construct(%Array%)` makes a
+            // fresh array (its prototype read from a non-writable
+            // `Array.prototype`), the iteration reads only own elements and
+            // runs nothing, and each value's CreateDataPropertyOrThrow on the
+            // fresh array is an append — so the result is a copy of the
+            // elements. Anything else is the host's.
+            if realm.multi_realm
+                || !arg(1).is_undefined()
+                || realm.native_at(h) != Some(crate::nbexec::N_BASE_ARRAY)
+            {
+                return None;
+            }
+            let vals = super::iter_fast::plain_array_values(realm, arg(0))?.to_vec();
+            NanBox::handle(realm.new_array(vals).to_raw())
+        }
         FastOp::ArrayIsArray => match arg(0).as_handle().map(Handle::from_raw) {
             // A proxy is unwrapped (and may be revoked): the host's.
             Some(a) if realm.proxy_at(a).is_some() => return None,

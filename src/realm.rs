@@ -1454,6 +1454,16 @@ impl Realm {
         self.set_native_proto(h, proto);
     }
 
+    /// Whether `ctor` is the (single) realm's default `Set` constructor (see
+    /// [`new_default_collection`](Realm::new_default_collection)).
+    #[must_use]
+    pub fn is_default_set_ctor(&self, ctor: NanBox) -> bool {
+        !self.multi_realm
+            && ctor
+                .as_handle()
+                .is_some_and(|c| self.coll_default[1].is_some_and(|(dc, _)| dc.to_raw() == c))
+    }
+
     /// `new C()` / `new C(undefined)` / `new C(null)` when `C` is the
     /// recorded default `Map` or `Set` constructor
     /// ([`link_collection_proto`](Realm::link_collection_proto)) and

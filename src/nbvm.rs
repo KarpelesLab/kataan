@@ -57,6 +57,7 @@ mod global_obj;
 pub(crate) use global_mirror::plan_body as plan_global_mirrors;
 #[cfg(all(feature = "jit", jit_native))]
 mod await_fast;
+mod coll_from;
 mod coll_hof;
 mod gen_fast;
 mod iter_fast;
@@ -11212,8 +11213,13 @@ fn run_frame_at_ic(
                     }
                     continue;
                 }
-                // `new Map()` / `new Set()` of the default constructors.
-                if let Some(v) = ctx.realm.new_default_collection(c, &argv) {
+                // `new Map()` / `new Set()` of the default constructors, and
+                // `new Set(array)`.
+                if let Some(v) = ctx
+                    .realm
+                    .new_default_collection(c, &argv)
+                    .or_else(|| coll_from::new_set_from_array(ctx, c, &argv))
+                {
                     regs[*dst as usize] = v;
                     continue;
                 }

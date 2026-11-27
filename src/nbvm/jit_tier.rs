@@ -5206,6 +5206,11 @@ pub(crate) fn jit_helper_construct(
                 site.coll_ctor = ctor_val.to_bits();
                 return 0;
             }
+            // `new Set(array)` (no lean form: it reads its argument).
+            if let Some(v) = super::coll_from::new_set_from_array(ctx, ctor_val, &argv) {
+                regs[*dst as usize] = v;
+                return 0;
+            }
         }
         fill_construct_site(ctx, ctor_val, site);
     }
