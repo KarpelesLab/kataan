@@ -11594,6 +11594,14 @@ fn run_frame_at_ic(
                     regs[*dst as usize] = v;
                     continue;
                 }
+                // `new Set(gen)` over a VM generator, resumed here.
+                if let Some(r) = coll_from::new_set_from_gen(ctx, funcs, &*regs, c, &argv) {
+                    match r {
+                        Ok(v) => regs[*dst as usize] = v,
+                        Err(e) => handle_throw!(e),
+                    }
+                    continue;
+                }
                 match with_host_regs(ctx, regs, |h| h.construct(c, &argv)) {
                     Some(Ok(v)) => regs[*dst as usize] = v,
                     Some(Err(e)) => handle_throw!(VmError::from(e)),
