@@ -89,6 +89,11 @@ const REGEXP_LITERAL_MEMOS: usize = 4;
 /// How many unobserved RegExp cells `Realm::regexp_lend_pool` keeps.
 const REGEXP_LEND_POOL: usize = 4;
 
+/// `Realm::regexp_proof_mirror`'s copy of the host's RegExp-protocol proof:
+/// the prototype, its key epoch, per proved method its slot and value bits,
+/// and the cell-swap count.
+pub(crate) type RegexpProofMirror = (Handle, u32, [(u32, u64); 4], u32);
+
 /// One `Realm::regexp_literal_memo` entry: a literal's source, its flags and
 /// the program they compile to once known.
 type RegexpLiteralMemo = (
@@ -569,6 +574,18 @@ pub struct Realm {
     /// no program holds it. Emptied by every collection and cell swap (a
     /// cell only the dead register of its call held may be swept).
     regexp_lend_pool: [Option<Handle>; REGEXP_LEND_POOL],
+    /// A copy of the host's last proof that this realm's
+    /// `%RegExp.prototype%` holds the intrinsic protocol (the host's
+    /// `RegexpProtoProof`): the prototype, its key epoch, per method of
+    /// `exec`, `@@replace`, `@@match`, `@@split` its slot and the value
+    /// proved there, and the cell-swap count. Lets the VM recheck the proof
+    /// without crossing to the host
+    /// ([`regexp_pristine_mirrored`](Realm::regexp_pristine_mirrored)).
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    pub(crate) regexp_proof_mirror: Option<RegexpProofMirror>,
     /// The `[[Prototype]]` of a Promise cell that carries no `native_protos`
     /// entry, as [`regexp_default_proto`](Realm::regexp_default_proto) is a
     /// RegExp's (see [`link_promise_proto`](Realm::link_promise_proto)).
@@ -1262,6 +1279,7 @@ impl Realm {
             regexp_literal_memo: [const { None }; REGEXP_LITERAL_MEMOS],
             regexp_literal_next: 0,
             regexp_lend_pool: [None; REGEXP_LEND_POOL],
+            regexp_proof_mirror: None,
             promise_default_proto: None,
             coll_default: [None; 2],
             hidden_memo: [const { None }; HIDDEN_MEMOS],
@@ -5369,12 +5387,10 @@ impl Realm {
     /// A RegExp of `source` and `flags` from the lending pool, `lastIndex`
     /// 0, or `None`.
     fn regexp_lend_take(&mut self, source: &[u8], flags: &str) -> Option<Handle> {
-        let Self {
-            regexp_lend_pool,
-            heap,
-            ..
-        } = self;
-        for slot in regexp_lend_pool.iter_mut() {
+        // (Compared by reading the cell; only a taken cell whose `lastIndex`
+        // a call moved is written, through the barrier.)
+        let mut found = None;
+        for (i, slot) in self.regexp_lend_pool.iter().enumerate() {
             let Some(h) = *slot else {
                 continue;
             };
@@ -5383,16 +5399,20 @@ impl Realm {
                 flags: f,
                 last_index,
                 ..
-            }) = heap.get_mut(h)
-                && **s == *source
-                && **f == *flags
+            }) = self.heap.get(h)
+                && short_bytes_eq(s, source)
+                && short_bytes_eq(f.as_bytes(), flags.as_bytes())
             {
-                *last_index = 0;
-                *slot = None;
-                return Some(h);
+                found = Some((i, h, *last_index != 0));
+                break;
             }
         }
-        None
+        let (i, h, moved) = found?;
+        if moved && let Some(Cell::RegExp { last_index, .. }) = self.heap.get_mut(h) {
+            *last_index = 0;
+        }
+        self.regexp_lend_pool[i] = None;
+        Some(h)
     }
 
     /// Hands the RegExp `re` back to the lending pool: a lending literal's
@@ -11108,6 +11128,19 @@ pub(crate) const HIDDEN_KEYS_MAX: usize = 3;
 /// The number of [`Realm::hidden_slots`] memos (one per caller): a
 /// `DataView`'s slots (0) and its buffer's (1).
 pub(crate) const HIDDEN_MEMOS: usize = 2;
+
+/// `a == b` for byte strings, without a library call for short ones (a
+/// regex literal's source and flags are a few bytes).
+#[inline]
+fn short_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() > 16 {
+        return a == b;
+    }
+    a.iter().zip(b).all(|(x, y)| x == y)
+}
 
 /// [`Vec::retain`] of `list[from..]` alone: the entries before `from` all
 /// stay, unvisited.

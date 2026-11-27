@@ -150,6 +150,62 @@ pub(super) fn try_lean(
     Some(finish(ctx, funcs, regs, [recv, search, replace], step))
 }
 
+/// [`try_lean`]'s answer when it is the receiver itself, found without the
+/// host: `recv` (the string cell `recv_h`) is flat and all-ASCII, the search
+/// value a RegExp that the realm's copy of the host's protocol proof shows
+/// pristine for `exec` and `@@replace` (`Realm::regexp_pristine_mirrored`),
+/// with no named group, and none of `recv`'s units can begin a match of its
+/// program (`Regex::ascii_never_matches`). Then `RegExp.prototype
+/// [@@replace]` runs no user code (the replacement is a VM function, never
+/// called, or a string, whose `ToString` is itself), finds no match — a
+/// global or sticky RegExp's `lastIndex` is left 0, the legacy match record
+/// as it was — and returns the subject. `None`, having done nothing,
+/// otherwise.
+#[cfg(all(
+    feature = "jit",
+    feature = "regex",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+#[inline]
+pub(super) fn try_never(
+    ctx: &mut Ctx,
+    regs: &[NanBox],
+    recv: NanBox,
+    recv_h: Handle,
+    args: &[Reg],
+) -> Option<NanBox> {
+    let &[a, b] = args else {
+        return None;
+    };
+    let sh = Handle::from_raw(regs[a as usize].as_handle()?);
+    let rh = Handle::from_raw(regs[b as usize].as_handle()?);
+    let realm = &mut ctx.realm;
+    // The match test first (pure, two cell reads and a scan of the
+    // subject): a replace that may match leaves at once, for the host.
+    let reset = realm.regexp_ascii_never(sh, recv_h)?;
+    if !realm.typeof_is_string(recv_h)
+        || !(realm.is_vm_function(rh) || realm.typeof_is_string(rh))
+        || !realm.regexp_pristine_mirrored(sh, NEED_EXEC_REPLACE)
+    {
+        return None;
+    }
+    if reset {
+        realm.set_regex_last_index(sh, 0);
+    }
+    Some(recv)
+}
+
+/// The host's `NEED_EXEC | NEED_REPLACE` (`nbexec::regexp::lean`): the
+/// methods a replace reads.
+#[cfg(all(
+    feature = "jit",
+    feature = "regex",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+const NEED_EXEC_REPLACE: u32 = 1 | 2;
+
 /// The rest of a replace call whose host step is `step`: its result, or the
 /// replacer calls of a plan made here.
 fn finish(

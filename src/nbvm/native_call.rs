@@ -1037,6 +1037,16 @@ pub(super) fn str_call(
     if ctx.host.is_none() || ctx.realm.multi_realm || args.len() > 2 {
         return None;
     }
+    #[cfg(feature = "regex")]
+    if matches!(op, FastOp::StrReplace)
+        && super::str_replace::lean_on()
+        && let Some(v) = super::str_replace::try_never(ctx, regs, recv, h, args)
+    {
+        if lent {
+            ctx.realm.regexp_lend_return(regs[args[0] as usize]);
+        }
+        return Some(Ok(v));
+    }
     if matches!(op, FastOp::StrReplace)
         && super::str_replace::lean_on()
         && let Some(r) = super::str_replace::try_lean(ctx, funcs, regs, recv, h, args)

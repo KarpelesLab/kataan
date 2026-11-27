@@ -143,6 +143,7 @@ impl Interp {
     /// recording its proof on success.
     fn regexp_proto_prove(&mut self, proto: Handle, stamp: (usize, u64, u32, u32)) -> bool {
         self.regexp_proto_proof = None;
+        self.realm.regexp_proof_mirror = None;
         if self.regexp_flags_check(proto).is_none() {
             return false;
         }
@@ -170,6 +171,12 @@ impl Interp {
                 return false;
             }
             *key = (slot, v.to_bits());
+        }
+        // The VM's copy, for its own recheck of the fast path's stamp
+        // (`Realm::regexp_pristine_mirrored`): only for the one realm of a
+        // single-realm run, which that recheck alone serves.
+        if pristine_fast_on() && self.created_realms.is_empty() {
+            self.realm.regexp_proof_mirror = Some((proto, stamp.2, keys, stamp.3));
         }
         self.regexp_proto_proof = Some(RegexpProtoProof {
             stamp,

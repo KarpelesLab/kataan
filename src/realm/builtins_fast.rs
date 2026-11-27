@@ -401,6 +401,54 @@ impl Realm {
         true
     }
 
+    /// The host's fast recheck of its RegExp-protocol proof (`Interp::
+    /// regexp_pristine`), made on this realm's copy of that proof
+    /// ([`regexp_proof_mirror`](Realm::regexp_proof_mirror)): `handle` is a
+    /// RegExp with no own property beside its `lastIndex` slot whose
+    /// `[[Prototype]]` is the proved `%RegExp.prototype%`, which still holds
+    /// the proved methods of `need` (the host's `NEED_*` bits) under the
+    /// proved key epoch and cell-swap count, in a single-realm run. `false`
+    /// (ask the host) otherwise.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    #[inline]
+    pub(crate) fn regexp_pristine_mirrored(&self, handle: Handle, need: u32) -> bool {
+        let Some((proto, epoch, keys, swaps)) = &self.regexp_proof_mirror else {
+            return false;
+        };
+        !self.multi_realm
+            && *swaps == self.cell_swap_count()
+            && self.plain_regexp_default_proto(handle) == Some(*proto)
+            && self.own_data_epoch_hold(*proto, *epoch, keys, need)
+    }
+
+    /// Whether no match of the RegExp at `handle` can begin anywhere in the
+    /// string at `subject`, a flat all-ASCII string
+    /// (`Regex::ascii_never_matches`), the RegExp's program compiled already
+    /// and holding no named group: then whether the RegExp is global or
+    /// sticky. `None` when that is not known.
+    #[cfg(feature = "regex")]
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    #[inline]
+    pub(crate) fn regexp_ascii_never(&self, handle: Handle, subject: Handle) -> Option<bool> {
+        let Some(Cell::RegExp { compiled, .. }) = self.heap.get(handle) else {
+            return None;
+        };
+        let program = compiled.borrow();
+        let re = program.as_deref()?;
+        if !re.group_names().is_empty() || !re.ascii_never_matches(self.string_leaf_bytes(subject)?)
+        {
+            return None;
+        }
+        let flags = re.flags();
+        Some(flags.global || flags.sticky)
+    }
+
     /// The flags of the RegExp at `handle`, borrowed (no source rendering).
     #[must_use]
     pub fn regexp_flags(&self, handle: Handle) -> Option<&str> {
