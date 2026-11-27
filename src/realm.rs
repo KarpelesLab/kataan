@@ -10964,7 +10964,26 @@ impl Realm {
             Unpacked::Handle(raw) => {
                 match self.heap.get(Handle::from_raw(raw)).and_then(Cell::as_str) {
                     Some(rope) => {
-                        let s = rope.materialize();
+                        // A flat run of 1-15 decimal digits is that integer
+                        // exactly (StringToNumber of a StrUnsignedDecimalLiteral
+                        // of at most 15 digits rounds nothing).
+                        if let Some(b) = rope.as_leaf_bytes()
+                            && (1..=15).contains(&b.len())
+                            && b.iter().all(u8::is_ascii_digit)
+                        {
+                            let n = b.iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0'));
+                            return n as f64;
+                        }
+                        // A flat string without lone surrogates is read in
+                        // place; anything else is copied out first.
+                        let owned;
+                        let s: &str = match rope.as_leaf_bytes().map(core::str::from_utf8) {
+                            Some(Ok(s)) => s,
+                            _ => {
+                                owned = rope.materialize();
+                                &owned
+                            }
+                        };
                         let t = s.trim_matches(is_js_whitespace);
                         if t.is_empty() {
                             return 0.0;
