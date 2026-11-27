@@ -1683,13 +1683,37 @@ fn promise_resolve_lean_on() -> bool {
 /// `x` — no code runs, nothing is queued (it has no reactions yet). That
 /// promise, made as the host makes it; `None`, having done nothing
 /// observable, otherwise.
+///
+/// Also an ordinary object `x` that is not a promise and has no `then`
+/// along a chain of ordinary objects (no accessor, no proxy on the way —
+/// the lookup runs no code): the resolve function's `Get(x, "then")` finds
+/// nothing callable, so the promise is fulfilled with `x`.
 fn promise_resolve_fast(ctx: &mut Ctx, h: Handle, x: NanBox) -> Option<NanBox> {
     if !promise_resolve_lean_on()
         || ctx.realm.multi_realm
-        || x.as_handle().is_some()
         || ctx.realm.native_at(h) != Some(crate::nbexec::N_PROMISE)
     {
         return None;
+    }
+    if let Some(xh) = x.as_handle().map(Handle::from_raw) {
+        if !ctx.realm.is_plain_object(xh)
+            || ctx.realm.is_promise(xh)
+            || ctx.realm.is_host_exotic(xh)
+            || super::iter_fast::plain_lookup(&ctx.realm, xh, "then") != Some(None)
+            || !crate::nbexec::promise::await_settle_on()
+        {
+            return None;
+        }
+        let p = super::vm_new_promise(ctx)?;
+        let s = ctx
+            .realm
+            .promise_state_mut(Handle::from_raw(p.as_handle()?))?;
+        if s.status != crate::cell::PromiseStatus::Pending || !s.reactions.is_empty() {
+            return None;
+        }
+        s.status = crate::cell::PromiseStatus::Fulfilled;
+        s.value = x;
+        return Some(p);
     }
     let p = super::vm_new_promise(ctx)?;
     super::settle_unwatched(ctx, p, x).then_some(p)
