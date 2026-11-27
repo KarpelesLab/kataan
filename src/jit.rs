@@ -3852,6 +3852,22 @@ fn iter_const_enabled() -> bool {
     }
 }
 
+/// Whether a compiled `a.push(x, y, …)` (several values, or one read
+/// after the method) appends in place (`arr_push::X64Assembler::ap_push_n`;
+/// `KATAAN_JIT_PUSHN=0` turns it off, read once per process).
+#[cfg(all(feature = "alloc", target_os = "linux", target_arch = "x86_64"))]
+fn push_n_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("KATAAN_JIT_PUSHN").map_or(true, |v| v != "0"))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 /// Whether an inline `a.push(x)` whose result nothing reads (the register
 /// dead past the op, by the body's liveness) skips making the new length's
 /// Number (`KATAAN_JIT_PUSHDEAD=0` turns it off, read once per process).
@@ -5404,6 +5420,7 @@ impl JitProto {
             if let GenericOp::CallWithMethod { ic, .. } = *op
                 && let Some(k) = keys.get(ic as usize)
                 && (matches!(&**k, "get" | "has")
+                    || (&**k == "push" && push_n_enabled())
                     || (str_call_enabled() && crate::nbvm::native_call::str_call_code(k).is_some())
                     || (matches!(&**k, "set" | "add" | "delete") && coll::write_enabled())
                     || crate::nbexec::dv_access_for(k.as_bytes()).is_some())
@@ -10391,9 +10408,19 @@ impl JitFunction {
         // every path from the op writes the register before reading it, so
         // the inline append need not make the Number (`KATAAN_JIT_PUSHDEAD`).
         let push_dead: Vec<bool> = {
-            let is_push = |op: &crate::nbvm::Op| {
-                matches!(op, crate::nbvm::Op::CallMethod { key, args, .. }
-                    if key == "push" && args.len() == 1)
+            let is_push = |op: &crate::nbvm::Op| match op {
+                crate::nbvm::Op::CallMethod { key, args, .. } => {
+                    key == "push"
+                        && (args.len() == 1
+                            || ((2..=arr_push::PUSH_N_MAX).contains(&args.len())
+                                && push_n_enabled()))
+                }
+                crate::nbvm::Op::CallWithMethod { key, args, .. } => {
+                    key == "push"
+                        && (1..=arr_push::PUSH_N_MAX).contains(&args.len())
+                        && push_n_enabled()
+                }
+                _ => false,
             };
             if push_dead_enabled() && bytecode.iter().any(is_push) {
                 match &body_live {
@@ -10401,7 +10428,10 @@ impl JitFunction {
                         .iter()
                         .enumerate()
                         .map(|(pc, op)| match op {
-                            crate::nbvm::Op::CallMethod { dst, .. } if is_push(op) => {
+                            crate::nbvm::Op::CallMethod { dst, .. }
+                            | crate::nbvm::Op::CallWithMethod { dst, .. }
+                                if is_push(op) =>
+                            {
                                 (*dst as usize) < n_regs
                                     && pc + 1 < bytecode.len()
                                     && l.get((pc + 1) * words + *dst as usize / 64)
@@ -14145,6 +14175,51 @@ impl JitFunction {
                         a.cold_end(cold);
                         a.bind(general);
                     }
+                    // `a.push(x, y, …)` outside speculative regions: the
+                    // appends of all its values in place (`arr_push::
+                    // X64Assembler::ap_push_n`), else the general call.
+                    if let crate::nbvm::Op::CallMethod {
+                        key, args: margs, ..
+                    } = bytecode.get(op_idx)?
+                        && key == "push"
+                        && (2..=arr_push::PUSH_N_MAX).contains(&margs.len())
+                        && push_n_enabled()
+                        && ok(dst)
+                        && ok(recv)
+                        && margs.iter().all(|&m| ok(m))
+                        && !si.method_ptr.is_null()
+                        && !num.in_any_spec(op_idx)
+                        && num.result_xmm(op_idx, dst).is_none()
+                        && !num.is_int(dst)
+                    {
+                        for &m in margs.iter() {
+                            num.operand_xmm(&mut a, op_idx, m, false);
+                        }
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let cl = &helpers.call_layout;
+                        ap_proof_begin!(None, si.method_ptr, general, prove);
+                        walk_to_slot!(recv, general);
+                        let vals: Vec<i32> = margs.iter().map(|&m| disp(m)).collect();
+                        a.ap_push_n(&layout, cl.realm, &vals, general);
+                        if !push_dead.get(op_idx).copied().unwrap_or(false) {
+                            a.g_mov(call_seq::r::RAX, call_seq::r::R8);
+                            a.cvtsi2sd_xmm0_rax();
+                            numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                            a.store_rax(disp(dst));
+                        }
+                        a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
                     // (Every other path of a fast version's push: a leave.)
                     if let Some(b) = push_bail {
                         a.jmp(b);
@@ -17209,6 +17284,54 @@ impl JitFunction {
                     a.store_rax(disp(dst));
                     a.jmp(done);
                     a.bind(call_helper);
+                    // `a.push` / `a.pop` / `a.shift` read before the call's
+                    // arguments, on an array that owns no named property
+                    // and keeps the default `[[Prototype]]`: the built-in
+                    // the site's proof found where its lookup continues
+                    // (`native_call::prove_array_push` and the like), while
+                    // that slot still holds it.
+                    if arr_push::method_read_enabled()
+                        && !num.in_any_spec(op_idx)
+                        && matches!(
+                            bytecode.get(op_idx),
+                            Some(
+                                crate::nbvm::Op::GetProp { key, .. }
+                                    | crate::nbvm::Op::GetMethod { key, .. }
+                            ) if matches!(key.as_str(), "push" | "pop" | "shift")
+                        )
+                        && num.result_xmm(op_idx, dst).is_none()
+                    {
+                        let miss = a.new_label();
+                        let prove = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, miss);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, miss);
+                        walk_to_slot!(obj, miss);
+                        a.cmp_byte_at_rcx_imm(layout.off_cell_tag, layout.cell_array_disc);
+                        a.jne(miss);
+                        a.cmp_byte_at_rcx_imm(layout.off_arr_side, 0);
+                        a.jne(miss);
+                        a.cmp_byte_at_rcx_imm(layout.off_arr_proto_set, 0);
+                        a.jne(miss);
+                        // (Falls through with `rax` = the slot's value, the
+                        // proved built-in.)
+                        a.p_str_proof(s.method_ptr, prove, miss);
+                        a.store_rax(disp(dst));
+                        a.jmp(done);
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(obj));
+                        a.movabs_argreg(2, s.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.jmp(miss);
+                        a.cold_end(cold);
+                        a.bind(miss);
+                    }
                     // `m.set` / `s.add` / … read before the call's
                     // arguments, on a default collection: the built-in the
                     // site's collection proof names (`coll`).
@@ -19654,6 +19777,65 @@ impl JitFunction {
                         a.test_rax_rax();
                         a.jne(retry);
                         a.jmp(general);
+                        a.cold_end(cold);
+                        a.bind(general);
+                    }
+                    // `a.push(x, f(y))` (the method read before the
+                    // arguments): when that method is the very built-in the
+                    // site's proof found, the appends in place
+                    // (`arr_push`), as the `CallMethod` arm's.
+                    if got.is_none()
+                        && bail.is_none()
+                        && push_n_enabled()
+                        && !num.in_any_spec(op_idx)
+                        && !si.method_ptr.is_null()
+                        && (1..=arr_push::PUSH_N_MAX).contains(&args.len())
+                        && num.result_xmm(op_idx, dst).is_none()
+                        && !num.is_int(dst)
+                        && let crate::nbvm::Op::CallWithMethod { key, .. } = bytecode.get(op_idx)?
+                        && key == "push"
+                    {
+                        for &r in [callee, recv].iter().chain(args.iter()) {
+                            num.operand_xmm(&mut a, op_idx, r, false);
+                        }
+                        let general = a.new_label();
+                        let prove = a.new_label();
+                        let proven = a.new_label();
+                        let cl = &helpers.call_layout;
+                        a.g_cmp_byte_imm(call_seq::r::R15, cl.hosted, 0);
+                        a.g_jcc(call_seq::cc::E, general);
+                        a.g_load(call_seq::r::R9, call_seq::r::R15, cl.realm);
+                        a.g_cmp_byte_imm(call_seq::r::R9, cl.multi_realm, 0);
+                        a.g_jcc(call_seq::cc::NE, general);
+                        a.load_rax(disp(callee));
+                        a.p_str_proof_rax(si.method_ptr, prove, general);
+                        a.bind(proven);
+                        walk_to_slot!(recv, general);
+                        let vals: Vec<i32> = args.iter().map(|&m| disp(m)).collect();
+                        if vals.len() == 1 {
+                            a.ap_push(&layout, cl.realm, vals[0], general, false);
+                        } else {
+                            a.ap_push_n(&layout, cl.realm, &vals, general);
+                        }
+                        if !push_dead.get(op_idx).copied().unwrap_or(false) {
+                            a.g_mov(call_seq::r::RAX, call_seq::r::R8);
+                            a.cvtsi2sd_xmm0_rax();
+                            numeric::NumGen::gpr_from_xmm(&mut a, 0, 0);
+                            a.store_rax(disp(dst));
+                        }
+                        a.jmp(done);
+                        // (A stale proof is made again, then tested once
+                        // more: anything but the built-in is the call's.)
+                        let cold = a.cold_begin();
+                        a.bind(prove);
+                        a.mov_rdi_r15();
+                        a.load_argreg(1, disp(recv));
+                        a.movabs_argreg(2, si.method_ptr as i64);
+                        a.movabs_rax(helpers.str_proof as usize as i64);
+                        a.call_rax();
+                        a.load_rax(disp(callee));
+                        a.p_str_proof_rax(si.method_ptr, general, general);
+                        a.jmp(proven);
                         a.cold_end(cold);
                         a.bind(general);
                     }
