@@ -2575,6 +2575,18 @@ fn vm_set_prop_mode(
     if global_obj::set_prop(ctx, recv, key, value) {
         return Ok(());
     }
+    // `arr.length = n` with `n` a Number that is a valid array length
+    // (ToUint32(n) = ToNumber(n), neither coercion observable): the host's
+    // ArraySetLength, when the array's `length` is writable and no element a
+    // shrink deletes is non-configurable, is exactly the truncation (or
+    // growth) itself.
+    if key == "length"
+        && let Some(h) = array_length_plain_write(ctx, recv, value)
+    {
+        let (all_deleted, _) = ctx.realm.array_set_length_truncating(h.0, h.1);
+        debug_assert!(all_deleted, "no non-configurable element was in range");
+        return Ok(());
+    }
     // A write to the global object also updates the global environment's
     // bindings (the host mirrors it), so it is the host's.
     let to_host = read_needs_host(ctx, recv)
@@ -2608,6 +2620,27 @@ fn vm_set_prop_mode(
     }
     let k = ctx.realm.key_value(key);
     host_set(ctx, recv, k, value, strict, regs)
+}
+
+/// For `recv.length = value` ([`vm_set_prop_mode`]): the array and the new
+/// length when the write is a plain ArraySetLength — `recv` an array
+/// (neither host-exotic nor a dispatch-tracked prototype) whose `length` is
+/// writable, `value` a Number whose ToUint32 equals it (so neither the
+/// coercions nor the RangeError can be observed), and no element a shrink
+/// would delete non-configurable. `None` for anything else (the host's).
+fn array_length_plain_write(ctx: &Ctx, recv: NanBox, value: NanBox) -> Option<(Handle, usize)> {
+    let h = Handle::from_raw(recv.as_handle()?);
+    let n = value.as_number()?;
+    if !(n >= 0.0 && n <= f64::from(u32::MAX) && n == (n as u32) as f64) {
+        return None;
+    }
+    let len = n as u32 as usize;
+    let realm = &ctx.realm;
+    (realm.is_array(h)
+        && !realm.is_host_exotic(h)
+        && !realm.is_dispatch_tracked_proto(h)
+        && !realm.array_length_set_needs_slow_path(h, len))
+    .then_some((h, len))
 }
 
 /// [`vm_set_elem`] with the hosted write rules of [`vm_set_prop_mode`].
