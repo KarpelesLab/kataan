@@ -7,6 +7,149 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/KarpelesLab/kataan/compare/v0.0.11...v0.0.12) - 2026-11-28
+
+### Added
+
+- *(bytecode)* EXT opcode prefix (tag 255 + u16 sub-op) for unlimited new ops
+- *(jit)* the JIT runs on aarch64: Int/Float tiers, and an opt-in baseline generic tier
+- *(jit)* AArch64 encoder, A64 Int/Float tier code and executable memory
+- *(jit)* enable the x86-64 JIT on macOS (compile-checked)
+- *(jit)* the x86-64 JIT runs on Windows
+
+### Fixed
+
+- *(proxy)* VM trap calls only on behalf of a VM frame
+- *(gc)* every collection scrubs and roots the JIT register stack
+- *(bigint)* an exponent of 2^64 or more is no longer taken as 0
+- *(date)* a setter on an invalid date returns NaN without writing the date
+- *(convert)* a hosted operator's ToPrimitive runs on every kind of object
+- *(vm)* a non-index Number key on a non-extensible array adds no property
+- *(jit)* a handed-back op's inline cache is not reused by another op at its address
+- *(ffi)* build and lint on targets whose c_char is unsigned (aarch64 Linux)
+
+### Other
+
+- *(dstr)* a declaration array pattern needs no handler; its steps inline
+- *(class)* a super accessor site remembers the accessor it called
+- *(dstr)* rest elements unpack inline; object rest by a remembered plan; one memo check per plain spread
+- *(class)* polymorphic setters and getters inline; super.x = v makes no snapshot
+- *(vm)* a yield* step passes an inner generator's yielded value up unwrapped
+- *(jit)* a compiled call of a built-in method skips the one-op frame
+- *(vm)* IteratorStep over a user-written next() runs in the VM
+- *(builtins)* new Set/Map(iterable) adds through the intrinsic adder directly
+- *(builtins)* Promise.resolve of a then-less plain object without the host
+- *(builtins)* Array.prototype.slice scans only its own range for holes
+- *(vm)* next() through a yield* chain resumes the innermost generator
+- *(vm)* GetIterator over a user [Symbol.iterator]() runs in the VM
+- *(builtins)* a plain RegExp's method lookup starts at %RegExp.prototype%
+- *(regexp)* lean lastIndex reads/writes, match-array named reads, exec site proof by the mirror
+- *(iter)* strings iterate by code point in VM registers; Array.from(s, fn) loops in the VM
+- *(jit)* a pristine RegExp's `exec` read without a lookup
+- *(regex)* each Split's simple-loop shape read from the guard table
+- *(regexp)* the one-step RegExpBuiltinExec builds the d flag's indices too
+- *(iterator)* a string's @@iterator through a validated lookup memo
+- *(regexp)* replace with a function over a pattern with named groups takes the one-step plan
+- *(builtins)* lean isWellFormed/toWellFormed/normalize and per-character string calls
+- *(nbvm)* re.lastIndex reads and canonical writes straight from the RegExp cell
+- *(realm)* ToNumber of a flat digit string without copying it
+- *(regexp)* matchAll steps run RegExpBuiltinExec directly over a pristine matcher
+- *(regex)* split guards, reused VM buffers, lookbehind-literal start filter
+- *(jit)* charCodeAt/codePointAt/at on a non-ASCII string take the direct string call
+- *(regexp)* a match's groups object built straight into its remembered layout
+- *(builtins)* new Set(generator) resumes the generator in the VM
+- *(promise)* Promise.race over a plain array takes Promise.all's lean element path
+- *(realm)* a memo of Symbol-keyed own data slots per layout
+- *(iter)* iterator helpers step in the VM; their consumers loop there
+- *(vm)* x instanceof F with a user @@hasInstance runs in the VM
+- *(vm)* o[symbol] over an ordinary chain without the key allocation
+- *(builtins)* WeakMap/WeakSet calls take the collection site's lean form
+- *(proxy)* a proxy's call and deleteProperty trap run in the VM
+- *(reflect)* Reflect.get / set / apply as lean method-call ops
+- *(proxy)* a proxy's get / set / has run in the VM
+- *(proxy)* a proxy Receiver's write skips descriptor objects when no trap can see it
+- *(builtins)* f.bind(t, ...) of a VM function without the host
+- *(jit)* the inline private access memo keeps four layouts, made only for compiled sites
+- *(vm)* o[sym] / o[sym] = v build the Symbol's storage key on the stack
+- *(jit)* o.#x = v stores inline through the site's memo
+- *(jit)* o.#x reads inline through the site's memo; private name checks skip the text
+- *(call)* f(...xs, a, b) over a plain array makes the call directly (Op::CallSpreadMid)
+- *(dstr)* an array pattern over a plain array reads its values at once (Op::ArrayUnpack)
+- *(class)* private and super method calls are ordinary method calls; super.x without the host
+- *(dataview)* whole-word byte order and i64 truncation in the call-path accessor
+- *(strings)* the short-join memo's hit in add_fast's line
+- *(jit)* two-BigInt operands take the BigInt path at the helper's entry
+- *(jit)* String.fromCharCode(c) of an interned unit in line
+- *(strings)* probe the short-join memo before reading either operand
+- *(bigint)* truthiness, ++/-- and type probes of a BigInt without copying it
+- *(strings)* hand out a recent join of the same two short string cells again
+- *(bigint)* DataView BigInt accessors, BigInt() and BigInt.asUintN/asIntN without the host
+- *(bigint)* machine arithmetic for operands of at most two limbs
+- *(builtins)* one copy of the Map/Set lean form per collection strength
+- *(builtins)* Object.fromEntries over plain arrays without the host's iteration
+- *(vm)* x instanceof BuiltinCtor takes the instanceof memo too
+- *(vm)* two BigInts take the host's lean operator before any ToPrimitive test
+- *(object)* delete of the last-added key pops the layout; other deletes make a dictionary
+- *(iter)* an iterator helper's running flag is cleared in place, not deleted
+- *(gen)* yield* over a generator resumes it directly; iterator results read without the host
+- *(intl)* a collator's settings and sort keys are kept across compares
+- *(ic)* polymorphic prototype-chain and private-element caches; a cached setter is called directly
+- *(builtins)* TypedArray reverse/indexOf/lastIndexOf/includes/fill/set and Date.UTC at the call site
+- *(builtins)* Date getters, setters, construction and arithmetic without the host
+- *(vm)* ToPrimitive of an ordinary object operand runs its methods in the VM
+- *(builtins)* WeakMap/WeakSet methods and WeakRef.prototype.deref served at the call site
+- bench/js3, 14 clean-room programs for areas no benchmark covered
+- *(jit)* string switch pick tree compares with constant words, reuses its split's flags
+- *(jit)* leaner generic array step: one-byte done test, cursor stores from xmm0 (KATAAN_JIT_ITERBYTE)
+- *(jit)* thread a jump past the test of a proven boolean (KATAAN_JIT_BOOLTHREAD)
+- *(jit)* shortest displacement forms in the hand-written x86 encoders
+- *(jit)* aarch64 native call sequences between compiled functions
+- *(jit)* aarch64 property and element writes in place
+- *(jit)* the aarch64 generic tier inlines its hot ops and is on by default
+- *(jit)* compiled `super(...array)` constructs through the native sequence
+- *(jit)* an `arguments` object only read for length and indices is not made
+- *(jit)* a rest-parameter function is a native call and construct target
+- *(jit)* a function making an `arguments` object is a native call target
+- *(array)* flatMap runs in the VM's array loop instead of the host
+- *(regexp)* str.search(re) of a pristine RegExp calls its @@search directly
+- *(builtins)* Array.from(array) and new Set(array) of plain arrays skip the host
+- *(realm)* a Symbol's property key is built without format!
+- *(class)* super() calls the class's field initializer directly
+- *(class)* a base class's constructor runs its field initializer itself
+- *(class)* class-field defines go through a per-site transition memo
+- *(jit)* leaner assembler bookkeeping in the generic compile (KATAAN_JIT_CTIME names recompile reasons)
+- cargo fmt (module order in src/jit.rs)
+- *(jit)* cliffs' new JIT-only code uses jit_native
+- *(jit)* carried fields in loops with branches of their own (KATAAN_JIT_FCARRYBR)
+- *(jit)* a speculative loop's integer version holds named property reads as int32s (KATAAN_JIT_INTPROP)
+- *(jit)* a receiver register written only by moves takes its source's class (KATAAN_JIT_RCLASSMOVE)
+- *(sort)* the merge sort skips the merge of two halves already in order
+- *(array)* DirectCallee::call stays inlined into the lean loops
+- *(collections)* Map/Set forEach with a VM callback walks in the VM
+- *(builtins)* arr.toString() and n.toPrecision(p) served at the call site; toPrecision/toExponential format 3 guard digits, not 30
+- *(call)* a call of a bound VM function calls its target in the VM
+- *(iter)* Map/Set keys/values/entries and for-of/spread over a Map or Set open in the VM
+- *(intl)* localeCompare without locales/options reuses the default collator's settings
+- *(array)* find/findIndex/findLast/findLastIndex/reduce/reduceRight take the lean direct-callee loop
+- *(iter)* array keys()/values()/entries() iterators step and open without the host
+- *(builtins)* concat, fill, at, lastIndexOf, reverse and string at/codePointAt/concat/repeat/lastIndexOf/split('') served at the call site
+- *(jit)* code landed alongside jit_native uses it too
+- *(jit)* code landed alongside the jit_x64 alias uses it too
+- *(jit)* one `jit_x64` cfg alias names the JIT's target condition
+- *(legacy_reach)* don't link the private note_token from public docs
+- *(jit)* sloppy calls go headerless while no code can read f.caller / f.arguments
+- *(jit)* `new Array()` / `new Array(x)` takes the lean construct path (KATAAN_JIT_NEWCOLL)
+- *(vm)* `arr.length = n` with a valid Number length skips the host
+- *(jit)* a.push(x, y, ...) and a.push/pop/shift method reads run in place
+- *(jit)* compiled Map set / Set add insert into an indexed collection in line
+- *(rope)* a short all-ASCII string knows its UTF-16 length from birth
+- *(jit)* an inline Map set after a get of the same key updates the entry the get found
+- *(regexp)* a replace that cannot match answers in the VM, without the host
+- *(jit)* `a === b` of two short Strings compares their rope nodes inline
+- *(call)* a compiled call of a rest-parameter closure enters its native-call entry
+- *(array)* map/forEach/filter/some/every with a compiled callback run a lean loop
+- *(string)* s.substr() takes the direct string call; s[i] of a flat ASCII string skips the general element read
+
 ## [0.0.11](https://github.com/KarpelesLab/kataan/compare/v0.0.10...v0.0.11) - 2026-11-27
 
 ### Added
